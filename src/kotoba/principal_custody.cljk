@@ -18,26 +18,35 @@
     recovery  committed by hash only; signs `recover` when `next` is lost.
               Written to its OWN file -- move it off this machine.
 
-  After the handover, pre-rotation is active: only a key whose hash the
-  previous entry committed can sign. None of the service's keys was ever
-  committed, so it cannot sign an entry any resolver accepts.
+  ## What is checked, and why (security review of PR #635)
 
-  ## Files (mode 0600, under `${XDG_DATA_HOME:-~/.local/share}/kotoba/`)
+  - B1: the handover the host publishes must be EXACTLY the entry this
+    machine expects -- the previous document reduced to an allowlist with only
+    the active key swapped in, parameters exactly the two lists -- and the
+    parameters in force after it must carry no witness, watchers or
+    deactivation inherited from the host's era. Every rotation builds its
+    document from the same allowlist, so nothing the host ever put there is
+    carried forward.
+  - M1: one state file per DID; nothing is written until the log has been
+    checked, and a DID this machine does not hold is never overwritten.
+  - M2: `recover --recovery FILE` works on a machine with no state: it pins
+    the log as served (trust on first use, said so in the result), checks the
+    head commits to the recovery key, and recovers.
+  - M3: a rotation keeps the SIGNED ENTRY in the state before sending it; a
+    retry resubmits exactly that entry (or adopts it if the host had accepted
+    it); a lock file serialises commands on one DID.
+  - The log must be the one its URL names (`:id/did-url-mismatch`), every
+    fetch must extend the pinned version (`:id/log-fork-detected`), and the
+    holder's signed handover attestation lets anyone else detect a fork at
+    the handover.
 
-    webvh-custody.edn       state: DID, active/next seeds, recovery-key hash,
-                            the pinned head, any in-flight rotation
-    webvh-recovery-*.edn    the recovery seed (or `--recovery-out PATH`)
+  ## Files (under `${XDG_DATA_HOME:-~/.local/share}/kotoba/webvh-custody/`)
 
-  Seeds are written BEFORE anything is sent, so a crash after the server
-  accepted an entry never loses the key the entry committed to; the next run
-  finds the entry in the log and completes.
-
-  ## Rollback and fork detection
-
-  Every fetch checks the served log EXTENDS the pinned head (same versionId at
-  the pinned position) and nothing is signed on a log that does not: a host
-  that truncates or forks the log is reported as `:id/log-fork-detected`.
-  `verify --pin <versionId>` lets anyone else make the same check."
+    <rp-id>--<user>.edn               state, mode 0600
+    <rp-id>--<user>.lock              the command lock
+    <rp-id>--<user>-handover.json     the holder-signed handover attestation
+                                      (public: publish it)
+    recovery key                      its own file (`--recovery-out`)"
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [json.data-json :as json]
@@ -48,17 +57,20 @@
             [didwebvh.entry :as entry]
             [didwebvh.hash :as h]
             [didwebvh.log :as log]
+            [didwebvh.params :as params]
+            [didwebvh.proof :as proof]
             [didwebvh.signer :as signer])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
-           [java.nio.file Files OpenOption StandardOpenOption]
+           [java.nio.channels FileChannel OverlappingFileLockException]
+           [java.nio.file CopyOption Files LinkOption OpenOption StandardCopyOption StandardOpenOption]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]
            [java.security SecureRandom]
            [java.time Duration Instant]))
 
-(def state-relpath "kotoba/webvh-custody.edn")
+(def state-reldir "kotoba/webvh-custody")
 
-(def ^:dynamic *state-path* nil)
+(def ^:dynamic *state-dir* nil)
 (def ^:dynamic *http!*
   "(fn [method url body-string-or-nil] -> {:status n :body string}). nil = the
   JDK client. Bound by tests to an in-process host."
@@ -80,8 +92,8 @@
   (when (and (string? s) (re-matches #"[0-9a-f]{64}" s))
     (byte-array (map #(unchecked-byte (Integer/parseInt (apply str %) 16)) (partition 2 s)))))
 
-(defn new-seed []
-  (let [b (byte-array 32)] (.nextBytes (SecureRandom.) b) b))
+(defn- random-bytes [n] (let [b (byte-array n)] (.nextBytes (SecureRandom.) b) b))
+(defn new-seed [] (random-bytes 32))
 
 (defn key-of
   "`{:seed hex :multikey z6Mk…}` for raw seed bytes."
@@ -108,13 +120,18 @@
   [entries]
   (boolean (some #(seq (get-in % ["parameters" "nextKeyHashes"])) entries)))
 
+(defn find-handover
+  "[index entry] of the first entry that commits to next keys, or nil."
+  [entries]
+  (first (keep-indexed (fn [i e] (when (seq (get-in e ["parameters" "nextKeyHashes"])) [i e])) entries)))
+
 (defn proposal [active next-key recovery-hash]
   {"updateKeys" [(:multikey active)]
    "nextKeyHashes" [(h/key-hash (:multikey next-key)) recovery-hash]})
 
 (defn proposal-code
-  "The confirmation code the approval page shows -- the same digest the host
-  computes (`authn.webvh-custody/proposal-code`)."
+  "The confirmation code the holder types on the approval page -- the same
+  digest the host computes (`authn.webvh-custody/proposal-code`)."
   [p]
   (let [d (h/hash-json {"updateKeys" (vec (get p "updateKeys"))
                         "nextKeyHashes" (vec (get p "nextKeyHashes"))})
@@ -127,7 +144,7 @@
   fork), does not."
   [entries {:keys [version-id index]}]
   (or (nil? version-id)
-      (and (integer? index) (<= index (count entries))
+      (and (integer? index) (<= 1 index (count entries))
            (= version-id (get (nth entries (dec index)) "versionId")))))
 
 (defn- iso-seconds [ms]
@@ -142,14 +159,58 @@
     (iso-seconds (* 1000 sec))))
 
 (defn document-with-key
-  "The current document with its verification methods replaced by `mk`."
+  "The document for a version whose update key is `mk`, built from an
+  ALLOWLIST of the previous document: `@context`, `id`, `alsoKnownAs`, and
+  `mk` as the only verification method. Anything else (a `service`, extra
+  keys, `capabilityInvocation`) is dropped, so nothing a host put into the
+  document survives into the holder's versions. The host's handover uses the
+  same allowlist (`authn.webvh-custody/handover-state`)."
   [state mk]
   (let [id (get state "id")
         vm {"id" (str id "#" mk) "type" "Multikey" "controller" id "publicKeyMultibase" mk}]
-    (assoc state
-           "verificationMethod" [vm]
-           "authentication" [(get vm "id")]
-           "assertionMethod" [(get vm "id")])))
+    (cond-> {"@context" (get state "@context")
+             "id" id
+             "verificationMethod" [vm]
+             "authentication" [(get vm "id")]
+             "assertionMethod" [(get vm "id")]}
+      (contains? state "alsoKnownAs") (assoc "alsoKnownAs" (get state "alsoKnownAs")))))
+
+(defn active-parameters
+  "The method's own fold of the parameters of `entries` (no cryptography)."
+  [entries]
+  (reduce (fn [active e] (params/advance active (get e "parameters")))
+          (params/initial (get (first entries) "parameters"))
+          (rest entries)))
+
+(defn inherited-problem
+  "Why the parameters in force would put the holder under someone else's
+  rules, or nil: a configured witness (its approvals would be required),
+  watchers, or deactivation."
+  [active]
+  (cond
+    (:deactivated? active) :deactivated
+    (seq (:watchers active)) :watchers
+    (seq (get-in active [:witness "witnesses"])) :witness
+    :else nil))
+
+(defn expected-handover
+  "The parameters and state the handover at position `idx` must have, built
+  here from the entry before it and the proposal."
+  [entries idx p]
+  {"parameters" {"updateKeys" (vec (get p "updateKeys"))
+                 "nextKeyHashes" (vec (get p "nextKeyHashes"))}
+   "state" (document-with-key (get (nth entries (dec idx)) "state") (first (get p "updateKeys")))})
+
+(defn handover-matches?
+  "B1: the published handover is exactly the expected entry (only its
+  versionId, versionTime and proof may differ -- those the method checks), and
+  nothing inherited would bind the holder."
+  [entries idx p]
+  (let [e (nth entries idx)]
+    (and (pos? idx)
+         (= #{"versionId" "versionTime" "parameters" "state" "proof"} (set (keys e)))
+         (= (expected-handover entries idx p) (select-keys e ["parameters" "state"]))
+         (nil? (inherited-problem (active-parameters (subvec (vec entries) 0 (inc idx))))))))
 
 (defn rotation-entry
   "The next entry (unsigned): reveal `reveal-mk`, commit to `commit-hashes`."
@@ -169,35 +230,63 @@
 
 ;; ── files ───────────────────────────────────────────────────────────────────
 
-(defn state-path []
-  (or *state-path*
+(defn state-dir []
+  (or *state-dir*
       (let [xdg (System/getenv "XDG_DATA_HOME")
             home (or (System/getenv "HOME") (System/getProperty "user.home"))]
         (.getPath (io/file (if (and (string? xdg) (not (str/blank? xdg))) xdg (str home "/.local/share"))
-                           state-relpath)))))
+                           state-reldir)))))
 
-(defn- set-posix-mode! [path mode]
-  (try (Files/setPosixFilePermissions path (PosixFilePermissions/fromString mode))
-       (catch UnsupportedOperationException _)))
+(defn- slug [rp-id user-id] (str rp-id "--" user-id))
+(defn state-path [rp-id user-id] (.getPath (io/file (state-dir) (str (slug rp-id user-id) ".edn"))))
+(defn lock-path [rp-id user-id] (.getPath (io/file (state-dir) (str (slug rp-id user-id) ".lock"))))
+(defn attestation-path [rp-id user-id] (.getPath (io/file (state-dir) (str (slug rp-id user-id) "-handover.json"))))
+
+(def ^:private owner-only-dir (PosixFilePermissions/asFileAttribute (PosixFilePermissions/fromString "rwx------")))
+(def ^:private owner-only-file (PosixFilePermissions/asFileAttribute (PosixFilePermissions/fromString "rw-------")))
+
+(defn- ensure-parent!
+  "Create the parent directory 0700 if it does not exist. An EXISTING
+  directory is never chmodded: it may be one the user chose (a removable
+  drive for `--recovery-out`)."
+  [nio]
+  (let [parent (.getParent (.toAbsolutePath nio))]
+    (when-not (Files/exists parent (make-array LinkOption 0))
+      (try (Files/createDirectories parent (into-array FileAttribute [owner-only-dir]))
+           (catch UnsupportedOperationException _
+             (Files/createDirectories parent (make-array FileAttribute 0)))))
+    parent))
+
+(defn- fsync-dir! [dir]
+  (try (with-open [ch (FileChannel/open dir (into-array OpenOption [StandardOpenOption/READ]))]
+         (.force ch true))
+       (catch Exception _ nil)))
+
+(defn- write-file!
+  [path ^bytes bytes secret?]
+  (let [target (.toPath (io/file path))
+        parent (ensure-parent! target)
+        tmp (.resolve parent (str "." (.getFileName target) "." (hex (random-bytes 8)) ".tmp"))
+        opts (java.util.HashSet. [StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE
+                                  LinkOption/NOFOLLOW_LINKS])]
+    (try
+      (with-open [ch (try (FileChannel/open tmp opts (into-array FileAttribute (if secret? [owner-only-file] [])))
+                          (catch UnsupportedOperationException _
+                            (FileChannel/open tmp opts (make-array FileAttribute 0))))]
+        (.write ch (java.nio.ByteBuffer/wrap bytes))
+        (.force ch true))
+      (Files/move tmp target (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING
+                                                     StandardCopyOption/ATOMIC_MOVE]))
+      (fsync-dir! parent)
+      (finally (Files/deleteIfExists tmp)))))
 
 (defn write-secret-edn!
-  "Write `record` to `path`, mode 0600 (parent 0700), atomically enough for a
-  single writer: temp file then rename."
+  "Write `record` to `path`: a fresh temp file created EXCLUSIVELY with mode
+  0600 from the start (never a moment readable by others, no symlink
+  followed), fsynced, renamed over the target, and the directory fsynced."
   [path record]
-  (let [nio (.toPath (io/file path))
-        parent (.getParent nio)
-        tmp (.toPath (io/file (str path ".tmp")))]
-    (when parent
-      (Files/createDirectories parent (make-array FileAttribute 0))
-      (set-posix-mode! parent "rwx------"))
-    (Files/write tmp (kbytes/utf8-bytes (str (pr-str record) "\n"))
-                 (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/TRUNCATE_EXISTING
-                                         StandardOpenOption/WRITE]))
-    (set-posix-mode! tmp "rw-------")
-    (Files/move tmp nio (into-array java.nio.file.CopyOption
-                                    [java.nio.file.StandardCopyOption/REPLACE_EXISTING
-                                     java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
-    record))
+  (write-file! path (kbytes/utf8-bytes (str (pr-str record) "\n")) true)
+  record)
 
 (defn read-edn [path]
   (let [f (io/file path)]
@@ -205,11 +294,14 @@
       (try (edn/read-string {:readers {} :default (fn [_ _] nil)} (slurp f))
            (catch Exception _ nil)))))
 
-(defn read-state [] (read-edn (state-path)))
+(defn read-state [rp-id user-id] (read-edn (state-path rp-id user-id)))
 
-(defn default-recovery-path [scid]
-  (.getPath (io/file (.getParent (io/file (state-path)))
-                     (str "webvh-recovery-" (subs (str scid) 0 (min 12 (count (str scid)))) ".edn"))))
+(defn- all-states []
+  (->> (.listFiles (io/file (state-dir)))
+       (filter #(and (.isFile ^java.io.File %) (str/ends-with? (.getName ^java.io.File %) ".edn")))
+       (keep #(read-edn (.getPath ^java.io.File %)))
+       (filter :kotoba.webvh-custody/user-id)
+       vec))
 
 (defn- write-recovery! [path did k]
   (when (.exists (io/file path))
@@ -243,9 +335,7 @@
   (try (json/read-str body) (catch Exception _ {})))
 
 (defn fetch-log
-  "`{:entries [..] :witness-file [..]}` from the host, or `{:error kw :status n}`.
-  A cache-busting query keeps an edge cache from answering with a log older
-  than the one just written."
+  "`{:entries [..] :witness-file [..]}` from the host, or `{:error kw :status n}`."
   [url]
   (let [bust (str "?t=" (now-ms))
         r (http! "GET" (str url bust))]
@@ -275,9 +365,11 @@
 
 (defn- say [& xs] (binding [*out* *err*] (apply println xs)))
 
+(defn- failure? [x] (contains? x :kotoba.cli/code))
+
 (defn- verified-log
-  "Fetch and verify; enforce the pin when given. `{:entries :witness-file :v}`
-  or a failure result."
+  "Fetch and verify; the log must be the one `url` names; enforce the pin when
+  given. `{:entries :witness-file :v}` or a failure result."
   [url pin]
   (let [{:keys [entries witness-file error status]} (fetch-log url)]
     (cond
@@ -287,14 +379,30 @@
             {:url url :pin pin :served-head (get (peek entries) "versionId") :served-length (count entries)}
             "the served log does not extend the version this machine pinned -- rolled back or forked; nothing was signed")
       :else
-      (let [v (verify-entries entries witness-file)]
-        (if-not (:ok? v)
+      (let [v (verify-entries entries witness-file)
+            named (when (:ok? v) (try (did/log-url (:did v)) (catch Exception _ nil)))]
+        (cond
+          (not (:ok? v))
           (fail :id/log-invalid {:url url :error (:error v) :index (:index v) :message (:message v)})
-          {:entries entries :witness-file witness-file :v v})))))
+          (not= url named)
+          (fail :id/did-url-mismatch {:url url :did (:did v) :did-log-url named}
+                "the log served at this URL is for another DID")
+          :else {:entries entries :witness-file witness-file :v v})))))
 
-;; ── take-custody ────────────────────────────────────────────────────────────
+(defn- with-lock
+  "Run `f` holding the lock file of this DID; `:id/busy` if another command
+  holds it."
+  [rp-id user-id f]
+  (let [nio (.toPath (io/file (lock-path rp-id user-id)))]
+    (ensure-parent! nio)
+    (with-open [ch (FileChannel/open nio (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE]))]
+      (if-let [l (try (.tryLock ch) (catch OverlappingFileLockException _ nil))]
+        (try (f) (finally (.release l)))
+        (fail :id/busy {:lock (str nio)} "another kotoba id command is working on this DID")))))
 
-(defn- context-from [argv]
+;; ── selecting the DID ───────────────────────────────────────────────────────
+
+(defn- enrolled-context [argv]
   (let [record (principal/read-principal)
         rp-id (or (option argv "--rp-id") (:kotoba.principal/rp-id record) principal/canonical-rp-id)
         user-id (or (option argv "--user") (user-id-of (:kotoba.principal/account-did record)))]
@@ -304,226 +412,348 @@
       {:error (fail :id/not-enrolled {:hint "run `kotoba id new`, or pass --user u_…"})}
       :else {:rp-id rp-id :user-id user-id :url (log-url rp-id user-id)})))
 
-(defn- find-handover [entries]
-  (first (keep-indexed (fn [i e] (when (seq (get-in e ["parameters" "nextKeyHashes"])) [i e])) entries)))
+(defn- did-context [did-string]
+  (let [parsed (try (did/parse did-string) (catch Exception _ nil))
+        user-id (user-id-of did-string)]
+    (when (and parsed user-id (nil? (:port parsed)))
+      {:rp-id (:domain parsed) :user-id user-id :url (did/log-url did-string)})))
 
-(defn- matches-proposal? [e p]
-  (and (= (get p "updateKeys") (get-in e ["parameters" "updateKeys"]))
-       (= (get p "nextKeyHashes") (get-in e ["parameters" "nextKeyHashes"]))))
+(defn- selected-context
+  "Which DID a rotate/recover/verify acts on: `--did`, `--user` [+ `--rp-id`],
+  `fallback-did` (a recovery file's), or the one DID this machine holds."
+  [argv & [fallback-did]]
+  (cond
+    (option argv "--did") (or (did-context (option argv "--did")) {:error (fail :id/bad-did {:did (option argv "--did")})})
+    (option argv "--user") (let [rp (or (option argv "--rp-id") principal/canonical-rp-id)
+                                 u (option argv "--user")]
+                             {:rp-id rp :user-id u :url (log-url rp u)})
+    fallback-did (or (did-context fallback-did) {:error (fail :id/bad-did {:did fallback-did})})
+    :else (let [held (filter #(#{:custodied :pending} (:kotoba.webvh-custody/status %)) (all-states))]
+            (case (count held)
+              0 {:error (fail :id/not-custodied {:hint "run `kotoba id take-custody` first" :state-dir (state-dir)})}
+              1 (let [s (first held)]
+                  {:rp-id (:kotoba.webvh-custody/rp-id s) :user-id (:kotoba.webvh-custody/user-id s)
+                   :url (:kotoba.webvh-custody/log-url s)})
+              {:error (fail :id/ambiguous-did {:dids (mapv :kotoba.webvh-custody/did held)}
+                            "this machine holds several DIDs; pass --did or --user")}))))
+
+;; ── the handover attestation (ADR §M6: publishing the handover) ─────────────
+
+(defn- attestation-doc [did vid index]
+  {"type" "DidWebvhHandoverAttestation" "did" did "versionId" vid "index" index})
+
+(defn- write-attestation! [rp-id user-id did vid index active]
+  (let [doc (attestation-doc did vid index)
+        s (signer-of active)
+        att (assoc doc "proof" [(proof/create doc {:multikey (:multikey active) :sign-fn (:sign-fn s)})])
+        path (attestation-path rp-id user-id)]
+    (write-file! path (kbytes/utf8-bytes (json/write-str att)) false)
+    path))
+
+(defn attestation-check
+  "nil when the attestation at `path` is a valid holder signature over a
+  handover that IS in `entries` at its position, else the reason."
+  [path entries did]
+  (let [att (try (json/read-str (slurp path)) (catch Exception _ nil))
+        index (get att "index")
+        e (when (and (integer? index) (<= 1 index (count entries))) (nth entries (dec index)))
+        mk (first (get-in e ["parameters" "updateKeys"]))]
+    (cond
+      (nil? att) :unreadable
+      (not= did (get att "did")) :other-did
+      (nil? e) :log-shorter-than-handover
+      (not= (get att "versionId") (get e "versionId")) :different-entry-at-handover
+      (not (:ok? (proof/verify (dissoc att "proof") (first (get att "proof")) {:allowed #{mk}}))) :bad-signature
+      :else nil)))
+
+;; ── take-custody ────────────────────────────────────────────────────────────
 
 (defn- finalize-handover [state entries idx]
   (let [e (nth entries idx)
+        did (get-in (peek entries) ["state" "id"])
+        rp (:kotoba.webvh-custody/rp-id state)
+        uid (:kotoba.webvh-custody/user-id state)
+        att (write-attestation! rp uid did (get e "versionId") (inc idx) (:kotoba.webvh-custody/active state))
         state* (-> state
                    (assoc :kotoba.webvh-custody/status :custodied
-                          :kotoba.webvh-custody/did (get-in (peek entries) ["state" "id"])
+                          :kotoba.webvh-custody/did did
                           :kotoba.webvh-custody/pin {:version-id (get (peek entries) "versionId")
                                                      :index (count entries)}
-                          :kotoba.webvh-custody/handover-version-id (get e "versionId"))
+                          :kotoba.webvh-custody/handover {:version-id (get e "versionId") :index (inc idx)})
                    (dissoc :kotoba.webvh-custody/proposal))]
-    (write-secret-edn! (state-path) state*)
+    (write-secret-edn! (state-path rp uid) state*)
     (ok :id/custody-taken
-        {:did (:kotoba.webvh-custody/did state*)
+        {:did did
          :handover-version-id (get e "versionId")
          :update-key (get-in state* [:kotoba.webvh-custody/active :multikey])
          :recovery-path (:kotoba.webvh-custody/recovery-path state*)
-         :state-path (state-path)
-         :warning "move the recovery key file off this machine; losing both it and this machine's next key freezes the DID forever"})))
+         :state-path (state-path rp uid)
+         :attestation-path att
+         :warning (str "move the recovery key file off this machine; losing both it and this machine's next "
+                       "key freezes the DID forever. Publish the attestation file wherever relying parties "
+                       "will find it: it is what lets them detect a host that forks the log at the handover.")})))
 
-(defn take-custody-result
-  "Generate keys here; have the account's passkey approve one handover entry
-  naming them; verify the result; pin it."
-  [argv]
-  (let [{:keys [error rp-id user-id url]} (context-from argv)
-        existing (read-state)]
-    (cond
-      error error
-
-      (and (= :custodied (:kotoba.webvh-custody/status existing))
-           (= user-id (:kotoba.webvh-custody/user-id existing)))
-      (fail :id/already-custodied {:did (:kotoba.webvh-custody/did existing) :state-path (state-path)})
-
-      :else
+(defn- take-custody*
+  [argv {:keys [rp-id user-id url]}]
+  (let [existing (read-state rp-id user-id)]
+    (if (= :custodied (:kotoba.webvh-custody/status existing))
+      (fail :id/already-custodied {:did (:kotoba.webvh-custody/did existing) :state-path (state-path rp-id user-id)})
       (let [fetched (verified-log url nil)]
-        (if (:kotoba.cli/code fetched)
+        (if (failure? fetched)
           fetched
           (let [{:keys [entries]} fetched
                 did (get-in (peek entries) ["state" "id"])
-                pending (when (and (= :pending (:kotoba.webvh-custody/status existing))
-                                   (= user-id (:kotoba.webvh-custody/user-id existing)))
-                          existing)
-                state (or pending
-                          (let [a (key-of (new-seed)) b (key-of (new-seed)) r (key-of (new-seed))
-                                rpath (or (option argv "--recovery-out")
-                                          (default-recovery-path (get-in (peek entries) ["parameters" "scid"]
-                                                                         (second (str/split did #":")))))]
-                            (write-recovery! rpath did r)
-                            {:kotoba.webvh-custody/version 1
-                             :kotoba.webvh-custody/status :pending
-                             :kotoba.webvh-custody/user-id user-id
-                             :kotoba.webvh-custody/rp-id rp-id
-                             :kotoba.webvh-custody/log-url url
-                             :kotoba.webvh-custody/did did
-                             :kotoba.webvh-custody/active a
-                             :kotoba.webvh-custody/next b
-                             :kotoba.webvh-custody/recovery-hash (h/key-hash (:multikey r))
-                             :kotoba.webvh-custody/recovery-path rpath}))
-                p (proposal (:kotoba.webvh-custody/active state) (:kotoba.webvh-custody/next state)
-                            (:kotoba.webvh-custody/recovery-hash state))
-                code (proposal-code p)]
-            (when-not pending (write-secret-edn! (state-path) state))
-            (if-let [[idx e] (find-handover entries)]
+                pending (when (= :pending (:kotoba.webvh-custody/status existing)) existing)
+                pending-p (when pending (proposal (:kotoba.webvh-custody/active pending)
+                                                  (:kotoba.webvh-custody/next pending)
+                                                  (:kotoba.webvh-custody/recovery-hash pending)))]
+            (if-let [[idx _] (find-handover entries)]
               ;; Already handed over: ours (a previous run that died before
-              ;; recording it) or someone else's.
-              (if (matches-proposal? e p)
-                (finalize-handover state entries idx)
-                (fail :id/already-client-custody {:did did :handover-version-id (get e "versionId")}
+              ;; recording it) or someone else's -- nothing is written.
+              (if (and pending-p (handover-matches? entries idx pending-p))
+                (finalize-handover pending entries idx)
+                (fail :id/already-client-custody {:did did :handover-version-id (get (nth entries idx) "versionId")}
                       "this DID is already held by keys this machine does not have"))
-              (let [r (http! "POST" (str (origin-of url) "/v1/webvh/custody/request")
-                             (assoc p "userId" user-id))
-                    body (body-json r)
-                    uri (get body "verificationUriComplete")]
-                (cond
-                  (not= 200 (:status r))
-                  (fail :id/custody-request-refused {:status (:status r) :error (get body "error")})
+              (if-let [problem (inherited-problem (active-parameters entries))]
+                (fail :id/inherited-parameters {:did did :problem problem}
+                      "the log carries a witness, watchers or deactivation that would bind the holder; not taking it")
+                (let [state (or pending
+                                (let [a (key-of (new-seed)) b (key-of (new-seed)) r (key-of (new-seed))
+                                      rpath (or (option argv "--recovery-out")
+                                                (.getPath (io/file (state-dir) (str (slug rp-id user-id) "-recovery.edn"))))]
+                                  (write-recovery! rpath did r)
+                                  (write-secret-edn! (state-path rp-id user-id)
+                                                     {:kotoba.webvh-custody/version 2
+                                                      :kotoba.webvh-custody/status :pending
+                                                      :kotoba.webvh-custody/user-id user-id
+                                                      :kotoba.webvh-custody/rp-id rp-id
+                                                      :kotoba.webvh-custody/log-url url
+                                                      :kotoba.webvh-custody/did did
+                                                      :kotoba.webvh-custody/active a
+                                                      :kotoba.webvh-custody/next b
+                                                      :kotoba.webvh-custody/recovery-hash (h/key-hash (:multikey r))
+                                                      :kotoba.webvh-custody/recovery-path rpath})))
+                      p (proposal (:kotoba.webvh-custody/active state) (:kotoba.webvh-custody/next state)
+                                  (:kotoba.webvh-custody/recovery-hash state))
+                      code (proposal-code p)
+                      r (http! "POST" (str (origin-of url) "/v1/webvh/custody/request") (assoc p "userId" user-id))
+                      body (body-json r)
+                      uri (get body "verificationUri")
+                      delay-ms (* 1000 (long (or (get body "delaySeconds") 0)))]
+                  (cond
+                    (not= 200 (:status r))
+                    (fail :id/custody-request-refused {:status (:status r) :error (get body "error")})
 
-                  (not= code (get body "code"))
-                  (fail :id/code-mismatch {:local code :host (get body "code")}
-                        "the host computed a different confirmation code for this proposal; not continuing")
+                    (not= code (get body "code"))
+                    (fail :id/code-mismatch {:local code :host (get body "code")}
+                          "the host computed a different confirmation code for this proposal; not continuing")
 
-                  (not (principal/verification-uri-ok? rp-id uri))
-                  (fail :id/bad-verification-uri {:uri uri})
+                    (not (and (principal/verification-uri-ok? rp-id uri)
+                              (= "/webvh/custody" (.getPath (URI. uri)))
+                              (nil? (.getRawQuery (URI. uri)))))
+                    (fail :id/bad-verification-uri {:uri uri})
 
-                  :else
-                  (do
-                    (say "Approve the DID handover with your Passkey:")
-                    (say uri)
-                    (say "Confirmation code:" code "(it must match the page)")
-                    (say "Recovery key written to" (:kotoba.webvh-custody/recovery-path state) "-- move it off this machine.")
-                    (when-not ((or *browser-open!* principal/open-browser!) uri)
-                      (say "Could not open a browser; open the URL above."))
-                    (let [deadline (+ (now-ms) handover-timeout-ms)]
-                      (loop []
-                        (if (> (now-ms) deadline)
-                          (fail :id/handover-timeout {:did did :state-path (state-path)}
-                                "not approved in time; run `kotoba id take-custody` again (same keys, same code)")
-                          (let [polled (verified-log url nil)]
-                            (if (:kotoba.cli/code polled)
-                              polled
-                              (let [es (:entries polled)]
-                                (if-let [[idx e] (find-handover es)]
-                                  (if (matches-proposal? e p)
-                                    (finalize-handover state es idx)
-                                    (fail :id/handover-mismatch {:did did :handover-version-id (get e "versionId")}
-                                          "a handover to OTHER keys appeared in the log"))
-                                  (do ((or *sleep-ms!* #(Thread/sleep (long %))) poll-interval-ms)
-                                      (recur)))))))))))))))))))
+                    :else
+                    (do
+                      (say "Open" uri "signed in with your Passkey, and TYPE this code:")
+                      (say "   " code)
+                      (say "Never type a code you did not get from this command.")
+                      (say "Recovery key written to" (:kotoba.webvh-custody/recovery-path state) "-- move it off this machine.")
+                      (when (pos? delay-ms)
+                        (say "After approval the handover waits" (quot delay-ms 1000) "s (cancellable on that page) before it takes effect."))
+                      (when-not ((or *browser-open!* principal/open-browser!) uri)
+                        (say "Could not open a browser; open the URL above."))
+                      (let [deadline (+ (now-ms) handover-timeout-ms delay-ms)]
+                        (loop []
+                          (if (> (now-ms) deadline)
+                            (fail :id/handover-timeout {:did did :state-path (state-path rp-id user-id)}
+                                  "not approved (or not yet effective); run `kotoba id take-custody` again -- same keys, same code")
+                            (do
+                              (http! "POST" (str (origin-of url) "/v1/webvh/custody/finalize") {"userId" user-id})
+                              (let [polled (verified-log url nil)]
+                                (if (failure? polled)
+                                  polled
+                                  (let [es (:entries polled)]
+                                    (if-let [[idx e] (find-handover es)]
+                                      (if (handover-matches? es idx p)
+                                        (finalize-handover state es idx)
+                                        (fail :id/handover-mismatch {:did did :handover-version-id (get e "versionId")}
+                                              "the published handover is not exactly the proposed one (other keys, extra document content or parameters); refusing it"))
+                                      (do ((or *sleep-ms!* #(Thread/sleep (long %))) poll-interval-ms)
+                                          (recur)))))))))))))))))))))
+
+(defn take-custody-result
+  "Generate keys here; have the account's passkey approve one handover entry
+  naming them; check the published entry is exactly that; pin it."
+  [argv]
+  (let [{:keys [error rp-id user-id] :as ctx} (enrolled-context argv)]
+    (if error
+      error
+      (try (with-lock rp-id user-id #(take-custody* argv ctx))
+           (catch clojure.lang.ExceptionInfo e
+             (fail (or (:code (ex-data e)) :id/take-custody-failed) (dissoc (ex-data e) :code) (ex-message e)))))))
 
 ;; ── rotate / recover ────────────────────────────────────────────────────────
 
 (defn- complete-pending
-  "A rotation from a previous run: if its entry is in the log, adopt it; if
-  the log is still at the pin, drop it (nothing was accepted)."
+  "A rotation from a previous run whose entry IS in the log is adopted (its
+  keys become current, the pin moves). Otherwise the pending entry is kept,
+  to be resubmitted exactly."
   [state entries]
   (if-let [{:keys [version-id] :as pending} (:kotoba.webvh-custody/pending state)]
-    (let [idx (some (fn [[i e]] (when (= version-id (get e "versionId")) i)) (map-indexed vector entries))]
-      (if idx
-        (-> state
-            (assoc :kotoba.webvh-custody/active (:active pending)
-                   :kotoba.webvh-custody/next (:next pending)
-                   :kotoba.webvh-custody/recovery-hash (:recovery-hash pending)
-                   :kotoba.webvh-custody/pin {:version-id version-id :index (inc idx)})
-            (cond-> (:recovery-path pending) (assoc :kotoba.webvh-custody/recovery-path (:recovery-path pending)))
-            (dissoc :kotoba.webvh-custody/pending))
-        (dissoc state :kotoba.webvh-custody/pending)))
+    (if-let [idx (some (fn [[i e]] (when (= version-id (get e "versionId")) i)) (map-indexed vector entries))]
+      (-> state
+          (assoc :kotoba.webvh-custody/active (:active pending)
+                 :kotoba.webvh-custody/next (:next pending)
+                 :kotoba.webvh-custody/recovery-hash (:recovery-hash pending)
+                 :kotoba.webvh-custody/pin {:version-id version-id :index (inc idx)})
+          (cond-> (:recovery-path pending) (assoc :kotoba.webvh-custody/recovery-path (:recovery-path pending)))
+          (dissoc :kotoba.webvh-custody/pending))
+      state)
     state))
 
-(defn- rotate!
-  "Shared by rotate and recover. `signer-key` is the pre-committed key that
-  signs (`next` or the recovery key); a fresh next key is committed, and the
-  recovery commitment is either kept or replaced (`new-recovery`)."
-  [argv mode]
-  (let [state0 (read-state)]
-    (if-not (= :custodied (:kotoba.webvh-custody/status state0))
-      (fail :id/not-custodied {:hint "run `kotoba id take-custody` first" :state-path (state-path)})
-      (let [url (:kotoba.webvh-custody/log-url state0)
-            {:keys [entries] :as fetched} (verified-log url nil)]
-        (if (:kotoba.cli/code fetched)
-          fetched
-          (let [state (complete-pending state0 entries)
-                pin (:kotoba.webvh-custody/pin state)]
-            (when-not (= state state0) (write-secret-edn! (state-path) state))
-            (cond
-              (not (extends-pin? entries pin))
-              (fail :id/log-fork-detected {:url url :pin pin :served-head (get (peek entries) "versionId")}
-                    "the served log does not extend the version this machine pinned; nothing was signed")
+(defn- submit!
+  "Send the pending entry of `state` and confirm it is visible."
+  [state url mode]
+  (let [{:keys [version-id] :as pending} (:kotoba.webvh-custody/pending state)
+        e (json/read-str (:entry pending))
+        r (http! "POST" (str (origin-of url) "/v1/webvh/append")
+                 {"userId" (:kotoba.webvh-custody/user-id state) "entry" e})
+        body (body-json r)
+        path (state-path (:kotoba.webvh-custody/rp-id state) (:kotoba.webvh-custody/user-id state))]
+    (if-not (= 200 (:status r))
+      (fail :id/append-refused {:status (:status r) :error (get body "error") :detail (get body "detail")
+                                :version-id version-id
+                                :hint "run the same command again: the signed entry is kept and is resubmitted (or adopted if it landed)"})
+      (let [after (verified-log url (:kotoba.webvh-custody/pin state))]
+        (if (failure? after)
+          after
+          (let [state* (complete-pending state (:entries after))]
+            (write-secret-edn! path state*)
+            (if-not (= version-id (get-in state* [:kotoba.webvh-custody/pin :version-id]))
+              (fail :id/append-not-visible {:version-id version-id})
+              (ok (if (= :recover (or (:mode pending) mode)) :id/recovered :id/rotated)
+                  (cond-> {:did (get-in (peek (:entries after)) ["state" "id"])
+                           :version-id version-id
+                           :update-key (get-in pending [:active :multikey])
+                           :state-path path}
+                    (:recovery-path pending)
+                    (assoc :recovery-path (:recovery-path pending)
+                           :warning "a NEW recovery key was written; move it off this machine and destroy the old one")
+                    (:tofu state*)
+                    (update :warning #(str % (when % " ") (:tofu state*))))))))))))
 
-              (not= (:index pin) (count entries))
-              (fail :id/unexpected-entries {:url url :pin pin :served-length (count entries)}
-                    "the log has versions this machine did not write -- a holder key may be compromised; run `kotoba id verify`")
+(def ^:private tofu-warning
+  (str "This machine had no record of this DID, so it pinned the log as the host served it now "
+       "(trust on first use): a host that forked or rolled the log back before this moment would not "
+       "be detected here. Check the result with `kotoba id verify --attestation <your handover attestation>`."))
+
+(defn- rotate*
+  [argv mode {:keys [rp-id user-id url]} recovery-file]
+  (let [path (state-path rp-id user-id)
+        stored (read-state rp-id user-id)
+        fetched (verified-log url nil)]
+    (cond
+      (failure? fetched) fetched
+
+      (and (not= :custodied (:kotoba.webvh-custody/status stored)) (not= mode :recover))
+      (fail :id/not-custodied {:hint "run `kotoba id take-custody` first" :state-path path})
+
+      :else
+      (let [{:keys [entries]} fetched
+            tofu? (not= :custodied (:kotoba.webvh-custody/status stored))
+            state0 (if tofu?
+                     {:kotoba.webvh-custody/version 2
+                      :kotoba.webvh-custody/status :custodied
+                      :kotoba.webvh-custody/user-id user-id
+                      :kotoba.webvh-custody/rp-id rp-id
+                      :kotoba.webvh-custody/log-url url
+                      :kotoba.webvh-custody/did (get-in (peek entries) ["state" "id"])
+                      :kotoba.webvh-custody/pin {:version-id (get (peek entries) "versionId") :index (count entries)}
+                      :kotoba.webvh-custody/recovery-path (option argv "--recovery")
+                      :tofu tofu-warning}
+                     stored)
+            state (complete-pending state0 entries)
+            pin (:kotoba.webvh-custody/pin state)]
+        (cond
+          (not (client-custody? entries))
+          (fail :id/not-custodied {:hint "this DID is still in service custody; run `kotoba id take-custody`"})
+
+          (not (extends-pin? entries pin))
+          (fail :id/log-fork-detected {:url url :pin pin :served-head (get (peek entries) "versionId")}
+                "the served log does not extend the version this machine pinned; nothing was signed")
+
+          (not= (:index pin) (count entries))
+          (fail :id/unexpected-entries {:url url :pin pin :served-length (count entries)}
+                "the log has versions this machine did not write -- a holder key may be compromised; run `kotoba id verify`")
+
+          ;; M3: a signed entry from an interrupted run, not in the log, the
+          ;; log still at the pin: send exactly that entry again.
+          (:kotoba.webvh-custody/pending state)
+          (do (write-secret-edn! path state) (submit! state url mode))
+
+          :else
+          (let [signing-key (case mode
+                              :rotate (:kotoba.webvh-custody/next state)
+                              :recover (when recovery-file
+                                         {:seed (:kotoba.webvh-recovery/seed recovery-file)
+                                          :multikey (:kotoba.webvh-recovery/multikey recovery-file)}))]
+            (cond
+              (nil? (:seed signing-key))
+              (fail :id/recovery-key-missing {:hint "pass --recovery PATH to the recovery key file"})
+
+              (not= (:multikey signing-key) (:multikey (key-of (unhex (:seed signing-key)))))
+              (fail :id/key-file-corrupt {})
+
+              (not (committed? entries (:multikey signing-key)))
+              (fail :id/key-not-committed {:multikey (:multikey signing-key)}
+                    "the log's head did not commit to this key")
 
               :else
-              (let [recovery-file (when (= mode :recover)
-                                    (read-edn (or (option argv "--recovery")
-                                                  (:kotoba.webvh-custody/recovery-path state))))
-                    signing-key (case mode
-                                  :rotate (:kotoba.webvh-custody/next state)
-                                  :recover (when recovery-file
-                                             {:seed (:kotoba.webvh-recovery/seed recovery-file)
-                                              :multikey (:kotoba.webvh-recovery/multikey recovery-file)}))]
-                (cond
-                  (nil? (:seed signing-key))
-                  (fail :id/recovery-key-missing {:hint "pass --recovery PATH to the recovery key file"})
+              (let [did (get-in (peek entries) ["state" "id"])
+                    new-next (key-of (new-seed))
+                    new-recovery (when (= mode :recover) (key-of (new-seed)))
+                    new-recovery-path (when new-recovery
+                                        (or (option argv "--recovery-out")
+                                            (str (or (:kotoba.webvh-custody/recovery-path state)
+                                                     (.getPath (io/file (state-dir) (str (slug rp-id user-id) "-recovery.edn"))))
+                                                 "." (count entries))))
+                    recovery-hash (if new-recovery
+                                    (h/key-hash (:multikey new-recovery))
+                                    (:kotoba.webvh-custody/recovery-hash state))
+                    e (entry/sign (rotation-entry entries (:multikey signing-key)
+                                                  [(h/key-hash (:multikey new-next)) recovery-hash])
+                                  (signer-of signing-key))]
+                (when new-recovery (write-recovery! new-recovery-path did new-recovery))
+                (let [state* (assoc state :kotoba.webvh-custody/pending
+                                    (cond-> {:version-id (get e "versionId")
+                                             :entry (json/write-str e)
+                                             :mode mode
+                                             :active signing-key
+                                             :next new-next
+                                             :recovery-hash recovery-hash}
+                                      new-recovery-path (assoc :recovery-path new-recovery-path)))]
+                  (write-secret-edn! path state*)
+                  (submit! state* url mode))))))))))
 
-                  (not= (:multikey signing-key) (:multikey (key-of (unhex (:seed signing-key)))))
-                  (fail :id/key-file-corrupt {})
-
-                  (not (committed? entries (:multikey signing-key)))
-                  (fail :id/key-not-committed {:multikey (:multikey signing-key)}
-                        "the log's head did not commit to this key")
-
-                  :else
-                  (let [did (get-in (peek entries) ["state" "id"])
-                        new-next (key-of (new-seed))
-                        new-recovery (when (= mode :recover) (key-of (new-seed)))
-                        new-recovery-path (when new-recovery
-                                            (or (option argv "--recovery-out")
-                                                (str (:kotoba.webvh-custody/recovery-path state) "." (count entries))))
-                        recovery-hash (if new-recovery
-                                        (h/key-hash (:multikey new-recovery))
-                                        (:kotoba.webvh-custody/recovery-hash state))
-                        unsigned (rotation-entry entries (:multikey signing-key)
-                                                 [(h/key-hash (:multikey new-next)) recovery-hash])
-                        e (entry/sign unsigned (signer-of signing-key))
-                        vid (get e "versionId")]
-                    (when new-recovery (write-recovery! new-recovery-path did new-recovery))
-                    (let [state (write-secret-edn! (state-path)
-                                                   (assoc state :kotoba.webvh-custody/pending
-                                                          (cond-> {:version-id vid
-                                                                   :active signing-key
-                                                                   :next new-next
-                                                                   :recovery-hash recovery-hash}
-                                                            new-recovery-path (assoc :recovery-path new-recovery-path))))
-                          r (http! "POST" (str (origin-of url) "/v1/webvh/append")
-                                   {"userId" (:kotoba.webvh-custody/user-id state) "entry" e})
-                          body (body-json r)]
-                      (if-not (= 200 (:status r))
-                        (fail :id/append-refused {:status (:status r) :error (get body "error")
-                                                  :detail (get body "detail") :version-id vid})
-                        (let [after (verified-log url pin)]
-                          (if (:kotoba.cli/code after)
-                            after
-                            (let [state* (complete-pending state (:entries after))]
-                              (write-secret-edn! (state-path) state*)
-                              (if-not (= vid (get-in state* [:kotoba.webvh-custody/pin :version-id]))
-                                (fail :id/append-not-visible {:version-id vid})
-                                (ok (if (= mode :recover) :id/recovered :id/rotated)
-                                    (cond-> {:did did
-                                             :version-id vid
-                                             :update-key (:multikey signing-key)
-                                             :state-path (state-path)}
-                                      new-recovery-path
-                                      (assoc :recovery-path new-recovery-path
-                                             :warning "a NEW recovery key was written; move it off this machine and destroy the old one")))))))))))))))))))
+(defn- rotate! [argv mode]
+  (let [recovery-file (when (= mode :recover)
+                        (some-> (option argv "--recovery") read-edn))
+        ctx (selected-context argv (when (and (= mode :recover) (nil? (option argv "--did")) (nil? (option argv "--user")))
+                                     (let [held (filter #(= :custodied (:kotoba.webvh-custody/status %)) (all-states))]
+                                       (when (empty? held) (:kotoba.webvh-recovery/did recovery-file)))))]
+    (cond
+      (:error ctx) (:error ctx)
+      (and (= mode :recover) (nil? recovery-file)
+           (nil? (read-edn (or (:kotoba.webvh-custody/recovery-path (read-state (:rp-id ctx) (:user-id ctx))) ""))))
+      (fail :id/recovery-key-missing {:hint "pass --recovery PATH to the recovery key file"})
+      :else
+      (let [recovery-file (or recovery-file
+                              (when (= mode :recover)
+                                (read-edn (:kotoba.webvh-custody/recovery-path (read-state (:rp-id ctx) (:user-id ctx))))))]
+        (try (with-lock (:rp-id ctx) (:user-id ctx) #(rotate* argv mode ctx recovery-file))
+             (catch clojure.lang.ExceptionInfo e
+               (fail (or (:code (ex-data e)) :id/rotate-failed) (dissoc (ex-data e) :code) (ex-message e))))))))
 
 (defn rotate-result [argv] (rotate! argv :rotate))
 (defn recover-result [argv] (rotate! argv :recover))
@@ -532,44 +762,65 @@
 
 (defn verify-result
   "Resolve and verify an account DID's log as a third party would. `--did`
-  (did:webvh), or `--user` [+ `--rp-id`], or this machine's custody state.
-  `--pin <versionId>` additionally requires that version to be in the log."
+  (did:webvh), or `--user` [+ `--rp-id`], or this machine's DID.
+  `--pin <versionId>` requires that version in the log; `--attestation FILE`
+  checks the holder's signed handover attestation against the log.
+
+  `:custody` is `:service`, `:holder-pinned` (the handover is confirmed by a
+  pin or attestation obtained independently of this host) or
+  `:holder-unpinned` (the log says the holder controls it, but a host that
+  forked at the handover would show the same thing to a first-time viewer)."
   [argv]
-  (let [state (read-state)
-        did-arg (option argv "--did")
-        url (cond
-              did-arg (try (did/log-url did-arg) (catch Exception _ nil))
-              (option argv "--user") (log-url (or (option argv "--rp-id") principal/canonical-rp-id)
-                                              (option argv "--user"))
-              state (:kotoba.webvh-custody/log-url state)
-              :else (:url (context-from argv)))
+  (let [ctx (selected-context argv)
+        local (when (and (not (:error ctx)) (nil? (option argv "--did")) (nil? (option argv "--user")))
+                (read-state (:rp-id ctx) (:user-id ctx)))
+        local-pin (:kotoba.webvh-custody/pin local)
         pin-arg (option argv "--pin")
-        local-pin (when (and state (not did-arg) (not (option argv "--user")))
-                    (:kotoba.webvh-custody/pin state))]
-    (if-not url
-      (fail :id/no-did {:hint "pass --did did:webvh:… or --user u_…"})
-      (let [fetched (verified-log url local-pin)]
-        (if (:kotoba.cli/code fetched)
+        att (option argv "--attestation")]
+    (if (:error ctx)
+      (:error ctx)
+      (let [fetched (verified-log (:url ctx) local-pin)]
+        (if (failure? fetched)
           fetched
           (let [{:keys [entries v]} fetched
-                pinned? (or (nil? pin-arg) (boolean (some #(= pin-arg (get % "versionId")) entries)))]
+                did (:did v)
+                handover (find-handover entries)
+                pin-found? (or (nil? pin-arg) (boolean (some #(= pin-arg (get % "versionId")) entries)))
+                att-problem (when att (attestation-check att entries did))]
             (cond
-              (and did-arg (not= did-arg (:did v)))
-              (fail :id/did-mismatch {:expected did-arg :resolved (:did v)})
+              (and (option argv "--did") (not= (option argv "--did") did))
+              (fail :id/did-mismatch {:expected (option argv "--did") :resolved did})
 
-              (not pinned?)
+              (not pin-found?)
               (fail :id/log-fork-detected {:pin pin-arg :served-head (get (peek entries) "versionId")}
                     "the pinned version is not in the served log")
 
+              att-problem
+              (fail :id/log-fork-detected {:attestation att :problem att-problem}
+                    "the holder's handover attestation does not match the served log")
+
               :else
-              (ok :id/verified
-                  {:did (:did v)
-                   :versions (count entries)
-                   :head (get (peek entries) "versionId")
-                   :custody (if (client-custody? entries) :holder :service)
-                   :update-keys (get-in v [:parameters :update-keys])
-                   :pre-rotation? (get-in v [:parameters :pre-rotation?])
-                   :witness-threshold (get-in v [:parameters :witness "threshold"])
-                   :signed-by (mapv (fn [x] {:version-id (:version-id x) :signed-by (:signed-by x)})
-                                    (:versions v))
-                   :log-url url}))))))))
+              (let [[hidx _] handover
+                    pinned? (and handover
+                                 (or (and att (nil? att-problem))
+                                     (and pin-arg (some (fn [[i e]] (and (>= i hidx) (= pin-arg (get e "versionId"))))
+                                                        (map-indexed vector entries)))
+                                     (and local-pin (>= (:index local-pin) (inc hidx)))))
+                    custody (cond (nil? handover) :service pinned? :holder-pinned :else :holder-unpinned)]
+                (ok :id/verified
+                    (cond-> {:did did
+                             :versions (count entries)
+                             :head (get (peek entries) "versionId")
+                             :custody custody
+                             :update-keys (get-in v [:parameters :update-keys])
+                             :pre-rotation? (get-in v [:parameters :pre-rotation?])
+                             :witness-threshold (get-in v [:parameters :witness "threshold"])
+                             :signed-by (mapv (fn [x] {:version-id (:version-id x) :signed-by (:signed-by x)})
+                                              (:versions v))
+                             :log-url (:url ctx)}
+                      handover (assoc :handover-version-id (get (second handover) "versionId"))
+                      (= custody :holder-unpinned)
+                      (assoc :warning (str "the log names holder-held keys, but nothing independent of this host "
+                                           "confirms the handover: a host can serve a fork at the handover to a "
+                                           "first-time viewer. Pass --pin <versionId> or --attestation <file> "
+                                           "obtained from the holder."))))))))))))

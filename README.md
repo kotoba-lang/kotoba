@@ -73,26 +73,38 @@ service can host the log but can no longer change it:
 
 ```sh
 kotoba id take-custody --recovery-out /Volumes/offline/kotoba-recovery.edn
-# generates active / next / recovery Ed25519 keys HERE, prints an approval URL
-# and a confirmation code; approve with your Passkey; the CLI verifies the
-# handover entry and pins it
+# generates active / next / recovery Ed25519 keys HERE and prints a CODE.
+# Open the fixed page it names, signed in with your Passkey, TYPE the code,
+# approve with the Passkey. After the host's delay the CLI checks that the
+# published handover is exactly the proposed entry, pins it, and writes a
+# handover attestation signed by your key -- publish that file.
 
 kotoba id rotate                 # sign the next entry with the pre-committed next key
 kotoba id recover --recovery /Volumes/offline/kotoba-recovery.edn \
                   --recovery-out /Volumes/offline/kotoba-recovery-2.edn
-kotoba id verify --did did:webvh:… [--pin <versionId>]   # anyone can run this
+                                 # also works on a new machine (trust on first use, said so)
+kotoba id verify --did did:webvh:… [--pin <versionId>] [--attestation handover.json]
 ```
 
 The handover entry lists your active key in `updateKeys` and commits, by hash
 only, to your next and recovery keys (`nextKeyHashes`). From then on the
 did:webvh pre-rotation rule means only a pre-committed key can sign the next
 entry; the service's keys were never committed, so an entry it signs fails
-every resolver. Keys live in `${XDG_DATA_HOME:-$HOME/.local/share}/kotoba/`
-(mode 0600); the recovery key goes to its own file — keep it offline. Losing
-both the next key and the recovery key freezes the DID: nobody, the service
-included, can update it again. Every fetch checks that the served log extends
-the version this machine pinned, so a host that rolls back or forks the log is
-reported (`:id/log-fork-detected`) and nothing is signed on top of it.
+every resolver. The CLI refuses a handover that differs in any way from the
+entry it expects (another key, a service endpoint, watchers, a witness) and
+builds every later document from the same allowlist.
+
+State lives in `${XDG_DATA_HOME:-$HOME/.local/share}/kotoba/webvh-custody/`,
+one file per DID (mode 0600, created private, written atomically, with a
+lock per DID); the recovery key goes to its own file -- keep it offline.
+Losing both the next key and the recovery key freezes the DID: nobody, the
+service included, can update it again. Every fetch checks that the served log
+is the one its URL names and extends the version this machine pinned, so a
+host that rolls back or forks the log is reported (`:id/log-fork-detected`)
+and nothing is signed on top of it. `verify` labels custody
+`:holder-pinned` only when a pin or the holder's attestation confirms the
+handover independently of the host; otherwise `:holder-unpinned`, with the
+fork risk spelled out.
 
 Base remains a useful Murakumo settlement link, but it appears only when
 `eip155:8453` is supplied. `kotoba id account --address 0x… --chain-id 1`

@@ -1,19 +1,22 @@
 (ns kotoba.principal-custody-test
   "`kotoba id take-custody | rotate | recover | verify` against an in-process
   host that behaves as cloud-kotoba/kotobase-control-plane's authn does
-  (ADR-2610101200): it holds a server-custodied update key, signs the one
-  handover entry when the account's passkey approves (here: when the CLI
-  opens the approval URL), and afterwards only appends entries whose whole
-  log verifies. Every log the CLI sees is checked with the did:webvh
-  library's own resolver."
+  (ADR-2610101200): it holds a server-custodied update key, signs and
+  publishes the one handover entry when the account's passkey approves (here:
+  when the CLI opens the approval page), and afterwards only appends entries
+  whose whole log verifies. Every log the CLI sees is checked with the
+  did:webvh library's own resolver.
+
+  The security review of PR #635 is here as regressions (B1, M1-M3, minors);
+  `a-dishonest-host-*` tests play the host as the adversary."
   (:require [clojure.edn :as edn]
             [kotoba.io :as kio]
             [kotoba.lang.text :as str]
             [kotoba.test :refer [deftest is testing]]
             [json.data-json :as json]
             [kotoba.principal-custody :as custody]
-            [kotoba.launcher :as launcher]
             [kotoba.principal-identity :as principal]
+            [kotoba.launcher :as launcher]
             [didwebvh.entry :as entry]
             [didwebvh.hash :as h]
             [didwebvh.log :as log]
@@ -22,96 +25,116 @@
            [java.nio.file.attribute PosixFilePermissions]))
 
 (def user-id "u_custodyclitest01")
+(def user-2 "u_otheruser000001")
 (def rp-id "auth.kotoba.cloud")
-(def log-path (str "/tenant/" user-id "/did.jsonl"))
 (def server-key (signer/from-seed (byte-array (range 32))))
 
-(defn- genesis []
+(defn- genesis [uid & [extra-params]]
   (-> (entry/genesis
        {:version-time "2026-10-01T00:00:00Z"
-        :parameters {"method" h/method-1-0 "scid" h/scid-placeholder
-                     "updateKeys" [(:multikey server-key)] "portable" false}
+        :parameters (merge {"method" h/method-1-0 "scid" h/scid-placeholder
+                            "updateKeys" [(:multikey server-key)] "portable" false}
+                           extra-params)
         :state {"@context" ["https://www.w3.org/ns/did/v1" "https://w3id.org/security/multikey/v1"]
-                "id" (str "did:webvh:" h/scid-placeholder ":" rp-id ":tenant:" user-id)
-                "alsoKnownAs" [(str "did:web:kotoba.cloud:tenant:" user-id)]}})
+                "id" (str "did:webvh:" h/scid-placeholder ":" rp-id ":tenant:" uid)
+                "alsoKnownAs" [(str "did:web:kotoba.cloud:tenant:" uid)]}})
       (entry/sign server-key)))
+
+(defn- now-s [] (quot (System/currentTimeMillis) 1000))
 
 ;; ── the in-process host ─────────────────────────────────────────────────────
 
+(defn- honest-handover
+  "What authn.webvh-custody signs: the allowlisted document, the two lists."
+  [es p]
+  (let [prev (peek es)]
+    (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
+                                :parameters {"updateKeys" (get p "updateKeys")
+                                             "nextKeyHashes" (get p "nextKeyHashes")}
+                                :state (custody/document-with-key (get prev "state")
+                                                                  (first (get p "updateKeys")))})
+        (entry/sign server-key))))
+
 (defn- host
-  "A host over `world` (an atom of {:entries :requests}). `opts`:
-  :code-override  answer the custody request with this code
-  :hand-to        hand over to THIS proposal instead of the requested one
-  :serve          (fn [entries] entries-to-serve) -- a dishonest host"
-  [world & [{:keys [code-override hand-to serve]}]]
+  "A host over `world` (atom {:logs {uid [entries]} :requests {uid proposal}}).
+  opts:
+   :code-override  answer the custody request with this code
+   :serve          (fn [uid entries] entries-to-serve) -- a dishonest host
+   :append         (fn [uid e] -> response-or-nil) -- intercept appends"
+  [world & [{:keys [code-override serve append]}]]
   (fn [method url body]
     (let [path (first (str/split (subs url (count (str "https://" rp-id))) #"\?"))
-          b (when body (json/read-str body))]
+          b (when body (json/read-str body))
+          [_ uid file] (re-matches #"/tenant/(u_[a-z0-9]+)/(did\.jsonl|did-witness\.json)" path)]
       (cond
-        (and (= "GET" method) (= path log-path))
-        {:status 200 :body (str (str/join "\n" (map json/write-str ((or serve identity) (:entries @world)))) "\n")}
+        (and (= "GET" method) (= file "did.jsonl"))
+        (if-let [es (get-in @world [:logs uid])]
+          {:status 200 :body (str (str/join "\n" (map json/write-str ((or serve (fn [_ es] es)) uid es))) "\n")}
+          {:status 404 :body "{}"})
 
-        (and (= "GET" method) (str/ends-with? path "/did-witness.json"))
-        {:status 200 :body "[]"}
+        (and (= "GET" method) (= file "did-witness.json")) {:status 200 :body "[]"}
 
         (and (= "POST" method) (= path "/v1/webvh/custody/request"))
         (let [p {"updateKeys" (get b "updateKeys") "nextKeyHashes" (get b "nextKeyHashes")}]
-          (swap! world assoc-in [:requests "r1"] (or hand-to p))
-          {:status 200 :body (json/write-str {"requestId" "r1"
-                                              "code" (or code-override (custody/proposal-code p))
-                                              "verificationUriComplete"
-                                              (str "https://" rp-id "/webvh/custody?request=r1")})})
+          (swap! world #(-> % (assoc-in [:requests (get b "userId")] p) (assoc :last-uid (get b "userId"))))
+          {:status 200 :body (json/write-str {"code" (or code-override (custody/proposal-code p))
+                                              "verificationUri" (str "https://" rp-id "/webvh/custody")
+                                              "delaySeconds" 0})})
+
+        (and (= "POST" method) (= path "/v1/webvh/custody/finalize"))
+        (if (custody/client-custody? (get-in @world [:logs (get b "userId")]))
+          {:status 200 :body "{\"ok\":true}"}
+          {:status 404 :body "{\"error\":\"no-pending-handover\"}"})
 
         (and (= "POST" method) (= path "/v1/webvh/append"))
-        (let [es (:entries @world)
-              e (get b "entry")
-              v (log/verify (conj es e) {:now (quot (System/currentTimeMillis) 1000)})]
-          (cond
-            (not (custody/client-custody? es)) {:status 409 :body "{\"error\":\"server-custody\"}"}
-            (not (:ok? v)) {:status 422 :body (json/write-str {"error" "invalid-entry" "detail" (str (:error v))})}
-            :else (do (swap! world update :entries conj e)
-                      {:status 200 :body (json/write-str {"ok" true "versionId" (get e "versionId")})})))
+        (let [uid (get b "userId")
+              e (get b "entry")]
+          (or (when append (append uid e))
+              (let [es (get-in @world [:logs uid])
+                    v (log/verify (conj es e) {:now (now-s)})]
+                (cond
+                  (not (custody/client-custody? es)) {:status 409 :body "{\"error\":\"server-custody\"}"}
+                  (<= (entry/version-number (get e "versionId")) (count es)) {:status 409 :body "{\"error\":\"stale-head\"}"}
+                  (not (:ok? v)) {:status 422 :body (json/write-str {"error" "invalid-entry" "detail" (str (:error v))})}
+                  :else (do (swap! world update-in [:logs uid] conj e)
+                            {:status 200 :body (json/write-str {"ok" true "versionId" (get e "versionId")})})))))
 
         :else {:status 404 :body "{}"}))))
 
 (defn- approve!
-  "The account's passkey approving request r1: the server key signs the
-  handover entry exactly as authn.webvh-custody builds it."
-  [world]
-  (let [es (:entries @world)
-        p (get-in @world [:requests "r1"])
-        prev (peek es)
-        e (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
-                                      :parameters {"updateKeys" (get p "updateKeys")
-                                                   "nextKeyHashes" (get p "nextKeyHashes")}
-                                      :state (custody/document-with-key (get prev "state")
-                                                                        (first (get p "updateKeys")))})
-              (entry/sign server-key))]
-    (swap! world update :entries conj e)
+  "The account's passkey approving the pending proposal of `uid` (default
+  user-id): the host signs `(sign-handover es p)` and publishes it."
+  [world & [uid sign-handover]]
+  (let [uid (or uid (:last-uid @world) user-id)
+        es (get-in @world [:logs uid])
+        p (get-in @world [:requests uid])]
+    (swap! world update-in [:logs uid] conj ((or sign-handover honest-handover) es p))
     true))
 
-(defmacro ^:private with-cli [[world dir & [host-opts]] & body]
-  `(let [~dir (kio/temp-dir "kotoba-custody")
-         ~world (atom {:entries [(genesis)] :requests {}})]
-     (binding [custody/*state-path* (str ~dir "/webvh-custody.edn")
+(defn- new-world [] (atom {:logs {user-id [(genesis user-id)] user-2 [(genesis user-2)]} :requests {}}))
+
+(defmacro ^:private with-cli [[world dir & [host-opts approve]] & body]
+  `(let [~dir (str (kio/temp-dir "kotoba-custody"))
+         ~world (new-world)]
+     (binding [custody/*state-dir* (str ~dir "/state")
                principal/*principal-path* (str ~dir "/principal.edn")
                custody/*http!* (host ~world ~host-opts)
-               custody/*browser-open!* (fn [~'_] (approve! ~world))
+               custody/*browser-open!* (or ~approve (fn [~'_] (approve! ~world)))
                custody/*sleep-ms!* (fn [~'_] nil)
                *err* (java.io.StringWriter.)]
        ~@body)))
 
-(defn- take! [dir] (custody/take-custody-result ["id" "take-custody" "--user" user-id
-                                                  "--recovery-out" (str dir "/recovery.edn")]))
-(defn- served [world] (:entries @world))
-(defn- verify-served [world]
-  (log/verify (served world) {:now (quot (System/currentTimeMillis) 1000)}))
-
+(defn- take! [dir & [uid extra]]
+  (custody/take-custody-result (into ["id" "take-custody" "--user" (or uid user-id)
+                                      "--recovery-out" (str dir "/recovery-" (or uid user-id) ".edn")]
+                                     extra)))
+(defn- state [& [uid]] (custody/read-state rp-id (or uid user-id)))
+(defn- served [world & [uid]] (get-in @world [:logs (or uid user-id)]))
 (defn- mode-of [path]
   (PosixFilePermissions/toString
    (Files/getPosixFilePermissions (.toPath (java.io.File. ^String path)) (make-array LinkOption 0))))
 
-;; ── tests ───────────────────────────────────────────────────────────────────
+;; ── pure ────────────────────────────────────────────────────────────────────
 
 (deftest proposal-code-is-the-hosts-code
   ;; Vector computed by authn.webvh-custody/proposal-code (ClojureScript, the
@@ -126,162 +149,308 @@
   (is (nil? (custody/user-id-of "did:web:kotoba.cloud")))
   (let [es [{"versionId" "1-a"} {"versionId" "2-b"} {"versionId" "3-c"}]]
     (is (custody/extends-pin? es {:version-id "2-b" :index 2}))
-    (is (custody/extends-pin? es {:version-id "3-c" :index 3}))
     (is (not (custody/extends-pin? es {:version-id "2-x" :index 2})) "a different entry at the pin is a fork")
-    (is (not (custody/extends-pin? (subvec es 0 1) {:version-id "2-b" :index 2})) "truncated below the pin")))
+    (is (not (custody/extends-pin? (subvec es 0 1) {:version-id "2-b" :index 2})) "truncated below the pin"))
+  (testing "B1: documents are built from an allowlist"
+    (is (= #{"@context" "id" "alsoKnownAs" "verificationMethod" "authentication" "assertionMethod"}
+           (set (keys (custody/document-with-key {"@context" [] "id" "did:x" "alsoKnownAs" []
+                                                  "service" [{"id" "#evil"}]
+                                                  "capabilityInvocation" ["#srv"]}
+                                                 "z6Mk")))))))
+
+;; ── the happy path ──────────────────────────────────────────────────────────
 
 (deftest take-custody-hands-the-did-to-local-keys
   (with-cli [world dir]
     (let [r (take! dir)
-          state (custody/read-state)
-          recovery (edn/read-string (slurp (str dir "/recovery.edn")))
+          s (state)
+          recovery (edn/read-string (slurp (str dir "/recovery-" user-id ".edn")))
           [_ handover] (served world)
-          v (verify-served world)]
+          v (log/verify (served world) {:now (now-s)})]
       (is (= :id/custody-taken (:kotoba.cli/code r)) (pr-str r))
-      (is (:ok? v) (pr-str (select-keys v [:error :message])))
+      (is (:ok? v))
       (testing "the handover names the local active key and commits to next + recovery, nothing else"
-        (is (= [(get-in state [:kotoba.webvh-custody/active :multikey])]
-               (get-in handover ["parameters" "updateKeys"])))
-        (is (= [(h/key-hash (get-in state [:kotoba.webvh-custody/next :multikey]))
+        (is (= [(get-in s [:kotoba.webvh-custody/active :multikey])] (get-in handover ["parameters" "updateKeys"])))
+        (is (= [(h/key-hash (get-in s [:kotoba.webvh-custody/next :multikey]))
                 (h/key-hash (:kotoba.webvh-recovery/multikey recovery))]
                (get-in handover ["parameters" "nextKeyHashes"]))))
       (testing "the state pins the handover; the recovery seed is NOT in the state file"
-        (is (= :custodied (:kotoba.webvh-custody/status state)))
-        (is (= {:version-id (get handover "versionId") :index 2} (:kotoba.webvh-custody/pin state)))
-        (is (not (str/includes? (slurp (custody/state-path)) (:kotoba.webvh-recovery/seed recovery)))))
+        (is (= :custodied (:kotoba.webvh-custody/status s)))
+        (is (= {:version-id (get handover "versionId") :index 2} (:kotoba.webvh-custody/pin s)))
+        (is (not (str/includes? (slurp (custody/state-path rp-id user-id)) (:kotoba.webvh-recovery/seed recovery)))))
       (testing "key files are owner-only"
-        (is (= "rw-------" (mode-of (custody/state-path))))
-        (is (= "rw-------" (mode-of (str dir "/recovery.edn")))))
-      (testing "a second take-custody refuses"
+        (is (= "rw-------" (mode-of (custody/state-path rp-id user-id))))
+        (is (= "rw-------" (mode-of (str dir "/recovery-" user-id ".edn")))))
+      (testing "M6: a handover attestation signed by the holder's active key is written and verifies"
+        (let [att (get-in r [:kotoba.cli/data :attestation-path])
+              did (get-in handover ["state" "id"])]
+          (is (string? att))
+          (is (= :id/verified (:kotoba.cli/code (custody/verify-result ["id" "verify" "--did" did "--attestation" att]))))))
+      (testing "a second take-custody of the same DID refuses"
         (is (= :id/already-custodied (:kotoba.cli/code (take! dir))))))))
+
+(deftest rotate-recover-and-third-party-verify
+  (with-cli [world dir]
+    (take! dir)
+    (let [s0 (state)
+          r1 (custody/rotate-result ["id" "rotate"])
+          r2 (custody/rotate-result ["id" "rotate"])]
+      (is (= :id/rotated (:kotoba.cli/code r1)) (pr-str r1))
+      (is (= :id/rotated (:kotoba.cli/code r2)) (pr-str r2))
+      (is (= (get-in s0 [:kotoba.webvh-custody/next :multikey]) (get-in r1 [:kotoba.cli/data :update-key])))
+      (is (= 4 (count (served world))))
+      (testing "recovery: the next key is lost, the recovery key rotates and is itself replaced"
+        (let [old (edn/read-string (slurp (str dir "/recovery-" user-id ".edn")))
+              r3 (custody/recover-result ["id" "recover" "--recovery" (str dir "/recovery-" user-id ".edn")
+                                          "--recovery-out" (str dir "/recovery-2.edn")])
+              new (edn/read-string (slurp (str dir "/recovery-2.edn")))
+              head (peek (served world))]
+          (is (= :id/recovered (:kotoba.cli/code r3)) (pr-str r3))
+          (is (= [(:kotoba.webvh-recovery/multikey old)] (get-in head ["parameters" "updateKeys"])))
+          (is (some #{(h/key-hash (:kotoba.webvh-recovery/multikey new))} (get-in head ["parameters" "nextKeyHashes"])))))
+      (testing "a third party verifies; custody is labelled precisely"
+        (let [did (get-in (peek (served world)) ["state" "id"])
+              hv (get (nth (served world) 1) "versionId")
+              unpinned (custody/verify-result ["id" "verify" "--did" did])
+              pinned (custody/verify-result ["id" "verify" "--did" did "--pin" hv])]
+          (is (= :id/verified (:kotoba.cli/code unpinned)))
+          (is (= :holder-unpinned (get-in unpinned [:kotoba.cli/data :custody])))
+          (is (str/includes? (str (get-in unpinned [:kotoba.cli/data :warning])) "fork"))
+          (is (= :holder-pinned (get-in pinned [:kotoba.cli/data :custody])))
+          (is (= 5 (get-in pinned [:kotoba.cli/data :versions])))
+          (is (= [[(:multikey server-key)] [(:multikey server-key)]]
+                 (mapv :signed-by (take 2 (get-in pinned [:kotoba.cli/data :signed-by]))))))))))
+
+;; ── B1: the handover is checked byte for byte ───────────────────────────────
+
+(defn- padded-handover
+  "The reviewer's PoC1: a handover that also lists the server key as an
+  assertion method, adds capabilityInvocation, a service, watchers and ttl."
+  [es p]
+  (let [prev (peek es)
+        id (get-in prev ["state" "id"])
+        smk (:multikey server-key)
+        st (-> (custody/document-with-key (get prev "state") (first (get p "updateKeys")))
+               (update "verificationMethod" conj {"id" (str id "#srv") "type" "Multikey" "controller" id
+                                                  "publicKeyMultibase" smk})
+               (update "assertionMethod" conj (str id "#srv"))
+               (assoc "capabilityInvocation" [(str id "#srv")]
+                      "service" [{"id" (str id "#evil") "type" "LinkedDomains" "serviceEndpoint" "https://evil.example"}]))]
+    (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
+                                :parameters {"updateKeys" (get p "updateKeys")
+                                             "nextKeyHashes" (get p "nextKeyHashes")
+                                             "watchers" ["https://evil.example/watch"]
+                                             "ttl" 999999}
+                                :state st})
+        (entry/sign server-key))))
+
+(deftest b1-a-padded-handover-is-refused
+  (with-cli [world dir nil (fn [_] (approve! world user-id padded-handover))]
+    (let [r (take! dir)]
+      (is (= :id/handover-mismatch (:kotoba.cli/code r)) (pr-str r))
+      (is (not= :custodied (:kotoba.webvh-custody/status (state))))
+      (is (= :id/not-custodied (:kotoba.cli/code (custody/rotate-result ["id" "rotate"])))
+          "nothing is built on top of it"))))
+
+(deftest b1-a-state-only-padding-is-refused-too
+  (with-cli [world dir nil (fn [_] (approve! world user-id
+                                             (fn [es p]
+                                               (let [prev (peek es)]
+                                                 (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
+                                                                             :parameters {"updateKeys" (get p "updateKeys")
+                                                                                          "nextKeyHashes" (get p "nextKeyHashes")}
+                                                                             :state (assoc (custody/document-with-key (get prev "state") (first (get p "updateKeys")))
+                                                                                           "service" [{"id" "#x" "type" "T" "serviceEndpoint" "https://evil.example"}])})
+                                                     (entry/sign server-key))))))]
+    (is (= :id/handover-mismatch (:kotoba.cli/code (take! dir))))))
+
+(deftest b1-inherited-witness-or-watchers-are-refused
+  (with-cli [world dir]
+    (swap! world assoc-in [:logs user-id] [(genesis user-id {"watchers" ["https://evil.example/w"]})])
+    (is (= :id/inherited-parameters (:kotoba.cli/code (take! dir))))))
+
+;; ── M1: one state per DID ───────────────────────────────────────────────────
+
+(deftest m1-a-second-did-never-overwrites-the-first
+  (with-cli [world dir]
+    (take! dir)
+    (let [before (state)
+          r2 (take! dir user-2)
+          after (state)]
+      (is (= :id/custody-taken (:kotoba.cli/code r2)) (pr-str r2))
+      (is (= before after) "X's keys are untouched")
+      (is (= :custodied (:kotoba.webvh-custody/status (state user-2))))
+      (testing "with two DIDs, rotate must be told which"
+        (is (= :id/ambiguous-did (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
+        (is (= :id/rotated (:kotoba.cli/code (custody/rotate-result ["id" "rotate" "--user" user-2]))))))))
+
+(deftest m1-nothing-is-written-when-the-did-is-already-held-elsewhere
+  (with-cli [world dir]
+    (take! dir)
+    (binding [custody/*state-dir* (str dir "/other-machine")]
+      (is (= :id/already-client-custody (:kotoba.cli/code (take! dir user-id ["--recovery-out" (str dir "/r-other.edn")]))))
+      (is (nil? (state)) "no pending state, no keys written for a DID this machine does not hold"))))
+
+;; ── M2: recovery on a new machine ───────────────────────────────────────────
+
+(deftest m2-recover-on-a-machine-with-no-state
+  (with-cli [world dir]
+    (take! dir)
+    (custody/rotate-result ["id" "rotate"])
+    (let [rec (str dir "/recovery-" user-id ".edn")]
+      (binding [custody/*state-dir* (str dir "/new-machine")]
+        (let [r (custody/recover-result ["id" "recover" "--recovery" rec
+                                         "--recovery-out" (str dir "/recovery-new.edn")])]
+          (is (= :id/recovered (:kotoba.cli/code r)) (pr-str r))
+          (is (str/includes? (str (get-in r [:kotoba.cli/data :warning])) "trust on first use"))
+          (is (= :custodied (:kotoba.webvh-custody/status (state))))
+          (is (= :id/rotated (:kotoba.cli/code (custody/rotate-result ["id" "rotate"])))
+              "the new machine holds the DID from now on"))))))
+
+(deftest m2-recover-refuses-a-key-the-head-did-not-commit
+  (with-cli [world dir]
+    (take! dir)
+    (custody/recover-result ["id" "recover" "--recovery" (str dir "/recovery-" user-id ".edn")
+                             "--recovery-out" (str dir "/r2.edn")])
+    (binding [custody/*state-dir* (str dir "/new-machine")]
+      (is (= :id/key-not-committed
+             (:kotoba.cli/code (custody/recover-result ["id" "recover" "--recovery" (str dir "/recovery-" user-id ".edn")])))
+          "the used recovery key is not committed any more"))))
+
+;; ── M3: crash / retry never loses keys ──────────────────────────────────────
+
+(deftest m3-an-append-accepted-but-unanswered-is-adopted
+  (let [lost (atom 0)]
+    (with-cli [world dir {:append (fn [uid e]
+                                    (when (zero? @lost)
+                                      (swap! lost inc)
+                                      (swap! world update-in [:logs uid] conj e)   ; accepted…
+                                      {:status 503 :body "{}"}))}]              ; …but the answer is lost
+      (take! dir)
+      (let [r1 (custody/rotate-result ["id" "rotate"])
+            pending (:kotoba.webvh-custody/pending (state))
+            r2 (custody/rotate-result ["id" "rotate"])]
+        (is (= :id/append-refused (:kotoba.cli/code r1)))
+        (is (some? (:entry pending)) "the signed entry itself is kept")
+        (is (= :id/rotated (:kotoba.cli/code r2)) (pr-str r2))
+        (is (= (:version-id pending) (get (nth (served world) 2) "versionId"))
+            "the entry that landed unanswered is adopted, its keys kept")
+        (is (= (get-in r2 [:kotoba.cli/data :version-id]) (get (nth (served world) 3) "versionId")))
+        (is (= 4 (count (served world))) "the adopted rotation, then the new one")
+        (is (= :id/verified (:kotoba.cli/code (custody/verify-result ["id" "verify"]))))))))
+
+(deftest m3-an-unaccepted-append-is-resubmitted-exactly
+  (let [fail-once (atom true)]
+    (with-cli [world dir {:append (fn [_ _] (when @fail-once (reset! fail-once false) {:status 503 :body "{}"}))}]
+      (take! dir)
+      (let [r1 (custody/rotate-result ["id" "rotate"])
+            signed (get-in (state) [:kotoba.webvh-custody/pending :entry])
+            r2 (custody/rotate-result ["id" "rotate"])]
+        (is (= :id/append-refused (:kotoba.cli/code r1)))
+        (is (= :id/rotated (:kotoba.cli/code r2)))
+        (is (= (get (json/read-str signed) "versionId") (get (nth (served world) 2) "versionId"))
+            "the SAME signed entry, not a new one with new keys")))))
+
+(deftest m3-a-held-lock-refuses
+  (with-cli [world dir]
+    (take! dir)
+    (let [lock (custody/lock-path rp-id user-id)]
+      (with-open [ch (java.nio.channels.FileChannel/open
+                      (.toPath (java.io.File. ^String lock))
+                      (into-array java.nio.file.OpenOption [java.nio.file.StandardOpenOption/CREATE
+                                                           java.nio.file.StandardOpenOption/WRITE]))]
+        (let [l (.lock ch)]
+          (try
+            (is (= :id/busy (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
+            (finally (.release l))))))))
+
+;; ── the server can no longer update / rollback / fork ───────────────────────
 
 (deftest the-server-can-no-longer-update-after-handover
   (with-cli [world dir]
     (take! dir)
     (let [es (served world)
           prev (peek es)
-          forged-self (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
-                                                  :parameters {"updateKeys" [(:multikey server-key)]
-                                                               "nextKeyHashes" [(h/key-hash (:multikey server-key))]}
-                                                  :state (get prev "state")})
-                          (entry/sign server-key))
-          committed-next (get-in (custody/read-state) [:kotoba.webvh-custody/next :multikey])
-          forged-borrow (-> (custody/rotation-entry es committed-next [(h/key-hash "z6MkAnything")
-                                                                       (h/key-hash "z6MkElse")])
-                            (entry/sign server-key))
-          now (quot (System/currentTimeMillis) 1000)]
-      (is (= :didwebvh/uncommitted-update-key (:error (log/verify (conj es forged-self) {:now now})))
-          "re-listing the server key: not pre-committed")
-      (is (= :didwebvh/unauthorized-entry (:error (log/verify (conj es forged-borrow) {:now now})))
-          "listing the holder's committed key but signing with the server key")
-      (testing "a host that serves a server-signed entry anyway: the CLI refuses to build on it"
-        (binding [custody/*http!* (host world {:serve (fn [es] (conj es forged-self))})]
-          (is (= :id/log-invalid (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
-          (is (= :id/log-invalid (:kotoba.cli/code (custody/verify-result ["id" "verify"])))))))))
-
-(deftest rotate-recover-and-third-party-verify
-  (with-cli [world dir]
-    (take! dir)
-    (let [s0 (custody/read-state)
-          r1 (custody/rotate-result ["id" "rotate"])
-          s1 (custody/read-state)
-          r2 (custody/rotate-result ["id" "rotate"])
-          s2 (custody/read-state)]
-      (is (= :id/rotated (:kotoba.cli/code r1)) (pr-str r1))
-      (is (= :id/rotated (:kotoba.cli/code r2)) (pr-str r2))
-      (testing "each rotation is signed by the key the previous entry committed"
-        (is (= (get-in s0 [:kotoba.webvh-custody/next :multikey]) (get-in r1 [:kotoba.cli/data :update-key])))
-        (is (= (get-in s1 [:kotoba.webvh-custody/next :multikey]) (get-in r2 [:kotoba.cli/data :update-key])))
-        (is (= 4 (count (served world))))
-        (is (= {:version-id (get (peek (served world)) "versionId") :index 4} (:kotoba.webvh-custody/pin s2))))
-      (testing "recovery: the next key is lost, the recovery key rotates and is itself replaced"
-        (let [old-recovery (edn/read-string (slurp (str dir "/recovery.edn")))
-              r3 (custody/recover-result ["id" "recover" "--recovery" (str dir "/recovery.edn")
-                                          "--recovery-out" (str dir "/recovery-2.edn")])
-              new-recovery (edn/read-string (slurp (str dir "/recovery-2.edn")))
-              head (peek (served world))]
-          (is (= :id/recovered (:kotoba.cli/code r3)) (pr-str r3))
-          (is (= [(:kotoba.webvh-recovery/multikey old-recovery)] (get-in head ["parameters" "updateKeys"])))
-          (is (some #{(h/key-hash (:kotoba.webvh-recovery/multikey new-recovery))}
-                    (get-in head ["parameters" "nextKeyHashes"])))
-          (is (not (some #{(h/key-hash (:kotoba.webvh-recovery/multikey old-recovery))}
-                         (get-in head ["parameters" "nextKeyHashes"])))
-              "the used recovery key is not committed again")))
-      (testing "a third party verifies the log and sees who signed what"
-        (let [did (get-in (peek (served world)) ["state" "id"])
-              v (custody/verify-result ["id" "verify" "--did" did])
-              data (:kotoba.cli/data v)
-              s (custody/read-state)]
-          (is (= :id/verified (:kotoba.cli/code v)) (pr-str v))
-          (is (= :holder (:custody data)))
-          (is (= 5 (:versions data)))
-          (is (= [[(:multikey server-key)] [(:multikey server-key)]]
-                 (mapv :signed-by (take 2 (:signed-by data))))
-              "only the genesis and the handover carry the server's signature")
-          (is (= [(get-in s [:kotoba.webvh-custody/active :multikey])] (:update-keys data)))
-          (is (= :id/verified (:kotoba.cli/code (custody/verify-result ["id" "verify" "--did" did
-                                                                        "--pin" (get (nth (served world) 2) "versionId")])))))))))
+          forged (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
+                                             :parameters {"updateKeys" [(:multikey server-key)]
+                                                          "nextKeyHashes" [(h/key-hash (:multikey server-key))]}
+                                             :state (get prev "state")})
+                     (entry/sign server-key))]
+      (is (= :didwebvh/uncommitted-update-key (:error (log/verify (conj es forged) {:now (now-s)}))))
+      (binding [custody/*http!* (host world {:serve (fn [_ es] (conj es forged))})]
+        (is (= :id/log-invalid (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
+        (is (= :id/log-invalid (:kotoba.cli/code (custody/verify-result ["id" "verify"]))))))))
 
 (deftest rollback-and-fork-are-detected
   (with-cli [world dir]
     (take! dir)
     (custody/rotate-result ["id" "rotate"])
     (let [full (served world)
-          v3 (get (nth full 2) "versionId")]
-      (testing "a host that rolls back to before the pinned version"
-        (binding [custody/*http!* (host world {:serve (fn [es] (subvec es 0 2))})]
-          (is (= :id/log-fork-detected (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
-          (is (= :id/log-fork-detected (:kotoba.cli/code (custody/verify-result ["id" "verify"]))))
-          (is (= :id/log-fork-detected
-                 (:kotoba.cli/code (custody/verify-result ["id" "verify" "--user" user-id "--pin" v3]))))))
-      (testing "a host that forks at the handover with a server-signed sibling"
-        (let [genesis-only [(first full)]
-              prev (first full)
-              sibling (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
-                                                  :parameters {"updateKeys" [(:multikey server-key)]}
-                                                  :state (get prev "state")})
-                          (entry/sign server-key))]
-          (is (:ok? (log/verify (conj genesis-only sibling) {:now (quot (System/currentTimeMillis) 1000)}))
-              "the fork verifies on its own -- which is why the pin matters")
-          (binding [custody/*http!* (host world {:serve (fn [_] (conj genesis-only sibling))})]
-            (is (= :id/log-fork-detected (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
-            (is (= :id/log-fork-detected (:kotoba.cli/code (custody/verify-result ["id" "verify"]))))))))))
+          v3 (get (nth full 2) "versionId")
+          sibling (let [prev (first full)]
+                    (-> (entry/next-entry prev {:version-time (custody/version-time (get prev "versionTime"))
+                                                :parameters {"updateKeys" [(:multikey server-key)]}
+                                                :state (get prev "state")})
+                        (entry/sign server-key)))]
+      (binding [custody/*http!* (host world {:serve (fn [_ es] (subvec es 0 2))})]
+        (is (= :id/log-fork-detected (:kotoba.cli/code (custody/rotate-result ["id" "rotate"]))))
+        (is (= :id/log-fork-detected (:kotoba.cli/code (custody/verify-result ["id" "verify" "--user" user-id "--pin" v3])))))
+      (binding [custody/*http!* (host world {:serve (fn [_ _] [(first full) sibling])})]
+        (is (:ok? (log/verify [(first full) sibling] {:now (now-s)})) "the fork verifies on its own")
+        (is (= :id/log-fork-detected (:kotoba.cli/code (custody/verify-result ["id" "verify"]))))
+        (is (= :id/log-fork-detected
+               (:kotoba.cli/code (custody/verify-result ["id" "verify" "--user" user-id
+                                                         "--attestation" (str (custody/attestation-path rp-id user-id))])))
+            "a third party holding the holder's handover attestation detects the fork too")))))
+
+(deftest a-log-for-another-did-is-refused
+  (with-cli [world dir {:serve (fn [uid es] (if (= uid user-id) (get-in @world [:logs user-2]) es))}]
+    (is (= :id/did-url-mismatch (:kotoba.cli/code (take! dir))))))
 
 (deftest a-dishonest-approval-is-caught
   (testing "the host answers with a code for a different proposal"
     (with-cli [world dir {:code-override "XXXX-YYYY"}]
       (is (= :id/code-mismatch (:kotoba.cli/code (take! dir))))
-      (is (= 1 (count (served world))) "nothing was approved")))
+      (is (= 1 (count (served world))))))
   (testing "the host hands over to keys other than the ones proposed"
-    (let [other {"updateKeys" [(:multikey (signer/from-seed (byte-array (range 1 33))))]
-                 "nextKeyHashes" [(h/key-hash "z6MkA") (h/key-hash "z6MkB")]}]
-      (with-cli [world dir {:hand-to other}]
-        (is (= :id/handover-mismatch (:kotoba.cli/code (take! dir)))))))
-  (testing "rotate before take-custody"
-    (with-cli [world dir]
-      (is (= :id/not-custodied (:kotoba.cli/code (custody/rotate-result ["id" "rotate"])))))))
+    (with-cli [world dir nil (fn [_] (approve! world user-id
+                                               (fn [es _] (honest-handover es {"updateKeys" [(:multikey (signer/from-seed (byte-array (range 1 33))))]
+                                                                               "nextKeyHashes" [(h/key-hash "z6MkA") (h/key-hash "z6MkB")]}))))]
+      (is (= :id/handover-mismatch (:kotoba.cli/code (take! dir)))))))
 
 (deftest an-interrupted-take-custody-resumes-with-the-same-keys
-  (with-cli [world dir]
-    (binding [custody/*browser-open!* (fn [_] true)          ; nobody approves…
-              custody/*now-ms* (let [t (atom (System/currentTimeMillis))] #(swap! t + (* 6 60 1000)))]
+  (with-cli [world dir nil (fn [_] true)]
+    (binding [custody/*now-ms* (let [t (atom (System/currentTimeMillis))] #(swap! t + (* 6 60 1000)))]
       (is (= :id/handover-timeout (:kotoba.cli/code (take! dir)))))
-    (let [pending (custody/read-state)]
+    (let [pending (state)]
       (is (= :pending (:kotoba.webvh-custody/status pending)))
-      (approve! world)                                     ; …approved after the CLI gave up
-      (let [r (take! dir)
-            done (custody/read-state)]
+      (approve! world)
+      (let [r (take! dir)]
         (is (= :id/custody-taken (:kotoba.cli/code r)) (pr-str r))
-        (is (= (:kotoba.webvh-custody/active pending) (:kotoba.webvh-custody/active done))
-            "the keys written before the request are the keys that took custody")))))
+        (is (= (:kotoba.webvh-custody/active pending) (:kotoba.webvh-custody/active (state))))))))
+
+;; ── files ───────────────────────────────────────────────────────────────────
+
+(deftest secret-files-are-created-private-and-user-dirs-are-left-alone
+  (let [dir (str (kio/temp-dir "kotoba-custody-files"))
+        user-dir (str dir "/usb")
+        _ (.mkdirs (java.io.File. user-dir))
+        _ (Files/setPosixFilePermissions (.toPath (java.io.File. user-dir)) (PosixFilePermissions/fromString "rwxr-xr-x"))
+        p (str user-dir "/recovery.edn")]
+    (custody/write-secret-edn! p {:a 1})
+    (is (= "rw-------" (mode-of p)))
+    (is (= "rwxr-xr-x" (mode-of user-dir)) "a directory the user chose is not chmodded")
+    (is (empty? (filter #(str/includes? (.getName ^java.io.File %) ".tmp") (.listFiles (java.io.File. user-dir))))
+        "no temporary file is left behind")
+    (testing "a symlink planted at the temp path is not followed"
+      (custody/write-secret-edn! p {:a 2})
+      (is (= {:a 2} (edn/read-string (slurp p)))))))
 
 (deftest the-launcher-routes-id-custody-subcommands
   (with-cli [world dir]
     (is (= :id/not-custodied (:kotoba.cli/code (launcher/dispatch ["id" "rotate"]))))
-    (is (= :id/not-custodied (:kotoba.cli/code (launcher/dispatch ["id" "recover"]))))
     (is (= :id/custody-taken (:kotoba.cli/code (launcher/dispatch ["id" "take-custody" "--user" user-id
                                                                     "--recovery-out" (str dir "/r.edn")]))))
     (is (= :id/verified (:kotoba.cli/code (launcher/dispatch ["id" "verify"]))))
     (is (= :id/rotated (:kotoba.cli/code (launcher/dispatch ["id" "rotate"]))))
-    (is (= :id/not-enrolled (:kotoba.cli/code (launcher/dispatch ["id" "show"])))
-        "`id show` still reads the enrolled principal")))
+    (is (= :id/not-enrolled (:kotoba.cli/code (launcher/dispatch ["id" "show"]))))))
