@@ -6,36 +6,41 @@ Root authority: `com-junkawasaki/root` ADR-2607241100 (kotoba stack topology
 and design cleanup). This ADR is the kotoba-repo mirror; the canonical
 topology and the full cross-repo cleanup list live there.
 
-## Canonical topology (verified against deps.edn, 2026-07-24)
+## Position in the stack topology
 
-```
-                    ┌────────────────────────────────────────────┐
-                    │ shared leaves: security · ed25519 · datom  │
-                    │ cacao · did · kotoba-{core,selfhost}-      │
-                    │ contracts · kotoba-lang (contract/CLI)     │
-                    └────────────────────────────────────────────┘
-                                        ▲
-        ┌───────────────┐               │
-        │   compiler    │  foundation — depends on NOTHING else in the stack
-        └──────┬────────┘  (security + pinned kotoba-script JS backend only)
-       library │      │ emitted artifacts (freestanding ELF, fail-closed verified)
-               ▼      ▼
-        ┌──────────┐ ┌──────────┐
-        │  kotoba  │ │  aiueos  │  capability OS/broker — deps: security+chicory ONLY
-        │THIS REPO │ └────▲─────┘
-        └────▲─────┘      │ deps.edn edge: "aiueos decides, kototama enforces"
-             │       ┌────┴─────┐
-             │       │ kototama │  Wasm tender runtime
-             │       └──────────┘
-        ┌────┴─────┐
-        │ kotobase │  datom database — depends on kotoba, NEVER the reverse
-        └──────────┘
+Updated 2026-10-10 against fetched main manifests. The
+[stack architecture](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/stack-architecture.md) and
+[composition contract](https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/stack-architecture.edn) distinguish responsibility, library,
+artifact and runtime/service graphs.
+
+```text
+kotoba-lang = language contracts (T1)
+kotoba      = CLI, libraries and Codebase
+amu         = compiler and project linker (T2)
+abi         = shared execution contract (T0)
+kototama    = Lisp VM contract; engines implement it (T3)
+grant       = pure permission decisions (T4); authority owns scope/delegation
+aiueos      = operating system (T5); enforces grant's answer
+sahai       = reusable placement (T6); murakumo operates its own inference fleet
+kotobase    = database and persistent data plane
 ```
 
-Invariants: `compiler` never depends on the other four. `aiueos` never
-depends on `kotoba`/`kototama`/`kotobase`. `kotoba` (this repo) never depends
-on `kotobase`/`kototama`/`aiueos`. `kotobase` : `kotoba` = Datomic : Clojure —
-the database depends on the language, never the reverse (ADR-2607032500).
+AiueOS is the OS for a modern Kotoba Lisp machine in development; Kototama is
+its Lisp VM contract, also implemented by hosted engines. These are
+architectural roles, not completion/qualification claims.
+
+Library arrows mean consumer → dependency: Kotoba imports Amu and Kototama;
+Kototama imports grant and abi; AiueOS imports grant; grant imports authority
+and abi and does not import the OS. Amu imports contracts and multiple
+backends. Alias-only dependencies must be labelled separately.
+The booted kernel consumes verified compiler artifacts rather than linking
+the compiler. Host build/conformance aliases may import compiler libraries.
+The database/language boundary describes ownership, not a claim that every
+database runtime directly imports the Kotoba CLI.
+
+The July 2026 topology snapshot was corrected on 2026-10-10 after the grant
+split and VM-contract separation; its old dependency counts and “AiueOS
+decides” wording are not current invariants.
 
 ## Decision 1 — finish the language-authority migration to `kotoba-lang/kotoba-lang`
 
