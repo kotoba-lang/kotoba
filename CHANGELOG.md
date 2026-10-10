@@ -6,6 +6,33 @@ user-visible or architecturally significant changes.
 
 ## Unreleased
 
+- Added: no single network host is mandatory any more
+  (`docs/ADR-configurable-endpoints.md`). Delegated routers, trustless
+  gateways, package-catalog mirrors (with pinned-CID fetch from gateways), the
+  hosted storage origin, IPNS routers and the Passkey RP allow-list are ordered
+  lists resolved as CLI flag > env var (`KOTOBA_ROUTERS`, `KOTOBA_GATEWAYS`,
+  `KOTOBA_CATALOG_URLS`, `KOTOBA_CATALOG_GATEWAYS`, `KOTOBA_HOSTED_ENDPOINT`,
+  `KOTOBA_IPNS_ROUTERS`, `KOTOBA_PASSKEY_RP_IDS`) > defaults. Historical
+  defaults stay first; verification (CID, no redirects, size caps, IPNS key,
+  RP refusal before any browser opens) is unchanged.
+  Review follow-ups: `KOTOBA_PASSKEY_RP_IDS` only extends the allow-list
+  (implicit RP stays `auth.kotoba.cloud`; a non-canonical RP needs `--rp-id`,
+  warns, and is flagged in `principal.edn`); `block-source` verifies each
+  candidate and moves past junk gateways; endpoint entries are validated
+  (absolute http(s), no userinfo/query/fragment, trailing `/` stripped);
+  gateway bodies have an overall deadline; default gateways are only
+  `trustless-gateway.link` (others opt-in; `ipfs.io`, `ipfs.4everland.io`
+  dropped); catalog gateway fallback is opt-in; `announced?` reports router
+  outages; `KOTOBA_HOSTED_ENDPOINT` must be one HTTPS origin; the
+  availability-proof router ignores `KOTOBA_ROUTERS`.
+  Round 2: a router's 404 means "no records", not an outage; the RP's
+  verification URI must be `https` on the RP's own origin (`open --`); RP ids
+  under .localhost/.local/.internal/.home.arpa or IP-shaped are refused; a
+  non-canonical RP cannot replace a canonical principal without `--force`;
+  env-chosen hosted origin / IPNS routers warn on stderr; pulls try known
+  providers before routing and have an overall `:budget-ms`; endpoint hosts
+  are lowercased.
+
 - Fixed: the emitter wrote a WebAssembly `call` operand as a single byte, so
   any module needing function index 128 or above got an operand with the
   LEB128 continuation bit set and no continuation byte. `kotoba compile

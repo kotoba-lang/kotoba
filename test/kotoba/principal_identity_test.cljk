@@ -1,6 +1,7 @@
 (ns kotoba.principal-identity-test
   (:require [kotoba.io :as kio] [clojure.edn :as edn]
-            [kotoba.test :refer [deftest is]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.endpoint-config :as endpoint-config]
             [kotoba.principal-identity :as principal]))
 
 (def verified
@@ -59,3 +60,171 @@
         (is (= :id/shown (:kotoba.cli/code shown)))
         (is (= (:principalId verified) (get-in shown [:kotoba.cli/data :principal])))
         (is (= "kotoba-test000000" (get-in shown [:kotoba.cli/data :username])))))))
+
+
+;; docs/ADR-configurable-endpoints.md: the RP is an allow-list whose default is
+;; exactly the historical canonical RP.
+
+(defn- authority-result [rp-id]
+  {:kotoba.cli/ok? true
+   :kotoba.cli/data {:host-action :secure-random-principal-id
+                     :controller {:kind :passkey :rp-id rp-id}}})
+
+(deftest the-rp-allow-list-defaults-to-the-canonical-rp
+  (binding [endpoint-config/*getenv* (fn [_] nil)]
+    (is (= ["auth.kotoba.cloud"] (principal/allowed-rp-ids)))
+    (is (= "auth.kotoba.cloud" (principal/default-rp-id)))
+    (is (principal/allowed-rp-id? "auth.kotoba.cloud"))
+    (is (not (principal/allowed-rp-id? "itonami.cloud")))))
+
+(deftest rp-ids-must-be-bare-hostnames
+  (is (principal/valid-rp-id? "auth.example.org"))
+  (doseq [bad ["https://auth.example.org" "auth.example.org:443" "auth.example.org/x"
+               "Auth.Example.org" "localhost" "" nil "auth..example.org" "-a.example.org"]]
+    (is (not (principal/valid-rp-id? bad)) (pr-str bad)))
+  (testing "invalid configured entries are never allowed; none valid => canonical"
+    (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "https://evil.example,evil.example:8443"}]
+      (is (= ["auth.kotoba.cloud"]
+             (binding [*err* (java.io.StringWriter.)] (principal/allowed-rp-ids)))))
+    (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "https://evil.example, id.self.example"}]
+      (is (= ["auth.kotoba.cloud" "id.self.example"]
+             (binding [*err* (java.io.StringWriter.)] (principal/allowed-rp-ids)))))))
+
+(deftest an-unlisted-rp-is-refused-before-any-browser-opens
+  (doseq [env [(fn [_] nil) {"KOTOBA_PASSKEY_RP_IDS" "id.self.example"}]]
+    (binding [endpoint-config/*getenv* env
+              principal/*device-authorize!* (fn [& _] (throw (ex-info "must not run" {})))]
+      (let [result (principal/enroll-result (authority-result "itonami.cloud"))]
+        (is (= :id/noncanonical-rp (:kotoba.cli/code result)))
+        (is (= "itonami.cloud" (get-in result [:kotoba.cli/data :requested-rp-id])))))))
+
+(deftest a-configured-rp-enrolls-and-is-recorded
+  (let [directory (kio/temp-dir "kotoba-principal-rp")
+        path (.toString (kio/file directory "principal.edn"))]
+    (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "id.self.example,auth.kotoba.cloud"}
+              principal/*principal-path* path
+              principal/*device-authorize!* (fn [& _] verified)
+              *err* (java.io.StringWriter.)]
+      (let [result (principal/enroll-result (authority-result "id.self.example"))]
+        (is (= :id/enrolled (:kotoba.cli/code result)))
+        (is (= "id.self.example" (get-in result [:kotoba.cli/data :controller :rp-id])))
+        (is (= "id.self.example" (:kotoba.principal/rp-id (edn/read-string (slurp path))))))
+      (testing "the canonical RP stays usable"
+        (is (= :id/enrolled
+               (:kotoba.cli/code (principal/enroll-result (authority-result "auth.kotoba.cloud")))))))))
+
+;; Review finding 1 (PR #632): the environment may only EXTEND the allow-list.
+
+(deftest review-1-env-cannot-change-the-implicit-default-rp
+  (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "evil.example,auth.kotoba.cloud"}]
+    (is (= "auth.kotoba.cloud" (principal/default-rp-id))
+        "an env var must not make evil.example the RP `kotoba id new` talks to")
+    (is (= "auth.kotoba.cloud" (first (principal/allowed-rp-ids))))
+    (is (principal/allowed-rp-id? "evil.example") "the env may extend the list")
+    (is (principal/canonical-rp? "auth.kotoba.cloud"))
+    (is (not (principal/canonical-rp? "evil.example")))))
+
+(deftest review-1-a-non-canonical-rp-is-flagged-warned-and-recorded
+  (let [directory (kio/temp-dir "kotoba-principal-noncanonical")
+        path (.toString (kio/file directory "principal.edn"))
+        err (java.io.StringWriter.)]
+    (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "id.self.example"}
+              principal/*principal-path* path
+              principal/*device-authorize!* (fn [& _] verified)
+              *err* err]
+      (let [result (principal/enroll-result (authority-result "id.self.example"))
+            stored (edn/read-string (slurp path))]
+        (is (= :id/enrolled (:kotoba.cli/code result)))
+        (is (true? (get-in result [:kotoba.cli/data :non-canonical-rp?])))
+        (is (true? (get-in result [:kotoba.cli/data :controller :non-canonical-rp?])))
+        (is (true? (:kotoba.principal/non-canonical-rp? stored)))
+        (is (re-find #"id\.self\.example" (str err)))
+        (is (re-find #"(?i)non-canonical" (str err)))))
+    (testing "the canonical RP is not flagged"
+      (binding [endpoint-config/*getenv* (fn [_] nil)
+                principal/*principal-path* path
+                principal/*device-authorize!* (fn [& _] verified)]
+        (let [result (principal/enroll-result (authority-result "auth.kotoba.cloud"))]
+          (is (not (get-in result [:kotoba.cli/data :non-canonical-rp?])))
+          (is (not (:kotoba.principal/non-canonical-rp? (edn/read-string (slurp path))))))))))
+
+(deftest the-device-flow-refuses-an-unlisted-rp-without-network
+  (binding [endpoint-config/*getenv* (fn [_] nil)]
+    (is (= :noncanonical-rp
+           (:error (ex-data (try (principal/device-authorize! "evil.example")
+                                 (catch Exception e e))))))))
+
+
+;; ---------------------------------------------------------------------------
+;; Round-2 review findings on PR #632.
+
+(deftest review2-m1-the-verification-uri-must-be-the-rps-own-https-origin
+  (is (principal/verification-uri-ok? "id.self.example" "https://id.self.example/device?code=AB"))
+  (is (principal/verification-uri-ok? "id.self.example" "https://id.self.example:443/device"))
+  (doseq [bad ["http://id.self.example/device"
+               "https://evil.example/device"
+               "https://id.self.example.evil.example/device"
+               "https://id.self.example@evil.example/device"
+               "https://id.self.example:8443/device"
+               "javascript:alert(1)"
+               "file:///etc/passwd"
+               "-a Calculator"
+               nil]]
+    (is (not (principal/verification-uri-ok? "id.self.example" bad)) (pr-str bad)))
+  (testing "device-authorize! refuses a foreign URI before any browser opens"
+    (let [opened (atom nil)]
+      (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "id.self.example"}
+                principal/*browser-open!* (fn [url] (reset! opened url) true)]
+        (with-redefs-fn {#'principal/post-json
+                         (fn [_origin _path _body]
+                           {:status 200
+                            :body {:deviceCode "d" :userCode "U"
+                                   :verificationUriComplete "https://evil.example/phish"}})}
+          (fn []
+            (let [data (ex-data (try (principal/device-authorize! "id.self.example")
+                                     (catch Exception e e)))]
+              (is (= :verification-uri-mismatch (:error data)))
+              (is (nil? @opened)))))))))
+
+(deftest review2-m1-open-passes-end-of-options-before-the-url
+  (is (= ["open" "--" "https://auth.kotoba.cloud/device"]
+         (principal/open-command "https://auth.kotoba.cloud/device"))))
+
+(deftest review2-m3-rp-ids-reject-local-and-ip-shaped-names
+  (doseq [bad ["foo.localhost" "printer.local" "metadata.google.internal"
+               "router.home.arpa" "169.254.169.254.nip.io" "10.0.0.1.sslip.io"
+               "169-254-169-254.sslip.io" "a.127.0.0.1.example.com"]]
+    (is (not (principal/valid-rp-id? bad)) bad))
+  (doseq [good ["auth.kotoba.cloud" "id.self.example" "xn--80ak6aa92e.com" "web3.example.org"]]
+    (is (principal/valid-rp-id? good) good)))
+
+(deftest review2-nit-the-non-canonical-rp-reaches-the-device-flow
+  (let [directory (kio/temp-dir "kotoba-principal-flow")
+        path (.toString (kio/file directory "principal.edn"))
+        seen (atom nil)]
+    (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "id.self.example"}
+              principal/*principal-path* path
+              principal/*device-authorize!* (fn [rp-id] (reset! seen rp-id) verified)
+              *err* (java.io.StringWriter.)]
+      (principal/enroll-result (authority-result "id.self.example"))
+      (is (= "id.self.example" @seen)))))
+
+(deftest review2-nit-a-canonical-principal-is-not-silently-replaced
+  (let [directory (kio/temp-dir "kotoba-principal-replace")
+        path (.toString (kio/file directory "principal.edn"))]
+    (binding [endpoint-config/*getenv* {"KOTOBA_PASSKEY_RP_IDS" "id.self.example"}
+              principal/*principal-path* path
+              principal/*device-authorize!* (fn [& _] verified)
+              *err* (java.io.StringWriter.)]
+      (is (= :id/enrolled (:kotoba.cli/code (principal/enroll-result
+                                             (authority-result "auth.kotoba.cloud")))))
+      (let [called? (atom false)
+            refused (binding [principal/*device-authorize!*
+                              (fn [& _] (reset! called? true) verified)]
+                      (principal/enroll-result (authority-result "id.self.example")))]
+        (is (= :id/canonical-principal-exists (:kotoba.cli/code refused)))
+        (is (false? @called?) "refused before any device flow")
+        (is (= "auth.kotoba.cloud" (:kotoba.principal/rp-id (edn/read-string (slurp path))))))
+      (let [forced (principal/enroll-result (authority-result "id.self.example") {:force? true})]
+        (is (= :id/enrolled (:kotoba.cli/code forced)))
+        (is (= "id.self.example" (:kotoba.principal/rp-id (edn/read-string (slurp path)))))))))

@@ -14,6 +14,7 @@
             [kotoba.codebase.fetch :as fetch]
             [kotoba.codebase.publication :as publication]
             [kotoba.codebase.store :as store]
+            [kotoba.endpoint-config :as endpoint-config]
             [kotoba.lang.package-registry :as registry]
             [kotoba.library-release :as release]
             [kotoba.package-pqc :as package-pqc]
@@ -26,6 +27,35 @@
 
 (def default-catalog-url
   "https://kotoba-lang.org/.well-known/kotoba-package-registry.edn")
+
+(def default-catalog-urls
+  "Catalog locations tried in order. The catalog is discovery, and an install
+  is authorised by the caller's pinned catalog CID, not by the host -- so any
+  mirror serving the pinned bytes is as good as the origin. Override with
+  `KOTOBA_CATALOG_URLS` (comma-separated) or repeated `--catalog`."
+  [default-catalog-url])
+
+(def catalog-urls-env "KOTOBA_CATALOG_URLS")
+(def catalog-gateways-env "KOTOBA_CATALOG_GATEWAYS")
+
+(defn configured-catalog-urls
+  "CLI values > `KOTOBA_CATALOG_URLS` > `default-catalog-urls`."
+  ([] (configured-catalog-urls nil))
+  ([cli-values]
+   (endpoint-config/resolve-endpoints cli-values catalog-urls-env default-catalog-urls)))
+
+(defn configured-catalog-gateways
+  "Trustless gateways asked for the pinned catalog CID once every catalog URL
+  has failed. CLI values > `KOTOBA_CATALOG_GATEWAYS` > nothing.
+
+  Opt-in, deliberately: by default no gateway is asked. A gateway fallback
+  sends the pinned catalog CID (and the client IP) to third parties, adds a
+  full timeout per unreachable gateway before an install can fail, and turns
+  a catalog URL's specific error into an aggregate. `KOTOBA_GATEWAYS` is not
+  inherited for the same reason."
+  ([] (configured-catalog-gateways nil))
+  ([cli-values]
+   (endpoint-config/resolve-endpoints cli-values catalog-gateways-env [])))
 (def default-lock-path "kotoba.lock.edn")
 (def default-store-path ".kotoba/codebase")
 (def max-catalog-bytes (* 1024 1024))
@@ -65,19 +95,101 @@
         (fail! :package/catalog-too-large {:limit max-catalog-bytes}))
       bytes)))
 
+(defn- catalog-bytes-from
+  "Bytes for one catalog SOURCE: `{:url u}` (HTTPS GET) or `{:gateway g}`
+  (trustless `/ipfs/<expected-cid>?format=raw`, only meaningful when pinned)."
+  [{:keys [url gateway]} expected-cid timeout-ms]
+  (if url
+    (http-get-bytes url timeout-ms)
+    (let [bytes (or (try
+                      ;; The 1 MiB cap is passed INTO the read so it stops
+                      ;; there, rather than reading up to the 4 MiB block cap.
+                      (routing/fetch-block-from gateway expected-cid
+                                                {:timeout-ms timeout-ms
+                                                 :max-bytes max-catalog-bytes})
+                      (catch clojure.lang.ExceptionInfo e
+                        (if (= :routing/block-too-large (:problem (ex-data e)))
+                          (fail! :package/catalog-too-large {:limit max-catalog-bytes})
+                          (throw e))))
+                    (fail! :package/catalog-unavailable {:gateway gateway}))]
+      (when (> (alength ^bytes bytes) max-catalog-bytes)
+        (fail! :package/catalog-too-large {:limit max-catalog-bytes}))
+      bytes)))
+
+(defn- catalog-sources [urls gateways expected-cid]
+  (concat (map (fn [url] {:url url}) urls)
+          ;; A gateway can only be asked for content by name, so it is a source
+          ;; only when the caller pinned the name.
+          (when expected-cid (map (fn [gateway] {:gateway gateway}) gateways))))
+
+(defn- attempt-report
+  "One failed catalog source, for an aggregated error: its own problem, HTTP
+  status and message are kept so the aggregate does not mask them."
+  [{:keys [error] :as failure}]
+  (let [data (when error (ex-data error))]
+    (cond-> (dissoc failure :error)
+      (:status data) (assoc :status (:status data))
+      (:limit data) (assoc :limit (:limit data))
+      error (assoc :message (or (ex-message error) (str (class error)))))))
+
 (defn catalog
-  [{:keys [url expected-cid timeout-ms]
-    :or {url default-catalog-url timeout-ms default-timeout-ms}}]
-  (let [bytes (http-get-bytes url timeout-ms)
-        cid (mf/cidv1-raw bytes)]
-    (when (and expected-cid (not= expected-cid cid))
-      (fail! :package/catalog-cid-mismatch {:expected expected-cid :observed cid}))
-    (let [value (try (edn/read-string (kbytes/utf8-string ^bytes bytes))
-                     (catch Exception _ (fail! :package/catalog-invalid {})))
-          checked (registry/validate value)]
-      (when-not (:ok? checked)
-        (fail! :package/catalog-invalid {:problems (:problems checked)}))
-      {:cid cid :url url :value value})))
+  "Fetch the package catalog from the first source that yields valid bytes.
+
+  Sources are `:urls` (or the single `:url`) in order, then -- only when
+  `:expected-cid` is pinned -- `:gateways` asked for that CID. With a pin, a
+  source whose bytes hash to anything else is skipped like an unreachable one:
+  a mirror that serves the wrong catalog is unhelpful, never authoritative.
+  When every source fails: any CID mismatch is reported as
+  `:package/catalog-cid-mismatch`; a single source rethrows its own error
+  unchanged (the historical one-URL behaviour); otherwise
+  `:package/catalog-unavailable` lists each attempt."
+  [{:keys [url urls gateways expected-cid timeout-ms]
+    :or {timeout-ms default-timeout-ms}}]
+  (let [urls (cond (seq urls) (vec urls)
+                   url [url]
+                   :else (configured-catalog-urls))
+        sources (vec (catalog-sources urls gateways expected-cid))]
+    (loop [[source & more] sources
+           failures []]
+      (if-not source
+        (let [mismatches (filterv #(= :package/catalog-cid-mismatch (:problem %)) failures)]
+          (cond
+            (seq mismatches)
+            (fail! :package/catalog-cid-mismatch
+                   (assoc (dissoc (first mismatches) :problem :source)
+                          :attempts (mapv attempt-report failures)))
+
+            (= 1 (count failures))
+            (throw (:error (first failures)))
+
+            :else
+            (fail! :package/catalog-unavailable
+                   {:attempts (mapv attempt-report failures)})))
+        (let [outcome
+              (try
+                (let [bytes (catalog-bytes-from source expected-cid timeout-ms)
+                      cid (mf/cidv1-raw bytes)]
+                  (if (and expected-cid (not= expected-cid cid))
+                    {:failure {:source source :problem :package/catalog-cid-mismatch
+                               :expected expected-cid :observed cid}}
+                    {:bytes bytes :cid cid}))
+                (catch Exception e
+                  {:failure {:source source
+                             :problem (or (:problem (ex-data e)) :package/catalog-unavailable)
+                             :error e}}))]
+          (if-let [failure (:failure outcome)]
+            (recur more (conj failures failure))
+            (let [{:keys [bytes cid]} outcome
+                  value (try (edn/read-string (kbytes/utf8-string ^bytes bytes))
+                             (catch Exception _ (fail! :package/catalog-invalid {})))
+                  checked (registry/validate value)]
+              ;; Bytes that match the pin but do not validate are the pinned
+              ;; catalog itself being invalid -- no other mirror can fix that.
+              (when-not (:ok? checked)
+                (fail! :package/catalog-invalid {:problems (:problems checked)}))
+              (cond-> {:cid cid :value value}
+                (:url source) (assoc :url (:url source))
+                (:gateway source) (assoc :gateway (:gateway source))))))))))
 
 (defn- providers [record]
   (mapv (fn [provider]
@@ -241,14 +353,19 @@
   (verify-lock-pqc! root (read-lock lock-path)))
 
 (defn install!
-  [{:keys [coordinate version catalog-url catalog-cid lock-path root timeout-ms]
-    :or {catalog-url default-catalog-url lock-path default-lock-path
+  [{:keys [coordinate version catalog-url catalog-urls catalog-gateways catalog-cid
+           lock-path root timeout-ms]
+    :or {lock-path default-lock-path
          root default-store-path timeout-ms default-timeout-ms}}]
   (when-not (string? catalog-cid)
     (fail! :package/catalog-cid-required
            {:hint "pin the catalog CID shown by kotoba-lang.org"}))
   (let [{:keys [name version]} (parse-coordinate coordinate version)
-        discovered (catalog {:url catalog-url :expected-cid catalog-cid
+        discovered (catalog {:urls (cond (seq catalog-urls) catalog-urls
+                                         catalog-url [catalog-url]
+                                         :else (configured-catalog-urls))
+                             :gateways catalog-gateways
+                             :expected-cid catalog-cid
                              :timeout-ms timeout-ms})
         resolved (registry/resolve-record (:value discovered) name version)]
     (when-not (:ok? resolved)
