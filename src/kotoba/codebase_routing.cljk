@@ -28,22 +28,66 @@
   than implying otherwise."
   (:require [json.data-json :as json]
             [kotoba.lang.text :as str]
-            [kotoba.codebase.fetch :as fetch])
+            [kotoba.codebase.fetch :as fetch]
+            [kotoba.endpoint-config :as endpoint-config])
   (:import [java.io ByteArrayOutputStream]
            [java.net URI]
            [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.time Duration]))
 
+(def default-routers
+  "Public delegated routers, tried in order (`/routing/v1` base URLs).
+
+  An ordered list rather than one host so discovery does not have a single
+  mandatory operator. A router only names *where* to ask; every block it leads
+  to is still checked against its CID, so adding a router grants it nothing.
+  Override with `KOTOBA_ROUTERS` (comma-separated) or repeated `--router`."
+  ["https://delegated-ipfs.dev" "https://cid.contact"])
+
 (def default-router
-  "Public delegated router. Backed by the IPFS DHT and the IPNI indexers."
-  "https://delegated-ipfs.dev")
+  "The first default router. Kept for callers that record a single router
+  (availability proofs name the router that counted the providers)."
+  (first default-routers))
 
 (def default-gateways
   "Trustless gateways tried when routing returns no HTTP-reachable provider.
 
   A fixed list is a convenience, not an authority: these are asked for bytes
-  that are checked against the CID, so including one grants it nothing."
-  ["https://trustless-gateway.link" "https://ipfs.io"])
+  that are checked against the CID, so including one grants it nothing. The
+  first two are the historical defaults (same order); the rest are operated
+  by different parties and were observed serving `?format=raw` without a
+  redirect (2026-10-10). Override with `KOTOBA_GATEWAYS` or `--gateway`."
+  ["https://trustless-gateway.link" "https://ipfs.io"
+   "https://ipfs.filebase.io" "https://gateway.pinata.cloud"
+   "https://ipfs.4everland.io"])
+
+(def routers-env "KOTOBA_ROUTERS")
+(def gateways-env "KOTOBA_GATEWAYS")
+
+(defn configured-routers
+  "Routers in effect: CLI values > `KOTOBA_ROUTERS` > `default-routers`."
+  ([] (configured-routers nil))
+  ([cli-values] (endpoint-config/resolve-list cli-values routers-env default-routers)))
+
+(defn configured-gateways
+  "Gateways in effect: CLI values > `KOTOBA_GATEWAYS` > `default-gateways`."
+  ([] (configured-gateways nil))
+  ([cli-values] (endpoint-config/resolve-list cli-values gateways-env default-gateways)))
+
+(defn configured-router
+  "The single router a one-router caller should use: the first configured."
+  ([] (configured-router nil))
+  ([cli-values] (first (configured-routers cli-values))))
+
+(defn- routers-of
+  "The ordered router list an opts map asks for. An explicit `:router` keeps
+  its historical meaning (exactly that router); `:routers` is an ordered list;
+  neither means the configured list."
+  [{:keys [router routers]}]
+  (cond
+    (string? router) [router]
+    (seq routers) (vec routers)
+    :else (configured-routers)))
 
 (def max-block-bytes (* 4 1024 1024))
 (def max-providers 20)
@@ -113,9 +157,9 @@
   gave them. An empty result means nobody announced it to that router -- not
   that the CID is invalid."
   ([cid] (providers cid {}))
-  ([cid {:keys [router timeout-ms] :or {router default-router
-                                        timeout-ms default-timeout-ms}}]
-   (let [url (str router "/routing/v1/providers/" cid
+  ([cid {:keys [router timeout-ms] :or {timeout-ms default-timeout-ms}}]
+   (let [router (or router (configured-router))
+         url (str router "/routing/v1/providers/" cid
                   "?filter-protocols=transport-ipfs-gateway-http")
          response (.send (client timeout-ms)
                          (request url "application/json" timeout-ms)
@@ -156,9 +200,9 @@
   peer, while one peer can announce many addresses.  The peer ID is therefore
   the unit counted for distributed availability qualification."
   ([cid] (provider-identities cid {}))
-  ([cid {:keys [router timeout-ms] :or {router default-router
-                                        timeout-ms default-timeout-ms}}]
-   (let [url (str router "/routing/v1/providers/" cid)
+  ([cid {:keys [router timeout-ms] :or {timeout-ms default-timeout-ms}}]
+   (let [router (or router (configured-router))
+         url (str router "/routing/v1/providers/" cid)
          response (.send (client timeout-ms)
                          (request url "application/json" timeout-ms)
                          (HttpResponse$BodyHandlers/ofString))]
@@ -190,23 +234,46 @@
      (catch java.io.IOException _ nil)
      (catch java.net.http.HttpTimeoutException _ nil))))
 
+(defn routed-providers
+  "Ask ROUTERS in order and return the first non-empty HTTP provider list.
+
+  A router that errors or names nobody is skipped, so one unreachable or
+  censoring router does not end discovery. Stopping at the first answer keeps
+  the common case at one round trip. Answers are only hints: the bytes each
+  provider returns are still verified against the CID by the caller."
+  [cid routers {:keys [timeout-ms] :or {timeout-ms default-timeout-ms}}]
+  (loop [[router & more] routers]
+    (if-not router
+      []
+      (let [found (try (:providers (providers cid {:router router :timeout-ms timeout-ms}))
+                       (catch Exception _ []))]
+        (if (seq found) found (recur more))))))
+
 (defn block-source
   "A `fetch/hydrate!` source that discovers providers and falls back.
 
   Provider lists are resolved per CID and cached for the life of the source, so
   hydrating a closure of fifty blocks does not mean fifty routing round trips
   when they all live in the same place. Bytes are still verified per block by
-  the caller -- caching WHERE to ask never caches what was said."
+  the caller -- caching WHERE to ask never caches what was said.
+
+  Routers: `:router` (exactly one, historical), `:routers` (ordered list), or
+  the configured list. Gateways: `:gateways` when given (even empty -- an
+  explicit provider set is not widened behind the caller's back), otherwise
+  the configured list."
   ([] (block-source {}))
-  ([{:keys [router gateways timeout-ms verbose?]
-     :or {router default-router gateways default-gateways
-          timeout-ms default-timeout-ms}}]
-   (let [discovered (atom [])
+  ([{:keys [timeout-ms verbose?]
+     :or {timeout-ms default-timeout-ms}
+     :as opts}]
+   (let [routers (routers-of opts)
+         gateways (if (contains? opts :gateways)
+                    (:gateways opts)
+                    (configured-gateways))
+         discovered (atom [])
          attempts (atom [])]
      (with-meta
        (fn [cid]
-         (let [routed (try (:providers (providers cid {:router router :timeout-ms timeout-ms}))
-                           (catch Exception _ []))
+         (let [routed (routed-providers cid routers {:timeout-ms timeout-ms})
                ;; Providers already known to have answered come first: the
                ;; closure of one definition is usually held by one host.
                candidates (distinct (concat @discovered routed gateways))]
@@ -218,7 +285,8 @@
                      bytes)
                  (do (when verbose? (swap! attempts conj {:cid cid :from base :ok? false}))
                      (recur (next remaining))))))))
-       {:discovered discovered :attempts attempts}))))
+       {:discovered discovered :attempts attempts
+        :routers routers :gateways gateways}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Announcement
@@ -274,12 +342,23 @@
   "Whether a router can now name a provider for CID.
 
   Asked of the routing layer, not of whoever was asked to pin: the question is
-  whether the network can find it, and only the network answers that."
+  whether the network can find it, and only the network answers that. With
+  several routers (`:routers`, or the configured list when no `:router` is
+  given) the first that names a provider answers."
   ([cid] (announced? cid {}))
   ([cid opts]
-   (let [{:keys [providers status]} (providers cid opts)]
-     {:cid cid :status status :providers providers
-      :announced? (boolean (seq providers))})))
+   (loop [[router & more] (routers-of opts)
+          last-answer nil]
+     (if-not router
+       (let [{:keys [providers status router]} last-answer]
+         {:cid cid :status status :router router :providers (or providers [])
+          :announced? false})
+       (let [answer (try (providers cid (assoc (dissoc opts :routers) :router router))
+                         (catch Exception _ {:router router :providers [] :status nil}))]
+         (if (seq (:providers answer))
+           {:cid cid :status (:status answer) :router router
+            :providers (:providers answer) :announced? true}
+           (recur more answer)))))))
 
 (defn announce!
   "Request a pin, then verify by asking a router who provides the CID.
@@ -302,4 +381,5 @@
          result (fetch/hydrate! store roots (assoc opts :fetch-block source))]
      (assoc result
             :providers-used (vec @(:discovered (meta source)))
-            :router (:router opts default-router)))))
+            :router (first (:routers (meta source)))
+            :routers (:routers (meta source))))))

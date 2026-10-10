@@ -6,6 +6,16 @@ user-visible or architecturally significant changes.
 
 ## Unreleased
 
+- Added: no single network host is mandatory any more
+  (`docs/ADR-configurable-endpoints.md`). Delegated routers, trustless
+  gateways, package-catalog mirrors (with pinned-CID fetch from gateways), the
+  hosted storage origin, IPNS routers and the Passkey RP allow-list are ordered
+  lists resolved as CLI flag > env var (`KOTOBA_ROUTERS`, `KOTOBA_GATEWAYS`,
+  `KOTOBA_CATALOG_URLS`, `KOTOBA_CATALOG_GATEWAYS`, `KOTOBA_HOSTED_ENDPOINT`,
+  `KOTOBA_IPNS_ROUTERS`, `KOTOBA_PASSKEY_RP_IDS`) > defaults. Historical
+  defaults stay first; verification (CID, no redirects, size caps, IPNS key,
+  RP refusal before any browser opens) is unchanged.
+
 - Fixed: the emitter wrote a WebAssembly `call` operand as a single byte, so
   any module needing function index 128 or above got an operand with the
   LEB128 continuation bit set and no continuation byte. `kotoba compile

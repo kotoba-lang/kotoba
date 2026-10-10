@@ -1,0 +1,122 @@
+(ns kotoba.endpoint-config-test
+  "No single host is mandatory (docs/ADR-configurable-endpoints.md).
+
+  Each default endpoint list is replaceable by environment and CLI, keeps its
+  historical first entries, and -- the part that matters -- extra hosts are
+  only ever asked, never believed: routing still falls through to the next
+  router, and fetched bytes are still verified by the caller."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.endpoint-config :as endpoint-config]
+            [kotoba.codebase-routing :as routing])
+  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+           [java.net InetSocketAddress]))
+
+(defn- env [m] (fn [name] (get m name)))
+
+(deftest lists-parse-in-order-without-blanks-or-duplicates
+  (is (= ["https://a" "https://b"]
+         (endpoint-config/parse-list " https://a, ,https://b,https://a ")))
+  (is (nil? (endpoint-config/parse-list nil)))
+  (is (nil? (endpoint-config/parse-list "   ")))
+  (is (nil? (endpoint-config/parse-list " , ,"))
+      "a set-but-empty variable must not produce an empty list"))
+
+(deftest cli-beats-env-beats-defaults
+  (binding [endpoint-config/*getenv* (env {"X" "https://env-1,https://env-2"})]
+    (is (= ["https://cli"] (endpoint-config/resolve-list ["https://cli"] "X" ["https://d"])))
+    (is (= ["https://env-1" "https://env-2"] (endpoint-config/resolve-list [] "X" ["https://d"])))
+    (is (= ["https://env-1" "https://env-2"] (endpoint-config/resolve-list nil "X" ["https://d"]))))
+  (binding [endpoint-config/*getenv* (env {})]
+    (is (= ["https://d"] (endpoint-config/resolve-list nil "X" ["https://d"])))))
+
+(deftest routing-defaults-are-a-list-whose-head-is-the-historical-default
+  (is (= "https://delegated-ipfs.dev" routing/default-router))
+  (is (< 1 (count routing/default-routers)) "discovery has no single mandatory router")
+  (is (= ["https://trustless-gateway.link" "https://ipfs.io"]
+         (subvec routing/default-gateways 0 2))
+      "historical gateways keep their position; new ones are appended")
+  (is (< 2 (count (distinct routing/default-gateways))))
+  (binding [endpoint-config/*getenv* (env {})]
+    (is (= routing/default-routers (routing/configured-routers)))
+    (is (= routing/default-gateways (routing/configured-gateways))))
+  (binding [endpoint-config/*getenv* (env {"KOTOBA_ROUTERS" "http://r1, http://r2"
+                                           "KOTOBA_GATEWAYS" "http://g1"})]
+    (is (= ["http://r1" "http://r2"] (routing/configured-routers)))
+    (is (= "http://r1" (routing/configured-router)))
+    (is (= ["http://g1"] (routing/configured-gateways)))
+    (is (= ["http://cli"] (routing/configured-routers ["http://cli"])))))
+
+;; ---------------------------------------------------------------------------
+;; Real HTTP: a dead router, then a live one that names a live provider.
+
+(defn- respond! [^HttpExchange exchange status ^bytes body]
+  (.sendResponseHeaders exchange status (if body (alength body) -1))
+  (with-open [out (.getResponseBody exchange)]
+    (when body (.write out body))))
+
+(defn- server
+  "An HTTP server whose handler is (fn [method path] [status bytes-or-nil])."
+  [handler]
+  (let [s (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.createContext s "/"
+                    (reify HttpHandler
+                      (^void handle [_ ^HttpExchange exchange]
+                        (let [[status body] (handler (.getRequestMethod exchange)
+                                                     (.getPath (.getRequestURI exchange)))]
+                          (respond! exchange status body))
+                        nil)))
+    (.start s)
+    {:stop #(.stop s 0)
+     :port (.getPort (.getAddress s))
+     :url (str "http://127.0.0.1:" (.getPort (.getAddress s)))}))
+
+(defn- utf8 ^bytes [s] (.getBytes ^String s "UTF-8"))
+
+(deftest a-dead-router-does-not-end-discovery
+  (let [block (utf8 "block-bytes")
+        provider (server (fn [_ path]
+                           (if (= path "/ipfs/bafkreiexample")
+                             [200 block]
+                             [404 nil])))
+        dead-router (server (fn [_ _] [503 nil]))
+        live-router (server
+                     (fn [_ path]
+                       (if (= path "/routing/v1/providers/bafkreiexample")
+                         [200 (utf8 (str "{\"Providers\":[{\"ID\":\"peer\",\"Addrs\":"
+                                         "[\"/ip4/127.0.0.1/tcp/" (:port provider) "/http\"]}]}"))]
+                         [404 nil])))]
+    (try
+      (testing "the first router that names a provider answers"
+        (is (= [(:url provider)]
+               (routing/routed-providers "bafkreiexample"
+                                         [(:url dead-router) (:url live-router)] {}))))
+      (testing "block-source walks the ordered routers, gateways only as fallback"
+        (let [source (routing/block-source {:routers [(:url dead-router) (:url live-router)]
+                                            :gateways []})]
+          (is (= "block-bytes" (String. ^bytes (source "bafkreiexample") "UTF-8")))
+          (is (= [(:url provider)] @(:discovered (meta source))))))
+      (testing "an explicit :router still means exactly that router"
+        (let [source (routing/block-source {:router (:url dead-router) :gateways []})]
+          (is (nil? (source "bafkreiexample")))
+          (is (= [(:url dead-router)] (:routers (meta source))))))
+      (testing "announced? asks each router until one names a provider"
+        (let [answer (routing/announced? "bafkreiexample"
+                                         {:routers [(:url dead-router) (:url live-router)]})]
+          (is (true? (:announced? answer)))
+          (is (= (:url live-router) (:router answer))))
+        (is (false? (:announced? (routing/announced? "bafkreiexample"
+                                                     {:routers [(:url dead-router)]})))))
+      (testing "with no router or gateway option, the configured lists are used"
+        (binding [endpoint-config/*getenv* (env {"KOTOBA_ROUTERS" (:url live-router)
+                                                 "KOTOBA_GATEWAYS" "http://127.0.0.1:1"})]
+          (let [source (routing/block-source)]
+            (is (= [(:url live-router)] (:routers (meta source))))
+            (is (= ["http://127.0.0.1:1"] (:gateways (meta source))))
+            (is (some? (source "bafkreiexample"))))))
+      (finally
+        (doseq [s [provider dead-router live-router]] ((:stop s)))))))
+
+(deftest an-explicit-empty-gateway-list-is-not-widened
+  (binding [endpoint-config/*getenv* (env {"KOTOBA_GATEWAYS" "http://127.0.0.1:1"})]
+    (is (= [] (:gateways (meta (routing/block-source {:router "http://127.0.0.1:1"
+                                                      :gateways []})))))))

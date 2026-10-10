@@ -6,6 +6,8 @@
             [kotoba.codebase.publication :as publication]
             [kotoba.codebase.store :as store]
             [kotoba.codebase-typed :as typed]
+            [kotoba.codebase-routing :as routing]
+            [kotoba.endpoint-config :as endpoint-config]
             [kotoba.library-release :as release]
             [kotoba.package-install :as packages]
             [kotoba.package-pqc :as package-pqc]
@@ -216,3 +218,148 @@
                   {:coordinate "kotoba-lang/reference-math@0.1.0"
                    :catalog-cid (mf/cidv1-raw bytes)}))
                (catch #?(:clj clojure.lang.ExceptionInfo :cljs kerror/ExceptionInfo) e e))))))))
+
+
+;; ---------------------------------------------------------------------------
+;; Catalog mirrors (docs/ADR-configurable-endpoints.md): any source serving the
+;; pinned bytes is acceptable, and no source serving other bytes ever is.
+
+(defn- problem-of [f]
+  (try (f) nil
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs kerror/ExceptionInfo) e (ex-data e))))
+
+(defn- minimal-catalog []
+  (let [release-cid (mf/cidv1-raw (kbytes/utf8-bytes "release"))
+        attestation (package-pqc/sign
+                     {:ed25519-seed (seed 1) :ml-dsa-seed (seed 2)
+                      :release-cid release-cid
+                      :publication-record-cid release-cid})]
+    (kbytes/utf8-bytes
+     (pr-str (registry release-cid release-cid "did:key:zMirror" attestation
+                       ["https://one.example" "https://two.example"])))))
+
+(deftest catalog-urls-are-an-ordered-configurable-list
+  (binding [endpoint-config/*getenv* (fn [_] nil)]
+    (is (= [packages/default-catalog-url] (packages/configured-catalog-urls)))
+    (is (= routing/default-gateways (packages/configured-catalog-gateways))))
+  (binding [endpoint-config/*getenv*
+            {"KOTOBA_CATALOG_URLS" "https://mirror-a.example/c.edn,https://mirror-b.example/c.edn"
+             "KOTOBA_CATALOG_GATEWAYS" "https://gw.example"}]
+    (is (= ["https://mirror-a.example/c.edn" "https://mirror-b.example/c.edn"]
+           (packages/configured-catalog-urls)))
+    (is (= ["https://cli.example/c.edn"]
+           (packages/configured-catalog-urls ["https://cli.example/c.edn"])))
+    (is (= ["https://gw.example"] (packages/configured-catalog-gateways)))))
+
+(deftest a-pinned-catalog-may-come-from-any-mirror-serving-its-bytes
+  (let [good (minimal-catalog)
+        good-cid (mf/cidv1-raw good)
+        evil (kbytes/utf8-bytes (pr-str {:kotoba.registry/version 1 :records []}))
+        served {"https://evil.example/c.edn" evil
+                "https://good.example/c.edn" good}
+        fetched (atom [])]
+    (with-redefs [packages/http-get-bytes
+                  (fn [url _]
+                    (swap! fetched conj url)
+                    (or (get served url)
+                        (throw (ex-info "catalog-http-status"
+                                        {:problem :package/catalog-http-status :status 503}))))]
+      (testing "a mirror with other bytes is skipped, the next matching one is used"
+        (let [result (packages/catalog {:urls ["https://down.example/c.edn"
+                                               "https://evil.example/c.edn"
+                                               "https://good.example/c.edn"]
+                                        :expected-cid good-cid})]
+          (is (= good-cid (:cid result)))
+          (is (= "https://good.example/c.edn" (:url result)))
+          (is (= ["https://down.example/c.edn" "https://evil.example/c.edn"
+                  "https://good.example/c.edn"]
+                 @fetched))))
+      (testing "when no mirror matches the pin, the mismatch is reported"
+        (let [data (problem-of #(packages/catalog {:urls ["https://down.example/c.edn"
+                                                          "https://evil.example/c.edn"]
+                                                   :expected-cid good-cid}))]
+          (is (= :package/catalog-cid-mismatch (:problem data)))
+          (is (= good-cid (:expected data)))
+          (is (= 2 (count (:attempts data))))))
+      (testing "several unreachable mirrors are reported together"
+        (is (= :package/catalog-unavailable
+               (:problem (problem-of #(packages/catalog
+                                       {:urls ["https://down.example/a" "https://down.example/b"]
+                                        :expected-cid good-cid}))))))
+      (testing "one unreachable source keeps its own historical error"
+        (is (= :package/catalog-http-status
+               (:problem (problem-of #(packages/catalog
+                                       {:url "https://down.example/a"
+                                        :expected-cid good-cid})))))))))
+
+(deftest a-pinned-catalog-falls-back-to-trustless-gateways-by-cid
+  (let [good (minimal-catalog)
+        good-cid (mf/cidv1-raw good)
+        asked (atom [])]
+    (with-redefs [packages/http-get-bytes
+                  (fn [_ _] (throw (ex-info "down" {:problem :package/catalog-http-status})))
+                  routing/fetch-block-from
+                  (fn [gateway cid & _]
+                    (swap! asked conj [gateway cid])
+                    (case gateway
+                      "https://wrong-gw.example" (kbytes/utf8-bytes "not the catalog")
+                      "https://good-gw.example" good
+                      nil))]
+      (testing "gateways are asked for the pinned CID after every URL failed"
+        (let [result (packages/catalog {:urls ["https://down.example/c.edn"]
+                                        :gateways ["https://empty-gw.example"
+                                                   "https://wrong-gw.example"
+                                                   "https://good-gw.example"]
+                                        :expected-cid good-cid})]
+          (is (= good-cid (:cid result)))
+          (is (= "https://good-gw.example" (:gateway result)))
+          (is (= [["https://empty-gw.example" good-cid]
+                  ["https://wrong-gw.example" good-cid]
+                  ["https://good-gw.example" good-cid]]
+                 @asked))))
+      (testing "without a pin there is no name to ask a gateway for"
+        (reset! asked [])
+        (is (= :package/catalog-http-status
+               (:problem (problem-of #(packages/catalog
+                                       {:urls ["https://down.example/c.edn"]
+                                        :gateways ["https://good-gw.example"]})))))
+        (is (empty? @asked))))
+    (testing "the catalog size cap also binds the gateway path"
+      (let [huge (byte-array (inc packages/max-catalog-bytes))]
+        (with-redefs [packages/http-get-bytes
+                      (fn [_ _] (throw (ex-info "down" {:problem :package/catalog-http-status})))
+                      routing/fetch-block-from (fn [& _] huge)]
+          (is (= :package/catalog-unavailable
+                 (:problem (problem-of #(packages/catalog
+                                         {:urls ["https://down.example/c.edn"]
+                                          :gateways ["https://huge-gw.example"]
+                                          :expected-cid (mf/cidv1-raw huge)}))))))))))
+
+(deftest install-accepts-an-ordered-catalog-mirror-list
+  ;; One provider only, so install stops right after the catalog is accepted
+  ;; (`:release-contract-incomplete`) and never reaches network hydration.
+  (let [release-cid (mf/cidv1-raw (kbytes/utf8-bytes "release"))
+        attestation (package-pqc/sign
+                     {:ed25519-seed (seed 1) :ml-dsa-seed (seed 2)
+                      :release-cid release-cid
+                      :publication-record-cid release-cid})
+        bytes (kbytes/utf8-bytes
+               (pr-str (update-in (registry release-cid release-cid "did:key:zMirror"
+                                            attestation
+                                            ["https://one.example" "https://two.example"])
+                                  [:records 0 :registry/providers] pop)))
+        seen (atom [])]
+    (is (= :package/release-contract-incomplete
+           (:problem
+            (problem-of
+             #(with-redefs [packages/http-get-bytes
+                            (fn [url _]
+                              (swap! seen conj url)
+                              (if (= url "https://second.example/c.edn")
+                                bytes
+                                (throw (ex-info "down" {:problem :package/catalog-http-status}))))]
+                (packages/install!
+                 {:coordinate "kotoba-lang/reference-math@0.1.0"
+                  :catalog-urls ["https://first.example/c.edn" "https://second.example/c.edn"]
+                  :catalog-cid (mf/cidv1-raw bytes)}))))))
+    (is (= ["https://first.example/c.edn" "https://second.example/c.edn"] @seen))))

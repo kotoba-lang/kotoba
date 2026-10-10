@@ -9,6 +9,7 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [kotoba.lang.text :as str]
+            [kotoba.endpoint-config :as endpoint-config]
             [kotoba.security.information-flow :as information-flow])
   (:import [java.awt Desktop Desktop$Action]
            [java.net URI]
@@ -17,8 +18,52 @@
            [java.nio.file.attribute FileAttribute PosixFilePermissions]
            [java.time Duration Instant]))
 
-(def canonical-rp-id "auth.kotoba.cloud")
+(def canonical-rp-id
+  "The default Passkey RP. Still the only one accepted unless the operator
+  configures an allow-list (`KOTOBA_PASSKEY_RP_IDS`)."
+  "auth.kotoba.cloud")
 (def canonical-origin (str "https://" canonical-rp-id))
+
+(def rp-ids-env
+  "Comma-separated Passkey RP allow-list. The FIRST entry is the RP `kotoba id
+  new` uses when `--rp-id` is not given; every entry must be a bare lowercase
+  DNS hostname (no scheme, port or path), and the device flow is spoken to
+  `https://<rp-id>` -- the RP and the origin can never be configured apart."
+  "KOTOBA_PASSKEY_RP_IDS")
+
+(defn valid-rp-id?
+  "A bare lowercase DNS hostname with at least two labels."
+  [rp-id]
+  (boolean
+   (and (string? rp-id)
+        (<= (count rp-id) 253)
+        (re-matches #"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]"
+                    rp-id))))
+
+(defn allowed-rp-ids
+  "The ordered Passkey RP allow-list. Entries that are not valid hostnames are
+  never allowed; when the variable is unset, blank, or names no valid RP the
+  list is exactly `[canonical-rp-id]`, so the historical behaviour holds."
+  []
+  (or (some->> (endpoint-config/env-list rp-ids-env)
+               (filter valid-rp-id?)
+               seq
+               vec)
+      [canonical-rp-id]))
+
+(defn default-rp-id
+  "The RP `kotoba id new` asks for when none is given."
+  []
+  (first (allowed-rp-ids)))
+
+(defn allowed-rp-id?
+  [rp-id]
+  (boolean (some #{rp-id} (allowed-rp-ids))))
+
+(defn rp-origin
+  "The only origin a given RP's device flow is spoken to."
+  [rp-id]
+  (str "https://" rp-id))
 (def principal-relpath "kotoba/principal.edn")
 
 (def ^:dynamic *principal-path* nil)
@@ -50,40 +95,41 @@
 
 (defn write-principal!
   "Persist only the verified public projection, mode 0600."
-  [path identity]
-  (when-not (public-identity? identity)
-    (throw (ex-info "principal projection is not verified public identity"
-                    {:problem :id/invalid-principal-projection})))
-  (let [flow-decision
-        (information-flow/evaluate-egress
-         {:subject (:principalId identity)
-          :purpose :kotoba.principal/store-public-projection
-          :now (str (Instant/now))
-          :input-classifications [:public]
-          :output-classification :public})]
-    (when-not (:information-flow/allowed? flow-decision)
-      (throw (ex-info "principal projection rejected by information-flow policy"
-                      {:problem :id/information-flow-denied
-                       :decision flow-decision}))))
-  (let [nio (.toPath (io/file path))
-        parent (.getParent nio)
-        record {:kotoba.principal/version 1
-                :kotoba.principal/id (:principalId identity)
-                :kotoba.principal/username (:handle identity)
-                :kotoba.principal/account-did (:accountDid identity)
-                :kotoba.principal/controller (:activeDid identity)
-                :kotoba.principal/rp-id canonical-rp-id
-                :kotoba.principal/verified-at (str (Instant/now))}]
-    (when parent
-      (Files/createDirectories parent (make-array FileAttribute 0))
-      (set-posix-mode! parent "rwx------"))
-    (Files/write nio
-                 (kbytes/utf8-bytes (str (pr-str record) "\n"))
-                 (into-array OpenOption [StandardOpenOption/CREATE
-                                         StandardOpenOption/TRUNCATE_EXISTING
-                                         StandardOpenOption/WRITE]))
-    (set-posix-mode! nio "rw-------")
-    record))
+  ([path identity] (write-principal! path identity canonical-rp-id))
+  ([path identity rp-id]
+   (when-not (public-identity? identity)
+     (throw (ex-info "principal projection is not verified public identity"
+                     {:problem :id/invalid-principal-projection})))
+   (let [flow-decision
+         (information-flow/evaluate-egress
+          {:subject (:principalId identity)
+           :purpose :kotoba.principal/store-public-projection
+           :now (str (Instant/now))
+           :input-classifications [:public]
+           :output-classification :public})]
+     (when-not (:information-flow/allowed? flow-decision)
+       (throw (ex-info "principal projection rejected by information-flow policy"
+                       {:problem :id/information-flow-denied
+                        :decision flow-decision}))))
+   (let [nio (.toPath (io/file path))
+         parent (.getParent nio)
+         record {:kotoba.principal/version 1
+                 :kotoba.principal/id (:principalId identity)
+                 :kotoba.principal/username (:handle identity)
+                 :kotoba.principal/account-did (:accountDid identity)
+                 :kotoba.principal/controller (:activeDid identity)
+                 :kotoba.principal/rp-id rp-id
+                 :kotoba.principal/verified-at (str (Instant/now))}]
+     (when parent
+       (Files/createDirectories parent (make-array FileAttribute 0))
+       (set-posix-mode! parent "rwx------"))
+     (Files/write nio
+                  (kbytes/utf8-bytes (str (pr-str record) "\n"))
+                  (into-array OpenOption [StandardOpenOption/CREATE
+                                          StandardOpenOption/TRUNCATE_EXISTING
+                                          StandardOpenOption/WRITE]))
+     (set-posix-mode! nio "rw-------")
+     record)))
 
 (defn read-principal
   ([] (read-principal (principal-path)))
@@ -111,10 +157,10 @@
                ((juxt :principalId :accountDid :activeDid :handle) identity))))
 
 (defn- post-json
-  [path body]
+  [origin path body]
   (let [client (.build (-> (HttpClient/newBuilder)
                            (.connectTimeout (Duration/ofSeconds 5))))
-        request (-> (HttpRequest/newBuilder (URI/create (str canonical-origin path)))
+        request (-> (HttpRequest/newBuilder (URI/create (str origin path)))
                     (.timeout (Duration/ofSeconds 10))
                     (.header "accept" "application/json")
                     (.header "content-type" "application/json")
@@ -159,51 +205,64 @@
     (catch Exception _ false)))
 
 (defn device-authorize!
-  []
-  (let [{:keys [status body]} (post-json "/v1/device/start" {})]
-    (when-not (= 200 status)
-      (throw (ex-info "Kotoba identity service refused device authorization"
-                      {:status status :error (:error body)})))
-    (let [code (:deviceCode body)
-          verification (:verificationUriComplete body)
-          interval (long (max 1 (or (:interval body) 2)))
-          deadline (+ (System/currentTimeMillis)
-                      (* 1000 (long (or (:expiresIn body) 600))))
-          opened? ((or *browser-open!* open-browser!) verification)]
-      (binding [*out* *err*]
-        (println "PasskeyでKotoba CLIを接続してください:")
-        (println verification)
-        (println "確認コード:" (:userCode body))
-        (when-not opened? (println "ブラウザを自動で開けなかったため、上のURLを開いてください。")))
-      (loop []
-        (when (>= (System/currentTimeMillis) deadline)
-          (throw (ex-info "Kotoba Passkey approval timed out" {:error :expired-token})))
-        (let [{poll-status :status poll-body :body poll-retry-after :retry-after}
-              (post-json "/v1/device/token" {:deviceCode code})]
-          (cond
-            (= 200 poll-status) (:identity poll-body)
-            (#{428 429} poll-status)
-            (do (Thread/sleep (* 1000 (device-retry-delay-seconds
-                                       poll-status interval poll-retry-after)))
-                (recur))
-            :else (throw (ex-info "Kotoba Passkey approval failed"
-                                  {:status poll-status :error (:error poll-body)}))))))))
+  ([] (device-authorize! (default-rp-id)))
+  ([rp-id]
+   (when-not (allowed-rp-id? rp-id)
+     (throw (ex-info "Passkey RP is not in the allow-list"
+                     {:error :noncanonical-rp :rp-id rp-id})))
+   (let [origin (rp-origin rp-id)
+         {:keys [status body]} (post-json origin "/v1/device/start" {})]
+     (when-not (= 200 status)
+       (throw (ex-info "Kotoba identity service refused device authorization"
+                       {:status status :error (:error body)})))
+     (let [code (:deviceCode body)
+           verification (:verificationUriComplete body)
+           interval (long (max 1 (or (:interval body) 2)))
+           deadline (+ (System/currentTimeMillis)
+                       (* 1000 (long (or (:expiresIn body) 600))))
+           opened? ((or *browser-open!* open-browser!) verification)]
+       (binding [*out* *err*]
+         (println "PasskeyでKotoba CLIを接続してください:")
+         (println verification)
+         (println "確認コード:" (:userCode body))
+         (when-not opened? (println "ブラウザを自動で開けなかったため、上のURLを開いてください。")))
+       (loop []
+         (when (>= (System/currentTimeMillis) deadline)
+           (throw (ex-info "Kotoba Passkey approval timed out" {:error :expired-token})))
+         (let [{poll-status :status poll-body :body poll-retry-after :retry-after}
+               (post-json origin "/v1/device/token" {:deviceCode code})]
+           (cond
+             (= 200 poll-status) (:identity poll-body)
+             (#{428 429} poll-status)
+             (do (Thread/sleep (* 1000 (device-retry-delay-seconds
+                                        poll-status interval poll-retry-after)))
+                 (recur))
+             :else (throw (ex-info "Kotoba Passkey approval failed"
+                                   {:status poll-status :error (:error poll-body)})))))))))
 
 (defn enroll-result
   [authority-result]
-  (let [requested-rp (get-in authority-result [:kotoba.cli/data :controller :rp-id])]
-    (if-not (= canonical-rp-id requested-rp)
+  (let [requested-rp (get-in authority-result [:kotoba.cli/data :controller :rp-id])
+        allowed (allowed-rp-ids)]
+    ;; Refused before any browser opens, exactly as before; the allow-list is
+    ;; `[canonical-rp-id]` unless the operator configured one.
+    (if-not (some #{requested-rp} allowed)
       {:kotoba.cli/ok? false
        :kotoba.cli/code :id/noncanonical-rp
-       :kotoba.cli/message (str "kotoba id new uses the canonical Passkey RP " canonical-rp-id)
-       :kotoba.cli/data {:requested-rp-id requested-rp :rp-id canonical-rp-id}}
+       :kotoba.cli/message (str "kotoba id new uses an allow-listed Passkey RP "
+                                (str/join ", " allowed))
+       :kotoba.cli/data {:requested-rp-id requested-rp :rp-id (first allowed)
+                         :allowed-rp-ids allowed}}
       (try
-        (let [identity ((or *device-authorize!* device-authorize!))]
+        (let [rp-id requested-rp
+              identity (if *device-authorize!*
+                         (*device-authorize!*)
+                         (device-authorize! rp-id))]
           (if-not (public-identity? identity)
             {:kotoba.cli/ok? false :kotoba.cli/code :id/invalid-principal-projection
-             :kotoba.cli/data {:rp-id canonical-rp-id}}
+             :kotoba.cli/data {:rp-id rp-id}}
             (let [path (principal-path)
-                  stored (write-principal! path identity)]
+                  stored (write-principal! path identity rp-id)]
               {:kotoba.cli/ok? true
                :kotoba.cli/code :id/enrolled
                :kotoba.cli/data
@@ -211,7 +270,7 @@
                         :username (:kotoba.principal/username stored)
                         :account-did (:kotoba.principal/account-did stored)
                         :controller {:kind :passkey
-                                     :rp-id canonical-rp-id
+                                     :rp-id rp-id
                                      :did (:kotoba.principal/controller stored)}
                         :method :passkey-smart-account
                         :proof :webauthn-passkey
@@ -225,7 +284,7 @@
           {:kotoba.cli/ok? false
            :kotoba.cli/code :id/enrollment-failed
            :kotoba.cli/message (ex-message error)
-           :kotoba.cli/data (merge {:rp-id canonical-rp-id}
+           :kotoba.cli/data (merge {:rp-id requested-rp}
                                    (select-keys (ex-data error) [:status :error]))})))))
 
 (defn show-result
