@@ -14,6 +14,10 @@
   set-but-blank variable is treated as unset, so `KOTOBA_ROUTERS=` cannot
   silently produce an empty list that disables discovery.
 
+  Entries that are not absolute http(s) URLs (or carry userinfo, a query or a
+  fragment) are dropped with a stderr warning; a list left empty by that is an
+  error (`resolve-endpoints`). Trailing `/` is stripped.
+
   Nothing here adds trust. Whatever a configured host returns is still checked
   by the caller exactly as before (CID, size cap, no redirects, signatures)."
   (:require [kotoba.lang.text :as str]))
@@ -46,3 +50,83 @@
   (or (some->> cli-values (remove str/blank?) distinct seq vec)
       (env-list name)
       (vec defaults)))
+
+;; ---------------------------------------------------------------------------
+;; Endpoint validation (review of PR #632, finding 3).
+;;
+;; A malformed entry used to reach `URI/create` / the HTTP client and throw
+;; IllegalArgumentException out of the whole operation, and a trailing `/`
+;; produced `//ipfs/...`. Entries are now checked once, where they enter.
+
+(defn normalize-endpoint
+  "ENTRY as a normalized base URL, or nil when it is not one.
+
+  Accepted: absolute `http`/`https` URLs with a host, no userinfo, no query,
+  no fragment. Trailing `/` characters are stripped so callers can append
+  `/ipfs/...` or `/routing/v1/...` safely. A path is kept (IPNS routers are
+  configured as `.../routing/v1`)."
+  [entry]
+  (when (string? entry)
+    #?(:clj
+       (try
+         (let [uri (java.net.URI. (str/trim entry))
+               scheme (some-> (.getScheme uri) str/lower)]
+           (when (and (#{"http" "https"} scheme)
+                      (not (str/blank? (.getHost uri)))
+                      (nil? (.getRawUserInfo uri))
+                      (nil? (.getRawQuery uri))
+                      (nil? (.getRawFragment uri))
+                      (not (.isOpaque uri)))
+             (let [path (str/replace (or (.getRawPath uri) "") #"/+$" "")]
+               (str scheme "://" (.getRawAuthority uri) path))))
+         (catch java.net.URISyntaxException _ nil))
+       :cljs
+       (try
+         (let [url (js/URL. (str/trim entry))
+               scheme (subs (.-protocol url) 0 (dec (count (.-protocol url))))]
+           (when (and (#{"http" "https"} scheme)
+                      (not (str/blank? (.-hostname url)))
+                      (str/blank? (.-username url))
+                      (str/blank? (.-password url))
+                      (str/blank? (.-search url))
+                      (str/blank? (.-hash url))
+                      ;; js/URL resolves "a.example" relative to nothing → throws;
+                      ;; require the scheme to have been written explicitly.
+                      (str/starts-with? (str/lower (str/trim entry)) (str scheme "://")))
+             (str scheme "://" (.-host url)
+                  (str/replace (.-pathname url) #"/+$" ""))))
+         (catch :default _ nil)))))
+
+(defn- warn! [message]
+  #?(:clj (binding [*out* *err*] (println message))
+     :cljs (.error js/console message)))
+
+(defn validate-endpoints
+  "Normalize ENTRIES (from SOURCE, a label such as an env var name or `--gateway`).
+  Invalid entries are dropped with a warning on stderr; if entries were given
+  but none is valid, fail with `:endpoint/no-valid-endpoints` rather than
+  silently falling back to a default the operator did not choose."
+  [entries source]
+  (let [checked (map (fn [entry] [entry (normalize-endpoint entry)]) entries)
+        invalid (keep (fn [[entry ok]] (when-not ok entry)) checked)
+        valid (vec (distinct (keep second checked)))]
+    (doseq [entry invalid]
+      (warn! (str "kotoba: ignoring invalid endpoint " (pr-str entry) " from " source
+                  " (expected an absolute http(s) URL without userinfo, query or fragment)")))
+    (when (and (seq entries) (empty? valid))
+      (throw (ex-info "no valid endpoint configured"
+                      {:problem :endpoint/no-valid-endpoints
+                       :source source
+                       :invalid (vec invalid)})))
+    valid))
+
+(defn resolve-endpoints
+  "`resolve-list`, then `validate-endpoints` on whichever layer won. Defaults
+  are trusted constants and are validated too, cheaply."
+  [cli-values name defaults]
+  (let [cli (some->> cli-values (remove str/blank?) distinct seq vec)
+        env (when-not cli (env-list name))]
+    (cond
+      cli (validate-endpoints cli "command-line flag")
+      env (validate-endpoints env name)
+      :else (validate-endpoints (vec defaults) "built-in defaults"))))

@@ -29,8 +29,11 @@
   (:require [json.data-json :as json]
             [kotoba.lang.text :as str]
             [kotoba.codebase.fetch :as fetch]
+            [kotoba.codebase.store :as store]
             [kotoba.endpoint-config :as endpoint-config])
-  (:import [java.io ByteArrayOutputStream]
+  (:import [java.io ByteArrayOutputStream InputStream]
+           [java.util.concurrent Callable ExecutionException Executors ThreadFactory
+            TimeUnit TimeoutException]
            [java.net URI]
            [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.time Duration]))
@@ -53,13 +56,22 @@
   "Trustless gateways tried when routing returns no HTTP-reachable provider.
 
   A fixed list is a convenience, not an authority: these are asked for bytes
-  that are checked against the CID, so including one grants it nothing. The
-  first two are the historical defaults (same order); the rest are operated
-  by different parties and were observed serving `?format=raw` without a
-  redirect (2026-10-10). Override with `KOTOBA_GATEWAYS` or `--gateway`."
-  ["https://trustless-gateway.link" "https://ipfs.io"
-   "https://ipfs.filebase.io" "https://gateway.pinata.cloud"
-   "https://ipfs.4everland.io"])
+  that are checked against the CID, so including one grants it nothing for
+  integrity. It does grant it something else: every gateway asked sees the
+  CID being fetched and the client's IP. So the default is the one gateway the
+  CLI effectively used before (`ipfs.io` 301-redirects `?format=raw` to it, and
+  redirects are refused, so `ipfs.io` was a dead entry) and further operators
+  are opt-in -- see `opt-in-gateways` and docs/ADR-configurable-endpoints.md.
+  Override with `KOTOBA_GATEWAYS` or `--gateway`."
+  ["https://trustless-gateway.link"])
+
+(def opt-in-gateways
+  "Further public trustless gateways, run by other (commercial) operators,
+  observed serving `?format=raw` with a 200 and no redirect (2026-10-10).
+  Not used unless the operator lists them, e.g.
+  `KOTOBA_GATEWAYS=https://trustless-gateway.link,https://ipfs.filebase.io,https://gateway.pinata.cloud`.
+  `ipfs.4everland.io` was dropped: 53 s observed for a 117 KB block."
+  ["https://ipfs.filebase.io" "https://gateway.pinata.cloud"])
 
 (def routers-env "KOTOBA_ROUTERS")
 (def gateways-env "KOTOBA_GATEWAYS")
@@ -67,12 +79,12 @@
 (defn configured-routers
   "Routers in effect: CLI values > `KOTOBA_ROUTERS` > `default-routers`."
   ([] (configured-routers nil))
-  ([cli-values] (endpoint-config/resolve-list cli-values routers-env default-routers)))
+  ([cli-values] (endpoint-config/resolve-endpoints cli-values routers-env default-routers)))
 
 (defn configured-gateways
   "Gateways in effect: CLI values > `KOTOBA_GATEWAYS` > `default-gateways`."
   ([] (configured-gateways nil))
-  ([cli-values] (endpoint-config/resolve-list cli-values gateways-env default-gateways)))
+  ([cli-values] (endpoint-config/resolve-endpoints cli-values gateways-env default-gateways)))
 
 (defn configured-router
   "The single router a one-router caller should use: the first configured."
@@ -111,18 +123,53 @@
       (.GET)
       (.build)))
 
-(defn- read-bounded
-  "Read at most `max-block-bytes`, so a gateway cannot stream forever."
-  [^java.io.InputStream in]
+(defn- base-url
+  "BASE without trailing `/`, so `base + \"/ipfs/...\"` never doubles the slash."
+  [base]
+  (str/replace (str base) #"/+$" ""))
+
+(def ^:private reader-pool
+  "Daemon threads for deadline-bounded body reads: an abandoned read must not
+  keep the CLI's JVM alive."
+  (delay (Executors/newCachedThreadPool
+          (reify ThreadFactory
+            (newThread [_ runnable]
+              (doto (Thread. ^Runnable runnable "kotoba-routing-read")
+                (.setDaemon true)))))))
+
+(defn- read-loop [^InputStream in max-bytes deadline-ms]
   (let [out (ByteArrayOutputStream.)
         buffer (byte-array 65536)]
     (loop []
+      (when (and deadline-ms (> (System/currentTimeMillis) deadline-ms))
+        (fail! :routing/body-deadline-exceeded {}))
       (let [n (.read in buffer)]
         (cond
           (neg? n) (.toByteArray out)
-          (> (+ (.size out) n) max-block-bytes)
-          (fail! :routing/block-too-large {:limit max-block-bytes})
+          (> (+ (.size out) n) max-bytes)
+          (fail! :routing/block-too-large {:limit max-bytes})
           :else (do (.write out buffer 0 n) (recur)))))))
+
+(defn read-bounded
+  "Read at most `:max-bytes` (default `max-block-bytes`), so a gateway cannot
+  stream forever, and -- with `:deadline-ms` (epoch millis) -- finish by then,
+  so it cannot trickle forever either. The deadline is enforced even while a
+  single `read` is blocked: the read runs on a daemon thread and is abandoned
+  (stream closed, thread interrupted) when the deadline passes."
+  ([in] (read-bounded in {}))
+  ([^InputStream in {:keys [max-bytes deadline-ms] :or {max-bytes max-block-bytes}}]
+   (if-not deadline-ms
+     (read-loop in max-bytes nil)
+     (let [work (.submit ^java.util.concurrent.ExecutorService @reader-pool
+                         ^Callable (fn [] (read-loop in max-bytes deadline-ms)))]
+       (try
+         (.get work (max 0 (- deadline-ms (System/currentTimeMillis))) TimeUnit/MILLISECONDS)
+         (catch TimeoutException _
+           (.cancel work true)
+           (try (.close in) (catch Exception _ nil))
+           (fail! :routing/body-deadline-exceeded {}))
+         (catch ExecutionException e
+           (throw (or (.getCause e) e))))))))
 
 (defn multiaddr->base-url
   "Convert an HTTP-capable multiaddr to a base URL, or nil.
@@ -159,7 +206,7 @@
   ([cid] (providers cid {}))
   ([cid {:keys [router timeout-ms] :or {timeout-ms default-timeout-ms}}]
    (let [router (or router (configured-router))
-         url (str router "/routing/v1/providers/" cid
+         url (str (base-url router) "/routing/v1/providers/" cid
                   "?filter-protocols=transport-ipfs-gateway-http")
          response (.send (client timeout-ms)
                          (request url "application/json" timeout-ms)
@@ -202,7 +249,7 @@
   ([cid] (provider-identities cid {}))
   ([cid {:keys [router timeout-ms] :or {timeout-ms default-timeout-ms}}]
    (let [router (or router (configured-router))
-         url (str router "/routing/v1/providers/" cid)
+         url (str (base-url router) "/routing/v1/providers/" cid)
          response (.send (client timeout-ms)
                          (request url "application/json" timeout-ms)
                          (HttpResponse$BodyHandlers/ofString))]
@@ -220,19 +267,30 @@
 
   nil rather than an exception for a miss: a provider that does not have the
   block is the normal case when several are being tried, and only a block whose
-  bytes fail verification is an actual fault."
-  ([base-url cid] (fetch-block-from base-url cid {}))
-  ([base-url cid {:keys [timeout-ms] :or {timeout-ms default-timeout-ms}}]
-   (try
-     (let [url (str base-url "/ipfs/" cid "?format=raw")
-           response (.send (client timeout-ms)
-                           (request url "application/vnd.ipld.raw" timeout-ms)
-                           (HttpResponse$BodyHandlers/ofInputStream))]
-       (when (= 200 (.statusCode response))
-         (with-open [in (.body response)]
-           (read-bounded in))))
-     (catch java.io.IOException _ nil)
-     (catch java.net.http.HttpTimeoutException _ nil))))
+  bytes fail verification is an actual fault. A malformed BASE (no scheme,
+  `file:`, unparsable) is a miss too, not an abort of the whole operation.
+
+  `:timeout-ms` bounds the whole fetch, body included; `:max-bytes` (default
+  `max-block-bytes`) stops the read as soon as it is exceeded, so a caller with
+  a smaller cap (the 1 MiB catalog) never reads more than that."
+  ([base cid] (fetch-block-from base cid {}))
+  ([base cid {:keys [timeout-ms max-bytes]
+              :or {timeout-ms default-timeout-ms max-bytes max-block-bytes}}]
+   (let [deadline-ms (+ (System/currentTimeMillis) timeout-ms)]
+     (try
+       (let [url (str (base-url base) "/ipfs/" cid "?format=raw")
+             response (.send (client timeout-ms)
+                             (request url "application/vnd.ipld.raw" timeout-ms)
+                             (HttpResponse$BodyHandlers/ofInputStream))]
+         (with-open [in ^InputStream (.body response)]
+           (when (= 200 (.statusCode response))
+             (read-bounded in {:max-bytes max-bytes :deadline-ms deadline-ms}))))
+       (catch clojure.lang.ExceptionInfo e
+         (if (= :routing/body-deadline-exceeded (:problem (ex-data e)))
+           nil
+           (throw e)))
+       (catch IllegalArgumentException _ nil)
+       (catch java.io.IOException _ nil)))))
 
 (defn routed-providers
   "Ask ROUTERS in order and return the first non-empty HTTP provider list.
@@ -254,8 +312,16 @@
 
   Provider lists are resolved per CID and cached for the life of the source, so
   hydrating a closure of fifty blocks does not mean fifty routing round trips
-  when they all live in the same place. Bytes are still verified per block by
-  the caller -- caching WHERE to ask never caches what was said.
+  when they all live in the same place. Caching WHERE to ask never caches what
+  was said.
+
+  Bytes are verified against the CID here, per candidate (raw or dag-cbor by
+  the CID's codec, with `kotoba.codebase.fetch`'s own checks): a candidate that
+  serves the wrong bytes, an oversized body, or nothing is skipped and the next
+  is tried, so one junk gateway early in the list cannot end a pull. If no
+  candidate served the right bytes and at least one served wrong ones, that is
+  still reported as `:codebase/fetched-cid-mismatch`. `hydrate!` verifies
+  again (defense in depth).
 
   Routers: `:router` (exactly one, historical), `:routers` (ordered list), or
   the configured list. Gateways: `:gateways` when given (even empty -- an
@@ -277,14 +343,31 @@
                ;; Providers already known to have answered come first: the
                ;; closure of one definition is usually held by one host.
                candidates (distinct (concat @discovered routed gateways))]
-           (loop [remaining candidates]
-             (when-let [base (first remaining)]
-               (if-let [bytes (fetch-block-from base cid {:timeout-ms timeout-ms})]
-                 (do (swap! discovered #(vec (distinct (cons base %))))
-                     (when verbose? (swap! attempts conj {:cid cid :from base :ok? true}))
-                     bytes)
-                 (do (when verbose? (swap! attempts conj {:cid cid :from base :ok? false}))
-                     (recur (next remaining))))))))
+           (loop [remaining candidates
+                  rejected []]
+             (if-let [base (first remaining)]
+               (let [outcome (try
+                               (when-let [bytes (fetch-block-from base cid {:timeout-ms timeout-ms})]
+                                 (if (store/raw-cid? cid)
+                                   (fetch/verify-raw-bytes cid bytes)
+                                   (fetch/verify-bytes cid bytes))
+                                 {:bytes bytes})
+                               (catch clojure.lang.ExceptionInfo e
+                                 {:problem (or (:problem (ex-data e)) :routing/fetch-failed)}))]
+                 (if-let [bytes (:bytes outcome)]
+                   (do (swap! discovered #(vec (distinct (cons base %))))
+                       (when verbose? (swap! attempts conj {:cid cid :from base :ok? true}))
+                       bytes)
+                   (do (when verbose? (swap! attempts conj (cond-> {:cid cid :from base :ok? false}
+                                                             (:problem outcome)
+                                                             (assoc :problem (:problem outcome)))))
+                       (recur (next remaining)
+                              (cond-> rejected
+                                (#{:codebase/fetched-cid-mismatch
+                                   :codebase/fetched-block-not-canonical} (:problem outcome))
+                                (conj base))))))
+               (when (seq rejected)
+                 (fail! :codebase/fetched-cid-mismatch {:cid cid :from rejected}))))))
        {:discovered discovered :attempts attempts
         :routers routers :gateways gateways}))))
 
@@ -344,21 +427,39 @@
   Asked of the routing layer, not of whoever was asked to pin: the question is
   whether the network can find it, and only the network answers that. With
   several routers (`:routers`, or the configured list when no `:router` is
-  given) the first that names a provider answers."
+  given) the first that names a provider answers.
+
+  A router that errors or answers non-200 is an outage, not a `no`: it is kept
+  under `:errors`, and when EVERY router failed this throws
+  `:codebase/announce-failed` instead of reporting `:announced? false`."
   ([cid] (announced? cid {}))
   ([cid opts]
-   (loop [[router & more] (routers-of opts)
-          last-answer nil]
-     (if-not router
-       (let [{:keys [providers status router]} last-answer]
-         {:cid cid :status status :router router :providers (or providers [])
-          :announced? false})
-       (let [answer (try (providers cid (assoc (dissoc opts :routers) :router router))
-                         (catch Exception _ {:router router :providers [] :status nil}))]
-         (if (seq (:providers answer))
-           {:cid cid :status (:status answer) :router router
-            :providers (:providers answer) :announced? true}
-           (recur more answer)))))))
+   (let [routers (routers-of opts)]
+     (loop [[router & more] routers
+            last-answer nil
+            errors []]
+       (if-not router
+         (if (and (seq errors) (= (count errors) (count routers)))
+           (fail! :codebase/announce-failed {:cid cid :errors errors})
+           (let [{:keys [providers status router]} last-answer]
+             (cond-> {:cid cid :status status :router router :providers (or providers [])
+                      :announced? false}
+               (seq errors) (assoc :errors errors))))
+         (let [answer (try (providers cid (assoc (dissoc opts :routers) :router router))
+                           (catch Exception e {:router router :providers [] :status nil
+                                               :error (or (ex-message e) (str (class e)))}))]
+           (cond
+             (seq (:providers answer))
+             (cond-> {:cid cid :status (:status answer) :router router
+                      :providers (:providers answer) :announced? true}
+               (seq errors) (assoc :errors errors))
+
+             (or (:error answer) (not= 200 (:status answer)))
+             (recur more last-answer
+                    (conj errors (cond-> {:router router :status (:status answer)}
+                                   (:error answer) (assoc :error (:error answer)))))
+
+             :else (recur more answer errors))))))))
 
 (defn announce!
   "Request a pin, then verify by asking a router who provides the CID.
@@ -368,7 +469,12 @@
   reported fact into an implied guarantee."
   [cid opts]
   (let [requested (request-pin! cid opts)]
-    (assoc requested :verification (announced? cid opts))))
+    (assoc requested
+           :verification
+           (try (announced? cid opts)
+                (catch clojure.lang.ExceptionInfo e
+                  ;; Every router was down: keep what the pinning service said.
+                  (throw (ex-info (ex-message e) (assoc (ex-data e) :pin requested) e)))))))
 
 (defn pull!
   "Discover and hydrate the closure rooted at ROOTS into the local store.

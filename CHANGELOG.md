@@ -15,6 +15,16 @@ user-visible or architecturally significant changes.
   `KOTOBA_IPNS_ROUTERS`, `KOTOBA_PASSKEY_RP_IDS`) > defaults. Historical
   defaults stay first; verification (CID, no redirects, size caps, IPNS key,
   RP refusal before any browser opens) is unchanged.
+  Review follow-ups: `KOTOBA_PASSKEY_RP_IDS` only extends the allow-list
+  (implicit RP stays `auth.kotoba.cloud`; a non-canonical RP needs `--rp-id`,
+  warns, and is flagged in `principal.edn`); `block-source` verifies each
+  candidate and moves past junk gateways; endpoint entries are validated
+  (absolute http(s), no userinfo/query/fragment, trailing `/` stripped);
+  gateway bodies have an overall deadline; default gateways are only
+  `trustless-gateway.link` (others opt-in; `ipfs.io`, `ipfs.4everland.io`
+  dropped); catalog gateway fallback is opt-in; `announced?` reports router
+  outages; `KOTOBA_HOSTED_ENDPOINT` must be one HTTPS origin; the
+  availability-proof router ignores `KOTOBA_ROUTERS`.
 
 - Fixed: the emitter wrote a WebAssembly `call` operand as a single byte, so
   any module needing function index 128 or above got an operand with the

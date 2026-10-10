@@ -19,16 +19,23 @@
            [java.time Duration Instant]))
 
 (def canonical-rp-id
-  "The default Passkey RP. Still the only one accepted unless the operator
-  configures an allow-list (`KOTOBA_PASSKEY_RP_IDS`)."
+  "The Passkey RP `kotoba id new` uses unless `--rp-id` names another. Always
+  allowed, always the implicit default; the environment can add RPs to the
+  allow-list but can never replace or reorder this one."
   "auth.kotoba.cloud")
 (def canonical-origin (str "https://" canonical-rp-id))
 
 (def rp-ids-env
-  "Comma-separated Passkey RP allow-list. The FIRST entry is the RP `kotoba id
-  new` uses when `--rp-id` is not given; every entry must be a bare lowercase
-  DNS hostname (no scheme, port or path), and the device flow is spoken to
-  `https://<rp-id>` -- the RP and the origin can never be configured apart."
+  "Comma-separated ADDITIONAL Passkey RPs. The variable only EXTENDS the
+  allow-list (`canonical-rp-id` is always first and always the implicit
+  default): a non-canonical RP is used only when named explicitly with
+  `--rp-id`, and its enrollment is flagged (`:non-canonical-rp?`), warned about
+  on stderr, and recorded in principal.edn. Every entry must be a bare
+  lowercase DNS hostname (no scheme, port or path), and the device flow is
+  spoken to `https://<rp-id>` -- the RP and the origin can never be
+  configured apart. Rationale: whatever sets the environment of a shell (a
+  dotfile, a CI variable, a wrapper script) must not be able to silently
+  redirect identity enrollment to another host."
   "KOTOBA_PASSKEY_RP_IDS")
 
 (defn valid-rp-id?
@@ -41,20 +48,26 @@
                     rp-id))))
 
 (defn allowed-rp-ids
-  "The ordered Passkey RP allow-list. Entries that are not valid hostnames are
-  never allowed; when the variable is unset, blank, or names no valid RP the
-  list is exactly `[canonical-rp-id]`, so the historical behaviour holds."
+  "The ordered Passkey RP allow-list: `canonical-rp-id` first, then any valid
+  hostnames from `KOTOBA_PASSKEY_RP_IDS`. Invalid entries are never allowed
+  and are reported on stderr."
   []
-  (or (some->> (endpoint-config/env-list rp-ids-env)
-               (filter valid-rp-id?)
-               seq
-               vec)
-      [canonical-rp-id]))
+  (let [configured (endpoint-config/env-list rp-ids-env)]
+    (doseq [entry (remove valid-rp-id? configured)]
+      (binding [*out* *err*]
+        (println (str "kotoba: ignoring invalid Passkey RP " (pr-str entry) " from "
+                      rp-ids-env " (expected a bare lowercase hostname)"))))
+    (vec (distinct (cons canonical-rp-id (filter valid-rp-id? configured))))))
 
 (defn default-rp-id
-  "The RP `kotoba id new` asks for when none is given."
+  "The RP `kotoba id new` asks for when none is given: always the canonical
+  RP, whatever the environment says."
   []
-  (first (allowed-rp-ids)))
+  canonical-rp-id)
+
+(defn canonical-rp?
+  [rp-id]
+  (= canonical-rp-id rp-id))
 
 (defn allowed-rp-id?
   [rp-id]
@@ -97,6 +110,8 @@
   "Persist only the verified public projection, mode 0600."
   ([path identity] (write-principal! path identity canonical-rp-id))
   ([path identity rp-id]
+   (write-principal! path identity rp-id (not (canonical-rp? rp-id))))
+  ([path identity rp-id non-canonical-rp?]
    (when-not (public-identity? identity)
      (throw (ex-info "principal projection is not verified public identity"
                      {:problem :id/invalid-principal-projection})))
@@ -113,13 +128,14 @@
                         :decision flow-decision}))))
    (let [nio (.toPath (io/file path))
          parent (.getParent nio)
-         record {:kotoba.principal/version 1
+         record (cond-> {:kotoba.principal/version 1
                  :kotoba.principal/id (:principalId identity)
                  :kotoba.principal/username (:handle identity)
                  :kotoba.principal/account-did (:accountDid identity)
                  :kotoba.principal/controller (:activeDid identity)
                  :kotoba.principal/rp-id rp-id
-                 :kotoba.principal/verified-at (str (Instant/now))}]
+                 :kotoba.principal/verified-at (str (Instant/now))}
+                  non-canonical-rp? (assoc :kotoba.principal/non-canonical-rp? true))]
      (when parent
        (Files/createDirectories parent (make-array FileAttribute 0))
        (set-posix-mode! parent "rwx------"))
@@ -255,6 +271,15 @@
                          :allowed-rp-ids allowed}}
       (try
         (let [rp-id requested-rp
+              non-canonical? (not (canonical-rp? rp-id))
+              _ (when non-canonical?
+                  ;; The projection a non-canonical RP returns is only
+                  ;; shape-checked here; say so where a human will see it.
+                  (binding [*out* *err*]
+                    (println (str "kotoba: WARNING enrolling with non-canonical Passkey RP "
+                                  rp-id " (canonical: " canonical-rp-id "). Its identity "
+                                  "projection is shape-checked only, not vouched for by "
+                                  canonical-rp-id "."))))
               identity (if *device-authorize!*
                          (*device-authorize!*)
                          (device-authorize! rp-id))]
@@ -262,22 +287,24 @@
             {:kotoba.cli/ok? false :kotoba.cli/code :id/invalid-principal-projection
              :kotoba.cli/data {:rp-id rp-id}}
             (let [path (principal-path)
-                  stored (write-principal! path identity rp-id)]
+                  stored (write-principal! path identity rp-id non-canonical?)]
               {:kotoba.cli/ok? true
                :kotoba.cli/code :id/enrolled
                :kotoba.cli/data
                (cond-> {:principal (:kotoba.principal/id stored)
                         :username (:kotoba.principal/username stored)
                         :account-did (:kotoba.principal/account-did stored)
-                        :controller {:kind :passkey
-                                     :rp-id rp-id
-                                     :did (:kotoba.principal/controller stored)}
+                        :controller (cond-> {:kind :passkey
+                                             :rp-id rp-id
+                                             :did (:kotoba.principal/controller stored)}
+                                      non-canonical? (assoc :non-canonical-rp? true))
                         :method :passkey-smart-account
                         :proof :webauthn-passkey
                         :custody :passkey-provider
                         :authority :verified-device-flow
                         :path path
                         :chain-default nil}
+                 non-canonical? (assoc :non-canonical-rp? true)
                  (seq (get-in authority-result [:kotoba.cli/data :accounts]))
                  (assoc :accounts (get-in authority-result [:kotoba.cli/data :accounts])))})))
         (catch Exception error
@@ -294,9 +321,11 @@
      :kotoba.cli/data {:principal (:kotoba.principal/id record)
                        :username (:kotoba.principal/username record)
                        :account-did (:kotoba.principal/account-did record)
-                       :controller {:kind :passkey
-                                    :rp-id (:kotoba.principal/rp-id record)
-                                    :did (:kotoba.principal/controller record)}
+                       :controller (cond-> {:kind :passkey
+                                            :rp-id (:kotoba.principal/rp-id record)
+                                            :did (:kotoba.principal/controller record)}
+                                     (:kotoba.principal/non-canonical-rp? record)
+                                     (assoc :non-canonical-rp? true))
                        :path (principal-path)}}
     {:kotoba.cli/ok? false :kotoba.cli/code :id/not-enrolled
      :kotoba.cli/data {:path (principal-path)

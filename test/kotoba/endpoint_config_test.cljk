@@ -6,8 +6,13 @@
   only ever asked, never believed: routing still falls through to the next
   router, and fetched bytes are still verified by the caller."
   (:require [kotoba.test :refer [deftest is testing]]
+            [cbor.core :as cbor]
+            [kotoba.io :as kio]
+            [kotoba.lang.text :as str]
+            [kotoba.codebase.store :as store]
             [kotoba.endpoint-config :as endpoint-config]
-            [kotoba.codebase-routing :as routing])
+            [kotoba.codebase-routing :as routing]
+            [multiformats.core :as mf])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
            [java.net InetSocketAddress]))
 
@@ -32,10 +37,8 @@
 (deftest routing-defaults-are-a-list-whose-head-is-the-historical-default
   (is (= "https://delegated-ipfs.dev" routing/default-router))
   (is (< 1 (count routing/default-routers)) "discovery has no single mandatory router")
-  (is (= ["https://trustless-gateway.link" "https://ipfs.io"]
-         (subvec routing/default-gateways 0 2))
-      "historical gateways keep their position; new ones are appended")
-  (is (< 2 (count (distinct routing/default-gateways))))
+  (is (= "https://trustless-gateway.link" (first routing/default-gateways))
+      "the historical (effective) gateway keeps its position")
   (binding [endpoint-config/*getenv* (env {})]
     (is (= routing/default-routers (routing/configured-routers)))
     (is (= routing/default-gateways (routing/configured-gateways))))
@@ -74,45 +77,48 @@
 
 (deftest a-dead-router-does-not-end-discovery
   (let [block (utf8 "block-bytes")
+        cid (mf/cidv1-raw block)
         provider (server (fn [_ path]
-                           (if (= path "/ipfs/bafkreiexample")
+                           (if (= path (str "/ipfs/" cid))
                              [200 block]
                              [404 nil])))
         dead-router (server (fn [_ _] [503 nil]))
         live-router (server
                      (fn [_ path]
-                       (if (= path "/routing/v1/providers/bafkreiexample")
+                       (if (= path (str "/routing/v1/providers/" cid))
                          [200 (utf8 (str "{\"Providers\":[{\"ID\":\"peer\",\"Addrs\":"
                                          "[\"/ip4/127.0.0.1/tcp/" (:port provider) "/http\"]}]}"))]
                          [404 nil])))]
     (try
       (testing "the first router that names a provider answers"
         (is (= [(:url provider)]
-               (routing/routed-providers "bafkreiexample"
+               (routing/routed-providers cid
                                          [(:url dead-router) (:url live-router)] {}))))
       (testing "block-source walks the ordered routers, gateways only as fallback"
         (let [source (routing/block-source {:routers [(:url dead-router) (:url live-router)]
                                             :gateways []})]
-          (is (= "block-bytes" (String. ^bytes (source "bafkreiexample") "UTF-8")))
+          (is (= "block-bytes" (String. ^bytes (source cid) "UTF-8")))
           (is (= [(:url provider)] @(:discovered (meta source))))))
       (testing "an explicit :router still means exactly that router"
         (let [source (routing/block-source {:router (:url dead-router) :gateways []})]
-          (is (nil? (source "bafkreiexample")))
+          (is (nil? (source cid)))
           (is (= [(:url dead-router)] (:routers (meta source))))))
       (testing "announced? asks each router until one names a provider"
-        (let [answer (routing/announced? "bafkreiexample"
+        (let [answer (routing/announced? cid
                                          {:routers [(:url dead-router) (:url live-router)]})]
           (is (true? (:announced? answer)))
           (is (= (:url live-router) (:router answer))))
-        (is (false? (:announced? (routing/announced? "bafkreiexample"
-                                                     {:routers [(:url dead-router)]})))))
+        (is (= :codebase/announce-failed
+               (:problem (ex-data (try (routing/announced? cid {:routers [(:url dead-router)]})
+                                       (catch clojure.lang.ExceptionInfo e e)))))
+            "a router outage is not evidence that nobody provides the CID"))
       (testing "with no router or gateway option, the configured lists are used"
         (binding [endpoint-config/*getenv* (env {"KOTOBA_ROUTERS" (:url live-router)
                                                  "KOTOBA_GATEWAYS" "http://127.0.0.1:1"})]
           (let [source (routing/block-source)]
             (is (= [(:url live-router)] (:routers (meta source))))
             (is (= ["http://127.0.0.1:1"] (:gateways (meta source))))
-            (is (some? (source "bafkreiexample"))))))
+            (is (some? (source cid))))))
       (finally
         (doseq [s [provider dead-router live-router]] ((:stop s)))))))
 
@@ -120,3 +126,203 @@
   (binding [endpoint-config/*getenv* (env {"KOTOBA_GATEWAYS" "http://127.0.0.1:1"})]
     (is (= [] (:gateways (meta (routing/block-source {:router "http://127.0.0.1:1"
                                                       :gateways []})))))))
+
+;; ---------------------------------------------------------------------------
+;; Review findings on PR #632 -- each test reproduces one finding.
+
+(defn- stderr-of
+  "Run F with *err* captured; return [result captured-text]."
+  [f]
+  (let [w (java.io.StringWriter.)
+        result (binding [*err* w] (f))]
+    [result (str w)]))
+
+(defn- problem-of [f]
+  (try (f) nil
+       (catch clojure.lang.ExceptionInfo e (ex-data e))))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq (java.io.File. (str root))))] (.delete ^java.io.File f)))
+
+(def ^:private refused-router
+  "Nothing listens on port 1: connection refused, immediately, no network."
+  "http://127.0.0.1:1")
+
+(deftest review-2-a-junk-gateway-before-a-good-one-does-not-abort-the-pull
+  (let [raw (utf8 "hello raw block")
+        raw-cid (mf/cidv1-raw raw)
+        block {"schema" "kotoba.test.block" "value" 1}
+        cbor-bytes (cbor/encode block)
+        cbor-cid (mf/cidv1-dag-cbor cbor-bytes)
+        junk (server (fn [_ _] [200 (utf8 "JUNK")]))
+        junk-cbor (server (fn [_ _] [200 (cbor/encode {"schema" "something-else"})]))
+        good (server (fn [_ path]
+                       (cond (= path (str "/ipfs/" raw-cid)) [200 raw]
+                             (= path (str "/ipfs/" cbor-cid)) [200 cbor-bytes]
+                             :else [404 nil])))
+        root (kio/temp-dir "kotoba-review-pull-")]
+    (try
+      (store/initialize! root)
+      (testing "block-source verifies against the CID (raw codec) and moves on"
+        (let [source (routing/block-source {:router refused-router
+                                            :gateways [(:url junk) (:url good)]})]
+          (is (= (seq raw) (seq (source raw-cid))))
+          (is (= [(:url good)] @(:discovered (meta source))))))
+      (testing "block-source verifies against the CID (dag-cbor codec) and moves on"
+        (let [source (routing/block-source {:router refused-router
+                                            :gateways [(:url junk-cbor) (:url good)]})]
+          (is (= (seq cbor-bytes) (seq (source cbor-cid))))))
+      (testing "pull! completes with [junk, good] gateways"
+        (let [pulled (routing/pull! root [raw-cid]
+                                    {:router refused-router
+                                     :gateways [(:url junk) (:url good)]})]
+          (is (true? (:complete? pulled)))
+          (is (= [(:url good)] (:providers-used pulled)))))
+      (testing "when every candidate served wrong bytes, the mismatch is still a fault"
+        (is (= :codebase/fetched-cid-mismatch
+               (:problem (problem-of #(routing/pull! root [cbor-cid]
+                                                     {:router refused-router
+                                                      :gateways [(:url junk-cbor)]}))))))
+      (finally
+        (doseq [s [junk junk-cbor good]] ((:stop s)))
+        (delete-tree root)))))
+
+(deftest review-3-endpoint-entries-are-validated-and-normalized
+  (testing "absolute http/https only; no userinfo, query or fragment; trailing / stripped"
+    (is (= "https://a.example" (endpoint-config/normalize-endpoint "https://a.example/")))
+    (is (= "http://r1.example/routing/v1"
+           (endpoint-config/normalize-endpoint "http://r1.example/routing/v1//")))
+    (is (= "http://127.0.0.1:8080" (endpoint-config/normalize-endpoint "http://127.0.0.1:8080")))
+    (doseq [bad ["trustless-gateway.link" "file:///etc" "ftp://a.example"
+                 "https://user:pw@a.example" "https://a.example/?x=1"
+                 "https://a.example/#frag" "https://" "https://a b.example" "//a.example"]]
+      (is (nil? (endpoint-config/normalize-endpoint bad)) (pr-str bad))))
+  (testing "an invalid env entry is dropped with a visible warning"
+    (binding [endpoint-config/*getenv* (env {"KOTOBA_GATEWAYS"
+                                             "trustless-gateway.link,http://127.0.0.1:18082/"})]
+      (let [[gateways err] (stderr-of #(routing/configured-gateways))]
+        (is (= ["http://127.0.0.1:18082"] gateways))
+        (is (str/includes? err "trustless-gateway.link"))
+        (is (str/includes? err "KOTOBA_GATEWAYS")))))
+  (testing "a list with no valid entry is an error, not a silent default"
+    (binding [endpoint-config/*getenv* (env {"KOTOBA_ROUTERS" "file:///etc,nope"})]
+      (let [[data _] (stderr-of #(problem-of (fn [] (routing/configured-routers))))]
+        (is (= :endpoint/no-valid-endpoints (:problem data)))
+        (is (= "KOTOBA_ROUTERS" (:source data))))))
+  (testing "CLI values are validated the same way"
+    (let [[gateways err] (stderr-of #(routing/configured-gateways ["https://g.example/" "g2.example"]))]
+      (is (= ["https://g.example"] gateways))
+      (is (str/includes? err "g2.example")))))
+
+(deftest review-3-a-malformed-candidate-is-a-miss-not-an-abort
+  (let [cid (mf/cidv1-raw (utf8 "x"))]
+    (doseq [bad ["file:///etc" "trustless-gateway.link" "http://a b"]]
+      (is (nil? (routing/fetch-block-from bad cid {:timeout-ms 500})) bad))
+    (let [good (server (fn [_ path] (if (= path (str "/ipfs/" cid)) [200 (utf8 "x")] [404 nil])))]
+      (try
+        (let [source (routing/block-source {:router refused-router
+                                            :gateways ["file:///etc" "nope" (:url good)]})]
+          (is (= "x" (String. ^bytes (source cid) "UTF-8"))))
+        (finally ((:stop good)))))))
+
+(deftest review-3-a-trailing-slash-does-not-produce-a-double-slash
+  (let [seen (atom [])
+        cid (mf/cidv1-raw (utf8 "y"))
+        recorder (server (fn [_ path] (swap! seen conj path) [404 nil]))]
+    (try
+      (routing/fetch-block-from (str (:url recorder) "/") cid {})
+      (routing/providers cid {:router (str (:url recorder) "/")})
+      (is (= [(str "/ipfs/" cid) (str "/routing/v1/providers/" cid)] @seen))
+      (finally ((:stop recorder))))))
+
+(defn- trickle-server
+  "Sends 200 headers, then one byte every 100 ms for ~10 s."
+  []
+  (let [s (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.setExecutor s (java.util.concurrent.Executors/newCachedThreadPool))
+    (.createContext s "/"
+                    (reify HttpHandler
+                      (^void handle [_ ^HttpExchange exchange]
+                        (.sendResponseHeaders exchange 200 0)
+                        (try
+                          (with-open [out (.getResponseBody exchange)]
+                            (dotimes [_ 100]
+                              (.write out (byte-array [(byte 65)]))
+                              (.flush out)
+                              (Thread/sleep 100)))
+                          (catch Exception _ nil))
+                        nil)))
+    (.start s)
+    {:stop #(.stop s 0)
+     :url (str "http://127.0.0.1:" (.getPort (.getAddress s)))}))
+
+(deftest review-6-a-trickling-body-is-bounded-by-an-overall-deadline
+  (let [slow (trickle-server)
+        cid (mf/cidv1-raw (utf8 "z"))]
+    (try
+      (let [started (System/currentTimeMillis)
+            result (routing/fetch-block-from (:url slow) cid {:timeout-ms 600})
+            elapsed (- (System/currentTimeMillis) started)]
+        (is (nil? result) "a body that misses the deadline is a miss")
+        (is (< elapsed 3000) (str "took " elapsed " ms; the body must not run to completion")))
+      (finally ((:stop slow))))))
+
+(deftest review-6-7-default-gateways-are-live-and-not-silently-widened
+  (is (not-any? #{"https://ipfs.4everland.io"} routing/default-gateways)
+      "53 s for 117 KB observed")
+  (is (not-any? #{"https://ipfs.io"} routing/default-gateways)
+      "ipfs.io 301-redirects ?format=raw and redirects are refused: a dead entry")
+  (is (= ["https://trustless-gateway.link"] routing/default-gateways)
+      "extra commercial gateways see CID + client IP; they are opt-in")
+  (is (every? #(endpoint-config/normalize-endpoint %) routing/opt-in-gateways))
+  (is (not-any? (set routing/default-gateways) routing/opt-in-gateways)))
+
+(deftest review-8-router-outages-are-not-reported-as-not-announced
+  (let [cid (mf/cidv1-raw (utf8 "announce"))
+        dead (server (fn [_ _] [503 nil]))
+        empty-router (server (fn [_ _] [200 (utf8 "{\"Providers\":[]}")]))]
+    (try
+      (testing "every router failed: announce-failed, with each error kept"
+        (let [data (problem-of #(routing/announced? cid {:routers [(:url dead) refused-router]}))]
+          (is (= :codebase/announce-failed (:problem data)))
+          (is (= [(:url dead) refused-router] (mapv :router (:errors data))))
+          (is (= 503 (:status (first (:errors data)))))))
+      (testing "one router answered (nobody): not announced, outages still reported"
+        (let [answer (routing/announced? cid {:routers [(:url dead) (:url empty-router)]})]
+          (is (false? (:announced? answer)))
+          (is (= [(:url dead)] (mapv :router (:errors answer))))))
+      (finally ((:stop dead)) ((:stop empty-router))))))
+
+(deftest review-10-the-gateway-read-stops-at-the-callers-cap
+  (let [cid (mf/cidv1-raw (utf8 "big"))
+        big (byte-array (* 2 1024 1024))
+        served (server (fn [_ _] [200 big]))]
+    (try
+      (let [data (problem-of #(routing/fetch-block-from (:url served) cid
+                                                        {:max-bytes (* 1024 1024)}))]
+        (is (= :routing/block-too-large (:problem data)))
+        (is (= (* 1024 1024) (:limit data))))
+      (finally ((:stop served))))))
+
+(defn- trickle-stream
+  "An InputStream yielding one byte every 100 ms, 100 bytes in all (~10 s)."
+  ^java.io.InputStream []
+  (let [left (atom 100)]
+    (proxy [java.io.InputStream] []
+      (read
+        ([] (if (neg? (swap! left dec)) -1 (do (Thread/sleep 100) 65)))
+        ([^bytes b] (.read ^java.io.InputStream this b 0 (alength b)))
+        ([^bytes b off len]
+         (if (neg? (swap! left dec))
+           -1
+           (do (Thread/sleep 100) (aset b (int off) (byte 65)) 1)))))))
+
+(deftest review-6-read-bounded-enforces-an-overall-deadline-itself
+  ;; Independent of whether the JDK's request timeout happens to cover the body.
+  (let [started (System/currentTimeMillis)
+        data (problem-of #(routing/read-bounded (trickle-stream)
+                                                {:max-bytes 1024
+                                                 :deadline-ms (+ started 500)}))
+        elapsed (- (System/currentTimeMillis) started)]
+    (is (= :routing/body-deadline-exceeded (:problem data)))
+    (is (< elapsed 2500) (str "took " elapsed " ms"))))
