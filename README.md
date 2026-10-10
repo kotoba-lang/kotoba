@@ -1557,3 +1557,7 @@ and legacy v1 wire fields/CIDs remain compatible. See
 [whole-stack procedure](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/stack-refactor-procedure.md).
 The dependency update does not enable default v2 runtime admission or qualify
 new target/host/consistency combinations.
+
+### Explicit v2 execution composition
+
+The merged AMU `:execution-v2` alias and Kototama v2 entrypoints provide closed target binding, authority-issued invocation/leases and authenticated admission. Default CLI execution remains compatible with v1. See the [implementation and qualification boundary](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/execution-v2-migration.md) before enabling a host.
