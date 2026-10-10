@@ -241,13 +241,19 @@
          (nil? (inherited-problem (active-parameters (subvec (vec entries) 0 (inc idx))))))))
 
 (defn rotation-entry
-  "The next entry (unsigned): reveal `reveal-mk`, commit to `commit-hashes`."
+  "The next entry (unsigned): reveal `reveal-mk`, commit to `commit-hashes`.
+  Rotations happen only after the handover, so the previous document is one
+  the HOLDER signed: its aliases are carried verbatim (the pre-handover
+  allowlist is not applied to the holder's own choices) unless `aliases`
+  replaces them."
   [entries reveal-mk commit-hashes user-id & [aliases]]
-  (let [prev (peek (vec entries))]
+  (let [prev (peek (vec entries))
+        carried (vec (get-in prev ["state" "alsoKnownAs"]))]
     (entry/next-entry prev {:version-time (version-time (get prev "versionTime"))
                             :parameters {"updateKeys" [reveal-mk]
                                          "nextKeyHashes" (vec commit-hashes)}
-                            :state (document-with-key (get prev "state") reveal-mk user-id aliases)})))
+                            :state (document-with-key (get prev "state") reveal-mk user-id
+                                                      (or aliases carried))})))
 
 (defn committed? [entries mk]
   (boolean (some #{(h/key-hash mk)} (get-in (peek (vec entries)) ["parameters" "nextKeyHashes"]))))
@@ -687,10 +693,25 @@
       ;; A permanent refusal (the host says the entry is invalid): drop it, so
       ;; the next run builds a new one instead of resubmitting forever.
       (and (<= 400 (:status r) 499) (not (#{408 409 425 429} (:status r))))
-      (do (write-secret-edn! path (dissoc state :kotoba.webvh-custody/pending))
-          (fail :id/append-rejected {:status (:status r) :error (get body "error") :detail (get body "detail")
-                                     :version-id version-id}
-                "the host rejected the signed entry; it was dropped -- run `kotoba id verify` before trying again"))
+      ;; Round 3: before dropping, look -- an entry that LANDED despite the
+      ;; answer is adopted; one that did not is archived (its keys kept),
+      ;; never deleted.
+      (let [after (verified-log url (:kotoba.webvh-custody/pin state))
+            adopted (when-not (failure? after) (complete-pending state (:entries after)))]
+        (if (and adopted (nil? (:kotoba.webvh-custody/pending adopted)))
+          (do (write-secret-edn! path adopted)
+              (ok (if (= :recover (or (:mode pending) mode)) :id/recovered :id/rotated)
+                  {:did (get-in (peek (:entries after)) ["state" "id"])
+                   :version-id version-id
+                   :update-key (get-in pending [:active :multikey])
+                   :state-path path
+                   :note "the host answered with an error, but the entry is in the log; adopted"}))
+          (do (write-secret-edn! path (-> state
+                                          (update :kotoba.webvh-custody/dropped (fnil conj []) pending)
+                                          (dissoc :kotoba.webvh-custody/pending)))
+              (fail :id/append-rejected {:status (:status r) :error (get body "error") :detail (get body "detail")
+                                         :version-id version-id}
+                    "the host rejected the signed entry; it was dropped (its keys are archived in the state) -- run `kotoba id verify` before trying again"))))
 
       (not= 200 (:status r))
       (fail :id/append-refused {:status (:status r) :error (get body "error") :detail (get body "detail")
@@ -749,7 +770,10 @@
                                   (when-not (and e (= (:version-id hv) (get e "versionId"))
                                                  (= [(:update-key hv)] (get-in e ["parameters" "updateKeys"])))
                                     :fork))
-                             att (when (attestation-check att entries did*) :fork)
+                             att (let [p (attestation-check att entries did*)]
+                                   (cond (nil? p) nil
+                                         (#{:unreadable :bad-type :other-did :bad-signature} p) :attestation-invalid
+                                         :else :fork))
                              :else :unconfirmed))
             aliases-arg (option argv "--also-known-as")
             aliases (when aliases-arg (vec (remove str/blank? (map str/trim (str/split aliases-arg #",")))))
@@ -771,6 +795,10 @@
           (= :fork tofu-problem)
           (fail :id/log-fork-detected {:url url :handover hv}
                 "the served log does not contain the handover this recovery key belongs to -- forked; nothing was signed")
+
+          (= :attestation-invalid tofu-problem)
+          (fail :id/attestation-invalid {:attestation att :problem (attestation-check att entries did*)}
+                "the attestation file itself is not a valid holder attestation for this DID")
 
           (= :unconfirmed tofu-problem)
           (fail :id/handover-unconfirmed {:url url}
@@ -899,6 +927,10 @@
               (not pin-found?)
               (fail :id/log-fork-detected {:pin pin-arg :served-head (get (peek entries) "versionId")}
                     "the pinned version is not in the served log")
+
+              (#{:unreadable :bad-type :other-did :bad-signature} att-problem)
+              (fail :id/attestation-invalid {:attestation att :problem att-problem}
+                    "the attestation file itself is not a valid holder attestation for this DID")
 
               att-problem
               (fail :id/log-fork-detected {:attestation att :problem att-problem}
