@@ -73,14 +73,32 @@ IPNS namespace and artifact signing. It is not the default human login ID.
 
 An empty policy denies every host effect, including `:host/http`. Hosted billed
 deploy of those grants is not live. Wasm Component is the primary portable
-profile. Bounded native AOT (x86-64/AArch64) is a supported, explicitly selected
-backend; ordinary-application native (ambient OS process) is a non-goal.
+profile. The compiler CLI defaults to the host native target; browser/Worker
+builds select their Wasm target explicitly. Bounded native AOT
+(x86-64/AArch64) still requires admitted capabilities; an ambient OS process
+is not the application execution model.
 
 The persistent Datalog database is
 [`kotoba-lang/kotobase`](https://github.com/kotoba-lang/kotobase), not this
 repository.
 
 The rest of this file is the implementation contract.
+
+## Lisp machine architecture
+
+AiueOS is the OS for a modern Kotoba Lisp machine in development. Kototama
+is its implementation-independent Lisp VM contract: closed S-expression
+computation, IPLD state, bounded authority and content-addressed receipts.
+Amu checks and compiles code; grant decides permission; runtime hosts and OS
+mechanisms enforce the admitted boundary. Kototama also has hosted engines
+and does not require AiueOS for every execution.
+
+The [stack architecture](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/stack-architecture.md) separates responsibility, source/library
+and artifact dependencies. Its [composition contract](https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/stack-architecture.edn) routes
+to each owner's specification; it is not a new language or runtime semantics.
+"Modern Lisp machine" describes the architectural direction. It does not
+certify a complete integrated debugger, live system modification, full heap
+image restore, selfhost compiler or physical-machine qualification.
 
 ## Purpose and philosophy
 
@@ -155,13 +173,11 @@ The machine-readable contract is
 Discovery is not ambient authority: each deploy receipt records the origins
 separately and the CLI refuses a profile whose pinned role assignments drift.
 
-The canonical dependency topology of the stack (compiler at the foundation;
-`kotoba` → compiler; `kototama` → `aiueos` ("decides ⊣ enforces") ; `kotobase`
-→ `kotoba`, never the reverse; `aiueos` dependency-minimal, consuming compiler
-*artifacts*), plus this repo's assigned cleanup items (finishing the
-language-authority migration to `kotoba-lang/kotoba-lang`, and the
-`kototama`/`kotodama` · `kotobase*`/`kotoba-client` naming convergence), is
-recorded in
+The current topology separates library dependencies from generated artifacts:
+this CLI imports Amu and Kototama; Kototama and AiueOS import grant for
+permission decisions; the booted OS consumes verified compiler artifacts.
+The database is a separate data plane. This repo's language-authority and
+naming cleanup decisions are recorded in
 [`docs/ADR-stack-topology-and-design-cleanup.md`](docs/ADR-stack-topology-and-design-cleanup.md)
 (root authority: `com-junkawasaki/root` ADR-2607241100).
 
