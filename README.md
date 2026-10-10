@@ -1546,3 +1546,14 @@ See the [owner integration guide and dependency direction](docs/stack-architectu
 The direction is adopted; runtime contract migration and qualification remain
 explicit, separately verified work. Tier labels are responsibility axes, not
 a single dependency ranking.
+
+## Neutral execution and target profiles
+
+Execution descriptors are owned by `kotoba.core.execution` in core-contracts;
+Component/WASI admission belongs to `kotoba.abi.component` in abi. Upstream
+consumer pins follow these entrypoints. Native remains an independent AMU target,
+and legacy v1 wire fields/CIDs remain compatible. See
+[the integration spec](spec/execution-profile-integration.edn) and
+[whole-stack procedure](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/stack-refactor-procedure.md).
+The dependency update does not enable default v2 runtime admission or qualify
+new target/host/consistency combinations.

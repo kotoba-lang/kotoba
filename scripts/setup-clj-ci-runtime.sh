@@ -9,7 +9,7 @@ for entry in "amu $amu_revision" 'org-babashka-nbb 829f0ba11016e925001d80e51f128
   git -C "$runtime/$repo" fetch --depth 1 "https://github.com/kotoba-lang/$repo.git" "$revision"
   git -C "$runtime/$repo" checkout --detach -q FETCH_HEAD
 done
-# The pinned old Amu launcher owns and loads this exact npm runtime. Missing
+# The selected Amu target launcher owns and loads this exact npm runtime. Missing
 # dependencies used to make every --jvm-free compiler invocation refuse.
 npm ci --prefix "$runtime/amu" --ignore-scripts --no-audit --no-fund
 cat > "$runtime/nbb" <<'NBB'
