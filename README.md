@@ -79,10 +79,11 @@ kotoba id take-custody --recovery-out /Volumes/offline/kotoba-recovery.edn
 # published handover is exactly the proposed entry, pins it, and writes a
 # handover attestation signed by your key -- publish that file.
 
-kotoba id rotate                 # sign the next entry with the pre-committed next key
+kotoba id rotate [--also-known-as did:…,did:…]   # sign the next entry with the pre-committed next key
 kotoba id recover --recovery /Volumes/offline/kotoba-recovery.edn \
                   --recovery-out /Volumes/offline/kotoba-recovery-2.edn
-                                 # also works on a new machine (trust on first use, said so)
+                                 # also works on a new machine: the recovery file records its
+                                 # handover, and a log forked there is refused
 kotoba id verify --did did:webvh:… [--pin <versionId>] [--attestation handover.json]
 ```
 
@@ -92,7 +93,9 @@ did:webvh pre-rotation rule means only a pre-committed key can sign the next
 entry; the service's keys were never committed, so an entry it signs fails
 every resolver. The CLI refuses a handover that differs in any way from the
 entry it expects (another key, a service endpoint, watchers, a witness) and
-builds every later document from the same allowlist.
+builds every later document from the same allowlist (pinned `@context`,
+your own `alsoKnownAs`, your key). The code (`XXXX-XXXX-XXXX`) is bound to
+your account.
 
 State lives in `${XDG_DATA_HOME:-$HOME/.local/share}/kotoba/webvh-custody/`,
 one file per DID (mode 0600, created private, written atomically, with a

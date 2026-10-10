@@ -131,12 +131,36 @@
 
 (defn proposal-code
   "The confirmation code the holder types on the approval page -- the same
-  digest the host computes (`authn.webvh-custody/proposal-code`)."
-  [p]
-  (let [d (h/hash-json {"updateKeys" (vec (get p "updateKeys"))
+  digest the host computes (`authn.webvh-custody/proposal-code`): bound to the
+  account, 12 base58 characters."
+  [user-id p]
+  (let [d (h/hash-json {"userId" user-id
+                        "updateKeys" (vec (get p "updateKeys"))
                         "nextKeyHashes" (vec (get p "nextKeyHashes"))})
-        s (subs d 2 10)]
-    (str (subs s 0 4) "-" (subs s 4 8))))
+        s (subs d 2 14)]
+    (str (subs s 0 4) "-" (subs s 4 8) "-" (subs s 8 12))))
+
+(def expected-context
+  "The `@context` every holder document carries -- pinned, never inherited."
+  ["https://www.w3.org/ns/did/v1" "https://w3id.org/security/multikey/v1"])
+
+(def max-ttl-seconds 86400)
+
+(defn allowed-alias?
+  "An inherited `alsoKnownAs` entry that may carry over: the account's own
+  did:web form, or a did:pkh wallet identity -- the same rule as the host
+  (`authn.webvh-custody/allowed-alias?`)."
+  [user-id s]
+  (boolean
+   (and (string? s)
+        (or (and (str/ends-with? s (str ":tenant:" user-id))
+                 (re-matches #"did:web:[a-z0-9.-]+:tenant:u_[a-z0-9]{12,48}" s))
+            (re-matches #"did:pkh:eip155:[0-9]{1,12}:0x[0-9a-fA-F]{40}" s)))))
+
+(defn valid-alias?
+  "An `alsoKnownAs` entry the HOLDER may choose in a rotation: any DID."
+  [s]
+  (boolean (and (string? s) (<= (count s) 256) (re-matches #"did:[a-z0-9]+:[A-Za-z0-9._:%-]+" s))))
 
 (defn extends-pin?
   "Does `entries` contain the pinned version at its pinned position? A log that
@@ -160,20 +184,23 @@
 
 (defn document-with-key
   "The document for a version whose update key is `mk`, built from an
-  ALLOWLIST of the previous document: `@context`, `id`, `alsoKnownAs`, and
-  `mk` as the only verification method. Anything else (a `service`, extra
-  keys, `capabilityInvocation`) is dropped, so nothing a host put into the
-  document survives into the holder's versions. The host's handover uses the
+  ALLOWLIST: the pinned `expected-context`, the previous `id`, the aliases
+  (`aliases` when the holder chose them, else the previous ones that pass
+  `allowed-alias?`), and `mk` as the only verification method. Nothing else
+  a host put into a document -- a `service`, extra keys, a context, a planted
+  alias -- survives into the holder's versions. The host's handover uses the
   same allowlist (`authn.webvh-custody/handover-state`)."
-  [state mk]
-  (let [id (get state "id")
-        vm {"id" (str id "#" mk) "type" "Multikey" "controller" id "publicKeyMultibase" mk}]
-    (cond-> {"@context" (get state "@context")
-             "id" id
-             "verificationMethod" [vm]
-             "authentication" [(get vm "id")]
-             "assertionMethod" [(get vm "id")]}
-      (contains? state "alsoKnownAs") (assoc "alsoKnownAs" (get state "alsoKnownAs")))))
+  ([state mk user-id] (document-with-key state mk user-id nil))
+  ([state mk user-id aliases]
+   (let [id (get state "id")
+         aliases (vec (or aliases (filter #(allowed-alias? user-id %) (get state "alsoKnownAs"))))
+         vm {"id" (str id "#" mk) "type" "Multikey" "controller" id "publicKeyMultibase" mk}]
+     (cond-> {"@context" expected-context
+              "id" id
+              "verificationMethod" [vm]
+              "authentication" [(get vm "id")]
+              "assertionMethod" [(get vm "id")]}
+       (seq aliases) (assoc "alsoKnownAs" aliases)))))
 
 (defn active-parameters
   "The method's own fold of the parameters of `entries` (no cryptography)."
@@ -191,35 +218,36 @@
     (:deactivated? active) :deactivated
     (seq (:watchers active)) :watchers
     (seq (get-in active [:witness "witnesses"])) :witness
+    (and (number? (:ttl active)) (< max-ttl-seconds (:ttl active))) :ttl
     :else nil))
 
 (defn expected-handover
   "The parameters and state the handover at position `idx` must have, built
   here from the entry before it and the proposal."
-  [entries idx p]
+  [entries idx p user-id]
   {"parameters" {"updateKeys" (vec (get p "updateKeys"))
                  "nextKeyHashes" (vec (get p "nextKeyHashes"))}
-   "state" (document-with-key (get (nth entries (dec idx)) "state") (first (get p "updateKeys")))})
+   "state" (document-with-key (get (nth entries (dec idx)) "state") (first (get p "updateKeys")) user-id)})
 
 (defn handover-matches?
   "B1: the published handover is exactly the expected entry (only its
   versionId, versionTime and proof may differ -- those the method checks), and
   nothing inherited would bind the holder."
-  [entries idx p]
+  [entries idx p user-id]
   (let [e (nth entries idx)]
     (and (pos? idx)
          (= #{"versionId" "versionTime" "parameters" "state" "proof"} (set (keys e)))
-         (= (expected-handover entries idx p) (select-keys e ["parameters" "state"]))
+         (= (expected-handover entries idx p user-id) (select-keys e ["parameters" "state"]))
          (nil? (inherited-problem (active-parameters (subvec (vec entries) 0 (inc idx))))))))
 
 (defn rotation-entry
   "The next entry (unsigned): reveal `reveal-mk`, commit to `commit-hashes`."
-  [entries reveal-mk commit-hashes]
+  [entries reveal-mk commit-hashes user-id & [aliases]]
   (let [prev (peek (vec entries))]
     (entry/next-entry prev {:version-time (version-time (get prev "versionTime"))
                             :parameters {"updateKeys" [reveal-mk]
                                          "nextKeyHashes" (vec commit-hashes)}
-                            :state (document-with-key (get prev "state") reveal-mk)})))
+                            :state (document-with-key (get prev "state") reveal-mk user-id aliases)})))
 
 (defn committed? [entries mk]
   (boolean (some #{(h/key-hash mk)} (get-in (peek (vec entries)) ["parameters" "nextKeyHashes"]))))
@@ -303,16 +331,23 @@
        (filter :kotoba.webvh-custody/user-id)
        vec))
 
-(defn- write-recovery! [path did k]
+(defn- write-recovery!
+  "Write the recovery key file. `handover` -- `{:version-id :index
+  :update-key}` of the handover this key belongs to -- is recorded once known,
+  so a recovery on a machine with no state can refuse a log that forked at
+  the handover (review round 2, PoC-B)."
+  [path did k & [handover]]
   (when (.exists (io/file path))
     (let [existing (read-edn path)]
       (when-not (= (:multikey k) (:kotoba.webvh-recovery/multikey existing))
-        (throw (ex-info (str "refusing to overwrite an existing recovery key file: " path)
+        (throw (ex-info (str "refusing to overwrite an existing recovery key file: " path
+                             " -- pass another --recovery-out")
                         {:code :id/recovery-file-exists :path path})))))
-  (write-secret-edn! path {:kotoba.webvh-recovery/version 1
-                           :kotoba.webvh-recovery/did did
-                           :kotoba.webvh-recovery/seed (:seed k)
-                           :kotoba.webvh-recovery/multikey (:multikey k)}))
+  (write-secret-edn! path (cond-> {:kotoba.webvh-recovery/version 2
+                                   :kotoba.webvh-recovery/did did
+                                   :kotoba.webvh-recovery/seed (:seed k)
+                                   :kotoba.webvh-recovery/multikey (:multikey k)}
+                            handover (assoc :kotoba.webvh-recovery/handover handover))))
 
 ;; ── HTTP ────────────────────────────────────────────────────────────────────
 
@@ -426,7 +461,10 @@
     (option argv "--did") (or (did-context (option argv "--did")) {:error (fail :id/bad-did {:did (option argv "--did")})})
     (option argv "--user") (let [rp (or (option argv "--rp-id") principal/canonical-rp-id)
                                  u (option argv "--user")]
-                             {:rp-id rp :user-id u :url (log-url rp u)})
+                             (cond
+                               (not (user-id-of (str ":tenant:" u))) {:error (fail :id/bad-user {:user u})}
+                               (not (principal/allowed-rp-id? rp)) {:error (fail :id/noncanonical-rp {:rp-id rp})}
+                               :else {:rp-id rp :user-id u :url (log-url rp u)}))
     fallback-did (or (did-context fallback-did) {:error (fail :id/bad-did {:did fallback-did})})
     :else (let [held (filter #(#{:custodied :pending} (:kotoba.webvh-custody/status %)) (all-states))]
             (case (count held)
@@ -457,11 +495,14 @@
   (let [att (try (json/read-str (slurp path)) (catch Exception _ nil))
         index (get att "index")
         e (when (and (integer? index) (<= 1 index (count entries))) (nth entries (dec index)))
-        mk (first (get-in e ["parameters" "updateKeys"]))]
+        mk (first (get-in e ["parameters" "updateKeys"]))
+        [hidx _] (find-handover entries)]
     (cond
       (nil? att) :unreadable
+      (not= "DidWebvhHandoverAttestation" (get att "type")) :bad-type
       (not= did (get att "did")) :other-did
       (nil? e) :log-shorter-than-handover
+      (not= index (some-> hidx inc)) :not-the-handover
       (not= (get att "versionId") (get e "versionId")) :different-entry-at-handover
       (not (:ok? (proof/verify (dissoc att "proof") (first (get att "proof")) {:allowed #{mk}}))) :bad-signature
       :else nil)))
@@ -473,17 +514,32 @@
         did (get-in (peek entries) ["state" "id"])
         rp (:kotoba.webvh-custody/rp-id state)
         uid (:kotoba.webvh-custody/user-id state)
+        handover {:version-id (get e "versionId") :index (inc idx)
+                  :update-key (get-in state [:kotoba.webvh-custody/active :multikey])}
         att (write-attestation! rp uid did (get e "versionId") (inc idx) (:kotoba.webvh-custody/active state))
+        rpath (:kotoba.webvh-custody/recovery-path state)
+        seed (:kotoba.webvh-custody/recovery-seed state)
+        _ (cond
+            ;; the recovery file now records which handover it belongs to
+            seed (write-secret-edn! rpath {:kotoba.webvh-recovery/version 2
+                                           :kotoba.webvh-recovery/did did
+                                           :kotoba.webvh-recovery/seed seed
+                                           :kotoba.webvh-recovery/multikey (:multikey (key-of (unhex seed)))
+                                           :kotoba.webvh-recovery/handover handover})
+            (read-edn rpath) (write-secret-edn! rpath (assoc (read-edn rpath) :kotoba.webvh-recovery/handover handover))
+            :else nil)
         state* (-> state
                    (assoc :kotoba.webvh-custody/status :custodied
                           :kotoba.webvh-custody/did did
                           :kotoba.webvh-custody/pin {:version-id (get (peek entries) "versionId")
                                                      :index (count entries)}
-                          :kotoba.webvh-custody/handover {:version-id (get e "versionId") :index (inc idx)})
-                   (dissoc :kotoba.webvh-custody/proposal))]
+                          :kotoba.webvh-custody/handover handover)
+                   ;; the recovery seed leaves this machine's state once custody is taken
+                   (dissoc :kotoba.webvh-custody/proposal :kotoba.webvh-custody/recovery-seed))]
     (write-secret-edn! (state-path rp uid) state*)
     (ok :id/custody-taken
         {:did did
+         :also-known-as (get-in e ["state" "alsoKnownAs"])
          :handover-version-id (get e "versionId")
          :update-key (get-in state* [:kotoba.webvh-custody/active :multikey])
          :recovery-path (:kotoba.webvh-custody/recovery-path state*)
@@ -510,7 +566,7 @@
             (if-let [[idx _] (find-handover entries)]
               ;; Already handed over: ours (a previous run that died before
               ;; recording it) or someone else's -- nothing is written.
-              (if (and pending-p (handover-matches? entries idx pending-p))
+              (if (and pending-p (handover-matches? entries idx pending-p user-id))
                 (finalize-handover pending entries idx)
                 (fail :id/already-client-custody {:did did :handover-version-id (get (nth entries idx) "versionId")}
                       "this DID is already held by keys this machine does not have"))
@@ -521,7 +577,8 @@
                                 (let [a (key-of (new-seed)) b (key-of (new-seed)) r (key-of (new-seed))
                                       rpath (or (option argv "--recovery-out")
                                                 (.getPath (io/file (state-dir) (str (slug rp-id user-id) "-recovery.edn"))))]
-                                  (write-recovery! rpath did r)
+                                  ;; The state FIRST, carrying the recovery seed until custody is
+                                  ;; taken: a crash before the recovery file lands is resumable.
                                   (write-secret-edn! (state-path rp-id user-id)
                                                      {:kotoba.webvh-custody/version 2
                                                       :kotoba.webvh-custody/status :pending
@@ -532,10 +589,14 @@
                                                       :kotoba.webvh-custody/active a
                                                       :kotoba.webvh-custody/next b
                                                       :kotoba.webvh-custody/recovery-hash (h/key-hash (:multikey r))
+                                                      :kotoba.webvh-custody/recovery-seed (:seed r)
                                                       :kotoba.webvh-custody/recovery-path rpath})))
+                      _ (when-let [seed (:kotoba.webvh-custody/recovery-seed state)]
+                          (write-recovery! (:kotoba.webvh-custody/recovery-path state) did (key-of (unhex seed))))
                       p (proposal (:kotoba.webvh-custody/active state) (:kotoba.webvh-custody/next state)
                                   (:kotoba.webvh-custody/recovery-hash state))
-                      code (proposal-code p)
+                      code (proposal-code user-id p)
+                      aliases (vec (filter #(allowed-alias? user-id %) (get-in (peek entries) ["state" "alsoKnownAs"])))
                       r (http! "POST" (str (origin-of url) "/v1/webvh/custody/request") (assoc p "userId" user-id))
                       body (body-json r)
                       uri (get body "verificationUri")
@@ -557,6 +618,7 @@
                     (do
                       (say "Open" uri "signed in with your Passkey, and TYPE this code:")
                       (say "   " code)
+                      (say "The DID will keep these aliases (alsoKnownAs):" (if (seq aliases) (str/join ", " aliases) "(none)"))
                       (say "Never type a code you did not get from this command.")
                       (say "Recovery key written to" (:kotoba.webvh-custody/recovery-path state) "-- move it off this machine.")
                       (when (pos? delay-ms)
@@ -575,7 +637,7 @@
                                   polled
                                   (let [es (:entries polled)]
                                     (if-let [[idx e] (find-handover es)]
-                                      (if (handover-matches? es idx p)
+                                      (if (handover-matches? es idx p user-id)
                                         (finalize-handover state es idx)
                                         (fail :id/handover-mismatch {:did did :handover-version-id (get e "versionId")}
                                               "the published handover is not exactly the proposed one (other keys, extra document content or parameters); refusing it"))
@@ -621,10 +683,21 @@
                  {"userId" (:kotoba.webvh-custody/user-id state) "entry" e})
         body (body-json r)
         path (state-path (:kotoba.webvh-custody/rp-id state) (:kotoba.webvh-custody/user-id state))]
-    (if-not (= 200 (:status r))
+    (cond
+      ;; A permanent refusal (the host says the entry is invalid): drop it, so
+      ;; the next run builds a new one instead of resubmitting forever.
+      (and (<= 400 (:status r) 499) (not (#{408 409 425 429} (:status r))))
+      (do (write-secret-edn! path (dissoc state :kotoba.webvh-custody/pending))
+          (fail :id/append-rejected {:status (:status r) :error (get body "error") :detail (get body "detail")
+                                     :version-id version-id}
+                "the host rejected the signed entry; it was dropped -- run `kotoba id verify` before trying again"))
+
+      (not= 200 (:status r))
       (fail :id/append-refused {:status (:status r) :error (get body "error") :detail (get body "detail")
                                 :version-id version-id
                                 :hint "run the same command again: the signed entry is kept and is resubmitted (or adopted if it landed)"})
+
+      :else
       (let [after (verified-log url (:kotoba.webvh-custody/pin state))]
         (if (failure? after)
           after
@@ -662,6 +735,24 @@
       :else
       (let [{:keys [entries]} fetched
             tofu? (not= :custodied (:kotoba.webvh-custody/status stored))
+            did* (get-in (peek entries) ["state" "id"])
+            hv (:kotoba.webvh-recovery/handover recovery-file)
+            att (option argv "--attestation")
+            ;; Round 2, PoC-B: with no state, the served log must contain the
+            ;; handover the recovery key belongs to -- as recorded in the
+            ;; recovery file, or as the holder's attestation says. H(R) is
+            ;; public; a fork at the handover can copy it.
+            tofu-problem (when tofu?
+                           (cond
+                             hv (let [e (when (and (integer? (:index hv)) (<= 1 (:index hv) (count entries)))
+                                          (nth entries (dec (:index hv))))]
+                                  (when-not (and e (= (:version-id hv) (get e "versionId"))
+                                                 (= [(:update-key hv)] (get-in e ["parameters" "updateKeys"])))
+                                    :fork))
+                             att (when (attestation-check att entries did*) :fork)
+                             :else :unconfirmed))
+            aliases-arg (option argv "--also-known-as")
+            aliases (when aliases-arg (vec (remove str/blank? (map str/trim (str/split aliases-arg #",")))))
             state0 (if tofu?
                      {:kotoba.webvh-custody/version 2
                       :kotoba.webvh-custody/status :custodied
@@ -671,11 +762,23 @@
                       :kotoba.webvh-custody/did (get-in (peek entries) ["state" "id"])
                       :kotoba.webvh-custody/pin {:version-id (get (peek entries) "versionId") :index (count entries)}
                       :kotoba.webvh-custody/recovery-path (option argv "--recovery")
+                      :kotoba.webvh-custody/handover hv
                       :tofu tofu-warning}
                      stored)
             state (complete-pending state0 entries)
             pin (:kotoba.webvh-custody/pin state)]
         (cond
+          (= :fork tofu-problem)
+          (fail :id/log-fork-detected {:url url :handover hv}
+                "the served log does not contain the handover this recovery key belongs to -- forked; nothing was signed")
+
+          (= :unconfirmed tofu-problem)
+          (fail :id/handover-unconfirmed {:url url}
+                "this recovery file does not record its handover; pass --attestation <your handover attestation>")
+
+          (and aliases (or (empty? aliases) (< 8 (count aliases)) (not (every? valid-alias? aliases))))
+          (fail :id/bad-also-known-as {:also-known-as aliases-arg} "--also-known-as takes up to 8 comma-separated DIDs")
+
           (not (client-custody? entries))
           (fail :id/not-custodied {:hint "this DID is still in service custody; run `kotoba id take-custody`"})
 
@@ -722,9 +825,11 @@
                                     (h/key-hash (:multikey new-recovery))
                                     (:kotoba.webvh-custody/recovery-hash state))
                     e (entry/sign (rotation-entry entries (:multikey signing-key)
-                                                  [(h/key-hash (:multikey new-next)) recovery-hash])
+                                                  [(h/key-hash (:multikey new-next)) recovery-hash]
+                                                  user-id aliases)
                                   (signer-of signing-key))]
-                (when new-recovery (write-recovery! new-recovery-path did new-recovery))
+                (when new-recovery (write-recovery! new-recovery-path did new-recovery
+                                                    (:kotoba.webvh-custody/handover state)))
                 (let [state* (assoc state :kotoba.webvh-custody/pending
                                     (cond-> {:version-id (get e "versionId")
                                              :entry (json/write-str e)
