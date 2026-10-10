@@ -1535,3 +1535,14 @@ HTTP loadtest matrix, and operator-UX defaults.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Target-neutral and distributed stack architecture
+
+Orchestrates checking, project linking, runtime admission and user workflows through owner contracts. Content-addressed checked code is not a running heap image. Target selection and distributed consistency are independent; a remote location, gateway or service does not grant authority. The proposed conductor/cell composition does not become an implementation merely by documentation.
+
+See the [owner integration guide and dependency direction](docs/stack-architecture.md),
+[composition metadata](spec/stack-integration.edn), and
+[whole-stack refactor procedure](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/stack-refactor-procedure.md).
+The direction is adopted; runtime contract migration and qualification remain
+explicit, separately verified work. Tier labels are responsibility axes, not
+a single dependency ranking.
