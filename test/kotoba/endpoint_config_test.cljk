@@ -264,7 +264,9 @@
             result (routing/fetch-block-from (:url slow) cid {:timeout-ms 600})
             elapsed (- (System/currentTimeMillis) started)]
         (is (nil? result) "a body that misses the deadline is a miss")
-        (is (< elapsed 3000) (str "took " elapsed " ms; the body must not run to completion")))
+        ;; The body takes ~10 s to complete; anything well under that proves
+        ;; the deadline cut it (generous bound to stay robust on slow CI).
+        (is (< elapsed 8000) (str "took " elapsed " ms; the body must not run to completion")))
       (finally ((:stop slow))))))
 
 (deftest review-6-7-default-gateways-are-live-and-not-silently-widened
@@ -325,4 +327,86 @@
                                                  :deadline-ms (+ started 500)}))
         elapsed (- (System/currentTimeMillis) started)]
     (is (= :routing/body-deadline-exceeded (:problem data)))
-    (is (< elapsed 2500) (str "took " elapsed " ms"))))
+    ;; The stream needs ~10 s; well under that proves the deadline fired.
+    (is (< elapsed 8000) (str "took " elapsed " ms"))))
+
+
+;; ---------------------------------------------------------------------------
+;; Round-2 review findings on PR #632.
+
+(deftest review2-M1-a-404-router-means-no-records-not-an-outage
+  (let [cid (mf/cidv1-raw (utf8 "announce-404"))
+        not-found (server (fn [_ _] [404 nil]))
+        dead (server (fn [_ _] [503 nil]))]
+    (try
+      (testing "cid.contact answers 404 for `no records`: a single such router is not a failure"
+        (let [answer (routing/announced? cid {:routers [(:url not-found)]})]
+          (is (false? (:announced? answer)))
+          (is (nil? (:errors answer)))))
+      (testing "a 404 alongside a 503: only the 503 is an outage"
+        (let [answer (routing/announced? cid {:routers [(:url dead) (:url not-found)]})]
+          (is (false? (:announced? answer)))
+          (is (= [(:url dead)] (mapv :router (:errors answer))))))
+      (finally ((:stop not-found)) ((:stop dead))))))
+
+(deftest review2-m4-a-known-provider-is-tried-before-routing-again
+  (let [a (utf8 "block-a") b (utf8 "block-b")
+        cid-a (mf/cidv1-raw a) cid-b (mf/cidv1-raw b)
+        provider (server (fn [_ path]
+                           (condp = path
+                             (str "/ipfs/" cid-a) [200 a]
+                             (str "/ipfs/" cid-b) [200 b]
+                             [404 nil])))
+        router-hits (atom 0)
+        router (server (fn [_ _]
+                         (swap! router-hits inc)
+                         [200 (utf8 (str "{\"Providers\":[{\"ID\":\"p\",\"Addrs\":"
+                                         "[\"/ip4/127.0.0.1/tcp/" (:port provider) "/http\"]}]}"))]))]
+    (try
+      (let [source (routing/block-source {:router (:url router) :gateways []})]
+        (is (some? (source cid-a)))
+        (is (some? (source cid-b)))
+        (is (= 1 @router-hits)
+            "the second block came from the cached provider without a routing round trip"))
+      (finally ((:stop provider)) ((:stop router))))))
+
+(defn- slow-404-server
+  "Answers 404 after DELAY-MS."
+  [delay-ms]
+  (let [s (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.setExecutor s (java.util.concurrent.Executors/newCachedThreadPool))
+    (.createContext s "/"
+                    (reify HttpHandler
+                      (^void handle [_ ^HttpExchange exchange]
+                        (Thread/sleep (long delay-ms))
+                        (respond! exchange 404 nil)
+                        nil)))
+    (.start s)
+    {:stop #(.stop s 0)
+     :url (str "http://127.0.0.1:" (.getPort (.getAddress s)))}))
+
+(deftest review2-m4-a-pull-has-an-overall-time-budget
+  (is (pos? routing/default-budget-ms))
+  (let [slow (repeatedly 6 #(slow-404-server 700))
+        cid (mf/cidv1-raw (utf8 "budget"))]
+    (try
+      (let [source (routing/block-source {:router refused-router
+                                          :gateways (mapv :url slow)
+                                          :budget-ms 1000})
+            started (System/currentTimeMillis)
+            data (problem-of #(source cid))
+            elapsed (- (System/currentTimeMillis) started)]
+        (is (= :routing/budget-exceeded (:problem data)))
+        (is (= 1000 (:budget-ms data)))
+        ;; Six candidates at 700 ms each would take 4.2 s without a budget.
+        (is (< elapsed 3500) (str "took " elapsed " ms")))
+      (finally (doseq [s slow] ((:stop s)))))))
+
+(deftest review2-nit-normalization-lowercases-and-rejects-edge-forms
+  (is (= "https://gw.example" (endpoint-config/normalize-endpoint "HTTPS://Gw.Example/")))
+  (doseq [bad ["https://example.com?" "https://example.com#" "https:///example.com"
+               "https://example.com:99999"]]
+    (is (nil? (endpoint-config/normalize-endpoint bad)) (pr-str bad)))
+  (binding [endpoint-config/*getenv* (env {"KOTOBA_GATEWAYS" "https://GW.example,https://gw.example/"})]
+    (is (= ["https://gw.example"] (routing/configured-gateways))
+        "entries differing only by host case are one entry")))

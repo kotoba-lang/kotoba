@@ -25,6 +25,13 @@ user-visible or architecturally significant changes.
   dropped); catalog gateway fallback is opt-in; `announced?` reports router
   outages; `KOTOBA_HOSTED_ENDPOINT` must be one HTTPS origin; the
   availability-proof router ignores `KOTOBA_ROUTERS`.
+  Round 2: a router's 404 means "no records", not an outage; the RP's
+  verification URI must be `https` on the RP's own origin (`open --`); RP ids
+  under .localhost/.local/.internal/.home.arpa or IP-shaped are refused; a
+  non-canonical RP cannot replace a canonical principal without `--force`;
+  env-chosen hosted origin / IPNS routers warn on stderr; pulls try known
+  providers before routing and have an overall `:budget-ms`; endpoint hosts
+  are lowercased.
 
 - Fixed: the emitter wrote a WebAssembly `call` operand as a single byte, so
   any module needing function index 128 or above got an operand with the

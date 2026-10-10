@@ -105,6 +105,14 @@
 (def max-providers 20)
 (def default-timeout-ms 15000)
 
+(def default-budget-ms
+  "Overall wall-clock budget for one `block-source` (one pull), across every
+  block, router query and gateway attempt. Per-request timeouts alone let a
+  closure of many blocks times many slow candidates run for hours; past this
+  budget the pull fails with `:routing/budget-exceeded`. Override per call
+  with `:budget-ms`."
+  (* 5 60 1000))
+
 (defn- fail! [problem data]
   (throw (ex-info (name problem) (assoc data :problem problem))))
 
@@ -323,53 +331,84 @@
   still reported as `:codebase/fetched-cid-mismatch`. `hydrate!` verifies
   again (defense in depth).
 
+  Order per block: providers that already answered for this source (no
+  routing round trip), then -- only if none of them has it -- the providers
+  the routers name, then the gateways. `:budget-ms` (default
+  `default-budget-ms`) bounds the whole pull; each request's timeout is capped
+  by what is left of it, and running out fails with `:routing/budget-exceeded`.
+
   Routers: `:router` (exactly one, historical), `:routers` (ordered list), or
   the configured list. Gateways: `:gateways` when given (even empty -- an
   explicit provider set is not widened behind the caller's back), otherwise
   the configured list."
   ([] (block-source {}))
-  ([{:keys [timeout-ms verbose?]
-     :or {timeout-ms default-timeout-ms}
+  ([{:keys [timeout-ms verbose? budget-ms]
+     :or {timeout-ms default-timeout-ms budget-ms default-budget-ms}
      :as opts}]
    (let [routers (routers-of opts)
          gateways (if (contains? opts :gateways)
                     (:gateways opts)
                     (configured-gateways))
          discovered (atom [])
-         attempts (atom [])]
+         attempts (atom [])
+         ;; The budget starts at the first block asked for, not at creation.
+         deadline (delay (+ (System/currentTimeMillis) budget-ms))]
      (with-meta
        (fn [cid]
-         (let [routed (routed-providers cid routers {:timeout-ms timeout-ms})
-               ;; Providers already known to have answered come first: the
-               ;; closure of one definition is usually held by one host.
-               candidates (distinct (concat @discovered routed gateways))]
-           (loop [remaining candidates
-                  rejected []]
-             (if-let [base (first remaining)]
-               (let [outcome (try
-                               (when-let [bytes (fetch-block-from base cid {:timeout-ms timeout-ms})]
-                                 (if (store/raw-cid? cid)
-                                   (fetch/verify-raw-bytes cid bytes)
-                                   (fetch/verify-bytes cid bytes))
-                                 {:bytes bytes})
-                               (catch clojure.lang.ExceptionInfo e
-                                 {:problem (or (:problem (ex-data e)) :routing/fetch-failed)}))]
-                 (if-let [bytes (:bytes outcome)]
-                   (do (swap! discovered #(vec (distinct (cons base %))))
-                       (when verbose? (swap! attempts conj {:cid cid :from base :ok? true}))
-                       bytes)
-                   (do (when verbose? (swap! attempts conj (cond-> {:cid cid :from base :ok? false}
-                                                             (:problem outcome)
-                                                             (assoc :problem (:problem outcome)))))
-                       (recur (next remaining)
-                              (cond-> rejected
-                                (#{:codebase/fetched-cid-mismatch
-                                   :codebase/fetched-block-not-canonical} (:problem outcome))
-                                (conj base))))))
-               (when (seq rejected)
-                 (fail! :codebase/fetched-cid-mismatch {:cid cid :from rejected}))))))
+         (let [remaining #(- @deadline (System/currentTimeMillis))
+               check-budget! #(when-not (pos? (remaining))
+                                (fail! :routing/budget-exceeded
+                                       {:cid cid :budget-ms budget-ms}))
+               step-timeout #(long (max 1 (min timeout-ms (remaining))))
+               attempt
+               (fn [base]
+                 (check-budget!)
+                 (try
+                   (when-let [bytes (fetch-block-from base cid {:timeout-ms (step-timeout)})]
+                     (if (store/raw-cid? cid)
+                       (fetch/verify-raw-bytes cid bytes)
+                       (fetch/verify-bytes cid bytes))
+                     {:bytes bytes})
+                   (catch clojure.lang.ExceptionInfo e
+                     {:problem (or (:problem (ex-data e)) :routing/fetch-failed)})))
+               walk
+               (fn [candidates tried rejected]
+                 (loop [remaining-candidates candidates
+                        tried tried
+                        rejected rejected]
+                   (if-let [base (first remaining-candidates)]
+                     (let [outcome (attempt base)]
+                       (if-let [bytes (:bytes outcome)]
+                         (do (swap! discovered #(vec (distinct (cons base %))))
+                             (when verbose? (swap! attempts conj {:cid cid :from base :ok? true}))
+                             {:bytes bytes})
+                         (do (when verbose?
+                               (swap! attempts conj (cond-> {:cid cid :from base :ok? false}
+                                                      (:problem outcome)
+                                                      (assoc :problem (:problem outcome)))))
+                             (recur (next remaining-candidates)
+                                    (conj tried base)
+                                    (cond-> rejected
+                                      (#{:codebase/fetched-cid-mismatch
+                                         :codebase/fetched-block-not-canonical} (:problem outcome))
+                                      (conj base))))))
+                     {:tried tried :rejected rejected})))
+               ;; Providers that already answered come first, BEFORE asking a
+               ;; router: the closure of one definition is usually held by one
+               ;; host, so most blocks need no routing round trip at all.
+               known (walk @discovered #{} [])]
+           (if-let [bytes (:bytes known)]
+             bytes
+             (let [_ (check-budget!)
+                   routed (routed-providers cid routers {:timeout-ms (step-timeout)})
+                   others (remove (:tried known) (distinct (concat routed gateways)))
+                   found (walk others (:tried known) (:rejected known))]
+               (or (:bytes found)
+                   (when (seq (:rejected found))
+                     (fail! :codebase/fetched-cid-mismatch
+                            {:cid cid :from (:rejected found)})))))))
        {:discovered discovered :attempts attempts
-        :routers routers :gateways gateways}))))
+        :routers routers :gateways gateways :budget-ms budget-ms}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Announcement
@@ -429,7 +468,8 @@
   several routers (`:routers`, or the configured list when no `:router` is
   given) the first that names a provider answers.
 
-  A router that errors or answers non-200 is an outage, not a `no`: it is kept
+  A router that errors or answers anything but 200/404 is an outage, not a
+  `no` (404 is the spec-allowed `no records` answer, e.g. cid.contact): it is kept
   under `:errors`, and when EVERY router failed this throws
   `:codebase/announce-failed` instead of reporting `:announced? false`."
   ([cid] (announced? cid {}))
@@ -454,7 +494,9 @@
                       :providers (:providers answer) :announced? true}
                (seq errors) (assoc :errors errors))
 
-             (or (:error answer) (not= 200 (:status answer)))
+             ;; 404 is how some routers (cid.contact) say `no records`, which
+             ;; the Delegated Routing spec allows: same as 200 with none.
+             (or (:error answer) (not (#{200 404} (:status answer))))
              (recur more last-answer
                     (conj errors (cond-> {:router router :status (:status answer)}
                                    (:error answer) (assoc :error (:error answer)))))

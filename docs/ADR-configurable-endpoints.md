@@ -36,8 +36,10 @@ treated as unset so it can never disable a list by accident.
 
 Every URL entry (routers, gateways, catalog URLs, IPNS routers) is validated
 where it enters (`endpoint-config/resolve-endpoints`): it must be an absolute
-`http`/`https` URL with a host and no userinfo, query or fragment; trailing
-`/` is stripped (no more `//ipfs/…`). An invalid entry is dropped with a
+`http`/`https` URL with a host, no userinfo, query or fragment (an empty `?`
+or `#` included) and a port in 1–65535; scheme and host are lowercased, so
+entries differing only in case are one entry; trailing `/` is stripped (no
+more `//ipfs/…`). The same textual pre-checks run on the JVM and JS paths. An invalid entry is dropped with a
 warning on stderr; a list left empty by that is an error
 (`:endpoint/no-valid-endpoints`), never a silent fall-back to defaults. At
 fetch time a malformed candidate is additionally treated as a miss rather than
@@ -75,7 +77,15 @@ which third parties observe what they fetch. So:
 
 The default is therefore exactly the one gateway an unconfigured CLI
 effectively used before this change: no new third party sees a user's
-fetches without the operator choosing it. Gateway availability is still not
+fetches without the operator choosing it.
+
+Caveat, stated plainly: `delegated-ipfs.dev` (first default router) and
+`trustless-gateway.link` (default gateway) are, as far as we can tell, run by
+the same operator family (the IPFS Foundation / Shipyard infrastructure that
+also ran `ipfs.io`), and `cid.contact` is close to it too. The unconfigured
+defaults still lean on essentially one operator; what this change removes is
+the *mandatory* part — every one of them is replaceable without a code
+change. Gateway availability is still not
 a single point of failure for the *mechanism* — routing is tried first (two
 default routers), any gateway list can be configured, and a gateway is only
 the fallback when routing names no HTTP provider.
@@ -87,9 +97,10 @@ the fallback when routing names no HTTP provider.
   router that errors or names nobody is skipped. An explicit `:router` /
   single `--router` still means exactly that router. An explicit `:gateways`
   (even empty) is never widened by the configured gateway list — but providers
-  named by the routers are still tried, **before** the explicit gateways
-  (candidates are: providers that already answered, then router-named
-  providers, then `:gateways`). So `package add` asks its catalog's providers
+  named by the routers are still tried, **before** the explicit gateways.
+  Order per block: providers that already answered for this pull are tried
+  first *without* asking a router; only if none has the block are the routers
+  asked, then their providers and finally `:gateways` are tried. So `package add` asks its catalog's providers
   plus whatever the routers name for that CID; every byte is verified either
   way.
 - **Per-candidate verification.** `block-source` verifies each candidate's
@@ -101,10 +112,15 @@ the fallback when routing names no HTTP provider.
   again (defense in depth).
 - **Deadlines.** `:timeout-ms` bounds the whole gateway fetch including the
   body: `read-bounded` enforces an overall deadline even while a read is
-  blocked, so a gateway cannot trickle a body forever.
-- **Announcement.** `announced?` keeps router outages (exception or non-200)
-  under `:errors`; if every router failed it throws
-  `:codebase/announce-failed` instead of reporting "not announced".
+  blocked, so a gateway cannot trickle a body forever. On top of that, one
+  pull has an overall budget (`:budget-ms`, default 5 min,
+  `routing/default-budget-ms`); every request's timeout is capped by what is
+  left, and running out fails with `:routing/budget-exceeded`.
+- **Announcement.** `announced?` keeps router outages under `:errors`; if
+  every router failed it throws `:codebase/announce-failed` instead of
+  reporting "not announced". An outage is an exception or a status other than
+  200/404: a 404 is the spec-allowed "no records" answer (`cid.contact` uses
+  it) and counts exactly like a 200 with no providers.
 - **Availability proofs** record one router as evidence. It comes only from an
   explicit `--router` or the built-in `default-router`; `KOTOBA_ROUTERS` is
   ignored for it (`library-release/availability-router`), because a silently
@@ -127,6 +143,17 @@ the fallback when routing names no HTTP provider.
   replaces the single origin with several independent ones. The value (env or
   `--endpoint`) must be exactly one origin, HTTPS — plain HTTP only for
   `localhost` / `127.0.0.1` / `::1` — else `:codebase/hosted-endpoint-invalid`.
+  The origin is written into the signed publication (`storageOrigin`), so a
+  non-default value taken from `KOTOBA_HOSTED_ENDPOINT` prints a stderr
+  warning (an explicit `--endpoint` does not) — the same policy as the RP:
+  the environment may configure, but never silently.
+- **IPNS routers.** `kad.routing` accepts the first valid record a router
+  returns (effectively quorum 1 with one router). A router can therefore
+  serve an *older*, still validly signed record: it can roll back, never
+  forge. Only a follower that already holds a newer head detects that (via
+  the signed head's sequence); a first-time resolver cannot. Routers taken
+  from `KOTOBA_IPNS_ROUTERS` (rather than `--router`) are announced on
+  stderr for that reason.
 - **Passkey RP.** `KOTOBA_PASSKEY_RP_IDS` only *extends* the allow-list:
   `auth.kotoba.cloud` is always allowed and is always what `kotoba id new`
   asks for when `--rp-id` is absent. A non-canonical RP is used only when named
@@ -135,8 +162,16 @@ the fallback when routing names no HTTP provider.
   `:non-canonical-rp? true` in the result and
   `:kotoba.principal/non-canonical-rp? true` in `principal.edn`. Rationale:
   whatever controls a shell's environment must not be able to silently
-  redirect identity enrollment. Entries must be bare lowercase DNS hostnames;
-  invalid entries are never allowed and are reported on stderr. The device flow is always
+  redirect identity enrollment. Entries must be bare lowercase public DNS
+  hostnames — not under `.localhost`, `.local`, `.internal` or `.home.arpa`,
+  and not IP-shaped (`169.254.169.254.nip.io`, `10-0-0-1.sslip.io`); invalid
+  entries are never allowed and are reported on stderr. The RP's
+  `verificationUriComplete` is opened only if it is `https` on exactly
+  `https://<rp-id>` (no userinfo, port absent or 443), and macOS `open` is
+  invoked as `open -- <url>`. Replacing an existing principal enrolled with
+  the canonical RP by one from a non-canonical RP is refused
+  (`:id/canonical-principal-exists`) unless `--force` is given: a configured
+  allow-list must not silently swap the identity later commands act as. The device flow is always
   spoken to `https://<rp-id>` — RP and origin cannot be configured apart — and
   `device-authorize!` itself refuses an RP outside the list, so the refusal
   happens before any browser opens or any request is sent, as before. The
@@ -160,6 +195,13 @@ change (plus `cid.contact` as a second router); widening it is the operator's
 explicit choice.
 
 ## Not done in this step
+
+- Default routers and gateway are still (likely) one operator family — see
+  "Default gateways" above. Independent defaults need operators that commit
+  to serving `/routing/v1` and `?format=raw` without redirects; none were
+  added in this step.
+- IPNS resolution still trusts the first valid record (quorum 1); a quorum /
+  highest-sequence-wins resolve across several routers is a follow-up.
 
 - `deploy_adapter`'s pinned control-plane topology (which also names
   `auth.kotoba.cloud` and `kotobase.net`) is a separate authority check and is
