@@ -64,6 +64,36 @@ It does not mint an unrelated local UUID and never receives a Passkey private
 key, wallet seed, browser cookie, or long-lived bearer token. A non-canonical
 `--rp-id` is refused before the browser opens.
 
+### Holding your own DID update keys
+
+The account DID `did:webvh:<scid>:auth.kotoba.cloud:tenant:<user>` is a
+hash-chained, signed log. By default its update keys are custodied by the
+identity service. These commands move them to this machine, after which the
+service can host the log but can no longer change it:
+
+```sh
+kotoba id take-custody --recovery-out /Volumes/offline/kotoba-recovery.edn
+# generates active / next / recovery Ed25519 keys HERE, prints an approval URL
+# and a confirmation code; approve with your Passkey; the CLI verifies the
+# handover entry and pins it
+
+kotoba id rotate                 # sign the next entry with the pre-committed next key
+kotoba id recover --recovery /Volumes/offline/kotoba-recovery.edn \
+                  --recovery-out /Volumes/offline/kotoba-recovery-2.edn
+kotoba id verify --did did:webvh:… [--pin <versionId>]   # anyone can run this
+```
+
+The handover entry lists your active key in `updateKeys` and commits, by hash
+only, to your next and recovery keys (`nextKeyHashes`). From then on the
+did:webvh pre-rotation rule means only a pre-committed key can sign the next
+entry; the service's keys were never committed, so an entry it signs fails
+every resolver. Keys live in `${XDG_DATA_HOME:-$HOME/.local/share}/kotoba/`
+(mode 0600); the recovery key goes to its own file — keep it offline. Losing
+both the next key and the recovery key freezes the DID: nobody, the service
+included, can update it again. Every fetch checks that the served log extends
+the version this machine pinned, so a host that rolls back or forks the log is
+reported (`:id/log-fork-detected`) and nothing is signed on top of it.
+
 Base remains a useful Murakumo settlement link, but it appears only when
 `eip155:8453` is supplied. `kotoba id account --address 0x… --chain-id 1`
 describes a compatibility account alias; it never replaces the principal.
