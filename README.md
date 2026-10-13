@@ -1536,6 +1536,11 @@ HTTP loadtest matrix, and operator-UX defaults.
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
+OSS use remains available under its existing license for organizations of every
+size. Optional enterprise offerings have separate fees and OSS participation
+terms; see the [licensing policy and enterprise contract drafts (Japanese)](docs/enterprise/README.ja.md).
+These drafts do not create a contract or change the OSS license.
+
 ## Target-neutral and distributed stack architecture
 
 Orchestrates checking, project linking, runtime admission and user workflows through owner contracts. Content-addressed checked code is not a running heap image. Target selection and distributed consistency are independent; a remote location, gateway or service does not grant authority. The proposed conductor/cell composition does not become an implementation merely by documentation.
