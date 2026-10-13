@@ -18,11 +18,11 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
   `kotoba-vault`/KSE, `kotoba-runtime`, `kotoba-clj`, `kotoba-server`, …) was
   removed in `60489617` (#259, 2026-07-01). None of its `cargo` commands,
   crate paths or benchmarks exist here any more, and neither do its WIT host
-  files. The only `.wit` files left are the Python SDK's guest world
-  (`sdk/kotoba-modal/wit/world.wit` and the packaged copy
-  `sdk/kotoba-modal/kotoba_modal/wit/world.wit`, shipped via `pyproject.toml`
-  and asserted present in the wheel by CI). Its design
-  vocabulary is kept in `docs/HISTORICAL-RUST-ARCHITECTURE.md`; the previous,
+  files — with one exception: the `kotoba:kais` WIT package the Python SDK
+  uses to build py→wasm guests survives as `sdk/kotoba-modal/wit/world.wit`
+  and its identical packaged copy `sdk/kotoba-modal/kotoba_modal/wit/world.wit`
+  (shipped via `pyproject.toml`; CI asserts it is in the wheel). The Rust
+  design vocabulary is kept in `docs/HISTORICAL-RUST-ARCHITECTURE.md`; the previous,
   Rust-era version of this file is in git history (`git show 5505040e:CLAUDE.md`).
 - KQE (Kotoba Query Engine) is called **`kgraph`** in the current
   implementation (an EAVT graph store with assert/retract, not only queries);
