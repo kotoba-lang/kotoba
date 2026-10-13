@@ -17,8 +17,12 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
 - The Rust workspace (`crates/*`: `kotoba-core`, `kotoba-query`/KQE,
   `kotoba-vault`/KSE, `kotoba-runtime`, `kotoba-clj`, `kotoba-server`, …) was
   removed in `60489617` (#259, 2026-07-01). None of its `cargo` commands,
-  crate paths, benchmarks or WIT host files exist here any more. Its design
-  vocabulary is kept in `docs/HISTORICAL-RUST-ARCHITECTURE.md`; the previous,
+  crate paths or benchmarks exist here any more, and neither do its WIT host
+  files — with one exception: the `kotoba:kais` WIT package the Python SDK
+  uses to build py→wasm guests survives as `sdk/kotoba-modal/wit/world.wit`
+  and its identical packaged copy `sdk/kotoba-modal/kotoba_modal/wit/world.wit`
+  (shipped via `pyproject.toml`; CI asserts it is in the wheel). The Rust
+  design vocabulary is kept in `docs/HISTORICAL-RUST-ARCHITECTURE.md`; the previous,
   Rust-era version of this file is in git history (`git show 5505040e:CLAUDE.md`).
 - KQE (Kotoba Query Engine) is called **`kgraph`** in the current
   implementation (an EAVT graph store with assert/retract, not only queries);
@@ -57,8 +61,11 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
 # public CLI from a source checkout (same as the installed `kotoba`)
 bin/kotoba check --kind cli-contract --json
 
-# full suite via kotoba.test-runner (CI "Test CLJ launcher")
+# JVM aggregate suite via kotoba.test-runner (CI "Test CLJ launcher")
 clojure -M:test
+
+# portable kbb/SCI slice (incl. kotoba.kbb-deps-test, which is SCI-only)
+kbb --backend sci --classpath src:test run-tests.cljk
 
 # Q9 backend-qualification report
 clojure -M:qualification
@@ -73,12 +80,16 @@ bin/kotoba-clj package verify --lock test/fixtures/package/positive-lock.edn --t
 ```
 
 Other `deps.edn` aliases: `:dev` (sibling `:local/root` overrides, e.g.
-`../../kotoba-lang/amu`), `:build` (`build.cljk` uberjar), `:release-tag`,
+`../../kotoba-lang/amu`), `:build` (`build.cljk` uberjar, `-T` tool alias), `:release-tag`,
 `:reproducible-emit`, `:raw-memory-audit`, and the security checks
 `:grade-a-check`, `:grade-a-attest`, `:crypto-check`, `:threat-model-check`,
 `:supply-chain-check`, `:key-hierarchy-check`, `:control-adoption-check`,
 `:vulnerability-response-check`. Native binary: `scripts/build-native.sh`
-(needs GraalVM `native-image`).
+(needs GraalVM `native-image`). **Known broken since the `.cljk` rename:** its
+`kbb -T:build uber` step cannot run tools.build (kbb's engine loads no Maven
+jars), `clojure -T:build uber` cannot find the `build` namespace in
+`build.cljk`, and tools.build's `compile-clj` cannot AOT-load `.cljk` sources.
+The last native release (`native-release.yml`) is v0.7.2 (2026-08-17).
 
 Some tests resolve evidence paths in sibling checkouts; CI sets
 `KOTOBA_LANG_AUTHORITY_ROOT`, `KOTOBA_COMPILER_EVIDENCE_ROOT` and
@@ -123,8 +134,10 @@ via `KBB_ENGINE`.
 - New Clojure-family source is `.cljk`. Keep `tools/cljk_loader.cljk`
   byte-identical to its kotoba-lang/kotoba-lang origin.
 - Every test namespace must be listed in `test/kotoba/test_runner.cljk` —
-  in both the `:require` and the `run-tests` call — otherwise it never runs.
-  Portable tests also go in `run-tests.cljk`.
+  in both the `:require` and the `run-tests` call — otherwise it never runs
+  (`kotoba.test-runner-completeness-test` enforces this). SCI-only namespaces
+  (currently `kotoba.kbb-deps-test`) are exempted there and run only from
+  `run-tests.cljk`; other portable tests also go in `run-tests.cljk`.
 - Dependencies are immutable `:git/sha` pins. `nbb.edn` copies its `:paths`
   and shas from `deps.edn`; change both together. Production git deps must
   match `resources/repository-rules.edn` `:depends-on`.
