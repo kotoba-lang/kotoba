@@ -94,7 +94,7 @@ via `KBB_ENGINE`.
   launchers delegate to that CLJC contract; do not add independent command
   semantics here.
 - Domain actors/cells live in `etzhayyim/com-etzhayyim-*`; AT Protocol actors,
-  PDS/AppView and XRPC application surfaces in `gftdcojp/app-aozora`; hosting,
+  PDS/AppView and XRPC application surfaces in `network-awai/app-aozora`; hosting,
   placement, fleet and gateway operations in `kotoba-lang/murakumo`; the
   persistent database in `kotoba-lang/kotobase`; the OS product in
   `kotoba-lang/aiueos`. Reusable libraries get their own `kotoba-lang/<lib>` repo.
