@@ -129,6 +129,51 @@ repository.
 
 The rest of this file is the implementation contract.
 
+## Where this fits / quick use
+
+Figure: an [interactive map of the kotoba / murakumo stack](https://kotoba-lang.org/anatomy/kotoba-murakumo/)
+(published from the same figure as this section; the page may not be live yet).
+
+| piece | use it for |
+|---|---|
+| [kotoba](https://github.com/kotoba-lang/kotoba) | the language and CLI. Grants authority (capabilities) to programs and agents; `kotoba id new` creates a Passkey-controlled principal. |
+| [itonami](https://github.com/network-awai/cloud-itonami) | hands over jobs with stable IDs, deadlines and output limits. |
+| [murakumo](https://github.com/kotoba-lang/murakumo) | the compute plane: nodes, gateways, and quorum placement of a job on a ready node. |
+| [kotobase](https://github.com/kotoba-lang/kotobase) | results as a signed, immutable, CID-addressed commit DAG. [`kotoba-lang/chain`](https://github.com/kotoba-lang/chain) is the parent-linked commit-chain primitive; [`kotobase-anchor-fevm`](https://github.com/kotoba-lang/kotobase-anchor-fevm) is by default a chainless signed transparency log, with an optional EVM anchor. |
+
+Two layers sit beside this path and are not part of it yet:
+
+- Private network layer: AWAI DNA (spec in
+  [network-awai/network-awai-apex PR #14](https://github.com/network-awai/network-awai-apex/pull/14),
+  branch `dna-private-network-spec`, directory `awai-dna/`): the DNA CID is the
+  network id, each agent keeps a signed source chain, with warrants and a kekkai
+  realm. Proposed / spec stage, open PR, simulated transport only. There is no
+  "awai chain".
+- Settlement: Base / x402 settles bounded USDC charges for murakumo's public
+  paid route (`cloud-murakumo`). Base is a settlement link, not the identity
+  root. Chain ID 260425 (`cloud-itonami/chain-contracts`) is decommissioned and
+  is not live.
+
+Quick use (this repo; commands as documented below in [Install](#install) and [Quick start](#quick-start)):
+
+```sh
+brew tap kotoba-lang/kotoba && brew trust kotoba-lang/kotoba && brew install kotoba
+kotoba -e '(+ 1 2)'
+kotoba id new          # opens a browser; approve with Passkey; saves the public principal projection locally
+kotoba id show
+kotoba check --kind cli-contract --json   # validate the CLI/package/lock contract
+```
+
+`kotoba id new` never receives a Passkey private key, wallet seed or bearer
+token, and authentication alone grants an agent no authority. Running jobs
+(`itonami`), nodes and gateways (`murakumo`), and result storage (`kotobase`)
+live in their own repositories; see
+[`kotoba-lang/murakumo`](https://github.com/kotoba-lang/murakumo) for the node
+and job commands.
+
+Not live or guaranteed: hosted billed deploy of kotoba grants; the AWAI DNA
+network; anything on chain ID 260425.
+
 ## Lisp machine architecture
 
 AiueOS is the OS for a modern Kotoba Lisp machine in development. Kototama
