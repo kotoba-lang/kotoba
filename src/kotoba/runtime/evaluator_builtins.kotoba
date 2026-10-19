@@ -1,0 +1,487 @@
+;; Native Kotoba implementation of evaluator builtins. The interpreter
+;; machine keeps dispatch mechanics while this module owns builtin behavior.
+(ns kotoba.runtime.evaluator-builtins
+  (:export [call-builtin builtin-name?])
+  (:require [kotoba.form :as form]
+            [kotoba.runtime.evaluator-collections :as collection-builtin]
+            [kotoba.runtime.evaluator-strings :as string-builtin]
+            [kotoba.runtime.value-semantics :as value-semantics])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                      [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :runtime/eval-out [:record :runtime/eval-out
+                                [[:ok :bool] [:value [:ref :form/r]]
+                                 [:error :string] [:fuel :i64]]]}))
+
+(defn- outcome [ok :bool value [:ref :form/r] error :string fuel :i64]
+  [:ref :runtime/eval-out]
+  (record-new [:ref :runtime/eval-out] ok value error fuel))
+
+(defn- success [value [:ref :form/r] fuel :i64] [:ref :runtime/eval-out]
+  (outcome true value "" fuel))
+
+(defn- failure [message :string fuel :i64] [:ref :runtime/eval-out]
+  (outcome false (form/nil-form) message fuel))
+
+(defn- item-at [node [:ref :form/r] index :i64] [:ref :form/r]
+  (typed-list-nth [:list [:ref :form/r]] (form/kids-of node) index))
+
+
+(defn- code-point-width [point :i64] :i64
+  (if (< point 128) 1
+      (if (< point 2048) 2
+          (if (< point 65536) 3 4))))
+
+(defn- utf8-byte-of [point :i64 local-index :i64] :i64
+  (let [width (code-point-width point)]
+    (cond
+      (= width 1) point
+      (= width 2)
+      (if (= local-index 0)
+        (bit-or 0xC0 (i64-shift-right point 6))
+        (bit-or 0x80 (bit-and point 0x3F)))
+      (= width 3)
+      (if (= local-index 0)
+        (bit-or 0xE0 (i64-shift-right point 12))
+        (if (= local-index 1)
+          (bit-or 0x80 (bit-and (i64-shift-right point 6) 0x3F))
+          (bit-or 0x80 (bit-and point 0x3F))))
+      (= local-index 0)
+      (bit-or 0xF0 (i64-shift-right point 18))
+      (= local-index 1)
+      (bit-or 0x80 (bit-and (i64-shift-right point 12) 0x3F))
+      (= local-index 2)
+      (bit-or 0x80 (bit-and (i64-shift-right point 6) 0x3F))
+      :else (bit-or 0x80 (bit-and point 0x3F)))))
+
+(defn- utf8-byte-at [text :string byte-index :i64] :i64
+  (let [length (string-byte-length text)]
+    (loop [char-index 0 byte-offset 0]
+      (if (>= byte-offset length)
+        -1
+        (let [point (string-code-point-at text char-index)
+              width (code-point-width point)]
+          (if (< byte-index (+ byte-offset width))
+            (utf8-byte-of point (- byte-index byte-offset))
+            (recur (+ char-index width) (+ byte-offset width))))))))
+
+(defn- local-name [text :string] :string
+  (let [length (string-byte-length text)]
+    (loop [from 0 last-slash -1]
+      (let [found (string-find-byte text 47 from)]
+        (if (< found 0)
+          (if (< last-slash 0)
+            text
+            (string-substring text (+ last-slash 1) length))
+          (recur (+ found 1) found))))))
+
+
+(defn- call-byte-at [args [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (not (= (form/count-of args) 2))
+    (failure "byte-at expects a value and a non-negative index" fuel)
+    (let [value (item-at args 0)
+          index-form (item-at args 1)]
+      (if (not (and (form/is-int? index-form)
+                    (>= (form/int-value index-form) 0)))
+        (failure "byte-at index must be a non-negative integer" fuel)
+        (let [index (form/int-value index-form)]
+          (cond
+            (form/is-string? value)
+            (if (< index (string-byte-length (form/string-value value)))
+              (success (form/int-form
+                        (utf8-byte-at (form/string-value value) index)) fuel)
+              (failure "byte-at index is out of range" fuel))
+
+            (form/is-vec? value)
+            (if (< index (form/count-of value))
+              (success (form/nth-of value index) fuel)
+              (failure "byte-at index is out of range" fuel))
+
+            :else (failure "byte-at expects a string or vector" fuel)))))))
+
+(defn- call-keyword [args [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (and (= (form/count-of args) 1)
+           (form/is-string? (item-at args 0)))
+    (success (form/keyword-form
+              (keyword-from-string (form/string-value (item-at args 0)))) fuel)
+    (failure "keyword expects one string" fuel)))
+
+(defn- call-symbol [args [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (and (= (form/count-of args) 1)
+           (form/is-string? (item-at args 0)))
+    (success (form/symbol-form (form/string-value (item-at args 0))) fuel)
+    (failure "symbol expects one string" fuel)))
+
+(defn- call-name [args [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (not (= (form/count-of args) 1))
+    (failure "name expects one string, symbol, or keyword" fuel)
+    (let [value (item-at args 0)]
+      (cond
+        (form/is-string? value)
+        (success value fuel)
+
+        (form/is-symbol? value)
+        (success (form/string-form (local-name (form/symbol-value value))) fuel)
+
+        (form/is-keyword? value)
+        (success (form/string-form (keyword-name (form/keyword-value value))) fuel)
+
+        :else (failure "name expects one string, symbol, or keyword" fuel)))))
+
+(defn- integer-fold [args [:ref :form/r] index :i64 current :i64 op :string fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (>= index (form/count-of args))
+    (success (form/int-form current) fuel)
+    (let [value (item-at args index)]
+      (if (not (form/is-int? value))
+        (failure "arithmetic operands must be integers" fuel)
+        (let [n (form/int-value value)
+              next (cond
+                     (string=? op "+") (+ current n)
+                     (string=? op "-") (- current n)
+                     (string=? op "*") (* current n)
+                     (string=? op "bit-and") (bit-and current n)
+                     (string=? op "bit-or") (bit-or current n)
+                     (string=? op "bit-xor") (bit-xor current n)
+                     (string=? op "min") (if (< current n) current n)
+                     :else (if (> current n) current n))]
+          (integer-fold args (+ index 1) next op fuel))))))
+
+(defn- integer-comparison [args [:ref :form/r] index :i64 previous :i64 op :string fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (>= index (form/count-of args))
+    (success (form/bool-form true) fuel)
+    (let [value (item-at args index)]
+      (if (not (form/is-int? value))
+        (failure "comparison operands must be integers" fuel)
+        (let [n (form/int-value value)
+              matches (cond
+                        (string=? op "<") (< previous n)
+                        (string=? op ">") (> previous n)
+                        (string=? op "<=") (<= previous n)
+                        :else (>= previous n))]
+          (if matches
+            (integer-comparison args (+ index 1) n op fuel)
+            (success (form/bool-form false) fuel)))))))
+
+(defn- integer-binary [args [:ref :form/r] op :string fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (not (= 2 (form/count-of args)))
+    (failure "integer operation expects two operands" fuel)
+    (let [left (item-at args 0)
+          right (item-at args 1)]
+      (if (not (and (form/is-int? left) (form/is-int? right)))
+        (failure "integer operation operands must be integers" fuel)
+        (let [a (form/int-value left)
+              b (form/int-value right)]
+          (cond
+            (and (or (string=? op "quot") (string=? op "mod") (string=? op "rem")) (= b 0))
+            (failure "division by zero" fuel)
+            (string=? op "quot") (success (form/int-form (quot a b)) fuel)
+            (string=? op "mod")
+            (let [remainder (- a (* (quot a b) b))]
+              (success (form/int-form
+                        (if (or (and (< remainder 0) (> b 0))
+                                (and (> remainder 0) (< b 0)))
+                          (+ remainder b)
+                          remainder)) fuel))
+            :else (success (form/int-form (- a (* (quot a b) b))) fuel)))))))
+
+(defn- integer-shift [args [:ref :form/r] op :string fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (not (= 2 (form/count-of args)))
+    (failure "bit shift expects two operands" fuel)
+    (let [value (item-at args 0)
+          shift (item-at args 1)]
+      (if (not (and (form/is-int? value) (form/is-int? shift)))
+        (failure "bit shift operands must be integers" fuel)
+        (let [n (form/int-value value)
+              amount (form/int-value shift)]
+          (success
+           (form/int-form
+            (cond
+              (or (string=? op "bit-shift-left") (string=? op "i64shl"))
+              (i64-shift-left n amount)
+              (or (string=? op "bit-shift-right") (string=? op "i64shr"))
+              (i64-shift-right n amount)
+              :else (u64-shift-right n amount)))
+           fuel))))))
+
+(defn call-builtin [name :string args [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (let [count (form/count-of args)]
+    (cond
+      (or (string=? name "+") (string=? name "i64+"))
+      (integer-fold args 0 0 "+" fuel)
+
+      (or (string=? name "*") (string=? name "i64*"))
+      (integer-fold args 0 1 "*" fuel)
+
+      (or (string=? name "bit-and") (string=? name "i64and"))
+      (integer-fold args 0 -1 "bit-and" fuel)
+
+      (or (string=? name "bit-or") (string=? name "i64or"))
+      (integer-fold args 0 0 "bit-or" fuel)
+
+      (or (string=? name "bit-xor") (string=? name "i64xor"))
+      (integer-fold args 0 0 "bit-xor" fuel)
+
+      (or (string=? name "bit-shift-left") (string=? name "bit-shift-right")
+          (string=? name "unsigned-bit-shift-right") (string=? name "i64shl")
+          (string=? name "i64shr") (string=? name "i64ushr"))
+      (integer-shift args name fuel)
+
+      (or (string=? name "-") (string=? name "i64-"))
+      (cond
+        (= count 0) (failure "- expects at least one operand" fuel)
+        (= count 1) (let [x (item-at args 0)]
+                      (if (form/is-int? x)
+                        (success (form/int-form (- 0 (form/int-value x))) fuel)
+                        (failure "arithmetic operands must be integers" fuel)))
+        :else (integer-fold args 1 (form/int-value (item-at args 0)) "-" fuel))
+
+      (or (string=? name "min") (string=? name "max"))
+      (if (= count 0)
+        (failure "min/max expects at least one operand" fuel)
+        (let [first-value (item-at args 0)]
+          (if (not (form/is-int? first-value))
+            (failure "arithmetic operands must be integers" fuel)
+            (integer-fold args 1 (form/int-value first-value) name fuel))))
+
+      (or (string=? name "quot") (string=? name "mod") (string=? name "rem"))
+      (integer-binary args name fuel)
+
+      (or (string=? name "inc") (string=? name "dec") (string=? name "i64"))
+      (if (not (= count 1))
+        (failure "integer conversion expects one operand" fuel)
+        (let [x (item-at args 0)]
+          (if (not (form/is-int? x))
+            (failure "integer operand required" fuel)
+            (success (form/int-form
+                      (if (string=? name "inc") (+ (form/int-value x) 1)
+                          (if (string=? name "dec") (- (form/int-value x) 1)
+                              (form/int-value x)))) fuel))))
+
+      (or (string=? name "<") (string=? name ">")
+          (string=? name "<=") (string=? name ">="))
+      (if (< count 2)
+        (failure "comparison expects at least two operands" fuel)
+        (let [first-value (item-at args 0)]
+          (if (not (form/is-int? first-value))
+            (failure "comparison operands must be integers" fuel)
+            (integer-comparison args 1 (form/int-value first-value) name fuel))))
+
+      (string=? name "=")
+      (if (< count 2)
+        (success (form/bool-form true) fuel)
+        (let [first-value (item-at args 0)]
+          (success (form/bool-form
+                    (loop [index 1]
+                      (if (>= index count)
+                        true
+                        (and (form/eq first-value (item-at args index))
+                             (recur (+ index 1)))))) fuel)))
+
+      (string=? name "not")
+      (if (= count 1)
+        (success (form/bool-form (not (value-semantics/truthy? (item-at args 0)))) fuel)
+        (failure "not expects one operand" fuel))
+
+      (or (string=? name "zero?") (string=? name "pos?") (string=? name "neg?"))
+      (if (not (= count 1))
+        (failure "numeric predicate expects one operand" fuel)
+        (let [x (item-at args 0)]
+          (if (not (form/is-int? x))
+            (failure "numeric predicate operand must be an integer" fuel)
+            (let [n (form/int-value x)]
+              (success (form/bool-form
+                        (if (string=? name "zero?") (= n 0)
+                            (if (string=? name "pos?") (> n 0) (< n 0)))) fuel)))))
+
+      (string=? name "list") (success (form/form-seq (form/kids-of args)) fuel)
+      (string=? name "vector") (success args fuel)
+
+      (or (string=? name "string-length") (string=? name "string-byte-length")
+          (string=? name "string=?") (string=? name "string=")
+          (string=? name "string-concat") (string=? name "string-substring")
+          (string=? name "string-index-of") (string=? name "string-index-of-from")
+          (string=? name "string-contains?")
+          (string=? name "string-split-count"))
+      (string-builtin/call-string-builtin name args fuel)
+
+      (string=? name "byte-at")
+      (call-byte-at args fuel)
+
+      (string=? name "keyword")
+      (call-keyword args fuel)
+
+      (string=? name "symbol")
+      (call-symbol args fuel)
+
+      (string=? name "name")
+      (call-name args fuel)
+
+      (or (string=? name "second") (string=? name "rest")
+          (string=? name "cons") (string=? name "empty?") (string=? name "contains?")
+          (string=? name "conj") (string=? name "assoc")
+          (string=? name "dissoc") (string=? name "keys"))
+      (collection-builtin/call-collection-builtin name args fuel)
+
+      (string=? name "count")
+      (if (= count 1)
+        (let [collection (item-at args 0)]
+          (if (form/is-map? collection)
+            (success (form/int-form (quot (form/count-of collection) 2)) fuel)
+            (if (or (form/is-seq? collection) (form/is-vec? collection) (form/is-set? collection))
+              (success (form/int-form (form/count-of collection)) fuel)
+              (failure "count expects a collection" fuel))))
+        (failure "count expects one operand" fuel))
+
+      (string=? name "first")
+      (if (= count 1)
+        (let [collection (item-at args 0)]
+          (success (if (= (form/count-of collection) 0)
+                     (form/nil-form)
+                     (item-at collection 0)) fuel))
+        (failure "first expects one operand" fuel))
+
+      (string=? name "nth")
+      (if (or (= count 2) (= count 3))
+        (let [collection (item-at args 0)
+              index (item-at args 1)]
+          (if (and (form/is-int? index) (>= (form/int-value index) 0)
+                   (< (form/int-value index) (form/count-of collection)))
+            (success (item-at collection (form/int-value index)) fuel)
+            (if (= count 3)
+              (success (item-at args 2) fuel)
+              (failure "nth index is out of range" fuel))))
+        (failure "nth expects two or three operands" fuel))
+
+      (string=? name "get")
+      (if (or (= count 2) (= count 3))
+        (let [collection (item-at args 0)
+              key (item-at args 1)]
+          (if (form/is-map? collection)
+            (if (form/form-has? collection key)
+              (success (form/form-get collection key) fuel)
+              (success (if (= count 3) (item-at args 2) (form/nil-form)) fuel))
+            (if (and (form/is-int? key) (>= (form/int-value key) 0)
+                     (< (form/int-value key) (form/count-of collection)))
+              (success (item-at collection (form/int-value key)) fuel)
+              (success (if (= count 3) (item-at args 2) (form/nil-form)) fuel))))
+        (failure "get expects two or three operands" fuel))
+
+      (or (string=? name "alloc") (string=? name "alloc-checked")
+          (string=? name "str-ptr") (string=? name "bytes-ptr"))
+      (success (form/int-form 0) fuel)
+
+      (string=? name "memory-pages")
+      (success (form/int-form 1) fuel)
+
+      (string=? name "memory-grow")
+      (if (= count 1)
+        (success (form/int-form 1) fuel)
+        (failure "memory-grow expects one operand" fuel))
+
+      (string=? name "host-i64-roundtrip")
+      (if (= count 1)
+        (let [value (item-at args 0)]
+          (if (form/is-int? value)
+            (success value fuel)
+            (failure "integer roundtrip expects an integer" fuel)))
+        (failure "integer roundtrip expects one operand" fuel))
+
+      (string=? name "call-indirect")
+      (if (= count 2)
+        (success (item-at args 1) fuel)
+        (failure "call-indirect expects an index and value" fuel))
+
+      (or (string=? name "mem-byte-at") (string=? name "mem-i32-at"))
+      (if (= count 2)
+        (success (form/int-form 0) fuel)
+        (failure "memory read expects two operands" fuel))
+
+      (string=? name "slice-byte-at")
+      (if (= count 3)
+        (success (form/int-form 0) fuel)
+        (failure "slice-byte-at expects three operands" fuel))
+
+      (string=? name "byte-store!")
+      (if (= count 3)
+        (success (item-at args 2) fuel)
+        (failure "byte-store! expects three operands" fuel))
+
+      (string=? name "i32-store!")
+      (if (= count 3)
+        (success (item-at args 2) fuel)
+        (failure "i32-store! expects three operands" fuel))
+
+      (string=? name "slice-byte-store!")
+      (if (= count 4)
+        (success (item-at args 3) fuel)
+        (failure "slice-byte-store! expects four operands" fuel))
+
+      (or (string=? name "result-ok?") (string=? name "result-err?"))
+      (if (= count 1)
+        (let [value (item-at args 0)]
+          (if (form/is-int? value)
+            (let [negative (< (form/int-value value) 0)]
+              (success (form/bool-form
+                        (if (string=? name "result-ok?") (not negative) negative))
+                       fuel))
+            (failure "result predicate expects an integer" fuel)))
+        (failure "result predicate expects one operand" fuel))
+
+      (string=? name "result-write!")
+      (if (= count 2)
+        (success (item-at args 0) fuel)
+        (failure "result-write! expects two operands" fuel))
+
+      (or (string=? name "result-status") (string=? name "result-value"))
+      (if (= count 1)
+        (success (form/int-form 0) fuel)
+        (failure "result accessor expects one operand" fuel))
+
+      :else (failure "unsupported builtin function" fuel))))
+
+(defn builtin-name? [name :string] :bool
+  (or (string=? name "+") (string=? name "-") (string=? name "*")
+      (string=? name "i64+") (string=? name "i64-") (string=? name "i64*")
+      (string=? name "quot") (string=? name "mod") (string=? name "rem")
+      (string=? name "inc") (string=? name "dec") (string=? name "i64")
+      (string=? name "min") (string=? name "max") (string=? name "=")
+      (string=? name "bit-and") (string=? name "bit-or") (string=? name "bit-xor")
+      (string=? name "bit-shift-left") (string=? name "bit-shift-right")
+      (string=? name "unsigned-bit-shift-right") (string=? name "i64and")
+      (string=? name "i64or") (string=? name "i64xor") (string=? name "i64shl")
+      (string=? name "i64shr") (string=? name "i64ushr")
+      (string=? name "<") (string=? name ">") (string=? name "<=")
+      (string=? name ">=") (string=? name "zero?") (string=? name "pos?")
+      (string=? name "neg?") (string=? name "not") (string=? name "list")
+      (string=? name "vector") (string=? name "count") (string=? name "first")
+      (string=? name "string-length") (string=? name "string-byte-length")
+      (string=? name "string=?") (string=? name "string=")
+      (string=? name "string-concat") (string=? name "string-substring")
+      (string=? name "string-index-of") (string=? name "string-index-of-from")
+      (string=? name "string-contains?")
+      (string=? name "string-split-count")
+      (string=? name "byte-at")
+      (string=? name "keyword") (string=? name "symbol") (string=? name "name")
+      (string=? name "second") (string=? name "rest") (string=? name "cons")
+      (string=? name "empty?")
+      (string=? name "contains?") (string=? name "conj") (string=? name "assoc")
+      (string=? name "dissoc") (string=? name "keys")
+      (string=? name "nth") (string=? name "get")
+      (string=? name "alloc") (string=? name "alloc-checked")
+      (string=? name "str-ptr") (string=? name "bytes-ptr")
+      (string=? name "memory-pages") (string=? name "memory-grow")
+      (string=? name "host-i64-roundtrip")
+      (string=? name "call-indirect") (string=? name "mem-byte-at")
+      (string=? name "mem-i32-at") (string=? name "slice-byte-at")
+      (string=? name "byte-store!") (string=? name "i32-store!")
+      (string=? name "slice-byte-store!") (string=? name "result-ok?")
+      (string=? name "result-err?") (string=? name "result-write!")
+      (string=? name "result-status") (string=? name "result-value")))
