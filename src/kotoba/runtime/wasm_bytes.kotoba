@@ -1,0 +1,158 @@
+(ns kotoba.runtime.wasm-bytes
+  {:kotoba/export [align-to heap-base uleb sleb32 f32-bits-le-bytes
+                   concat-packed-bytes vector-items-packed section
+                   global-entry memory-entry table-entry element-segment data-segment
+                   import-entry export-entry]}
+  (:require [kotoba.bytes :as bytes]))
+
+(defn align-to [value :i64 alignment :i64] :i64
+  "Round a nonnegative address up to the next alignment boundary."
+  (let [raw-remainder (- value (* (quot value alignment) alignment))
+        normalized-remainder (if (< raw-remainder 0)
+                               (+ raw-remainder alignment)
+                               raw-remainder)]
+    (if (= normalized-remainder 0)
+      value
+      (+ value (- alignment normalized-remainder)))))
+
+(defn heap-base [ranges :vector-i64] :i64
+  "First 16-byte-aligned address after [offset length ...] ranges, at least 2048."
+  (loop [index 0 high-water 2048]
+    (if (>= (+ index 1) (vector-count ranges))
+      (align-to high-water 16)
+      (let [end (+ (vector-at ranges index)
+                   (vector-at ranges (+ index 1)))]
+        (recur (+ index 2) (if (> end high-water) end high-water))))))
+
+(defn uleb [n :i64] :vector-i64
+  "Unsigned LEB128 encoding used by the WASM module writer."
+  (loop [value n output []]
+    (let [byte (bit-and value 127)
+          next-value (u64-shift-right value 7)]
+      (if (= next-value 0)
+        (conj output byte)
+        (recur next-value (conj output (bit-or byte 128)))))))
+
+(defn sleb32 [n :i64] :vector-i64
+  "Signed LEB128 encoding for i32 constants."
+  (loop [value n output []]
+    (let [byte (bit-and value 127)
+          shifted (i64-shift-right value 7)
+          sign-set? (> (bit-and byte 64) 0)
+          done? (or (and (= shifted 0) (not sign-set?))
+                    (and (= shifted -1) sign-set?))]
+      (if done?
+        (conj output byte)
+        (recur shifted (conj output (bit-or byte 128)))))))
+
+(defn f32-bits-le-bytes [bits :i64] :vector-i64
+  "Canonical IEEE-754 single-precision bits, in little-endian byte order."
+  [(bit-and bits 255)
+   (bit-and (i64-shift-right bits 8) 255)
+   (bit-and (i64-shift-right bits 16) 255)
+   (bit-and (i64-shift-right bits 24) 255)])
+
+(defn- append-i64 [left :vector-i64 right :vector-i64] :vector-i64
+  (loop [index 0 output left]
+    (if (>= index (vector-count right))
+      output
+      (recur (+ index 1)
+             (vector-conj output (vector-at right index))))))
+
+(defn- append-packed-parts [packed :vector-i64 output :vector-i64] :vector-i64
+  ;; PACKED is [part-count, byte-count, bytes..., byte-count, bytes...].
+  ;; This keeps the exported boundary scalar even though the host compiler
+  ;; naturally assembles a sequence of byte vectors.
+  (let [total (vector-count packed)]
+    (if (< total 1)
+      output
+      (let [part-count (vector-at packed 0)]
+        (if (or (< part-count 0) (> part-count (- total 1)))
+          output
+          (loop [part 0 cursor 1 result output]
+            (if (>= part part-count)
+              result
+              (if (>= cursor total)
+                result
+                (let [length (vector-at packed cursor)
+                      remaining (- total (+ cursor 1))]
+                  (if (or (< length 0) (> length remaining))
+                    result
+                    (let [result
+                          (loop [byte 0 next-result result]
+                            (if (>= byte length)
+                              next-result
+                              (recur (+ byte 1)
+                                     (vector-conj next-result
+                                                  (vector-at packed (+ cursor 1 byte))))))]
+                      (recur (+ part 1) (+ cursor 1 length) result))))))))))))
+
+(defn concat-packed-bytes [packed :vector-i64] :vector-i64
+  "Concatenate the bytes in a packed part vector into one flat vector."
+  (append-packed-parts packed (vector-i64)))
+
+(defn section [id :i64 payload :vector-i64] :vector-i64
+  "Encode a WASM section id and its ULEB-length-prefixed payload."
+  (append-i64
+   (append-i64 [id] (uleb (vector-count payload)))
+   payload))
+
+(defn global-entry [initial-value :i64] :vector-i64
+  "Encode one mutable i32 global initialized from a signed constant."
+  (append-i64 [0x7f 0x01 0x41]
+              (append-i64 (sleb32 initial-value) [0x0b])))
+
+(defn memory-entry [minimum-pages :i64 maximum-pages :i64] :vector-i64
+  "Encode a bounded WASM memory entry with explicit minimum and maximum pages."
+  (append-i64 [0x01]
+              (append-i64 (uleb minimum-pages) (uleb maximum-pages))))
+
+(defn table-entry [size :i64] :vector-i64
+  "Encode a funcref table with minimum size and no maximum."
+  [0x70 0x00 size])
+
+(defn element-segment [function-indexes :vector-i64] :vector-i64
+  "Encode an active element segment for table zero at offset zero."
+  (loop [index 0
+         output (append-i64 [0x00 0x41 0x00 0x0b]
+                            (uleb (vector-count function-indexes)))]
+    (if (>= index (vector-count function-indexes))
+      output
+      (recur (+ index 1)
+             (append-i64 output (uleb (vector-at function-indexes index)))))))
+
+(defn data-segment [offset :i64 bytes :vector-i64] :vector-i64
+  "Encode an active memory-zero data segment at a constant i32 offset."
+  (append-i64
+   (append-i64
+    (append-i64 [0x00 0x41] (sleb32 offset))
+    [0x0b])
+   (append-i64 (uleb (vector-count bytes)) bytes)))
+
+(defn import-entry [module :string field :string type-index :i64] :vector-i64
+  "Encode a function import with UTF-8 module/field names and a type index."
+  (let [module-bytes (bytes/utf8-encode module)
+        field-bytes (bytes/utf8-encode field)]
+    (append-i64
+     (append-i64 (uleb (vector-count module-bytes)) module-bytes)
+     (append-i64
+      (append-i64 (uleb (vector-count field-bytes)) field-bytes)
+      (append-i64 [0x00] (uleb type-index))))))
+
+(defn export-entry [name :string kind :i64 index :i64] :vector-i64
+  "Encode a named WASM export and its item index."
+  (let [name-bytes (bytes/utf8-encode name)]
+    (append-i64
+     (append-i64
+      (append-i64 (uleb (vector-count name-bytes)) name-bytes)
+      [kind])
+     (uleb index))))
+
+(defn vector-items-packed [packed :vector-i64] :vector-i64
+  "Encode a WASM vec(item) from packed byte vectors."
+  (if (= (vector-count packed) 0)
+    (vector-i64)
+    (let [item-count (vector-at packed 0)]
+      (if (< item-count 0)
+        (vector-i64)
+        (append-packed-parts packed (uleb item-count))))))

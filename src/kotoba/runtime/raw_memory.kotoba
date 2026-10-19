@@ -1,0 +1,116 @@
+;; Native Kotoba implementation of the runtime's T1 raw-memory source gate.
+;; It inspects the original Form tree before lowering can introduce memory ops.
+(ns kotoba.runtime.raw-memory
+  (:export [raw-memory-source-violation raw-memory-declared?])
+  (:require [kotoba.form :as form]
+            [kotoba.grammar.embedded-native :as embedded-grammar])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                      [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn- truthy-form? [value [:ref :form/r]] :bool
+  (and (not (form/is-nil? value))
+       (not (and (form/is-bool? value) (not (form/bool-value value)))))
+)
+
+(defn- policy-flag? [policy [:ref :form/r] qualified :keyword unqualified :keyword] :bool
+  (or (truthy-form? (form/form-get policy (form/keyword-form qualified)))
+      (truthy-form? (form/form-get policy (form/keyword-form unqualified))))
+)
+
+(defn- ns-form? [value [:ref :form/r]] :bool
+  (and (form/is-seq? value)
+       (> (form/count-of value) 0)
+       (form/is-symbol? (form/first-of value))
+       (string=? (form/symbol-value (form/first-of value)) "ns"))
+)
+
+(defn- has-raw-memory-attr? [header [:ref :form/r]] :bool
+  (loop [index 1]
+    (if (>= index (form/count-of header))
+      false
+      (let [child (form/nth-of header index)]
+        (if (and (form/is-map? child)
+                 (form/form-has? child (form/keyword-form :kotoba/raw-memory)))
+          true
+          (recur (+ index 1)))))))
+
+(defn raw-memory-declared? [forms [:list [:ref :form/r]]] :bool
+  "True when a top-level ns form has an attr-map :kotoba/raw-memory key."
+  (loop [index 0]
+    (if (>= index (vector-count forms))
+      false
+      (let [header (typed-list-nth [:list [:ref :form/r]] forms index)]
+        (if (and (ns-form? header) (has-raw-memory-attr? header))
+          true
+          (recur (+ index 1)))))))
+
+(defn- raw-op? [name :string] :bool
+  ;; The host gate unions the generated grammar catalog with runtime-owned
+  ;; dereferences. Keep the same shape here so a catalog addition reaches the
+  ;; native runtime without editing a second generated-looking list.
+  (or (embedded-grammar/raw-memory-op? name)
+      (string=? name "mem-byte-at")
+      (string=? name "mem-i32-at")
+      (string=? name "byte-store!")
+      (string=? name "i32-store!")
+      (string=? name "slice-byte-at")
+      (string=? name "slice-byte-store!")))
+
+(defn- node-raw-op [node [:ref :form/r]] :string
+  (if (and (form/is-seq? node)
+           (> (form/count-of node) 0)
+           (form/is-symbol? (form/first-of node)))
+    (let [name (form/symbol-value (form/first-of node))]
+      (if (raw-op? name) name ""))
+    ""))
+
+(defn- pop-stack [stack [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [limit (- (vector-count stack) 1)]
+    (loop [index 0 output (form/no-forms)]
+      (if (>= index limit)
+        output
+        (recur (+ index 1)
+               (form/append-form
+                output
+                (typed-list-nth [:list [:ref :form/r]] stack index)))))))
+
+(defn- push-children-reversed [stack [:list [:ref :form/r]] children [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (loop [index (- (vector-count children) 1) output stack]
+    (if (< index 0)
+      output
+      (recur (- index 1)
+             (form/append-form
+              output
+              (typed-list-nth [:list [:ref :form/r]] children index)))))
+)
+
+(defn- initial-stack [forms [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (push-children-reversed (form/no-forms) forms))
+
+(defn- find-first-raw-op [stack [:list [:ref :form/r]]] :string
+  (loop [pending stack]
+    (if (= (vector-count pending) 0)
+      ""
+      (let [top-index (- (vector-count pending) 1)
+            node (typed-list-nth [:list [:ref :form/r]] pending top-index)
+            op (node-raw-op node)
+            remaining (pop-stack pending)]
+        (if (not (string=? op ""))
+          op
+          (recur (push-children-reversed remaining (form/kids-of node))))))))
+
+(defn raw-memory-source-violation [forms [:list [:ref :form/r]]
+                                   policy [:ref :form/r]] :string
+  "Return the first raw dereference op in surface forms, or the empty string
+  when the source has an explicit module declaration/policy grant or is clean.
+  Policy forbid flags override both grants."
+  (let [forbid? (policy-flag? policy :kotoba.policy/forbid-raw-memory
+                               :forbid-raw-memory)
+        allowed? (and (not forbid?)
+                      (or (policy-flag? policy :kotoba.policy/allow-raw-memory
+                                        :allow-raw-memory)
+                          (raw-memory-declared? forms)))]
+    (if allowed?
+      ""
+      (find-first-raw-op (initial-stack forms)))))

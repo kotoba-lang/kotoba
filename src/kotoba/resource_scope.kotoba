@@ -1,0 +1,352 @@
+(ns kotoba.resource-scope
+  (:export [covers?])
+  (:schemas {:scope/url [:record :scope/url
+                         [[:scheme :string]
+                          [:host :string]
+                          [:port :i64]
+                          [:path :string]
+                          [:userinfo :bool]
+                          [:query :bool]
+                          [:fragment :bool]]]
+             :scope/path-state [:record :scope/path-state
+                                [[:segments [:list :string]]
+                                 [:active :i64]
+                                 [:trailing :bool]]]})
+  (:require [kotoba.bytes :as kbytes]))
+
+;; Kotoba-native resource scope. The .cljk twin remains the JVM URI oracle;
+;; this target parses the URI components it needs, then applies the same
+;; boundary-aware decision without java.net.URI or a host callback.
+
+(defn- width [point :i64] :i64
+  (if (< point 128) 1
+      (if (< point 2048) 2
+          (if (< point 65536) 3 4))))
+
+(defn- alpha? [point :i64] :bool
+  (or (and (>= point 65) (<= point 90))
+      (and (>= point 97) (<= point 122))))
+
+(defn- digit? [point :i64] :bool
+  (and (>= point 48) (<= point 57)))
+
+(defn- scheme-tail-char? [point :i64] :bool
+  (or (alpha? point) (digit? point)
+      (= point 43) (= point 45) (= point 46)))
+
+(defn- scheme-valid-run [scheme :string index :i64] :bool
+  (if (>= index (string-byte-length scheme))
+    true
+    (let [point (string-code-point-at scheme index)]
+      (if (scheme-tail-char? point)
+        (scheme-valid-run scheme (+ index (width point)))
+        false))))
+
+(defn- scheme-valid? [scheme :string] :bool
+  (if (= (string-byte-length scheme) 0)
+    false
+    (and (alpha? (string-code-point-at scheme 0))
+         (scheme-valid-run scheme 1))))
+
+(defn- uri-ascii-char? [point :i64] :bool
+  (or (alpha? point) (digit? point)
+      (= point 33) (= point 36) (= point 38) (= point 39)
+      (= point 40) (= point 41) (= point 42) (= point 43)
+      (= point 44) (= point 45) (= point 46) (= point 47)
+      (= point 58) (= point 59) (= point 61) (= point 63)
+      (= point 64) (= point 95) (= point 126) (= point 35)
+      (= point 37)))
+
+(defn- hex? [point :i64] :bool
+  (or (digit? point)
+      (and (>= point 65) (<= point 70))
+      (and (>= point 97) (<= point 102))))
+
+(defn- hex-value [point :i64] :i64
+  (if (digit? point)
+    (- point 48)
+    (if (<= 65 point 70)
+      (+ 10 (- point 65))
+      (+ 10 (- point 97)))) )
+
+(defn- uri-chars-valid-run [s :string index :i64] :bool
+  (let [n (string-byte-length s)]
+    (if (>= index n)
+      true
+      (let [point (string-code-point-at s index)]
+        (if (or (>= point 128) (uri-ascii-char? point))
+          (if (= point 37)
+            (if (>= (+ index 3) n)
+              false
+              (and (hex? (string-code-point-at s (+ index 1)))
+                   (hex? (string-code-point-at s (+ index 2)))
+                   (uri-chars-valid-run s (+ index 3))))
+            (uri-chars-valid-run s (+ index (width point))))
+          false)))))
+
+(defn- uri-chars-valid? [s :string] :bool
+  (uri-chars-valid-run s 0))
+
+(defn- host-valid-run [host :string index :i64 label-length :i64 last-hyphen :bool] :bool
+  (let [n (string-byte-length host)]
+    (if (>= index n)
+      (and (> label-length 0) (not last-hyphen))
+      (let [point (string-code-point-at host index)]
+        (cond
+          (= point 46)
+          (if (or (= label-length 0) last-hyphen)
+            false
+            (if (= (+ index 1) n)
+              true
+              (host-valid-run host (+ index 1) 0 false)))
+
+          (= point 45)
+          (if (= label-length 0)
+            false
+            (host-valid-run host (+ index 1) (+ label-length 1) true))
+
+          (or (alpha? point) (digit? point))
+          (host-valid-run host (+ index 1) (+ label-length 1) false)
+
+          :else false)))))
+
+(defn- host-valid? [host :string] :bool
+  (and (> (string-byte-length host) 0)
+       (host-valid-run host 0 0 false)))
+
+(defn- ascii-lowercase [text :string] :string
+  "Lowercase an ASCII URI component after its grammar has been validated."
+  (let [length (string-byte-length text)]
+    (loop [index 0 output (vector-i64)]
+      (if (>= index length)
+        (kbytes/utf8-string (bytes-from-vector-i64 output))
+        (let [point (string-code-point-at text index)
+              lowered (if (and (>= point 65) (<= point 90))
+                       (+ point 32)
+                       point)]
+          (recur (+ index 1) (vector-conj output lowered)))))))
+
+(defn- port-run [text :string index :i64 value :i64] :i64
+  (let [n (string-byte-length text)]
+    (if (>= index n)
+      value
+      (let [point (string-code-point-at text index)
+            digit (- point 48)
+            next-value (+ (* value 10) digit)]
+        (if (and (digit? point) (<= next-value 2147483647))
+          (port-run text (+ index 1) next-value)
+          -2)))))
+
+(defn- port-value [text :string] :i64
+  (if (= (string-byte-length text) 0)
+    -2
+    (port-run text 0 0)))
+
+(defn- earlier [left :i64 right :i64 fallback :i64] :i64
+  (if (< left 0)
+    (if (< right 0) fallback right)
+    (if (< right 0) left (if (< left right) left right))))
+
+(defn- delimiter-index [s :string] :i64
+  (earlier (string-index-of s "/")
+           (earlier (string-index-of s "?")
+                    (string-index-of s "#")
+                    (string-byte-length s))
+           (string-byte-length s)))
+
+(defn- path-state [segments [:list :string] active :i64 trailing :bool]
+  [:ref :scope/path-state]
+  (record-new [:ref :scope/path-state] segments active trailing))
+
+(defn- append-byte-vector [output :vector-i64 bytes :vector-i64 index :i64]
+  :vector-i64
+  (if (>= index (vector-count bytes))
+    output
+    (append-byte-vector (vector-conj output (vector-at bytes index))
+                        bytes (+ index 1))))
+
+(defn- decode-path-bytes-run [path :string index :i64 output :vector-i64]
+  :vector-i64
+  (let [n (string-byte-length path)]
+    (if (>= index n)
+      output
+      (let [point (string-code-point-at path index)]
+        (if (= point 37)
+          (let [high (hex-value (string-code-point-at path (+ index 1)))
+                low (hex-value (string-code-point-at path (+ index 2)))]
+            (decode-path-bytes-run path (+ index 3)
+                                   (vector-conj output (+ (* high 16) low))))
+          (let [next-index (+ index (width point))
+                literal (string-substring path index next-index)
+                encoded (kbytes/utf8-encode literal)]
+            (decode-path-bytes-run path next-index
+                                   (append-byte-vector output encoded 0))))))))
+
+(defn- decode-path [path :string] :string
+  (kbytes/utf8-string
+   (bytes-from-vector-i64
+    (decode-path-bytes-run path 0 (vector-i64)))))
+
+(defn- prefix-segments [segments [:list :string] active :i64 index :i64
+                        output [:list :string]] [:list :string]
+  (if (>= index active)
+    output
+    (prefix-segments segments active (+ index 1)
+                     (typed-list-conj [:list :string] output
+                                     (typed-list-nth [:list :string] segments index)))))
+
+(defn- normalize-path-run [path :string index :i64
+                          segments [:list :string] active :i64]
+  [:ref :scope/path-state]
+  (let [n (string-byte-length path)]
+    (if (>= index n)
+      (path-state segments active true)
+      (let [tail (string-substring path index n)
+            slash (string-index-of tail "/")
+            end (if (< slash 0) n (+ index slash))
+            segment (string-substring path index end)
+            final? (= end n)
+            next-segments
+            (if (or (string=? segment ".") (string=? segment ".."))
+              segments
+              (typed-list-conj [:list :string]
+                               (prefix-segments segments active 0
+                                                (typed-list-new [:list :string]))
+                               segment))
+            next-active
+            (if (string=? segment "..")
+              (if (> active 0) (- active 1) 0)
+              (if (string=? segment ".") active (+ active 1)))]
+        (if final?
+          (path-state next-segments next-active
+                      (or (string=? segment ".") (string=? segment "..")))
+          (normalize-path-run path (+ end 1) next-segments next-active))))))
+
+(defn- join-path-segments [segments [:list :string] active :i64
+                           index :i64 output :string] :string
+  (if (>= index active)
+    output
+    (let [segment (typed-list-nth [:list :string] segments index)
+          next-output
+          (if (= index 0)
+            (string-concat "/" segment)
+            (string-concat (string-concat output "/") segment))]
+      (join-path-segments segments active (+ index 1) next-output))))
+
+(defn- normalized-path [path :string] :string
+  (let [state (normalize-path-run path 1 (typed-list-new [:list :string]) 0)
+        segments (record-get [:ref :scope/path-state] state :segments)
+        active (record-get [:ref :scope/path-state] state :active)
+        trailing (record-get [:ref :scope/path-state] state :trailing)
+        visible-prefix (prefix-segments segments active 0 (typed-list-new [:list :string]))
+        visible (if trailing
+                  (typed-list-conj [:list :string] visible-prefix "")
+                  visible-prefix)
+        visible-count (if trailing (+ active 1) active)
+        joined (if (= visible-count 0)
+                 "/"
+                 (join-path-segments visible visible-count 0 ""))]
+    (decode-path joined)))
+
+(defn- host-part [authority :string] :string
+  (if (>= (string-index-of authority "@") 0)
+    ""
+    (let [colon (string-index-of authority ":")]
+      (if (< colon 0) authority (string-substring authority 0 colon)))))
+
+(defn- port-part [authority :string] :i64
+  (if (>= (string-index-of authority "@") 0)
+    -1
+    (let [colon (string-index-of authority ":")]
+      (if (< colon 0)
+        -1
+        (port-value (string-substring authority (+ colon 1)
+                                       (string-byte-length authority)))))))
+
+(defn- parse-uri [s :string] [:ref :scope/url]
+  (let [scheme-end (string-index-of s "://")
+        n (string-byte-length s)]
+    (if (<= scheme-end 0)
+      (record-new [:ref :scope/url] "" "" -1 "/" false false false)
+      (let [scheme (string-substring s 0 scheme-end)
+            after-scheme (+ scheme-end 3)
+            remainder (string-substring s after-scheme n)
+            authority-end (delimiter-index remainder)
+            authority (string-substring remainder 0 authority-end)
+            tail (string-substring remainder authority-end
+                                   (string-byte-length remainder))
+            q (string-index-of tail "?")
+            f (string-index-of tail "#")
+            path-end (earlier q f (string-byte-length tail))
+            has-path? (and (> (string-byte-length tail) 0)
+                           (string=? (string-substring tail 0 1) "/"))
+            raw-path (if has-path?
+                       (string-substring tail 0 path-end)
+                       "/")
+            userinfo? (>= (string-index-of authority "@") 0)
+            host (host-part authority)
+            port (port-part authority)
+            valid? (and (scheme-valid? scheme)
+                        (uri-chars-valid? s)
+                        (or userinfo? (host-valid? host))
+                        (or userinfo? (>= port -1)))
+            final-scheme (if valid? (ascii-lowercase scheme) "")
+            final-host (if (and valid? (not userinfo?))
+                         (ascii-lowercase host)
+                         "")
+            final-path (if valid? (normalized-path raw-path) "/")
+            query? (and (>= q 0) (or (< f 0) (< q f)))
+            fragment? (>= f 0)]
+        (record-new [:ref :scope/url] final-scheme final-host port final-path
+                    userinfo? query? fragment?)))))
+
+(defn- http-scheme? [scheme :string] :bool
+  (or (string=? scheme "http") (string=? scheme "https")))
+
+(defn- effective-port [scheme :string port :i64] :i64
+  (if (>= port 0)
+    port
+    (if (string=? scheme "http") 80
+        (if (string=? scheme "https") 443 -1))))
+
+(defn- starts-with? [s :string prefix :string] :bool
+  (let [m (string-byte-length prefix)
+        n (string-byte-length s)]
+    (and (<= m n) (string=? (string-substring s 0 m) prefix))))
+
+(defn- path-covers? [grant :string resource :string] :bool
+  (if (= (string-byte-length grant) 0)
+    false
+    (if (string=? grant resource)
+      true
+      (let [n (string-byte-length grant)
+            last (string-substring grant (- n 1) n)]
+        (if (string=? last "/")
+          (starts-with? resource grant)
+          (starts-with? resource (string-concat grant "/")))))))
+
+(defn- covers-http? [g [:ref :scope/url] r [:ref :scope/url]] :bool
+  (let [gs (record-get [:ref :scope/url] g :scheme)
+        rs (record-get [:ref :scope/url] r :scheme)
+        gh (record-get [:ref :scope/url] g :host)
+        rh (record-get [:ref :scope/url] r :host)
+        gp (record-get [:ref :scope/url] g :port)
+        rp (record-get [:ref :scope/url] r :port)
+        gpath (record-get [:ref :scope/url] g :path)
+        rpath (record-get [:ref :scope/url] r :path)]
+    (and (http-scheme? gs)
+         (string=? gs rs)
+         (not (record-get [:ref :scope/url] g :userinfo))
+         (not (record-get [:ref :scope/url] r :userinfo))
+         (not (record-get [:ref :scope/url] g :fragment))
+         (not (record-get [:ref :scope/url] r :fragment))
+         (not (record-get [:ref :scope/url] g :query))
+         (> (string-byte-length gh) 0)
+         (string=? gh rh)
+         (= (effective-port gs gp) (effective-port rs rp))
+         (path-covers? gpath rpath))))
+
+(defn covers? [grant :string resource :string] :bool
+  (if (string=? grant resource)
+    true
+    (covers-http? (parse-uri grant) (parse-uri resource))))

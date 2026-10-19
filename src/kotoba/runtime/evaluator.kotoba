@@ -1,0 +1,767 @@
+;; Native Kotoba implementation of the runtime's tree-walking evaluator.
+;; Runtime values, function definitions, and local environments remain typed
+;; Form records; only eval-program adapts the result at the scalar ABI edge.
+(ns kotoba.runtime.evaluator
+  (:export [eval-expression eval-program eval-program-value])
+  (:require [kotoba.form :as form]
+            [kotoba.runtime.evaluator-builtins :as builtins]
+            [kotoba.runtime.value-semantics :as value-semantics])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                      [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :runtime/eval-out [:record :runtime/eval-out
+                                [[:ok :bool] [:value [:ref :form/r]]
+                                 [:error :string] [:fuel :i64]]]
+             :runtime/eval-summary [:record :runtime/eval-summary
+                                    [[:ok :i64] [:value :i64] [:error :string]
+                                     [:steps :i64] [:fuel :i64]]]}))
+
+(defn- outcome [ok :bool value [:ref :form/r] error :string fuel :i64]
+  [:ref :runtime/eval-out]
+  (record-new [:ref :runtime/eval-out] ok value error fuel))
+
+(defn- success [value [:ref :form/r] fuel :i64] [:ref :runtime/eval-out]
+  (outcome true value "" fuel))
+
+(defn- failure [message :string fuel :i64] [:ref :runtime/eval-out]
+  (outcome false (form/nil-form) message fuel))
+
+(defn- ok? [result [:ref :runtime/eval-out]] :bool
+  (record-get [:ref :runtime/eval-out] result :ok))
+
+(defn- value-of [result [:ref :runtime/eval-out]] [:ref :form/r]
+  (record-get [:ref :runtime/eval-out] result :value))
+
+(defn- error-of [result [:ref :runtime/eval-out]] :string
+  (record-get [:ref :runtime/eval-out] result :error))
+
+(defn- fuel-of [result [:ref :runtime/eval-out]] :i64
+  (record-get [:ref :runtime/eval-out] result :fuel))
+
+(defn- item-at [node [:ref :form/r] index :i64] [:ref :form/r]
+  (typed-list-nth [:list [:ref :form/r]] (form/kids-of node) index))
+
+(defn- head-name [expr [:ref :form/r]] :string
+  (if (form/is-seq? expr)
+    (if (form/is-symbol? (form/first-of expr))
+      (form/symbol-value (form/first-of expr))
+      "")
+    ""))
+
+(defn- head-is? [expr [:ref :form/r] name :string] :bool
+  (string=? (head-name expr) name))
+
+(defn- function-definition? [expr [:ref :form/r]] :bool
+  (or (head-is? expr "defn") (head-is? expr "defn-")))
+
+(defn- source-type-descriptor? [value [:ref :form/r]] :bool
+  (if (form/is-keyword? value)
+    true
+    (if (form/is-vec? value)
+      (form/is-keyword? (form/first-of value))
+      false)))
+
+(defn- parse-params [raw-params [:ref :form/r] index :i64
+                    acc [:list [:ref :form/r]] fuel :i64]
+  [:ref :runtime/eval-out]
+  (if (>= index (form/count-of raw-params))
+    (success (form/form-vec acc) fuel)
+    (let [items (form/kids-of raw-params)
+          param (typed-list-nth [:list [:ref :form/r]] items index)]
+      (if (not (form/is-symbol? param))
+        (failure "function parameters must be plain symbols" fuel)
+        (let [has-descriptor? (and (< (+ index 1) (form/count-of raw-params))
+                                   (source-type-descriptor?
+                                    (typed-list-nth [:list [:ref :form/r]] items (+ index 1))))]
+          (parse-params raw-params
+                        (if has-descriptor? (+ index 2) (+ index 1))
+                        (form/append-form acc param)
+                        fuel))))))
+
+(defn- parse-function-def [definition [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (let [count (form/count-of definition)]
+    (if (or (< count 4) (not (function-definition? definition)))
+      (failure "defn requires a symbol name, parameter vector, and body" fuel)
+      (let [name (item-at definition 1)]
+        (if (not (form/is-symbol? name))
+          (failure "defn requires a symbol name, parameter vector, and body" fuel)
+          (let [params-index (if (form/is-string? (item-at definition 2)) 3 2)
+                raw-params (item-at definition params-index)]
+            (if (not (form/is-vec? raw-params))
+              (failure "defn parameters must be a vector" fuel)
+              (let [parsed-params (parse-params raw-params 0 (form/no-forms) fuel)
+                    raw-body-index (+ params-index 1)
+                    body-index (if (and (< raw-body-index count)
+                                        (source-type-descriptor? (item-at definition raw-body-index)))
+                                 (+ raw-body-index 1)
+                                 raw-body-index)]
+                (if (not (ok? parsed-params))
+                  parsed-params
+                  (if (>= body-index count)
+                    (failure "defn requires at least one body form" fuel)
+                    (let [body (loop [index body-index items (form/no-forms)]
+                                 (if (>= index count)
+                                   (form/form-vec items)
+                                   (recur (+ index 1)
+                                          (form/append-form items (item-at definition index)))))
+                          function-value (form/assoc-form
+                                          (form/assoc-form
+                                           (form/assoc-form
+                                            (form/assoc-form (form/form-map (form/no-forms))
+                                                             (form/keyword-form :kind)
+                                                             (form/keyword-form :kotoba.runtime/fn))
+                                            (form/keyword-form :name) name)
+                                           (form/keyword-form :params) (value-of parsed-params))
+                                          (form/keyword-form :body) body)]
+                      (success function-value (fuel-of parsed-params)))))))))))))
+
+(defn- collect-functions [forms [:list [:ref :form/r]] index :i64
+                          functions [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (loop [i index collected functions]
+    (if (>= i (vector-count forms))
+      (success collected fuel)
+      (let [definition (typed-list-nth [:list [:ref :form/r]] forms i)]
+        (if (not (function-definition? definition))
+          (recur (+ i 1) collected)
+          (let [parsed (parse-function-def definition fuel)]
+            (if (not (ok? parsed))
+              parsed
+              (let [function-value (value-of parsed)
+                    name (form/form-get function-value (form/keyword-form :name))]
+                (recur (+ i 1)
+                       (form/assoc-form collected name function-value))))))))))
+
+(defn- eval-frame [kind :keyword] [:ref :form/r]
+  (form/assoc-form (form/form-map (form/no-forms))
+                   (form/keyword-form :kind)
+                   (form/keyword-form kind)))
+
+(defn- eval-frame-get [frame [:ref :form/r] key :keyword] [:ref :form/r]
+  (form/form-get frame (form/keyword-form key)))
+
+(defn- eval-frame-set [frame [:ref :form/r] key :keyword value [:ref :form/r]]
+  [:ref :form/r]
+  (form/assoc-form frame (form/keyword-form key) value))
+
+(defn- eval-stack-top [stack [:list [:ref :form/r]]] [:ref :form/r]
+  (typed-list-nth [:list [:ref :form/r]] stack (- (vector-count stack) 1)))
+
+(defn- eval-stack-pop [stack [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (loop [index 0 output (form/no-forms)
+         limit (- (vector-count stack) 1)]
+    (if (>= index limit)
+      output
+      (recur (+ index 1)
+             (form/append-form output
+                               (typed-list-nth [:list [:ref :form/r]] stack index))
+             limit))))
+
+;; CEK-style evaluation keeps pending work in typed Form frames. The only
+;; recursive edge in this machine is to itself; nested expression traversal
+;; does not create a mutually recursive family of generated loop functions.
+(defn- eval-machine [expr [:ref :form/r] env [:ref :form/r]
+                     functions [:ref :form/r] fuel :i64
+                     stack [:list [:ref :form/r]] mode :i64
+                     delivered [:ref :runtime/eval-out]]
+  [:ref :runtime/eval-out]
+  (if (= mode 0)
+    (if (<= fuel 0)
+      (failure "interpreter step limit exhausted" 0)
+      (let [remaining (- fuel 1)]
+        (cond
+          (form/is-symbol? expr)
+          (eval-machine expr env functions remaining stack 1
+                        (if (form/form-has? env expr)
+                          (success (form/form-get env expr) remaining)
+                          (if (form/form-has? functions expr)
+                            (success (form/form-get functions expr) remaining)
+                            (if (builtins/builtin-name? (form/symbol-value expr))
+                              (success expr remaining)
+                              (failure "unknown symbol" remaining)))))
+
+          (or (form/is-nil? expr) (form/is-bool? expr) (form/is-int? expr)
+              (form/is-string? expr) (form/is-keyword? expr) (form/is-f64? expr))
+          (eval-machine expr env functions remaining stack 1 (success expr remaining))
+
+          (form/is-vec? expr)
+          (if (= (form/count-of expr) 0)
+            (eval-machine expr env functions remaining stack 1
+                          (success (form/form-vec (form/no-forms)) remaining))
+            (let [frame0 (eval-frame :eval/vector)
+                  frame1 (eval-frame-set frame0 :target expr)
+                  frame2 (eval-frame-set frame1 :index (form/int-form 1))
+                  frame3 (eval-frame-set frame2 :acc (form/form-vec (form/no-forms)))
+                  frame4 (eval-frame-set frame3 :env env)
+                  frame5 (eval-frame-set frame4 :functions functions)]
+              (eval-machine (item-at expr 0) env functions remaining
+                            (form/append-form stack frame5) 0 delivered)))
+
+          (form/is-set? expr)
+          (if (= (form/count-of expr) 0)
+            (eval-machine expr env functions remaining stack 1
+                          (success (form/form-set (form/no-forms)) remaining))
+            (let [frame0 (eval-frame :eval/set)
+                  frame1 (eval-frame-set frame0 :target expr)
+                  frame2 (eval-frame-set frame1 :index (form/int-form 1))
+                  frame3 (eval-frame-set frame2 :acc (form/form-vec (form/no-forms)))
+                  frame4 (eval-frame-set frame3 :env env)
+                  frame5 (eval-frame-set frame4 :functions functions)]
+              (eval-machine (item-at expr 0) env functions remaining
+                            (form/append-form stack frame5) 0 delivered)))
+
+          (form/is-map? expr)
+          (if (= (form/count-of expr) 0)
+            (eval-machine expr env functions remaining stack 1
+                          (success (form/form-map (form/no-forms)) remaining))
+            (if (= (bit-and (form/count-of expr) 1) 1)
+              (failure "map literal requires key/value pairs" remaining)
+              (let [frame (eval-frame :eval/map-key)]
+                (eval-machine (item-at expr 0) env functions remaining
+                              (form/append-form
+                               stack
+                               (eval-frame-set
+                                (eval-frame-set
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set frame :target expr)
+                                   :index (form/int-form 0))
+                                  :acc (form/form-map (form/no-forms)))
+                                 :env env)
+                                :functions functions))
+                              0 delivered))))
+
+          (not (form/is-seq? expr))
+          (eval-machine expr env functions remaining stack 1 (success expr remaining))
+
+          (= (form/count-of expr) 0)
+          (eval-machine expr env functions remaining stack 1 (success expr remaining))
+
+          :else
+          (let [name (head-name expr)]
+            (cond
+              (string=? name "ns")
+              (eval-machine expr env functions remaining stack 1
+                            (success (form/nil-form) remaining))
+
+              (string=? name "defn")
+              (eval-machine expr env functions remaining stack 1
+                            (success (form/nil-form) remaining))
+
+              (string=? name "quote")
+              (if (= 2 (form/count-of expr))
+                (eval-machine expr env functions remaining stack 1
+                              (success (item-at expr 1) remaining))
+                (failure "quote expects one operand" remaining))
+
+              (string=? name "if")
+              (if (not (= 4 (form/count-of expr)))
+                (failure "if expects a test and two branches" remaining)
+                (let [frame (eval-frame :eval/if)]
+                  (eval-machine (item-at expr 1) env functions remaining
+                                (form/append-form
+                                 stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set frame :then (item-at expr 2))
+                                   :else (item-at expr 3))
+                                  :env env))
+                                0 delivered)))
+
+              (string=? name "do")
+              (if (= (form/count-of expr) 1)
+                (eval-machine expr env functions remaining stack 1
+                              (success (form/nil-form) remaining))
+                (let [frame (eval-frame :eval/sequence)]
+                  (eval-machine (item-at expr 1) env functions remaining
+                                (form/append-form
+                                 stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set frame :target expr)
+                                   :index (form/int-form 2))
+                                  :env env))
+                                0 delivered)))
+
+              (string=? name "let")
+              (let [bindings (item-at expr 1)
+                    binding-count (form/count-of bindings)]
+                (if (or (< (form/count-of expr) 3)
+                        (not (form/is-vec? bindings))
+                        (not (= binding-count (* 2 (quot binding-count 2)))))
+                  (failure "let expects an even binding vector and a body" remaining)
+                  (if (= binding-count 0)
+                    (let [frame (eval-frame :eval/sequence)]
+                      (eval-machine (item-at expr 2) env functions remaining
+                                    (form/append-form
+                                     stack
+                                     (eval-frame-set
+                                      (eval-frame-set
+                                       (eval-frame-set frame :target expr)
+                                       :index (form/int-form 3))
+                                      :env env))
+                                    0 delivered))
+                    (let [binding-name (item-at bindings 0)]
+                      (if (not (form/is-symbol? binding-name))
+                        (failure "let binding name must be a symbol" remaining)
+                        (let [frame (eval-frame :eval/let-init)]
+                          (eval-machine (item-at bindings 1) env functions remaining
+                                        (form/append-form
+                                         stack
+                                         (eval-frame-set
+                                          (eval-frame-set
+                                           (eval-frame-set
+                                            (eval-frame-set
+                                             (eval-frame-set
+                                              (eval-frame-set frame :bindings bindings)
+                                              :index (form/int-form 2))
+                                             :name binding-name)
+                                            :env env)
+                                           :target expr)
+                                          :functions functions))
+                                        0 delivered)))))))
+
+              (string=? name "when")
+              (if (< (form/count-of expr) 2)
+                (failure "when expects a test" remaining)
+                (let [frame (eval-frame :eval/when)]
+                  (eval-machine (item-at expr 1) env functions remaining
+                                (form/append-form
+                                 stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set frame :target expr)
+                                   :env env)
+                                  :functions functions))
+                              0 delivered)))
+
+              (string=? name "and")
+              (if (= (form/count-of expr) 1)
+                (eval-machine expr env functions remaining stack 1
+                              (success (form/int-form 1) remaining))
+                (let [frame (eval-frame :eval/and)]
+                  (eval-machine (item-at expr 1) env functions remaining
+                                (form/append-form
+                                 stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set frame :target expr)
+                                   :index (form/int-form 2))
+                                  :env env))
+                                0 delivered)))
+
+              (string=? name "or")
+              (if (= (form/count-of expr) 1)
+                (eval-machine expr env functions remaining stack 1
+                              (success (form/int-form 0) remaining))
+                (let [frame (eval-frame :eval/or)]
+                  (eval-machine (item-at expr 1) env functions remaining
+                                (form/append-form
+                                 stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set frame :target expr)
+                                   :index (form/int-form 2))
+                                  :env env))
+                                0 delivered)))
+
+              (string=? name "def")
+              (eval-machine (if (>= (form/count-of expr) 3)
+                              (item-at expr 2)
+                              (form/nil-form))
+                            env functions remaining stack 0 delivered)
+
+              :else
+              (let [frame (eval-frame :eval/call-callee)]
+                (eval-machine (item-at expr 0) env functions remaining
+                              (form/append-form
+                               stack
+                               (eval-frame-set
+                                (eval-frame-set
+                                 (eval-frame-set frame :target expr)
+                                 :env env)
+                                :functions functions))
+                              0 delivered)))))))
+
+    (if (not (ok? delivered))
+      delivered
+      (if (= (vector-count stack) 0)
+        delivered
+        (let [frame (eval-stack-top stack)
+              outer-stack (eval-stack-pop stack)
+              kind (eval-frame-get frame :kind)
+              value (value-of delivered)
+              current-fuel (fuel-of delivered)]
+          (cond
+            (form/eq kind (form/keyword-form :eval/if))
+            (eval-machine (eval-frame-get frame
+                                          (if (value-semantics/truthy? value) :then :else))
+                          (eval-frame-get frame :env) functions current-fuel
+                          outer-stack 0 delivered)
+
+            (form/eq kind (form/keyword-form :eval/sequence))
+            (let [target (eval-frame-get frame :target)
+                  index (form/int-value (eval-frame-get frame :index))]
+              (if (>= index (form/count-of target))
+                (eval-machine expr env functions current-fuel outer-stack 1 delivered)
+                (eval-machine (item-at target index) (eval-frame-get frame :env)
+                              functions current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set frame :index (form/int-form (+ index 1))))
+                              0 delivered)))
+
+            (form/eq kind (form/keyword-form :eval/when))
+            (let [target (eval-frame-get frame :target)]
+              (if (value-semantics/truthy? value)
+                (if (>= (form/count-of target) 3)
+                  (eval-machine (item-at target 2) (eval-frame-get frame :env)
+                                functions current-fuel
+                                (form/append-form
+                                 outer-stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set (eval-frame :eval/sequence) :target target)
+                                   :index (form/int-form 3))
+                                  :env (eval-frame-get frame :env)))
+                                0 delivered)
+                  (eval-machine expr env functions current-fuel outer-stack 1
+                                (success (form/int-form 0) current-fuel)))
+                (eval-machine expr env functions current-fuel outer-stack 1
+                              (success (form/int-form 0) current-fuel))))
+
+            (form/eq kind (form/keyword-form :eval/and))
+            (if (not (value-semantics/truthy? value))
+              (eval-machine expr env functions current-fuel outer-stack 1 delivered)
+              (let [target (eval-frame-get frame :target)
+                    index (form/int-value (eval-frame-get frame :index))]
+                (if (>= index (form/count-of target))
+                  (eval-machine expr env functions current-fuel outer-stack 1 delivered)
+                  (eval-machine (item-at target index) (eval-frame-get frame :env)
+                                functions current-fuel
+                                (form/append-form
+                                 outer-stack
+                                 (eval-frame-set frame :index (form/int-form (+ index 1))))
+                                0 delivered))))
+
+            (form/eq kind (form/keyword-form :eval/or))
+            (if (value-semantics/truthy? value)
+              (eval-machine expr env functions current-fuel outer-stack 1 delivered)
+              (let [target (eval-frame-get frame :target)
+                    index (form/int-value (eval-frame-get frame :index))]
+                (if (>= index (form/count-of target))
+                  (eval-machine expr env functions current-fuel outer-stack 1
+                                (success (form/int-form 0) current-fuel))
+                  (eval-machine (item-at target index) (eval-frame-get frame :env)
+                                functions current-fuel
+                                (form/append-form
+                                 outer-stack
+                                 (eval-frame-set frame :index (form/int-form (+ index 1))))
+                                0 delivered))))
+
+            (or (form/eq kind (form/keyword-form :eval/vector))
+                (form/eq kind (form/keyword-form :eval/set)))
+            (let [target (eval-frame-get frame :target)
+                  index (form/int-value (eval-frame-get frame :index))
+                  values (form/append-form (form/kids-of (eval-frame-get frame :acc)) value)]
+              (if (>= index (form/count-of target))
+                (eval-machine expr env functions current-fuel outer-stack 1
+                              (success (if (form/eq kind (form/keyword-form :eval/vector))
+                                         (form/form-vec values)
+                                         (form/form-set values))
+                                       current-fuel))
+                (eval-machine (item-at target index) (eval-frame-get frame :env)
+                              functions current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set
+                                (eval-frame-set frame :index (form/int-form (+ index 1)))
+                                :acc (form/form-vec values)))
+                              0 delivered)))
+
+            (form/eq kind (form/keyword-form :eval/map-key))
+            (let [target (eval-frame-get frame :target)
+                  index (form/int-value (eval-frame-get frame :index))
+                  value-frame (eval-frame :eval/map-value)]
+              (eval-machine (item-at target index) (eval-frame-get frame :env)
+                            functions current-fuel
+                            (form/append-form
+                             outer-stack
+                             (eval-frame-set
+                              (eval-frame-set
+                               (eval-frame-set
+                                (eval-frame-set
+                                 (eval-frame-set value-frame :target target)
+                                 :index (form/int-form (+ index 1)))
+                                :key value)
+                               :acc (eval-frame-get frame :acc))
+                              :env (eval-frame-get frame :env)))
+                            0 delivered))
+
+            (form/eq kind (form/keyword-form :eval/map-value))
+            (let [target (eval-frame-get frame :target)
+                  next-index (+ (form/int-value (eval-frame-get frame :index)) 1)
+                  acc (form/assoc-form (eval-frame-get frame :acc)
+                                       (eval-frame-get frame :key) value)]
+              (if (>= next-index (form/count-of target))
+                (eval-machine expr env functions current-fuel outer-stack 1
+                              (success acc current-fuel))
+                (eval-machine (item-at target next-index) (eval-frame-get frame :env)
+                              functions current-fuel
+                              (form/append-form
+                               outer-stack
+                                 (eval-frame-set
+                                  (eval-frame-set
+                                   (eval-frame-set
+                                    (eval-frame-set (eval-frame :eval/map-key) :target target)
+                                    :index (form/int-form next-index))
+                                 :acc acc)
+                                :env (eval-frame-get frame :env)))
+                              0 delivered)))
+
+            (form/eq kind (form/keyword-form :eval/let-init))
+            (let [bindings (eval-frame-get frame :bindings)
+                  index (form/int-value (eval-frame-get frame :index))
+                  local-env (form/assoc-form (eval-frame-get frame :env)
+                                             (eval-frame-get frame :name) value)]
+              (if (>= index (form/count-of bindings))
+                (eval-machine (item-at (eval-frame-get frame :target) 2) local-env
+                              (eval-frame-get frame :functions) current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set
+                                (eval-frame-set
+                                 (eval-frame-set (eval-frame :eval/sequence)
+                                                 :target (eval-frame-get frame :target))
+                                 :index (form/int-form 3))
+                                :env local-env))
+                              0 delivered)
+                (let [binding-name (item-at bindings index)]
+                  (if (not (form/is-symbol? binding-name))
+                    (failure "let binding name must be a symbol" current-fuel)
+                    (eval-machine (item-at bindings (+ index 1)) local-env
+                                  (eval-frame-get frame :functions) current-fuel
+                                  (form/append-form
+                                   outer-stack
+                                   (eval-frame-set
+                                    (eval-frame-set
+                                     (eval-frame-set frame :index
+                                                     (form/int-form (+ index 2)))
+                                     :name binding-name)
+                                    :env local-env))
+                                  0 delivered)))))
+
+            (form/eq kind (form/keyword-form :eval/call-callee))
+            (let [target (eval-frame-get frame :target)
+                  callee (value-of delivered)
+                  call-frame (eval-frame :eval/call-args)]
+              (if (<= (form/count-of target) 1)
+                (eval-machine expr env functions current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set (eval-frame :eval/apply) :callee callee))
+                              1 (success (form/form-vec (form/no-forms)) current-fuel))
+                (eval-machine (item-at target 1) (eval-frame-get frame :env)
+                              (eval-frame-get frame :functions) current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set
+                                (eval-frame-set
+                                 (eval-frame-set
+                                  (eval-frame-set call-frame :callee callee)
+                                  :target target)
+                                 :index (form/int-form 2))
+                                :args (form/form-vec (form/no-forms))))
+                              0 delivered)))
+
+            (form/eq kind (form/keyword-form :eval/call-args))
+            (let [target (eval-frame-get frame :target)
+                  index (form/int-value (eval-frame-get frame :index))
+                  args (form/append-form (form/kids-of (eval-frame-get frame :args)) value)]
+              (if (>= index (form/count-of target))
+                (eval-machine expr env functions current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set frame :kind
+                                               (form/keyword-form :eval/apply)))
+                              1 (success (form/form-vec args) current-fuel))
+                (eval-machine (item-at target index) (eval-frame-get frame :env)
+                              (eval-frame-get frame :functions) current-fuel
+                              (form/append-form
+                               outer-stack
+                               (eval-frame-set
+                                (eval-frame-set frame :index (form/int-form (+ index 1)))
+                                :args (form/form-vec args)))
+                              0 delivered)))
+
+            (form/eq kind (form/keyword-form :eval/apply))
+            (let [callee (eval-frame-get frame :callee)
+                  args (value-of delivered)]
+              (if (and (form/is-map? callee)
+                       (form/eq (form/form-get callee (form/keyword-form :kind))
+                                (form/keyword-form :kotoba.runtime/fn)))
+                (let [params (form/form-get callee (form/keyword-form :params))
+                      body (form/form-get callee (form/keyword-form :body))]
+                  (if (not (= (form/count-of params) (form/count-of args)))
+                    (failure "arity mismatch" current-fuel)
+                    (let [bound (bind-arguments params args
+                                                (form/form-map (form/no-forms))
+                                                0 current-fuel)
+                          call-env (value-of bound)]
+                      (if (= (form/count-of body) 0)
+                        (eval-machine expr env functions current-fuel outer-stack 1
+                                      (success (form/nil-form) current-fuel))
+                        (eval-machine (item-at body 0) call-env functions current-fuel
+                                      (form/append-form
+                                       outer-stack
+                                       (eval-frame-set
+                                        (eval-frame-set
+                                         (eval-frame-set (eval-frame :eval/sequence)
+                                                         :target body)
+                                         :index (form/int-form 1))
+                                        :env call-env))
+                                      0 delivered)))))
+                (if (form/is-symbol? callee)
+                  (eval-machine expr env functions current-fuel outer-stack 1
+                                (builtins/call-builtin (form/symbol-value callee) args current-fuel))
+                  (failure "not callable" current-fuel))))
+
+            :else
+            (failure "invalid evaluator continuation" current-fuel)))))))
+
+(defn- eval-form [expr [:ref :form/r] env [:ref :form/r]
+                  functions [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (eval-machine expr env functions fuel (form/no-forms) 0
+                (success (form/nil-form) fuel)))
+
+(defn eval-expression [expr [:ref :form/r] globals [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  "Evaluate one expression in a Form-valued global environment. This internal
+  Kotoba API is for compiler-time evaluation; source-operation and type/effect
+  admission must be performed by the caller before invoking it."
+  (if (<= fuel 0)
+    (failure "step limit must be positive" 0)
+    (eval-form expr globals (form/form-map (form/no-forms)) fuel)))
+
+(defn- bind-arguments [params [:ref :form/r] args [:ref :form/r]
+                       env [:ref :form/r] index :i64 fuel :i64]
+  [:ref :runtime/eval-out]
+  (loop [i index bound env]
+    (if (>= i (form/count-of params))
+      (success bound fuel)
+      (recur (+ i 1)
+             (form/assoc-form bound (item-at params i) (item-at args i))))))
+
+(defn- call-user [function-value [:ref :form/r] args [:ref :form/r]
+                  functions [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (let [params (form/form-get function-value (form/keyword-form :params))
+        body (form/form-get function-value (form/keyword-form :body))]
+    (if (not (= (form/count-of params) (form/count-of args)))
+      (failure "arity mismatch" fuel)
+      (let [env (bind-arguments params args (form/form-map (form/no-forms)) 0 fuel)]
+        (if (not (ok? env))
+          env
+          (if (= (form/count-of body) 0)
+            (success (form/nil-form) (fuel-of env))
+            (eval-machine (item-at body 0) (value-of env) functions (fuel-of env)
+                          (form/append-form
+                           (form/no-forms)
+                           (eval-frame-set
+                            (eval-frame-set
+                             (eval-frame-set (eval-frame :eval/sequence) :target body)
+                             :index (form/int-form 1))
+                            :env (value-of env)))
+                          0 (success (form/nil-form) (fuel-of env)))))))))
+
+(defn- eval-top-level [forms [:list [:ref :form/r]] functions [:ref :form/r]
+                       index :i64 last-value [:ref :form/r] fuel :i64]
+  [:ref :runtime/eval-out]
+  (loop [i index current-functions functions current-value last-value remaining fuel]
+    (if (>= i (vector-count forms))
+      (success current-value remaining)
+      (let [expr (typed-list-nth [:list [:ref :form/r]] forms i)]
+        (if (or (head-is? expr "ns") (function-definition? expr))
+          (recur (+ i 1) current-functions current-value remaining)
+          (let [result (eval-form expr (form/form-map (form/no-forms))
+                                  current-functions remaining)]
+            (if (not (ok? result))
+              result
+              (recur (+ i 1)
+                     (if (head-is? expr "def")
+                       (form/assoc-form current-functions (item-at expr 1)
+                                        (value-of result))
+                       current-functions)
+                     (value-of result) (fuel-of result)))))))))
+
+(defn- collect-top-level-defs [forms [:list [:ref :form/r]] functions [:ref :form/r]
+                               index :i64 fuel :i64]
+  [:ref :runtime/eval-out]
+  (loop [i index globals functions remaining fuel]
+    (if (>= i (vector-count forms))
+      (success globals remaining)
+      (let [expr (typed-list-nth [:list [:ref :form/r]] forms i)]
+        (if (not (head-is? expr "def"))
+          (recur (+ i 1) globals remaining)
+          (let [result (eval-form expr (form/form-map (form/no-forms))
+                                  globals remaining)]
+            (if (not (ok? result))
+              result
+              (recur (+ i 1)
+                     (form/assoc-form globals (item-at expr 1) (value-of result))
+                     (fuel-of result)))))))))
+
+(defn- eval-program-result [forms [:list [:ref :form/r]] fuel :i64]
+  [:ref :runtime/eval-out]
+  (let [collected (collect-functions forms 0 (form/form-map (form/no-forms)) fuel)]
+    (if (not (ok? collected))
+      collected
+      (let [functions (value-of collected)
+            main (form/symbol-form "main")]
+        (if (form/form-has? functions main)
+          (let [prepared (collect-top-level-defs forms functions 0 (fuel-of collected))]
+            (if (not (ok? prepared))
+              prepared
+              (let [globals (value-of prepared)
+                    main-function (form/form-get globals main)
+                    kind (if (form/is-map? main-function)
+                           (form/form-get main-function (form/keyword-form :kind))
+                           (form/nil-form))]
+                (if (form/eq kind (form/keyword-form :kotoba.runtime/fn))
+                  (call-user main-function
+                             (form/form-vec (form/no-forms))
+                             globals (fuel-of prepared))
+                  (failure "main must name a function" (fuel-of prepared))))))
+          (eval-top-level forms functions 0 (form/nil-form) (fuel-of collected)))))))
+
+(defn eval-program-value [forms [:list [:ref :form/r]] fuel :i64]
+  [:ref :runtime/eval-out]
+  "Evaluate forms and retain the typed Form result for Kotoba callers.
+  Recursive forms stay inside the Kotoba call graph; fuel is shared by all
+  recursive calls and applies to every expression node."
+  (if (<= fuel 0)
+    (failure "step limit must be positive" 0)
+    (eval-program-result forms fuel)))
+
+(defn eval-program [forms [:list [:ref :form/r]] fuel :i64]
+  [:ref :runtime/eval-summary]
+  "Collect top-level defn forms, call zero-argument main when present, or
+  evaluate remaining expressions in order. The scalar boundary preserves the
+  integer-only native ABI; Kotoba callers that need the typed result use
+  eval-program-value."
+  (if (<= fuel 0)
+    (record-new [:ref :runtime/eval-summary] 0 0 "step limit must be positive" 0 0)
+    (let [result (eval-program-value forms fuel)
+          steps (- fuel (fuel-of result))]
+      (cond
+        (not (ok? result))
+        (record-new [:ref :runtime/eval-summary] 0 0 (error-of result) steps (fuel-of result))
+
+        (not (form/is-int? (value-of result)))
+        (record-new [:ref :runtime/eval-summary] 0 0
+                    "evaluation result is not an integer" steps (fuel-of result))
+
+        :else
+        (record-new [:ref :runtime/eval-summary] 1
+                    (form/int-value (value-of result)) "" steps (fuel-of result))))))
