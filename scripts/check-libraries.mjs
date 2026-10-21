@@ -58,6 +58,8 @@ for (const id of ["kotoba.coll", "kotoba.spec", "kotoba.json"]) {
       if (entry.isDirectory()) collect(relative);
       else {
         assert.ok(entry.isFile(), `${id}/${relative}: non-regular source`);
+        assert.ok(!/\.(clj|cljs|cljc)$/.test(relative),
+                  `${id}/${relative}: imported Clojure-family sources must use .cljk`);
         implementationFiles.push(relative);
       }
     }

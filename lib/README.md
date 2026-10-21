@@ -36,8 +36,10 @@ older runner files are retained as import provenance; use the driver above to
 execute all portable suites, including the definition facades. The only
 excluded suite is `kotoba.json/test/json/core_test.cljk`, whose origin is `.clj`.
 
-`imports.json` preserves source commit/tree and per-file digests, licenses,
-and executable modes. `local-changes.json` explicitly records build metadata
+`imports.json` preserves source commit/tree, original-to-local file paths,
+per-file digests, licenses, and executable modes. Imported definition sources
+use `.cljk` here; `cljk-origin.edn` records their original extensions without
+changing their code bytes. `local-changes.json` explicitly records build metadata
 adjustments and removal of inherited empty lines at EOF. Source comments,
 changelogs, and READMEs inside
 the imports describe their original standalone repositories. This page and
