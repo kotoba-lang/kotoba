@@ -223,6 +223,56 @@ are unchanged. Physical tree mechanisms, storage owners/providers, the frozen
 peer, Amu and other execution foundations remain independent. Other Kotobase
 families and private sources still need their own review.
 
+## Protocol source owner monorepo
+
+Three opt-in LFS, IPQ and query-composition projects now share the existing
+`kotoba-lang/kotobase-protocol-core` owner under
+`surfaces/kotoba.kotobase.protocol.*`. Root production source and the default
+dependency graph are unchanged, and the registry-only router does not auto-mount
+or advertise an absent surface. Three source IDs and six exact repository and
+coordinate aliases preserve public Lisp namespaces, protocol identities and
+wire formats. LFS keeps its object-provider boundary and does not acquire a
+protocol-core dependency. Source lookup remains `admission: not-granted`,
+independent from standard library package admission. See
+[source PR #3](https://github.com/kotoba-lang/kotobase-protocol-core/pull/3).
+
+Only LFS's old storage floor advances to the existing upstream-main compiler fix
+`d4f0ac224af5309d326be0b59a2e74b6993d8e82`. The original computed `satisfies?`
+protocol passes JVM/SCI but fails real CLJS macroexpansion; the fix uses literal
+protocols. The transition's reachable source is hash-bound and the original
+configuration remains recoverable. Every other external EDN dependency and
+alias is unchanged. Imported production handler bytes are unchanged.
+
+Actual source main `d63193cd8312899b06c5fc1912dcc80a3dffe52f` passed [main CI](https://github.com/kotoba-lang/kotobase-protocol-core/actions/runs/39685963917), including
+three JVM projects (88 tests / 369 assertions), four SCI and compiled Node projects
+(102 tests / 444 assertions each), nine exact source lookups, and three actual
+public Kotoba CLI origins, full recovery and negative controls. Local main gates
+also completed. IPQ lint reports 0 errors / 11 retained warnings on byte-identical
+host views. A planted failure/error produces 28 tests / 108 assertions and Node
+exit 1. Node filesystem CLI and the existing query-composition tests are declared
+CLJS suites rather than fictitious JVM coverage. Native, live service, signing,
+runtime admission, production performance/default and deployment remain separate.
+
+Three complete histories / 30 refs / two historical PR heads / 37 original hashes
+restore and fsck. Archived reconciliation WIP and a squashed PR head have exact
+main successors; original nonancestor objects and all stash parents remain in
+the bundles. Original checkouts, branches, stashes and worktree metadata stay
+in place. After main gates and fresh source/ref/WIP and original 239 consumer guards, all three
+child URLs were archived with identical IDs/defaults/heads/tags/source timestamps.
+See the [merged receipt](https://github.com/kotoba-lang/kotobase-protocol-core/blob/6e520f21ebfd62bd5c03b5ad3ccf9e8c04d32936/maintenance/protocol-consolidation/2026-10-22/receipt.json) and
+[receipt PR #4](https://github.com/kotoba-lang/kotobase-protocol-core/pull/4).
+No repository was deleted. Archived Git coordinates keep their original history;
+they do not redirect consumers to a new dependency graph. Consumers select an
+immutable owner commit and the project's `:deps/root` when adopting this source.
+The original 239 consumer holds and signed west locks stay unchanged.
+
+The colliding legacy facade, private protocol/deploy shells, lake metadata,
+block codec, independent posting index, client transport, frozen peer and
+Amu/execution foundations retain their boundaries. Client-query transfer is held
+for missing license provenance. The original four protocol repos had Actions
+enabled and their settings were not changed manually; specified disabled repos
+and workflows stay disabled. Other org/private families remain under review.
+
 ## Remaining ownership decisions
 
 Other product/engine/database families and adapter catalogs remain in ownership
