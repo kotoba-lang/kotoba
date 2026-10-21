@@ -21,8 +21,8 @@ placement decision is supported by implementation, dependency and ownership
 review. A prefix, age, test result or absence of a deployment file alone does
 not establish that a repository should be moved or retired.
 
-The current source catalog contains 21 dotted IDs and 58 exact aliases. Its
-374 origins include 125 deleted repositories with recoverable histories and
+The current source catalog contains 25 dotted IDs and 70 exact aliases. Its
+405 licensed origins include 125 deleted repositories with recoverable histories and
 239 repositories held for existing consumer pins. Those holds are unchanged.
 The additional ten origins described below were subsequently merged in #667
 and archived after main/CLI verification. Their local histories were restored
@@ -101,12 +101,14 @@ node scripts/check-family-consolidations.mjs /absolute/github/workspaces/family-
 
 ## Remaining ownership decisions
 
-LSP (25 repos) and lint (18) remain under review for the tooling stdlib.
-Twelve split LSP definitions have no LICENSE. The licensed LSP owner contains
-original implementations of these functions; trace immutable source equivalence
-and license provenance before selecting an import/derivation path. Do not infer
-a new grant from a repository name or copy an absent license. The complete
-LSP/lint dependency closure and existing API/host behavior still need validation.
+LSP/lint tooling source is selected as four bundled packages, covering 31
+licensed origins plus 12 compatibility modules derived from the licensed LSP
+owner. All 43 histories/320 refs are preserved and restored/fsck checked.
+Main/CLI verification and archive readback are recorded in the dated tooling
+receipt; pending and archived states are explicit. See
+[the tooling review](library-tooling-consolidation.md) for provenance, the
+reproduced UTF-8 framing bug and its shared repair. This selection does not
+resolve unrelated license or ownership holds.
 
 Other product/engine/database families and adapter catalogs remain in ownership
 review. Their implementations, licenses, dependency closures, releases,
