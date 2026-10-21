@@ -143,6 +143,7 @@ console.log(`libraries: ${origins} pinned origins, ${files} imported files, port
 // an old import commit. The live archive operation must still recheck GitHub
 // and local WIP; this offline gate does not perform repository mutations.
 const migrations = readJSON(path.join(repo, "lib/repository-migrations.json"));
+const reviews = readJSON(path.join(repo, "lib/branch-reviews.json"));
 assert.equal(migrations.schema, "kotoba.library-repository-migrations.v1");
 assert.equal(migrations.repositories.length, origins);
 const importedRepos = ids.flatMap(id => readJSON(path.join(repo, "lib", id, "imports.json"))
@@ -162,8 +163,12 @@ for (const row of migrations.repositories) {
     assert.ok(destination.startsWith(root + path.sep));
     const actual = digest(fs.readFileSync(destination));
     const approved = changes[file.path];
+    const adaptedDefault = reviews.reviews.some(review => review.repo === row.repo &&
+      review.decision !== "hold" && review["source-sha256"]?.[file.source] === file.sha256 &&
+      review["integrated-files"]?.some(output =>
+        output.path === `${row.destination}/${file.path}` && output.sha256 === actual));
     assert.ok(actual === file.sha256 ||
-      (approved?.["imported-sha256"] === file.sha256 && approved.sha256 === actual),
+      (approved?.["imported-sha256"] === file.sha256 && approved.sha256 === actual) || adaptedDefault,
       `${row.repo}/${file.source}: reviewed default source is no longer integrated`);
     assert.equal(Boolean(fs.statSync(destination).mode & 0o111), file.mode === "100755");
   }
@@ -172,13 +177,17 @@ console.log(`repository migrations: ${migrations.repositories.filter(row => row.
 
 // A reviewed branch is bound to exact source bytes and its retained tip.
 // A prose decision cannot silently authorize different branch contents.
-const reviews = readJSON(path.join(repo, "lib/branch-reviews.json"));
 assert.equal(reviews.schema, "kotoba.library-branch-reviews.v1");
 for (const review of reviews.reviews) {
   assert.match(review.commit, /^[0-9a-f]{40}$/);
-  assert.ok(["integrate", "hold"].includes(review.decision));
+  assert.ok(["integrate", "superseded", "hold"].includes(review.decision));
   assert.ok(review.reason?.trim());
-  if (review.decision !== "integrate") continue;
+  if (review.decision === "hold") continue;
+  for (const removed of review["removed-destinations"] ?? []) {
+    const destination = path.resolve(repo, removed);
+    assert.ok(destination.startsWith(repo + path.sep));
+    assert.ok(!fs.existsSync(destination), "retired predecessor was restored");
+  }
   const migration = migrations.repositories.find(row => row.repo === review.repo);
   assert.ok(migration, `reviewed branch without source migration: ${review.repo}`);
   assert.ok(migration["reviewed-branches"].some(row => row.commit === review.commit && row.branch === review.branch));
@@ -223,3 +232,98 @@ for (const review of reviews.reviews) {
                  `${review.repo}@${review.commit}: reviewed source changed`);
   }
 }
+
+// Retired worktrees keep their exact original input, independently of the
+// corrected implementation. A local-change receipt cannot erase WIP history.
+const worktrees = readJSON(path.join(repo, "lib/worktree-reviews.json"));
+assert.equal(worktrees.schema, "kotoba.library-worktree-reviews.v1");
+assert.deepEqual(worktrees.reviews.map(review => review.id).sort(),
+  migrations.repositories.flatMap(row => row["reviewed-worktrees"] ?? []).sort(), "worktree review inventory mismatch");
+const snapshotBytes = (snapshot, expected, prefix) => {
+  assert.ok(snapshot.startsWith(prefix + "/"), "unconfined retained input");
+  const source = path.resolve(repo, snapshot);
+  assert.ok(source.startsWith(repo + path.sep));
+  assert.ok(fs.lstatSync(source).isFile(), "non-regular retained input");
+  const encoded = fs.readFileSync(source, "utf8").trimEnd();
+  const bytes = Buffer.from(encoded, "base64");
+  assert.equal(bytes.toString("base64"), encoded, "noncanonical retained input");
+  assert.match(expected, shaPattern);
+  assert.equal(digest(bytes), expected, "retained worktree input drift");
+};
+for (const review of worktrees.reviews) {
+  assert.match(review.id, /^[a-z0-9-]+$/);
+  assert.match(review["base-commit"], /^[0-9a-f]{40}$/);
+  assert.ok(review.reason?.trim());
+  const migration = migrations.repositories.find(row => row.repo === review.repo);
+  assert.ok(migration);
+  const prefix = `${migration.destination}/provenance/worktrees/${review.id}`;
+  for (const kind of ["base", "source", "diff"]) {
+    snapshotBytes(review[`${kind}-snapshot`], review[`${kind}-sha256`], prefix);
+  }
+  assert.ok(review["integrated-files"].length > 0);
+  for (const output of review["integrated-files"]) {
+    const destination = path.resolve(repo, output.path);
+    assert.ok(destination.startsWith(repo + path.sep));
+    assert.equal(digest(fs.readFileSync(destination)), output.sha256, "reviewed worktree output drift");
+  }
+}
+
+const homes = readJSON(path.join(repo, "lib/profile-homes.json"));
+assert.equal(homes.schema, "kotoba.library-profile-homes.v1");
+assert.deepEqual(homes.profiles.map(profile => profile.id).sort(),
+  ["server-operator-crawl", "whois-org-crawl", "wiki-standards-crawl"]);
+const retainedFiles = directory => fs.readdirSync(path.join(repo, directory), { withFileTypes: true })
+  .flatMap(entry => {
+    const file = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) return retainedFiles(file);
+    assert.ok(entry.isFile(), "non-regular profile source");
+    return [file];
+  }).sort();
+for (const profile of homes.profiles) {
+  assert.match(profile.id, /^[a-z][a-z0-9-]+$/);
+  assert.equal(profile["source-repo"], "kotoba-lang/text");
+  assert.equal(profile["home-repo"], "kotoba-lang/kotoba");
+  assert.equal(profile["hermes-rail"].provider, "openrouter");
+  assert.match(profile["source-commit"], /^[0-9a-f]{40}$/);
+  assert.deepEqual(profile.files.map(file => file.source).sort(),
+    retainedFiles(`lib/kotoba.text/hermes/profiles/${profile.id}`), "incomplete profile source inventory");
+  assert.deepEqual(profile.files.map(file => file.destination).sort(),
+    retainedFiles(`hermes/profiles/${profile.id}`), "incomplete profile destination inventory");
+  for (const file of profile.files) {
+    assert.ok(file.source.startsWith(`lib/kotoba.text/hermes/profiles/${profile.id}/`));
+    assert.ok(file.destination.startsWith(`hermes/profiles/${profile.id}/`));
+    assert.match(file.sha256, shaPattern);
+    if (file["destination-sha256"]) {
+      assert.ok(file.source.endsWith("/config.yaml"));
+      assert.equal(file.adaptation, "hermes-openrouter-rail");
+      assert.ok(file.reason?.trim(), "unexplained profile adaptation");
+      assert.match(file["destination-sha256"], shaPattern);
+    }
+    for (const relative of [file.source, file.destination]) {
+      const destination = path.resolve(repo, relative);
+      assert.ok(destination.startsWith(repo + path.sep));
+      const expected = relative === file.destination ? file["destination-sha256"] ?? file.sha256 : file.sha256;
+      assert.equal(digest(fs.readFileSync(destination)), expected, "preserved profile source drift");
+    }
+  }
+  const config = fs.readFileSync(path.join(repo, `hermes/profiles/${profile.id}/config.yaml`), "utf8");
+  assert.doesNotMatch(config, /murakumo|mishima|api\.kotoba\.cloud/i,
+    "Hermes profile uses a reserved native inference rail");
+  const providers = [...config.matchAll(/^\s*(?:-\s+)?provider:\s*(\S+)\s*$/gm)].map(match => match[1]);
+  assert.ok(providers.length > 0 && providers.every(provider => provider === "openrouter"),
+    "Hermes profile has an undeclared inference provider");
+  const model = config.match(/^model:\n((?:[ \t]+[^\n]*\n)*)/m)?.[1];
+  assert.ok(model, "Hermes model declaration missing");
+  assert.equal(model.match(/^  default:\s*(\S+)\s*$/m)?.[1], profile["hermes-rail"].model);
+  assert.match(config, /^fallback_providers: \[\]\s*$/m, "implicit profile fallback");
+  for (const match of config.matchAll(/https?:\/\/[^\s]+/g)) {
+    assert.equal(new URL(match[0]).origin, "https://openrouter.ai", "unexpected Hermes inference endpoint");
+  }
+  const jobs = readJSON(path.join(repo, `hermes/profiles/${profile.id}/cron/jobs.json`));
+  for (const job of jobs.jobs) {
+    assert.equal(job.model, null, "cron must inherit the reviewed Hermes rail");
+    assert.equal(job.provider, null, "cron provider pin bypasses the reviewed rail");
+    assert.equal(job.base_url, null, "cron endpoint pin bypasses the reviewed rail");
+  }
+}
+console.log(`retained worktrees: ${worktrees.reviews.length}; relocated profile sources: ${homes.profiles.length}`);

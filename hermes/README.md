@@ -11,7 +11,7 @@ kbb --backend sci scripts/hermes-profile-repo.cljk export <profile>        # hos
 ```
 
 (run from the com-junkawasaki/root superproject; registry
-`manifest/hermes-profile-repos.edn`.)
+`manifest/agent-registry.edn` (canonical source-home registry).)
 
 Each profile directory holds SOUL.md, profile.yaml, config.yaml (host-local
 blocks removed), cron/jobs.json (definitions only), scripts/ and the skills the
@@ -26,3 +26,15 @@ sessions, memories, logs, caches, run state.
 | `kbb-migrator` |  |
 | `sec-audit` | セキュリティ監査担当。kotoba-lang org と com-junkawasaki 配下の脆弱性評価、GitHub セキュリティ設定(secret |
 | `sec-sentinel` |  |
+| `server-operator-crawl` | Preserved text-library profile source |
+| `whois-org-crawl` | Preserved text-library profile source |
+| `wiki-standards-crawl` | Standards-body crawl profile source |
+
+The three text-library profile trees moved from `kotoba-lang/text` with their
+original inputs retained. `lib/profile-homes.json` binds every source and
+destination file. Maintained configs use the currently configured Hermes
+OpenRouter rail: legacy native inference providers, gateways and fallbacks
+are removed. Non-routing values, profile bodies, identities and schedules
+are preserved. Library import does not load these profiles, and this migration
+does not materialize host profiles or start cron jobs. Amu and other execution
+infrastructure remain in separate repositories.

@@ -1,27 +1,15 @@
-# hermes/ — the resident bots that act for this repository
+# Preserved text profile inputs
 
-This directory is the **source of truth** for the Hermes profiles listed below
-(ADR-2609241200). The host's `~/.hermes/profiles/<profile>` is materialized
-from `hermes/profiles/<profile>/` and checked against it:
+This directory retains the imported `kotoba-lang/text` profile sources for
+provenance. Their maintained source homes are now at
+[`hermes/profiles/`](../../../hermes/profiles/) in `kotoba-lang/kotoba`.
+The canonical root agent registry resolves that repository's ordinary
+`hermes/profiles/<profile>/` layout.
 
-```
-kbb --backend sci scripts/hermes-profile-repo.cljk materialize <profile>   # repo -> host
-kbb --backend sci scripts/hermes-profile-repo.cljk check <profile>         # 0 agree / 1 drift / 2 could not compare
-kbb --backend sci scripts/hermes-profile-repo.cljk export <profile>        # host -> repo, then commit
-```
-
-(run from the com-junkawasaki/root superproject; registry
-`manifest/hermes-profile-repos.edn`.)
-
-Each profile directory holds SOUL.md, profile.yaml, config.yaml (host-local
-blocks removed), cron/jobs.json (definitions only), scripts/ and the skills the
-profile owns. **Never here:** `.env` or any secret value, workspace/ledgers,
-sessions, memories, logs, caches, run state.
-
-## Profiles
-
-| profile | description |
-|---|---|
-| `server-operator-crawl` |  |
-| `whois-org-crawl` |  |
-| `wiki-standards-crawl` | Worldwide standards-body activity (ISO/IEC/IEEE/ITU/IETF) activity crawl bot for wiki.yataverse.com - world-standards corpus |
+`lib/profile-homes.json` binds complete original and maintained inventories.
+These legacy configs remain inactive provenance. The maintained config's
+inference routing follows Hermes's OpenRouter rail; native inference belongs
+to Itonami. Non-routing values, profile bodies, identities, cron expressions
+and helpers, including dirty-worktree checkout refusals, are preserved.
+Library import does not load or activate profiles. Host materialization,
+scheduler operations and runtime infrastructure remain separate operations.
