@@ -3,7 +3,10 @@
 The dated manifests preserve repository content and review evidence before
 GitHub retirement. They are snapshots, not a claim that an old GitHub URL
 continues to resolve or that deletion has already happened. Actual operation
-results are tracked in JUN-269.
+results are tracked in JUN-269 and the dated
+[deletion receipt](2026-10-22/deletion-receipt.json). The 2026-10-22 operation
+confirmed deletion of all 125 candidates and preservation of the 239 holds;
+post-deletion import/CLI, portable tests and full bundle restoration passed.
 
 The 2026-10-22 batch covers 125 public source repositories from `kotoba.async`,
 `kotoba.log`, `kotoba.scheduler`, `kotoba.store` and `kotoba.string`. The other
