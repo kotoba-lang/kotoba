@@ -149,6 +149,44 @@ checkouts with private local backups; private metadata is not published.
 Legacy GitHub discovery URLs remain archived and readable, not deleted.
 The original 239 dependency-pin holds and all original checkouts are retained.
 
+## Storage provider source owner monorepo
+
+Seven opt-in Git, IPFS, Kura, pack, PostgreSQL, S3/R2 and SQLite provider projects
+now share the existing `kotoba-lang/kotobase-storage` owner under
+`providers/kotoba.kotobase.storage.*`. The neutral root's production source and
+dependency graph remain unchanged. Each provider keeps its dependencies, build
+configuration, LICENSE and release boundary. The seven IDs / fourteen exact
+repository and coordinate aliases are source-only; they do not expand the
+standard library catalog or grant runtime admission. See
+[source PR #4](https://github.com/kotoba-lang/kotobase-storage/pull/4).
+
+Source main `a831dda3f475fa944824ee703e69da077dc79a25` passed 138 JVM tests / 516 assertions, fourteen
+SCI fixture scripts, Kura compiled Node17 tests / 70 assertions with lint0/0,
+the real local Miniflare R2 block/object suites, and compiled engine, Prolly and
+advanced ETag/CAS/reopen fixtures. The public S3 npm test entry also passed.
+All seven provider source origins were verified in their declared JVM or public
+Kotoba CLI/SCI hosts. Unconditional CAS and off-by-one range oracles are rejected.
+Existing invalid Amu build-ID test commands now use the original pinned
+Shadow/CLJS declarations with byte-identical filename views. Native/Wasm, live
+services/interoperability, production durability, signing and deployment remain
+separate claims. Existing Actions stay disabled; local results are not CI success.
+
+The seven sources were archived after main verification and immediate source,
+refs and local WIP rechecks. Seven complete histories / 114 refs / 11 historical
+PRs and all140 original file hashes restore/fsck successfully. Pack's existing17
+generated-file deletions apply in an independent restore with the exact original
+status. Original checkouts, stashes, branches and broken worktree metadata stay
+in place. See the [merged receipt](https://github.com/kotoba-lang/kotobase-storage/blob/ce8640e24ee2b1b8a15129b7a71f020a22f979a8/maintenance/storage-consolidation/2026-10-22/receipt.json) and
+[receipt PR #5](https://github.com/kotoba-lang/kotobase-storage/pull/5).
+No repository was deleted in this wave; old Git dependency URLs remain readable.
+The original239 dependency-pin holds remain unchanged.
+
+D1 remains a compatibility deployment/rollback boundary. The frozen peer is not
+made the owner of capabilities already extracted from it. Protocol/deployment
+shells and Amu/execution foundations remain separate pending their own source,
+ownership and compatibility reviews. Other Kotobase families and private sources
+remain under review; private details are not included in this public inventory.
+
 ## Remaining ownership decisions
 
 Other product/engine/database families and adapter catalogs remain in ownership
