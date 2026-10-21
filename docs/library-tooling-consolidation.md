@@ -82,3 +82,10 @@ import/CLI and test readback, plus immediate repository/ref/local-state checks.
 Old URLs remain available for historical pins; no repositories are deleted in
 this tooling batch. The original 239 dependency-pin holds, Amu and the other
 execution foundations remain unchanged. Organization-wide review remains open.
+
+All 43 repositories were archived and read back after source main
+`1e06d72682b979fa7fc75d717b88a1b5d20e4f7e` passed portable 530 tests / 15,254
+assertions, JVM 75 tests / 1,470 assertions, and public import/CLI 11 tests /
+951 assertions. Each archive retained the original repository ID, default,
+branches, tags and source bytes. The receipt keeps the full before/after
+metadata. Existing local checkouts, branches, stashes and WIP remain in place.

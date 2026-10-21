@@ -46,6 +46,7 @@ for(const r of m.repositories){
   if(r.archived){
     assert.equal(r['archive-status'],'archived-after-main-verification');
     assert(g['archive-readback']?.archived && g['archive-readback']['source-and-refs-unchanged']);
+    assert.deepEqual(g['repository-after-archive'],{...before,isArchived:true},'archived repository source or refs drifted');
     const v=m['main-verification'];assert.match(v?.commit??'',/^[0-9a-f]{40}$/);
     for(const host of ['portable','JVM'])assert(v[host].tests>0 && v[host].assertions>0 && v[host].failures===0 && v[host].errors===0);
     assert.equal(v['public-CLI'].namespaces,48);assert(v['public-CLI']['canonical-and-aliases']);

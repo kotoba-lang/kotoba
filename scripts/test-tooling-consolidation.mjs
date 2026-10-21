@@ -14,7 +14,7 @@ try{
  const mutation=fn=>{try{fn();assert.notEqual(check().status,0);refused++;}finally{fs.writeFileSync(file,original);}};
  mutation(()=>{const m=JSON.parse(original);m.repositories.pop();fs.writeFileSync(file,JSON.stringify(m));});
  mutation(()=>{const m=JSON.parse(original);m.repositories[0]['preserved-refs'][0].object='0'.repeat(40);fs.writeFileSync(file,JSON.stringify(m));});
- mutation(()=>{const m=JSON.parse(original);m.repositories[0].archived=true;m.repositories[0]['archive-status']='archived-after-main-verification';fs.writeFileSync(file,JSON.stringify(m));});
+ mutation(()=>{const m=JSON.parse(original);m.repositories[0].archived=true;m.repositories[0]['archive-status']='archived-after-main-verification';delete m['main-verification'];fs.writeFileSync(file,JSON.stringify(m));});
  const bundle=path.join(tmp,manifest.repositories[0]['history-bundle']),bytes=fs.readFileSync(bundle);
  try{mutation(()=>{const bad=Buffer.from(bytes);bad[0]^=1;fs.writeFileSync(bundle,bad);});}finally{fs.writeFileSync(bundle,bytes);}
  assert.equal(check().status,0);console.log(`tooling recovery: baseline PASS; ${refused} missing-repo/ref/archive-proof/bundle mutations refused`);

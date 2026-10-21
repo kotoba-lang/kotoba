@@ -99,16 +99,18 @@ node scripts/check-family-consolidations.mjs
 node scripts/check-family-consolidations.mjs /absolute/github/workspaces/family-restore
 ```
 
-## Remaining ownership decisions
+## Tooling source monorepo
 
 LSP/lint tooling source is selected as four bundled packages, covering 31
 licensed origins plus 12 compatibility modules derived from the licensed LSP
 owner. All 43 histories/320 refs are preserved and restored/fsck checked.
-Main/CLI verification and archive readback are recorded in the dated tooling
-receipt; pending and archived states are explicit. See
+All 43 were archived after main/tests/import/CLI verification; source/refs stayed
+unchanged, and the dated tooling receipt retains complete before/after metadata. See
 [the tooling review](library-tooling-consolidation.md) for provenance, the
 reproduced UTF-8 framing bug and its shared repair. This selection does not
 resolve unrelated license or ownership holds.
+
+## Remaining ownership decisions
 
 Other product/engine/database families and adapter catalogs remain in ownership
 review. Their implementations, licenses, dependency closures, releases,
