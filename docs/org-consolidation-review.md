@@ -110,6 +110,45 @@ unchanged, and the dated tooling receipt retains complete before/after metadata.
 reproduced UTF-8 framing bug and its shared repair. This selection does not
 resolve unrelated license or ownership holds.
 
+## Capability source owner monorepo
+
+The existing neutral `kotoba-lang/kotoba-core-contracts` owner now co-locates
+61 atomic packages in `capabilities/kotoba.capability.*`, following
+[source PR #31](https://github.com/kotoba-lang/kotoba-core-contracts/pull/31).
+The authority remains independent of the language CLI and execution foundations.
+Each package retains its own source, tests, build artifacts, LICENSE and release
+boundary. The root authority's production source and dependency closure are
+unchanged. These 61 source IDs / 122 exact aliases are separate from the standard
+library catalog's 25 IDs / 70 aliases; lookup grants no admission.
+
+The owning definition codec recomputes all 61 manifests as 60 distinct CIDs.
+`calendar/read` and `contacts/read` share a semantic CID, so CID-only source
+selection refuses ambiguity. One existing `process/spawn` CID literal was
+corrected with reversible byte provenance; its old invalid CID is not an alias.
+Four definitions remain unregistered and rejected, including `process/spawn`
+without an approved RID. No grant, signed release or RID was fabricated.
+
+Merged source main `301f2310ca900f843bc801ead7f1500fe60ad64c` passed all 61 original JVM suites
+(140 tests / 347 assertions), authority conformance (35 cases), execution
+(5 tests / 113 assertions), canonical CID/source-literal agreement and the real
+public source CLI's 61 namespaces with origins inside the owner subtrees.
+Ten existing Wasm cores validate and both unbound HTTP/inference cores return
+`-3` with no host imports. MMIO's direct I/O pin now matches the authority's
+existing API floor; all other external dependency values remain unchanged.
+The LLM resolver test refuses before transport and sends no prompt externally.
+These are local source checks; existing Actions remain disabled, and native
+runtime qualification, signing and production operation remain separate.
+
+All 61 repositories were archived only after main verification and fresh remote
+ref/local WIP checks. Their complete histories, 331 refs, all 16 historical PRs
+and 551 original file hashes were restored/fsck checked. See the
+[merged receipt](https://github.com/kotoba-lang/kotoba-core-contracts/blob/575dc9def2042ca4d7a67f944184ce517375f960/maintenance/capability-consolidation/2026-10-22/receipt.json) and
+[receipt PR #32](https://github.com/kotoba-lang/kotoba-core-contracts/pull/32).
+Two local Finder metadata files remain byte-identical in their original
+checkouts with private local backups; private metadata is not published.
+Legacy GitHub discovery URLs remain archived and readable, not deleted.
+The original 239 dependency-pin holds and all original checkouts are retained.
+
 ## Remaining ownership decisions
 
 Other product/engine/database families and adapter catalogs remain in ownership
