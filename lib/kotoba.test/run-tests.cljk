@@ -1,0 +1,21 @@
+;; nbb entry -- the SAME .cljc suite the JVM runs, on the other runtime.
+;;
+;; Measured 2026-08-20: of 22 kotoba-lang stdlib libraries, 12 had tests and
+;; no way to run them on a second runtime. That is how kotoba-lang/bytes
+;; shipped a SHA-1 that returned the wrong digest on ClojureScript, and how
+;; kotoba-lang/lint shipped an error path that threw there instead of
+;; reporting. Neither was visible to a JVM run, and a JVM run was all
+;; either had.
+;;
+;;
+;; nbb prints its own summary; this only supplies the exit code, because a
+;; suite that fails while exiting 0 is worse than one that does not run.
+(ns run-tests
+  (:require [clojure.test :as t]
+            [kotoba.lang.test-test]
+            ))
+
+(defmethod t/report [:cljs.test/default :end-run-tests] [m]
+  (when-not (t/successful? m) (js/process.exit 1)))
+
+(t/run-tests 'kotoba.lang.test-test)

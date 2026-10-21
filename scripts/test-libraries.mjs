@@ -9,10 +9,6 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const libraryProject = path.join(repo, "lib");
 const design = process.argv[2] === "--check-design";
 assert.ok(design || process.argv.length === 2, "usage: test-libraries.mjs [--check-design ADR.kotoba...]");
-const declaredText = fs.readFileSync(path.join(repo, "deps.edn"), "utf8")
-  .match(/io\.github\.kotoba-lang\/text\s+\{:git\/sha\s+"([0-9a-f]{40})"/);
-assert.ok(declaredText, "bootstrap text must be pinned in deps.edn");
-const textCommit = declaredText[1];
 let engine = process.env.KBB_ENGINE;
 if (!engine) {
   const kbb = fs.realpathSync(execFileSync("which", ["kbb"], { encoding: "utf8" }).trim());
@@ -22,25 +18,9 @@ assert.ok(fs.existsSync(engine), "set KBB_ENGINE to the installed .cljk-capable 
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "kotoba-library-tests-"));
 try {
-  // Bootstrap the existing native deps resolver from a declared immutable
-  // text snapshot, never the working files of a sibling or an implicit
-  // workspace classpath. This also avoids nbb's JVM tools.deps adapter.
-  const gitlibs = process.env.GITLIBS ?? path.join(os.homedir(), ".gitlibs");
-  const candidates = [path.join(gitlibs, "libs/io.github.kotoba-lang/text", textCommit),
-    path.resolve(repo, "../text")];
-  let textRepo = candidates.find(dir => fs.existsSync(dir) &&
-    spawnSync("git", ["-C", dir, "cat-file", "-e", `${textCommit}^{commit}`],
-              { stdio: "ignore" }).status === 0);
-  if (!textRepo) {
-    textRepo = path.join(temporary, "text.git");
-    execFileSync("git", ["clone", "--bare", "https://github.com/kotoba-lang/text.git", textRepo],
-                 { stdio: "inherit" });
-  }
-  const bootstrap = path.join(temporary, "bootstrap");
-  fs.mkdirSync(bootstrap);
-  const archive = execFileSync("git", ["-C", textRepo, "archive", textCommit, "src"],
-                               { maxBuffer: 8 * 1024 * 1024 });
-  execFileSync("tar", ["-xf", "-", "-C", bootstrap], { input: archive });
+  const bootstrap = path.join(repo, "lib/kotoba.text");
+  assert.ok(fs.existsSync(path.join(bootstrap, "src/kotoba/lang/text.cljk")),
+            "bundled text bootstrap is missing");
 
   const blocked = path.join(temporary, "blocked");
   fs.mkdirSync(blocked);

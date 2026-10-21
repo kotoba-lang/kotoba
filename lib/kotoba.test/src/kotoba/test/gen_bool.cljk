@@ -1,0 +1,14 @@
+(ns kotoba.test.gen-bool
+  "gen-bool -- addressed on its own.
+
+  Split out of kotoba.lang.test on 2026-09-09 (ADR-2609091200). The unit
+  here is the DEFINITION, and this repo's deps.edn names exactly the
+  definitions it reaches -- nothing else.
+"
+  (:require [kotoba.lang.spec :as spec]
+            [kotoba.test.next-long :refer [next-long]])
+  #?(:clj  (:require [kotoba.lang.spec :as spec])
+     :cljs (:require [kotoba.lang.spec :as spec])))
+
+(defn gen-bool [rng]
+  (let [[n r] (next-long rng)] [(zero? (mod n 2)) r]))

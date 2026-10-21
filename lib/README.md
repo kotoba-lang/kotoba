@@ -14,6 +14,17 @@ The bundled standard libraries live in this repository:
 | `kotoba.bytes` | `kotoba.bytes/src` | `kotoba.bytes`, `kotoba.bytes.sha1`, `kotoba.bytes.sha256` |
 | `kotoba.pprint` | `kotoba.pprint/src` | `kotoba.pprint` |
 | `kotoba.error` | `kotoba.error/src` | `kotoba.lang.error` |
+| `kotoba.text` | `kotoba.text/src` | `kotoba.text`, `kotoba.lang.text` |
+| `kotoba.test` | `kotoba.test/src` | `kotoba.test`, `kotoba.lang.test` |
+| `kotoba.edn` | `kotoba.edn/src` | `kotoba.edn`, `kotoba.lang.edn` |
+| `kotoba.io` | `kotoba.io/src` | `kotoba.io`, `kotoba.lang.io` |
+| `kotoba.process` | `kotoba.process/src` | `kotoba.process`, `kotoba.lang.process` |
+| `kotoba.async` | `kotoba.async/src` | `kotoba.async`, `kotoba.lang.async` |
+| `kotoba.scheduler` | `kotoba.scheduler/src` | `kotoba.scheduler`, `kotoba.lang.scheduler` |
+| `kotoba.store` | `kotoba.store/src` | `kotoba.store`, `kotoba.lang.store` |
+| `kotoba.fmt` | `kotoba.fmt/src` | `kotoba.fmt`, `kotoba.lang.fmt` |
+| `kotoba.log` | `kotoba.log/src` | `kotoba.log`, `kotoba.lang.log` |
+| `kotoba.fs` | `kotoba.fs/src` | `kotoba.fs`, `kotoba.lang.fs` |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
@@ -37,13 +48,16 @@ program with `run --runtime sci --library <ID-or-alias>`. The development
 catalog facade delegates resolution to the language-owned portable contract.
 
 The test driver uses the installed `.cljk` SCI engine (`KBB_ENGINE` can select
-it), the existing native `bin/kbb_deps.cljk` resolver, the declared immutable
+it), the existing native `bin/kbb_deps.cljk` resolver, the checked-in bundled
 text bootstrap, and the dependency graph of `lib/deps.edn`. No implicit sibling
 classpath or JVM resolver is used. Missing declared dependencies fail the run.
 The driver refuses Java/Clojure/bb subprocesses. The standalone libraries'
 older runner files are retained as import provenance; use the driver above to
-execute all portable suites, including the definition facades. The only
-excluded suite is `kotoba.json/test/json/core_test.cljk`, whose origin is `.clj`.
+execute all portable suites, including the definition facades. `test-suites.json` registers every imported suite and its host.
+`node scripts/test-library-jvm.mjs` runs the original JVM-only suites, current
+bytes module admission, and the async native oracle in its isolated, original
+test-only compiler graph. This historical async oracle does not qualify async
+against the current CLI compiler. See [wave 2 review](../docs/library-wave2.md).
 
 `imports.json` preserves source commit/tree, original-to-local file paths,
 per-file digests, licenses, and executable modes. Imported definition sources

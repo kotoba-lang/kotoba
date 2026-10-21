@@ -1,0 +1,224 @@
+(ns kotoba.lang.edn-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.edn :as edn]))
+
+(defn- rejected [input]
+  (try (edn/read-string input) nil
+       (catch :default error error)))
+
+(deftest bounded-roundtrip
+  (doseq [value [nil true false 42 -7 "言葉" :actor/run
+                 [1 :two "three"]
+                 {:goal "migrate" :caps #{:http :clock}}]]
+    (is (= value (edn/read-string (edn/write-string value))))))
+
+(deftest reads-one-form-with-comments-and-sets
+  (is (= {:allow #{[:cap/call 7]} :args [1 -2]}
+         (edn/read-string "; policy\n{:allow #{[:cap/call 7]}, :args [1 -2]}"))))
+
+(deftest rejects-unsafe-or-ambiguous-input
+  (doseq [[label input pattern]
+          [["empty" " ; none\n" #"empty"]
+           ["trailing" "{} {}" #"trailing"]
+           ["tag" "#inst \"2026-08-02\"" #"dispatch"]
+           ["discard" "{:safe true} #_ :hidden" #"dispatch"]
+           ["mismatch" "[1}" #"delimiters"]
+           ["unterminated" "[1" #"unterminated"]]]
+    (testing label
+      (let [error (rejected input)]
+        (is (some? error))
+        (is (re-find pattern (ex-message error)))
+        (is (= :decode (:phase (ex-data error))))))))
+
+(deftest rejects-resource-attacks
+  (with-redefs [edn/max-depth 4 edn/max-token-chars 8 edn/max-string-chars 8]
+    (is (re-find #"nesting" (ex-message (rejected "[[[[[0]]]]]"))))
+    (is (re-find #"token" (ex-message (rejected "123456789"))))
+    (is (re-find #"string" (ex-message (rejected "\"123456789\""))))))
+
+;; ---------------------------------------------------------------------------
+;; Canonical text may not contain a raw control byte
+;;
+;; A single one makes `file(1)` call the file `data`, and grep then SKIPS it
+;; silently: `grep -c somename <file>` prints nothing and exits 1 — exactly
+;; what a file not containing that name does. Every search-based conclusion
+;; about that file is void and nothing says so.
+;;
+;; Measured 2026-08-18: twenty source and resource files in this workspace held
+;; raw NUL bytes, all of them on purpose, because `pr-str` emits the raw byte.
+;; Three were `.kir.edn` — the canonical IR — and the code they encode is the
+;; null-byte check itself.
+;;
+;; The invariant lives in the WRITER, not in a checker. A checker finds these
+;; afterwards and leaves a window; a writer that cannot emit one closes it.
+;; ---------------------------------------------------------------------------
+
+(defn- control-codes [s]
+  (into #{} (comp (map #?(:clj int :cljs #(.charCodeAt (str %) 0)))
+                  (filter #(or (< % 32) (= % 127))))
+        s))
+
+(deftest no-value-can-produce-a-raw-control-byte
+  (testing "total, not best-effort: every C0 code point and DEL, in a string,
+            as a keyword-adjacent value, and nested"
+    (doseq [code (concat (range 0 32) [127])]
+      (let [v {:s (str "a" (char code) "b")}
+            t (edn/write-string v)
+            raw (disj (control-codes t) 9 10 13)]
+        (is (empty? raw)
+            (str "code " code " left raw control(s) " raw " in " (pr-str t)))))))
+
+(deftest tab-newline-and-return-stay-literal
+  (testing "they are what make EDN readable and every text tool handles them.
+            Escaping them would be correct and unpleasant"
+    (let [t (edn/write-string {:s "a\tb\nc\rd"})]
+      (is (str/includes? t "\\t"))
+      (is (str/includes? t "\\n"))
+      (is (str/includes? t "\\r"))
+      (is (not (str/includes? t "\\u0009"))))))
+
+(deftest escaping-is-a-projection-and-not-a-change-of-value
+  (testing "`\\u0000` reads back as the same character, so identity taken over
+            the VALUE is untouched. That is the whole reason this is safe to
+            do at all"
+    (doseq [code [0 1 7 27 31 127]]
+      (let [v {:s (str "x" (char code) "y")}]
+        (is (= v (edn/read-string (edn/write-string v)))
+            (str "round trip failed for code " code))))))
+
+(deftest writing-is-idempotent
+  (testing "escaping already-escaped text is a no-op, which is what makes a
+            `--check` gate over generated text meaningful"
+    (let [v {:a (str "n" (char 0) "ul") :b [1 2 {:c (str (char 27) "esc")}]}
+          once (edn/write-string v)]
+      (is (= once (edn/write-string (edn/read-string once)))))))
+
+(deftest the-byte-limit-is-on-what-is-written
+  (testing "one control character becomes six, so a value that passed a
+            pre-escape check could still produce oversized output. The limit
+            has to be applied after escaping, and this pins the order"
+    (let [;; comfortably under the limit unescaped, comfortably over escaped
+          n (inc (quot edn/max-edn-bytes 6))
+          v {:s (apply str (repeat n (char 0)))}]
+      (is (thrown? #?(:clj Exception :cljs :default) (edn/write-string v))))))
+
+(deftest a-value-with-no-controls-is-untouched
+  (testing "the escaping must not be a rewrite of everything it passes"
+    (doseq [v [{:a 1} "plain" [:x :y] {:nested {:deep "日本語テキスト"}}]]
+      (is (= (pr-str v) (edn/write-string v))
+          (str "escaping altered a value with no control characters: "
+               (pr-str v))))))
+
+(deftest escape-controls-is-usable-by-other-writers
+  (testing "`write-string` is one writer with one shape and a byte bound.
+            A checked-in KIR file is written by `clojure.pprint/pprint`,
+            where the multi-line layout IS the point — and pprint emits the
+            raw byte exactly as pr-str does. Those writers need the rule and
+            not this writer, so the rule is handed over rather than
+            reimplemented"
+    (is (= "a\\u0000b" (edn/escape-controls (str "a" (char 0) "b"))))
+    (testing "it is a text function, not a value function — it takes and
+              returns text, so any writer can post-process with it"
+      (is (= "already \\u0000 escaped"
+             (edn/escape-controls "already \\u0000 escaped"))
+          "idempotent, which is what lets a generator run twice"))
+    (testing "and it leaves what pr-str and pprint already escaped alone"
+      (is (= "a\\tb" (edn/escape-controls "a\\tb"))))))
+
+(deftest structural-whitespace-survives
+  (testing "This function takes TEXT, not a value. `pr-str` escapes tab,
+            newline and return inside string literals — but the whitespace
+            BETWEEN forms in a pretty-printed artefact is raw code 9/10/13
+            that no writer touched, and escaping it destroys the document.
+
+            Measured 2026-08-19 by breaking it: removing the exemption turned
+            a 16,250-character KIR artefact into one line with zero line
+            terminators, and it stopped parsing — `Map literal must contain
+            an even number of forms`. The mutation that should have caught it
+            survived because the only caller under test was `write-string`,
+            whose `pr-str` output is one line. A live guard was deleted and
+            called dead code."
+    (let [pretty "{:a 1,\n :b {:c 2,\n     :d 3}}\n"
+          out (edn/escape-controls pretty)]
+      (is (= pretty out) "multi-line text passes through untouched")
+      (is (= 3 (count (filter #(= \newline %) out))))
+      (is (= {:a 1 :b {:c 2 :d 3}} (edn/read-string out))
+          "and it still parses, which is the property that broke"))
+    (testing "a tab used as layout is layout, not a control byte to hide"
+      (is (= "a\tb" (edn/escape-controls "a\tb"))))
+    (testing "but a control character that is NOT layout is still escaped,
+              even when it arrives beside layout"
+      (let [out (edn/escape-controls (str "{:a 1,\n :b \"x" (char 0) "y\"}"))]
+        (is (str/includes? out "\\u0000"))
+        (is (= 1 (count (filter #(= \newline %) out))))))))
+
+;; ---------------------------------------------------------------------------
+;; read-all
+;; ---------------------------------------------------------------------------
+
+(deftest read-all-returns-every-top-level-form-in-order
+  (is (= [{:a 1} [2 3] :kw "s" 42]
+         (edn/read-all "{:a 1}\n[2 3]\n:kw \"s\" 42")))
+  ;; one form is still a vector of one -- the return shape does not change
+  ;; with the number of forms, so a caller never has to branch on it
+  (is (= [{:a 1}] (edn/read-all "{:a 1}")))
+  (is (= [1 2 3] (edn/read-all "1 2 3")))
+  (is (= [#{1 2}] (edn/read-all "#{1 2}"))))
+
+(deftest read-all-on-empty-input-is-empty-not-an-error
+  ;; Question 1 of the 8: what does it return with no input? `[]` here is a
+  ;; deliberate answer, not an accident -- a file that failed to read throws,
+  ;; so the caller can still tell the two apart.
+  (is (= [] (edn/read-all "")))
+  (is (= [] (edn/read-all "   \n\t ")))
+  (is (= [] (edn/read-all ";; only a comment\n")))
+  ;; contrast: read-string refuses the same input rather than inventing a value
+  (is (rejected "")))
+
+(deftest read-all-separates-forms-that-touch
+  ;; The lexer cases that a naive "split on newline" gets wrong.
+  (is (= [1 2] (edn/read-all "1,2")))
+  (is (= [[1] [2]] (edn/read-all "[1][2]")))
+  (is (= ["a" "b"] (edn/read-all "\"a\"\"b\"")))
+  (is (= ['sym [1]] (edn/read-all "sym[1]")))
+  (is (= [:a "b"] (edn/read-all ":a\"b\"")))
+  ;; a separator INSIDE a string is not a form boundary
+  (is (= ["a b\nc"] (edn/read-all "\"a b\nc\"")))
+  ;; nor is a `;` inside a string a comment
+  (is (= ["; not a comment" 1] (edn/read-all "\"; not a comment\" 1")))
+  ;; nor is an escaped quote the end of the string
+  (is (= ["a\"b" 1] (edn/read-all "\"a\\\"b\" 1"))))
+
+(deftest read-all-keeps-every-bound-read-string-enforces
+  ;; It is not a hole in the bounds: malformed and forbidden input is refused
+  ;; exactly as read-string refuses it.
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "[1 2")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "\"unterminated")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "[1} 2")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "#inst \"2026\"")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all 42)))
+  ;; and a LATER form being bad fails the whole read -- it does not return the
+  ;; good prefix and drop the rest silently
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "{:a 1} [1 2"))))
+
+(deftest read-all-matches-a-clojure-edn-read-eof-loop
+  ;; Parity against the call shape this replaces. Without this the tests above
+  ;; only pin what I believed a drain loop returns.
+  (letfn [(host-drain [text]
+            #?(:clj (let [r (java.io.PushbackReader. (java.io.StringReader. text))]
+                      (loop [acc []]
+                        (let [v (clojure.edn/read {:eof ::eof} r)]
+                          (if (= v ::eof) acc (recur (conj acc v))))))
+               :cljs (cljs.reader/read-string (str "[" text "]"))))]
+    (doseq [text ["{:a 1}\n[2 3]\n:kw \"s\" 42"
+                  "1 2 3"
+                  "1,2"
+                  "[1][2]"
+                  "sym[1]"
+                  ":a\"b\""
+                  "\"; not a comment\" 1"
+                  ";; only a comment\n"
+                  "   \n\t "
+                  "{:a 1}"]]
+      (is (= (vec (host-drain text)) (edn/read-all text)) (pr-str text)))))

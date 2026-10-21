@@ -1,0 +1,17 @@
+(ns kotoba.test.registered-tests
+  "registered-tests -- addressed on its own.
+
+  Split out of kotoba.lang.test on 2026-09-09 (ADR-2609091200). The unit
+  here is the DEFINITION, and this repo's deps.edn names exactly the
+  definitions it reaches -- nothing else.
+"
+  (:require [kotoba.lang.spec :as spec]
+            [kotoba.test.test-registry :refer [test-registry]])
+  #?(:clj  (:require [kotoba.lang.spec :as spec])
+     :cljs (:require [kotoba.lang.spec :as spec])))
+
+(defn registered-tests
+  "Read-only snapshot of the global test registry: {ns-sym {test-sym
+  test-fn}}."
+  []
+  @test-registry)

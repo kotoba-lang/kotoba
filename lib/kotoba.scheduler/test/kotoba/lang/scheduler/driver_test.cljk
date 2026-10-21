@@ -1,0 +1,71 @@
+(ns kotoba.lang.scheduler.driver-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.scheduler :as sch]
+            [kotoba.lang.scheduler.driver :as d]
+            [kotoba.lang.time :as t]))
+
+(defn- clock-fn [state-atom] (fn [] @state-atom))
+
+(deftest lease-valid?-fences-on-epoch
+  (is (true?  (d/lease-valid? (d/lease "host-a" 3) (d/lease "host-a" 3))))
+  (is (true?  (d/lease-valid? (d/lease "host-a" 3) (d/lease "host-b" 4))))
+  (is (false? (d/lease-valid? (d/lease "host-a" 3) (d/lease "host-b" 2)))
+      "a checkpoint written under a lower, since-superseded epoch is stale"))
+
+(deftest run-tick!-fires-due-jobs-and-spends-budget-by-count-fired
+  (let [clk (atom 0)
+        s (-> (sch/scheduler (clock-fn clk))
+              (sch/at :a (t/instant 1000) (fn [now] [:a (:time/instant now)]))
+              (sch/at :b (t/instant 1000) (fn [now] [:b (:time/instant now)])))
+        ckpt (d/checkpoint s 5 (d/lease "host-a" 1))]
+    (let [[ckpt' fired] (d/run-tick! ckpt (t/instant 1000))]
+      (is (= 2 (count fired)) "both :a and :b were due")
+      (is (= 3 (:budget ckpt')) "budget 5 minus 2 jobs actually fired")
+      (is (empty? (:jobs (:scheduler ckpt'))) "both one-shots removed after firing"))))
+
+(deftest run-tick!-idle-tick-does-not-spend-budget
+  (testing "nothing due yet -- an idle tick must not starve a loop that's simply waiting"
+    (let [clk (atom 0)
+          s (sch/at (sch/scheduler (clock-fn clk)) :a (t/instant 1000) (fn [_now] :fired))
+          ckpt (d/checkpoint s 1 (d/lease "host-a" 1))]
+      (let [[ckpt' fired] (d/run-tick! ckpt (t/instant 500))]
+        (is (empty? fired))
+        (is (= 1 (:budget ckpt')) "budget untouched -- no job fired at this tick")))))
+
+(deftest run-tick!-stops-once-budget-is-exhausted
+  (let [clk (atom 0)
+        s (sch/every (sch/scheduler (clock-fn clk)) :repeating (t/seconds 1)
+                     (fn [_now] :tick) :start (t/instant 1000))
+        ckpt (d/checkpoint s 2 (d/lease "host-a" 1))]
+    (let [[ckpt1 fired1] (d/run-tick! ckpt (t/instant 1000))
+          [ckpt2 fired2] (d/run-tick! ckpt1 (t/instant 2000))
+          [ckpt3 fired3] (d/run-tick! ckpt2 (t/instant 3000))]
+      (is (= [:tick] fired1))
+      (is (= [:tick] fired2))
+      (is (true? (d/exhausted? ckpt2)) "budget of 2 spent after 2 firings")
+      (is (empty? fired3) "a durable loop stops firing once its budget is exhausted")
+      (is (= 0 (:budget ckpt3))))))
+
+(deftest drain-ready!-observes-what-actually-fired-across-ticks
+  (let [clk (atom 0)
+        s (-> (sch/scheduler (clock-fn clk))
+              (sch/at :a (t/instant 1000) (fn [_now] :a))
+              (sch/at :b (t/instant 2000) (fn [_now] :b)))
+        ckpt (d/checkpoint s 10 (d/lease "host-a" 1))
+        [ckpt1 _fired1] (d/run-tick! ckpt (t/instant 1000))
+        [ckpt2 _fired2] (d/run-tick! ckpt1 (t/instant 2000))
+        [ckpt3 records] (d/drain-ready! ckpt2)]
+    (is (= [:a :b] (mapv :id records))
+        "drain-ready! observes both jobs, in fire order, across two separate ticks")
+    (is (empty? (:buffer (:ready-queue (:scheduler ckpt3)))) "ready-queue drained")))
+
+(deftest checkpoint-budget-and-lease-are-plain-edn
+  (testing ":budget and :lease round-trip through pr-str/read-string as-is
+            -- :scheduler does not, on its own, since it carries the
+            host-injected clock fn and each job's callback (see
+            checkpoint's own docstring); a host persists job/clock
+            IDENTITY, not the closures themselves"
+    (let [ckpt (d/checkpoint (sch/scheduler (clock-fn (atom 0))) 3 (d/lease "host-a" 1))]
+      (is (= (:budget ckpt) (edn/read-string (pr-str (:budget ckpt)))))
+      (is (= (:lease ckpt) (edn/read-string (pr-str (:lease ckpt))))))))

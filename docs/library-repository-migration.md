@@ -39,11 +39,18 @@ omitted. Its categories are triage, not semantic qualification or archive proof.
 - Other repositories require an ownership and dependency review before moving.
   Unreviewed is not obsolete, and inactivity is not archive evidence.
 
-The next standard-library review covers text/test/EDN compatibility readers,
-I/O/process adapters, async/scheduler/store, numeric and formatting helpers.
-These have broader bootstrap, host-effect or state boundaries and need their
-own source/consumer tests. `math` remains separate because its current source
-tree has no LICENSE; no license is invented during import.
+The second wave (JUN-196) adds text/test/EDN compatibility readers,
+io/fs/process, async/scheduler/store, fmt/log: 11 packages and 189 additional
+source repositories. The complete catalog has 21 IDs, 58 exact old-name aliases,
+364 origins and 1,691 imported files. [Wave 2 review](library-wave2.md) records
+bootstrap self-dependency removal, namespace ownership, state/host boundaries,
+and the separate json/bytes branch decisions.
+
+`num` keeps its independent GPU backend/release boundary. `atom` is Atom
+syndication (RFC 4287), not mutable state. `hash` is a compiler-facing native
+memory kernel; it needs its own compiler/runtime review. `math` and `i64` have
+no LICENSE in the reviewed defaults and remain separate. Protocol bindings,
+security authorities and execution foundations are not swept into this wave.
 
 ## Archive criteria
 
@@ -61,13 +68,15 @@ archiving, the operator verifies:
 4. Default/branch state and local WIP are rechecked immediately before the
    GitHub operation; any change holds the repository. The result is read back.
 
-At review, `json` and `bytes` have unintegrated branches. Their source is
-bundled, but their repositories remain writable. The untracked Finder metadata
-in the `set-rename-keys` checkout is reviewed as non-source data and preserved
-locally. The remaining 173 repositories are eligible only after the main
-verification gate. The inventory is an eligibility record, not a claim that
-the remote operation has already occurred. Actual archive/readback evidence is
-recorded in [JUN-195](https://linear.app/com-junkawasaki/issue/JUN-195).
+The first wave archived 173 repositories after merged-main CI and public CLI
+verification; its receipts are in [JUN-195](https://linear.app/com-junkawasaki/issue/JUN-195).
+The second-wave inventory rechecks every new source repository. The reviewed
+bytes dual-runtime branch is integrated file-for-file, while main's bytes core
+fixes remain. Unintegrated json/text/EDN/I/O/process/async work and local WIP keep
+the affected repositories writable. The exact per-repository holds are in the
+inventory; actual second-wave archive/readback evidence is recorded in
+[JUN-196](https://linear.app/com-junkawasaki/issue/JUN-196). Historical branches
+and immutable pins remain available, including on archived repositories.
 
 Archive is preferred over deletion: it preserves source history, tags, releases,
 and immutable Git dependencies used by existing consumers. Repository pins and
@@ -82,5 +91,5 @@ No fleet-wide `west update` or manifest regeneration is part of this migration.
 local changes, portable test inventory and reviewed default-source equivalence.
 `node scripts/test-libraries.mjs` executes the portable suites with JVM bootstrap
 blocked, including the 17,338-case bytes oracle. Public CLI tests exercise all
-catalog aliases and actual calls through the seven additional package IDs,
+catalog aliases and actual calls through both consolidation waves,
 asserting that each loaded source is inside its monorepo subtree.
