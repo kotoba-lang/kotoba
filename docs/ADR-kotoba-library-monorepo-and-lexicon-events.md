@@ -10,6 +10,11 @@ This document explains its implementation in `kotoba-lang/kotoba`.
 
 ## Names and authority
 
+The language-owned [Kotoba naming Spec](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/lang/naming.md)
+defines the contexts and Lisp punctuation conventions. Its Kotoba ADL resource
+`kotoba/spec/naming.kotoba` ships with the portable import contract;
+`kotoba.lang.naming` is the sole validator. The CLI catalog delegates to it.
+
 Bundled libraries have project-local dotted IDs: `kotoba.coll`, `kotoba.spec`,
 and `kotoba.json`. Each segment starts with a lowercase ASCII letter and
 continues with ASCII letters or digits. Names are case-sensitive. There is no
@@ -142,6 +147,15 @@ wildcards are subscription selectors only. The Kotoba selector grammar uses
 segments. Patterns are expanded/intersected with declared event subjects and
 the caller's grants; they never broaden authority. ATProto's NSID glob grammar
 is different and must not be reused as this matcher.
+
+The naming Spec defines dotted field paths as shorthand for relative string
+keys, and typed vectors for exact keys and array indices. For example,
+`body.display-name` means `["body" "display-name"]`, while `["body" "display.name"]`
+keeps the dot inside one literal key. No implicit code lookup, data access,
+publication or subscription is added by dotted spelling. The design gate checks
+the event example with the language-owned validator and runs its normative
+positive/negative examples through the actual ADL reader. Transport and grant
+checks remain separate gates.
 
 Durable delivery assumes at-least-once, not exactly-once business effects.
 Consumers deduplicate by committed EventCID/action identity, commit their
