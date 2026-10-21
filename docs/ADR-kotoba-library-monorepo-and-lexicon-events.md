@@ -183,8 +183,11 @@ Application origins continue to serve static artifacts only.
 - `scripts/library-catalog.cljk`: real development lookup and classpath
   resolution through canonical IDs and old aliases.
 
-Next gates are signed subtree package publication/admission, integration of
-these IDs into the public language-owned import/CLI contracts, event schema
+The public source import/CLI contract now resolves these IDs and aliases via
+`library import` and explicit `run --runtime sci --library`; see
+[source imports](library-source-import.md). Checked/native package imports are
+not provided by that compatibility route. Next gates are signed subtree
+package publication/admission, checked/native import integration, event schema
 compiler/codegen, journal/host implementations, browser/transport qualification,
 and eventual consumer migration. None is completed by accepting this ADR or
 passing portable compatibility tests.

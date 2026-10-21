@@ -41,6 +41,7 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
 | `src/kotoba/*.cljk` | host implementation: `launcher` (dispatch), `runtime`, `wasm_exec` (Chicory Wasm execution, fuel-bounded), `cap_table`, `host_providers`, adapters (`git_`, `rad_`, `graph_`, `did_`, `deploy_adapter`), `kami_host`, `sensing_host`, `kagi_boundary`, codebase (`codebase_*`, `semantic_codebase`), identity/custody (`principal_*`, `operator_identity`, `passkey_pqc`), security gates (`grade_a`, `key_hierarchy`, `control_adoption`, `crypto_qualification`, `sealed_egress`, `cold_tier_admission`, `anchor_relayer`, `origin_assertion`, …) |
 | `src/*.kotoba` + `src/*_policy.edn` | demo / gate programs and their capability policies |
 | `cores/` | decision cores moved from host code into Kotoba source (see `cores/README.md`) |
+| `lib/catalog.edn`, `lib/kotoba.*`, `src/kotoba/library_source.cljk` | bundled dotted-ID sources, language-owned alias resolution, explicit SCI source imports |
 | `lib/kbb/`, `examples/kbb/` | kbb standard library and example scripts (`.kotoba` + policy) |
 | `providers/` | host provider consumers/transports (HTTP, DB, Postgres) and their policies |
 | `test/kotoba/*_test.cljk` | test namespaces; `test/kotoba/test_runner.cljk` is the aggregate runner; `test/fixtures/` |

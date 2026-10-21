@@ -1,0 +1,139 @@
+(ns kotoba.library-source
+  "Host adapter for explicit bundled-library source imports.
+  SCI is the existing local script host, not a checked Kotoba fallback."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [kotoba.lang.library-import :as import])
+  (:import [java.io PushbackReader StringReader File]
+           [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(defn source-root []
+  (.getCanonicalFile
+    (io/file (or (System/getenv "KOTOBA_CLI_HOME") (System/getProperty "user.dir")))))
+
+(defn- fail! [problem data]
+  (throw (ex-info (name problem) (assoc data :problem problem))))
+
+(defn- one-edn [text]
+  (with-open [reader (PushbackReader. (StringReader. text))]
+    (let [eof (Object.)
+          value (edn/read {:eof eof} reader)]
+      (when (or (identical? eof value) (not (identical? eof (edn/read {:eof eof} reader))))
+        (fail! :library/argument-invalid {}))
+      value)))
+
+(defn- source-paths! [root catalog names]
+  (let [resolved (import/source-paths catalog names)]
+    (when-not (:ok? resolved)
+      (fail! (or (get-in resolved [:problems 0 :problem]) :library/import-refused)
+             {:problems (:problems resolved)}))
+    (let [paths (mapv (fn [path]
+                        (let [file (.getCanonicalFile (io/file root path))]
+                          (when-not (and (.startsWith (.toPath file) (.toPath root))
+                                         (.isDirectory file))
+                            (fail! :library/source-path-unavailable {:path path}))
+                          (.getPath file)))
+                      (:paths resolved))]
+      (assoc resolved :classpath paths
+             :imports (mapv #(select-keys (import/resolve-library catalog %)
+                                        [:requested :id :alias?]) names)))))
+
+(defn resolve-imports!
+  "Read the installed catalog and resolve every request before execution."
+  [names]
+  (let [root (source-root)
+        file (io/file root "lib/catalog.edn")]
+    (when-not (and (.isFile file) (<= (.length file) 1048576))
+      (fail! :library/catalog-unavailable {}))
+    (let [catalog (edn/read-string (slurp file))
+          resolved (source-paths! root catalog names)]
+      (assoc resolved :root (.getPath root)
+             :packages (mapv #(select-keys (:package (import/resolve-library catalog %))
+                                           [:id :entry-namespaces :signed-release])
+                              (:ids resolved))))))
+
+(defn- result [ok? code data]
+  {:kotoba.cli/ok? ok? :kotoba.cli/code code :kotoba.cli/data data})
+
+(defn- refused [error]
+  (result false (or (:problem (ex-data error)) :library/source-import-failed)
+          (assoc (dissoc (ex-data error) :problem) :message (ex-message error))))
+
+(defn import-result [request]
+  (let [checked (import/import-request request)]
+    (if-not (:ok? checked)
+      (result false (:problem checked) (dissoc checked :ok?))
+      (try
+        (result true :library/import-resolved (resolve-imports! (:libraries checked)))
+        (catch Exception error (refused error))))))
+
+(defn- caller-file [path]
+  (let [file (io/file path)]
+    (.getCanonicalFile
+      (if (.isAbsolute file) file
+          (io/file (or (System/getenv "KOTOBA_CALLER_DIR")
+                       (System/getProperty "user.dir")) path)))))
+
+(defn run-result [request]
+  (let [checked (import/source-request request)]
+    (if-not (and (:ok? checked) (= :sci (:runtime checked)))
+      (result false (or (:problem checked) :library/runtime-required) (dissoc checked :ok?))
+      (try
+        (let [resolved (resolve-imports! (:libraries checked))
+              source (caller-file (:entry checked))
+              roots (mapv caller-file (:source-roots checked))
+              arguments (try (mapv one-edn (:arguments checked))
+                             (catch Exception _ (fail! :library/argument-invalid {})))
+              root (io/file (:root resolved))
+              driver (io/file root "bin/kotoba_library_run.cljk")
+              runner (io/file root "bin/kbb")
+              config (io/file root "lib/nbb.edn")
+              ;; The compatibility launcher already resolved immutable deps.
+              ;; Only directories are meaningful to SCI; selected bundled
+              ;; sources precede every dependency and explicit project root.
+              dependency-paths (keep (fn [path]
+                                       (let [file (.getCanonicalFile (io/file path))]
+                                         (when (.isDirectory file) (.getPath file))))
+                                       (str/split (System/getProperty "java.class.path")
+                                                  (re-pattern (java.util.regex.Pattern/quote File/pathSeparator))))
+              classpath (str/join File/pathSeparator
+                                 (distinct (concat (:classpath resolved)
+                                                   [(str (io/file root "src"))]
+                                                   (map str roots) dependency-paths)))]
+          (when-not (.isFile source) (fail! :library/source-not-readable {}))
+          (when-not (every? #(.isDirectory ^File %) roots)
+            (fail! :library/source-path-unavailable {}))
+          (when-not (and (.isFile driver) (.isFile runner) (.isFile config))
+            (fail! :library/runtime-unavailable {}))
+          (let [directory (.toFile (Files/createTempDirectory "kotoba-library-source"
+                                                             (make-array FileAttribute 0)))
+                input (io/file directory "request.edn")
+                output (io/file directory "result.edn")]
+            (try
+              (spit input (pr-str {:source (str source) :function (:function checked)
+                                   :arguments arguments :output (str output)}))
+              (let [execution (shell/sh (str runner) "--backend" "sci" "--config" (str config)
+                                         "--classpath" classpath (str driver) (str input)
+                                         :dir (or (System/getenv "KOTOBA_CALLER_DIR")
+                                                  (System/getProperty "user.dir"))
+                                         :env (merge (into {} (System/getenv))
+                                                     {"KBB_NO_STDLIB" "1" "KBB_NO_NPM" "1"
+                                                      "KBB_CLASSPATH_TAIL" ""}))
+                    value (when (.isFile output)
+                            (try (edn/read-string (slurp output))
+                                 (catch Exception _ nil)))
+                    ok? (and (zero? (:exit execution)) (true? (:ok? value)))]
+                (result ok? (if ok? :run/completed
+                                (or (:problem value) :library/source-run-failed))
+                        (merge (select-keys resolved [:ids :imports])
+                               {:runtime :sci :source-profile :cljk-compatibility
+                                :value (:value value) :stdout (:out execution)
+                                :stderr (:err execution)}
+                               (when-not ok? (select-keys value [:message])))))
+              (finally (.delete output) (.delete input) (.delete directory)))))
+        (catch java.io.IOException _
+          (result false :library/runtime-unavailable {}))
+        (catch Exception error (refused error))))))
