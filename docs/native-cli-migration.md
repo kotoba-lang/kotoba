@@ -31,7 +31,7 @@ program with the host supervisor.
 
 `scripts/test-selfhost-runtime.sh` uses the fresh G3 to compile the complete
 19-module native runtime fixture from this repository and two immutable source
-snapshots (Amu reader sources and portable bytes). It executes seven checks of
+snapshots (the same pinned Amu checkout and portable bytes). It executes seven checks of
 typed values, scalar compatibility, reader/policy refusal and runtime fuel,
 then verifies native fuel exhaustion and unsupported target/policy refusal.
 Source digests and execution reports are retained. The workflow pins all input
@@ -53,8 +53,10 @@ CLI targets are migrated. In particular:
   the normal public package build. A compiler's self-build does not establish
   those targets or command parity.
 * The previous 59-module combined native CLI depends on source overlays in its
-  historical build records. Its sources were removed from later Amu main
-  history; immutable support sources used by the fixture are named explicitly.
+  historical build records. Amu #1426 restores its 27 native modules and
+  fixtures; frontend dependency integration and the full CLI build remain open.
+  The compiler seed and native reader used by CI now share merged Amu
+  `1b0687a5997c35fec1d3903840eecc76b934589e`.
 
 The normal CLI and build switch, and removal of CLJ from required CI, must wait
 for a reproducible complete native command graph and equivalent admission,
