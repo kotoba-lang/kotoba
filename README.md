@@ -34,6 +34,12 @@ Language contract:
 [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang) · site:
 [kotoba-lang.org](https://kotoba-lang.org)
 
+The bundled standard-library pilot uses `kotoba.coll`, `kotoba.spec`, and
+`kotoba.json` IDs, with explicit old-name aliases. See [lib/](lib/README.md)
+for source layout and portable verification, and the
+[library and Lexicon event design](docs/ADR-kotoba-library-monorepo-and-lexicon-events.md).
+Amu and other execution/contract owners remain separate repositories.
+
 ```sh
 brew tap kotoba-lang/kotoba && brew trust kotoba-lang/kotoba && brew install kotoba
 kotoba -e '(+ 1 2)'

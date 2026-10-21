@@ -33,22 +33,25 @@ content-verified against aiueos commit
 `489b1c1f0fe6d79f6daeef87a20c6606338bad5b`, pinned through west, and removed
 from this repository. See `ADR-aiueos-boot-kernel-os-integration.md`.
 
-Reusable libraries are independently versioned repositories in the
-`kotoba-lang` organization, not permanent subtrees of a growing monorepo. A
-west manifest composes their pinned revisions for development, integration,
-and releases. West is the checkout/composition authority; it does not transfer
-source ownership back to this repository or allow floating branch references
-in release manifests.
+The 2026-10-21 owner decision in
+[the library monorepo ADR](ADR-kotoba-library-monorepo-and-lexicon-events.md)
+supersedes the blanket repo-per-library rule. The standard-library pilot
+(`coll/spec/json`) is maintained under `lib/kotoba.*` in this repository, with
+package boundaries, aliases, provenance, tests, and eventual signed subtree
+releases. Definition-level identity does not depend on physical Git placement.
+Amu, language/contract authorities, ABI, protocol, and OS implementations keep
+their existing repositories. West remains checkout/composition authority for
+independent repositories; this decision permits no floating release dependency.
 
 Use the following extraction rules:
 
 - `kotoba-lang/aiueos`: owns the complete OS product. This repository retains
   only freestanding language/compiler contracts and cross-repository
   conformance fixtures.
-- repo-per-library: a reusable library with a stable public contract and an
-  independent release gate receives its own `kotoba-lang/<library>` repository.
-  Consumers use published identities or west-pinned revisions, never an
-  unversioned workspace-only path as a release dependency.
+- Libraries: prefer co-location for shared maintenance and coordinated changes;
+  split when ownership, build, deployment, or release actually needs an
+  independent boundary. Consumers use admitted published identities or pinned
+  source trees, never an unversioned workspace-only release dependency.
 
 - `kotoba-lang/kotoba-lang`: reserve this repo for the language contract once a
   second compiler/runtime, external package, or independent conformance suite
