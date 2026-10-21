@@ -1571,8 +1571,11 @@ described by [kotoba-lang.org](https://kotoba-lang.org/) and the versioned
 [`kotoba` CLI contract](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/cli.md).
 `kotoba rad build` and `kotoba rad test` remain compatibility spellings.
 
-Repository-maintainer conformance, lint, security, Python SDK, and release gates
-run on the Murakumo fleet. Their implementation details are internal gates, not
+Repository-maintainer conformance, lint, security, and release gates
+include the explicitly named CLJ bootstrap/compatibility route. Native/selfhost
+qualification is recorded separately. The retired `kotoba-modal` Python SDK
+contained packaging assets without Python implementation or tests and is no
+longer shipped or required by CI. These maintainer gates are separate from
 the user-facing Kotoba project build command. This repository has no Rust build;
 see [Current repositories](#current-repositories-cljc-post-migration).
 

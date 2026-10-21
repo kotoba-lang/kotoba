@@ -18,10 +18,9 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
   `kotoba-vault`/KSE, `kotoba-runtime`, `kotoba-clj`, `kotoba-server`, …) was
   removed in `60489617` (#259, 2026-07-01). None of its `cargo` commands,
   crate paths or benchmarks exist here any more, and neither do its WIT host
-  files — with one exception: the `kotoba:kais` WIT package the Python SDK
-  uses to build py→wasm guests survives as `sdk/kotoba-modal/wit/world.wit`
-  and its identical packaged copy `sdk/kotoba-modal/kotoba_modal/wit/world.wit`
-  (shipped via `pyproject.toml`; CI asserts it is in the wheel). The Rust
+  files. The remaining Python SDK/WIT packaging assets were retired in
+  JUN-198 because their Python implementation and tests were already absent.
+  The Rust
   design vocabulary is kept in `docs/HISTORICAL-RUST-ARCHITECTURE.md`; the previous,
   Rust-era version of this file is in git history (`git show 5505040e:CLAUDE.md`).
 - KQE (Kotoba Query Engine) is called **`kgraph`** in the current
@@ -51,12 +50,18 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
 | `tools/` | `cljk_loader.cljk` (byte-identical copy from kotoba-lang/kotoba-lang; see `tools/CLJK-COMPATIBILITY.md`), `raw_memory_audit.cljk` |
 | `scripts/` | native build/release (`build-native.sh`, `package-native-release.sh`, `verify-release-binary.mjs`), CI runtime setup, `prepare-jvm-analysis.mjs` |
 | `vendor/grammar` | committed overlay of kotoba-lang/grammar (`:local/root`) |
-| `sdk/kotoba-modal`, `py/` | Python SDK and packages |
 | `lexicons/`, `kotoba.words.json`, `kotoba.lock.edn` | ATProto lexicons and word/root registry artifacts |
 | `docs/` | ADRs, docs site (`.github/workflows/pages.yml`), `docs/lang/` language profile and gates, `docs/issues/` + `.issues/` issue sources |
 | `Formula/`, `install.sh` | Homebrew formula and shell installer |
 
 ## Build and test
+
+The required native gate builds three compiler generations and executes the
+19-module runtime fixture with hosted language executables denied. Its scope
+and remaining public CLI/build migration are explicit in
+[`docs/native-cli-migration.md`](docs/native-cli-migration.md). The CLJ commands
+below remain bootstrap/compatibility diagnostics; their passing result is not
+native/selfhost qualification.
 
 ```bash
 # public CLI from a source checkout (same as the installed `kotoba`)
