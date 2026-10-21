@@ -4,10 +4,406 @@
   Reader evaluation and tagged literals are forbidden. Input size, nesting,
   token length, node count, and string length are all bounded before values
   cross an actor or I/O boundary."
-  {:kotoba/export '[escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-string write-string]}
+  {:kotoba/export #?(:kotoba [escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-document write-string]
+                     :default '[escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-string write-string])}
   (:refer-clojure :exclude [read-string])
-  (:require [kotoba.bytes :as kbytes]))
+  (:require #?@(:kotoba [] :default [[kotoba.bytes :as kbytes]])))
 
+
+;; ── the Kotoba reading ───────────────────────────────────────────────────────
+;;
+;; Dual-runtime (the posix-path idiom, amu src/kotoba/compiler/posix_path.cljk):
+;; `#?(:kotoba A :default B)` gives Kotoba its own reading; the host code below is
+;; unchanged. On Kotoba the value tree is a `:document`, bytes are UTF-8 offsets,
+;; public codec functions catch typed aborts as explicit `[:result T :document]` values,
+;; and the exported limits are zero-argument functions.
+;;
+;; The Kotoba reader is the SAME bounded lexer (`scan`: size, nesting, token
+;; length, single form, unterminated string or collection, dispatch forms) in
+;; front of the language's own safe EDN reader, `document-edn-read`, which reads
+;; no tag and evaluates nothing. Where the host's parser reads something the
+;; language's reader does not, the Kotoba reading REFUSES rather than reading a
+;; different value:
+;;   * `#:ns{...}` namespaced maps and character literals (`\a`): refused;
+;;   * the host-divergent numbers (1N, 1.5M, 1/2, integers past 2^53-1): refused
+;;     with the host's message;
+;;   * a map with a DUPLICATE key is refused by the host with a typed abort; the
+;;     language reader refuses it too, but as a runtime trap that no `try` can
+;;     catch (the odd-length map, the other map error, is caught by `scan`);
+;;   * `read-string` is a reserved name in the language, so the Kotoba name of
+;;     `read-string` is `read-document` (the name `kotoba.edn` already uses);
+;;   * the options of `read-string` / `read-all` (`:readers`, `:default`, `:eof`)
+;;     are function values, which have no Kotoba spelling: only the option-free
+;;     call exists.
+;; `write-string` prints with `document-edn-print`, as `kotoba.lang.canonical-document`
+;; does, so a map prints in sorted order without commas where `pr-str` does not.
+
+#?(:kotoba
+   (defn max-edn-bytes [] :i64 8388608))
+#?(:kotoba
+   (defn max-depth [] :i64 128))
+#?(:kotoba
+   (defn max-token-chars [] :i64 4096))
+#?(:kotoba
+   (defn max-nodes [] :i64 200000))
+#?(:kotoba
+   (defn max-string-chars [] :i64 1048576))
+#?(:kotoba
+   (defn max-exact-integer [] :i64 9007199254740991))
+
+#?(:kotoba
+   (defn- utf8-width [cp :i64] :i64
+     (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4)))
+
+#?(:kotoba
+   (defn- separator-code? [c :i64] :bool
+     (if (= c 44) true (if (= c 32) true (if (= c 9) true (if (= c 10) true (= c 13)))))))
+
+#?(:kotoba
+   (defn- opening-code? [c :i64] :bool
+     (if (= c 40) true (if (= c 91) true (= c 123)))))
+
+#?(:kotoba
+   (defn- closing-code? [c :i64] :bool
+     (if (= c 41) true (if (= c 93) true (= c 125)))))
+
+#?(:kotoba
+   (defn- matching-close-code [c :i64] :i64
+     (if (= c 40) 41 (if (= c 91) 93 125))))
+
+#?(:kotoba
+   (defn- pop-stack [v :vector-i64] :vector-i64
+     (let [n (vector-count v)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i (- n 1)) out (recur (+ i 1) (vector-conj out (vector-at v i))))))))
+
+#?(:kotoba
+   ;; -1 when the stack is empty
+   (defn- top-of [v :vector-i64] :i64
+     (if (= (vector-count v) 0) -1 (vector-at v (- (vector-count v) 1)))))
+
+;; The lexer. Its state travels in the loop: position, the stack of expected
+;; closers, the length of the token being read (0 when none), string/escape/comment
+;; flags, the start of the top-level form in progress (-1 when none), the spans of
+;; the finished forms as flat start/end pairs, and every bare token as start/end
+;; pairs (checked afterwards, so the loop itself only aborts on paths that leave it).
+;; `counts` is the number of forms read so far in each open collection (parallel to
+;; `stack`), so that a map with an odd number of forms is refused here, as the host
+;; refuses it, rather than reaching the language's reader, which cannot abort.
+#?(:kotoba
+   (defn- bump [counts :vector-i64] :vector-i64
+     (let [n (vector-count counts)]
+       (if (= n 0)
+         counts
+         (vector-assoc counts (- n 1) (+ 1 (vector-at counts (- n 1))))))))
+
+#?(:kotoba
+   (defn- odd-map-close? [c :i64 counts :vector-i64] :bool
+     (if (= c 125)
+       (if (> (vector-count counts) 0)
+         (= 1 (- (top-of counts) (* 2 (quot (top-of counts) 2))))
+         false)
+       false)))
+
+#?(:kotoba
+   (defn- scan-loop [text :string n :i64] :document
+     (loop [i 0 stack (vector-i64) counts (vector-i64) tlen 0 in-string? false escaped? false in-comment? false
+            start -1 spans (vector-i64) toks (vector-i64) tstart -1]
+       (if (>= i n)
+         (cond
+           in-string? (throw (ex-info "EDN string is unterminated" {:phase :decode}))
+           (> (vector-count stack) 0) (throw (ex-info "EDN collection is unterminated" {:phase :decode}))
+           :else
+           (let [toks2 (if (> tlen 0) (vector-conj (vector-conj toks tstart) n) toks)
+                 spans2 (if (>= start 0) (vector-conj (vector-conj spans start) n) spans)]
+             (document-vector (dvec spans2) (dvec toks2))))
+         (let [c (string-code-point-at text i)
+               w (utf8-width c)
+               depth (vector-count stack)]
+           (cond
+             in-comment?
+             (recur (+ i w) stack counts 0 false false (not (= c 10)) start spans toks -1)
+
+             (if in-string? escaped? false)
+             (recur (+ i w) stack counts 0 true false false start spans toks -1)
+
+             (if in-string? (= c 92) false)
+             (recur (+ i w) stack counts 0 true true false start spans toks -1)
+
+             in-string?
+             (if (= c 34)
+               (if (= depth 0)
+                 (recur (+ i w) stack counts 0 false false false -1 (vector-conj (vector-conj spans start) (+ i w)) toks -1)
+                 (recur (+ i w) stack (bump counts) 0 false false false start spans toks -1))
+               (recur (+ i w) stack counts 0 true false false start spans toks -1))
+
+             ;; a top-level bare token ends at the first character that cannot continue it
+             (if (> tlen 0)
+               (if (= depth 0)
+                 (if (separator-code? c) true (if (closing-code? c) true (if (opening-code? c) true (if (= c 59) true (if (= c 34) true (= c 35))))))
+                 false)
+               false)
+             (recur i stack counts 0 false false false -1
+                    (vector-conj (vector-conj spans start) i) (vector-conj (vector-conj toks tstart) i) -1)
+
+             ;; inside a collection a token ends at the same characters
+             (if (> tlen 0)
+               (if (separator-code? c) true (if (closing-code? c) true (if (opening-code? c) true (if (= c 59) true (if (= c 34) true (= c 35))))))
+               false)
+             (recur i stack (bump counts) 0 false false false start spans (vector-conj (vector-conj toks tstart) i) -1)
+
+             (= c 59) (recur (+ i w) stack counts 0 false false true start spans toks -1)
+
+             (= c 34) (recur (+ i w) stack counts 0 true false false (if (= depth 0) i start) spans toks -1)
+
+             (= c 35)
+             (if (= (ch-at text (+ i 1)) 123)
+               (if (>= (+ depth 1) 128)
+                 (throw (ex-info "EDN nesting exceeds limit" {:phase :decode :limit 128}))
+                 (recur (+ i 2) (vector-conj stack 126) (vector-conj counts 0) 0 false false false (if (= depth 0) i start) spans toks -1))
+               (throw (ex-info "EDN dispatch forms are forbidden" {:phase :decode})))
+
+             (opening-code? c)
+             (if (> (+ depth 1) 128)
+               (throw (ex-info "EDN nesting exceeds limit" {:phase :decode :limit 128}))
+               (recur (+ i w) (vector-conj stack (matching-close-code c)) (vector-conj counts 0) 0 false false false (if (= depth 0) i start) spans toks -1))
+
+             ;; a set closes with `}` too; it is on the stack as 126
+             (closing-code? c)
+             (if (if (= depth 0) true (not (= (if (= (top-of stack) 126) 125 (top-of stack)) c)))
+               (throw (ex-info "EDN collection delimiters do not match" {:phase :decode :index i}))
+               (if (if (= (top-of stack) 125) (odd-map-close? c counts) false)
+                 (throw (ex-info "EDN map has an odd number of forms" {:phase :decode :count (top-of counts)}))
+                 (if (= depth 1)
+                   (recur (+ i w) (pop-stack stack) (pop-stack counts) 0 false false false -1 (vector-conj (vector-conj spans start) (+ i w)) toks -1)
+                   (recur (+ i w) (pop-stack stack) (bump (pop-stack counts)) 0 false false false start spans toks -1))))
+
+             (separator-code? c) (recur (+ i w) stack counts 0 false false false start spans toks -1)
+
+             :else
+             (let [nl (+ tlen 1)]
+               (if (> nl 4096)
+                 (throw (ex-info "EDN token exceeds limit" {:phase :decode :limit 4096}))
+                 (recur (+ i w) stack counts nl false false false
+                        (if (if (= depth 0) (= start -1) false) i start) spans toks (if (= tlen 0) i tstart))))))))))
+
+#?(:kotoba
+   (defn- ch-at [s :string i :i64] :i64
+     (if (if (>= i 0) (< i (string-byte-length s)) false) (string-code-point-at s i) -1)))
+
+#?(:kotoba
+   (defn- dvec [v :vector-i64] :document
+     (loop [i 0 d (document-vector)]
+       (if (>= i (vector-count v)) d (recur (+ i 1) (document-vector-conj d (document-i64 (vector-at v i))))))))
+
+#?(:kotoba
+   (defn- delem [d :document i :i64] :document
+     (if (= (document-kind d) :list)
+       (option-or (document-list-at d i) (document-null))
+       (option-or (document-vector-at d i) (document-null)))))
+
+#?(:kotoba
+   (defn- dnum [d :document i :i64] :i64
+     (option-or (document-i64-value (delem d i)) 0)))
+
+#?(:kotoba
+   (defn- digit-code? [c :i64] :bool (if (>= c 48) (<= c 57) false)))
+
+#?(:kotoba
+   (defn- digits-end [t :string i0 :i64 n :i64] :i64
+     (loop [i i0] (if (if (< i n) (digit-code? (string-code-point-at t i)) false) (recur (+ i 1)) i))))
+
+#?(:kotoba
+   ;; |value| of an integer token that fits an i64 (16 digits always do)
+   (defn- parsed-abs [t :string] :i64
+     (let [v (result-value-of [:result :i64 :keyword] (string-parse-i64 t) 0)]
+       (if (< v 0) (- 0 v) v))))
+
+#?(:kotoba
+   ;; how a bare token reads: 0 ordinary, 1 refused number, 2 malformed number,
+   ;; 3 empty keyword, 4 auto-resolved keyword, 5 character literal
+   (defn- token-verdict [t :string] :i64
+     (let [n (string-byte-length t)
+           c0 (string-code-point-at t 0)]
+       (cond
+         (= c0 92) 5
+         (= c0 58) (if (= n 1) 3 (if (= (string-code-point-at t 1) 58) 4 0))
+         (if (digit-code? c0) true (if (if (= c0 43) true (= c0 45)) (if (> n 1) (digit-code? (string-code-point-at t 1)) false) false))
+         (let [s (if (digit-code? c0) 0 1)
+               d1 (digits-end t s n)
+               last (string-code-point-at t (- n 1))]
+           (cond
+             (if (= d1 n) true false)
+             (if (> (- n s) 16) 1 (if (> (parsed-abs t) 9007199254740991) 1 0))
+             (if (= d1 s) true false) 2
+             (if (= d1 (- n 1)) (if (= last 78) true (= last 77)) false) 1
+             (= (string-code-point-at t d1) 47) 1
+             (float-shape? t d1 n) 0
+             (= last 77) 1
+             :else 2))
+         :else 0))))
+
+#?(:kotoba
+   ;; the rest of a float after its integer part, from offset d1: (.digits*)?([eE][+-]?digits+)?
+   (defn- float-shape? [t :string d1 :i64 n :i64] :bool
+     (let [c (string-code-point-at t d1)
+           i1 (if (= c 46) (digits-end t (+ d1 1) n) d1)
+           e (if (< i1 n) (string-code-point-at t i1) -1)]
+       (if (= i1 n)
+         (if (= c 46) true false)
+         (if (if (= e 101) true (= e 69))
+           (let [j (if (< (+ i1 1) n) (if (if (= (string-code-point-at t (+ i1 1)) 43) true (= (string-code-point-at t (+ i1 1)) 45)) (+ i1 2) (+ i1 1)) (+ i1 1))]
+             (if (< j n) (= (digits-end t j n) n) false))
+           false)))))
+
+#?(:kotoba
+   (defn- check-token [text :string a :i64 b :i64] :i64
+     (let [t (string-substring text a b)
+           v (token-verdict t)]
+       (cond
+         (= v 1) (throw (ex-info (string-concat "EDN number would not mean the same on every host: " t) {:phase :decode :token t}))
+         (= v 2) (throw (ex-info "EDN number is malformed" {:phase :decode :token t}))
+         (= v 3) (throw (ex-info "EDN keyword is empty" {:phase :decode}))
+         (= v 4) (throw (ex-info "EDN auto-resolved keywords are forbidden" {:phase :decode :token t}))
+         (= v 5) (throw (ex-info "EDN character literals are not read on this route" {:phase :decode :token t}))
+         :else 0))))
+
+#?(:kotoba
+   (defn- check-tokens [text :string toks :document k :i64] :i64
+     (if (>= (* 2 k) (document-count toks))
+       0
+       (let [ok (check-token text (dnum toks (* 2 k)) (dnum toks (+ 1 (* 2 k))))]
+         (check-tokens text toks (+ k 1))))))
+
+#?(:kotoba
+   (defn- string-too-long? [d :document] :bool
+     (if (= (document-kind d) :string)
+       (> (string-byte-length (option-or (document-string-value d) "")) 1048576)
+       false)))
+
+#?(:kotoba
+   ;; node count after walking `x`, or -1 past the depth bound, -2 past the node
+   ;; bound, -3 for a string past its bound (nothing here aborts; `validated` does)
+   (defn- walk [x :document depth :i64 nodes :i64] :i64
+     (if (> depth 128)
+       -1
+       (if (> (+ nodes 1) 200000)
+         -2
+         (if (string-too-long? x)
+           -3
+           (let [kind (document-kind x)]
+             (cond
+               (= kind :map) (walk-entries x 0 (+ depth 1) (+ nodes 1))
+               (= kind :vector) (walk-elems x 0 (+ depth 1) (+ nodes 1))
+               (= kind :list) (walk-elems x 0 (+ depth 1) (+ nodes 1))
+               ;; a set's elements cannot be indexed: it counts as its size
+               (= kind :set) (+ nodes (+ 1 (document-count x)))
+               :else (+ nodes 1))))))))
+
+#?(:kotoba
+   (defn- walk-elems [x :document i :i64 depth :i64 nodes :i64] :i64
+     (if (>= i (document-count x))
+       nodes
+       (let [n2 (walk (delem x i) depth nodes)]
+         (if (< n2 0) n2 (walk-elems x (+ i 1) depth n2))))))
+
+#?(:kotoba
+   (defn- walk-entries [x :document i :i64 depth :i64 nodes :i64] :i64
+     (if (>= i (document-count x))
+       nodes
+       (let [e (option-or (document-map-entry-at x i) (document-null))
+             n1 (walk (delem e 0) depth nodes)
+             n2 (if (< n1 0) n1 (walk (delem e 1) depth n1))]
+         (if (< n2 0) n2 (walk-entries x (+ i 1) depth n2))))))
+
+#?(:kotoba
+   (defn- validated [v :document] :document
+     (let [n (walk v 0 0)]
+       (cond
+         (= n -1) (throw (ex-info "EDN value nesting exceeds limit" {:phase :decode :limit 128}))
+         (= n -2) (throw (ex-info "EDN value contains too many nodes" {:phase :decode :limit 200000}))
+         (= n -3) (throw (ex-info "EDN string exceeds limit" {:phase :decode :limit 1048576}))
+         :else v))))
+
+#?(:kotoba
+   (defn- read-span [text :string a :i64 b :i64] :document
+     (validated (document-edn-read (string-substring text a b)))))
+
+#?(:kotoba
+   (defn- scan [text :string] :document
+     (if (> (string-byte-length text) 8388608)
+       (throw (ex-info "EDN input exceeds byte limit" {:phase :decode :limit 8388608}))
+       (let [r (scan-loop text (string-byte-length text))
+             toks (delem r 1)
+             ok (check-tokens text toks 0)]
+         (delem r 0)))))
+
+#?(:kotoba
+   (defn- read-document-value [text :string] :document
+     (let [spans (scan text)
+           k (quot (document-count spans) 2)]
+       (cond
+         (= k 0) (throw (ex-info "EDN input is empty" {:phase :decode}))
+         (> k 1) (throw (ex-info "EDN input contains trailing forms" {:phase :decode}))
+         :else (read-span text (dnum spans 0) (dnum spans 1))))))
+
+#?(:kotoba
+   (defn- read-spans [text :string spans :document k :i64 n :i64 out :document] :document
+     (if (>= k n)
+       out
+       (let [v (read-span text (dnum spans (* 2 k)) (dnum spans (+ 1 (* 2 k))))]
+         (read-spans text spans (+ k 1) n (document-vector-conj out v))))))
+
+#?(:kotoba
+   (defn- read-all-value [text :string] :document
+     (let [spans (scan text)]
+       (read-spans text spans 0 (quot (document-count spans) 2) (document-vector)))))
+
+#?(:kotoba
+   (defn escape-controls [text :string] :string
+     (let [n (string-byte-length text)]
+       (loop [i 0 out ""]
+         (if (>= i n)
+           out
+           (let [c (string-code-point-at text i)
+                 w (utf8-width c)]
+             (recur (+ i w)
+                    (string-concat
+                     out
+                     (if (if (if (< c 32) true (= c 127)) (if (= c 9) false (if (= c 10) false (not (= c 13)))) false)
+                       (string-concat "\\u" (string-concat "00" (string-concat (hex-digit (bit-and (i64-shift-right c 4) 15)) (hex-digit (bit-and c 15)))))
+                       (string-substring text i (+ i w)))))))))))
+
+#?(:kotoba
+   (defn- write-string-value [value :document] :string
+     (let [v (validated value)
+           text (escape-controls (document-edn-print v))]
+       (if (> (string-byte-length text) 8388608)
+         (throw (ex-info "EDN output exceeds byte limit" {:phase :decode :limit 8388608}))
+         text))))
+
+#?(:kotoba
+   (defn- hex-digit [n :i64] :string
+     (string-substring "0123456789abcdef" n (+ n 1))))
+
+
+#?(:kotoba
+   (defn read-document [text :string] [:result :document :document]
+     (try (result-ok-of [:result :document :document] (read-document-value text))
+          (catch error (result-err-of [:result :document :document] error)))))
+#?(:kotoba
+   (defn read-all [text :string] [:result :document :document]
+     (try (result-ok-of [:result :document :document] (read-all-value text))
+          (catch error (result-err-of [:result :document :document] error)))))
+#?(:kotoba
+   (defn write-string [value :document] [:result :string :document]
+     (try (result-ok-of [:result :string :document] (write-string-value value))
+          (catch error (result-err-of [:result :string :document] error)))))
+
+;; Keep the current bounded host parser, including later lexer fixes.
+#?(:kotoba nil
+   :default
+   (do
 (def max-edn-bytes (* 8 1024 1024))
 (def max-depth 128)
 (def max-token-chars 4096)
@@ -838,3 +1234,5 @@
      (reject! "EDN :eof has no meaning for read-all; the empty vector is the answer" {}))
    (mapv (fn [[start end]] (read-string opts (subs text start end)))
          (form-spans text (boolean (or (:readers opts) (:default opts)))))))
+
+))

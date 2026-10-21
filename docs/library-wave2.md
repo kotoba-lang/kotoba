@@ -1,5 +1,11 @@
 # Bootstrap, I/O and state library review (JUN-196)
 
+This page records the second-wave review. Its held native branches and
+historical async compiler isolation were subsequently resolved by
+[JUN-203's native compatibility work](library-native-compat.md), except for
+text's independently retained bot work and WIP. The following branch/verification
+paragraphs describe the JUN-196 checkpoint.
+
 The second wave selects eleven standard libraries: `kotoba.text`, `kotoba.test`,
 `kotoba.edn`, `kotoba.io`, `kotoba.fs`, `kotoba.process`, `kotoba.async`,
 `kotoba.scheduler`, `kotoba.store`, `kotoba.fmt`, and `kotoba.log`. Their complete

@@ -36,6 +36,7 @@ Run from repository root:
 
 ```sh
 node scripts/check-libraries.mjs
+node scripts/test-library-provenance.mjs
 node scripts/test-libraries.mjs
 node scripts/test-libraries.mjs --check-design
 
@@ -55,9 +56,11 @@ The driver refuses Java/Clojure/bb subprocesses. The standalone libraries'
 older runner files are retained as import provenance; use the driver above to
 execute all portable suites, including the definition facades. `test-suites.json` registers every imported suite and its host.
 `node scripts/test-library-jvm.mjs` runs the original JVM-only suites, current
-bytes module admission, and the async native oracle in its isolated, original
-test-only compiler graph. This historical async oracle does not qualify async
-against the current CLI compiler. See [wave 2 review](../docs/library-wave2.md).
+bytes module admission, and the async JVM/KIR/JavaScript/Wasm oracle in the
+current launcher compiler graph. Required native CI separately self-builds the
+compiler and executes the bundled library closures with fuel refusal and source
+readback. See [native compatibility](../docs/library-native-compat.md) for the
+qualified APIs and explicit host/native distinctions.
 
 `imports.json` preserves source commit/tree, original-to-local file paths,
 per-file digests, licenses, and executable modes. Imported definition sources
@@ -69,9 +72,9 @@ the imports describe their original standalone repositories. This page and
 the [implementation ADR](../docs/ADR-kotoba-library-monorepo-and-lexicon-events.md)
 describe the current integration.
 
-This is source consolidation and portable compatibility coverage. It is not
-signed release publication, full Kotoba source conversion, native qualification,
-or an implementation of event publish/subscribe. Amu and the other execution
+This is source consolidation, host compatibility coverage and the declared
+native library fixture qualification. Signed release publication, full Kotoba
+source conversion and event publish/subscribe are separate work. Amu and the other execution
 and contract owners stay separate. Existing external pins keep working from
 the old repositories until their consumers migrate.
 
