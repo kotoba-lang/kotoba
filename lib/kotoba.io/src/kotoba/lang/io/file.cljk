@@ -1,0 +1,689 @@
+(ns kotoba.lang.io.file
+  "The portable subset of clojure.java.io: path construction and the two
+  filesystem operations that answer with a value rather than a stream.
+
+    file  as-file  as-relative-path  make-parents  delete-file
+
+  JVM: each var IS clojure.java.io's (delegation, not a re-implementation), so
+  a JVM caller gets the same java.io.File and the same exceptions as before.
+
+  ClojureScript on Node (the kbb engine): a file is its PATH STRING, built by
+  java.io.File's own normalisation (UnixFileSystem.normalize / resolve), so
+  `(str (file ...))` is the same string on both hosts. Measured against JVM
+  clojure.java.io 2026-09-24 (every literal in test/kotoba/lang/io/file_test):
+
+    (file \"a//b/\")      \"a/b\"        (file \"\" \"b\")   \"/b\"
+    (file \"a\" \"\")       \"a\"          (file \"\" \"\")    \"/\"
+    (file \"a\" \"/b\")     throws \"/b is not a relative path\"
+    (file \"a\" nil)      throws        (file nil \"b\")  \"b\"
+    (file \"./a/../b\")   \"./a/../b\"   (no .. resolution, unlike path.join)
+    (make-parents p)    true created / false already there or blocked / nil no parent
+    (delete-file p s)   true deleted (a file or an EMPTY directory) / s when s is
+                        truthy / otherwise throws \"Couldn't delete <p>\"
+
+  The java.io.File METHODS, as functions of a file value (see the section
+  below): exists? file? directory? hidden? absolute? file-name path parent
+  parent-file absolute-path absolute-file canonical-path canonical-file mkdir
+  mkdirs delete create-new-file rename-to length last-modified
+  set-last-modified list-names list-files can-read? can-write? can-execute?,
+  and file-seq. scripts/migrate-java-io-file-interop-to-kotoba-io.cljk
+  (com-junkawasaki/root) rewrites `(.exists f)` to `(io/exists? f)` with them.
+
+  NOT here, on purpose (a caller of these keeps clojure.java.io; see
+  scripts/migrate-clojure-java-io-to-kotoba-io.cljk in com-junkawasaki/root):
+  reader writer input-stream output-stream (streams), resource (the JVM
+  classpath), as-url (java.net.URL), copy (kotoba.io/copy is the IReader/IWriter
+  drain, a different function), and the File methods with no portable answer
+  (toPath toURI toURL deleteOnExit compareTo get*Space set*able setReadOnly)."
+  (:refer-clojure :exclude [file-seq])
+  #?(:clj (:require [clojure.java.io :as jio])))
+
+#?(:cljs (defn- node-fs [] (js/require "fs")))
+
+(declare mkdirs)
+
+;; ---------------------------------------------------------------------------
+;; java.io.UnixFileSystem, transcribed
+;; ---------------------------------------------------------------------------
+
+#?(:cljs
+   (defn- normalize
+     "Collapse runs of `/`, drop a trailing `/` unless the path is `/`."
+     [s]
+     (let [t (.replace s (js/RegExp. "/+" "g") "/")]
+       (if (and (> (count t) 1) (.endsWith t "/")) (subs t 0 (dec (count t))) t))))
+
+#?(:cljs
+   (defn- resolve-child
+     [parent child]
+     (cond
+       (= "" child) parent
+       (.startsWith child "/") (if (= "/" parent) child (str parent child))
+       (= "/" parent) (str parent child)
+       :else (str parent "/" child))))
+
+#?(:cljs
+   (defn- abs? [p] (.startsWith p "/")))
+
+#?(:cljs
+   (defn- parent-of
+     "java.io.File#getParent: nil for `a`, `/` for `/a`, nil for `/`."
+     [p]
+     (let [prefix (if (abs? p) 1 0)
+           i (.lastIndexOf p "/")]
+       (if (< i prefix)
+         (when (and (pos? prefix) (> (count p) prefix)) (subs p 0 prefix))
+         (subs p 0 i)))))
+
+;; ---------------------------------------------------------------------------
+;; the public surface
+;; ---------------------------------------------------------------------------
+
+(defn as-file
+  "clojure.java.io/as-file. JVM: a java.io.File. Node: the normalised path
+  string. nil -> nil."
+  [x]
+  #?(:clj (jio/as-file x)
+     :cljs (cond
+             (nil? x) nil
+             (string? x) (normalize x)
+             :else (throw (ex-info (str "No implementation of method: :as-file of protocol: "
+                                        "#'clojure.java.io/Coercions found for class: " (type x))
+                                   {:kotoba.io/op :as-file :value x})))))
+
+(defn as-relative-path
+  "clojure.java.io/as-relative-path: the path, or throws when it is absolute."
+  [x]
+  #?(:clj (jio/as-relative-path x)
+     :cljs (let [f (as-file x)]
+             (cond
+               (nil? f) (throw (ex-info "as-relative-path of nil" {:kotoba.io/op :as-relative-path}))
+               (abs? f) (throw (ex-info (str f " is not a relative path")
+                                             {:kotoba.io/op :as-relative-path :path f}))
+               :else f))))
+
+(defn file
+  "clojure.java.io/file. JVM: a java.io.File. Node: its path string."
+  ([arg]
+   #?(:clj (jio/file arg)
+      :cljs (as-file arg)))
+  ([parent child]
+   #?(:clj (jio/file parent child)
+      :cljs (let [p (as-file parent)
+                  c (as-relative-path child)]
+              (cond
+                (nil? p) c
+                (= "" p) (resolve-child "/" c)
+                :else (resolve-child p c)))))
+  ([parent child & more]
+   (reduce file (file parent child) more)))
+
+(defn make-parents
+  "clojure.java.io/make-parents: mkdir -p the parent of (apply file f more).
+  true when directories were created, false when they already existed or
+  could not be made, nil when the path has no parent."
+  [f & more]
+  #?(:clj (apply jio/make-parents f more)
+     ;; clojure.java.io: (when-let [parent (.getParentFile f)] (.mkdirs parent))
+     :cljs (when-let [parent (parent-of (apply file f more))]
+             (mkdirs parent))))
+
+(defn delete-file
+  "clojure.java.io/delete-file: delete a file or an EMPTY directory. true on
+  success; otherwise `silently` when it is truthy, else throws
+  \"Couldn't delete <f>\"."
+  [f & [silently]]
+  #?(:clj (jio/delete-file f silently)
+     :cljs (let [p (file f)
+                 fs (node-fs)
+                 deleted? (try (let [st (.lstatSync fs p)]
+                                 (if (.isDirectory st) (.rmdirSync fs p) (.unlinkSync fs p))
+                                 true)
+                               (catch :default _ false))]
+             (or deleted? silently
+                 (throw (ex-info (str "Couldn't delete " f) {:kotoba.io/op :delete-file :path p}))))))
+
+;; ---------------------------------------------------------------------------
+;; java.io.File methods, as functions of a file value
+;;
+;; Each is the java.io.File method of the same answer:
+;;
+;;   exists? file? directory? hidden? absolute?      .exists .isFile .isDirectory .isHidden .isAbsolute
+;;   file-name path parent parent-file               .getName .getPath .getParent .getParentFile
+;;   absolute-path absolute-file                     .getAbsolutePath .getAbsoluteFile
+;;   canonical-path canonical-file                   .getCanonicalPath .getCanonicalFile
+;;   mkdir mkdirs delete create-new-file rename-to   .mkdir .mkdirs .delete .createNewFile .renameTo
+;;   length last-modified set-last-modified          .length .lastModified .setLastModified
+;;   list-names list-files                           .list .listFiles
+;;   can-read? can-write? can-execute?               .canRead .canWrite .canExecute
+;;   file-seq                                        clojure.core/file-seq
+;;
+;; JVM: the method itself, on (as-file f) -- so a java.io.File answers exactly
+;; as before and a path string is accepted too. nil throws, as the method call
+;; on nil did (NullPointerException on the JVM, ex-info on Node).
+;;
+;; Node: f is the path string kotoba.io/file makes (or any path string). The
+;; answer is java.io.UnixFileSystem's, transcribed: the same syscalls where a
+;; syscall answers (stat, lstat, access, mkdir, rmdir/unlink, rename,
+;; open(O_CREAT|O_EXCL), realpath(3) via fs.realpathSync.native, readdir in
+;; directory order via fs.opendirSync -- NOT fs.readdirSync, which sorts), the
+;; same string arithmetic where none does (getName, getParent, resolve against
+;; user.dir = process.cwd(), canonicalize's collapse of . and ..). Measured
+;; against the JVM in test/kotoba/lang/io/file_ops_test.cljk.
+;;
+;; list-names / list-files return a host ARRAY (String[] / File[] on the JVM,
+;; a JS array on Node), nil when the file is not a listable directory, in
+;; directory order on both (java.io.File promises no order).
+;; ---------------------------------------------------------------------------
+
+#?(:cljs
+   (defn- path!
+     "The normalised path of f, or throw as a method call on nil does."
+     [f op]
+     (if (nil? f)
+       (throw (ex-info (str "Cannot invoke \"java.io.File." op "()\" because the file is null")
+                       {:kotoba.io/op (keyword op)}))
+       (as-file f))))
+
+#?(:cljs (defn- stat* [p] (try (.statSync (node-fs) p) (catch :default _ nil))))
+
+#?(:cljs
+   (defn- ok? [thunk] (try (thunk) true (catch :default _ false))))
+
+(defn exists?
+  "java.io.File#exists."
+  [f]
+  #?(:clj (.exists ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "exists")] (and (not= "" p) (some? (stat* p))))))
+
+(defn file?
+  "java.io.File#isFile: a regular file (links followed)."
+  [f]
+  #?(:clj (.isFile ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "isFile")] (boolean (and (not= "" p) (some-> (stat* p) .isFile))))))
+
+(defn directory?
+  "java.io.File#isDirectory (links followed)."
+  [f]
+  #?(:clj (.isDirectory ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "isDirectory")] (boolean (and (not= "" p) (some-> (stat* p) .isDirectory))))))
+
+(defn file-name
+  "java.io.File#getName: the last name of the path, \"\" for \"/\" and \"\"."
+  [f]
+  #?(:clj (.getName ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "getName")
+                 i (.lastIndexOf p "/")
+                 prefix (if (abs? p) 1 0)]
+             (if (< i prefix) (subs p prefix) (subs p (inc i))))))
+
+(defn hidden?
+  "java.io.File#isHidden (Unix: the name starts with a dot; existence is not asked)."
+  [f]
+  #?(:clj (.isHidden ^java.io.File (jio/as-file f))
+     :cljs (.startsWith (file-name (path! f "isHidden")) ".")))
+
+(defn absolute?
+  "java.io.File#isAbsolute."
+  [f]
+  #?(:clj (.isAbsolute ^java.io.File (jio/as-file f))
+     :cljs (.startsWith (path! f "isAbsolute") "/")))
+
+(defn path
+  "java.io.File#getPath: the normalised path string."
+  [f]
+  #?(:clj (.getPath ^java.io.File (jio/as-file f))
+     :cljs (path! f "getPath")))
+
+(defn parent
+  "java.io.File#getParent: the parent path string, or nil."
+  [f]
+  #?(:clj (.getParent ^java.io.File (jio/as-file f))
+     :cljs (parent-of (path! f "getParent"))))
+
+(defn parent-file
+  "java.io.File#getParentFile: the parent as a file, or nil."
+  [f]
+  #?(:clj (.getParentFile ^java.io.File (jio/as-file f))
+     :cljs (parent-of (path! f "getParentFile"))))
+
+#?(:cljs
+   (defn- absolute-of [p]
+     (if (.startsWith p "/") p (resolve-child (normalize (.cwd js/process)) p))))
+
+(defn absolute-path
+  "java.io.File#getAbsolutePath: resolved against user.dir, not normalised further."
+  [f]
+  #?(:clj (.getAbsolutePath ^java.io.File (jio/as-file f))
+     :cljs (absolute-of (path! f "getAbsolutePath"))))
+
+(defn absolute-file
+  "java.io.File#getAbsoluteFile."
+  [f]
+  #?(:clj (.getAbsoluteFile ^java.io.File (jio/as-file f))
+     :cljs (absolute-of (path! f "getAbsoluteFile"))))
+
+#?(:cljs
+   (defn- collapse
+     "canonicalize_md.c collapse(): drop `.` names; drop a `..` together with the
+     nearest preceding kept name; a `..` with nothing before it stays."
+     [p]
+     (let [names (remove #(= "" %) (.split p "/"))
+           kept (reduce (fn [acc nm]
+                          (cond
+                            (= "." nm) acc
+                            (and (= ".." nm) (some some? acc))
+                            (let [j (last (keep-indexed (fn [k v] (when (some? v) k)) acc))]
+                              (conj (assoc acc j nil) nil))
+                            :else (conj acc nm)))
+                        [] names)]
+       (str "/" (.join (clj->js (filter some? kept)) "/")))))
+
+#?(:cljs
+   (defn- realpath [p] (try (.native (.-realpathSync (node-fs)) p) (catch :default _ nil))))
+
+#?(:cljs
+   (defn- canonicalize
+     "JDK_Canonicalize: realpath(3) of the whole path; failing that, of the
+     longest prefix that resolves, with the unresolved rest appended; then
+     collapse."
+     [abs]
+     (if-let [r (realpath abs)]
+       (collapse r)
+       (loop [cut (count abs)]
+         (let [k (.lastIndexOf abs "/" (dec cut))]
+           (if (<= k 0)
+             (collapse abs)
+             (if-let [r (realpath (subs abs 0 k))]
+               (let [tail (subs abs k)]
+                 (collapse (if (and (.endsWith r "/") (.startsWith tail "/")) (str r (subs tail 1)) (str r tail))))
+               (recur k))))))))
+
+(defn canonical-path
+  "java.io.File#getCanonicalPath."
+  [f]
+  #?(:clj (.getCanonicalPath ^java.io.File (jio/as-file f))
+     :cljs (canonicalize (absolute-of (path! f "getCanonicalPath")))))
+
+(defn canonical-file
+  "java.io.File#getCanonicalFile."
+  [f]
+  #?(:clj (.getCanonicalFile ^java.io.File (jio/as-file f))
+     :cljs (canonicalize (absolute-of (path! f "getCanonicalFile")))))
+
+(defn mkdir
+  "java.io.File#mkdir: true when this one directory was made."
+  [f]
+  #?(:clj (.mkdir ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "mkdir")] (and (not= "" p) (ok? #(.mkdirSync (node-fs) p))))))
+
+(defn mkdirs
+  "java.io.File#mkdirs, transcribed: false when it exists; else mkdir; else
+  mkdirs the CANONICAL parent and mkdir the canonical file."
+  [f]
+  #?(:clj (.mkdirs ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "mkdirs")]
+             (cond
+               (exists? p) false
+               (mkdir p) true
+               :else (let [canon (canonical-file p)
+                           par (parent-of canon)]
+                       (boolean (and par (or (mkdirs par) (exists? par)) (mkdir canon))))))))
+
+(defn delete
+  "java.io.File#delete: a file, a link, or an EMPTY directory; true when deleted."
+  [f]
+  #?(:clj (.delete ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "delete") fs (node-fs)]
+             (and (not= "" p)
+                  (ok? #(let [st (.lstatSync fs p)]
+                          (if (.isDirectory st) (.rmdirSync fs p) (.unlinkSync fs p))))))))
+
+(defn create-new-file
+  "java.io.File#createNewFile: true when created, false when it existed; throws
+  otherwise (no such directory, permission)."
+  [f]
+  #?(:clj (.createNewFile ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "createNewFile") fs (node-fs)]
+             (try (.closeSync fs (.openSync fs p "wx" 438)) true
+                  (catch :default e
+                    (if (= "EEXIST" (.-code e))
+                      false
+                      (throw (ex-info (case (.-code e)
+                                        "ENOENT" "No such file or directory"
+                                        "ENOTDIR" "Not a directory"
+                                        "EACCES" "Permission denied"
+                                        "EISDIR" "Is a directory"
+                                        (str "createNewFile failed: " (.-code e)))
+                                      {:kotoba.io/op :create-new-file :path p :code (.-code e)}))))))))
+
+(defn rename-to
+  "java.io.File#renameTo: rename(2); true when renamed."
+  [f dest]
+  #?(:clj (.renameTo ^java.io.File (jio/as-file f) ^java.io.File (jio/as-file dest))
+     :cljs (let [p (path! f "renameTo") d (path! dest "renameTo")]
+             (ok? #(.renameSync (node-fs) p d)))))
+
+(defn length
+  "java.io.File#length: stat size (links followed), 0 when it cannot be read."
+  [f]
+  #?(:clj (.length ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "length")] (if-let [st (when (not= "" p) (stat* p))] (.-size st) 0))))
+
+(defn last-modified
+  "java.io.File#lastModified: stat mtime in whole milliseconds (truncated), 0
+  when it cannot be read."
+  [f]
+  #?(:clj (.lastModified ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "lastModified")
+                 st (when (not= "" p) (try (.statSync (node-fs) p #js {:bigint true}) (catch :default _ nil)))]
+             (if st (js/Number (/ (.-mtimeNs st) (js/BigInt 1000000))) 0))))
+
+(defn set-last-modified
+  "java.io.File#setLastModified: set mtime (ms), keep atime; true when set.
+  A negative time throws, as the JVM does."
+  [f t]
+  #?(:clj (.setLastModified ^java.io.File (jio/as-file f) (long t))
+     :cljs (let [p (path! f "setLastModified")]
+             (when (neg? t) (throw (ex-info "Negative time" {:kotoba.io/op :set-last-modified :time t})))
+             ;; utimes takes double SECONDS: t/1000 lands up to one ulp (~240ns at
+             ;; 1.6e9 s) BELOW t ms, which lastModified truncates to t-1. Half a
+             ;; millisecond keeps the stored mtime inside [t, t+1) ms, so every
+             ;; millisecond reader (lastModified, last-modified) sees t.
+             (if-let [st (when (not= "" p) (stat* p))]
+               (ok? #(.utimesSync (node-fs) p (/ (.-atimeMs st) 1000) (/ (+ (js/Math.trunc t) 0.5) 1000)))
+               false))))
+
+#?(:cljs
+   (defn- dir-names
+     "Names in directory order (opendir/readdir, as the JVM lists), or nil."
+     [p]
+     (try
+       (let [d (.opendirSync (node-fs) p) out #js []]
+         (try
+           (loop []
+             (when-let [e (.readSync d)]
+               (.push out (.-name e))
+               (recur)))
+           (finally (.closeSync d)))
+         out)
+       (catch :default _ nil))))
+
+(defn list-names
+  "java.io.File#list: the names in the directory (a host array), nil when it
+  is not a readable directory."
+  [f]
+  #?(:clj (.list ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "list")] (when (not= "" p) (dir-names p)))))
+
+(defn list-files
+  "java.io.File#listFiles: the children as files (a host array), nil when it
+  is not a readable directory."
+  [f]
+  #?(:clj (.listFiles ^java.io.File (jio/as-file f))
+     :cljs (let [p (path! f "listFiles")]
+             (when-let [names (when (not= "" p) (dir-names p))]
+               (.map names (fn [n] (resolve-child p n)))))))
+
+#?(:cljs
+   (defn- access? [f op mode]
+     (let [p (path! f op) fs (node-fs)]
+       (and (not= "" p) (ok? #(.accessSync fs p (aget (.-constants fs) mode)))))))
+
+(defn can-read?
+  "java.io.File#canRead: access(2) R_OK."
+  [f]
+  #?(:clj (.canRead ^java.io.File (jio/as-file f)) :cljs (access? f "canRead" "R_OK")))
+
+(defn can-write?
+  "java.io.File#canWrite: access(2) W_OK."
+  [f]
+  #?(:clj (.canWrite ^java.io.File (jio/as-file f)) :cljs (access? f "canWrite" "W_OK")))
+
+(defn can-execute?
+  "java.io.File#canExecute: access(2) X_OK."
+  [f]
+  #?(:clj (.canExecute ^java.io.File (jio/as-file f)) :cljs (access? f "canExecute" "X_OK")))
+
+(defn file-seq
+  "clojure.core/file-seq: the file and, depth first, everything under it."
+  [dir]
+  #?(:clj (clojure.core/file-seq (jio/as-file dir))
+     :cljs (tree-seq directory? (fn [d] (seq (list-files d))) (as-file dir))))
+
+;; ---------------------------------------------------------------------------
+;; java.nio.file.Files, ambient: temp files, whole-file bytes, delete-if-exists
+;;
+;;   temp-dir         Files/createTempDirectory  ([prefix] [dir prefix])
+;;   temp-file        Files/createTempFile       ([prefix suffix] [dir prefix suffix])
+;;   read-all-bytes   Files/readAllBytes
+;;   write-bytes      Files/write (Path, byte[], OpenOption...)
+;;   write-string     Files/writeString (Path, CharSequence, UTF_8, OpenOption...)
+;;   delete-if-exists Files/deleteIfExists
+;;
+;; A path argument is a file value (what `file` makes) or a path string; a
+;; returned path is a file value (java.io.File on the JVM, its path string on
+;; Node) -- never a java.nio.file.Path. No FileAttribute: the JDK's default
+;; for temp files (0600) and temp directories (0700) is what both hosts give.
+;; Open options are a collection of keywords, the subset of
+;; StandardOpenOption that means the same on both hosts:
+;;
+;;   :append :create :truncate-existing :write
+;;
+;; none given = the JDK default, CREATE + TRUNCATE_EXISTING + WRITE.
+;;
+;; JVM: each IS the Files method (the same exceptions). Node: the same
+;; syscalls (mkdir 0700, open O_CREAT|O_EXCL 0600, open with the option
+;; flags 0666, lstat + unlink/rmdir), the name TempFileHelper makes (prefix +
+;; an unsigned random long in decimal + suffix, a suffix of nil = ".tmp" for
+;; files), and the JDK's exceptions as ex-info whose message is the JDK
+;; exception's getMessage and whose ex-data :kotoba.io/exception names its
+;; class. read-all-bytes answers a host byte array: byte[] on the JVM, an
+;; Int8Array on Node (what kbb's (.getBytes s) gives -- signed, like byte[]).
+;; Measured against JDK 21 in test/kotoba/lang/io/files_test.cljk.
+;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (defn- nio-path ^java.nio.file.Path [f]
+     (.toPath ^java.io.File (jio/as-file f))))
+
+#?(:clj
+   (def ^:private no-attrs (make-array java.nio.file.attribute.FileAttribute 0)))
+
+#?(:clj
+   (def ^:private open-option
+     {:append java.nio.file.StandardOpenOption/APPEND
+      :create java.nio.file.StandardOpenOption/CREATE
+      :truncate-existing java.nio.file.StandardOpenOption/TRUNCATE_EXISTING
+      :write java.nio.file.StandardOpenOption/WRITE}))
+
+(def ^:private open-option-keys #{:append :create :truncate-existing :write})
+
+(defn- check-options! [opts]
+  (doseq [o opts]
+    (when-not (contains? open-option-keys o)
+      (throw (ex-info (str "Unsupported open option " (pr-str o) " (kotoba.io supports "
+                           ":append :create :truncate-existing :write)")
+                      {:kotoba.io/op :write :option o}))))
+  opts)
+
+#?(:clj
+   (defn- open-options ^"[Ljava.nio.file.OpenOption;" [opts]
+     (into-array java.nio.file.OpenOption (map open-option (check-options! opts)))))
+
+#?(:cljs
+   (def ^:private strerror
+     {"ENOTDIR" "Not a directory" "EISDIR" "Is a directory" "EPERM" "Operation not permitted"
+      "ELOOP" "Too many levels of symbolic links or unable to access attributes of symbolic link"
+      "ENAMETOOLONG" "File name too long" "EROFS" "Read-only file system"
+      "ENOSPC" "No space left on device" "EBUSY" "Resource busy" "EINVAL" "Invalid argument"}))
+
+#?(:cljs
+   (defn- nio-ex
+     "UnixException.translateToIOException, as ex-info: the JDK class in
+     :kotoba.io/exception and its getMessage as the message."
+     [e p op]
+     (let [code (.-code e)
+           [cls msg] (case code
+                       "ENOENT" ["java.nio.file.NoSuchFileException" p]
+                       "EEXIST" ["java.nio.file.FileAlreadyExistsException" p]
+                       "EACCES" ["java.nio.file.AccessDeniedException" p]
+                       ["java.nio.file.FileSystemException"
+                        (str p ": " (or (get strerror code) (.-message e)))])]
+       (ex-info msg {:kotoba.io/op op :kotoba.io/exception cls :path p :code code}))))
+
+#?(:cljs
+   (defn- nio-path!
+     "The path string of a file value, or throw as the JDK does on null."
+     [f op]
+     (if (nil? f)
+       (throw (ex-info "Cannot invoke \"java.io.File.toPath()\" because the file is null"
+                       {:kotoba.io/op op :kotoba.io/exception "java.lang.NullPointerException"}))
+       (as-file f))))
+
+#?(:cljs
+   (defn- temp-name
+     "TempFileHelper.generatePath's name: prefix + an unsigned random long in
+     decimal + suffix, which must be a simple file name after normalisation."
+     [prefix suffix]
+     (let [n (.toString (.readBigUInt64BE (.randomBytes (js/require "crypto") 8)))
+           s (normalize (str (or prefix "") n suffix))]
+       (if (.includes s "/")
+         (throw (ex-info "Invalid prefix or suffix"
+                         {:kotoba.io/op :temp :kotoba.io/exception "java.lang.IllegalArgumentException"
+                          :prefix prefix :suffix suffix}))
+         s))))
+
+#?(:cljs
+   (defn- default-tmp [] (normalize (.tmpdir (js/require "os")))))
+
+#?(:cljs
+   (defn- create-temp!
+     "Retry on a name collision, as TempFileHelper does."
+     [dir prefix suffix make!]
+     (loop []
+       (let [p (resolve-child dir (temp-name prefix suffix))
+             r (try (make! p) p
+                    (catch :default e
+                      (if (= "EEXIST" (.-code e)) ::again (throw (nio-ex e p :temp)))))]
+         (if (= ::again r) (recur) r)))))
+
+(defn temp-dir
+  "Files/createTempDirectory: a new directory (mode 0700) named prefix + a
+  random number, in `dir` or the host's temporary directory
+  (java.io.tmpdir / os.tmpdir()). A nil prefix is \"\". Returns the file value."
+  ([prefix]
+   #?(:clj (.toFile (java.nio.file.Files/createTempDirectory ^String prefix ^"[Ljava.nio.file.attribute.FileAttribute;" no-attrs))
+      :cljs (create-temp! (default-tmp) prefix "" #(.mkdirSync (node-fs) % 448))))
+  ([dir prefix]
+   #?(:clj (.toFile (java.nio.file.Files/createTempDirectory (nio-path dir) ^String prefix ^"[Ljava.nio.file.attribute.FileAttribute;" no-attrs))
+      :cljs (create-temp! (nio-path! dir :temp-dir) prefix "" #(.mkdirSync (node-fs) % 448)))))
+
+#?(:cljs
+   (defn- make-file! [p] (.closeSync (node-fs) (.openSync (node-fs) p "wx" 384))))
+
+(defn temp-file
+  "Files/createTempFile: a new empty file (mode 0600) named prefix + a random
+  number + suffix (nil suffix = \".tmp\"), in `dir` or the host's temporary
+  directory. Returns the file value."
+  ([prefix suffix]
+   #?(:clj (.toFile (java.nio.file.Files/createTempFile ^String prefix ^String suffix ^"[Ljava.nio.file.attribute.FileAttribute;" no-attrs))
+      :cljs (create-temp! (default-tmp) prefix (if (nil? suffix) ".tmp" suffix) make-file!)))
+  ([dir prefix suffix]
+   #?(:clj (.toFile (java.nio.file.Files/createTempFile (nio-path dir) ^String prefix ^String suffix ^"[Ljava.nio.file.attribute.FileAttribute;" no-attrs))
+      :cljs (create-temp! (nio-path! dir :temp-file) prefix (if (nil? suffix) ".tmp" suffix) make-file!))))
+
+(defn read-all-bytes
+  "Files/readAllBytes: the file's bytes as a host byte array (byte[] on the
+  JVM, Int8Array on Node)."
+  [f]
+  #?(:clj (java.nio.file.Files/readAllBytes (nio-path f))
+     :cljs (let [p (nio-path! f :read-all-bytes)
+                 b (try (.readFileSync (node-fs) p)
+                        (catch :default e
+                          (throw (if (= "EISDIR" (.-code e))
+                                   ;; the JDK opens a directory, then read(2) fails
+                                   (ex-info "Is a directory" {:kotoba.io/op :read-all-bytes :kotoba.io/exception "java.io.IOException" :path p})
+                                   (nio-ex e p :read-all-bytes)))))]
+             (js/Int8Array. (.-buffer b) (.-byteOffset b) (.-byteLength b)))))
+
+#?(:cljs
+   (defn- node-write!
+     "Files.newOutputStream's option rules, then open(2) with their flags."
+     [p buf opts op]
+     (let [o (set (check-options! opts))
+           dflt? (empty? o)
+           create? (or dflt? (contains? o :create))
+           trunc? (or dflt? (contains? o :truncate-existing))
+           append? (contains? o :append)]
+       (when (and append? trunc?)
+         (throw (ex-info "APPEND + TRUNCATE_EXISTING not allowed"
+                         {:kotoba.io/op op :kotoba.io/exception "java.lang.IllegalArgumentException"})))
+       (let [fs (node-fs) c (.-constants fs)
+             flags (bit-or (.-O_WRONLY c) (if create? (.-O_CREAT c) 0) (if trunc? (.-O_TRUNC c) 0)
+                           (if append? (.-O_APPEND c) 0))
+             fd (try (.openSync fs p flags 438)
+                     (catch :default e (throw (nio-ex e p op))))]
+         (try
+           (loop [off 0]
+             (when (< off (.-length buf))
+               (recur (+ off (.writeSync fs fd buf off (- (.-length buf) off))))))
+           (finally (.closeSync fs fd)))
+         p))))
+
+#?(:cljs
+   (defn- ->u8 [b]
+     (cond
+       (nil? b) (throw (ex-info "Cannot read the array length because \"bytes\" is null"
+                                {:kotoba.io/op :write-bytes :kotoba.io/exception "java.lang.NullPointerException"}))
+       (js/ArrayBuffer.isView b) (js/Uint8Array. (.-buffer b) (.-byteOffset b) (.-byteLength b))
+       :else (js/Uint8Array.from (clj->js (map #(bit-and % 0xff) b))))))
+
+(defn write-bytes
+  "Files/write (Path, byte[], OpenOption...): write `bytes` (byte[] on the
+  JVM; on Node a typed array or a sequence of byte values) to f. `opts` is a
+  collection of :append :create :truncate-existing :write; none = CREATE +
+  TRUNCATE_EXISTING + WRITE. Returns the file value."
+  ([f bytes] (write-bytes f bytes nil))
+  ([f bytes opts]
+   #?(:clj (.toFile (java.nio.file.Files/write (nio-path f) ^bytes bytes (open-options opts)))
+      :cljs (as-file (node-write! (nio-path! f :write-bytes) (->u8 bytes) opts :write-bytes)))))
+
+(defn write-string
+  "Files/writeString (Path, CharSequence, UTF_8, OpenOption...): `s` encoded
+  as UTF-8; a string that is not well-formed UTF-16 (a lone surrogate) throws,
+  as the JDK encoder does (UnmappableCharacterException, \"Input length = 1\"). Options as write-bytes. Returns the file value."
+  ([f s] (write-string f s nil))
+  ([f s opts]
+   #?(:clj (.toFile (java.nio.file.Files/writeString (nio-path f) ^CharSequence s java.nio.charset.StandardCharsets/UTF_8
+                                                     (open-options opts)))
+      :cljs (let [p (nio-path! f :write-string)]
+              (when (nil? s)
+                (throw (ex-info "Cannot invoke \"java.lang.CharSequence.length()\" because \"csq\" is null"
+                                {:kotoba.io/op :write-string :kotoba.io/exception "java.lang.NullPointerException"})))
+              (when-not (.isWellFormed (str s))
+                (throw (ex-info "Input length = 1" {:kotoba.io/op :write-string
+                                                    :kotoba.io/exception "java.nio.charset.UnmappableCharacterException"})))
+              (as-file (node-write! p (js/Buffer.from (str s) "utf8") opts :write-string))))))
+
+(defn delete-if-exists
+  "Files/deleteIfExists: true when f (a file, a link -- not its target -- or an
+  EMPTY directory) was deleted, false when there was nothing. A non-empty
+  directory throws (DirectoryNotEmptyException; ex-info on Node)."
+  [f]
+  #?(:clj (java.nio.file.Files/deleteIfExists (nio-path f))
+     :cljs (let [p (nio-path! f :delete-if-exists) fs (node-fs)
+                 st (try (.lstatSync fs p)
+                         (catch :default e
+                           (if (= "ENOENT" (.-code e)) nil (throw (nio-ex e p :delete-if-exists)))))]
+             (if (nil? st)
+               false
+               (try (if (.isDirectory st) (.rmdirSync fs p) (.unlinkSync fs p))
+                    true
+                    (catch :default e
+                      (case (.-code e)
+                        "ENOENT" false
+                        ("ENOTEMPTY" "EEXIST")
+                        (throw (ex-info p {:kotoba.io/op :delete-if-exists :path p
+                                           :kotoba.io/exception "java.nio.file.DirectoryNotEmptyException"}))
+                        (throw (nio-ex e p :delete-if-exists)))))))))

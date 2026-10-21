@@ -1,0 +1,180 @@
+(ns kotoba.lang.process-test
+  (:require [kotoba.io :as kio] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.process :as proc]
+            [kotoba.lang.process-host :as host]))
+
+(deftest exec-rejects-bad-argv
+  (let [r (proc/exec ["echo" "a" "b"] #{"nope"})]
+    (is (= 127 (:status r)))
+    (is (str/includes? (:stderr r) "not-allowed"))))
+
+#?(:clj
+   (deftest exec-runs-array-on-jvm
+     ;; argv[0] is a basename resolved on PATH (java.lang.ProcessBuilder), so
+     ;; the exec-array policy (no path separators) still holds.
+     (let [r (proc/exec ["echo" "itonami"] #{"echo"})]
+       (is (= 0 (:status r)))
+       (is (str/includes? (:stdout r) "itonami")))))
+
+#?(:clj
+   (deftest exec-missing-command-fails-closed
+     ;; argv[0] basename (no path separator) that does not exist on PATH →
+     ;; ProcessBuilder.start() throws IOException, which exec turns into a
+     ;; non-zero :status, never a throw.
+     (let [r (proc/exec ["definitely-not-a-real-binary-xyz" "1"])]
+       (is (pos? (:status r)))
+       (is (string? (:stdout r)))
+       (is (string? (:stderr r))))))
+
+(deftest validate-spawn-refuses-path-commands
+  (is (= :process/path-command
+         (proc/validate-spawn ["/bin/echo" "x"] 100 1000 #{"echo"})))
+  (is (= :process/not-allowed
+         (proc/validate-spawn ["rm" "-rf"] 100 1000 #{"echo"})))
+  (is (nil? (proc/validate-spawn ["echo" "hi"] 100 1000 #{"echo"}))))
+
+(deftest echo-process-ok
+  (let [p (proc/echo-process #{"echo"})
+        r (proc/spawn! p {:argv ["echo" "a" "b"] :timeout-ms 1000
+                          :max-stdout-bytes 1000})]
+    (is (= :ok (:tag r)))
+    (is (= 0 (:exit r)))
+    (is (= "a b" (:stdout r)))))
+
+(deftest echo-process-deny
+  (let [p (proc/echo-process #{"echo"})
+        r (proc/spawn! p {:argv ["curl" "http://x"] :timeout-ms 1000
+                          :max-stdout-bytes 1000})]
+    (is (= :error (:tag r)))
+    (is (= :process/not-allowed (:code r)))))
+
+#?(:clj
+   (deftest os-spawn-echo-on-jvm
+     (let [echo (let [c (kio/file "/bin/echo")]
+                  (when (kio/file? c) (kio/absolute-path c)))
+           _ (is (string? echo) "need /bin/echo for this host test")
+           p (host/os-spawn {:binaries {"echo" echo}})
+           r (proc/spawn! p {:argv ["echo" "itonami"]
+                             :timeout-ms 5000
+                             :max-stdout-bytes 4096})]
+       (is (= :ok (:tag r)))
+       (is (= 0 (:exit r)))
+       (is (str/starts-with? (str/trim (:stdout r)) "itonami")))))
+
+#?(:cljs
+   (deftest os-spawn-echo-on-node
+     (let [echo "/bin/echo"
+           p (host/os-spawn {:binaries {"echo" echo}})
+           r (proc/spawn! p {:argv ["echo" "itonami"]
+                             :timeout-ms 5000
+                             :max-stdout-bytes 4096})]
+       (is (= :ok (:tag r)))
+       (is (= 0 (:exit r)))
+       (is (str/starts-with?
+            (str/trim (:stdout r)) "itonami")))))
+
+;; ---------------------------------------------------------------------------
+;; host/sh — portable clojure.java.shell/sh drop-in.
+;;
+;; These deftests are ordinary portable .cljc — `sh` itself dispatches on
+;; #?(:clj ProcessBuilder :cljs child_process.spawnSync) internally, so the
+;; test bodies below run byte-identical on JVM (`kbb -M:test`) and nbb
+;; (`kbb --backend sci --classpath src:test run-tests.cljk`); no #?(:clj ...) / #?(:cljs ...)
+;; split is needed at the test level.
+
+(defn- file-exists? [path]
+  #?(:clj (kio/exists? (kio/file ^String path))
+     :cljs (.existsSync (js/require "fs") path)))
+
+(defn- delete-file! [path]
+  #?(:clj (kio/delete (kio/file ^String path))
+     :cljs (try (.unlinkSync (js/require "fs") path)
+                (catch :default _ nil))))
+
+(defn- tmp-dir []
+  #?(:clj (System/getProperty "java.io.tmpdir")
+     :cljs (.tmpdir (js/require "os"))))
+
+(deftest sh-matches-clojure-java-shell-return-shape
+  ;; :exit/:out/:err — clojure.java.shell/sh's own keys, not os-spawn's
+  ;; :exit/:stdout/:stderr or exec's :status/:stdout/:stderr.
+  (let [r (host/sh "echo" "itonami" {:allowed #{"echo"}})]
+    (is (= 0 (:exit r)))
+    (is (str/includes? (:out r) "itonami"))
+    (is (string? (:err r)))))
+
+(deftest sh-is-synchronous-not-async
+  ;; A blocking call: the map is fully populated the instant sh returns, with
+  ;; no promise/future/channel involved. If sh ever became async under this
+  ;; name, :exit here would not yet be an int at this point.
+  (let [r (host/sh "echo" "sync-check" {:allowed #{"echo"}})]
+    (is (int? (:exit r)))
+    (is (string? (:out r)))))
+
+(deftest sh-honors-in-option
+  ;; `cat` with no argv file operands reads stdin and echoes it to stdout.
+  ;; This only succeeds if :in was actually piped in AND stdin was closed
+  ;; afterward (otherwise cat blocks forever waiting for EOF and this test
+  ;; times out instead of passing).
+  (let [r (host/sh "cat" {:allowed #{"cat"} :in "itonami-stdin-payload\n"})]
+    (is (= 0 (:exit r)))
+    (is (str/includes? (:out r) "itonami-stdin-payload"))))
+
+(deftest sh-honors-dir-option
+  ;; `touch <name>` with :dir set must create the file *inside* :dir, proven
+  ;; by checking the file at the absolute :dir + name path, not relative to
+  ;; whatever the test runner's own cwd happens to be.
+  (let [dir (tmp-dir)
+        fname (str "kotoba-process-sh-dir-" (rand-int 1000000000) ".marker")
+        full (str dir "/" fname)]
+    (delete-file! full)
+    (is (not (file-exists? full)))
+    (let [r (host/sh "touch" fname {:allowed #{"touch"} :dir dir})]
+      (is (= 0 (:exit r))))
+    (is (file-exists? full) ":dir must be honored — file must appear inside it")
+    (delete-file! full)))
+
+(deftest sh-policy-allowed-command-actually-spawns
+  ;; Positive control for the negative test below: same command ("touch"),
+  ;; same sentinel-file technique, but with an :allowed set that DOES
+  ;; include "touch" — the OS spawn primitive must actually run and the
+  ;; sentinel file must actually appear.
+  (let [dir (tmp-dir)
+        fname (str "kotoba-process-sh-allowed-" (rand-int 1000000000) ".marker")
+        full (str dir "/" fname)]
+    (delete-file! full)
+    (let [r (host/sh "touch" fname {:allowed #{"touch"} :dir dir})]
+      (is (= 0 (:exit r)))
+      (is (not (str/includes? (:err r) "rejected"))))
+    (is (file-exists? full) "an allowed command must actually run")
+    (delete-file! full)))
+
+(deftest sh-policy-rejected-command-never-actually-spawns
+  ;; Negative control: same command ("touch"), same sentinel-file technique,
+  ;; but :allowed does NOT include "touch". validate-spawn must reject the
+  ;; argv, and — the actual thing under test — the sentinel file must NEVER
+  ;; appear. This does not just check the return value looks like a
+  ;; rejection: it proves the OS spawn primitive (ProcessBuilder /
+  ;; spawnSync) was never invoked for this argv, by observing that its
+  ;; real-world side effect (the file) never happened.
+  (let [dir (tmp-dir)
+        fname (str "kotoba-process-sh-rejected-" (rand-int 1000000000) ".marker")
+        full (str dir "/" fname)]
+    (delete-file! full)
+    (is (not (file-exists? full)))
+    (let [r (host/sh "touch" fname {:allowed #{"echo"} :dir dir})]
+      (is (= -1 (:exit r)))
+      (is (str/includes? (:err r) "not-allowed")))
+    (is (not (file-exists? full))
+        "policy-rejected command must never actually spawn — file must never appear")
+    ;; belt-and-braces: also true with no :allowed set at all but argv[0]
+    ;; carrying a path separator (validate-spawn's structural rejection,
+    ;; independent of any allowlist).
+    (let [fname2 (str "kotoba-process-sh-rejected-path-" (rand-int 1000000000) ".marker")
+          full2 (str dir "/" fname2)
+          r2 (host/sh (str dir "/touch") fname2 {:dir dir})]
+      (is (= -1 (:exit r2)))
+      (is (str/includes? (:err r2) "path-command"))
+      (is (not (file-exists? full2))))
+    (delete-file! full)))

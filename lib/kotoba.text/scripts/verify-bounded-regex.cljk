@@ -1,0 +1,148 @@
+#!/usr/bin/env kbb
+;; Runs the COMPILED bounded-regex kernel and compares it against an
+;; INDEPENDENT oracle: the host's own RegExp. Not a mirror implementation --
+;; a mirror written by the same hand would agree with the kernel's mistakes,
+;; so a disagreement here is real.
+;;
+;;   node <amu>/bin/amu compile src/kotoba/lang/bounded_regex.kotoba \
+;;     --target web --policy scripts/bounded-regex-policy.edn --output /tmp/re.mjs
+;;   nbb scripts/verify-bounded-regex.cljk /tmp/re.mjs
+;;
+;; Exit 0 clean, 1 findings, 2 REFUSED (it could not answer -- distinct from
+;; both, so "could not run" never reads as "ran and was fine").
+;;
+;; The fuel budget matters: the emitted web artifact bakes 512 when the policy
+;; does not declare one, and the self-check needs far more than that.
+
+(require '["fs" :as fs]
+         '[kotoba.lang.text :as str])
+
+(def artifact (first *command-line-args*))
+
+(defn refuse! [msg]
+  (println (str "REFUSED: " msg))
+  (set! (.-exitCode js/process) 2))
+
+;; --- the corpus ------------------------------------------------------------
+;; Patterns inside the subset, and inputs chosen to exercise both answers of
+;; every one of them. A pattern that only ever answers one way proves nothing.
+
+(def patterns
+  ["abc" "a.c" "ab*c" "ab+c" "ab?c" "^abc" "abc$" "^abc$" "[a-c]x" "[^a-c]x"
+   "[abc]+" "[0-9]+" "\\d+" "\\d" "\\w+" "\\." "a\\.c" "x|y" "cat|dog"
+   "^a.*z$" "a*" ".*" "[a-z]*[0-9]+" "\\w+\\d" "[^ ]+" "h.llo" "[-a]" "[a-]"
+   "^$" "a?b?" ".." "." "[A-Za-z_][A-Za-z0-9_]*" "é+" "[éa]+" "^\\d+$"])
+
+(def texts
+  ["" "a" "abc" "ac" "abbbc" "xabcd" "xxabc" "xxabcx" "zbx" "zdx" "a]b"
+   "hotdog" "hotbird" "ab123" "abc123z" "a1b22c333" "..a_1.." "hello world"
+   "h llo" "café" "caféé!" "A_b9" "line1\nline2" "aaa" "ababab" "-a-" "a-"])
+
+;; Patterns OUTSIDE the subset. Each must be REFUSED, not answered.
+(def refusals
+  ["(ab)+" "a{2,3}" "[abc" "*a" "a$b" "x^y" "a\\" "(?:ab)" "a)" "}b"])
+
+(defn byte-len [^string s] (.byteLength (.-Buffer js/globalThis) s "utf8"))
+
+(defn alt-prefix?
+  "Leftmost-LONGEST and the host's leftmost-FIRST agree except where one
+   alternative is a prefix of another. Those cases are excluded from the
+   automatic comparison and asserted separately below."
+  [p]
+  (let [arms (str/split p #"\|")]
+    (boolean (some (fn [a] (some (fn [b] (and (not= a b) (str/starts-with? b a))) arms)) arms))))
+
+(defn ok-value [r what]
+  (if (aget r 0)
+    (js/Number (aget r 1))
+    (throw (ex-info (str "kernel refused " what) {:reason (aget r 1)}))))
+
+(defn run [k]
+  (let [findings (volatile! [])
+        compared (volatile! 0)
+        finding! (fn [& xs] (vswap! findings conj (str/join " " xs)))]
+
+    ;; 1. the kernel's own self-check: failures * 1000 + checks-run
+    (let [v (js/Number ((aget k "main")))]
+      (when-not (= v 47)
+        (finding! "self-check answered" v "- expected 47 (0 failures over 47 checks);"
+                  "a value under 1000 that is not 47 means checks did not run")))
+
+    ;; 2. parity against the host's RegExp
+    (doseq [p patterns]
+      (let [skip-order (alt-prefix? p)
+            re (js/RegExp. p)
+            re-full (js/RegExp. (str "^(?:" p ")$"))
+            re-g (js/RegExp. p "g")
+            empty-ok (.test (js/RegExp. p) "")]
+        (doseq [t texts]
+          (let [contains (ok-value ((aget k "regex-contains") p t) (str p " contains"))
+                full (ok-value ((aget k "regex-match") p t) (str p " match"))
+                found (ok-value ((aget k "regex-find-index") p t) (str p " find"))
+                cnt (ok-value ((aget k "regex-count") p t) (str p " count"))
+                m (.match t re)
+                want-contains (if (.test re t) 1 0)
+                want-full (if (.test re-full t) 1 0)
+                want-found (if m (byte-len (.slice t 0 (.-index m))) -1)
+                want-count (count (js/Array.from (.matchAll t re-g)))]
+            (vswap! compared + 4)
+            (when (not= contains want-contains)
+              (finding! "contains" (pr-str p) (pr-str t) "kernel" contains "host" want-contains))
+            (when (and (not skip-order) (not= full want-full))
+              (finding! "match" (pr-str p) (pr-str t) "kernel" full "host" want-full))
+            (when (and (not skip-order) (not= found want-found))
+              (finding! "find-index" (pr-str p) (pr-str t) "kernel" found "host" want-found))
+            (when (and (not skip-order) (not empty-ok) (not= cnt want-count))
+              (finding! "count" (pr-str p) (pr-str t) "kernel" cnt "host" want-count))))))
+
+    ;; 3. the named divergences, asserted POSITIVELY so they cannot rot into
+    ;;    accidents. `[]]` is deliberately NOT in the corpus above: the host is
+    ;;    the outlier there, so comparing against it would report the kernel.
+    (vswap! compared + 3)
+    (when-not (= 1 (ok-value ((aget k "regex-contains") "[]]" "a]b") "[]] divergence"))
+      (finding! "the []] divergence is gone: a leading ] in a bracket"
+                "expression must be a LITERAL (POSIX; grep and Python agree)"))
+    (when-not (= 2 (ok-value ((aget k "regex-match-end") "a|ab" "abc" (js/BigInt 0)) "leftmost-longest"))
+      (finding! "alternation is no longer leftmost-longest: a|ab against"
+                "\"abc\" must end at byte 2"))
+    (when-not (= 0 (ok-value ((aget k "regex-contains") "\\d" "１２３") "ascii \\d"))
+      (finding! "\\d matched a non-ASCII digit; this kernel's classes are"
+                "ASCII and say so"))
+
+    ;; 4. every out-of-subset pattern must REFUSE, and a refusal must be
+    ;;    distinguishable from a zero answer.
+    (doseq [p refusals]
+      (vswap! compared inc)
+      (let [r ((aget k "regex-contains") p "whatever")]
+        (cond
+          (aget r 0) (finding! "pattern" (pr-str p) "was ANSWERED"
+                               (js/Number (aget r 1)) "- it is outside the subset and must refuse")
+          (not (string? (aget r 1))) (finding! "refusal for" (pr-str p) "carried no reason"))))
+
+    ;; 5. evidence floor: a run that compared nothing is not a clean run.
+    (println (str "COMPARED\t" @compared))
+    (cond
+      (zero? @compared)
+      (do (refuse! "compared nothing") nil)
+
+      (seq @findings)
+      (do (doseq [f @findings] (println (str "FINDING: " f)))
+          (println (str "bounded-regex: " (count @findings) " finding(s) over " @compared " comparisons"))
+          (set! (.-exitCode js/process) 1))
+
+      :else
+      (println (str "bounded-regex: clean over " @compared " comparisons"
+                    " (self-check 47, host-RegExp parity, 3 named divergences, "
+                    (count refusals) " refusals)")))))
+
+(cond
+  (nil? artifact)
+  (refuse! "usage: nbb scripts/verify-bounded-regex.cljk <compiled-web-artifact.mjs>")
+
+  (not (fs/existsSync artifact))
+  (refuse! (str "artifact not found: " artifact))
+
+  :else
+  (-> (js/import (if (str/starts-with? artifact "/") (str "file://" artifact) artifact))
+      (.then (fn [m] (run ((.-instantiateKotoba m)))))
+      (.catch (fn [e] (refuse! (str "could not run the artifact: " (.-message e)))))))

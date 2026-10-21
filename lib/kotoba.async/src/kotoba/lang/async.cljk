@@ -1,0 +1,237 @@
+(ns kotoba.lang.async
+  "Bounded channels as pure state machines. Layer 2 (cap/effect) of the kotoba
+  foundational stdlib.
+
+  The kotoba-WASM premise (no threads, no wall clock) rules out core.async
+  go-blocks and tokio-style runtimes. This lib models a channel as plain EDN
+  state and `put` / `take` as `[new-state result]` transitions a host or durable
+  loop threads through — the 'bounded state-machine channel' the
+  foundational-stdlib ADR specified. It composes with the durable outer loop
+  (lease / tick / budget) in AGENTS.md without inventing a runtime.
+
+  Buffer semantics (matching core.async):
+  - :fixed    — put is not accepted when full (the caller would block); take
+                removes from the front.
+  - :dropping — put is always accepted; when full the NEW value is discarded
+                (buffer unchanged).
+  - :sliding  — put is always accepted; when full the OLDEST value is dropped
+                (front removed) and the new value appended.
+
+  Zero third-party runtime deps; .cljc (JVM / SCI / CLJS / GraalVM / kotoba-WASM).
+
+  AUTHORITY AND LOAD PATH (ADR 0001, amended 2026-08-13 by ADR-2608130900).
+
+  `src/kotoba/lang/async.kotoba` is the semantic authority: it is the sovereign
+  Kotoba program, and it is what the typed-ABI, restricted-JavaScript and
+  typed-Wasm conformance tests execute. This `.cljc` is the *load path*.
+  `kotoba-lang/scheduler` requires this namespace from `src/` (not only from
+  its tests), and no Clojure/ClojureScript/nbb loader can require a `.kotoba`.
+  Between 2026-07-20 and 2026-08-13 this file did not exist; see ADR-2608071000
+  (which found the same class of breakage in `kotoba-lang/dsl-core`) and
+  ADR-2608130900. The two are held in agreement by
+  `test/kotoba/lang/async_parity_test.cljk`.
+
+  TWO DIVERGENCES FROM THE GUEST, BOTH DELIBERATE AND BOTH STATED:
+
+  1. Capacity. The guest restricts capacity to 1..32, because a document
+     container holds at most 32 items — that is the KIR value budget, not a
+     decision about channels. This namespace has no upper bound, because the
+     only consumer, `kotoba-lang/scheduler`, opens its ready queue as
+     `(a/chan :dropping 64)` (`scheduler.cljc:25`). The guest cannot represent
+     that channel at all. Narrowing the `.cljc` to match would not be parity;
+     it would be breaking the consumer to flatter the port. The parity gate
+     therefore asserts agreement for capacities 1..32 and asserts explicitly
+     that the guest refuses 0 and 33+ while this namespace accepts them.
+  2. Failure mechanism. The guest fails closed by trapping (surfacing as
+     `ExceptionInfo` at the execution boundary); this namespace throws
+     `ex-info`. Both refuse an unknown buffer kind or a non-positive capacity.
+
+  Two behaviours below are the guest's, NOT the 2026-07-20 original's, because
+  the guest is the authority and its versions are right:
+
+  - `can-put?` on a closed channel is `false`. The original returned `true`
+    for a closed non-full fixed channel while `put` refused it — the two
+    disagreed with each other, and the guest settled it.
+  - `closed?` returns a boolean rather than whatever was in the map."
+  (:refer-clojure :exclude [chan put take close empty?]))
+
+(def ^:private buffer-kinds #{:fixed :dropping :sliding})
+
+(defn chan
+  "Create a bounded channel. Forms:
+    (chan n)            ; fixed buffer of capacity n
+    (chan :fixed n)     ; explicit
+    (chan :dropping n)  ; drop-new when full
+    (chan :sliding n)   ; drop-oldest when full
+
+  Fails closed on an unknown buffer kind or a capacity below 1, as the guest
+  does. Unlike the guest it accepts capacities above 32; see the ns docstring."
+  ([cap] (chan :fixed cap))
+  ([buf-type cap]
+   (let [bt (if (number? buf-type) :fixed buf-type)
+         cap (if (number? buf-type) buf-type cap)]
+     (when-not (contains? buffer-kinds bt)
+       (throw (ex-info "Unknown channel buffer kind"
+                       {:buf-type buf-type :kinds buffer-kinds})))
+     (when-not (and (number? cap) (pos? cap))
+       (throw (ex-info "Channel capacity must be at least 1" {:cap cap})))
+     {:buf-type bt
+      :cap      (long cap)
+      :buffer   []
+      :closed?  false})))
+
+(defn fixed-chan
+  "A fixed-buffer channel of capacity `cap`; the guest's `fixed-chan`."
+  [cap]
+  (chan :fixed cap))
+
+(defn closed? [ch] (true? (:closed? ch)))
+
+(defn can-put?
+  "True iff a put would be accepted right now. A closed channel never accepts.
+  Fixed buffers refuse when full; dropping/sliding buffers always accept."
+  [ch]
+  (and (not (closed? ch))
+       (if (= (:buf-type ch) :fixed)
+         (< (count (:buffer ch)) (:cap ch))
+         true)))
+
+(defn can-take?
+  "True iff a value is immediately available."
+  [ch]
+  (pos? (count (:buffer ch))))
+
+(defn put
+  "Offer `val` onto `ch`. Returns `[ch' accepted?]`.
+  - fixed: not accepted when full (ch unchanged).
+  - dropping: always accepted; the new value is dropped when full.
+  - sliding: always accepted; the oldest value is dropped when full.
+  Putting onto a closed channel is not accepted."
+  [ch val]
+  (if (closed? ch)
+    [ch false]
+    (let [buf  (:buffer ch)
+          cap  (:cap ch)
+          full (= (count buf) cap)]
+      (case (:buf-type ch)
+        :fixed
+        (if full
+          [ch false]
+          [(assoc ch :buffer (conj buf val)) true])
+
+        :dropping
+        ;; always accepted; discard new value when full
+        [(assoc ch :buffer (if full buf (conj buf val))) true]
+
+        :sliding
+        ;; always accepted; drop oldest when full, then append
+        [(assoc ch :buffer
+                (conj (if full (subvec buf 1) buf) val)) true]))))
+
+(defn take
+  "Remove the front value from `ch`. Returns `[ch' val]`, or `[ch' nil]` when
+  nothing is available (the caller would block). Taking from a closed, empty
+  channel returns nil."
+  [ch]
+  (let [buf (:buffer ch)]
+    (if (pos? (count buf))
+      [(assoc ch :buffer (subvec buf 1)) (first buf)]
+      [ch nil])))
+
+(defn close
+  "Mark `ch` closed. Further puts are refused; remaining buffered values may
+  still be taken."
+  [ch]
+  (assoc ch :closed? true))
+
+(defn drain
+  "Take every immediately-available value from `ch`. Returns `[ch' [vals…]]`."
+  [ch]
+  (let [buf (:buffer ch)]
+    [(assoc ch :buffer []) buf]))
+
+;; ---------------------------------------------------------------------------
+;; Structured concurrency as a bounded, host-driven scope state machine.
+;; ---------------------------------------------------------------------------
+
+(def ^:private terminal-child-states #{:ok :error :cancelled})
+(def ^:private terminal-scope-states #{:completed :failed :cancelled})
+
+(defn scope
+  "Create an open structured-concurrency scope. Children cannot outlive this
+  value: closing waits in :joining until each child is terminal; failure and
+  cancellation cancel every still-running sibling."
+  []
+  {:status :open :next-id 0 :children [] :failure nil})
+
+(defn- all-terminal? [children]
+  (every? #(contains? terminal-child-states (:state %)) children))
+
+(defn scope-spawn
+  "Register a child task document. Returns `[scope' child-id]`. The guest and
+  load path both cap one scope at 32 children."
+  [s task]
+  (when-not (= :open (:status s))
+    (throw (ex-info "scope is not open" {:type :async/scope-closed})))
+  (when (>= (count (:children s)) 32)
+    (throw (ex-info "scope child bound exceeded" {:type :async/scope-full})))
+  (let [id (:next-id s)]
+    [(-> s
+         (update :next-id inc)
+         (update :children conj {:id id :state :running :value task}))
+     id]))
+
+(defn scope-close
+  "Close admission. The scope becomes completed immediately when it has no
+  running children, otherwise :joining until completions arrive."
+  [s]
+  (if (= :open (:status s))
+    (assoc s :status (if (all-terminal? (:children s)) :completed :joining))
+    s))
+
+(defn- child-index [s id]
+  (first (keep-indexed #(when (= id (:id %2)) %1) (:children s))))
+
+(defn- require-running-index [s id]
+  (let [i (child-index s id)]
+    (when (nil? i)
+      (throw (ex-info "unknown scope child" {:type :async/unknown-child :id id})))
+    (when-not (= :running (get-in s [:children i :state]))
+      (throw (ex-info "scope child is already terminal"
+                      {:type :async/child-terminal :id id})))
+    i))
+
+(defn scope-complete [s id value]
+  (let [i (require-running-index s id)
+        updated (assoc-in s [:children i] {:id id :state :ok :value value})]
+    (if (and (= :joining (:status updated)) (all-terminal? (:children updated)))
+      (assoc updated :status :completed)
+      updated)))
+
+(defn- cancel-running [children]
+  (mapv #(if (= :running (:state %)) (assoc % :state :cancelled) %) children))
+
+(defn scope-fail
+  "Fail one child and cancel every running sibling (fail-fast nursery rule)."
+  [s id error]
+  (let [i (require-running-index s id)
+        failed (assoc-in s [:children i] {:id id :state :error :value error})]
+    (assoc failed
+           :children (cancel-running (:children failed))
+           :status :failed
+           :failure error)))
+
+(defn scope-cancel [s reason]
+  (if (contains? terminal-scope-states (:status s))
+    s
+    (assoc s :children (cancel-running (:children s))
+             :status :cancelled :failure reason)))
+
+(defn scope-join-ready?
+  "True only when the scope reached a terminal state. A host/durable loop may
+  poll this without threads or wall-clock authority."
+  [s]
+  (contains? terminal-scope-states (:status s)))
+
+(defn scope-summary [s]
+  (select-keys s [:status :children :failure]))

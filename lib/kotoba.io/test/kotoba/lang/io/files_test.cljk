@@ -1,0 +1,315 @@
+(ns kotoba.lang.io.files-test
+  "java.nio.file.Files parity for temp-dir temp-file read-all-bytes
+  write-bytes write-string delete-if-exists. `golden` below was MEASURED on
+  the JVM (JDK 21, macOS/APFS, 2026-09-24) by `jvm-ops`: raw
+  java.nio.file.Files, not kotoba.io. The same probe then runs through
+  kotoba.io on every host and must give the same map; on the JVM the oracle
+  test also runs, so a JVM run re-proves the literal.
+
+  Paths are relativised: <T> the fixture directory, <TMP> the host's
+  temporary directory. A temp name's random number is replaced by <N> after
+  checking it is an unsigned 64-bit decimal (TempFileHelper's shape), so the
+  prefix/suffix placement is what is compared. Exceptions are
+  [class message]: on the JVM the exception's own, on Node the ex-info's
+  :kotoba.io/exception and message."
+  (:require [clojure.string :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.io :as io]
+            [kotoba.lang.io.file :as f]))
+
+(def ^:private host-fs #?(:cljs (js/require "fs") :clj nil))
+
+;; ---------------------------------------------------------------------------
+;; fixture and observation, host calls only (never the functions under test)
+;; ---------------------------------------------------------------------------
+
+(defn- tmp-root []
+  #?(:clj (let [p (System/getProperty "java.io.tmpdir")]
+            (if (and (> (count p) 1) (.endsWith ^String p "/")) (subs p 0 (dec (count p))) p))
+     :cljs (.tmpdir (js/require "os"))))
+
+(defn- tmp-dir []
+  #?(:clj (str (.toFile (java.nio.file.Files/createTempDirectory "kio-files-" (make-array java.nio.file.attribute.FileAttribute 0))))
+     :cljs (.mkdtempSync host-fs (str (.tmpdir (js/require "os")) "/kio-files-"))))
+
+(defn- mkdir! [p] #?(:clj (.mkdir (java.io.File. ^String p)) :cljs (.mkdirSync host-fs p)))
+(defn- write! [p s] #?(:clj (spit p s) :cljs (.writeFileSync host-fs p s)))
+(defn- symlink! [target link]
+  #?(:clj (java.nio.file.Files/createSymbolicLink (.toPath (java.io.File. ^String link)) (.toPath (java.io.File. ^String target))
+                                                  (make-array java.nio.file.attribute.FileAttribute 0))
+     :cljs (.symlinkSync host-fs target link)))
+(defn- host-bytes [xs]
+  #?(:clj (byte-array (map unchecked-byte xs)) :cljs (js/Int8Array.from (clj->js (map #(- (bit-and (+ % 128) 255) 128) xs)))))
+(defn- host-bytes? [b] #?(:clj (bytes? b) :cljs (instance? js/Int8Array b)))
+(defn- read-host [p]
+  #?(:clj (try (vec (java.nio.file.Files/readAllBytes (.toPath (java.io.File. ^String p)))) (catch Throwable _ :unreadable))
+     :cljs (try (vec (js/Int8Array.from (.readFileSync host-fs p) #(- (bit-and (+ % 128) 255) 128))) (catch :default _ :unreadable))))
+(defn- present? [p]
+  #?(:clj (java.nio.file.Files/exists (.toPath (java.io.File. ^String p)) (make-array java.nio.file.LinkOption 0))
+     :cljs (try (.lstatSync host-fs p) true (catch :default _ false))))
+(defn- mode [p]
+  #?(:clj (java.nio.file.attribute.PosixFilePermissions/toString
+           (java.nio.file.Files/getPosixFilePermissions (.toPath (java.io.File. ^String p)) (make-array java.nio.file.LinkOption 0)))
+     :cljs (let [m (bit-and (.-mode (.statSync host-fs p)) 511)]
+             (apply str (map (fn [bit ch] (if (pos? (bit-and m bit)) ch "-"))
+                             [256 128 64 32 16 8 4 2 1] ["r" "w" "x" "r" "w" "x" "r" "w" "x"])))))
+(defn- dir? [p] #?(:clj (.isDirectory (java.io.File. ^String p)) :cljs (try (.isDirectory (.statSync host-fs p)) (catch :default _ false))))
+(defn- rm-rf! [p] #?(:clj (doseq [x (reverse (file-seq (java.io.File. ^String p)))] (.delete ^java.io.File x))
+                     :cljs (.rmSync host-fs p #js {:recursive true :force true})))
+(defn- up [p] (let [i (.lastIndexOf ^String p "/")] (when (pos? i) (subs p 0 i))))
+(defn- leaf [p] (subs p (inc (.lastIndexOf ^String p "/"))))
+
+(defn- thrown [thunk]
+  (try (thunk) :no-throw
+       (catch #?(:clj Throwable :cljs :default) e
+         #?(:clj [(.getName (class e)) (.getMessage ^Throwable e)]
+            :cljs [(or (:kotoba.io/exception (ex-data e)) "not-ex-info") (ex-message e)]))))
+
+(def ^:private u64-max "18446744073709551615")
+
+(defn- name-shape
+  "prefix + <N> + suffix when `nm` is prefix, an unsigned 64-bit decimal, suffix."
+  [prefix suffix nm]
+  (let [pre (or prefix "")]
+    (if (and (.startsWith ^String nm pre) (.endsWith ^String nm suffix) (>= (count nm) (+ (count pre) (count suffix) 1)))
+      (let [digits (subs nm (count pre) (- (count nm) (count suffix)))]
+        (if (and (re-matches #"[0-9]{1,20}" digits)
+                 (or (< (count digits) 20) (not (pos? (compare digits u64-max)))))
+          (str pre "<N>" suffix)
+          nm))
+      nm)))
+
+;; ---------------------------------------------------------------------------
+;; the probe, over an ops map
+;; ---------------------------------------------------------------------------
+
+(def kio-ops
+  {:temp-dir io/temp-dir :temp-file io/temp-file :read-all-bytes io/read-all-bytes
+   :write-bytes io/write-bytes :write-string io/write-string :delete-if-exists io/delete-if-exists})
+
+#?(:clj
+   (def jvm-ops
+     "The oracle: java.nio.file.Files itself, on Paths."
+     (let [P (fn [x] (.toPath (java.io.File. ^String (str x))))
+           A #(make-array java.nio.file.attribute.FileAttribute 0)
+           O (fn [opts] (into-array java.nio.file.OpenOption
+                                    (map {:append java.nio.file.StandardOpenOption/APPEND
+                                          :create java.nio.file.StandardOpenOption/CREATE
+                                          :truncate-existing java.nio.file.StandardOpenOption/TRUNCATE_EXISTING
+                                          :write java.nio.file.StandardOpenOption/WRITE} opts)))]
+       {:temp-dir (fn ([p] (java.nio.file.Files/createTempDirectory ^String p ^"[Ljava.nio.file.attribute.FileAttribute;" (A)))
+                    ([d p] (java.nio.file.Files/createTempDirectory (P d) ^String p ^"[Ljava.nio.file.attribute.FileAttribute;" (A))))
+        :temp-file (fn ([p s] (java.nio.file.Files/createTempFile ^String p ^String s ^"[Ljava.nio.file.attribute.FileAttribute;" (A)))
+                     ([d p s] (java.nio.file.Files/createTempFile (P d) ^String p ^String s ^"[Ljava.nio.file.attribute.FileAttribute;" (A))))
+        :read-all-bytes (fn [x] (java.nio.file.Files/readAllBytes (P x)))
+        :write-bytes (fn ([x b] (java.nio.file.Files/write (P x) ^bytes b ^"[Ljava.nio.file.OpenOption;" (O nil)))
+                       ([x b opts] (java.nio.file.Files/write (P x) ^bytes b ^"[Ljava.nio.file.OpenOption;" (O opts))))
+        :write-string (fn ([x s] (java.nio.file.Files/writeString (P x) ^CharSequence s java.nio.charset.StandardCharsets/UTF_8 ^"[Ljava.nio.file.OpenOption;" (O nil)))
+                        ([x s opts] (java.nio.file.Files/writeString (P x) ^CharSequence s java.nio.charset.StandardCharsets/UTF_8 ^"[Ljava.nio.file.OpenOption;" (O opts))))
+        :delete-if-exists (fn [x] (java.nio.file.Files/deleteIfExists (P x)))})))
+
+(defn probe
+  "Every answer the ops give on a fresh fixture, as plain data."
+  [ops]
+  (let [t (tmp-dir)
+        tmp (tmp-root)
+        at #(str t "/" %)
+        R (fn [s] (when (some? s)
+                    (let [s (str s)]
+                      (cond (.startsWith ^String s (str t "/")) (str "<T>/" (subs s (inc (count t))))
+                            (= s t) "<T>"
+                            (= s tmp) "<TMP>"
+                            (.startsWith ^String s (str tmp "/")) (str "<TMP>/" (subs s (inc (count tmp))))
+                            :else s))))
+        op (fn [k & args] (apply (get ops k) args))
+        made (atom [])
+        temp (fn [k prefix suffix & args]
+               (let [r (apply op k args) s (str r)]
+                 (swap! made conj s)
+                 {:parent (R (up s)) :name (name-shape prefix suffix (leaf s))
+                  :dir? (dir? s) :mode (mode s) :bytes (when-not (dir? s) (read-host s))}))
+        T (fn [thunk] (let [r (thrown thunk)] (if (vector? r) [(first r) (str/replace (R (second r)) #"[0-9]{6,20}" "<N>")] r)))
+        W (fn [k p & args] (let [r (apply op k p args)] {:returned (R r) :now (read-host p)}))]
+    (mkdir! (at "d"))
+    (write! (at "d/f.txt") "hello")
+    (mkdir! (at "d/sub"))
+    (write! (at "d/sub/g") "0123456789")
+    (mkdir! (at "e"))
+    (symlink! "d" (at "link"))
+    (symlink! "d/f.txt" (at "flink"))
+    (symlink! "nowhere" (at "dangling"))
+    (write! (at "long") "abcdefghij")
+    (let [cases
+          [[:temp-dir-default (temp :temp-dir "kio-probe-" "" "kio-probe-")]
+           [:temp-dir-in (temp :temp-dir "p" "" (at "d") "p")]
+           [:temp-dir-nil-prefix (temp :temp-dir nil "" (at "e") nil)]
+           [:temp-dir-empty-prefix (temp :temp-dir "" "" (at "e") "")]
+           [:temp-dir-slash-prefix (T #(op :temp-dir (at "d") "a/b"))]
+           [:temp-dir-trailing-slash-prefix (T #(op :temp-dir (at "d") "a/"))]
+           [:temp-dir-missing-dir (T #(op :temp-dir (at "nope") "p"))]
+           [:temp-dir-under-file (T #(op :temp-dir (at "d/f.txt") "p"))]
+           [:temp-dir-through-link (temp :temp-dir "q" "" (at "link") "q")]
+           [:temp-file-default (temp :temp-file "kio-probe-" ".bin" "kio-probe-" ".bin")]
+           [:temp-file-default-nil-suffix (temp :temp-file "kio-probe-" ".tmp" "kio-probe-" nil)]
+           [:temp-file-nil-suffix (temp :temp-file "a" ".tmp" (at "e") "a" nil)]
+           [:temp-file-empty-suffix (temp :temp-file "a" "" (at "e") "a" "")]
+           [:temp-file-nil-both (temp :temp-file nil ".tmp" (at "e") nil nil)]
+           [:temp-file-dotted (temp :temp-file "x.y-" ".tar.gz" (at "e") "x.y-" ".tar.gz")]
+           [:temp-file-slash-suffix (T #(op :temp-file (at "d") "p" "/s"))]
+           [:temp-file-trailing-slash-suffix (let [r (thrown #(op :temp-file (at "d") "p" "/"))]
+                                               (if (vector? r) [(first r) (R (second r))]
+                                                   (let [s (str (op :temp-file (at "e") "p" "/"))] (swap! made conj s) (name-shape "p" "" (leaf s)))))]
+           [:temp-file-missing-dir (T #(op :temp-file (at "nope") "p" ".s"))]
+           [:temp-file-default-parent-is-tmp (let [s (str (op :temp-file "kio-probe-" nil))] (swap! made conj s) (= tmp (up s)))]
+           [:temp-dir-default-parent-is-tmp (let [s (str (op :temp-dir "kio-probe-"))] (swap! made conj s) (= tmp (up s)))]
+           [:read-file (let [b (op :read-all-bytes (at "d/f.txt"))] {:host-bytes? (host-bytes? b) :bytes (vec b)})]
+           [:read-all-256 (do (op :write-bytes (at "all") (host-bytes (range 256)))
+                              (let [b (op :read-all-bytes (at "all"))] {:host-bytes? (host-bytes? b) :n (count b) :at-0-127-128-255 (mapv #(nth b %) [0 127 128 255])
+                               :all-as-host-bytes? (= (vec b) (vec (host-bytes (range 256))))}))]
+           [:read-empty (vec (op :read-all-bytes (str (op :temp-file (at "e") "z" nil))))]
+           [:read-through-link (vec (op :read-all-bytes (at "flink")))]
+           [:read-dir (T #(op :read-all-bytes (at "d")))]
+           [:read-missing (T #(op :read-all-bytes (at "nope")))]
+           [:read-dangling (T #(op :read-all-bytes (at "dangling")))]
+           [:read-under-file (T #(op :read-all-bytes (at "d/f.txt/x")))]
+           [:write-new (W :write-bytes (at "w1") (host-bytes [1 2 3]))]
+           [:write-new-mode (mode (at "w1"))]
+           [:write-truncates (W :write-bytes (at "long") (host-bytes [65 66]))]
+           [:write-append (W :write-bytes (at "long") (host-bytes [67]) [:append])]
+           [:write-append-missing (T #(op :write-bytes (at "w-missing") (host-bytes [1]) [:append]))]
+           [:write-create-append-missing (W :write-bytes (at "w2") (host-bytes [9]) [:create :append])]
+           [:write-create-only-keeps-tail (do (write! (at "w3") "abcdef")
+                                              (W :write-bytes (at "w3") (host-bytes [88 89]) [:create]))]
+           [:write-truncate-only (W :write-bytes (at "w3") (host-bytes [90]) [:truncate-existing])]
+           [:write-truncate-only-missing (T #(op :write-bytes (at "w4") (host-bytes [1]) [:truncate-existing]))]
+           [:write-write-only-missing (T #(op :write-bytes (at "w4") (host-bytes [1]) [:write]))]
+           [:write-append-truncate (T #(op :write-bytes (at "long") (host-bytes [1]) [:append :truncate-existing]))]
+           [:write-into-dir (T #(op :write-bytes (at "d") (host-bytes [1])))]
+           [:write-missing-parent (T #(op :write-bytes (at "nope/x") (host-bytes [1])))]
+           [:write-empty (W :write-bytes (at "w5") (host-bytes []))]
+           [:write-through-link (do (W :write-bytes (at "flink") (host-bytes [104 105])) (read-host (at "d/f.txt")))]
+           [:write-string-utf8 (W :write-string (at "s1") "héllo ✓ 😀")]
+           [:write-string-append (W :write-string (at "s1") "!" [:append])]
+           [:write-string-empty (W :write-string (at "s2") "")]
+           [:write-string-lone-surrogate (T #(op :write-string (at "s3") "a\ud800b"))]
+           [:write-string-lone-surrogate-left (present? (at "s3"))]
+           [:delete-file (op :delete-if-exists (at "w1"))]
+           [:delete-file-again (op :delete-if-exists (at "w1"))]
+           [:delete-missing (op :delete-if-exists (at "e2-missing"))]
+           [:delete-nonempty-dir (T #(op :delete-if-exists (at "d/sub")))]
+           [:delete-nonempty-dir-kept (dir? (at "d/sub"))]
+           [:delete-link (op :delete-if-exists (at "link"))]
+           [:delete-link-target-kept (dir? (at "d"))]
+           [:delete-dangling (op :delete-if-exists (at "dangling"))]
+           [:delete-missing-parent (op :delete-if-exists (at "nope/x"))]
+           [:delete-under-file (T #(op :delete-if-exists (at "d/f.txt/x")))]
+           [:delete-emptied-dir (do (rm-rf! (at "e")) (mkdir! (at "e")) (op :delete-if-exists (at "e")))]]]
+      (doseq [s @made] (rm-rf! s))
+      (rm-rf! t)
+      (into (sorted-map) cases))))
+
+(def golden
+  ;; MEASURED on the JVM by (probe jvm-ops); see the ns docstring.
+  {:delete-dangling true,
+   :delete-emptied-dir true,
+   :delete-file true,
+   :delete-file-again false,
+   :delete-link true,
+   :delete-link-target-kept true,
+   :delete-missing false,
+   :delete-missing-parent false,
+   :delete-nonempty-dir ["java.nio.file.DirectoryNotEmptyException" "<T>/d/sub"],
+   :delete-nonempty-dir-kept true,
+   :delete-under-file ["java.nio.file.FileSystemException" "<T>/d/f.txt/x: Not a directory"],
+   :read-all-256 {:host-bytes? true, :n 256, :at-0-127-128-255 [0 127 -128 -1], :all-as-host-bytes? true},
+   :read-dangling ["java.nio.file.NoSuchFileException" "<T>/dangling"],
+   :read-dir ["java.io.IOException" "Is a directory"],
+   :read-empty [],
+   :read-file {:host-bytes? true, :bytes [104 101 108 108 111]},
+   :read-missing ["java.nio.file.NoSuchFileException" "<T>/nope"],
+   :read-through-link [104 101 108 108 111],
+   :read-under-file ["java.nio.file.FileSystemException" "<T>/d/f.txt/x: Not a directory"],
+   :temp-dir-default {:parent "<TMP>", :name "kio-probe-<N>", :dir? true, :mode "rwx------", :bytes nil},
+   :temp-dir-default-parent-is-tmp true,
+   :temp-dir-empty-prefix {:parent "<T>/e", :name "<N>", :dir? true, :mode "rwx------", :bytes nil},
+   :temp-dir-in {:parent "<T>/d", :name "p<N>", :dir? true, :mode "rwx------", :bytes nil},
+   :temp-dir-missing-dir ["java.nio.file.NoSuchFileException" "<T>/nope/p<N>"],
+   :temp-dir-nil-prefix {:parent "<T>/e", :name "<N>", :dir? true, :mode "rwx------", :bytes nil},
+   :temp-dir-slash-prefix ["java.lang.IllegalArgumentException" "Invalid prefix or suffix"],
+   :temp-dir-through-link {:parent "<T>/link", :name "q<N>", :dir? true, :mode "rwx------", :bytes nil},
+   :temp-dir-trailing-slash-prefix ["java.lang.IllegalArgumentException" "Invalid prefix or suffix"],
+   :temp-dir-under-file ["java.nio.file.FileSystemException" "<T>/d/f.txt/p<N>: Not a directory"],
+   :temp-file-default {:parent "<TMP>", :name "kio-probe-<N>.bin", :dir? false, :mode "rw-------", :bytes []},
+   :temp-file-default-parent-is-tmp true,
+   :temp-file-default-nil-suffix {:parent "<TMP>", :name "kio-probe-<N>.tmp", :dir? false, :mode "rw-------", :bytes []},
+   :temp-file-dotted {:parent "<T>/e", :name "x.y-<N>.tar.gz", :dir? false, :mode "rw-------", :bytes []},
+   :temp-file-empty-suffix {:parent "<T>/e", :name "a<N>", :dir? false, :mode "rw-------", :bytes []},
+   :temp-file-missing-dir ["java.nio.file.NoSuchFileException" "<T>/nope/p<N>.s"],
+   :temp-file-nil-both {:parent "<T>/e", :name "<N>.tmp", :dir? false, :mode "rw-------", :bytes []},
+   :temp-file-nil-suffix {:parent "<T>/e", :name "a<N>.tmp", :dir? false, :mode "rw-------", :bytes []},
+   :temp-file-slash-suffix ["java.lang.IllegalArgumentException" "Invalid prefix or suffix"],
+   :temp-file-trailing-slash-suffix "p<N>",
+   :write-append {:returned "<T>/long", :now [65 66 67]},
+   :write-append-missing ["java.nio.file.NoSuchFileException" "<T>/w-missing"],
+   :write-append-truncate ["java.lang.IllegalArgumentException" "APPEND + TRUNCATE_EXISTING not allowed"],
+   :write-create-append-missing {:returned "<T>/w2", :now [9]},
+   :write-create-only-keeps-tail {:returned "<T>/w3", :now [88 89 99 100 101 102]},
+   :write-empty {:returned "<T>/w5", :now []},
+   :write-into-dir ["java.nio.file.FileSystemException" "<T>/d: Is a directory"],
+   :write-missing-parent ["java.nio.file.NoSuchFileException" "<T>/nope/x"],
+   :write-new {:returned "<T>/w1", :now [1 2 3]},
+   :write-new-mode "rw-r--r--",
+   :write-string-append
+   {:returned "<T>/s1", :now [104 -61 -87 108 108 111 32 -30 -100 -109 32 -16 -97 -104 -128 33]},
+   :write-string-empty {:returned "<T>/s2", :now []},
+   :write-string-lone-surrogate ["java.nio.charset.UnmappableCharacterException" "Input length = 1"],
+   :write-string-lone-surrogate-left false,
+   :write-string-utf8
+   {:returned "<T>/s1", :now [104 -61 -87 108 108 111 32 -30 -100 -109 32 -16 -97 -104 -128]},
+   :write-through-link [104 105],
+   :write-truncate-only {:returned "<T>/w3", :now [90]},
+   :write-truncate-only-missing ["java.nio.file.NoSuchFileException" "<T>/w4"],
+   :write-truncates {:returned "<T>/long", :now [65 66]},
+   :write-write-only-missing ["java.nio.file.NoSuchFileException" "<T>/w4"]}
+  )
+
+(deftest kotoba-io-answers-as-java-nio-file-files
+  (let [got (probe kio-ops)]
+    (is (map? golden) "the golden literal is measured")
+    (when (map? golden)
+      (doseq [[k v] golden]
+        (testing (pr-str k)
+          (is (= v (get got k)))))
+      (is (= (set (keys golden)) (set (keys got))) "the same cases were probed"))))
+
+#?(:clj
+   (deftest the-golden-literal-is-the-jvm
+     (is (= golden (probe jvm-ops)))))
+
+(deftest the-facade-and-the-namespace-are-one-function
+  (is (= f/temp-dir io/temp-dir))
+  (is (= f/temp-file io/temp-file))
+  (is (= f/read-all-bytes io/read-all-bytes))
+  (is (= f/write-bytes io/write-bytes))
+  (is (= f/write-string io/write-string))
+  (is (= f/delete-if-exists io/delete-if-exists)))
+
+(deftest a-returned-path-is-a-file-value
+  (let [d (io/temp-dir "kio-value-")
+        p (io/temp-file d "v" ".txt")]
+    (try
+      (is (io/directory? d))
+      (is (io/file? p))
+      (is (= (str p) (str (io/write-string p "x"))) "write-string returns the file it wrote")
+      (is (= (str p) (str (io/write-bytes p (io/read-all-bytes p)))))
+      (is (= (str p) (str (io/file d (io/file-name p)))) "the same value io/file makes")
+      (is (true? (io/delete-if-exists p)))
+      (is (true? (io/delete-if-exists d)))
+      (finally (rm-rf! (str d))))))
+
+(deftest unsupported-open-option-is-refused-by-name
+  (let [p (io/temp-file "kio-opt-" nil)]
+    (try
+      (is (re-find #"Unsupported open option :sync"
+                   (second (thrown #(io/write-bytes p (host-bytes [1]) [:sync])))))
+      (finally (rm-rf! (str p))))))

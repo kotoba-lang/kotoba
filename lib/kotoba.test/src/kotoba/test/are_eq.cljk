@@ -1,0 +1,12 @@
+(ns kotoba.test.are-eq
+  "are-eq? -- addressed on its own.
+
+  Split out of kotoba.lang.test on 2026-09-09 (ADR-2609091200). The unit
+  here is the DEFINITION, and this repo's deps.edn names exactly the
+  definitions it reaches -- nothing else.
+"
+  (:require [kotoba.lang.spec :as spec])
+  #?(:clj  (:require [kotoba.lang.spec :as spec])
+     :cljs (:require [kotoba.lang.spec :as spec])))
+
+(defn are-eq? [actual expected] (= actual expected))

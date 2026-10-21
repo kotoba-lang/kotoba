@@ -1,0 +1,213 @@
+(ns kotoba.lang.fs
+  "Filesystem path ops + a host-injected IFilesystem protocol. Layer 3 (I/O) of
+  the kotoba foundational stdlib.
+
+  The path ops are pure (no OS). The effectful ops (read/write/list/exists?/
+  delete) live behind the IFilesystem protocol, which a host implements and
+  injects — a capability-confined kotoba cell only sees a granted handle, never
+  the OS. An in-memory mem-filesystem is provided for tests / OSS standalone.
+
+  Zero third-party runtime deps; .cljc (JVM / SCI / CLJS / GraalVM / kotoba-WASM)."
+  (:refer-clojure :exclude [read write list])
+  #?(:clj  (:require [kotoba.lang.text :as str])
+     :cljs (:require [kotoba.lang.text :as str]))
+  (:require [kotoba.bytes :as kbytes] [kotoba.fs.filesystem :as filesystem-p]
+            [kotoba.fs.async-filesystem :as asyncfilesystem-p]))
+
+(def ^:private sep "/")
+
+;; ---------- pure path ops ----------
+
+(defn absolute? [p] (str/starts-with? p sep))
+(defn relative? [p] (not (absolute? p)))
+
+(defn split
+  "Split a path into its components. A leading '/' is preserved as the first
+  element so roundtrips are exact."
+  [p]
+  (let [parts (str/split p #"/")
+        leading (when (str/starts-with? p "/") "/")]
+    (cond->> (remove str/blank? parts)
+      leading (cons leading))))
+
+(defn join
+  "Join path components with the separator. An absolute first component makes
+  the result absolute."
+  [& parts]
+  (let [comps (->> parts (mapcat split) (remove str/blank?))
+        absolute (and (seq comps) (= "/" (first comps)))
+        body (if absolute (rest comps) comps)]
+    (str (when absolute sep) (str/join sep body))))
+
+(defn basename [p]
+  (let [parts (split p)]
+    (if (and (= 1 (count parts)) (= "/" (first parts)))
+      "" ; root
+      (last parts))))
+
+(defn dirname [p]
+  (let [parts (split p)]
+    (cond
+      (<= (count parts) 1) ""
+      (= 2 (count parts)) (if (= "/" (first parts)) "/" "")
+      :else (if (= "/" (first parts))
+              (str sep (str/join sep (rest (butlast parts))))
+              (str/join sep (butlast parts))))))
+
+(defn ext
+  "Return a path's extension (without the dot), or nil if none. The basename's
+  last dot defines it; leading dots in a basename are not extensions."
+  [p]
+  (let [b (basename p)]
+    (when-let [i (str/last-index-of b ".")]
+      (if (pos? i)
+        (subs b (inc i))
+        nil))))
+
+(defn normalize
+  "Resolve `.` and `..` segments lexically (no filesystem access). Absolute
+  paths stay absolute; leading `..` on a relative path is preserved (it cannot
+  be resolved without a base)."
+  [p]
+  (let [absolute (absolute? p)
+        segs (remove #(= "/" %) (split p))
+        stack (reduce (fn [acc seg]
+                        (cond
+                          (= seg ".") acc
+                          (= seg "..") (cond
+                                         (and (seq acc) (not= (peek acc) "..")) (pop acc)
+                                         (not absolute) (conj acc "..")
+                                         :else acc)
+                          :else (conj acc seg)))
+                      [] segs)
+        joined (str/join sep stack)]
+    (cond
+      absolute (if (empty? stack) sep (str sep joined))
+      (empty? stack) "."
+      :else joined)))
+
+;; ---------- UTF-8 <-> unsigned byte vector ----------
+;;
+;; The byte face of this library speaks ONE representation: a vector of
+;; unsigned integers 0-255. Not a host byte[], not a Uint8Array, not a seq of
+;; characters -- those are three different things on three different hosts and
+;; a protocol that returns "whatever the host had" is not a portable protocol.
+;;
+;; Unsigned matters. A JVM byte is signed, so a raw `(vec (.getBytes s))` hands
+;; back -61 where every other host says 195, and code that round-trips it
+;; writes a different file than it read. Both directions below normalise.
+
+(defn utf8-bytes
+  "UTF-8 encode `text` into a vector of unsigned bytes (0-255)."
+  [text]
+  #?(:clj  (mapv #(bit-and (long %) 0xff)
+                 (kbytes/utf8-bytes ^String (str text)))
+     :cljs (vec (.encode (js/TextEncoder.) (str text)))))
+
+(defn utf8-text
+  "Decode a collection of unsigned bytes (0-255) as UTF-8 text."
+  [bytes]
+  #?(:clj  (kbytes/utf8-string (byte-array (mapv #(unchecked-byte (long %)) bytes)))
+     :cljs (.decode (js/TextDecoder. "utf-8")
+                    (js/Uint8Array.from (into-array (mapv int bytes))))))
+
+;; ---------- IFilesystem protocol (host-injected) ----------
+
+(def IFilesystem
+  "The protocol itself lives in one repo of its own now. This name is that
+  SAME protocol, not a second one: an implementation reified against either
+  is accepted by both (ADR-2609091900)."
+  filesystem-p/Filesystem)
+
+(def delete filesystem-p/delete)
+(def exists? filesystem-p/exists?)
+(def list filesystem-p/list)
+(def read filesystem-p/read)
+(def read-bytes filesystem-p/read-bytes)
+(def write filesystem-p/write)
+(def write-bytes filesystem-p/write-bytes)
+
+(def IAsyncFilesystem
+  "The protocol itself lives in one repo of its own now. This name is that
+  SAME protocol, not a second one: an implementation reified against either
+  is accepted by both (ADR-2609091900)."
+  asyncfilesystem-p/AsyncFilesystem)
+
+(def delete-async asyncfilesystem-p/delete-async)
+(def exists-async? asyncfilesystem-p/exists-async?)
+(def list-async asyncfilesystem-p/list-async)
+(def read-async asyncfilesystem-p/read-async)
+(def write-async asyncfilesystem-p/write-async)
+
+(defn eventual-error-type
+  "Recover a stable `:type` through Promise/SCI or Future wrapper causes.
+  Returns nil when no typed cause exists."
+  [error]
+  (loop [e error depth 0]
+    (when (and e (< depth 8))
+      (let [type (:type (ex-data e))]
+        (if (and (keyword? type) (not= :sci/error type))
+          type
+          (recur (ex-cause e) (inc depth)))))))
+
+;; ---------- in-memory filesystem (OSS standalone / tests) ----------
+
+(defn mem-filesystem
+  "An atom-backed IFilesystem. Paths map to either a string (file content) or
+  a nil placeholder (directory). Useful for tests and OSS-standalone apps; the
+  host injects a real one in production."
+  []
+  (let [store (atom {})]
+    (reify IFilesystem
+      ;; A stored value is a string (written as text), a vector of unsigned
+      ;; bytes (written as bytes), or nil (a directory placeholder). read and
+      ;; read-bytes each convert whichever one is there, so the two faces
+      ;; agree no matter which one wrote the file.
+      (read       [_ path]
+        (let [v (get @store path)]
+          (if (vector? v) (utf8-text v) v)))
+      (read-bytes [_ path]
+        (let [v (get @store path)]
+          (cond
+            (vector? v) v
+            (string? v) (utf8-bytes v))))
+      (write   [_ path content] (swap! store assoc path (str content)) nil)
+      (write-bytes [_ path bytes]
+        (swap! store assoc path (mapv #(bit-and (int %) 0xff) bytes)) nil)
+      (list    [_ path]
+        (let [prefix (if (= path sep) sep (str path sep))
+              ks (keys @store)]
+          (->> ks
+               (filter #(str/starts-with? % prefix))
+               (map #(subs % (count prefix)))
+               (map #(first (str/split % #"/")))
+               distinct
+               sort
+               vec)))
+      (exists? [_ path] (contains? @store path))
+      (delete  [_ path] (swap! store dissoc path) nil))))
+
+;; ---------- derived operations ----------
+;;
+;; The classpath-era `make-parents` has NO counterpart here and needs none:
+;; `write`/`write-bytes` already create the parent directory (see
+;; the host namespace). A migrated call site DELETES its make-parents call
+;; rather than translating it.
+
+(defn copy
+  "Byte-exact copy of `src` to `dst`. With three arguments both paths are on
+  the same handle; with four, `src` is read from `src-fs` and written to
+  `dst-fs`, which is how a copy crosses two separately granted roots.
+
+  Goes through the byte face, not the text face, so content that is not valid
+  UTF-8 survives. Returns nil.
+
+  There is no `:replace`/`:append` option: `write-bytes` replaces, which is
+  what a host-level `copy` into a file does."
+  ([fs src dst] (copy fs src fs dst))
+  ([src-fs src dst-fs dst]
+   (let [bytes (read-bytes src-fs src)]
+     (when (nil? bytes)
+       (throw (ex-info "no such file" {:type :fs/not-found :fs/path (str src)})))
+     (write-bytes dst-fs dst bytes)
+     nil)))

@@ -9,27 +9,77 @@
   {:kotoba/export [sha1-bytes hmac-sha1]}
   (:require [kotoba.bytes :as b]))
 
+;; Dual-runtime reading (see kotoba.bytes): `#?(:kotoba A :default B)` is A in
+;; the Kotoba module and B on the JVM / ClojureScript, so the host bodies below
+;; are the operations they always were. Bytes and words are `:vector-i64` on
+;; Kotoba; the leaves below are the only places the two hosts differ.
+
 (def ^:private mask32 0xffffffff)
 
-(defn- m32 [x] (bit-and x mask32))
+;; ---- leaves: one per primitive that differs between the hosts ----
 
-(defn- rotl32 [x n]
-  (m32 (bit-or (bit-shift-left x n) (unsigned-bit-shift-right x (- 32 n)))))
+(defn- shl [#?@(:kotoba [x :i64 n :i64] :default [x n])] #?@(:kotoba [:i64])
+  #?(:kotoba (i64-shift-left x n) :default (bit-shift-left x n)))
 
-(defn- add32 [& xs] (m32 (reduce + 0 xs)))
+;; logical right shift; every operand is a non-negative 32-bit value
+(defn- shr [#?@(:kotoba [x :i64 n :i64] :default [x n])] #?@(:kotoba [:i64])
+  #?(:kotoba (i64-shift-right x n) :default (unsigned-bit-shift-right x n)))
+
+(defn- vnew [] #?@(:kotoba [:vector-i64])
+  #?(:kotoba (vector-i64) :default []))
+
+(defn- vpush [#?@(:kotoba [v :vector-i64 x :i64] :default [v x])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba (vector-conj v x) :default (conj v x)))
+
+(defn- vat [#?@(:kotoba [v :vector-i64 i :i64] :default [v i])] #?@(:kotoba [:i64])
+  #?(:kotoba (vector-at v i) :default (nth v i)))
+
+(defn- vlen [#?@(:kotoba [v :vector-i64] :default [v])] #?@(:kotoba [:i64])
+  #?(:kotoba (vector-count v) :default (count v)))
+
+(defn- as-vec [#?@(:kotoba [v :vector-i64] :default [v])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba v :default (vec v)))
+
+(defn- vcat [#?@(:kotoba [a :vector-i64 b :vector-i64] :default [a b])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [n (vector-count b)]
+       (loop [i 0 out a]
+         (if (>= i n) out (recur (+ i 1) (vector-conj out (vector-at b i))))))
+     :default (into a b)))
+
+;; ---- 32-bit arithmetic ----
+
+(defn- m32 [#?@(:kotoba [x :i64] :default [x])] #?@(:kotoba [:i64])
+  (bit-and x mask32))
+
+(defn- rotl32 [#?@(:kotoba [x :i64 n :i64] :default [x n])] #?@(:kotoba [:i64])
+  (m32 (bit-or (shl x n) (shr x (- 32 n)))))
+
+(defn- not32 [#?@(:kotoba [x :i64] :default [x])] #?@(:kotoba [:i64])
+  #?(:kotoba (bit-xor x mask32) :default (m32 (bit-not x))))
+
+(defn- add32 [#?@(:kotoba [a :i64 b :i64] :default [a b])] #?@(:kotoba [:i64])
+  (m32 (+ a b)))
 
 (def ^:private h-init [0x67452301 0xEFCDAB89 0x98BADCFE 0x10325476 0xC3D2E1F0])
+
+(defn- h-init-vec [] #?@(:kotoba [:vector-i64])
+  (vpush (vpush (vpush (vpush (vpush (vnew) 0x67452301) 0xEFCDAB89) 0x98BADCFE) 0x10325476) 0xC3D2E1F0))
+
+(defn- pad-zeros [#?@(:kotoba [v :vector-i64 n :i64] :default [v n])] #?@(:kotoba [:vector-i64])
+  (loop [i 0 out v]
+    (if (>= i n) out (recur (+ i 1) (vpush out 0)))))
 
 (defn- pad-message
   "FIPS 180-4 §5.1.1 padding: append 0x80, zero-pad to 56 mod 64, then the
    original bit-length as a big-endian 64-bit integer (split across two
    32-bit big-endian words, since a single 64-bit shift is not cljs-safe)."
-  [msg]
-  (let [byte-len (count msg)
+  [#?@(:kotoba [msg :vector-i64] :default [msg])] #?@(:kotoba [:vector-i64])
+  (let [byte-len (vlen msg)
         bit-len (* byte-len 8)
-        with-marker (conj (vec msg) 0x80)
-        rem64 (mod (count with-marker) 64)
-        zero-pad (mod (- 56 rem64) 64)
+        with-marker (vpush (as-vec msg) 0x80)
+        rem64 (bit-and (vlen with-marker) 63)
+        zero-pad (bit-and (- 56 rem64) 63)
         ;; NOT `(unsigned-bit-shift-right bit-len 32)`. JavaScript's `>>>`
         ;; masks the shift COUNT modulo 32, so a shift by 32 is a shift by
         ;; zero: measured 2026-08-20, `(unsigned-bit-shift-right 24 32)` is 0
@@ -44,60 +94,80 @@
         ;; half was the same hazard again.
         hi (m32 (quot bit-len 4294967296))
         lo (m32 bit-len)]
-    (-> with-marker
-        (into (repeat zero-pad 0))
-        (into (b/u32->bytes hi))
-        (into (b/u32->bytes lo)))))
+    (vcat (vcat (pad-zeros with-marker zero-pad) (b/u32->bytes hi)) (b/u32->bytes lo))))
 
-(defn- words-from-chunk
-  "16 big-endian 32-bit words from a 64-byte chunk."
-  [chunk]
-  (mapv b/bytes->u32 (partition 4 chunk)))
+(defn- word-at
+  "The big-endian 32-bit word at byte offset O of BS."
+  [#?@(:kotoba [bs :vector-i64 o :i64] :default [bs o])] #?@(:kotoba [:i64])
+  (b/bytes->u32 (vpush (vpush (vpush (vpush (vnew) (vat bs o)) (vat bs (+ o 1))) (vat bs (+ o 2))) (vat bs (+ o 3)))))
 
 (defn- extend-schedule
-  "Extend 16 words to the full 80-word message schedule (§6.1.2 step (b))."
-  [w16]
-  (loop [w (vec w16) i 16]
+  "The full 80-word message schedule (§6.1.2 step (b)) of the 64-byte chunk of
+   PADDED at OFFSET."
+  [#?@(:kotoba [padded :vector-i64 offset :i64] :default [padded offset])] #?@(:kotoba [:vector-i64])
+  (loop [w (vnew) i 0]
     (if (= i 80)
       w
-      (recur (conj w (rotl32 (bit-xor (nth w (- i 3)) (nth w (- i 8))
-                                       (nth w (- i 14)) (nth w (- i 16)))
-                              1))
+      (recur (vpush w (if (< i 16)
+                        (word-at padded (+ offset (* i 4)))
+                        (rotl32 (bit-xor (bit-xor (vat w (- i 3)) (vat w (- i 8)))
+                                         (bit-xor (vat w (- i 14)) (vat w (- i 16))))
+                                1)))
              (inc i)))))
 
-(defn- round-fk [i b c d]
+(defn- round-f [#?@(:kotoba [i :i64 b :i64 c :i64 d :i64] :default [i b c d])] #?@(:kotoba [:i64])
   (cond
-    (<= 0 i 19)  [(bit-or (bit-and b c) (bit-and (m32 (bit-not b)) d)) 0x5A827999]
-    (<= 20 i 39) [(bit-xor b c d) 0x6ED9EBA1]
-    (<= 40 i 59) [(bit-or (bit-and b c) (bit-and b d) (bit-and c d)) 0x8F1BBCDC]
-    :else        [(bit-xor b c d) 0xCA62C1D6]))
+    (< i 20) (bit-or (bit-and b c) (bit-and (not32 b) d))
+    (< i 40) (bit-xor (bit-xor b c) d)
+    (< i 60) (bit-or (bit-or (bit-and b c) (bit-and b d)) (bit-and c d))
+    :else    (bit-xor (bit-xor b c) d)))
 
-(defn- process-chunk [[h0 h1 h2 h3 h4] chunk]
-  (let [w (extend-schedule (words-from-chunk chunk))]
+(defn- round-k [#?@(:kotoba [i :i64] :default [i])] #?@(:kotoba [:i64])
+  (cond
+    (< i 20) 0x5A827999
+    (< i 40) 0x6ED9EBA1
+    (< i 60) 0x8F1BBCDC
+    :else    0xCA62C1D6))
+
+(defn- vec5 [#?@(:kotoba [a :i64 b :i64 c :i64 d :i64 e :i64] :default [a b c d e])] #?@(:kotoba [:vector-i64])
+  (vpush (vpush (vpush (vpush (vpush (vnew) a) b) c) d) e))
+
+(defn- process-chunk
+  [#?@(:kotoba [h :vector-i64 padded :vector-i64 offset :i64] :default [h padded offset])] #?@(:kotoba [:vector-i64])
+  (let [w (extend-schedule padded offset)
+        h0 (vat h 0) h1 (vat h 1) h2 (vat h 2) h3 (vat h 3) h4 (vat h 4)]
     (loop [i 0 a h0 b h1 c h2 d h3 e h4]
       (if (= i 80)
-        [(add32 h0 a) (add32 h1 b) (add32 h2 c) (add32 h3 d) (add32 h4 e)]
-        (let [[f k] (round-fk i b c d)
-              temp (add32 (rotl32 a 5) f e k (nth w i))]
+        (vec5 (add32 h0 a) (add32 h1 b) (add32 h2 c) (add32 h3 d) (add32 h4 e))
+        (let [temp (add32 (add32 (add32 (add32 (rotl32 a 5) (round-f i b c d)) e) (round-k i)) (vat w i))]
           (recur (inc i) temp a (rotl32 b 30) c d))))))
+
+(defn- u32-bytes-into [#?@(:kotoba [out :vector-i64 x :i64] :default [out x])] #?@(:kotoba [:vector-i64])
+  (vcat out (b/u32->bytes x)))
 
 (defn sha1-bytes
   "SHA-1 digest of a byte vector; returns a 20-byte vector."
-  [msg]
+  [#?@(:kotoba [msg :vector-i64] :default [msg])] #?@(:kotoba [:vector-i64])
   (let [padded (pad-message msg)
-        chunks (partition 64 padded)
-        [h0 h1 h2 h3 h4] (reduce process-chunk h-init chunks)]
-    (vec (mapcat b/u32->bytes [h0 h1 h2 h3 h4]))))
+        n (vlen padded)
+        h (loop [h (h-init-vec) off 0]
+            (if (>= off n) h (recur (process-chunk h padded off) (+ off 64))))]
+    (u32-bytes-into (u32-bytes-into (u32-bytes-into (u32-bytes-into (u32-bytes-into (vnew) (vat h 0)) (vat h 1)) (vat h 2)) (vat h 3)) (vat h 4))))
 
 (def ^:const block-size 64)
+
+(defn- xor-each [#?@(:kotoba [v :vector-i64 x :i64] :default [v x])] #?@(:kotoba [:vector-i64])
+  (let [n (vlen v)]
+    (loop [i 0 out (vnew)]
+      (if (>= i n) out (recur (+ i 1) (vpush out (bit-xor (vat v i) x)))))))
 
 (defn hmac-sha1
   "HMAC-SHA1 (RFC 2104) of byte-vector `msg` under byte-vector `key`. Returns a
    20-byte vector. Pure — usable directly, and it's what the ClojureScript
    branch of `kotoba.turn.credential/hmac-sha1` calls."
-  [key msg]
-  (let [key' (if (> (count key) block-size) (sha1-bytes key) (vec key))
-        key-padded (b/pad-right key' (- block-size (count key')))
-        opad (mapv (fn [k] (bit-xor k 0x5c)) key-padded)
-        ipad (mapv (fn [k] (bit-xor k 0x36)) key-padded)]
-    (sha1-bytes (into opad (sha1-bytes (into ipad msg))))))
+  [#?@(:kotoba [k :vector-i64 msg :vector-i64] :default [k msg])] #?@(:kotoba [:vector-i64])
+  (let [k' (if (> (vlen k) block-size) (sha1-bytes k) (as-vec k))
+        key-padded (b/pad-right k' (- block-size (vlen k')))
+        opad (xor-each key-padded 0x5c)
+        ipad (xor-each key-padded 0x36)]
+    (sha1-bytes (vcat opad (sha1-bytes (vcat ipad msg))))))

@@ -1,0 +1,18 @@
+(ns kotoba.test.gen-int
+  "gen-int -- addressed on its own.
+
+  Split out of kotoba.lang.test on 2026-09-09 (ADR-2609091200). The unit
+  here is the DEFINITION, and this repo's deps.edn names exactly the
+  definitions it reaches -- nothing else.
+"
+  (:require [kotoba.lang.spec :as spec]
+            [kotoba.test.next-int :refer [next-int]])
+  #?(:clj  (:require [kotoba.lang.spec :as spec])
+     :cljs (:require [kotoba.lang.spec :as spec])))
+
+(defn gen-int
+  "Generator of integers in [`lo` `hi`] (inclusive). Defaults to a small range
+  biased toward finding edge cases quickly when used with shrink."
+  ([rng] (gen-int rng -100 100))
+  ([rng hi] (gen-int rng 0 hi))
+  ([rng lo hi] (next-int rng lo hi)))

@@ -1,0 +1,204 @@
+(ns kotoba.lang.async
+  (:export [main chan fixed-chan closed? can-put? can-take? put take close drain
+            scope scope-spawn scope-close scope-complete scope-fail scope-cancel
+            scope-join-ready? scope-summary]))
+
+(defn field [channel :document key :keyword] :document
+  (option-or (document-get channel key) (document-null)))
+
+(defn buffer [channel :document] :document (field channel :buffer))
+(defn capacity [channel :document] :i64
+  (option-or (document-i64-value (field channel :cap)) 0))
+(defn buffer-type [channel :document] :keyword
+  (option-or (document-keyword-value (field channel :buf-type)) :invalid))
+
+(defn chan [buf-type :keyword cap :i64] :document
+  (let [valid-type (or (= buf-type :fixed)
+                       (= buf-type :dropping)
+                       (= buf-type :sliding))
+        checked-cap (if (and valid-type (> cap 0) (<= cap 32))
+                      cap
+                      (quot 1 0))]
+    (document-map :buf-type (document-keyword buf-type)
+                  :cap (document-i64 checked-cap)
+                  :buffer (document-vector)
+                  :closed? (document-bool false))))
+
+(defn fixed-chan [cap :i64] :document (chan :fixed cap))
+
+(defn closed? [channel :document] :bool
+  (option-or (document-bool-value (field channel :closed?)) false))
+
+(defn can-put? [channel :document] :bool
+  (and (bool-not (closed? channel))
+       (if (= (buffer-type channel) :fixed)
+         (if (< (document-count (buffer channel)) (capacity channel)) true false)
+         true)))
+
+(defn can-take? [channel :document] :bool
+  (if (> (document-count (buffer channel)) 0) true false))
+
+(defn put [channel :document value :document] :document
+  (if (closed? channel)
+    (document-vector channel (document-bool false))
+    (let [items (buffer channel)
+          full (= (document-count items) (capacity channel))
+          kind (buffer-type channel)]
+      (if (= kind :fixed)
+        (if full
+          (document-vector channel (document-bool false))
+          (document-vector
+            (document-assoc channel :buffer (document-vector-conj items value))
+            (document-bool true)))
+        (if (= kind :dropping)
+          (document-vector
+            (document-assoc channel :buffer
+              (if full items (document-vector-conj items value)))
+            (document-bool true))
+          (document-vector
+            (document-assoc channel :buffer
+              (document-vector-conj
+                (if full (document-vector-drop items 1) items) value))
+            (document-bool true)))))))
+
+(defn take [channel :document] :document
+  (let [items (buffer channel)]
+    (if (> (document-count items) 0)
+      (document-vector
+        (document-assoc channel :buffer (document-vector-drop items 1))
+        (option-or (document-vector-at items 0) (document-null)))
+      (document-vector channel (document-null)))))
+
+(defn close [channel :document] :document
+  (document-assoc channel :closed? (document-bool true)))
+
+(defn drain [channel :document] :document
+  (document-vector
+    (document-assoc channel :buffer (document-vector))
+    (buffer channel)))
+
+(defn scope [] :document
+  (document-map :status (document-keyword :open)
+                :next-id (document-i64 0)
+                :children (document-vector)
+                :failure (document-null)))
+
+(defn scope-children [s :document] :document (field s :children))
+(defn scope-status [s :document] :keyword
+  (option-or (document-keyword-value (field s :status)) :invalid))
+(defn child-id [child :document] :i64
+  (option-or (document-i64-value (field child :id)) -1))
+(defn child-state [child :document] :keyword
+  (option-or (document-keyword-value (field child :state)) :invalid))
+
+(defn terminal-child? [child :document] :bool
+  (let [state (child-state child)]
+    (or (= state :ok) (= state :error) (= state :cancelled))))
+
+(defn all-terminal-from [children :document i :i64] :bool
+  (if (>= i (document-count children))
+    true
+    (if (terminal-child?
+         (option-or (document-vector-at children i) (document-null)))
+      (all-terminal-from children (+ i 1))
+      false)))
+
+(defn all-terminal? [children :document] :bool (all-terminal-from children 0))
+
+(defn scope-spawn [s :document task :document] :document
+  (let [children (scope-children s)
+        id (option-or (document-i64-value (field s :next-id)) 0)
+        admitted (if (and (= (scope-status s) :open)
+                          (< (document-count children) 32))
+                   true
+                   (= (quot 1 0) 0))
+        child (document-map :id (document-i64 id)
+                            :state (document-keyword :running)
+                            :value task)]
+    (document-vector
+      (document-assoc
+        (document-assoc s :next-id (document-i64 (+ id 1)))
+        :children (document-vector-conj children child))
+      (document-i64 id))))
+
+(defn scope-close [s :document] :document
+  (if (= (scope-status s) :open)
+    (document-assoc s :status
+      (document-keyword
+        (if (all-terminal? (scope-children s)) :completed :joining)))
+    s))
+
+(defn child-index-from [children :document id :i64 i :i64] :i64
+  (if (>= i (document-count children))
+    -1
+    (if (= id (child-id (option-or (document-vector-at children i) (document-null))))
+      i
+      (child-index-from children id (+ i 1)))))
+
+(defn running-child-index [s :document id :i64] :i64
+  (let [children (scope-children s)
+        i (child-index-from children id 0)]
+    (if (and (>= i 0)
+             (= :running
+                (child-state (option-or (document-vector-at children i)
+                                        (document-null)))))
+      i
+      (quot 1 0))))
+
+(defn scope-complete [s :document id :i64 value :document] :document
+  (let [children (scope-children s)
+        i (running-child-index s id)
+        child (document-map :id (document-i64 id)
+                            :state (document-keyword :ok)
+                            :value value)
+        updated (document-assoc s :children
+                  (document-vector-assoc children i child))]
+    (if (and (= (scope-status updated) :joining)
+             (all-terminal? (scope-children updated)))
+      (document-assoc updated :status (document-keyword :completed))
+      updated)))
+
+(defn cancel-running-from [children :document i :i64] :document
+  (if (>= i (document-count children))
+    children
+    (let [child (option-or (document-vector-at children i) (document-null))
+          next (if (= (child-state child) :running)
+                 (document-assoc child :state (document-keyword :cancelled))
+                 child)]
+      (cancel-running-from (document-vector-assoc children i next) (+ i 1)))))
+
+(defn scope-fail [s :document id :i64 error :document] :document
+  (let [children (scope-children s)
+        i (running-child-index s id)
+        child (document-map :id (document-i64 id)
+                            :state (document-keyword :error)
+                            :value error)
+        failed-children (document-vector-assoc children i child)]
+    (document-assoc
+      (document-assoc
+        (document-assoc s :children (cancel-running-from failed-children 0))
+        :status (document-keyword :failed))
+      :failure error)))
+
+(defn terminal-scope? [s :document] :bool
+  (let [status (scope-status s)]
+    (or (= status :completed) (= status :failed) (= status :cancelled))))
+
+(defn scope-cancel [s :document reason :document] :document
+  (if (terminal-scope? s)
+    s
+    (document-assoc
+      (document-assoc
+        (document-assoc s :children (cancel-running-from (scope-children s) 0))
+        :status (document-keyword :cancelled))
+      :failure reason)))
+
+(defn scope-join-ready? [s :document] :bool (terminal-scope? s))
+
+(defn scope-summary [s :document] :document
+  (document-map :status (field s :status)
+                :children (scope-children s)
+                :failure (field s :failure)))
+
+(defn main [] :i64
+  (if (can-put? (fixed-chan 2)) 0 1))

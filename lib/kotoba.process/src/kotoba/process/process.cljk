@@ -1,0 +1,24 @@
+(ns kotoba.process.process
+  "IProcess -- addressed on its own.
+
+  Split out of kotoba.lang.process on 2026-09-09 (ADR-2609091200). The unit
+  here is the DEFINITION, and this repo's deps.edn names exactly the
+  definitions it reaches -- nothing else.
+"
+  #?(:cljs (:require ["child_process" :as cp]))
+  #?(:clj
+     (:import (java.io ByteArrayOutputStream InputStream)
+              (java.nio.charset StandardCharsets)
+              (java.util.concurrent TimeUnit))))
+
+
+;; This namespace declines the java.lang names it was handed but did not
+;; ask for. On the JVM every namespace gets 96 of them before it says
+;; anything, and Process is one. The class stays reachable
+;; by its full name.
+#?(:clj (do (ns-unmap *ns* 'Process)))
+(defprotocol Process
+  (spawn! [proc request]
+    "Run `request` `{:argv :max-stdout-bytes :timeout-ms}`.
+     Returns `{:tag :ok :exit :stdout :stderr}` or
+     `{:tag :error :code :message}`."))

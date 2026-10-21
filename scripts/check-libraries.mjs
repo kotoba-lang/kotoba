@@ -15,6 +15,7 @@ const ids = fs.readdirSync(path.join(repo, "lib"))
 const catalogIDs = [...fs.readFileSync(path.join(repo, "lib/catalog.edn"), "utf8")
   .matchAll(/:id\s+"([^"]+)"/g)].map(match => match[1]).sort();
 assert.deepEqual(ids, catalogIDs, "every catalog package must have a checked import inventory");
+const hostNamespaces = new Map();
 
 for (const id of ids) {
   const root = path.join(repo, "lib", id);
@@ -66,6 +67,15 @@ for (const id of ids) {
         assert.ok(!/\.(clj|cljs|cljc)$/.test(relative),
                   `${id}/${relative}: imported Clojure-family sources must use .cljk`);
         implementationFiles.push(relative);
+        if (relative.startsWith("src/") && relative.endsWith(".cljk")) {
+          const namespace = fs.readFileSync(path.join(root, relative), "utf8")
+            .match(/\(ns\s+([^\s()]+)/)?.[1];
+          if (namespace) {
+            assert.ok(!hostNamespaces.has(namespace),
+                      `${namespace}: duplicate active host source in ${hostNamespaces.get(namespace)} and ${id}/${relative}`);
+            hostNamespaces.set(namespace, `${id}/${relative}`);
+          }
+        }
       }
     }
   };
@@ -76,9 +86,14 @@ for (const id of ids) {
   console.log(`${id}: ${provenance.imports.length} source origins; source-sha256:${digest(JSON.stringify(source))}`);
 }
 
-// Every portable imported test is required AND executed. Preserve the one
-// explicitly JVM-only oracle without pretending the SCI host ran it.
+// All imported suites have an explicit host. JVM-only origins are executed
+// by run-library-jvm-tests; SCI executes every other registered suite.
+const suites = readJSON(path.join(repo, "lib/test-suites.json"));
+assert.equal(suites.schema, "kotoba.library-test-suites.v1");
+const jvmRunner = ["run-library-jvm-tests.cljk", "run-library-async-tests.cljk"]
+  .map(file => fs.readFileSync(path.join(repo, "scripts", file), "utf8")).join("\n");
 const runner = fs.readFileSync(path.join(repo, "scripts/run-library-tests.cljk"), "utf8");
+const registered = new Set();
 for (const id of ids) {
   const tests = path.join(repo, "lib", id, "test");
   if (!fs.existsSync(tests)) continue;
@@ -88,10 +103,15 @@ for (const id of ids) {
       if (entry.isDirectory()) visit(file);
       else if (entry.name.endsWith("_test.cljk")) {
         const relative = path.relative(tests, file);
-        if (id === "kotoba.json" && relative === "json/core_test.cljk") {
-          assert.match(fs.readFileSync(path.join(repo, "lib", id, "cljk-origin.edn"), "utf8"),
-                       /"test\/json\/core_test\.cljk"\s+"\.clj"/,
-                       "the excluded test is no longer declared JVM-only; register it");
+        const fullPath = path.relative(repo, file);
+        const jvm = suites["jvm-only"].find(row => row.path === fullPath);
+        const portable = suites.portable.find(row => row.path === fullPath);
+        assert.ok(Boolean(jvm) !== Boolean(portable), `${fullPath}: choose exactly one test host`);
+        registered.add(fullPath);
+        if (jvm) {
+          const origins = fs.readFileSync(path.join(repo, "lib", id, "cljk-origin.edn"), "utf8");
+          assert.ok(origins.includes(`"test/${relative}" ".clj"`), `${fullPath}: no JVM-only origin`);
+          assert.ok(jvmRunner.includes(`[${jvm.namespace}]`) && jvmRunner.includes(`'${jvm.namespace}`));
           continue;
         }
         const source = fs.readFileSync(file, "utf8");
@@ -104,6 +124,8 @@ for (const id of ids) {
   };
   visit(tests);
 }
+assert.deepEqual([...registered].sort(), [...suites.portable, ...suites["jvm-only"]].map(row => row.path).sort(),
+                 "test registry contains a missing or duplicate suite");
 console.log(`libraries: ${origins} pinned origins, ${files} imported files, portable test inventory verified`);
 
 // Retirement eligibility is bound to reviewed default-source bytes, not just
@@ -136,3 +158,23 @@ for (const row of migrations.repositories) {
   }
 }
 console.log(`repository migrations: ${migrations.repositories.filter(row => row.disposition !== "hold").length} eligible; held repositories retained`);
+
+// A reviewed branch is bound to exact source bytes and its retained tip.
+// A prose decision cannot silently authorize different branch contents.
+const reviews = readJSON(path.join(repo, "lib/branch-reviews.json"));
+assert.equal(reviews.schema, "kotoba.library-branch-reviews.v1");
+for (const review of reviews.reviews) {
+  assert.match(review.commit, /^[0-9a-f]{40}$/);
+  assert.ok(["integrate", "hold"].includes(review.decision));
+  assert.ok(review.reason?.trim());
+  if (review.decision !== "integrate") continue;
+  const migration = migrations.repositories.find(row => row.repo === review.repo);
+  assert.ok(migration, `reviewed branch without source migration: ${review.repo}`);
+  assert.ok(migration["reviewed-branches"].some(row => row.commit === review.commit && row.branch === review.branch));
+  for (const file of review.files) {
+    const source = path.resolve(repo, migration.destination, file);
+    assert.ok(source.startsWith(path.resolve(repo, migration.destination) + path.sep));
+    assert.equal(digest(fs.readFileSync(source)), review["source-sha256"][file],
+                 `${review.repo}@${review.commit}: reviewed source changed`);
+  }
+}

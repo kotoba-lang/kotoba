@@ -1,0 +1,405 @@
+(ns kotoba.lang.fs-host-test
+  "Tests for the host-backed filesystem, against a REAL temp directory, on both
+  runtimes (`kbb -M:test` and `nbb`). Nothing here is mocked: every
+  assertion is about what the OS actually did.
+
+  Every refusal test asserts the refusal's `:type`, not merely that something
+  threw. `refusal-type` returns `nil` when a raw host exception escapes (no
+  `ex-data`), so a namespace that leaked an `IOException` fails these tests
+  rather than passing them."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.fs :as fs]
+            [kotoba.lang.fs-host :as host])
+  #?(:clj (:import
+                   (java.nio.file Files OpenOption Paths)
+                   (java.nio.file.attribute FileAttribute))))
+
+;; ---------------------------------------------------------------------------
+;; real temp directories, on both runtimes
+;; ---------------------------------------------------------------------------
+
+#?(:cljs (def ^:private node-fs (js/require "fs")))
+#?(:cljs (def ^:private node-path (js/require "path")))
+#?(:cljs (def ^:private node-os (js/require "os")))
+
+(def ^:private nul
+  "A real NUL, built rather than escaped so the character never has to survive
+  a heredoc, an editor, or a diff."
+  (str (char 0)))
+
+(defn- temp-root []
+  #?(:clj  (str (Files/createTempDirectory "fs-host-test" (into-array FileAttribute [])))
+     :cljs (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "fs-host-test-"))))
+
+(defn- slurp-real
+  "Read a file by absolute path, bypassing the handle entirely. Used to prove
+  that what the handle wrote really landed, and that what it refused really
+  did exist and really was reachable without it."
+  [abs]
+  #?(:clj  (kbytes/utf8-string (Files/readAllBytes (Paths/get (str abs) (into-array String []))))
+     :cljs (.readFileSync node-fs (str abs) "utf8")))
+
+(defn- spit-real [abs content]
+  #?(:clj  (do (Files/write (Paths/get (str abs) (into-array String []))
+                            (kbytes/utf8-bytes ^String content)
+                            (into-array OpenOption []))
+               (str abs))
+     :cljs (do (.writeFileSync node-fs (str abs) content "utf8") (str abs))))
+
+(defn- exists-real? [abs]
+  #?(:clj  (kio/exists? (kio/file (str abs)))
+     :cljs (.existsSync node-fs (str abs))))
+
+(defn- mkdir! [p]
+  #?(:clj  (Files/createDirectories (Paths/get (str p) (into-array String []))
+                                    (into-array FileAttribute []))
+     :cljs (.mkdirSync node-fs (str p) #js {:recursive true}))
+  (str p))
+
+(defn- symlink! [target link]
+  #?(:clj  (Files/createSymbolicLink (Paths/get (str link) (into-array String []))
+                                     (Paths/get (str target) (into-array String []))
+                                     (into-array FileAttribute []))
+     :cljs (.symlinkSync node-fs (str target) (str link))))
+
+(defn- refusal-type
+  "Run `f`; return the `:type` of the ex-info it threw. `::no-throw` when it
+  returned normally, `nil` when what escaped was a raw host exception with no
+  `ex-data` -- which is a failure of these tests, not a pass."
+  [f]
+  (try (f) ::no-throw
+       (catch :default e
+         (:type (ex-data e)))))
+
+(defn- fs-under [root & {:as opts}]
+  (host/host-filesystem (merge {:root root} opts)))
+
+#?(:clj
+   (defn- await-result [future]
+     (.get ^java.util.concurrent.CompletableFuture future)))
+
+#?(:clj
+   (defn- async-refusal-type [future]
+     (try (await-result future) ::no-throw
+          (catch java.util.concurrent.ExecutionException e
+            (fs/eventual-error-type e)))))
+
+;; ---------------------------------------------------------------------------
+;; happy paths, on a real filesystem
+;; ---------------------------------------------------------------------------
+
+(deftest write-then-read-roundtrip
+  (let [root (temp-root)
+        h    (fs-under root)]
+    (fs/write h "notes/hello.txt" "hello, world")
+    (is (= "hello, world" (fs/read h "notes/hello.txt")))
+    ;; the bytes really are on disk, under the root, at the path we named
+    (is (= "hello, world" (slurp-real (str root "/notes/hello.txt"))))
+    ;; overwrite truncates rather than appending
+    (fs/write h "notes/hello.txt" "bye")
+    (is (= "bye" (fs/read h "notes/hello.txt")))
+    (is (= "bye" (slurp-real (str root "/notes/hello.txt"))))))
+
+#?(:clj
+   (deftest async-capability-roundtrip-and-confinement
+     (let [root (temp-root)
+           h (host/async-host-filesystem {:root root :max-bytes 32})]
+       (is (instance? java.util.concurrent.CompletableFuture
+                      (fs/write-async h "async/a.txt" "hello")))
+       (is (nil? (await-result (fs/write-async h "async/a.txt" "hello"))))
+       (is (= "hello" (await-result (fs/read-async h "async/a.txt"))))
+       (is (= ["a.txt"] (await-result (fs/list-async h "async"))))
+       (is (true? (await-result (fs/exists-async? h "async/a.txt"))))
+       (is (= :fs/escape (async-refusal-type (fs/read-async h "../secret"))))
+       (is (= :fs/too-large
+              (async-refusal-type
+               (fs/write-async h "async/big.txt" (apply str (repeat 33 "x"))))))
+       (is (nil? (await-result (fs/delete-async h "async/a.txt"))))
+       (is (false? (await-result (fs/exists-async? h "async/a.txt")))))))
+
+(deftest exists-before-and-after-delete
+  (let [h (fs-under (temp-root))]
+    (is (false? (fs/exists? h "a/b.txt")))
+    (fs/write h "a/b.txt" "x")
+    (is (true? (fs/exists? h "a/b.txt")))
+    (is (nil? (fs/delete h "a/b.txt")))
+    (is (false? (fs/exists? h "a/b.txt")))
+    ;; deleting again is a no-op, matching mem-filesystem
+    (is (nil? (fs/delete h "a/b.txt")))))
+
+(deftest list-a-directory
+  (let [h (fs-under (temp-root))]
+    (fs/write h "dir/a.txt" "1")
+    (fs/write h "dir/b.txt" "2")
+    (fs/write h "dir/sub/c.txt" "3")
+    (is (= ["a.txt" "b.txt" "sub"] (fs/list h "dir")))
+    (is (= ["c.txt"] (fs/list h "dir/sub")))))
+
+;; ---------------------------------------------------------------------------
+;; confinement -- each REFUSED, asserting the refusal's own :type
+;; ---------------------------------------------------------------------------
+
+(deftest traversal-is-refused
+  (let [outer  (temp-root)
+        root   (mkdir! (str outer "/root"))
+        secret (spit-real (str outer "/secret.txt") "PASSWORD")
+        h      (fs-under root)]
+    ;; the target really exists and really is outside the root
+    (is (= "PASSWORD" (slurp-real secret)))
+
+    (testing "dot-dot traversal"
+      (is (= :fs/escape (refusal-type #(fs/read h "../secret.txt"))))
+      (is (= :fs/escape (refusal-type #(fs/read h "../etc/passwd"))))
+      (is (= :fs/escape (refusal-type #(fs/read h "a/../../secret.txt"))))
+      (is (= :fs/escape (refusal-type #(fs/write h "../pwned.txt" "x"))))
+      (is (= :fs/escape (refusal-type #(fs/delete h "../secret.txt"))))
+      (is (= :fs/escape (refusal-type #(fs/exists? h "../secret.txt"))))
+      (is (= :fs/escape (refusal-type #(fs/list h "..")))))
+
+    (testing "absolute path"
+      (is (= :fs/absolute (refusal-type #(fs/read h "/etc/passwd"))))
+      (is (= :fs/absolute (refusal-type #(fs/read h secret))))
+      (is (= :fs/absolute (refusal-type #(fs/write h "/tmp/pwned.txt" "x")))))
+
+    (testing "home escape"
+      (is (= :fs/home-escape (refusal-type #(fs/read h "~/.ssh/id_rsa"))))
+      (is (= :fs/home-escape (refusal-type #(fs/read h "~")))))
+
+    (testing "null byte"
+      (is (= :fs/null-byte
+             (refusal-type #(fs/read h (str "ok.txt" nul "/../../etc/passwd")))))
+      (is (= :fs/null-byte
+             (refusal-type #(fs/write h (str "a" nul "b") "x")))))
+
+    (testing "the remaining pure refusals"
+      (is (= :fs/empty-path (refusal-type #(fs/read h ""))))
+      (is (= :fs/empty-path (refusal-type #(fs/read h "   "))))
+      ;; "///" is all-empty segments AND absolute; the absolute check runs
+      ;; first, so that is the code it gets. Either way it is refused.
+      (is (= :fs/absolute (refusal-type #(fs/read h "///"))))
+      (is (= :fs/backslash (refusal-type #(fs/read h "..\\secret.txt"))))
+      (is (= :fs/path-too-long
+             (refusal-type #(fs/read h (apply str (repeat 1025 "x")))))))
+
+    (testing "nothing was created outside the root, nothing was disclosed"
+      (is (false? (exists-real? (str outer "/pwned.txt"))))
+      (is (= "PASSWORD" (slurp-real secret))))))
+
+(deftest symlink-out-of-root-is-refused
+  (let [outer  (temp-root)
+        root   (mkdir! (str outer "/root"))
+        secret (spit-real (str outer "/secret.txt") "PASSWORD")
+        h      (fs-under root)]
+    (symlink! secret (str root "/link.txt"))
+    ;; the symlink resolves to a real file with real content, outside the root
+    (is (= "PASSWORD" (slurp-real (str root "/link.txt"))))
+    ;; ... and the handle still refuses it
+    (is (= :fs/escape (refusal-type #(fs/read h "link.txt"))))
+    (is (= :fs/escape (refusal-type #(fs/write h "link.txt" "x"))))
+    (is (= :fs/escape (refusal-type #(fs/delete h "link.txt"))))
+    ;; the file is untouched by the refused write
+    (is (= "PASSWORD" (slurp-real secret)))
+    ;; a symlinked DIRECTORY out of root is refused for paths under it too
+    (symlink! outer (str root "/up"))
+    (is (= :fs/escape (refusal-type #(fs/read h "up/secret.txt"))))
+    (is (= :fs/escape (refusal-type #(fs/list h "up"))))))
+
+;; ---------------------------------------------------------------------------
+;; bounds, and typed errors
+;; ---------------------------------------------------------------------------
+
+(deftest read-over-max-bytes-is-refused
+  (let [root  (temp-root)
+        loose (fs-under root :max-bytes 1048576)
+        tight (fs-under root :max-bytes 16)]
+    (fs/write loose "big.txt" (apply str (repeat 100 "x")))
+    (is (= 100 (count (fs/read loose "big.txt"))))
+    (is (= :fs/too-large (refusal-type #(fs/read tight "big.txt"))))
+    ;; under the bound still reads
+    (fs/write tight "small.txt" "0123456789")
+    (is (= "0123456789" (fs/read tight "small.txt")))
+    ;; the refusal carries the numbers a caller needs to explain itself
+    (try (fs/read tight "big.txt")
+         (catch :default e
+           (is (= 100 (:fs/size (ex-data e))))
+           (is (= 16 (:fs/max-bytes (ex-data e))))))
+    ;; the same bound applies to write, so this handle cannot create a file it
+    ;; would then refuse to read back
+    (is (= :fs/too-large
+           (refusal-type #(fs/write tight "toobig.txt" (apply str (repeat 17 "x"))))))
+    (is (false? (fs/exists? tight "toobig.txt")))))
+
+(deftest missing-file-is-a-typed-error
+  (let [h (fs-under (temp-root))]
+    (is (= :fs/not-found (refusal-type #(fs/read h "nope.txt"))))
+    (is (= :fs/not-found (refusal-type #(fs/read h "no/such/dir/nope.txt"))))
+    (is (= :fs/not-found (refusal-type #(fs/list h "nope"))))
+    ;; the message and data are ours, not the host's
+    (try (fs/read h "nope.txt")
+         (catch :default e
+           (is (= "no such file" (ex-message e)))
+           (is (= "nope.txt" (:fs/path (ex-data e))))))))
+
+(deftest directory-and-file-confusions-are-typed
+  (let [h (fs-under (temp-root))]
+    (fs/write h "d/f.txt" "x")
+    (is (= :fs/is-directory (refusal-type #(fs/read h "d"))))
+    (is (= :fs/is-directory (refusal-type #(fs/delete h "d"))))
+    (is (= :fs/is-directory (refusal-type #(fs/write h "d" "x"))))
+    (is (= :fs/not-a-directory (refusal-type #(fs/list h "d/f.txt"))))
+    ;; the refused delete did not take the directory with it
+    (is (= ["f.txt"] (fs/list h "d")))))
+
+(deftest root-is-required-and-must-be-a-real-directory
+  (is (= :fs/bad-root (refusal-type #(host/host-filesystem {}))))
+  (is (= :fs/bad-root (refusal-type #(host/host-filesystem {:root ""}))))
+  (is (= :fs/bad-root (refusal-type #(host/host-filesystem {:root "relative/dir"}))))
+  (is (= :fs/bad-root (refusal-type #(host/host-filesystem {:root "/no/such/dir/at/all"}))))
+  (let [f (spit-real (str (temp-root) "/afile.txt") "x")]
+    (is (= :fs/bad-root (refusal-type #(host/host-filesystem {:root f}))))))
+
+;; ---------------------------------------------------------------------------
+;; the pure policy on its own
+;; ---------------------------------------------------------------------------
+
+(deftest resolve-relative-is-pure-policy
+  (is (= {:ok "a/b.txt"} (host/resolve-relative "a/b.txt")))
+  (is (= {:ok "a/b.txt"} (host/resolve-relative "a//b.txt")))
+  (is (= {:error :fs/escape} (host/resolve-relative "../x")))
+  (is (= {:error :fs/escape} (host/resolve-relative "a/./b")))
+  (is (= {:error :fs/absolute} (host/resolve-relative "/x")))
+  (is (= {:error :fs/home-escape} (host/resolve-relative "~/x")))
+  (is (= {:error :fs/null-byte} (host/resolve-relative (str "a" nul "b"))))
+  (is (= {:error :fs/backslash} (host/resolve-relative "a\\b")))
+  (is (= {:error :fs/empty-path} (host/resolve-relative "")))
+  (is (= {:error :fs/path-too-long} (host/resolve-relative (apply str (repeat 1025 "x")))))
+  ;; the length bound counts BYTES, not characters: U+3042 is 3 bytes in UTF-8,
+  ;; so 300 of them (900 bytes) fit and 400 of them (1200 bytes) do not, even
+  ;; though 400 CHARACTERS is well under the 1024 limit
+  (let [wide  (apply str (repeat 300 (char 0x3042)))
+        wider (apply str (repeat 400 (char 0x3042)))]
+    (is (= {:ok wide} (host/resolve-relative wide)))
+    (is (= {:error :fs/path-too-long} (host/resolve-relative wider)))))
+
+(deftest under-root?-is-a-separator-aware-prefix-test
+  (is (true? (host/under-root? "/a/b" "/a/b")))
+  (is (true? (host/under-root? "/a/b" "/a/b/c")))
+  (is (false? (host/under-root? "/a/b" "/a/bc")))
+  (is (false? (host/under-root? "/a/b" "/a")))
+  (is (true? (host/under-root? "/" "/a"))))
+
+;; ---------------------------------------------------------------------------
+;; the separation itself, checked by machine rather than by review
+;; ---------------------------------------------------------------------------
+
+(defn- read-source
+  "Read a source file relative to the repo root. Both runners (`kbb -M:test`
+  and `kbb --backend sci --classpath src:test test/run_portable.cljk`) start there. Fails
+  loudly if the file cannot be read -- a check that cannot run must not look
+  like a check that passed."
+  [rel]
+  #?(:clj  (slurp rel)
+     :cljs (.readFileSync node-fs rel "utf8")))
+
+(deftest requiring-kotoba-lang-fs-drags-in-no-host-filesystem
+  (let [src (read-source "lib/kotoba.fs/src/kotoba/lang/fs.cljk")]
+    ;; evidence floor: an empty or truncated read must not pass as "clean"
+    (is (< 2000 (count src)) "fs.cljc source was actually read")
+    (doseq [needle ["java.nio" "java.io" "js/require" "readFileSync" "fs-host"
+                    "(slurp" "(spit"]]
+      (is (not (str/includes? src needle))
+          (str "kotoba.lang.fs must stay free of host filesystem dependencies, "
+               "found: " needle))))
+  ;; and the host namespace is where all of that lives
+  (let [src (read-source "lib/kotoba.fs/src/kotoba/lang/fs_host.cljk")]
+    (is (< 2000 (count src)) "fs_host.cljc source was actually read")
+    (is (str/includes? src "java.nio"))
+    (is (str/includes? src "js/require"))
+    ;; no ambient-authority convenience sneaked back in
+    (is (not (str/includes? src "(defn slurp")))
+    (is (not (str/includes? src "(defn spit")))))
+
+;; ---------------------------------------------------------------------------
+;; the byte face, against the real host
+;; ---------------------------------------------------------------------------
+;;
+;; `read-bytes` was on IFilesystem, and implemented by mem-filesystem, before
+;; either host reify implemented it: every call against a real filesystem threw
+;; "No implementation of method: :read-bytes" while the suite stayed green,
+;; because the only test of it ran on the OTHER implementation. These tests are
+;; against the host on purpose.
+
+(deftest read-bytes-returns-unsigned-utf8-bytes-from-the-real-host
+  (let [root (temp-root)
+        h    (fs-under root)]
+    (fs/write h "t.txt" "あA")             ; U+3042 = E3 81 82
+    ;; unsigned, not the JVM's signed byte (-29 -127 -126)
+    (is (= [227 129 130 65] (fs/read-bytes h "t.txt")))
+    ;; and the two faces agree with each other
+    (is (= (fs/read-bytes h "t.txt") (fs/utf8-bytes (fs/read h "t.txt"))))))
+
+(deftest write-bytes-round-trips-content-that-is-not-text
+  (let [root (temp-root)
+        h    (fs-under root)
+        ;; 0 and 255 are the discriminating values: 0 terminates a C string,
+        ;; 255 is not a valid standalone UTF-8 byte, so a byte face that is
+        ;; secretly going through UTF-8 text mangles both.
+        blob [0 255 128 10 13 65]]
+    (fs/write-bytes h "bin/blob.dat" blob)
+    (is (= blob (fs/read-bytes h "bin/blob.dat")))
+    ;; write-bytes creates the parent directory, exactly as write does
+    (is (fs/exists? h "bin/blob.dat"))))
+
+(deftest write-bytes-and-write-see-the-same-file
+  (let [root (temp-root)
+        h    (fs-under root)]
+    (fs/write-bytes h "x" (fs/utf8-bytes "あA"))
+    (is (= "あA" (fs/read h "x")))
+    (fs/write h "x" "plain")
+    (is (= (fs/utf8-bytes "plain") (fs/read-bytes h "x")))))
+
+(deftest copy-is-byte-exact-and-creates-parents
+  (let [root (temp-root)
+        h    (fs-under root)
+        blob [0 255 128 66]]
+    (fs/write-bytes h "src.dat" blob)
+    (fs/copy h "src.dat" "deep/er/dst.dat")
+    (is (= blob (fs/read-bytes h "deep/er/dst.dat")))
+    ;; the source is untouched
+    (is (= blob (fs/read-bytes h "src.dat")))))
+
+(deftest copy-across-two-separately-granted-roots
+  (let [a (fs-under (temp-root))
+        b (fs-under (temp-root))]
+    (fs/write a "note.txt" "あ")
+    (fs/copy a "note.txt" b "copied/note.txt")
+    (is (= "あ" (fs/read b "copied/note.txt")))
+    ;; and it stayed inside b's root -- a path that escapes is still refused
+    (is (= :fs/escape (refusal-type #(fs/copy a "note.txt" b "../out.txt"))))))
+
+(deftest byte-face-refusals-carry-the-same-types-as-the-text-face
+  (let [root (temp-root)
+        h    (fs-under root)]
+    (is (= :fs/not-found  (refusal-type #(fs/read-bytes h "missing.txt"))))
+    (is (= :fs/absolute   (refusal-type #(fs/read-bytes h "/etc/passwd"))))
+    (is (= :fs/escape     (refusal-type #(fs/write-bytes h "../out.dat" [1]))))
+    (fs/write h "d/f" "x")
+    (is (= :fs/is-directory (refusal-type #(fs/read-bytes h "d"))))
+    ;; and the bound applies to the byte face too
+    (let [small (fs-under root :max-bytes 4)]
+      (is (= :fs/too-large (refusal-type #(fs/write-bytes small "big.dat" [1 2 3 4 5])))))))
+
+(deftest host-and-mem-agree-on-the-byte-face
+  ;; The mem-filesystem is what tests inject; if it disagrees with the host on
+  ;; bytes, a test that passes on mem proves nothing about production.
+  (let [h (fs-under (temp-root))
+        m (fs/mem-filesystem)]
+    (doseq [text ["" "A" "あA" "line\nline"]]
+      (fs/write h "f" text)
+      (fs/write m "f" text)
+      (is (= (fs/read-bytes m "f") (fs/read-bytes h "f")) (pr-str text)))
+    (doseq [blob [[] [0] [255 254] [0 255 128 10]]]
+      (fs/write-bytes h "b" blob)
+      (fs/write-bytes m "b" blob)
+      (is (= (fs/read-bytes m "b") (fs/read-bytes h "b")) (pr-str blob)))))
