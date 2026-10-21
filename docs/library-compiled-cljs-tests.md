@@ -5,6 +5,14 @@ multimethod used by `cljs.test`. Select it explicitly for a ClojureScript
 compiler build. The existing `kotoba.test` JVM/SCI function-shaped runner keeps
 its existing API, namespace and protocol identities.
 
+Git consumers that already use legacy pinned `text`/`spec` coordinates select
+the zero-dependency subproject with `:deps/root "lib/kotoba.test/compiled"`
+at a reviewed immutable Kotoba revision, using a distinct test-only coordinate.
+Its `:paths ["../src"]` reuses the one bridge source without copying it.
+Requiring `kotoba.test.cljs` needs no property-testing dependencies. This avoids
+mixing a parent package's local sibling coordinates with an application's
+legacy Git coordinates; Clojure tools.deps cannot compare those version types.
+
 ```clojure
 (ns example.checks
   (:require [kotoba.test.cljs :as t])
