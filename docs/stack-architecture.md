@@ -10,6 +10,25 @@ Orchestrates checking, project linking, runtime admission and user workflows thr
 
 ## Contract dependency direction
 
+Linked native callers keep recursive Form values and parsed policy Forms in
+the runtime. `eval-source-value`, `eval-cljk-source-value` and
+`eval-source-value-with-policy-bounded` return a typed evaluation outcome with
+the remaining shared fuel. Existing integer/text entry adapters keep their
+public signatures. Source policy, reader bounds and evaluation fuel are
+checked before returning either representation; passing a Form grants no
+provider access. See the shared
+[native execution-domain decision](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/adr/ADR-native-execution-domains.md).
+
+The complete runtime fixture is built and executed by
+`scripts/test-runtime-values-native.py` with explicit native compiler/loader
+artifacts and dependency source roots. The
+[recorded AArch64 evidence](evidence/native-runtime-values-20261021.json)
+covers typed strings/nested collections, integer API compatibility, shared
+evaluation fuel, reader bounds and policy refusal. It uses compiler source
+support at Amu `3fdfe65e` and bytes `04019b98`; those are explicit test inputs,
+not proof that today's default Amu main can rebuild its own native compiler.
+The C supervisor and pre-existing compiler remain in this verification route.
+
 Arrows are consumer → contract dependency. These are intended entrypoint
 boundaries, not whole-repository imports already achieved.
 
