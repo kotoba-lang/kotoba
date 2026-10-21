@@ -1,0 +1,119 @@
+#!/usr/bin/env kbb
+;; Run the `.kotoba` case batches for kotoba/json_scalar.kotoba on all three
+;; semantic targets (`:jvm-kir`, `:js`, `:wasm`) via amu's official harness.
+;;
+;; Why a splicer instead of one self-contained test file:
+;;
+;; - `amu test` takes a SINGLE source text, so a case can only call code in
+;;   the same file. Keeping the cases in the library file would ship test
+;;   exports inside the artifact a host imports.
+;; - That harness runs every case of one file against ONE instance, and fuel
+;;   is charged per function entry, so a whole suite shares one 512-unit
+;;   budget. Measured 2026-08-29: 23 cases in one file trap after the 12th on
+;;   `:js` and `:wasm`, while all 23 pass on `:jvm-kir`. Hence batches.
+;;
+;; Exit codes: 0 all passed, 1 a case failed, 2 the suite could not be RUN
+;; (missing input, unparseable report, a target that did not report). 2 is
+;; distinct from 1 on purpose -- "could not answer" must not look like
+;; "answered, and it was fine".
+
+(ns kotoba-test
+  (:require ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            ["node:child_process" :as cp]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def expected-targets #{:jvm-kir :js :wasm})
+
+;; Run from the repo root (that is where `kbb --backend sci scripts/kotoba_test.cljk` is
+;; invoked from); `REPO` overrides. Not derived from argv: under nbb argv[1]
+;; is the nbb binary, which silently resolved to /opt/homebrew.
+(def repo (path/resolve (or (.-REPO js/process.env) (.cwd js/process))))
+(def library (path/join repo "kotoba" "json_scalar.kotoba"))
+(def cases-dir (path/join repo "test" "kotoba"))
+(def amu (or (.-AMU js/process.env)
+             (path/join repo ".." "amu" "bin" "amu")))
+
+;; The exact line the splicer rewrites. Pinned literally so that reformatting
+;; the library's ns form fails loudly instead of silently splicing nothing.
+(def ns-line "(ns json-scalar\n  (:export [json-string-field]))")
+
+(defn die! [code msg]
+  (println (str "kotoba-test: " msg))
+  (.exit js/process code))
+
+(defn read! [p]
+  (when-not (fs/existsSync p) (die! 2 (str "missing input " p)))
+  (fs/readFileSync p "utf8"))
+
+(defn case-names [src]
+  (vec (map second (re-seq #"\(defn\s+(test-[A-Za-z0-9?*!-]+)\s*\[" src))))
+
+(defn run-batch [lib part-path]
+  (let [part (read! part-path)
+        names (case-names part)]
+    (when (zero? (count names))
+      (die! 2 (str "no test- cases found in " part-path)))
+    (when-not (str/includes? lib ns-line)
+      (die! 2 "library ns form does not match the pinned literal; splice would be a no-op"))
+    (let [exports (str "(ns json-scalar\n  (:export [json-string-field "
+                       (str/join " " names) "]))")
+          spliced (str (str/replace lib ns-line exports) "\n" part)
+          tmp (path/join (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-json-"))
+                         "json_scalar_cases.kotoba")]
+      (fs/writeFileSync tmp spliced)
+      (let [r (.spawnSync cp amu #js ["test" tmp "--json"]
+                          #js {:cwd repo :encoding "utf8" :maxBuffer 33554432})
+            out (str/trim (or (.-stdout r) ""))]
+        (when (empty? out)
+          (die! 2 (str "harness produced no report for " part-path "\n"
+                       (or (.-stderr r) ""))))
+        (let [report (try (edn/read-string out)
+                          (catch :default e
+                            (die! 2 (str "unparseable harness report for " part-path
+                                         ": " (.-message e)))))
+              results (:results report)
+              targets (set (keys results))
+              rows (mapcat val results)]
+          ;; Evidence floor: a batch counts as measured only if every target
+          ;; reported, and reported a row for every case.
+          (when-not (= expected-targets targets)
+            (die! 2 (str part-path ": targets reported " targets
+                         ", expected " expected-targets)))
+          (when-not (= (count rows) (* 3 (count names)))
+            (die! 2 (str part-path ": " (count rows) " result rows, expected "
+                         (* 3 (count names)))))
+          {:part (path/basename part-path)
+           :cases (count names)
+           :rows (count rows)
+           ;; Attribute each failure to the target whose result list it came
+           ;; from. Do NOT search for the row by value: rows from different
+           ;; targets can be equal maps, so a value search reports one target
+           ;; repeatedly and silently drops the others.
+           :failed (vec (for [[t rs] results r rs :when (not (:ok r))]
+                          (str (:test r) "@" t)))
+           :ok (every? :ok rows)})))))
+
+(defn -main []
+  (let [lib (read! library)
+        parts (->> (fs/readdirSync cases-dir)
+                   (filter #(str/ends-with? % ".kotoba-part"))
+                   sort
+                   (mapv #(path/join cases-dir %)))]
+    (when (zero? (count parts))
+      (die! 2 (str "no .kotoba-part batches in " cases-dir)))
+    (println (str "kotoba-test: " (count parts) " batch(es); targets "
+                  (str/join " " (sort (map name expected-targets)))))
+    (let [results (mapv #(run-batch lib %) parts)
+          cases (reduce + (map :cases results))
+          rows (reduce + (map :rows results))]
+      (doseq [r results]
+        (println (str "  " (:part r) ": " (:cases r) " cases, " (:rows r) " rows "
+                      (if (:ok r) "PASS" (str "FAIL " (:failed r))))))
+      (if (some (complement :ok) results)
+        (die! 1 (str "FAILED (" cases " cases, " rows " rows)"))
+        (println (str "kotoba-test: OK -- " cases " cases, " rows " rows"))))))
+
+(-main)
