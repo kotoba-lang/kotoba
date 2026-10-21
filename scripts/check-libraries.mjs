@@ -54,6 +54,15 @@ for (const id of ids) {
     origins++;
   }
   assert.deepEqual([...usedChanges].sort(), Object.keys(changes.files).sort(), "unused local-change entry");
+  for (const [file, addition] of Object.entries(changes.added ?? {})) {
+    const destination = path.resolve(root, file);
+    assert.ok(destination.startsWith(root + path.sep), `unconfined addition: ${file}`);
+    assert.ok(!seen.has(file), `imported source mislabeled as an addition: ${file}`);
+    assert.ok(addition.reason?.trim(), `unexplained addition: ${file}`);
+    assert.match(addition.sha256, shaPattern);
+    assert.ok(fs.lstatSync(destination).isFile(), `non-regular addition: ${file}`);
+    assert.equal(digest(fs.readFileSync(destination)), addition.sha256, `added source drift: ${file}`);
+  }
   // A deterministic source inventory digest, NOT a fabricated package CID or
   // DefCID. It covers implementation and dependency declarations, not repo HEAD.
   const implementationFiles = ["deps.edn"];
@@ -67,6 +76,8 @@ for (const id of ids) {
         assert.ok(!/\.(clj|cljs|cljc)$/.test(relative),
                   `${id}/${relative}: imported Clojure-family sources must use .cljk`);
         implementationFiles.push(relative);
+        assert.ok(seen.has(relative) || changes.added?.[relative],
+                  `${id}/${relative}: source has no origin or explicit addition record`);
         if (relative.startsWith("src/") && relative.endsWith(".cljk")) {
           const namespace = fs.readFileSync(path.join(root, relative), "utf8")
             .match(/\(ns\s+([^\s()]+)/)?.[1];
@@ -171,6 +182,40 @@ for (const review of reviews.reviews) {
   const migration = migrations.repositories.find(row => row.repo === review.repo);
   assert.ok(migration, `reviewed branch without source migration: ${review.repo}`);
   assert.ok(migration["reviewed-branches"].some(row => row.commit === review.commit && row.branch === review.branch));
+  if (review["integrated-files"]) {
+    // Adapted ports retain the exact reviewed input beside separately bound
+    // output bytes. Neither a prose decision nor an output hash alone proves
+    // which immutable branch was reviewed.
+    for (const file of review.files) {
+      const snapshot = review["source-snapshots"]?.[file];
+      assert.ok(snapshot?.startsWith(`${migration.destination}/provenance/branches/${review.commit}/`));
+      const source = path.resolve(repo, snapshot);
+      assert.ok(source.startsWith(repo + path.sep));
+      assert.ok(fs.lstatSync(source).isFile());
+      let bytes = fs.readFileSync(source);
+      if (review["source-snapshot-encoding"] === "base64") {
+        const encoded = bytes.toString("utf8").trimEnd();
+        bytes = Buffer.from(encoded, "base64");
+        assert.equal(bytes.toString("base64"), encoded, "noncanonical branch snapshot");
+      } else {
+        assert.equal(review["source-snapshot-encoding"], undefined);
+      }
+      assert.equal(digest(bytes), review["source-sha256"][file]);
+      assert.ok(review["integrated-files"].some(row => row.sources.includes(file)),
+                `${review.repo}/${file}: reviewed intent has no integrated destination`);
+    }
+    for (const file of review["integrated-files"]) {
+      const destination = path.resolve(repo, file.path);
+      assert.ok(destination.startsWith(repo + path.sep));
+      assert.ok(file.reason?.trim() && file.sources.length > 0);
+      assert.ok(file.sources.every(source => review.files.includes(source)));
+      assert.match(file.sha256, shaPattern);
+      assert.ok(fs.lstatSync(destination).isFile());
+      assert.equal(digest(fs.readFileSync(destination)), file.sha256,
+                   `${review.repo}@${review.commit}: adapted source drift`);
+    }
+    continue;
+  }
   for (const file of review.files) {
     const source = path.resolve(repo, migration.destination, file);
     assert.ok(source.startsWith(path.resolve(repo, migration.destination) + path.sep));
