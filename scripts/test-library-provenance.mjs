@@ -10,6 +10,7 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "kotoba-provenance-"));
 try {
   fs.cpSync(path.join(repo, "lib"), path.join(temporary, "lib"), { recursive: true });
+  fs.cpSync(path.join(repo, "hermes"), path.join(temporary, "hermes"), { recursive: true });
   fs.mkdirSync(path.join(temporary, "scripts"));
   const checker = path.join(temporary, "scripts/check-libraries.mjs");
   fs.copyFileSync(path.join(repo, "scripts/check-libraries.mjs"), checker);
@@ -65,5 +66,24 @@ try {
     fs.writeFileSync(sourceFile, originalSource);
     fs.writeFileSync(changeFile, originalChanges);
   }
-  console.log("library provenance: four source/receipt mutation refusals passed");
+  const worktrees = JSON.parse(fs.readFileSync(path.join(temporary, "lib/worktree-reviews.json"), "utf8"));
+  mutate(worktrees.reviews[0]["source-snapshot"],
+    bytes => Buffer.concat([bytes, Buffer.from("invalid")]), /AssertionError/);
+  mutate("lib/worktree-reviews.json", bytes => {
+    const data = JSON.parse(bytes);
+    data.reviews[0]["integrated-files"][0].sha256 = "0".repeat(64);
+    return JSON.stringify(data);
+  }, /reviewed worktree output drift/);
+  mutate("lib/worktree-reviews.json", bytes => {
+    const data = JSON.parse(bytes); data.reviews.pop();
+    return JSON.stringify(data);
+  }, /worktree review inventory mismatch/);
+  const homes = JSON.parse(fs.readFileSync(path.join(temporary, "lib/profile-homes.json"), "utf8"));
+  mutate(homes.profiles[0].files[0].destination,
+    bytes => Buffer.concat([bytes, Buffer.from("\n; drift\n")]), /preserved profile source drift/);
+  mutate("lib/profile-homes.json", bytes => {
+    const data = JSON.parse(bytes); data.profiles[0].files = [];
+    return JSON.stringify(data);
+  }, /incomplete profile source inventory/);
+  console.log("library provenance: nine source/receipt mutation refusals passed");
 } finally { fs.rmSync(temporary, { recursive: true, force: true }); }

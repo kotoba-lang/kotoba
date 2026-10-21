@@ -1,10 +1,12 @@
 # Native standard library compatibility (JUN-203)
 
 The sixteen retained source repositories were reviewed at immutable branch
-tips. Fifteen can retire after merged-main verification: async, EDN, JSON,
-process, I/O and its ten definition repositories. Text retains independent
-Hermes profile/cron branches and local WIP; it stays writable. No automation
-settings are copied or activated, and execution infrastructure stays separate.
+tips. All sixteen can retire after merged-main verification. The final text
+WIP inputs and parents are retained separately from their corrected outputs;
+JUN-232's explicit-fn change is ported onto the qualified I/O implementation.
+Text's three profile sources have a checked copy at `hermes/profiles/` and
+a corresponding source-home registry migration. No host profile is materialized,
+no cron is started, and execution infrastructure stays separate.
 
 The accepted [native API contract](ADR-261021-native-library-compat.kotoba)
 records the host/native distinctions. Existing host names and exact import
@@ -47,3 +49,16 @@ and public `bin/kotoba --runtime sci` checks exercise the host APIs separately.
 outputs separately. `local-changes.json` records every changed imported file
 and new native facade. `check-libraries.mjs` rejects source drift and undeclared
 additions. Git history and immutable consumers remain supported after archive.
+
+`worktree-reviews.json` binds both original text WIP files, parent bytes and
+patches to the adapted host formatter and boundary regressions. The prototype's
+`long(scaled + 0.5)` changes values just below a half and large integral values;
+host `Math/pow` and `Math/round` remain the oracle. Absolute value uses the local
+sign predicate, and fractional padding accepts a string. Native floating-format
+support is outside the declared bounded native text API.
+
+The Hermes branch's surviving files already match the imported default, with
+its obsolete Python predecessors absent. `profile-homes.json` binds complete
+source/destination inventories for all three preserved profile trees. The root
+agent registry changes only their source/home repository; identities, schedules,
+permissions and profile bodies remain unchanged.
