@@ -1,5 +1,11 @@
 # Bundled library source imports
 
+Names follow the language-owned [Kotoba naming Spec](https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/lang/naming.md).
+Dotted package IDs and Lisp namespace/function names are separate contexts.
+Operators, predicate/effect suffixes and other source punctuation retain their
+existing meaning. Canonical IDs forbid hyphens/spaces; explicit legacy aliases
+retain their spelling and exact one-hop resolution.
+
 `kotoba library import kotoba.coll kotoba.spec kotoba.json --json` resolves
 bundled source IDs. The installable `kotoba` checkout owns `lib/catalog.edn`;
 the [language authority](https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/library-import.edn)
