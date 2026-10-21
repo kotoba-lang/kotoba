@@ -14,6 +14,11 @@ owns the public shape and `kotoba.lang.library-import` resolver.
 The bundled project IDs are `kotoba.coll`, `kotoba.spec`, `kotoba.json`,
 `kotoba.set`, `kotoba.walk`, `kotoba.string`, `kotoba.time`, `kotoba.bytes`,
 `kotoba.pprint`, and `kotoba.error`.
+The later bootstrap/state packages and the tooling packages `kotoba.lsp`,
+`kotoba.lsp.rpc`, `kotoba.lint`, and `kotoba.lint.kotoba` are also listed in
+the [complete catalog](../lib/catalog.edn). For example, `kotoba.lsp.rpc`
+selects the retained Lisp namespace `kotoba.lsp-rpc`; dotted package identity
+does not rewrite a namespace's hyphens.
 They claim no DNS or ATProto namespace. Every legacy alias is declared on
 exactly one catalog package. Resolution is exact and case-sensitive; aliases
 are one hop, and a collision rejects the entire catalog. Unknown names fail

@@ -25,6 +25,10 @@ The bundled standard libraries live in this repository:
 | `kotoba.fmt` | `kotoba.fmt/src` | `kotoba.fmt`, `kotoba.lang.fmt` |
 | `kotoba.log` | `kotoba.log/src` | `kotoba.log`, `kotoba.lang.log` |
 | `kotoba.fs` | `kotoba.fs/src` | `kotoba.fs`, `kotoba.lang.fs` |
+| `kotoba.lsp` | `kotoba.lsp/src` | `kotoba.lsp`, `kotoba.lang.lsp` |
+| `kotoba.lsp.rpc` | `kotoba.lsp.rpc/src` | `kotoba.lsp-rpc`, `kotoba.lang.lsp-rpc` |
+| `kotoba.lint` | `kotoba.lint/src` | `kotoba.lint`, `kotoba.lang.lint` |
+| `kotoba.lint.kotoba` | `kotoba.lint.kotoba/src` | `kotoba.lint-kotoba`, `kotoba.lang.lint-kotoba` |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
@@ -71,6 +75,13 @@ changelogs, and READMEs inside
 the imports describe their original standalone repositories. This page and
 the [implementation ADR](../docs/ADR-kotoba-library-monorepo-and-lexicon-events.md)
 describe the current integration.
+
+The tooling packages import 31 licensed origins. Twelve compatibility modules
+are derived from the pinned Apache-2.0 LSP owner, with their original definition
+forms, explicit namespace bindings and license digests checked separately in
+`kotoba.lsp/derivations.json`. No active source is imported from the twelve
+license-less split repositories. Their complete Git histories remain recovery
+data. See [tooling consolidation](../docs/library-tooling-consolidation.md).
 
 This is source consolidation, host compatibility coverage and the declared
 native library fixture qualification. Signed release publication, full Kotoba

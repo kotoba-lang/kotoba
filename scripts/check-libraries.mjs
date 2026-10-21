@@ -139,6 +139,53 @@ assert.deepEqual([...registered].sort(), [...suites.portable, ...suites["jvm-onl
                  "test registry contains a missing or duplicate suite");
 console.log(`libraries: ${origins} pinned origins, ${files} imported files, portable test inventory verified`);
 
+// Compatibility modules derived from a licensed owner are not imports from
+// license-less split repositories. Bind each output to the original owner's
+// exact source and license. The portable/JVM suite also compares the actual
+// definition forms and the namespace's permitted dependency bindings.
+const derivedRoot = path.join(repo, "lib/kotoba.lsp");
+const derivations = readJSON(path.join(derivedRoot, "derivations.json"));
+assert.equal(derivations.schema, "kotoba.library-source-derivations.v1");
+assert.equal(derivations.derivations.length, 12);
+const derivedOrigins = readJSON(path.join(derivedRoot, "imports.json")).imports;
+const derivedChanges = readJSON(path.join(derivedRoot, "local-changes.json"));
+const derivedPaths = new Set();
+for (const row of derivations.derivations) {
+  assert.ok(!derivedPaths.has(row.path), "duplicate derived output");
+  derivedPaths.add(row.path);
+  assert.equal(row.path, `src/${row.namespace.replaceAll(".", "/").replaceAll("-", "_")}.cljk`);
+  const input = row["licensed-origin"];
+  assert.equal(input.repository, "kotoba-lang/lsp");
+  const owner = derivedOrigins.find(origin => origin.repo === "lsp" && origin.commit === input.commit);
+  assert.ok(owner, "derived source does not name the imported licensed owner");
+  for (const kind of ["source", "license"]) {
+    const original = owner.files.find(file => file.source === input[kind]);
+    assert.ok(original, "derived input is absent from the owner inventory");
+    assert.equal(input[`${kind}-sha256`], original.sha256, "derived input is not the immutable owner input");
+    const bytes = fs.readFileSync(path.join(derivedRoot, original.path));
+    if (kind === "license" && digest(bytes) !== original.sha256) {
+      // As with other imported LICENSE files, only an inherited empty final
+      // line may be removed. The exact original is retained in the bundle.
+      assert.equal(digest(Buffer.concat([bytes, Buffer.from("\n")])), original.sha256,
+                   "licensed derivation input drift");
+    } else assert.equal(digest(bytes), original.sha256, "licensed derivation input drift");
+  }
+  assert.equal(input.license, "LICENSE");
+  assert.equal(input.source, "src/kotoba/lang/lsp.cljk");
+  const output = path.resolve(derivedRoot, row.path);
+  assert.ok(output.startsWith(derivedRoot + path.sep), "unconfined derived output");
+  assert.equal(digest(fs.readFileSync(output)), row.sha256, "derived output drift");
+  assert.equal(derivedChanges.added[row.path]?.sha256, row.sha256, "derived output addition binding drift");
+  const compatibility = row["reviewed-compatibility"];
+  assert.match(compatibility.commit, /^[0-9a-f]{40}$/);
+  assert.match(compatibility["source-sha256"], shaPattern);
+  assert.equal(compatibility["normalized-implementation-equal"], true);
+  assert.equal(compatibility["source-imported"], false);
+  assert.ok(!derivedOrigins.some(origin => `kotoba-lang/${origin.repo}` === compatibility.repository),
+            "license-less compatibility input mislabeled as a source import");
+}
+console.log("licensed owner derivations: 12 compatibility modules bound to original source and license");
+
 // Retirement eligibility is bound to reviewed default-source bytes, not just
 // an old import commit. The live archive operation must still recheck GitHub
 // and local WIP; this offline gate does not perform repository mutations.

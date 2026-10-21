@@ -104,5 +104,20 @@ try {
   } finally {
     fs.writeFileSync(configPath, oldConfig); fs.writeFileSync(homesPath, oldHomes);
   }
-  console.log("library provenance: ten source/receipt/rail mutation refusals passed");
+  mutate("lib/kotoba.lsp/derivations.json", bytes => {
+    const data = JSON.parse(bytes);
+    data.derivations[0]["licensed-origin"].repository = "kotoba-lang/lsp-position";
+    return JSON.stringify(data);
+  }, /AssertionError/);
+  mutate("lib/kotoba.lsp/derivations.json", bytes => {
+    const data = JSON.parse(bytes);
+    data.derivations[0]["licensed-origin"]["license-sha256"] = "0".repeat(64);
+    return JSON.stringify(data);
+  }, /derived input is not the immutable owner input/);
+  mutate("lib/kotoba.lsp/derivations.json", bytes => {
+    const data = JSON.parse(bytes);
+    data.derivations[0]["reviewed-compatibility"]["source-imported"] = true;
+    return JSON.stringify(data);
+  }, /AssertionError/);
+  console.log("library provenance: thirteen source/receipt/rail/derivation mutation refusals passed");
 } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
