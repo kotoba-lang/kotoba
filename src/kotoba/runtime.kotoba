@@ -1,8 +1,9 @@
-;; Kotoba-target runtime entry point. The host-compatible runtime remains in
-;; runtime.cljk; this native boundary exports scalar evaluation summaries and
-;; keeps recursive source forms inside the linked Kotoba call graph.
+;; Kotoba runtime. Linked callers retain typed values and policy Forms in one
+;; execution domain. Scalar summaries below are compatibility/entry adapters;
+;; they are not the representation used between runtime functions.
 (ns kotoba.runtime
   (:export [eval-source eval-source-bounded eval-cljk-source eval-cljk-source-bounded
+            eval-source-value eval-cljk-source-value eval-source-value-with-policy-bounded
             eval-source-with-policy eval-source-with-policy-bounded
             eval-cljk-source-with-policy eval-cljk-source-with-policy-bounded
             align-to heap-base uleb sleb32 f32-bits-le-bytes
@@ -26,6 +27,9 @@
              :runtime/eval-summary [:record :runtime/eval-summary
                                     [[:ok :i64] [:value :i64] [:error :string]
                                      [:steps :i64] [:fuel :i64]]]
+             :runtime/eval-out [:record :runtime/eval-out
+                                [[:ok :bool] [:value [:ref :form/r]]
+                                 [:error :string] [:fuel :i64]]]
              :runtime/policy-result [:record :runtime/policy-result
                                      [[:ok :bool] [:value [:ref :form/r]]
                                       [:error :string]]]}))
@@ -62,14 +66,14 @@
   (record-get [:ref :kotoba.reader/out] result :at))
 
 (defn- eval-failure [message :string fuel :i64]
-  [:ref :runtime/eval-summary]
-  (record-new [:ref :runtime/eval-summary] 0 0 message 0 fuel))
+  [:ref :runtime/eval-out]
+  (record-new [:ref :runtime/eval-out] false (form/nil-form) message fuel))
 
 (defn- eval-parsed-result [parsed [:ref :kotoba.reader/out]
                            forms [:list [:ref :form/r]]
                            surface-forms [:list [:ref :form/r]]
                            fuel :i64 policy [:ref :form/r]]
-  [:ref :runtime/eval-summary]
+  [:ref :runtime/eval-out]
   (let [error (record-get [:ref :kotoba.reader/out] parsed :err)
         count (vector-count forms)
         raw-violation (if (string=? error "")
@@ -77,36 +81,27 @@
                         "")]
     (cond
       (not (string=? error ""))
-      (record-new [:ref :runtime/eval-summary] 0 0 error 0 fuel)
+      (eval-failure error fuel)
 
       (= count 0)
-      (record-new [:ref :runtime/eval-summary] 0 0
-                  "source must contain at least one form" 0 fuel)
+      (eval-failure "source must contain at least one form" fuel)
 
       (not (string=? raw-violation ""))
-      (record-new [:ref :runtime/eval-summary] 0 0
-                  (string-concat "raw linear-memory access denied: " raw-violation)
-                  0 fuel)
+      (eval-failure (string-concat "raw linear-memory access denied: " raw-violation) fuel)
 
       :else
-      (let [result (evaluator/eval-program forms fuel)]
-        (record-new [:ref :runtime/eval-summary]
-                    (record-get [:ref :runtime/eval-summary] result :ok)
-                    (record-get [:ref :runtime/eval-summary] result :value)
-                    (record-get [:ref :runtime/eval-summary] result :error)
-                    (record-get [:ref :runtime/eval-summary] result :steps)
-                    (record-get [:ref :runtime/eval-summary] result :fuel))))))
+      (evaluator/eval-program-value forms fuel))))
 
 (defn- eval-reader-result [parsed [:ref :kotoba.reader/out] fuel :i64
                            policy [:ref :form/r]]
-  [:ref :runtime/eval-summary]
+  [:ref :runtime/eval-out]
   (let [forms (record-get [:ref :kotoba.reader/out] parsed :forms)]
     (eval-parsed-result parsed forms forms fuel policy)))
 
 (defn- eval-source-with-form-policy-bounded
   [source :string fuel :i64 policy [:ref :form/r]
    lower-surface? :bool max-depth :i64 max-token-bytes :i64]
-  [:ref :runtime/eval-summary]
+  [:ref :runtime/eval-out]
   "Apply source policy to the original reader forms, then optionally lower
   `.cljk` syntax before evaluating it. This keeps raw-memory checks ahead of
   syntax lowering, matching the host runtime's surface-source boundary."
@@ -126,32 +121,53 @@
 (defn- eval-source-with-form-policy [source :string fuel :i64
                                     policy [:ref :form/r]
                                     lower-surface? :bool]
-  [:ref :runtime/eval-summary]
+  [:ref :runtime/eval-out]
   (eval-source-with-form-policy-bounded
    source fuel policy lower-surface?
    (reader-depth/reader-depth-limit) 0))
 
-(defn eval-source [source :string fuel :i64] [:ref :runtime/eval-summary]
+(defn eval-source-value [source :string fuel :i64] [:ref :runtime/eval-out]
   "Read source with the native Kotoba reader, then evaluate it with a shared
   fuel budget. Parsed forms and function values stay inside the typed runtime."
   (eval-reader-result
    (reader/read-forms-bounded source (reader-depth/reader-depth-limit) 0)
    fuel (form/nil-form)))
 
+(defn eval-cljk-source-value [source :string fuel :i64] [:ref :runtime/eval-out]
+  "Evaluate surface source with typed results, preserving the original-source
+  raw-memory gate and the caller's shared evaluation fuel."
+  (eval-source-with-form-policy source fuel (form/nil-form) true))
+
+(defn eval-source-value-with-policy-bounded
+  [source :string fuel :i64 policy-form [:ref :form/r] lower-surface? :bool
+   max-depth :i64 max-token-bytes :i64]
+  [:ref :runtime/eval-out]
+  "Internal typed entry. Policy is an already parsed Form, never serialized
+  to EDN between Kotoba calls. Admission and reader/fuel bounds still apply."
+  (let [checked (policy/validate-policy-form policy-form)]
+    (if (record-get [:ref :runtime/policy-result] checked :ok)
+      (eval-source-with-form-policy-bounded
+       source fuel policy-form lower-surface? max-depth max-token-bytes)
+      (eval-failure (record-get [:ref :runtime/policy-result] checked :error) fuel))))
+
+(defn eval-source [source :string fuel :i64] [:ref :runtime/eval-summary]
+  "Compatibility integer entry; linked consumers use eval-source-value."
+  (evaluator/integer-summary (eval-source-value source fuel) fuel))
+
 (defn eval-source-bounded [source :string fuel :i64 max-depth :i64
                            max-token-bytes :i64]
   [:ref :runtime/eval-summary]
   "Read and evaluate source with explicit reader depth and token-byte limits.
   A zero limit leaves that reader dimension unbounded."
-  (eval-reader-result
+  (evaluator/integer-summary (eval-reader-result
    (reader/read-forms-bounded source max-depth max-token-bytes)
-   fuel (form/nil-form)))
+   fuel (form/nil-form)) fuel))
 
 (defn eval-cljk-source [source :string fuel :i64] [:ref :runtime/eval-summary]
   "Read `.cljk` Kotoba surface source, lower the admitted syntax sugar in the
   Kotoba form pipeline, then evaluate the resulting core forms. `.kotoba` core
   source continues to use eval-source without surface lowering."
-  (eval-source-with-form-policy source fuel (form/nil-form) true))
+  (evaluator/integer-summary (eval-cljk-source-value source fuel) fuel))
 
 (defn eval-cljk-source-bounded [source :string fuel :i64 max-depth :i64
                                 max-token-bytes :i64]
@@ -159,22 +175,22 @@
   "Read, lower, and evaluate `.cljk` source under explicit delimiter-depth
   and token-byte limits. Raw-memory policy is checked against the original
   surface forms before lowering. A zero limit leaves that dimension unbounded."
-  (eval-source-with-form-policy-bounded
-   source fuel (form/nil-form) true max-depth max-token-bytes))
+  (evaluator/integer-summary (eval-source-with-form-policy-bounded
+   source fuel (form/nil-form) true max-depth max-token-bytes) fuel))
 
 (defn- eval-source-policy-text [source :string fuel :i64 policy-text :string
                                lower-surface? :bool max-depth :i64
                                max-token-bytes :i64]
   [:ref :runtime/eval-summary]
   (let [parsed-policy (policy/parse-policy-text policy-text)]
-    (if (record-get [:ref :runtime/policy-result] parsed-policy :ok)
+    (evaluator/integer-summary (if (record-get [:ref :runtime/policy-result] parsed-policy :ok)
       (eval-source-with-form-policy-bounded
        source fuel
        (record-get [:ref :runtime/policy-result] parsed-policy :value)
        lower-surface? max-depth max-token-bytes)
       (eval-failure
        (record-get [:ref :runtime/policy-result] parsed-policy :error)
-       fuel))))
+       fuel)) fuel)))
 
 (defn eval-source-with-policy [source :string fuel :i64 policy-text :string]
   [:ref :runtime/eval-summary]
