@@ -22,9 +22,11 @@ or a signed subtree release.
 
 ## Inventory and boundaries
 
-[The org inventory](library-repository-inventory.json) records 2,792 repositories
-observed on 2026-10-21, with 2,754 public repository names. Non-public details are
-omitted. Its categories are triage, not semantic qualification or archive proof.
+[The refreshed org inventory](library-repository-inventory.json) records 2,668
+repositories observed on 2026-10-22 JST, with 2,630 public repository names.
+Non-public details are omitted. Its categories are triage, not semantic
+qualification or archive proof. The [continuing org review](org-consolidation-review.md)
+records the wider goal and ten additional same-family definitions.
 
 - Standard libraries with coordinated maintenance belong in the monorepo.
   Definition identity and package release identity remain independent of Git
@@ -42,7 +44,9 @@ omitted. Its categories are triage, not semantic qualification or archive proof.
 The second wave (JUN-196) adds text/test/EDN compatibility readers,
 io/fs/process, async/scheduler/store, fmt/log: 11 packages and 189 additional
 source repositories. The complete catalog has 21 IDs, 58 exact old-name aliases,
-364 origins and 1,691 imported files. [Wave 2 review](library-wave2.md) records
+364 origins and 1,691 imported files at that checkpoint. Ten subsequently
+reviewed process/test/string definitions bring the source inventory to 374
+origins and 1,741 imported files. [Wave 2 review](library-wave2.md) records
 bootstrap self-dependency removal, namespace ownership, state/host boundaries,
 and the separate json/bytes branch decisions.
 
