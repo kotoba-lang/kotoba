@@ -187,6 +187,42 @@ shells and Amu/execution foundations remain separate pending their own source,
 ownership and compatibility reviews. Other Kotobase families and private sources
 remain under review; private details are not included in this public inventory.
 
+## Database engine source owner monorepo
+
+Three opt-in legacy, LSM and Prolly engine projects now share the existing
+`kotoba-lang/kotobase-engine-contract` owner under
+`implementations/kotoba.kotobase.engine.*`. The neutral root production source,
+dependency graph and qualification matrix are unchanged. Three source IDs and
+six exact repository/coordinate aliases preserve public namespaces and logical
+versus physical root semantics. Each project retains its license, dependencies,
+build and release boundary. Source lookup grants no runtime admission and does
+not expand the standard library catalog. See
+[source PR #11](https://github.com/kotoba-lang/kotobase-engine-contract/pull/11).
+
+Actual source main `87213760c7394271301423c08a4ec1106370527e` passed four independent JVM projects,
+95 tests / 425 assertions; SCI and compiled Node each ran100 unit tests /
+374 assertions, with three SCI and two compiled asynchronous provider fixtures.
+All three declared lint profiles reported zero errors/warnings. The public
+Kotoba CLI resolved all three source origins inside the owner; nine exact
+ID/alias lookups and source-refusal cases passed. A planted compiled failure and
+error returned exit1. Existing Actions remain disabled, so these are local
+main results, not CI success or native/live/production-default qualification.
+
+Three complete histories / 83 Git refs / 24 historical PR heads / 56 original
+file hashes restore and fsck successfully, including an explicitly bound linked
+LSM worktree HEAD. Five nonancestor commits have hash-bound branch review
+dispositions. The unused peer async-get option and incompatible LSM format-v2
+experiment remain fully recoverable; their APIs/formats are not claimed migrated
+or admitted. Original checkouts, branches, stashes and the experimental linked
+worktree remain in place. After main verification and immediate source/ref/WIP
+rechecks, all three child URLs were archived, with identical defaults, heads,
+tags and source timestamps. See the [merged receipt](https://github.com/kotoba-lang/kotobase-engine-contract/blob/ef214ec7a9801c8ad546ef641bd179f0abc26c22/maintenance/engine-consolidation/2026-10-22/receipt.json) and
+[receipt PR #12](https://github.com/kotoba-lang/kotobase-engine-contract/pull/12).
+No repository was deleted in this wave. The original239 dependency-pin holds
+are unchanged. Physical tree mechanisms, storage owners/providers, the frozen
+peer, Amu and other execution foundations remain independent. Other Kotobase
+families and private sources still need their own review.
+
 ## Remaining ownership decisions
 
 Other product/engine/database families and adapter catalogs remain in ownership
