@@ -4,7 +4,7 @@ The sixteen retained source repositories were reviewed at immutable branch
 tips. All sixteen can retire after merged-main verification. The final text
 WIP inputs and parents are retained separately from their corrected outputs;
 JUN-232's explicit-fn change is ported onto the qualified I/O implementation.
-Text's three profile sources have a checked copy at `hermes/profiles/` and
+Text's three profile sources have checked outputs at `hermes/profiles/` and
 a corresponding source-home registry migration. No host profile is materialized,
 no cron is started, and execution infrastructure stays separate.
 
@@ -59,6 +59,9 @@ support is outside the declared bounded native text API.
 
 The Hermes branch's surviving files already match the imported default, with
 its obsolete Python predecessors absent. `profile-homes.json` binds complete
-source/destination inventories for all three preserved profile trees. The root
-agent registry changes only their source/home repository; identities, schedules,
+source/destination inventories for all three preserved profile trees. Their
+legacy configs are retained as inactive input; maintained configs use the
+currently configured Hermes OpenRouter rail, with native inference providers
+and fallbacks removed. Non-routing values are preserved. The root agent
+registry changes only their source/home repository; identities, schedules,
 permissions and profile bodies remain unchanged.

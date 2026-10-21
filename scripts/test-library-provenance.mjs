@@ -85,5 +85,24 @@ try {
     const data = JSON.parse(bytes); data.profiles[0].files = [];
     return JSON.stringify(data);
   }, /incomplete profile source inventory/);
-  console.log("library provenance: nine source/receipt mutation refusals passed");
+  const config = homes.profiles[0].files.find(file => file.destination.endsWith("/config.yaml"));
+  const configPath = path.join(temporary, config.destination);
+  const homesPath = path.join(temporary, "lib/profile-homes.json");
+  const oldConfig = fs.readFileSync(configPath);
+  const oldHomes = fs.readFileSync(homesPath);
+  try {
+    const changed = oldConfig.toString("utf8").replace("provider: openrouter", "provider: murakumo");
+    assert.notEqual(changed, oldConfig.toString("utf8"));
+    fs.writeFileSync(configPath, changed);
+    const forged = JSON.parse(oldHomes);
+    forged.profiles[0].files.find(file => file.destination === config.destination)["destination-sha256"] =
+      createHash("sha256").update(changed).digest("hex");
+    fs.writeFileSync(homesPath, JSON.stringify(forged));
+    const result = check();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Hermes profile uses a reserved native inference rail/);
+  } finally {
+    fs.writeFileSync(configPath, oldConfig); fs.writeFileSync(homesPath, oldHomes);
+  }
+  console.log("library provenance: ten source/receipt/rail mutation refusals passed");
 } finally { fs.rmSync(temporary, { recursive: true, force: true }); }

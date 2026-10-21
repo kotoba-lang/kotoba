@@ -283,6 +283,7 @@ for (const profile of homes.profiles) {
   assert.match(profile.id, /^[a-z][a-z0-9-]+$/);
   assert.equal(profile["source-repo"], "kotoba-lang/text");
   assert.equal(profile["home-repo"], "kotoba-lang/kotoba");
+  assert.equal(profile["hermes-rail"].provider, "openrouter");
   assert.match(profile["source-commit"], /^[0-9a-f]{40}$/);
   assert.deepEqual(profile.files.map(file => file.source).sort(),
     retainedFiles(`lib/kotoba.text/hermes/profiles/${profile.id}`), "incomplete profile source inventory");
@@ -292,11 +293,37 @@ for (const profile of homes.profiles) {
     assert.ok(file.source.startsWith(`lib/kotoba.text/hermes/profiles/${profile.id}/`));
     assert.ok(file.destination.startsWith(`hermes/profiles/${profile.id}/`));
     assert.match(file.sha256, shaPattern);
+    if (file["destination-sha256"]) {
+      assert.ok(file.source.endsWith("/config.yaml"));
+      assert.equal(file.adaptation, "hermes-openrouter-rail");
+      assert.ok(file.reason?.trim(), "unexplained profile adaptation");
+      assert.match(file["destination-sha256"], shaPattern);
+    }
     for (const relative of [file.source, file.destination]) {
       const destination = path.resolve(repo, relative);
       assert.ok(destination.startsWith(repo + path.sep));
-      assert.equal(digest(fs.readFileSync(destination)), file.sha256, "preserved profile source drift");
+      const expected = relative === file.destination ? file["destination-sha256"] ?? file.sha256 : file.sha256;
+      assert.equal(digest(fs.readFileSync(destination)), expected, "preserved profile source drift");
     }
+  }
+  const config = fs.readFileSync(path.join(repo, `hermes/profiles/${profile.id}/config.yaml`), "utf8");
+  assert.doesNotMatch(config, /murakumo|mishima|api\.kotoba\.cloud/i,
+    "Hermes profile uses a reserved native inference rail");
+  const providers = [...config.matchAll(/^\s*(?:-\s+)?provider:\s*(\S+)\s*$/gm)].map(match => match[1]);
+  assert.ok(providers.length > 0 && providers.every(provider => provider === "openrouter"),
+    "Hermes profile has an undeclared inference provider");
+  const model = config.match(/^model:\n((?:[ \t]+[^\n]*\n)*)/m)?.[1];
+  assert.ok(model, "Hermes model declaration missing");
+  assert.equal(model.match(/^  default:\s*(\S+)\s*$/m)?.[1], profile["hermes-rail"].model);
+  assert.match(config, /^fallback_providers: \[\]\s*$/m, "implicit profile fallback");
+  for (const match of config.matchAll(/https?:\/\/[^\s]+/g)) {
+    assert.equal(new URL(match[0]).origin, "https://openrouter.ai", "unexpected Hermes inference endpoint");
+  }
+  const jobs = readJSON(path.join(repo, `hermes/profiles/${profile.id}/cron/jobs.json`));
+  for (const job of jobs.jobs) {
+    assert.equal(job.model, null, "cron must inherit the reviewed Hermes rail");
+    assert.equal(job.provider, null, "cron provider pin bypasses the reviewed rail");
+    assert.equal(job.base_url, null, "cron endpoint pin bypasses the reviewed rail");
   }
 }
 console.log(`retained worktrees: ${worktrees.reviews.length}; relocated profile sources: ${homes.profiles.length}`);

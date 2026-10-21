@@ -30,9 +30,11 @@ sessions, memories, logs, caches, run state.
 | `whois-org-crawl` | Preserved text-library profile source |
 | `wiki-standards-crawl` | Standards-body crawl profile source |
 
-The three text-library profile trees moved from `kotoba-lang/text` without
-changing their contents. `lib/profile-homes.json` binds every copied file to
-the imported default snapshot. Library import adds only library source paths;
-it does not load these profiles. This migration does not materialize host
-profiles or start cron jobs. Amu and other execution infrastructure remain
-in separate repositories.
+The three text-library profile trees moved from `kotoba-lang/text` with their
+original inputs retained. `lib/profile-homes.json` binds every source and
+destination file. Maintained configs use the currently configured Hermes
+OpenRouter rail: legacy native inference providers, gateways and fallbacks
+are removed. Non-routing values, profile bodies, identities and schedules
+are preserved. Library import does not load these profiles, and this migration
+does not materialize host profiles or start cron jobs. Amu and other execution
+infrastructure remain in separate repositories.
