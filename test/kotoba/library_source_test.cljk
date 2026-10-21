@@ -1,0 +1,118 @@
+(ns kotoba.library-source-test
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [json.data-json :as json]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.cli :as cli]
+            [kotoba.library-source :as source]
+            [kotoba.launcher :as launcher])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(deftest every-public-id-and-legacy-alias-resolves-the-installed-bundle
+  (let [catalog (edn/read-string (slurp "lib/catalog.edn"))]
+    (doseq [package (:packages catalog)
+            name (cons (:id package) (:aliases package))]
+      (let [result (launcher/dispatch ["library" "import" name])]
+        (is (:kotoba.cli/ok? result))
+        (is (= :library/import-resolved (:kotoba.cli/code result)))
+        (is (= [(:id package)] (get-in result [:kotoba.cli/data :ids])))
+        (is (= [(str (io/file (source/source-root) (:path package) "src"))]
+               (get-in result [:kotoba.cli/data :classpath])))))))
+
+(deftest source-import-refusals-precede-execution
+  (with-redefs [shell/sh (fn [& _] (throw (Exception. "must not launch a process")))]
+    (doseq [[argv code] [[["library" "import" "kotoba.missing"] :library/not-found]
+                         [["library" "import" "kotoba.coll" "missing"] :library/not-found]
+                         [["run" "test/fixtures/library-import/canonical.cljk" "--library" "kotoba.coll"]
+                          :library/runtime-required]
+                         [["run" "source.kotoba" "--runtime" "sci" "--library" "kotoba.coll"]
+                          :library/source-unsupported]
+                         [["run" "source.cljk" "--runtime" "sci" "--library" "kotoba.coll" "--policy" "policy.edn"]
+                          :library/unsupported-option]
+                         [["run" "source.cljk" "--runtime" "sci" "--library" "kotoba.coll" "--arg" "1 2"]
+                          :library/argument-invalid]]]
+      (is (= code (:kotoba.cli/code (launcher/dispatch argv))) (pr-str argv)))))
+
+(deftest a-bundled-source-symlink-cannot-escape-the-installed-tree
+  (let [attributes (make-array FileAttribute 0)
+        root (.toFile (Files/createTempDirectory "kotoba-import-root" attributes))
+        outside (.toFile (Files/createTempDirectory "kotoba-import-outside" attributes))
+        package (io/file root "lib/kotoba.coll")
+        catalog (io/file root "lib/catalog.edn")
+        link (io/file package "src")]
+    (try
+      (.mkdirs package)
+      (spit catalog (pr-str {:kotoba.library-catalog/version 1
+                            :packages [{:id "kotoba.coll" :kind :library
+                                        :path "lib/kotoba.coll" :source-paths ["src"] :aliases []}]}))
+      (Files/createSymbolicLink (.toPath link) (.toPath outside) attributes)
+      (with-redefs [source/source-root (fn [] root)]
+        (is (= :library/source-path-unavailable
+               (:kotoba.cli/code (source/import-result (cli/parse-argv ["import" "kotoba.coll"]))))))
+      (finally (.delete link) (.delete catalog) (.delete package)
+               (.delete (io/file root "lib")) (.delete root) (.delete outside)))))
+
+(defn- source-run [entry names]
+  (launcher/dispatch (into ["run" entry "--runtime" "sci" "--arg" "42"]
+                           (mapcat (fn [name] ["--library" name]) names))))
+
+(deftest canonical-and-legacy-imports-execute-real-bundled-definitions
+  (let [canonical (source-run "test/fixtures/library-import/canonical.cljk"
+                              ["kotoba.coll" "kotoba.spec" "kotoba.json"])
+        aliases (mapv #(source-run "test/fixtures/library-import/legacy.cljk" %)
+                      [["kotoba-lang/coll" "kotoba-lang/spec" "kotoba-lang/json"]
+                       ["io.github.kotoba-lang/coll" "io.github.kotoba-lang/spec" "io.github.kotoba-lang/json"]
+                       ["kotoba.lang.coll" "kotoba.lang.spec" "kotoba.lang.json"]])]
+    (doseq [result (cons canonical aliases)]
+      (is (:kotoba.cli/ok? result) (pr-str result))
+      (is (= :run/completed (:kotoba.cli/code result)))
+      (is (= :sci (get-in result [:kotoba.cli/data :runtime])))
+      (is (= {:collection {:a 43} :valid true :json "{\"ok\":true}"}
+             (dissoc (get-in result [:kotoba.cli/data :value]) :origins)))
+      (doseq [[kind path] (get-in result [:kotoba.cli/data :value :origins])]
+        (is (str/includes? path (str "/lib/kotoba." (name kind) "/src/")) path))
+      (is (= (get-in canonical [:kotoba.cli/data :value])
+             (get-in result [:kotoba.cli/data :value]))))))
+
+(deftest scalar-edn-arguments-results-and-program-output-survive-the-driver
+  (doseq [text ["nil" "false" "-42" ":kotoba.library-source/eof"]]
+    (let [result (launcher/dispatch ["run" "test/fixtures/library-import/canonical.cljk"
+                                     "--runtime" "sci" "--function" "echo" "--arg" text
+                                     "--library" "kotoba.coll" "--library" "kotoba.spec"
+                                     "--library" "kotoba.json"])]
+      (is (:kotoba.cli/ok? result) (pr-str result))
+      (is (= (edn/read-string text) (get-in result [:kotoba.cli/data :value])))
+      (is (= "echo\n" (get-in result [:kotoba.cli/data :stdout]))))))
+
+(deftest public-launcher-imports-from-a-different-working-directory
+  (let [directory (.toFile (Files/createTempDirectory "kotoba-public-import" (make-array FileAttribute 0)))
+        entry (io/file directory "demo space.cljk")
+        helper (io/file directory "src/example/helper.cljk")
+        executable (.getCanonicalPath (io/file "bin/kotoba"))]
+    (try
+      (io/make-parents helper)
+      (spit helper "(ns example.helper) (defn next-value [n] (inc n))")
+      (spit entry (-> (slurp "test/fixtures/library-import/canonical.cljk")
+                      (str/replace "(:require " "(:require [example.helper :as helper] ")
+                      (str/replace "coll/map-vals inc" "coll/map-vals helper/next-value")))
+      (let [execution (shell/sh executable "run" "--json" "demo space.cljk"
+                                "--runtime" "sci" "--library" "kotoba-lang/coll"
+                                "--library" "kotoba.spec" "--library" "kotoba.json"
+                                "--source-path" "src" "--arg" "-42"
+                                :dir (str directory))
+            result (json/read-str (:out execution) :key-fn keyword)]
+        (is (zero? (:exit execution)) (str (:out execution) (:err execution)))
+        (is (:kotoba.cli/ok? result))
+        (is (= {:a -41} (get-in result [:kotoba.cli/data :value :collection])))
+        (is (true? (get-in result [:kotoba.cli/data :value :valid]))))
+      (let [execution (shell/sh executable "library" "import" "--json" "kotoba-lang/json"
+                                :dir (str directory))
+            result (json/read-str (:out execution) :key-fn keyword)]
+        (is (zero? (:exit execution)) (:out execution))
+        (is (= ["kotoba.json"] (get-in result [:kotoba.cli/data :ids]))))
+      (finally (.delete entry) (.delete helper)
+               (.delete (io/file directory "src/example"))
+               (.delete (io/file directory "src")) (.delete directory)))))

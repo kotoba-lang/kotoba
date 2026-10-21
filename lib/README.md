@@ -21,11 +21,13 @@ node scripts/check-libraries.mjs
 node scripts/test-libraries.mjs
 node scripts/test-libraries.mjs --check-design
 
-KBB_NO_STDLIB=1 kbb --backend sci --config lib/nbb.edn --classpath src \
-  scripts/library-catalog.cljk resolve kotoba-lang/json
-KBB_NO_STDLIB=1 kbb --backend sci --config lib/nbb.edn --classpath src \
-  scripts/library-catalog.cljk classpath kotoba.coll kotoba.spec kotoba.json
+bin/kotoba library import kotoba-lang/json --json
+bin/kotoba library import kotoba.coll kotoba.spec kotoba.json --json
 ```
+
+See [public source imports](../docs/library-source-import.md) to execute a
+program with `run --runtime sci --library <ID-or-alias>`. The development
+catalog facade delegates resolution to the language-owned portable contract.
 
 The test driver uses the installed `.cljk` SCI engine (`KBB_ENGINE` can select
 it), the existing native `bin/kbb_deps.cljk` resolver, the declared immutable
