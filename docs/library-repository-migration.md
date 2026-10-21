@@ -61,9 +61,10 @@ archiving, the operator verifies:
 4. Default/branch state and local WIP are rechecked immediately before the
    GitHub operation; any change holds the repository. The result is read back.
 
-At review, `json` and `bytes` have unintegrated branches, and `set-rename-keys`
-has local changes. Their source is bundled, but their repositories remain
-writable. The remaining 172 repositories are eligible only after the main
+At review, `json` and `bytes` have unintegrated branches. Their source is
+bundled, but their repositories remain writable. The untracked Finder metadata
+in the `set-rename-keys` checkout is reviewed as non-source data and preserved
+locally. The remaining 173 repositories are eligible only after the main
 verification gate. The inventory is an eligibility record, not a claim that
 the remote operation has already occurred. Actual archive/readback evidence is
 recorded in [JUN-195](https://linear.app/com-junkawasaki/issue/JUN-195).
