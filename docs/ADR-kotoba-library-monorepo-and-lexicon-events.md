@@ -44,7 +44,8 @@ existing signed manifest or select a floating latest version.
 ## Physical repository boundaries
 
 `kotoba-lang/kotoba` owns the standard-library source pilot under
-`lib/kotoba.{coll,spec,json}`. Each package retains its API, tests, license,
+`lib/kotoba.{coll,spec,json}` and the
+[standard-library consolidation waves](library-repository-migration.md). Each package retains its API, tests, license,
 dependency declarations, provenance, and eventual independent release identity.
 Its same-family per-definition dependencies are included in that package.
 `imports.json` names each original commit, Git tree, and file digest;

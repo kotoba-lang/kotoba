@@ -1,0 +1,117 @@
+(ns kotoba.bytes-test
+  "`kotoba.bytes` says every value it handles is a `vector<int 0..255>`. These
+   are the tests for the one function that has to make that true of values
+   arriving from outside."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.bytes :as b]))
+
+(defn- host-bytes
+  "A platform byte container holding 1, 0xFF, 0 — the shape a store hands back.
+
+   On the JVM that is a signed `byte[]`, where 0xFF is -1; under ClojureScript
+   a `Uint8Array`, where it is 255. The divergence is the reason this function
+   exists."
+  []
+  #?(:clj  (byte-array [1 -1 0])
+     :cljs (js/Uint8Array.from #js [1 255 0])))
+
+(deftest absent-is-not-empty
+  (testing "nil survives as nil"
+    (is (nil? (b/->bytes nil))))
+  (testing "and an empty container is empty, not nil"
+    (is (= [] (b/->bytes [])))
+    (is (some? (b/->bytes [])))))
+
+(deftest host-containers-become-unsigned-vectors
+  (testing "a platform byte container, whatever its signedness"
+    (is (= [1 255 0] (b/->bytes (host-bytes)))))
+  (testing "a vector already in range is unchanged in value"
+    (is (= [0 127 255] (b/->bytes [0 127 255]))))
+  (testing "a lazy seq, which is neither a vector nor an array"
+    (is (= [0 1 2 3] (b/->bytes (range 4)))))
+  (testing "and the result is always a vector, never the input container"
+    (is (vector? (b/->bytes (host-bytes))))
+    (is (vector? (b/->bytes (range 4))))))
+
+(deftest strings-are-utf8-encoded-not-passed-through
+  (testing "ascii"
+    (is (= [104 105] (b/->bytes "hi"))))
+  (testing "multi-byte, agreeing with utf8-encode rather than with UTF-16"
+    (is (= (b/utf8-encode "日本語") (b/->bytes "日本語")))
+    (is (= 9 (count (b/->bytes "日本語")))
+        "three 3-byte codepoints; a UTF-16 passthrough would be 3"))
+  (testing "a string does not leave this function as a string"
+    (is (vector? (b/->bytes "hi")))))
+
+(deftest out-of-range-is-masked-like-u8
+  (is (= [44] (b/->bytes [300])) "300 & 0xff")
+  (is (= [255] (b/->bytes [-1])))
+  (is (= (mapv b/u8 [300 -1 256]) (b/->bytes [300 -1 256]))
+      "whatever u8 does, this does"))
+
+(deftest nothing-unreadable-slips-through-as-a-value
+  (testing "a value with no byte reading throws rather than returning nil,"
+    ;; `:cljs cljs.core/ExceptionInfo` reads fine but does not RESOLVE under
+    ;; nbb's SCI interpreter -- the whole namespace failed to load with
+    ;; "Unable to resolve symbol: cljs.core/ExceptionInfo", so this suite ran
+    ;; on the JVM only while the README said the code was identical on both.
+    ;; `:default` is the portable spelling and catches the same ex-info.
+    (is (thrown-with-msg? :default
+                          #"not convertible to bytes"
+                          (b/->bytes 42))))
+  (testing "because nil is already taken by the absent case"
+    (is (nil? (b/->bytes nil)))))
+
+(deftest round-trips-with-the-rest-of-the-library
+  (testing "coerced host bytes are usable by every other function here"
+    (let [bs (b/->bytes (host-bytes))]
+      (is (= "01ff00" (b/hex bs)))
+      (is (= bs (b/unhex (b/hex bs))))
+      (is (= bs (b/base64-decode (b/base64-encode bs))))))
+  (testing "and a coerced string equals the same string encoded directly"
+    (is (b/constant-time-eq (b/->bytes "Jefe") (b/utf8-encode "Jefe")))))
+
+(deftest utf8-decode-round-trips-and-refuses-malformed
+  (testing "round-trips with utf8-encode"
+    (doseq [s ["" "hi" "a\nb" "日本語" "\u00e9" "emoji \ud83d\ude00 here"]]
+      (is (= s (b/utf8-decode (b/utf8-encode s))) (str "round-trip: " (pr-str s)))))
+  (testing "ASCII decodes to itself"
+    (is (= "abc" (b/utf8-decode [97 98 99]))))
+  (testing "malformed input returns nil rather than a plausible string"
+    ;; Each of these is what a lenient decoder turns into U+FFFD -- and a
+    ;; string that looks fine is exactly the failure this contract avoids.
+    (is (nil? (b/utf8-decode [0xC0 0x80])) "overlong NUL")
+    (is (nil? (b/utf8-decode [0xE0 0x80 0xAF])) "overlong '/'")
+    (is (nil? (b/utf8-decode [0xED 0xA0 0x80])) "surrogate half U+D800")
+    (is (nil? (b/utf8-decode [0xF5 0x80 0x80 0x80])) "above U+10FFFF")
+    (is (nil? (b/utf8-decode [0x80])) "bare continuation byte")
+    (is (nil? (b/utf8-decode [0xE2 0x82])) "truncated 3-byte sequence")
+    (is (nil? (b/utf8-decode [0xC2 0x41])) "bad continuation byte")))
+
+(deftest bytes->u32-is-unsigned-on-every-host
+  ;; The docstring promised "unsigned int (0..2^32-1)" and delivered it on the
+  ;; JVM only: ClojureScript's bitwise operators work on SIGNED int32, so a
+  ;; leading byte >= 0x80 came back negative. Measured 2026-08-20 -- this
+  ;; assertion fails on nbb without the `>>> 0` in bytes->u32.
+  (is (= 4294967295 (b/bytes->u32 [0xFF 0xFF 0xFF 0xFF])))
+  (is (= 2147483648 (b/bytes->u32 [0x80 0x00 0x00 0x00])))
+  (is (= 1633837952 (b/bytes->u32 [0x61 0x62 0x63 0x80])) "no leading high bit")
+  (testing "round-trips with u32->bytes"
+    (doseq [v [0 1 2147483648 4294967295]]
+      (is (= v (b/bytes->u32 (b/u32->bytes v))) (str "round-trip " v)))))
+
+(deftest base64url-encode-is-the-jdk-url-encoder
+  ;; expected strings are java.util.Base64 output (JDK 21):
+  ;;   getEncoder / getUrlEncoder / (.withoutPadding (getUrlEncoder))
+  (doseq [[bs std url nopad] [[[] "" "" ""]
+                              [[0xfb] "+w==" "-w==" "-w"]
+                              [[0xfb 0xff] "+/8=" "-_8=" "-_8"]
+                              [[0xfb 0xff 0xbf] "+/+/" "-_-_" "-_-_"]
+                              [[102 111] "Zm8=" "Zm8=" "Zm8"]
+                              [[102 111 111 98 97 114] "Zm9vYmFy" "Zm9vYmFy" "Zm9vYmFy"]]]
+    (is (= std (b/base64-encode bs)) (str "standard " bs))
+    (is (= url (b/base64url-encode bs)) (str "url, padded " bs))
+    (is (= url (b/base64url-encode bs {:pad? true})) (str "url, :pad? true " bs))
+    (is (= nopad (b/base64url-encode bs {:pad? false})) (str "url, unpadded " bs)))
+  (testing "coerced host bytes read the same as the vector"
+    (is (= "Af8A" (b/base64url-encode (b/->bytes (host-bytes)))))))

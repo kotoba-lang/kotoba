@@ -11,7 +11,9 @@ bundled source IDs. The installable `kotoba` checkout owns `lib/catalog.edn`;
 the [language authority](https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/library-import.edn)
 owns the public shape and `kotoba.lang.library-import` resolver.
 
-The three project IDs are `kotoba.coll`, `kotoba.spec`, and `kotoba.json`.
+The bundled project IDs are `kotoba.coll`, `kotoba.spec`, `kotoba.json`,
+`kotoba.set`, `kotoba.walk`, `kotoba.string`, `kotoba.time`, `kotoba.bytes`,
+`kotoba.pprint`, and `kotoba.error`.
 They claim no DNS or ATProto namespace. Every legacy alias is declared on
 exactly one catalog package. Resolution is exact and case-sensitive; aliases
 are one hop, and a collision rejects the entire catalog. Unknown names fail

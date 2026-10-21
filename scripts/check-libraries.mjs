@@ -10,8 +10,13 @@ const readJSON = file => JSON.parse(fs.readFileSync(file, "utf8"));
 const shaPattern = /^[0-9a-f]{64}$/;
 let origins = 0;
 let files = 0;
+const ids = fs.readdirSync(path.join(repo, "lib"))
+  .filter(id => fs.existsSync(path.join(repo, "lib", id, "imports.json"))).sort();
+const catalogIDs = [...fs.readFileSync(path.join(repo, "lib/catalog.edn"), "utf8")
+  .matchAll(/:id\s+"([^"]+)"/g)].map(match => match[1]).sort();
+assert.deepEqual(ids, catalogIDs, "every catalog package must have a checked import inventory");
 
-for (const id of ["kotoba.coll", "kotoba.spec", "kotoba.json"]) {
+for (const id of ids) {
   const root = path.join(repo, "lib", id);
   const provenance = readJSON(path.join(root, "imports.json"));
   const changes = readJSON(path.join(root, "local-changes.json"));
@@ -74,8 +79,9 @@ for (const id of ["kotoba.coll", "kotoba.spec", "kotoba.json"]) {
 // Every portable imported test is required AND executed. Preserve the one
 // explicitly JVM-only oracle without pretending the SCI host ran it.
 const runner = fs.readFileSync(path.join(repo, "scripts/run-library-tests.cljk"), "utf8");
-for (const id of ["kotoba.coll", "kotoba.spec", "kotoba.json"]) {
+for (const id of ids) {
   const tests = path.join(repo, "lib", id, "test");
+  if (!fs.existsSync(tests)) continue;
   const visit = dir => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const file = path.join(dir, entry.name);
@@ -99,3 +105,34 @@ for (const id of ["kotoba.coll", "kotoba.spec", "kotoba.json"]) {
   visit(tests);
 }
 console.log(`libraries: ${origins} pinned origins, ${files} imported files, portable test inventory verified`);
+
+// Retirement eligibility is bound to reviewed default-source bytes, not just
+// an old import commit. The live archive operation must still recheck GitHub
+// and local WIP; this offline gate does not perform repository mutations.
+const migrations = readJSON(path.join(repo, "lib/repository-migrations.json"));
+assert.equal(migrations.schema, "kotoba.library-repository-migrations.v1");
+assert.equal(migrations.repositories.length, origins);
+const importedRepos = ids.flatMap(id => readJSON(path.join(repo, "lib", id, "imports.json"))
+  .imports.map(origin => `kotoba-lang/${origin.repo}`)).sort();
+assert.deepEqual(migrations.repositories.map(row => row.repo).sort(), importedRepos);
+for (const row of migrations.repositories) {
+  assert.match(row["reviewed-default-commit"], /^[0-9a-f]{40}$/);
+  assert.ok(ids.some(id => row.destination === `lib/${id}`));
+  assert.ok(["hold", "archive-after-main-verification"].includes(row.disposition));
+  assert.equal(row.disposition === "hold", row.holds.length > 0);
+  if (row.disposition === "hold") continue;
+  assert.ok(row["current-source-files"].length > 0);
+  const root = path.join(repo, row.destination);
+  const changes = readJSON(path.join(root, "local-changes.json")).files;
+  for (const file of row["current-source-files"]) {
+    const destination = path.resolve(root, file.path);
+    assert.ok(destination.startsWith(root + path.sep));
+    const actual = digest(fs.readFileSync(destination));
+    const approved = changes[file.path];
+    assert.ok(actual === file.sha256 ||
+      (approved?.["imported-sha256"] === file.sha256 && approved.sha256 === actual),
+      `${row.repo}/${file.source}: reviewed default source is no longer integrated`);
+    assert.equal(Boolean(fs.statSync(destination).mode & 0o111), file.mode === "100755");
+  }
+}
+console.log(`repository migrations: ${migrations.repositories.filter(row => row.disposition !== "hold").length} eligible; held repositories retained`);
