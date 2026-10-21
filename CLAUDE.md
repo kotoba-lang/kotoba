@@ -108,7 +108,11 @@ via `KBB_ENGINE`.
   PDS/AppView and XRPC application surfaces in `network-awai/app-aozora`; hosting,
   placement, fleet and gateway operations in `kotoba-lang/murakumo`; the
   persistent database in `kotoba-lang/kotobase`; the OS product in
-  `kotoba-lang/aiueos`. Reusable libraries get their own `kotoba-lang/<lib>` repo.
+  `kotoba-lang/aiueos`. The standard-library pilot (`coll/spec/json`) lives
+  under `lib/kotoba.*` here; see
+  `docs/ADR-kotoba-library-monorepo-and-lexicon-events.md`. Other libraries
+  are grouped or separated by maintenance/release boundaries. A definition's
+  content identity does not require its own physical repository.
 - Do not reintroduce a Rust workspace or `crates/` tree.
 - No central master node in distributed designs.
 

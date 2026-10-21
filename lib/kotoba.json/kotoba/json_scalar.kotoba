@@ -1,0 +1,271 @@
+(ns json-scalar
+  (:export [json-string-field]))
+;; A `.kotoba` port of ONE operation from `kotoba.lang.json`: reading the
+;; string value of a top-level object member out of a JSON document, inside
+;; the guest, without a host JSON parser.
+;;
+;; ## Why this operation, and not `decode`
+;;
+;; `amu/runtime/http-service.mjs` names the gap this closes, verbatim: "No
+;; structural JSON parsing *inside* the guest ... a guest that wants to
+;; inspect fields must do its own string work (or, once `kotoba-lang/json`
+;; has a `.kotoba` port, use that). Today's guests can validate/pass-through
+;; /emit fixed JSON text, not parse arbitrary keys."  The product need behind
+;; that sentence is a guest inspecting a field of a request body. That is
+;; this function. A full `decode` is deliberately NOT this slice: it would
+;; need a recursive JSON value, and the language's recursive value types are
+;; qualified on three backends but not on native.
+;;
+;; ## What this handles
+;;
+;; - A top-level JSON object, with any whitespace between tokens.
+;; - Exact key matching (not prefix matching).
+;; - Members before the wanted key are SKIPPED STRUCTURALLY, so a nested
+;;   object or array, a number, a literal, or a string containing `{`, `}`,
+;;   `,` or `:` cannot desynchronise the scan.
+;; - UTF-8 input. Every scan advances by the code point's own byte width,
+;;   because `string-code-point-at` TRAPS on an offset that is not a
+;;   code-point boundary (kotoba-kir `kir/value.cljc`, `utf8-code-point-at!`).
+;;
+;; ## What this does NOT do (named, not silent)
+;;
+;; - Three of JSON's eight escapes are REFUSED rather than decoded, and each
+;;   refusal is a measured language gap, not a policy choice:
+;;
+;;   `\u`      needs a code-point -> string constructor to build the decoded
+;;             character. The frontend's string table has none;
+;;             `string-from-i64` renders a decimal NUMBER, not a character.
+;;   `\b` `\f` cannot be WRITTEN in `.kotoba` source: measured 2026-08-29 with
+;;             `amu check`, a source file containing the literal "\b" or "\f"
+;;             is rejected at the read phase (`:kotoba/source-read-failed`),
+;;             while "\n" "\t" "\r" "\"" "\\" are all admitted.
+;;
+;;   Neither is a safety constraint. `lang/surface-status.edn` classifies
+;;   every admitted form, and its `:classification-rule` sets
+;;   `:default-for-missing :not-yet-implemented`, whose meaning that file
+;;   gives as "Not a safety prohibition; representation, bounded semantics,
+;;   conformance, or backend parity is unfinished." A value needing one of
+;;   these three escapes returns none rather than a wrong answer.
+;;
+;; - Only string-valued members are returned. A number/bool/null/object/array
+;;   value returns none. Those members are still SKIPPED correctly when the
+;;   key being looked for comes later.
+;; - Top-level members only; no path expressions, no nested lookup.
+;; - A key written with escapes is compared raw, so it will not match.
+;; - The caller is expected to have established that the document is
+;;   syntactically JSON; `http-service.mjs` already does this at the boundary.
+;;   On malformed input this returns none. It never throws: `:explicit-errors`
+;;   is an `:intentional-security-constraint` in surface-status.edn, so errors
+;;   are values here, never exceptions.
+;;
+;; ## Portability
+;;
+;; This module uses only the five string operations qualified on EVERY
+;; backend including native -- the five native ABI callback slots:
+;; `string-byte-length`, `string=?`, `string-concat`, `string-substring`,
+;; `string-code-point-at`. It deliberately avoids `string-contains?`,
+;; `string-replace-all`, `string-split-count` and `string-fold-case`, which
+;; the CLJS backend does not implement.
+;;
+;; ## Fuel
+;;
+;; Fuel is charged per function ENTRY, and this scan enters a function per
+;; code point, so the input a guest can traverse is bounded by the fuel baked
+;; into the artifact at COMPILE time (`--fuel`), not by anything the host can
+;; raise later. Budget roughly one unit per input byte. `kotoba-script`'s
+;; `default-fuel` docstring measures its own default at "returns at n=510,
+;; traps at n=600" and states the value has to be the host's to choose.
+;;
+;; ## Where the tests are
+;;
+;; This file exports only `json-string-field`, so a host importing the
+;; compiled artifact gets the operation and nothing else. The cases live in
+;; `test/kotoba/*.kotoba-part` and are run by `scripts/kotoba_test.cljk`,
+;; which splices them onto this source and hands the result to `amu test`
+;; (the official harness, which runs every case on `:jvm-kir`, `:js` AND
+;; `:wasm`). They are split into batches for the fuel reason above: that
+;; harness runs every case of one file against a SINGLE instance, so a whole
+;; suite shares one 512-unit budget.
+
+;; --- UTF-8 ----------------------------------------------------------------
+
+;; Byte width of the code point CP, so a scan can step to the next boundary.
+(defn cp-width [cp :i64] :i64
+  (cond
+    (< cp 128) 1
+    (< cp 2048) 2
+    (< cp 65536) 3
+    :else 4))
+
+(defn ws? [cp :i64] :bool
+  (or (= cp 32) (= cp 9) (= cp 10) (= cp 13)))
+
+(defn skip-ws [doc :string i :i64 len :i64] :i64
+  (if (>= i len)
+    i
+    (if (ws? (string-code-point-at doc i))
+      (skip-ws doc (+ i 1) len)
+      i)))
+
+;; --- scanning -------------------------------------------------------------
+
+;; Byte offset of the closing quote of the JSON string whose first CONTENT
+;; byte is I, or -1 if the document ends first. A backslash consumes the next
+;; byte, which is always ASCII in JSON, so +2 stays on a code-point boundary.
+(defn scan-string-end [doc :string i :i64 len :i64] :i64
+  (if (>= i len)
+    -1
+    (let [cp (string-code-point-at doc i)]
+      (cond
+        (= cp 34) i
+        (= cp 92) (scan-string-end doc (+ i 2) len)
+        :else (scan-string-end doc (+ i (cp-width cp)) len)))))
+
+;; End (exclusive) of the bracketed value starting at I. Strings are scanned
+;; as units, so a brace inside a string cannot change DEPTH.
+(defn scan-balanced [doc :string i :i64 len :i64 depth :i64] :i64
+  (if (>= i len)
+    -1
+    (let [cp (string-code-point-at doc i)]
+      (cond
+        (= cp 34) (let [e (scan-string-end doc (+ i 1) len)]
+                    (if (< e 0) -1 (scan-balanced doc (+ e 1) len depth)))
+        (or (= cp 123) (= cp 91)) (scan-balanced doc (+ i 1) len (+ depth 1))
+        (or (= cp 125) (= cp 93)) (if (= depth 1)
+                                    (+ i 1)
+                                    (scan-balanced doc (+ i 1) len (- depth 1)))
+        :else (scan-balanced doc (+ i (cp-width cp)) len depth)))))
+
+;; End (exclusive) of a number/true/false/null: up to `,` `}` `]` or space.
+(defn scan-scalar-end [doc :string i :i64 len :i64] :i64
+  (if (>= i len)
+    i
+    (let [cp (string-code-point-at doc i)]
+      (if (or (= cp 44) (= cp 125) (= cp 93) (ws? cp))
+        i
+        (scan-scalar-end doc (+ i (cp-width cp)) len)))))
+
+;; End (exclusive) of the value of any kind starting at I, or -1.
+(defn skip-value [doc :string i :i64 len :i64] :i64
+  (if (>= i len)
+    -1
+    (let [cp (string-code-point-at doc i)]
+      (cond
+        (= cp 34) (let [e (scan-string-end doc (+ i 1) len)]
+                    (if (< e 0) -1 (+ e 1)))
+        (or (= cp 123) (= cp 91)) (scan-balanced doc i len 0)
+        :else (scan-scalar-end doc i len)))))
+
+;; --- escapes --------------------------------------------------------------
+
+;; The six escape characters this slice can decode, as code points:
+;; `"` 34, `\` 92, `/` 47, `n` 110, `r` 114, `t` 116. `u` 117, `b` 98 and
+;; `f` 102 are the refused three -- see the header.
+(defn decodable-escape? [cp :i64] :bool
+  (or (= cp 34) (= cp 92) (= cp 47)
+      (= cp 110) (= cp 114) (= cp 116)))
+
+(defn escape-char [cp :i64] :string
+  (cond
+    (= cp 34) "\""
+    (= cp 92) "\\"
+    (= cp 47) "/"
+    (= cp 110) "\n"
+    (= cp 114) "\r"
+    (= cp 116) "\t"
+    :else ""))
+
+(defn has-escape? [doc :string i :i64 end :i64] :bool
+  (if (>= i end)
+    false
+    (let [cp (string-code-point-at doc i)]
+      (if (= cp 92)
+        true
+        (has-escape? doc (+ i (cp-width cp)) end)))))
+
+;; False as soon as [I,END) holds an escape this slice cannot decode.
+(defn escapes-decodable? [doc :string i :i64 end :i64] :bool
+  (if (>= i end)
+    true
+    (let [cp (string-code-point-at doc i)]
+      (if (= cp 92)
+        (if (>= (+ i 1) end)
+          false
+          (if (decodable-escape? (string-code-point-at doc (+ i 1)))
+            (escapes-decodable? doc (+ i 2) end)
+            false))
+        (escapes-decodable? doc (+ i (cp-width cp)) end)))))
+
+(defn decode-escapes [doc :string i :i64 end :i64 acc :string] :string
+  (if (>= i end)
+    acc
+    (let [cp (string-code-point-at doc i)]
+      (if (= cp 92)
+        (decode-escapes doc (+ i 2) end
+                        (string-concat acc (escape-char (string-code-point-at doc (+ i 1)))))
+        (let [w (cp-width cp)]
+          (decode-escapes doc (+ i w) end
+                          (string-concat acc (string-substring doc i (+ i w)))))))))
+
+;; --- result ---------------------------------------------------------------
+
+(defn found [s :string] [:option :string]
+  (option-some-of [:option :string] s))
+
+(defn absent [] [:option :string]
+  (option-none-of [:option :string]))
+
+;; --- the operation --------------------------------------------------------
+
+;; The member value whose first byte is I, if that value is a JSON string.
+(defn value-at [doc :string i :i64 len :i64] [:option :string]
+  (if (not= (string-code-point-at doc i) 34)
+    (absent)
+    (let [e (scan-string-end doc (+ i 1) len)]
+      (if (< e 0)
+        (absent)
+        (let [s (+ i 1)]
+          (if (not (has-escape? doc s e))
+            (found (string-substring doc s e))
+            (if (escapes-decodable? doc s e)
+              (found (decode-escapes doc s e ""))
+              (absent))))))))
+
+;; Walk members from byte I, which is just past `{` or just past a `,`.
+(defn member-scan [doc :string key :string i :i64 len :i64] [:option :string]
+  (let [a (skip-ws doc i len)]
+    (if (>= a len)
+      (absent)
+      (if (not= (string-code-point-at doc a) 34)
+        (absent)
+        (let [ke (scan-string-end doc (+ a 1) len)]
+          (if (< ke 0)
+            (absent)
+            (let [kraw (string-substring doc (+ a 1) ke)
+                  b (skip-ws doc (+ ke 1) len)]
+              (if (or (>= b len) (not= (string-code-point-at doc b) 58))
+                (absent)
+                (let [c (skip-ws doc (+ b 1) len)]
+                  (if (>= c len)
+                    (absent)
+                    (if (string=? kraw key)
+                      (value-at doc c len)
+                      (let [nx (skip-value doc c len)]
+                        (if (< nx 0)
+                          (absent)
+                          (let [d (skip-ws doc nx len)]
+                            (if (>= d len)
+                              (absent)
+                              (if (= (string-code-point-at doc d) 44)
+                                (member-scan doc key (+ d 1) len)
+                                (absent)))))))))))))))))
+
+;; The string value of top-level member KEY of DOC, or none.
+(defn json-string-field [doc :string key :string] [:option :string]
+  (let [len (string-byte-length doc)
+        i (skip-ws doc 0 len)]
+    (if (>= i len)
+      (absent)
+      (if (not= (string-code-point-at doc i) 123)
+        (absent)
+        (member-scan doc key (+ i 1) len)))))
