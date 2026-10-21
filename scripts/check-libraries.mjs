@@ -92,6 +92,7 @@ for (const id of ids) {
   };
   collect("src");
   collect("kotoba");
+  collect("compiled");
   const source = implementationFiles.sort().map(file =>
       [file, digest(fs.readFileSync(path.join(root, file)))]);
   console.log(`${id}: ${provenance.imports.length} source origins; source-sha256:${digest(JSON.stringify(source))}`);

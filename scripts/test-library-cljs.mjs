@@ -34,9 +34,13 @@ function run(command,args,label,expected=0){
   assert.equal(result.status,expected,`${label}: ${result.error??result.stderr}`);
   return result;
 }
-const deps='{:deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}}';
+const compiledProject=path.join(repo,'lib/kotoba.test/compiled');
+const deps='{:deps {org.clojure/clojurescript {:mvn/version "1.11.132"} '+
+  'kotoba.test/compiled {:local/root '+JSON.stringify(compiledProject)+'}}}';
 fs.writeFileSync(path.join(output,'deps.edn'),deps+'\n');
 const cp=run('clojure',['-Srepro','-Sdeps',deps,'-Spath'],'resolve').stdout.trim();
+assert(!cp.includes('kotoba.text')&&!cp.includes('kotoba.spec'),
+  'the compiled bridge must not introduce the property-testing runtime dependency graph');
 const classpath=[sources,...cp.split(path.delimiter).map(p=>path.resolve(output,p))].join(path.delimiter);
 run('java',['-Xmx1200m','-cp',classpath,'clojure.main','-m','cljs.main','--target','node',
   '--output-dir','build/out','--output-to','build/tests.cjs',
