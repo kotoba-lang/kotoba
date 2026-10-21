@@ -1,0 +1,1248 @@
+;; kotoba.bytes — portable byte-vector primitives shared by kotoba-lang
+;; protocol libraries (TURN/STUN codec, credential HMAC-SHA1 path, and other
+;; consumers). Every "bytes" value in this library is a plain Clojure vector
+;; of ints in [0,255] (NOT a platform byte-array), so almost all of this
+;; code runs unmodified on the JVM and in ClojureScript. The one exception
+;; is `utf8-encode`'s single `code-unit-at` accessor (below), a reader
+;; conditional needed because :clj and :cljs disagree on how to pull a
+;; UTF-16 code unit's numeric value out of an indexed string character —
+;; discovered as a real bug (silently encoded every string as all-zero
+;; bytes under :cljs) while building kotoba-lang/wire, this library's first
+;; consumer actually exercised under a ClojureScript runtime (nbb).
+(ns kotoba.bytes
+  {:kotoba/export [u8 u16->bytes bytes->u16 u32->bytes bytes->u32 xor-bytes pad-right utf8-encode
+                  ->bytes utf8-decode base64-encode base64url-encode base64-decode constant-time-eq
+                  hex unhex ->host-bytes base64-decode-bytes base64url-decode-bytes
+                  base64mime-decode-bytes utf8-bytes utf8-string]})
+
+;; ── the Kotoba reading of this file ─────────────────────────────────────────
+;;
+;; `#?(:kotoba A :default B)`: the Kotoba reader takes the first clause whose
+;; feature is :kotoba or :default, the JVM and ClojureScript readers ignore
+;; :kotoba and take :default -- so every host body below is byte-for-byte what
+;; it was, and the :kotoba clause is the same function in the statically typed
+;; language. A top-level `#?(:kotoba ...)` with no :default is dropped by the
+;; host readers entirely: the forms right here exist only in the Kotoba module.
+;; A parameter list `[#?@(:kotoba [x :vector-i64] :default [x])]` gives Kotoba
+;; the type (its inference cannot yet see through a `loop` that captures an
+;; unannotated parameter) and gives the hosts the same `[x]` as before.
+;;
+;; Kotoba has no characters, no nil and no dynamic type test, so: bytes are
+;; `:vector-i64`, a host `nil` answer ("not valid") is an option's none, the
+;; host's "host bytes" are `:bytes`, and a function that dispatches on the
+;; host type of its argument takes the one type the rest of the library needs.
+
+#?(:kotoba
+   ;; clojure.core's shifts on the JVM's long are Kotoba's i64 shifts.
+   (defn- bit-shift-left [x :i64 n :i64] :i64 (i64-shift-left x n)))
+#?(:kotoba
+   (defn- bit-shift-right [x :i64 n :i64] :i64 (i64-shift-right x n)))
+
+#?(:kotoba
+   ;; item k of v, or `absent` past its end. A helper rather than a local
+   ;; `(fn [k] ...)`: a Kotoba fn literal that captures a vector is refused.
+   (defn- vector-at-or [v :vector-i64 k :i64 absent :i64] :i64
+     (if (< k (vector-count v)) (vector-at v k) absent)))
+#?(:kotoba
+   ;; v with every item set to x
+   (defn- vector-assoc-each [v :vector-i64 x :i64] :vector-i64
+     (let [n (vector-count v)]
+       (loop [i 0 out v]
+         (if (>= i n) out (recur (+ i 1) (vector-assoc out i x)))))))
+#?(:kotoba
+   ;; a UTF-8 continuation byte, 10xxxxxx
+   (defn- utf8-cont? [x :i64] :bool (= 0x80 (bit-and x 0xC0))))
+
+#?(:kotoba
+   ;; bytes in the UTF-8 encoding of code point `cp`
+   (defn- utf8-width [cp :i64] :i64
+     (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4)))
+
+#?(:kotoba
+   ;; `out` with the UTF-8 encoding of code point `cp` appended
+   (defn- conj-utf8 [out :vector-i64 cp :i64] :vector-i64
+     (cond
+       (< cp 0x80) (vector-conj out cp)
+       (< cp 0x800) (vector-conj (vector-conj out (bit-or 0xC0 (bit-shift-right cp 6)))
+                                 (bit-or 0x80 (bit-and cp 0x3F)))
+       (< cp 0x10000) (vector-conj (vector-conj (vector-conj out (bit-or 0xE0 (bit-shift-right cp 12)))
+                                                (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+                                   (bit-or 0x80 (bit-and cp 0x3F)))
+       :else (vector-conj (vector-conj (vector-conj (vector-conj out (bit-or 0xF0 (bit-shift-right cp 18)))
+                                                    (bit-or 0x80 (bit-and (bit-shift-right cp 12) 0x3F)))
+                                       (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+                          (bit-or 0x80 (bit-and cp 0x3F))))))
+
+(defn u8 [n] (bit-and n 0xff))
+
+(defn u16->bytes
+  "Big-endian 2-byte encoding of a 16-bit unsigned int."
+  [n]
+  #?@(:kotoba [:vector-i64])
+  [(u8 (bit-shift-right n 8)) (u8 n)])
+
+(defn bytes->u16
+  "Decode 2 big-endian bytes (a 2-element byte vector) to an unsigned int."
+  [#?@(:kotoba [bs :vector-i64] :default [[hi lo]])]
+  #?(:kotoba (bit-or (bit-shift-left (bit-and (vector-at bs 0) 0xff) 8) (bit-and (vector-at bs 1) 0xff))
+     :default (bit-or (bit-shift-left (bit-and hi 0xff) 8) (bit-and lo 0xff))))
+
+(defn u32->bytes
+  "Big-endian 4-byte encoding of a 32-bit unsigned int."
+  [n]
+  #?@(:kotoba [:vector-i64])
+  [(u8 (bit-shift-right n 24)) (u8 (bit-shift-right n 16)) (u8 (bit-shift-right n 8)) (u8 n)])
+
+(defn bytes->u32
+  "Decode 4 big-endian bytes to an unsigned int (0..2^32-1).
+
+   The `unsigned` in that sentence was true on the JVM only. ClojureScript's
+   bitwise operators work on SIGNED int32, so a leading byte >= 0x80 made
+   `bit-shift-left ... 24` negative and `bit-or` kept it that way: measured
+   2026-08-20, `[0xFF 0xFF 0xFF 0xFF]` decoded to 4294967295 on the JVM and
+   -1 on nbb. `>>> 0` (ToUint32) restores the documented range."
+  [#?@(:kotoba [bs :vector-i64] :default [[b0 b1 b2 b3]])]
+  #?(:kotoba
+     ;; i64: a leading byte >= 0x80 stays positive, as on the JVM
+     (bit-or (bit-or (bit-shift-left (bit-and (vector-at bs 0) 0xff) 24)
+                     (bit-shift-left (bit-and (vector-at bs 1) 0xff) 16))
+             (bit-or (bit-shift-left (bit-and (vector-at bs 2) 0xff) 8)
+                     (bit-and (vector-at bs 3) 0xff)))
+     :default
+     (let [v (bit-or (bit-shift-left (bit-and b0 0xff) 24)
+                     (bit-shift-left (bit-and b1 0xff) 16)
+                     (bit-shift-left (bit-and b2 0xff) 8)
+                     (bit-and b3 0xff))]
+       #?(:clj v :cljs (unsigned-bit-shift-right v 0)))))
+
+(defn xor-bytes
+  "XOR two equal-length byte vectors elementwise."
+  [#?@(:kotoba [a :vector-i64 b :vector-i64] :default [a b])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     ;; as mapv: stops at the shorter one
+     (let [n (min (vector-count a) (vector-count b))]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           out
+           (recur (+ i 1) (vector-conj out (bit-xor (vector-at a i) (vector-at b i)))))))
+     :default (mapv #(bit-xor %1 %2) a b)))
+
+(defn pad-right
+  "Pad `bs` with `n` zero bytes on the right."
+  [#?@(:kotoba [bs :vector-i64 n :i64] :default [bs n])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (loop [i 0 out bs]
+       (if (>= i n) out (recur (+ i 1) (vector-conj out 0))))
+     :default (into (vec bs) (repeat n 0))))
+
+(defn- code-unit-at
+  "The UTF-16 code unit (0..0xFFFF) at index i of string s. `(int (nth s i))`
+   gives this on the JVM (String/nth -> Character, int coerces a Character
+   to its code point) but NOT under ClojureScript — a JS string indexed via
+   `nth` yields a length-1 *string*, and cljs's `int` does not coerce a
+   string to a numeric code point (it silently returns 0 for any non-numeric
+   input), so every call site that did `(int (nth s i))` here silently
+   encoded every character as a NUL byte under :cljs — verified empirically
+   under nbb (kotoba-lang/wire's Step 1, 2026-07). `.charAt`/`.charCodeAt`
+   are genuinely platform-divergent accessors for the same UTF-16 code-unit
+   value, so this one seam uses a reader conditional (same pattern already
+   used elsewhere in this library's own test suite, e.g.
+   kotoba.bytes.sha1-test's `hex` helper) rather than silently producing
+   wrong bytes under one platform."
+  [#?@(:kotoba [s :string i :i64] :default [^String s i])]
+  #?(:kotoba
+     ;; Kotoba strings are UTF-8: walk the code points counting UTF-16 units,
+     ;; answering the high or low half of a code point above U+FFFF. Past the
+     ;; end it answers -1 where the hosts throw; nothing in the Kotoba reading
+     ;; of this file calls it (those bodies walk code points directly).
+     (let [n (string-byte-length s)]
+       (loop [b 0 u 0]
+         (if (>= b n)
+           -1
+           (let [cp (string-code-point-at s b)]
+             (cond
+               (< cp 0x10000) (if (= u i) cp (recur (+ b (utf8-width cp)) (+ u 1)))
+               (= u i) (+ 0xD800 (bit-shift-right (- cp 0x10000) 10))
+               (= (+ u 1) i) (+ 0xDC00 (bit-and (- cp 0x10000) 0x3FF))
+               :else (recur (+ b 4) (+ u 2)))))))
+     :clj (int (.charAt s i))
+     :cljs (.charCodeAt s i)))
+
+(defn utf8-encode
+  "Encode a string to a UTF-8 byte vector. Pure/portable: handles the BMP plus
+   surrogate-pair codepoints (>0xFFFF), :clj and :cljs produce byte-identical
+   output (see code-unit-at for the one platform-divergent accessor this
+   needs to actually achieve that, rather than merely claim it).
+
+   Kotoba: a string is valid UTF-8 and cannot hold a lone surrogate, so the
+   answer is its own bytes, re-encoded code point by code point -- the same
+   bytes the hosts give for every string without a lone surrogate."
+  [#?@(:kotoba [s :string] :default [^String s])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [n (string-byte-length s)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           out
+           (let [cp (string-code-point-at s i)]
+             (recur (+ i (utf8-width cp)) (conj-utf8 out cp))))))
+     :default
+  (let [len (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i len)
+        (persistent! out)
+        (let [c1 (code-unit-at s i)]
+          (cond
+            ;; surrogate pair -> single codepoint > 0xFFFF
+            (and (<= 0xD800 c1 0xDBFF) (< (inc i) len))
+            (let [c2 (code-unit-at s (inc i))]
+              (if (<= 0xDC00 c2 0xDFFF)
+                (let [cp (+ 0x10000
+                            (bit-shift-left (- c1 0xD800) 10)
+                            (- c2 0xDC00))]
+                  (recur (+ i 2)
+                         (reduce conj! out
+                                 [(u8 (bit-or 0xF0 (bit-shift-right cp 18)))
+                                  (u8 (bit-or 0x80 (bit-and (bit-shift-right cp 12) 0x3F)))
+                                  (u8 (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+                                  (u8 (bit-or 0x80 (bit-and cp 0x3F)))])))
+                (recur (inc i) out))) ; lone high surrogate: skip (malformed input)
+
+            (< c1 0x80)
+            (recur (inc i) (conj! out c1))
+
+            (< c1 0x800)
+            (recur (inc i)
+                   (reduce conj! out
+                           [(u8 (bit-or 0xC0 (bit-shift-right c1 6)))
+                            (u8 (bit-or 0x80 (bit-and c1 0x3F)))]))
+
+            :else
+            (recur (inc i)
+                   (reduce conj! out
+                           [(u8 (bit-or 0xE0 (bit-shift-right c1 12)))
+                            (u8 (bit-or 0x80 (bit-and (bit-shift-right c1 6) 0x3F)))
+                            (u8 (bit-or 0x80 (bit-and c1 0x3F)))])))))))))
+
+(defn ->bytes
+  "Whatever a host handed over → this library's byte vector.
+
+   Everything above operates on `vector<int 0..255>` and says so; this is the
+   boundary where a value that came from somewhere else becomes one. Host
+   runtimes hand bytes over in their own shapes — a JVM `byte[]` (signed, so
+   0xFF arrives as -1), a `js/Uint8Array`, a Node `Buffer`, a lazy seq — and a
+   library whose stated contract is a vector has to be reachable from all of
+   them or the contract is advice.
+
+   The distinction worth keeping is absent versus empty: `nil` stays `nil`,
+   because a caller asking a store for an object it does not have needs a
+   different answer from one asking for an object that is zero bytes long, and
+   collapsing them here would erase that upstream where it cannot be recovered.
+
+   A string is UTF-8 encoded, which is what `constant-time-eq` already assumes
+   a string means when it is used as bytes. It is not a passthrough: leaving
+   strings alone would let a value that is not a byte vector out of a function
+   whose whole job is that every value leaving it is one.
+
+   Out-of-range ints are masked rather than refused, because `u8` is what every
+   other function here does with them and two answers to that question in one
+   library is worse than either answer.
+
+   Anything with no byte reading throws. Returning `nil` would put it in the
+   same bucket as a missing object, which is the one distinction this is
+   careful to preserve.
+
+   Kotoba has no nil and no run-time type to dispatch on: there the argument
+   is already a byte vector, and the answer is it with every item masked by
+   `u8`, as the hosts do."
+  [#?@(:kotoba [x :vector-i64] :default [x])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [n (vector-count x)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n) out (recur (+ i 1) (vector-conj out (u8 (vector-at x i)))))))
+     :default
+  (cond
+    (nil? x)     nil
+    (string? x)  (utf8-encode x)
+    ;; `seqable?` rather than `sequential?`: it is the predicate that covers a
+    ;; JVM byte[], a Uint8Array and a Buffer, none of which are `sequential?`
+    ;; but all of which are exactly what a host store hands back (verified on
+    ;; both runtimes — see scripts/verify-cljs.cljk).
+    (seqable? x) (mapv u8 x)
+    :else        (throw (ex-info "not convertible to bytes"
+                                 {:value x :type (type x)})))))
+
+(def ^:private b64-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(defn- code-point->string [cp]
+  #?@(:kotoba [:string])
+  #?(:kotoba (string-from-utf8 (bytes-from-vector-i64 (conj-utf8 (vector-i64) cp)))
+     :clj (String. (Character/toChars cp))
+     :cljs (js/String.fromCodePoint cp)))
+
+(defn utf8-decode
+  "Decode a UTF-8 byte vector to a string, or **nil** if the bytes are not
+   valid UTF-8 -- the same contract `unhex` and `base64-decode` already use in
+   this namespace, and for the same reason: a corrupted input should fail
+   loudly rather than decode to something plausible.
+
+   The rejections are the point, so they are listed rather than left implicit.
+   Returning U+FFFD for these, which is what a lenient decoder does, turns
+   each of them into a string that looks fine:
+
+   - **overlong encodings** (`C0 80` for NUL, `E0 80 AF` for `/`). The classic
+     way a path or prefix check is bypassed: the checker sees bytes it does
+     not recognise, the decoder produces the character anyway.
+   - **surrogate halves** (U+D800..U+DFFF encoded directly). Not valid UTF-8,
+     and on the ClojureScript side they would silently pair with whatever
+     followed.
+   - **code points above U+10FFFF**, truncated sequences, and continuation
+     bytes that are not `10xxxxxx`.
+
+   Round-trips with `utf8-encode` for every string that function can encode.
+
+   Kotoba: the answer is `[:option :string]`, none where the hosts answer nil.
+   The same scan accepts exactly canonical UTF-8, so the string is made once
+   from the bytes with `string-from-utf8`."
+  [#?@(:kotoba [bs :vector-i64] :default [bs])]
+  #?@(:kotoba [[:option :string]])
+  #?(:kotoba
+     (let [v (->bytes bs)
+           n (vector-count v)
+           valid
+           (loop [i 0]
+             (if (>= i n)
+               true
+               (let [b0 (vector-at v i)]
+                 (cond
+                   (< b0 0x80) (recur (+ i 1))
+                   (< b0 0xC2) false
+                   (< b0 0xE0) (if (utf8-cont? (vector-at-or v (+ i 1) -1)) (recur (+ i 2)) false)
+                   (< b0 0xF0)
+                   (if (and (utf8-cont? (vector-at-or v (+ i 1) -1)) (utf8-cont? (vector-at-or v (+ i 2) -1))
+                            (let [cp (bit-or (bit-shift-left (- b0 0xE0) 12)
+                                             (bit-or (bit-shift-left (- (vector-at v (+ i 1)) 0x80) 6) (- (vector-at v (+ i 2)) 0x80)))]
+                              (not (or (< cp 0x800) (<= 0xD800 cp 0xDFFF)))))
+                     (recur (+ i 3))
+                     false)
+                   (< b0 0xF5)
+                   (if (and (utf8-cont? (vector-at-or v (+ i 1) -1)) (utf8-cont? (vector-at-or v (+ i 2) -1)) (utf8-cont? (vector-at-or v (+ i 3) -1))
+                            (let [cp (bit-or (bit-or (bit-shift-left (- b0 0xF0) 18)
+                                                     (bit-shift-left (- (vector-at v (+ i 1)) 0x80) 12))
+                                             (bit-or (bit-shift-left (- (vector-at v (+ i 2)) 0x80) 6) (- (vector-at v (+ i 3)) 0x80)))]
+                              (not (or (< cp 0x10000) (> cp 0x10FFFF)))))
+                     (recur (+ i 4))
+                     false)
+                   :else false))))]
+       (if valid
+         (option-some-of [:option :string] (string-from-utf8 (bytes-from-vector-i64 v)))
+         (option-none-of [:option :string])))
+     :default
+  (let [v (->bytes bs)
+        n (count v)]
+    (loop [i 0 out []]
+      (if (>= i n)
+        (apply str out)
+        (let [b0 (nth v i)]
+          (cond
+            (< b0 0x80)
+            (recur (inc i) (conj out (code-point->string b0)))
+
+            ;; 0x80..0xC1 -- a continuation byte cannot start a sequence, and
+            ;; C0/C1 can only ever be an overlong two-byte form.
+            (< b0 0xC2) nil
+
+            (< b0 0xE0)
+            (when (< (inc i) n)
+              (let [b1 (nth v (inc i))]
+                (when (= 0x80 (bit-and b1 0xC0))
+                  (recur (+ i 2)
+                         (conj out (code-point->string
+                                    (bit-or (bit-shift-left (- b0 0xC0) 6)
+                                            (- b1 0x80))))))))
+
+            (< b0 0xF0)
+            (when (< (+ i 2) n)
+              (let [b1 (nth v (inc i)) b2 (nth v (+ i 2))]
+                (when (and (= 0x80 (bit-and b1 0xC0)) (= 0x80 (bit-and b2 0xC0)))
+                  (let [cp (bit-or (bit-shift-left (- b0 0xE0) 12)
+                                   (bit-shift-left (- b1 0x80) 6)
+                                   (- b2 0x80))]
+                    (when-not (or (< cp 0x800) (<= 0xD800 cp 0xDFFF))
+                      (recur (+ i 3) (conj out (code-point->string cp))))))))
+
+            (< b0 0xF5)
+            (when (< (+ i 3) n)
+              (let [b1 (nth v (inc i)) b2 (nth v (+ i 2)) b3 (nth v (+ i 3))]
+                (when (and (= 0x80 (bit-and b1 0xC0))
+                           (= 0x80 (bit-and b2 0xC0))
+                           (= 0x80 (bit-and b3 0xC0)))
+                  (let [cp (bit-or (bit-shift-left (- b0 0xF0) 18)
+                                   (bit-shift-left (- b1 0x80) 12)
+                                   (bit-shift-left (- b2 0x80) 6)
+                                   (- b3 0x80))]
+                    (when-not (or (< cp 0x10000) (> cp 0x10FFFF))
+                      (recur (+ i 4) (conj out (code-point->string cp))))))))
+
+            :else nil)))))))
+
+(def ^:private b64url-alphabet
+  "RFC 4648 §5 (base64url): `-` and `_` in place of `+` and `/`."
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+(defn- encode-64
+  "base64 of `bs` over `alphabet`; `pad?` appends `=` to a multiple of 4.
+   Reads each element as `(bit-and b 0xFF)`, so a byte vector, a JVM byte[]
+   (signed) and a Uint8Array all give the same string.
+
+   The Kotoba body (superproject adr-2609242330) builds the ASCII bytes of the
+   answer and makes the string once with `string-from-utf8`: Kotoba has no
+   character type to `nth` out of a string or to `apply str` over, and the
+   alphabet is ASCII, so its byte at offset i IS its i-th character."
+  [#?@(:kotoba [alphabet :string pad? :bool bs :vector-i64] :default [alphabet pad? bs])]
+  #?@(:kotoba [:string])
+  #?(:kotoba
+     (let [n (vector-count bs)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           (string-from-utf8 (bytes-from-vector-i64 out))
+           (let [b0 (bit-and (vector-at bs i) 255)
+                 b1 (if (< (+ i 1) n) (bit-and (vector-at bs (+ i 1)) 255) -1)
+                 b2 (if (< (+ i 2) n) (bit-and (vector-at bs (+ i 2)) 255) -1)
+                 triple (bit-or (bit-shift-left b0 16)
+                                (bit-or (bit-shift-left (if (< b1 0) 0 b1) 8)
+                                        (if (< b2 0) 0 b2)))
+                 o2 (vector-conj (vector-conj out (string-code-point-at alphabet (bit-and (bit-shift-right triple 18) 63)))
+                                 (string-code-point-at alphabet (bit-and (bit-shift-right triple 12) 63)))
+                 o3 (if (>= b1 0) (vector-conj o2 (string-code-point-at alphabet (bit-and (bit-shift-right triple 6) 63)))
+                      (if pad? (vector-conj o2 61) o2))
+                 o4 (if (>= b2 0) (vector-conj o3 (string-code-point-at alphabet (bit-and triple 63)))
+                      (if pad? (vector-conj o3 61) o3))]
+             (recur (+ i 3) o4)))))
+     :default
+     ;; A Uint8Array / Node Buffer is neither ICounted nor IIndexed under
+     ;; ClojureScript: `count` threw \"No protocol method ICounted.-count\" for the
+     ;; bytes an ed25519 signer hands back on kbb (kotoba-lang/release, measured
+     ;; 2026-09-24). Anything that is not already a vector goes through ->bytes.
+     (let [bs (if (or (nil? bs) (vector? bs)) bs (->bytes bs))
+           n (count bs)]
+       (apply str
+              (loop [i 0 out []]
+                (if (>= i n)
+                  out
+                  (let [b0 (bit-and (nth bs i) 0xFF)
+                        b1 (when (< (inc i) n) (bit-and (nth bs (inc i)) 0xFF))
+                        b2 (when (< (+ i 2) n) (bit-and (nth bs (+ i 2)) 0xFF))
+                        triple (bit-or (bit-shift-left b0 16)
+                                       (bit-shift-left (or b1 0) 8)
+                                       (or b2 0))
+                        c0 (bit-and (bit-shift-right triple 18) 0x3F)
+                        c1 (bit-and (bit-shift-right triple 12) 0x3F)
+                        c2 (bit-and (bit-shift-right triple 6) 0x3F)
+                        c3 (bit-and triple 0x3F)]
+                    (recur (+ i 3)
+                           (cond-> (conj out
+                                         (nth alphabet c0)
+                                         (nth alphabet c1))
+                             b1 (conj (nth alphabet c2))
+                             (and (not b1) pad?) (conj \=)
+                             b2 (conj (nth alphabet c3))
+                             (and (not b2) pad?) (conj \=))))))))))
+
+(defn base64-encode
+  "Standard (RFC 4648) base64 encode of a byte vector, padded with `=`."
+  [#?@(:kotoba [bs :vector-i64] :default [bs])]
+  #?@(:kotoba [:string])
+  (encode-64 b64-alphabet true bs))
+
+(defn base64url-encode
+  "base64url (RFC 4648 §5) encode of a byte vector: the URL- and
+   filename-safe alphabet (`-` `_` for `+` `/`).
+
+   `(base64url-encode bs)` is padded with `=`, the string
+   `java.util.Base64/getUrlEncoder` `.encodeToString` gives;
+   `(base64url-encode bs {:pad? false})` drops the padding, the string
+   `(.withoutPadding (Base64/getUrlEncoder))` gives (JWT, WebAuthn, PKCE).
+   Measured against JDK 21 on random byte[] of every length 0..299 and 700
+   more up to 4999: identical for both forms."
+  ([#?@(:kotoba [bs :vector-i64] :default [bs])] (encode-64 b64url-alphabet true bs))
+  ;; Kotoba has no options map: its second argument is `pad?` itself.
+  ([#?@(:kotoba [bs :vector-i64 pad? :bool] :default [bs {:keys [pad?] :or {pad? true}}])]
+   #?(:kotoba (encode-64 b64url-alphabet pad? bs)
+      :default (encode-64 b64url-alphabet (boolean pad?) bs))))
+
+(def ^:private b64-index
+  ;; Kotoba: a constant is evaluated before any function exists, so the index
+  ;; is written out -- ASCII byte -> sextet, -1 off the alphabet, -2 for `=`
+  ;; (the first half of `(b64-table b64-alphabet)` below; a vector literal
+  ;; holds at most 128 items, and every byte >= 128 is -1, which `b64-sextet`
+  ;; answers without a table). base64-decode drops `=` before it looks
+  ;; anything up, so the -2 is never read there.
+  #?(:kotoba
+     [-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+      -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+      -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 62 -1 -1 -1 63
+      52 53 54 55 56 57 58 59 60 61 -1 -1 -1 -2 -1 -1
+      -1 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+      15 16 17 18 19 20 21 22 23 24 25 -1 -1 -1 -1 -1
+      -1 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+      41 42 43 44 45 46 47 48 49 50 51 -1 -1 -1 -1 -1]
+     :default (into {} (map-indexed (fn [i c] [c i]) b64-alphabet))))
+
+#?(:kotoba
+   ;; base64-decode's first step: the sextets of `s` with every `=` dropped,
+   ;; wherever it is (as `(remove #(= % \=) ...)` does), or none at a
+   ;; character off the alphabet. base64-decode's two loops are two functions:
+   ;; a loop that reads a local bound to another loop's result was refused.
+   (defn- b64-sextets [s :string] [:option :vector-i64]
+     (let [n (string-byte-length s)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           (option-some-of [:option :vector-i64] out)
+           (let [cp (string-code-point-at s i)]
+             (cond
+               (= cp 61) (recur (+ i 1) out)
+               (and (< cp 128) (>= (vector-at b64-index cp) 0))
+               (recur (+ i 1) (vector-conj out (vector-at b64-index cp)))
+               :else (option-none-of [:option :vector-i64]))))))))
+#?(:kotoba
+   ;; base64-decode's second step: 4 sextets -> 3 bytes; a short last group
+   ;; gives 1 or 2
+   (defn- b64-join [vs :vector-i64] :vector-i64
+     (let [m (vector-count vs)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i m)
+           out
+           (let [v1 (vector-at-or vs (+ i 1) -1) v2 (vector-at-or vs (+ i 2) -1) v3 (vector-at-or vs (+ i 3) -1)
+                 triple (bit-or (bit-or (bit-shift-left (vector-at vs i) 18)
+                                        (bit-shift-left (max v1 0) 12))
+                                (bit-or (bit-shift-left (max v2 0) 6) (max v3 0)))
+                 o1 (vector-conj out (u8 (bit-shift-right triple 16)))
+                 o2 (if (>= v2 0) (vector-conj o1 (u8 (bit-shift-right triple 8))) o1)
+                 o3 (if (>= v3 0) (vector-conj o2 (u8 triple)) o2)]
+             (recur (+ i 4) o3)))))))
+
+(defn base64-decode
+  "Standard (RFC 4648) base64 decode to a byte vector. Ignores a trailing `=`
+   pad. Returns nil on malformed input (non-alphabet character).
+
+   Kotoba: `[:option :vector-i64]`, none where the hosts answer nil."
+  [#?@(:kotoba [s :string] :default [^String s])]
+  #?@(:kotoba [[:option :vector-i64]])
+  #?(:kotoba
+     (let [vals (b64-sextets s)]
+       (if (option-some?-of [:option :vector-i64] vals)
+         (option-some-of [:option :vector-i64]
+                         (b64-join (option-value-of [:option :vector-i64] vals (vector-i64))))
+         (option-none-of [:option :vector-i64])))
+     :default
+  (let [chars (remove #(= % \=) (seq s))]
+    (when (every? #(contains? b64-index %) chars)
+      (let [vals (mapv b64-index chars)
+            n (count vals)]
+        (loop [i 0 out (transient [])]
+          (if (>= i n)
+            (persistent! out)
+            (let [v0 (nth vals i)
+                  v1 (when (< (inc i) n) (nth vals (inc i)))
+                  v2 (when (< (+ i 2) n) (nth vals (+ i 2)))
+                  v3 (when (< (+ i 3) n) (nth vals (+ i 3)))
+                  triple (bit-or (bit-shift-left v0 18)
+                                 (bit-shift-left (or v1 0) 12)
+                                 (bit-shift-left (or v2 0) 6)
+                                 (or v3 0))]
+              (recur (+ i 4)
+                     (cond-> out
+                       true (conj! (u8 (bit-shift-right triple 16)))
+                       v2   (conj! (u8 (bit-shift-right triple 8)))
+                       v3   (conj! (u8 triple))))))))))))
+
+(defn constant-time-eq
+  "Constant-time equality for two byte vectors (or two strings). Always scans
+   the full length of the longer input and folds every mismatch into a single
+   accumulator, instead of short-circuiting on the first differing element —
+   this avoids leaking a length/content-dependent timing signal, which is the
+   whole point when comparing a caller-presented MESSAGE-INTEGRITY digest or
+   TURN credential against the locally-computed value (a plain `=` here would
+   be a timing side-channel on secret-derived data).
+
+   Kotoba: two byte vectors (no run-time string test; `utf8-encode` a string
+   first, which is what the hosts do with one)."
+  [#?@(:kotoba [a :vector-i64 b :vector-i64] :default [a b])]
+  #?@(:kotoba [:bool])
+  #?(:kotoba
+     (let [na (vector-count a)
+           nb (vector-count b)
+           n (max na nb)]
+       (loop [i 0 diff (bit-xor na nb)]
+         (if (>= i n)
+           (zero? diff)
+           (recur (+ i 1)
+                  (bit-or diff (bit-xor (if (< i na) (vector-at a i) 0)
+                                        (if (< i nb) (vector-at b i) 0)))))))
+     :default
+  (let [a (if (string? a) (utf8-encode a) a)
+        b (if (string? b) (utf8-encode b) b)
+        n (max (count a) (count b))]
+    (loop [i 0 diff (bit-xor (count a) (count b))]
+      (if (>= i n)
+        (zero? diff)
+        (recur (inc i)
+               (bit-or diff (bit-xor (int (get a i 0)) (int (get b i 0))))))))))
+
+;; ── hex ──────────────────────────────────────────────────────────────────────
+;;
+;; A byte-vector's hex form is the lingua franca of digests, signatures and
+;; content identifiers, and it was hand-rolled in 33 repos here (and parsed back
+;; in 36). The implementations differ in ways that only show up at the edges:
+;; some build the string with `(.toString b 16)` and forget to pad a byte below
+;; 0x10, some emit uppercase where a protocol demands lowercase. Neither
+;; mistake is visible until a signature is rejected.
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn hex
+  "Lowercase hex encoding of a byte-vector. Every byte becomes exactly two
+   characters, including bytes below 0x10 — the padding a `toString(16)`-based
+   encoder silently drops."
+  [#?@(:kotoba [bs :vector-i64] :default [bs])]
+  #?@(:kotoba [:string])
+  #?(:kotoba
+     ;; the digits are ASCII: their bytes are the answer's bytes
+     (let [n (vector-count bs)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           (string-from-utf8 (bytes-from-vector-i64 out))
+           (let [v (u8 (vector-at bs i))]
+             (recur (+ i 1)
+                    (vector-conj (vector-conj out (string-code-point-at hex-digits (bit-shift-right v 4)))
+                                 (string-code-point-at hex-digits (bit-and v 0xf))))))))
+     :default
+     (apply str (mapcat (fn [b]
+                          (let [v (u8 b)]
+                            [(nth hex-digits (bit-shift-right v 4))
+                             (nth hex-digits (bit-and v 0xf))]))
+                        bs))))
+
+(defn- hex-val
+  "Kotoba: `c` is a code point and -1 stands for nil."
+  [#?@(:kotoba [c :i64] :default [c])]
+  #?(:kotoba
+     (cond
+       (<= 48 c 57)  (- c 48)
+       (<= 97 c 102) (- c 87)
+       (<= 65 c 70)  (- c 55)
+       :else -1)
+     :default
+     (let [n #?(:clj (int ^char c) :cljs (.charCodeAt c 0))]
+       (cond
+         (<= 48 n 57)  (- n 48)          ; 0-9
+         (<= 97 n 102) (- n 87)          ; a-f
+         (<= 65 n 70)  (- n 55)          ; A-F
+         :else nil))))
+
+(defn unhex
+  "Decode a hex string to a byte-vector. Accepts either case. Returns nil on an
+   odd length or a non-hex character rather than guessing — a truncated or
+   corrupted digest should fail loudly, not decode to something plausible.
+
+   Kotoba: a string in, `[:option :vector-i64]` out, none where the hosts
+   answer nil. It walks UTF-8 bytes where the hosts walk UTF-16 units; any
+   non-ASCII character is a non-hex character, so the answers agree."
+  [#?@(:kotoba [s :string] :default [s])]
+  #?@(:kotoba [[:option :vector-i64]])
+  #?(:kotoba
+     (let [n (string-byte-length s)]
+       (if (= 1 (bit-and n 1))
+         (option-none-of [:option :vector-i64])
+         (loop [i 0 out (vector-i64)]
+           (if (>= i n)
+             (option-some-of [:option :vector-i64] out)
+             (let [hi (hex-val (string-code-point-at s i))]
+               (if (< hi 0)
+                 (option-none-of [:option :vector-i64])
+                 (let [lo (hex-val (string-code-point-at s (+ i 1)))]
+                   (if (< lo 0)
+                     (option-none-of [:option :vector-i64])
+                     (recur (+ i 2) (vector-conj out (bit-or (bit-shift-left hi 4) lo)))))))))))
+     :default
+  (let [s (str s)]
+    (when (even? (count s))
+      (loop [i 0 out (transient [])]
+        (if (>= i (count s))
+          (persistent! out)
+          (let [hi (hex-val (nth s i))
+                lo (hex-val (nth s (inc i)))]
+            (when (and hi lo)
+              (recur (+ i 2) (conj! out (bit-or (bit-shift-left hi 4) lo)))))))))))
+
+;; ── host bytes: the JDK's own answers, as the host's own byte container ─────
+;;
+;; Everything above answers a `vector<int 0..255>`. A caller migrating off
+;; `java.util.Base64` decoders or `String.getBytes` / `new String(b, UTF_8)`
+;; hands the result on to code that expects the HOST's byte container (a JVM
+;; `byte[]`; under kbb, the `Int8Array` its `(.getBytes s "UTF-8")` returns),
+;; and needs the JDK's exact answer -- including for malformed input, where
+;; `base64-decode` / `utf8-decode` above deliberately answer nil instead.
+;;
+;; These are transcriptions of JDK 21's `java.util.Base64$Decoder`
+;; (decodedOutLength + decode0) and `java.lang.String` (encodeUTF8_UTF16,
+;; decodeUTF8_UTF16 with replacement), measured against JDK 21 as an oracle:
+;; test/kotoba/bytes/host_bytes_oracle.edn is the JDK's output for a random
+;; and adversarial corpus (scripts/gen-host-bytes-oracle.clj regenerates it),
+;; and test/kotoba/bytes/host_bytes_test.cljk compares every entry on both
+;; hosts. Where the JDK throws IllegalArgumentException these throw ex-info
+;; {:kotoba.bytes/error :illegal-base64} with the JDK's message; a caller that
+;; catches IllegalArgumentException BY NAME will not catch it (ExceptionInfo
+;; is a RuntimeException, so `Exception` / `Throwable` / `:default` still do).
+
+(defn ->host-bytes
+  "A byte vector (or anything `->bytes` reads) as the host's byte container:
+   a signed `byte[]` on the JVM, an `Int8Array` under ClojureScript/kbb (what
+   kbb's `(.getBytes s \"UTF-8\")` returns). nil stays nil.
+
+   Kotoba: `:bytes`, the language's own host-independent byte string, made
+   from a byte vector (each item masked by `u8`, as `->bytes` does)."
+  [#?@(:kotoba [x :vector-i64] :default [x])]
+  #?@(:kotoba [:bytes])
+  #?(:kotoba (bytes-from-vector-i64 (->bytes x))
+     :default
+  (when-let [v (->bytes x)]
+    (let [n (count v)
+          a #?(:clj (byte-array n) :cljs (js/Int8Array. n))]
+      (dotimes [i n]
+        #?(:clj (aset-byte a i (unchecked-byte (nth v i)))
+           :cljs (aset a i (nth v i))))
+      a))))
+
+(defn- b64-table
+  "byte -> sextet, -2 for `=`, -1 otherwise (the JDK's fromBase64 tables).
+
+   Kotoba: the ASCII half only (bytes 0..127); `b64-sextet` answers -1 for
+   every byte above it, as the whole table does."
+  [#?@(:kotoba [alphabet :string] :default [alphabet])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     ;; (pad-right's Kotoba body fills the 128 slots; a second loop here that
+     ;; read the first loop's result was refused -- see b64-sextets)
+     (let [n (string-byte-length alphabet)]
+       (loop [i 0 t (vector-assoc-each (pad-right (vector-i64) 128) -1)]
+         (if (>= i n)
+           (vector-assoc t 61 -2)
+           (recur (+ i 1) (vector-assoc t (string-code-point-at alphabet i) i)))))
+     :default
+  (let [t (reduce (fn [t [i c]] (assoc t (code-unit-at (str c) 0) i))
+                  (vec (repeat 256 -1))
+                  (map-indexed vector alphabet))]
+    (assoc t 61 -2))))
+
+;; Kotoba: written out, because a constant is evaluated before any function
+;; exists -- `(b64-table b64-alphabet)` / `(b64-table b64url-alphabet)`.
+(def ^:private b64-std-table
+  #?(:kotoba
+     [-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+      -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+      -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 62 -1 -1 -1 63
+      52 53 54 55 56 57 58 59 60 61 -1 -1 -1 -2 -1 -1
+      -1 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+      15 16 17 18 19 20 21 22 23 24 25 -1 -1 -1 -1 -1
+      -1 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+      41 42 43 44 45 46 47 48 49 50 51 -1 -1 -1 -1 -1]
+     :default (b64-table b64-alphabet)))
+(def ^:private b64-url-table
+  #?(:kotoba
+     [-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+      -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+      -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 62 -1 -1
+      52 53 54 55 56 57 58 59 60 61 -1 -1 -1 -2 -1 -1
+      -1 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+      15 16 17 18 19 20 21 22 23 24 25 -1 -1 -1 -1 63
+      -1 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+      41 42 43 44 45 46 47 48 49 50 51 -1 -1 -1 -1 -1]
+     :default (b64-table b64url-alphabet)))
+
+#?(:kotoba
+   ;; `(nth table b)` over the full 256-entry table
+   (defn- b64-sextet [table :vector-i64 b :i64] :i64
+     (if (< b 128) (vector-at table b) -1)))
+
+(defn- latin1-units
+  "`String.getBytes(ISO_8859_1)` as unsigned ints: a code point above 0xFF (a
+   surrogate PAIR is one code point, a lone surrogate is one) becomes `?`.
+
+   Kotoba: code point by code point (a Kotoba string has no lone surrogate)."
+  [#?@(:kotoba [s :string] :default [^String s])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [n (string-byte-length s)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           out
+           (let [cp (string-code-point-at s i)]
+             (recur (+ i (utf8-width cp)) (vector-conj out (if (< cp 0x100) cp 63)))))))
+     :default
+  (let [n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (persistent! out)
+        (let [c (code-unit-at s i)]
+          (cond
+            (< c 0x100) (recur (inc i) (conj! out c))
+            (and (<= 0xD800 c 0xDBFF) (< (inc i) n)
+                 (<= 0xDC00 (code-unit-at s (inc i)) 0xDFFF))
+            (recur (+ i 2) (conj! out 63))
+            :else (recur (inc i) (conj! out 63)))))))))
+
+(defn- b64-fail [#?@(:kotoba [msg :string] :default [msg])]
+  ;; Kotoba: an abort carrying the JDK's message; decode-64 catches it. It
+  ;; never returns, so its result type is the one its one caller needs.
+  #?@(:kotoba [:i64])
+  #?(:kotoba (throw msg)
+     :default (throw (ex-info msg {:kotoba.bytes/error :illegal-base64}))))
+
+(defn- decoded-out-length
+  "JDK Base64$Decoder#decodedOutLength -- it throws for a 1-byte non-MIME input."
+  [#?@(:kotoba [table :vector-i64 mime? :bool src :vector-i64] :default [table mime? src])]
+  #?(:kotoba
+     (let [sl (vector-count src)]
+       (cond
+         (zero? sl) 0
+         (< sl 2) (if mime? 0 (b64-fail "Input byte[] should at least have 2 bytes for base64 bytes"))
+         :else
+         (let [len (if mime?
+                     (loop [sp 0 n 0]
+                       (if (>= sp sl)
+                         (- sl n)
+                         (let [b (vector-at src sp)]
+                           (cond
+                             (= b 61) (- sl (+ (- sl sp) n))
+                             (= -1 (b64-sextet table b)) (recur (+ sp 1) (+ n 1))
+                             :else (recur (+ sp 1) n)))))
+                     sl)
+               paddings (if mime?
+                          0
+                          (if (= 61 (vector-at src (- sl 1)))
+                            (if (= 61 (vector-at src (- sl 2))) 2 1)
+                            0))
+               ;; (Kotoba refuses a name bound twice in one let)
+               paddings2 (if (and (zero? paddings) (not (zero? (bit-and len 3))))
+                           (- 4 (bit-and len 3))
+                           paddings)]
+           (- (* 3 (quot (+ len 3) 4)) paddings2))))
+     :default
+  (let [sl (count src)]
+    (cond
+      (zero? sl) 0
+      (< sl 2) (if mime? 0 (b64-fail "Input byte[] should at least have 2 bytes for base64 bytes"))
+      :else
+      (let [[len paddings]
+            (if mime?
+              [(loop [sp 0 n 0]
+                 (if (>= sp sl)
+                   (- sl n)
+                   (let [b (nth src sp)]
+                     (cond
+                       (= b 61) (- sl (- sl sp) n)
+                       (= -1 (nth table b)) (recur (inc sp) (inc n))
+                       :else (recur (inc sp) n)))))
+               0]
+              [sl (if (= 61 (nth src (dec sl)))
+                    (if (= 61 (nth src (- sl 2))) 2 1)
+                    0)])
+            paddings (if (and (zero? paddings) (not (zero? (bit-and len 3))))
+                       (- 4 (bit-and len 3))
+                       paddings)]
+        (- (* 3 (quot (+ len 3) 4)) paddings))))))
+
+#?(:kotoba
+   ;; lowercase hex of n >= 0 without padding, as Integer/toString radix 16
+   (defn- hex-digits-of [n :i64] :string
+     (let [d (string-substring hex-digits (bit-and n 15) (+ (bit-and n 15) 1))]
+       (if (< n 16) d (string-concat (hex-digits-of (bit-shift-right n 4)) d)))))
+
+(defn- signed-hex [v]
+  #?@(:kotoba [:string])
+  (let [s (if (> v 127) (- v 256) v)]
+    #?(:kotoba (if (< s 0) (string-concat "-" (hex-digits-of (- 0 s))) (hex-digits-of s))
+       :clj (Integer/toString (int s) 16) :cljs (.toString s 16))))
+
+#?(:kotoba
+   ;; decode-64's loop state, carried in the first four slots of its output
+   ;; (a loop answers one value): status (0 ok, 1 the JDK threw), sp,
+   ;; shiftto, bits; the decoded bytes follow
+   (defn- b64-state [out :vector-i64 status :i64 sp :i64 shiftto :i64 bits :i64] :vector-i64
+     (vector-assoc (vector-assoc (vector-assoc (vector-assoc out 0 status) 1 sp) 2 shiftto) 3 bits)))
+
+#?(:kotoba
+   ;; decodedOutLength, or -1 where it throws. A function of its own: with
+   ;; this `try` inside decode-64-or-none (or around its whole body) the
+   ;; checker refused that function ("expected i64, got bool"), and removing
+   ;; either of its loops instead made the refusal go away.
+   (defn- b64-cap [table :vector-i64 mime? :bool src :vector-i64] :i64
+     (try (decoded-out-length table mime? src) (catch e -1))))
+
+#?(:kotoba
+   ;; decode0's check after the loop: a byte left over that MIME may not skip
+   ;; (a function of its own for the reason given at b64-sextets)
+   (defn- b64-trailing-bad? [table :vector-i64 mime? :bool src :vector-i64 from :i64] :bool
+     (let [sl (vector-count src)]
+       (loop [sp from]
+         (if (>= sp sl)
+           false
+           (if (and mime? (< (b64-sextet table (vector-at src sp)) 0))
+             (recur (+ sp 1))
+             true))))))
+
+#?(:kotoba
+   ;; decode-64's Kotoba body: none wherever the JDK throws
+   (defn- decode-64-or-none [table :vector-i64 mime? :bool x :string] [:option :bytes]
+     (let [src (latin1-units x)
+           sl (vector-count src)
+           cap (b64-cap table mime? src)
+           st (loop [sp 0 shiftto 18 bits 0 out [0 0 0 0]]
+                (if (>= sp sl)
+                  (b64-state out 0 sp shiftto bits)
+                  (let [b (b64-sextet table (vector-at src sp))
+                        sp (+ sp 1)]
+                    (cond
+                      (= b -2)
+                      (if (or (and (= shiftto 6) (or (= sp sl) (not (= 61 (vector-at src sp)))))
+                              (= shiftto 18))
+                        (b64-state out 1 sp shiftto bits)
+                        (b64-state out 0 (if (= shiftto 6) (+ sp 1) sp) shiftto bits))
+
+                      (< b 0)
+                      (if mime?
+                        (recur sp shiftto bits out)
+                        (b64-state out 1 sp shiftto bits))
+
+                      :else
+                      (let [bits (bit-or bits (bit-shift-left b shiftto))
+                            shiftto (- shiftto 6)]
+                        (if (< shiftto 0)
+                          (recur sp 18 0 (vector-conj (vector-conj (vector-conj out (u8 (bit-shift-right bits 16)))
+                                                                   (u8 (bit-shift-right bits 8)))
+                                                      (u8 bits)))
+                          (recur sp shiftto bits out)))))))
+           sp (vector-at st 1)
+           shiftto (vector-at st 2)
+           bits (vector-at st 3)
+           body (vector-drop st 4)
+           out (cond
+                 (= shiftto 6) (vector-conj body (u8 (bit-shift-right bits 16)))
+                 (= shiftto 0) (vector-conj (vector-conj body (u8 (bit-shift-right bits 16)))
+                                            (u8 (bit-shift-right bits 8)))
+                 :else body)
+           trailing-bad (b64-trailing-bad? table mime? src sp)]
+       (if (or (< cap 0) (= 1 (vector-at st 0)) (= shiftto 12) trailing-bad (> (vector-count out) cap))
+         (option-none-of [:option :bytes])
+         (option-some-of [:option :bytes] (->host-bytes out))))))
+
+(defn- decode-64
+  "JDK Base64$Decoder#decode(byte[]): decodedOutLength, then decode0.
+
+   Kotoba: `x` is a string (read as ISO-8859-1, as the JDK's decode(String)
+   does) -- there is no run-time string-or-bytes test -- and the answer is
+   `[:option :bytes]`: none wherever the JDK throws IllegalArgumentException
+   (the message is not carried; the hosts' ex-info has it)."
+  [#?@(:kotoba [table :vector-i64 mime? :bool x :string] :default [table mime? x])]
+  #?@(:kotoba [[:option :bytes]])
+  #?(:kotoba
+     (decode-64-or-none table mime? x)
+     :default
+  (do
+  (when (nil? x)
+    (throw (ex-info "base64 input is nil" {:kotoba.bytes/error :nil-input})))
+  (let [src (if (string? x) (latin1-units x) (->bytes x))
+        sl (count src)
+        cap (decoded-out-length table mime? src)
+        [out sp shiftto bits]
+        (loop [sp 0 shiftto 18 bits 0 out (transient [])]
+          (if (>= sp sl)
+            [out sp shiftto bits]
+            (let [b (nth table (nth src sp))
+                  sp (inc sp)]
+              (cond
+                (= b -2)
+                (if (or (and (= shiftto 6) (or (= sp sl) (not= 61 (nth src sp))))
+                        (= shiftto 18))
+                  (b64-fail "Input byte array has wrong 4-byte ending unit")
+                  ;; `src[sp++] != '='` consumed the second `=` when shiftto was 6
+                  [out (if (= shiftto 6) (inc sp) sp) shiftto bits])
+
+                (neg? b)
+                (if mime?
+                  (recur sp shiftto bits out)
+                  (b64-fail (str "Illegal base64 character " (signed-hex (nth src (dec sp))))))
+
+                :else
+                (let [bits (bit-or bits (bit-shift-left b shiftto))
+                      shiftto (- shiftto 6)]
+                  (if (neg? shiftto)
+                    (recur sp 18 0 (-> out
+                                       (conj! (u8 (bit-shift-right bits 16)))
+                                       (conj! (u8 (bit-shift-right bits 8)))
+                                       (conj! (u8 bits))))
+                    (recur sp shiftto bits out)))))))
+        out (persistent!
+             (cond
+               (= shiftto 6) (conj! out (u8 (bit-shift-right bits 16)))
+               (= shiftto 0) (-> out (conj! (u8 (bit-shift-right bits 16))) (conj! (u8 (bit-shift-right bits 8))))
+               (= shiftto 12) (b64-fail "Last unit does not have enough valid bits")
+               :else out))]
+    (loop [sp sp]
+      (when (< sp sl)
+        (if (and mime? (neg? (nth table (nth src sp))))
+          (recur (inc sp))
+          (b64-fail (str "Input byte array has incorrect ending byte at " (inc sp))))))
+    (when (> (count out) cap)
+      ;; the JDK's destination array is `cap` long: writing past it throws
+      (throw (ex-info "decoded length exceeds the JDK's destination array"
+                      {:kotoba.bytes/error :illegal-base64})))
+    (->host-bytes out)))))
+
+(defn base64-decode-bytes
+  "`(.decode (java.util.Base64/getDecoder) x)`: RFC 4648 base64 of a String
+   (read as ISO-8859-1, as the JDK does) or of bytes, to HOST bytes (see
+   `->host-bytes`). Padding is optional but must be right when present, and no
+   character outside the alphabet is allowed. Where the JDK throws
+   IllegalArgumentException this throws ex-info {:kotoba.bytes/error
+   :illegal-base64} with the JDK's message. Contrast `base64-decode`, which
+   answers a vector, or nil."
+  [#?@(:kotoba [x :string] :default [x])]
+  #?@(:kotoba [[:option :bytes]])
+  (decode-64 b64-std-table false x))
+
+(defn base64url-decode-bytes
+  "`(.decode (java.util.Base64/getUrlDecoder) x)`: as `base64-decode-bytes`
+   over the RFC 4648 §5 alphabet (`-` `_`; `+` and `/` are illegal)."
+  [#?@(:kotoba [x :string] :default [x])]
+  #?@(:kotoba [[:option :bytes]])
+  (decode-64 b64-url-table false x))
+
+(defn base64mime-decode-bytes
+  "`(.decode (java.util.Base64/getMimeDecoder) x)`: as `base64-decode-bytes`,
+   except every character outside the alphabet (line separators, spaces, any
+   other byte) is ignored, before and after a valid `=` ending."
+  [#?@(:kotoba [x :string] :default [x])]
+  #?@(:kotoba [[:option :bytes]])
+  (decode-64 b64-std-table true x))
+
+(defn utf8-bytes
+  "`(.getBytes s StandardCharsets/UTF_8)` as HOST bytes (see `->host-bytes`):
+   an unpaired surrogate becomes `?` (0x3F), as the JDK's replacement does.
+   Contrast `utf8-encode`, which answers a vector (and skips a lone high
+   surrogate). A non-string throws (the JDK threw NullPointerException on nil).
+
+   Kotoba: a string's own bytes as `:bytes` -- a Kotoba string cannot hold an
+   unpaired surrogate, so no `?` replacement is ever needed."
+  [#?@(:kotoba [s :string] :default [^String s])]
+  #?@(:kotoba [:bytes])
+  #?(:kotoba (->host-bytes (utf8-encode s))
+     :default
+  (do
+  (when-not (string? s)
+    (throw (ex-info "utf8-bytes needs a string" {:kotoba.bytes/error :not-a-string})))
+  (let [n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (->host-bytes (persistent! out))
+        (let [c (code-unit-at s i)]
+          (cond
+            (< c 0x80) (recur (inc i) (conj! out c))
+            (< c 0x800) (recur (inc i) (-> out
+                                           (conj! (bit-or 0xC0 (bit-shift-right c 6)))
+                                           (conj! (bit-or 0x80 (bit-and c 0x3F)))))
+            (<= 0xD800 c 0xDFFF)
+            (let [c2 (when (and (<= c 0xDBFF) (< (inc i) n)) (code-unit-at s (inc i)))]
+              (if (and c2 (<= 0xDC00 c2 0xDFFF))
+                (let [cp (+ 0x10000 (bit-shift-left (- c 0xD800) 10) (- c2 0xDC00))]
+                  (recur (+ i 2) (-> out
+                                     (conj! (bit-or 0xF0 (bit-shift-right cp 18)))
+                                     (conj! (bit-or 0x80 (bit-and (bit-shift-right cp 12) 0x3F)))
+                                     (conj! (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+                                     (conj! (bit-or 0x80 (bit-and cp 0x3F))))))
+                (recur (inc i) (conj! out 63))))
+            :else (recur (inc i) (-> out
+                                     (conj! (bit-or 0xE0 (bit-shift-right c 12)))
+                                     (conj! (bit-or 0x80 (bit-and (bit-shift-right c 6) 0x3F)))
+                                     (conj! (bit-or 0x80 (bit-and c 0x3F)))))))))))))
+
+(defn- utf16-units->string [#?@(:kotoba [units :vector-i64] :default [units])]
+  #?@(:kotoba [:string])
+  #?(:kotoba
+     ;; pairs each surrogate pair into its code point and makes the string
+     ;; from its UTF-8. An unpaired surrogate has no Kotoba string: it is
+     ;; encoded as its three bytes and `string-from-utf8` traps on them, by
+     ;; name. utf8-string never hands one over (the JDK replaces an encoded
+     ;; surrogate with U+FFFD and only ever emits whole pairs).
+     (let [n (vector-count units)]
+       (string-from-utf8
+        (bytes-from-vector-i64
+         (loop [i 0 out (vector-i64)]
+           (if (>= i n)
+             out
+             (let [c (vector-at units i)
+                   c2 (if (< (+ i 1) n) (vector-at units (+ i 1)) -1)]
+               (if (and (<= 0xD800 c 0xDBFF) (<= 0xDC00 c2 0xDFFF))
+                 (recur (+ i 2) (conj-utf8 out (+ 0x10000 (bit-or (bit-shift-left (- c 0xD800) 10)
+                                                                  (- c2 0xDC00)))))
+                 (recur (+ i 1) (conj-utf8 out c)))))))))
+     :clj (let [a (char-array (count units))]
+            (dotimes [i (count units)] (aset a i (char (nth units i))))
+            (String. a))
+     :cljs (apply str (map #(js/String.fromCharCode %) units))))
+
+#?(:kotoba
+   ;; utf8-string's two `bad2?`s, as functions of the lead byte rather than
+   ;; closures over it
+   (defn- utf8-bad2-of-3? [b1 :i64 b2 :i64] :bool
+     (or (and (= b1 0xE0) (= 0x80 (bit-and b2 0xE0))) (not (utf8-cont? b2)))))
+#?(:kotoba
+   (defn- utf8-bad2-of-4? [b1 :i64 b2 :i64] :bool
+     (or (and (= b1 0xF0) (or (< b2 0x90) (> b2 0xBF)))
+         (and (= b1 0xF4) (not (= 0x80 (bit-and b2 0xF0))))
+         (not (utf8-cont? b2)))))
+
+(defn utf8-string
+  "`(String. b StandardCharsets/UTF_8)`: decode host bytes (or a byte vector)
+   as UTF-8, replacing each malformed sequence with U+FFFD at exactly the
+   JDK's granularity (a transcription of JDK 21 String#decodeUTF8_UTF16 with
+   replacement: `ED A0 80`, an encoded surrogate, is ONE U+FFFD; `E0 80 80` is
+   three). Contrast `utf8-decode`, which answers nil for malformed input. nil
+   throws (the JDK threw NullPointerException).
+
+   Kotoba: `b` is `:bytes` (what `->host-bytes` / `utf8-bytes` answer), and
+   the answer is the same string: every U+FFFD and every pair the JDK writes
+   is a valid code point, so it has a Kotoba string."
+  [#?@(:kotoba [b :bytes] :default [b])]
+  #?@(:kotoba [:string])
+  #?(:kotoba
+     (let [src (vector-i64-from-bytes b)
+           sl (vector-count src)
+           repl 0xFFFD]
+       (loop [sp 0 out (vector-i64)]
+         (if (>= sp sl)
+           (utf16-units->string out)
+           (let [b1 (vector-at src sp) sp (+ sp 1)]
+             (cond
+               (< b1 0x80) (recur sp (vector-conj out b1))
+
+               (<= 0xC2 b1 0xDF)
+               (if (< sp sl)
+                 (let [b2 (vector-at src sp)]
+                   (if (utf8-cont? b2)
+                     (recur (+ sp 1) (vector-conj out (bit-or (bit-shift-left (bit-and b1 0x1F) 6) (bit-and b2 0x3F))))
+                     (recur sp (vector-conj out repl))))
+                 (recur sl (vector-conj out repl)))
+
+               (<= 0xE0 b1 0xEF)
+               (if (< (+ sp 1) sl)
+                 (let [b2 (vector-at src sp) b3 (vector-at src (+ sp 1))]
+                   (if (or (utf8-bad2-of-3? b1 b2) (not (utf8-cont? b3)))
+                     (recur (if (utf8-bad2-of-3? b1 b2) sp (+ sp 1)) (vector-conj out repl))
+                     (let [c (bit-or (bit-or (bit-shift-left (bit-and b1 0x0F) 12)
+                                             (bit-shift-left (bit-and b2 0x3F) 6))
+                                     (bit-and b3 0x3F))]
+                       (recur (+ sp 2) (vector-conj out (if (<= 0xD800 c 0xDFFF) repl c))))))
+                 (if (and (< sp sl) (utf8-bad2-of-3? b1 (vector-at src sp)))
+                   (recur sp (vector-conj out repl))
+                   (recur sl (vector-conj out repl))))
+
+               (<= 0xF0 b1 0xF7)
+               (if (< (+ sp 2) sl)
+                 (let [b2 (vector-at src sp) b3 (vector-at src (+ sp 1)) b4 (vector-at src (+ sp 2))
+                       uc (bit-or (bit-or (bit-shift-left (bit-and b1 0x07) 18)
+                                          (bit-shift-left (bit-and b2 0x3F) 12))
+                                  (bit-or (bit-shift-left (bit-and b3 0x3F) 6)
+                                          (bit-and b4 0x3F)))]
+                   (if (or (not (utf8-cont? b2)) (not (utf8-cont? b3)) (not (utf8-cont? b4))
+                           (not (<= 0x10000 uc 0x10FFFF)))
+                     (let [k (cond (or (> b1 0xF4) (utf8-bad2-of-4? b1 b2)) 1
+                                   (not (utf8-cont? b3)) 2
+                                   :else 3)]
+                       (recur (+ (- sp 1) k) (vector-conj out repl)))
+                     (let [v (- uc 0x10000)]
+                       (recur (+ sp 3) (vector-conj (vector-conj out (+ 0xD800 (bit-shift-right v 10)))
+                                                    (+ 0xDC00 (bit-and v 0x3FF)))))))
+                 (if (or (> b1 0xF4) (and (< sp sl) (utf8-bad2-of-4? b1 (vector-at src sp))))
+                   (recur sp (vector-conj out repl))
+                   (let [sp (+ sp 1)]
+                     (if (and (< sp sl) (not (utf8-cont? (vector-at src sp))))
+                       (recur sp (vector-conj out repl))
+                       (recur sl (vector-conj out repl))))))
+
+               :else (recur sp (vector-conj out repl)))))))
+     :default
+  (do
+  (when (nil? b)
+    (throw (ex-info "utf8-string needs bytes" {:kotoba.bytes/error :nil-input})))
+  (let [src (->bytes b)
+        sl (count src)
+        cont? (fn [x] (= 0x80 (bit-and x 0xC0)))
+        repl 0xFFFD]
+    (loop [sp 0 out (transient [])]
+      (if (>= sp sl)
+        (utf16-units->string (persistent! out))
+        (let [b1 (nth src sp) sp (inc sp)]
+          (cond
+            (< b1 0x80) (recur sp (conj! out b1))
+
+            (<= 0xC2 b1 0xDF)
+            (if (< sp sl)
+              (let [b2 (nth src sp)]
+                (if (cont? b2)
+                  (recur (inc sp) (conj! out (bit-or (bit-shift-left (bit-and b1 0x1F) 6) (bit-and b2 0x3F))))
+                  (recur sp (conj! out repl))))
+              (recur sl (conj! out repl)))
+
+            (<= 0xE0 b1 0xEF)
+            (let [bad2? (fn [b2] (or (and (= b1 0xE0) (= 0x80 (bit-and b2 0xE0))) (not (cont? b2))))]
+              (if (< (inc sp) sl)
+                (let [b2 (nth src sp) b3 (nth src (inc sp))]
+                  (if (or (bad2? b2) (not (cont? b3)))
+                    ;; malformed3: the one U+FFFD covers 1 byte, or 2
+                    (recur (if (bad2? b2) sp (inc sp)) (conj! out repl))
+                    (let [c (bit-or (bit-shift-left (bit-and b1 0x0F) 12)
+                                    (bit-shift-left (bit-and b2 0x3F) 6)
+                                    (bit-and b3 0x3F))]
+                      (recur (+ sp 2) (conj! out (if (<= 0xD800 c 0xDFFF) repl c))))))
+                (if (and (< sp sl) (bad2? (nth src sp)))
+                  (recur sp (conj! out repl))
+                  (recur sl (conj! out repl)))))
+
+            (<= 0xF0 b1 0xF7)
+            (let [bad2? (fn [b2] (or (and (= b1 0xF0) (or (< b2 0x90) (> b2 0xBF)))
+                                     (and (= b1 0xF4) (not= 0x80 (bit-and b2 0xF0)))
+                                     (not (cont? b2))))]
+              (if (< (+ sp 2) sl)
+                (let [b2 (nth src sp) b3 (nth src (inc sp)) b4 (nth src (+ sp 2))
+                      uc (bit-or (bit-shift-left (bit-and b1 0x07) 18)
+                                 (bit-shift-left (bit-and b2 0x3F) 12)
+                                 (bit-shift-left (bit-and b3 0x3F) 6)
+                                 (bit-and b4 0x3F))]
+                  (if (or (not (cont? b2)) (not (cont? b3)) (not (cont? b4))
+                          (not (<= 0x10000 uc 0x10FFFF)))
+                    ;; malformed4: the one U+FFFD covers 1, 2 or 3 bytes
+                    (let [k (cond (or (> b1 0xF4) (bad2? b2)) 1
+                                  (not (cont? b3)) 2
+                                  :else 3)]
+                      (recur (+ (dec sp) k) (conj! out repl)))
+                    (let [v (- uc 0x10000)]
+                      (recur (+ sp 3) (-> out
+                                          (conj! (+ 0xD800 (bit-shift-right v 10)))
+                                          (conj! (+ 0xDC00 (bit-and v 0x3FF))))))))
+                (if (or (> b1 0xF4) (and (< sp sl) (bad2? (nth src sp))))
+                  (recur sp (conj! out repl))
+                  ;; the JDK skips the next byte, writes one U+FFFD, and stops
+                  ;; unless the byte after that is not a continuation byte
+                  (let [sp (inc sp)]
+                    (if (and (< sp sl) (not (cont? (nth src sp))))
+                      (recur sp (conj! out repl))
+                      (recur sl (conj! out repl)))))))
+
+            :else (recur sp (conj! out repl))))))))))

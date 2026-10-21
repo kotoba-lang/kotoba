@@ -1,12 +1,19 @@
 # Bundled Kotoba libraries
 
-The standard-library pilot lives in this repository:
+The bundled standard libraries live in this repository:
 
 | Canonical ID | Source | Legacy namespace APIs |
 |---|---|---|
 | `kotoba.coll` | `kotoba.coll/src` | `kotoba.coll`, `kotoba.lang.coll` |
 | `kotoba.spec` | `kotoba.spec/src` | `kotoba.spec`, `kotoba.lang.spec` |
 | `kotoba.json` | `kotoba.json/src` | `kotoba.json`, `kotoba.lang.json`, `json.*` |
+| `kotoba.set` | `kotoba.set/src` | `kotoba.set` |
+| `kotoba.walk` | `kotoba.walk/src` | `kotoba.walk` |
+| `kotoba.string` | `kotoba.string/src` | `kotoba.string` |
+| `kotoba.time` | `kotoba.time/src` | `kotoba.time`, `kotoba.lang.time` |
+| `kotoba.bytes` | `kotoba.bytes/src` | `kotoba.bytes`, `kotoba.bytes.sha1`, `kotoba.bytes.sha256` |
+| `kotoba.pprint` | `kotoba.pprint/src` | `kotoba.pprint` |
+| `kotoba.error` | `kotoba.error/src` | `kotoba.lang.error` |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
@@ -54,4 +61,9 @@ or an implementation of event publish/subscribe. Amu and the other execution
 and contract owners stay separate. Existing external pins keep working from
 the old repositories until their consumers migrate.
 
-`lib/kbb/` remains the existing guest script library; it is not moved by this pilot.
+See [repository migration decisions](../docs/library-repository-migration.md) and
+[reviewed source retirement inventory](repository-migrations.json). Archive
+retains repository history and immutable dependency pins; the inventory records
+eligibility, while the linked Linear task records actual GitHub readback.
+
+`lib/kbb/` remains the existing guest script library.
