@@ -25,7 +25,9 @@ new normative Kotoba specifications.
 Text's duplicate old `kotoba.string` facade is kept under `provenance/text/src`,
 outside active source paths. The text/string behavioral parity tests remain;
 the text alias identity check now applies to `kotoba.text`. Classpath order
-must not select between two definitions of the same host namespace.
+must not select between two definitions of the same host namespace. The canonical
+string facade also forwards the old text alias's `re-quote`; the JVM suite checks
+that every legacy text export remains available alongside canonical `spec-re`.
 
 ## Effects and state
 
