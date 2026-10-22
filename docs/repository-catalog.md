@@ -26,9 +26,9 @@ forks. The classification table covers public repositories only:
 | Recorded classification | Repositories |
 |---|---:|
 | Source integration or licensed-owner compatibility derivation recorded | 427 |
-| Ownership review required | 773 |
+| Ownership review required | 769 |
 | Adapter/protocol review required | 1,312 |
-| Retained app, foundation, upstream-fork or owner boundary | 116 |
+| Retained app, foundation, upstream-fork or owner boundary | 120 |
 | License provenance hold | 2 |
 | Public total | 2,630 |
 
@@ -39,6 +39,17 @@ runtime evidence needed before further integration or retirement. Pending
 drafts such as Kami PR #139 are not counted as merged source integration.
 GitHub's primary-language field often does not recognize `.cljk`; it does not
 measure Kotoba adoption or runtime qualification.
+
+The [fixed-source owner review](../maintenance/repository-boundaries/2026-10-22/retained-owners.json)
+resolves four former ownership-triage rows. `artifact` keeps the shared identity
+and signing contract; `bonsai` keeps the Git object/remote-helper product;
+`murakumo` keeps the compute plane; `kami-engine` keeps the family monorepo
+owner and its external native-adapter boundary. Their rows now expose `owner`,
+`monorepo-role` and the exact review commit. This changes owner placement only:
+the 427 recorded integrations, 239 pin holds and all repository archive states
+are unchanged. Kami's draft #139 and its native component gates remain open.
+The observed host launchers in retained owners are still migration work;
+retention is not a permanent JVM/Node exception or native qualification.
 
 Private repository names and project details are omitted from the public
 catalog. The full 2,669-row inventory is retained locally as
