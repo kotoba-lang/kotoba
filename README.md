@@ -1627,3 +1627,6 @@ The merged AMU `:execution-v2` alias and Kototama v2 entrypoints provide closed 
 the bundled dotted IDs and their explicit legacy aliases. To use their source
 APIs, run `kotoba run example.cljk --runtime sci --library kotoba.coll --json`.
 See [the runnable example and compatibility boundary](docs/library-source-import.md).
+
+For organization-wide ownership, integration, checkout and manifest status, use
+the [repository catalog and query guide](docs/repository-catalog.md).

@@ -8,9 +8,12 @@ tracks the adapter/registry boundary.
 
 ## Current evidence, 2026-10-22 JST
 
-GitHub lists 2,668 repositories: 2,630 public and 38 private, including the 239
-archived dependency-pin holds. Every current default commit and Git tree was
-read from GitHub. Current project metadata was read from matching local Git
+GitHub now lists 2,669 repositories: 2,630 public and 39 private, including the 239
+archived dependency-pin holds. All canonical Git checkouts are placed. See the
+[catalog guide and queries](repository-catalog.md) for local placement,
+classification and registration counts. At the earlier source-review snapshot,
+every observed default commit and Git tree was
+read from GitHub. Project metadata at that observation was read from matching local Git
 objects for 2,564 repositories and through pinned GitHub objects for the other
 104. The latter still need tree-level review when selecting source to move.
 Private repository details stay outside this public inventory.

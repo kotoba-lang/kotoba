@@ -22,9 +22,12 @@ or a signed subtree release.
 
 ## Inventory and boundaries
 
-[The refreshed org inventory](library-repository-inventory.json) records 2,668
+[The refreshed org inventory](library-repository-inventory.json) records 2,669
 repositories observed on 2026-10-22 JST, with 2,630 public repository names.
-Non-public details are omitted. Its categories are triage, not semantic
+All 2,669 canonical checkouts are now placed, including 39 private repositories
+whose details are omitted. The [catalog guide](repository-catalog.md) explains
+the inventory, query tool, source catalogs and independent west manifest.
+Its categories are triage, not semantic
 qualification or archive proof. The [continuing org review](org-consolidation-review.md)
 records the wider goal and ten additional same-family definitions.
 
