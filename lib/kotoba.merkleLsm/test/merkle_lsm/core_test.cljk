@@ -1,0 +1,559 @@
+(ns merkle-lsm.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipld.core :as ipld]
+            [merkle-lsm.core :as lsm]))
+
+(def entries
+  [{:components ["alice" "name" "Alice"] :epoch 7 :op :assert :value "Alice"}
+   {:components ["bob" "name" "Bob"] :epoch 8 :op :assert :value "Bob"}
+   {:components ["alice" "name" "Alice"] :epoch 9 :op :retract :value "Alice"}])
+
+(deftest canonical-key-is-framed-and-newest-first
+  (is (not= (lsm/canonical-key :eavt "t" ["a|b" "c"] 1)
+            (lsm/canonical-key :eavt "t" ["a" "b|c"] 1)))
+  (is (neg? (compare (lsm/canonical-key :eavt "t" ["alice"] 9)
+                     (lsm/canonical-key :eavt "t" ["alice"] 7)))))
+
+(deftest run-is-canonical-and-range-described
+  (let [a (lsm/build-run :eavt "tenant-a" entries)
+        b (lsm/build-run :eavt "tenant-a" (reverse entries))]
+    (is (= (:cid a) (:cid b)))
+    (is (= (vec (:bytes a)) (vec (:bytes b))))
+    (is (= 3 (:count a)))
+    (is (= (:min-key a) (get (:node a) "min-key")))
+    (is (= (:max-key a) (get (:node a) "max-key")))
+    (is (= "salice" (:first-component-min a)))
+    (is (= "sbob" (:first-component-max a)))
+    (is (= {:effect/type :block/put :cid (:cid a) :bytes (:bytes a)}
+           (first (:effects a))))))
+
+(deftest same-epoch-retry-deduplicates-and-conflict-fails-closed
+  (let [entry {:components ["alice" "role" "admin"]
+               :epoch 7 :op :assert :value "admin"}
+        once (lsm/build-run :eavt "t" [entry])
+        retried (lsm/build-run :eavt "t" [entry entry])]
+    (is (= (:cid once) (:cid retried)))
+    (is (= 1 (:count retried)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (lsm/build-run :eavt "t"
+                                [entry (assoc entry :op :retract)])))))
+
+(deftest manifest-links-runs-and-is-deterministic
+  (let [run (lsm/build-run :eavt "tenant-a" entries)
+        opts {:db-id "tenant-a" :epoch 9 :safe-epoch 7
+              :indexes {:eavt {:l0 [run]} :avet {:l1 []}}}
+        a (lsm/build-manifest opts)
+        b (lsm/build-manifest opts)
+        run-link (get-in (:node a) ["indexes" "eavt" "l0" 0 "cid"])]
+    (is (= (:cid a) (:cid b)))
+    (is (ipld/link? run-link))
+    (is (= (:cid run) (ipld/link-cid run-link)))))
+
+(deftest range-directory-checkpoints-compacted-refs
+  (let [a (lsm/build-run :eavt "t" entries)
+        b (lsm/build-run :avet "t" entries)
+        directory (lsm/build-range-directory
+                   {:db-id "db" :epoch 9
+                    :indexes {:eavt [a] :avet [(lsm/run-ref b)]}
+                    :previous (:cid a)})]
+    (is (= "kotobase/range-directory" (get-in directory [:node "format"])))
+    (is (= [(lsm/run-ref a)]
+           (lsm/range-directory-refs (:node directory) :eavt)))
+    (is (= [(lsm/run-ref b)]
+           (lsm/range-directory-refs (:node directory) :avet)))
+    (is (= (:cid a)
+           (ipld/link-cid (get-in directory [:node "previous"]))))))
+
+(deftest range-directory-replaces-compacted-index-and-converges
+  (let [old-run (lsm/build-run :eavt "t" entries)
+        new-run (lsm/build-run :eavt "t" (take 1 entries))
+        untouched (lsm/build-run :avet "t" entries)
+        old-directory (:node (lsm/build-range-directory
+                              {:db-id "db" :epoch 1
+                               :indexes {:eavt [old-run]
+                                         :avet [untouched]}}))
+        new-ref (lsm/run-ref new-run)
+        compact-inputs (lsm/checkpoint-compaction-refs
+                        [new-ref new-ref] old-directory :eavt)
+        a (lsm/merge-range-directory-indexes
+           {:eavt [new-ref new-ref]} old-directory)
+        b (lsm/merge-range-directory-indexes
+           {:eavt (reverse [new-ref new-ref])} old-directory)]
+    (is (= #{(lsm/run-ref old-run) new-ref} (set compact-inputs))
+        "inherited refs participate in the replacement compaction")
+    (is (= [new-ref] (:eavt a))
+        "the compacted index replaces, rather than appends to, stale refs")
+    (is (= [(lsm/run-ref untouched)] (:avet a))
+        "indexes absent from the new output remain inherited")
+    (is (= a b))
+    (is (= (:cid (lsm/build-range-directory
+                  {:db-id "db" :epoch 2 :indexes a}))
+           (:cid (lsm/build-range-directory
+                  {:db-id "db" :epoch 2 :indexes b})))
+        "equivalent retries converge on one directory CID")))
+
+(deftest checkpoint-selection-reuses-non-overlapping-directory-ranges
+  (let [entry (fn [entity]
+                {:components [entity "name" entity]
+                 :epoch 1 :op :assert :value entity})
+        alice (lsm/build-run :eavt "t" [(entry "alice")])
+        zara (lsm/build-run :eavt "t" [(entry "zara")])
+        bob (lsm/build-run :eavt "t" [(entry "bob")])
+        alice-v2 (lsm/build-run
+                  :eavt "t" [(assoc (entry "alice") :epoch 2)])
+        directory
+        (:node (lsm/build-range-directory
+                {:db-id "db" :epoch 1 :indexes {:eavt [alice zara]}}))
+        append-selection
+        (lsm/checkpoint-compaction-selection
+         [(lsm/run-ref bob)] directory :eavt)
+        overlap-selection
+        (lsm/checkpoint-compaction-selection
+         [(lsm/run-ref alice-v2)] directory :eavt)]
+    (is (= [(lsm/run-ref bob)] (:inputs append-selection)))
+    (is (= #{(lsm/run-ref alice) (lsm/run-ref zara)}
+           (set (:untouched append-selection)))
+        "append-only ranges do not reread existing checkpoint blocks")
+    (is (= #{(lsm/run-ref alice) (lsm/run-ref alice-v2)}
+           (set (:inputs overlap-selection))))
+    (is (= [(lsm/run-ref zara)] (:untouched overlap-selection)))))
+
+(deftest range-directory-version-and-ownership-fail-closed
+  (let [directory (:node (lsm/build-range-directory
+                          {:db-id "db" :epoch 4 :indexes {}}))]
+    (is (= directory (lsm/validate-range-directory directory "db" 4)))
+    (doseq [invalid [(assoc directory "version" 2)
+                     (assoc directory "db-id" "other")
+                     (assoc directory "epoch" 5)
+                     (assoc-in directory ["indexes" "future"] [])
+                     (assoc-in directory ["indexes" "eavt"]
+                               [{"cid" "not-an-ipld-link"}])]]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (lsm/validate-range-directory invalid "db" 4))))))
+
+(deftest paged-range-directory-bounds-inline-metadata-and-links-leaves
+  (let [ref (fn [n]
+              {"cid" (ipld/link
+                      (:cid (lsm/build-run
+                             :eavt "t"
+                             [{:components [(str "e" n) "name" n]
+                               :epoch 1 :op :assert :value n}])))
+               "count" 1
+               "min-key" (str n)
+               "max-key" (str n)
+               "logical-min" (str n)
+               "logical-max" (str n)
+               "first-component-min" (str "se" n)
+               "first-component-max" (str "se" n)})
+        refs (mapv ref (range 5))
+        directory
+        (lsm/build-paged-range-directory
+         {:db-id "db" :epoch 2 :indexes {:eavt refs} :page-refs 2})
+        root (:node directory)
+        pages (get (:pages directory) "eavt")]
+    (is (= 2 (get root "version")))
+    (is (= [2 2 1] (mapv #(get-in % [:node "count"]) pages)))
+    (is (= 5
+           (reduce + (map #(get-in % [:descriptor "row-count"]) pages))))
+    (is (= 3 (count (lsm/range-directory-page-descriptors root :eavt))))
+    (is (= 4 (count (:effects directory)))
+        "three leaves and one root are immutable block puts")
+    (is (= 1
+           (count
+            (lsm/select-run-refs-by-first-component
+             (lsm/range-directory-page-descriptors root :eavt) "e0")))
+        "an exact first component selects one bounded leaf")
+    (let [selection
+          (lsm/checkpoint-directory-page-selection
+           [(assoc (first refs) "cid"
+                   (ipld/link
+                    (:cid (lsm/build-run
+                           :eavt "t"
+                           [{:components ["e0" "name" "new"]
+                             :epoch 2 :op :assert :value "new"}]))))]
+           root :eavt)]
+      (is (= 1 (count (:selected-pages selection))))
+      (is (= 2 (count (:untouched-pages selection)))
+          "copy-on-write retains non-overlapping leaf CIDs")
+      (let [replacement
+            (first
+             (get
+              (lsm/build-range-directory-pages
+               {:db-id "db" :epoch 3 :indexes {:eavt [(first refs)]}
+                :page-refs 2})
+              "eavt"))
+            successor
+            (lsm/build-paged-range-directory-root
+             {:db-id "db" :epoch 3 :page-refs 2
+              :indexes
+              {:eavt
+               (conj (:untouched-pages selection)
+                     (:descriptor replacement))}})]
+        (is (= 1 (count (:effects successor)))
+            "copy-on-write publishes one new root, not retained leaves")
+        (is (every? (lsm/linked-cids (:node successor))
+                    (map #(ipld/link-cid (get % "cid"))
+                         (:untouched-pages selection))))))
+    (let [legacy-v2
+          (-> root
+              (dissoc "page-bytes")
+              (update-in ["indexes" "eavt"]
+                         #(mapv (fn [descriptor]
+                                  (dissoc descriptor "encoded-bytes"))
+                                %)))
+          migration
+          (lsm/checkpoint-directory-page-selection
+           [(first refs)] legacy-v2 :eavt)]
+      (is (= 3 (count (:selected-pages migration))))
+      (is (empty? (:untouched-pages migration))
+          "pre-byte-limit v2 leaves are rewritten once, never retained"))
+    (is (every? (lsm/linked-cids root)
+                (map :cid pages))
+        "the generic IPLD walker reaches every directory leaf")
+    (doseq [page pages]
+      (is (= (:node page)
+             (lsm/validate-range-directory-page
+              (:node page) "db" 2 :eavt 2))))
+    (is (= root (lsm/validate-range-directory root "db" 2)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (lsm/range-directory-refs root :eavt)))))
+
+(deftest range-directory-pages-have-an-exact-byte-ceiling
+  (let [run (lsm/build-run :eavt "t" (take 1 entries))
+        refs (mapv
+              (fn [n]
+                (assoc (lsm/run-ref run)
+                       "cid" (ipld/link
+                              (:cid (lsm/build-run
+                                     :eavt "t"
+                                     [{:components [(str "entity-" n)
+                                                    "payload"
+                                                    (apply str
+                                                           (repeat 400 "x"))]
+                                       :epoch 1 :op :assert :value n}])))
+                       "logical-min" (str n)
+                       "logical-max" (str n)
+                       "padding" (apply str (repeat 400 "x"))))
+              (range 5))
+        pages
+        (get
+         (lsm/build-range-directory-pages
+          {:db-id "db" :epoch 1 :indexes {:eavt refs}
+           :page-refs 128 :page-bytes 1400})
+         "eavt")]
+    (is (< 1 (count pages))
+        "the encoded byte limit splits before the ref-count limit")
+    (is (every? #(<= #?(:clj (alength ^bytes (:bytes %))
+                        :cljs (.-byteLength (:bytes %)))
+                     1400)
+                pages))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (lsm/build-range-directory-pages
+                  {:db-id "db" :epoch 1 :indexes {:eavt [(first refs)]}
+                   :page-refs 128 :page-bytes 64})))))
+
+(deftest first-component-range-prunes-run-refs
+  (let [alice (lsm/build-run :eavt "t"
+                             [{:components ["alice" "name" "Alice"]
+                               :epoch 1 :op :assert :value "Alice"}])
+        bob (lsm/build-run :eavt "t"
+                           [{:components ["bob" "name" "Bob"]
+                             :epoch 1 :op :assert :value "Bob"}])
+        old-ref (dissoc (lsm/run-ref bob)
+                        "first-component-min" "first-component-max")]
+    (is (= [(lsm/run-ref alice)]
+           (lsm/select-run-refs-by-first-component
+            [(lsm/run-ref alice) (lsm/run-ref bob)] "ali")))
+    (is (= [(lsm/run-ref alice) old-ref]
+           (lsm/select-run-refs-by-first-component
+            [(lsm/run-ref alice) old-ref] "ali")))
+    (is (= [(lsm/run-ref alice) (lsm/run-ref bob)]
+           (lsm/select-run-refs-by-first-component
+            [(lsm/run-ref alice) (lsm/run-ref bob)] "")))))
+
+(deftest overlapping-run-ranges-form-transitive-tasks
+  (let [ref (fn [id lo hi] {"cid" id "min-key" lo "max-key" hi})
+        a (ref "a" "a" "d")
+        b (ref "b" "c" "f")
+        c (ref "c" "f" "h")
+        d (ref "d" "x" "z")
+        ranges (lsm/overlapping-run-ranges [d c a b])]
+    (is (= [[a b c] [d]] (mapv :refs ranges)))
+    (is (= [["a" "h"] ["x" "z"]]
+           (mapv (juxt :min-key :max-key) ranges)))
+    (is (= [[a (dissoc b "min-key")]]
+           (mapv :refs
+                 (lsm/overlapping-run-ranges
+                  [a (dissoc b "min-key")]))))))
+
+(deftest publication-puts-before-cas
+  (let [run (lsm/build-run :eavt "tenant-a" entries)
+        manifest (lsm/build-manifest
+                  {:db-id "tenant-a" :epoch 9 :indexes {:eavt {:l0 [run]}}})
+        plan (lsm/publication-plan "tenant-a" "old-cid" [run] manifest)
+        effects (:effects plan)]
+    (is (= [:block/put :block/put :head/cas]
+           (mapv :effect/type effects)))
+    (is (= {:effect/type :head/cas :db-id "tenant-a"
+            :expected "old-cid" :next (:cid manifest)}
+           (peek effects)))))
+
+(deftest flush-plan-builds-covering-runs-and-sparse-vaet
+  (let [target (ipld/link (:cid (lsm/build-run :eavt "t" [])))
+        plan (lsm/flush-plan
+              {:db-id "db" :tenant "t" :epoch 12 :safe-epoch 10
+               :expected "old"
+               :datoms [{:e "a" :a "name" :v "Alice"}
+                        {:e "a" :a "friend" :v target}]})
+        effects (:effects plan)]
+    (is (= #{:eavt :aevt :avet :vaet} (set (keys (:runs plan)))))
+    (is (= 2 (get-in plan [:runs :eavt 0 :count])))
+    (is (= 1 (get-in plan [:runs :vaet 0 :count])))
+    (is (= :head/cas (:effect/type (peek effects))))
+    (is (every? #(= :block/put (:effect/type %)) (pop effects)))
+    (is (= (:cid (:manifest plan)) (get-in plan [:result :manifest])))))
+
+(deftest flush-plan-partitions-broad-l0-runs
+  (let [datoms (mapv (fn [i] {:e (str "entity-" i) :a "value" :v i})
+                     (range 7))
+        plan (lsm/flush-plan {:db-id "db" :epoch 1 :datoms datoms
+                              :target-run-rows 2})
+        runs (get-in plan [:runs :eavt])
+        refs (get-in plan [:manifest :node "indexes" "eavt" "l0"])]
+    (is (= 4 (count runs)))
+    (is (= [2 2 2 1] (mapv :count runs)))
+    (is (= 7 (reduce + (map :count runs))))
+    (is (= (mapv lsm/run-ref runs) refs))
+    (is (= 2 (get-in plan [:manifest :node "statistics" "l0-target-run-rows"])))))
+
+(deftest invalid-manifest-safe-epoch-is-rejected
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (lsm/build-manifest {:db-id "x" :epoch 2 :safe-epoch 3}))))
+
+(deftest linked-cids-walks-decoded-ipld-values
+  (let [a (:cid (lsm/build-run :eavt "t" []))
+        b (:cid (lsm/build-run :avet "t" []))]
+    (is (= #{a b}
+           (lsm/linked-cids {"a" (ipld/link a)
+                             "nested" [{"b" (ipld/link b)} "plain"]})))))
+
+(deftest mvcc-merge-and-safe-epoch-compaction
+  (let [r1 (lsm/build-run :eavt "t"
+                          [{:components ["a" "name" "Alice"]
+                            :epoch 1 :op :assert :value "Alice"}
+                           {:components ["b" "name" "Bob"]
+                            :epoch 2 :op :assert :value "Bob"}])
+        r2 (lsm/build-run :eavt "t"
+                          [{:components ["a" "name" "Alice"]
+                            :epoch 3 :op :retract :value "Alice"}
+                           {:components ["a" "name" "Alicia"]
+                            :epoch 4 :op :assert :value "Alicia"}])
+        compacted (lsm/compact-runs :eavt "t" 3 [r1 r2])
+        partitions (lsm/compact-runs-partitioned :eavt "t" 3 2 [r1 r2])]
+    (testing "snapshot visibility honors assertions and tombstones"
+      (is (= 2 (count (lsm/visible-rows [r1 r2] 2))))
+      (is (= ["b"] (mapv #(first (get % "components"))
+                          (lsm/visible-rows [r1 r2] 3))))
+      (is (= #{"a" "b"}
+             (set (map #(first (get % "components"))
+                       (lsm/visible-rows [r1 r2] 4))))))
+    (testing "compaction preserves snapshots at and above safe epoch"
+      (is (= (lsm/visible-rows [r1 r2] 3)
+             (lsm/visible-rows [compacted] 3)))
+      (is (= (lsm/visible-rows [r1 r2] 4)
+             (lsm/visible-rows [compacted] 4)))
+      (is (= 3 (:count compacted))))
+    (testing "range partitions preserve MVCC results and remain deterministic"
+      (is (every? #(<= (:count %) 2) partitions))
+      (is (= (lsm/visible-rows [r1 r2] 3)
+             (lsm/visible-rows partitions 3)))
+      (is (= (lsm/visible-rows [r1 r2] 4)
+             (lsm/visible-rows partitions 4)))
+      (is (= (mapv :cid partitions)
+             (mapv :cid (lsm/compact-runs-partitioned
+                         :eavt "t" 3 2 [r2 r1])))))))
+
+(deftest checkpoint-compaction-preserves-portable-snapshot-corpus
+  (let [entries
+        (vec
+         (for [epoch (range 1 7)
+               entity (map #(str "entity-" %) (range 12))]
+           {:components [entity "flag" "on"]
+            :epoch epoch
+            :op (if (zero? (mod (+ epoch (count entity)) 3))
+                  :retract :assert)
+            :value "on"}))
+        by-epoch (group-by :epoch entries)
+        raw-runs (mapv #(lsm/build-run :eavt "t" (get by-epoch %))
+                       (range 1 7))
+        first-checkpoint
+        (lsm/compact-runs-partitioned :eavt "t" 2 7 (subvec raw-runs 0 3))
+        retry-run
+        (lsm/build-run :eavt "t"
+                       (concat (get by-epoch 4) (get by-epoch 4)))
+        second-inputs
+        (vec (concat first-checkpoint [retry-run]
+                     (subvec raw-runs 4 6)))
+        second-checkpoint
+        (lsm/compact-runs-partitioned :eavt "t" 2 7 second-inputs)
+        reversed-checkpoint
+        (lsm/compact-runs-partitioned :eavt "t" 2 7
+                                      (reverse second-inputs))]
+    (doseq [snapshot (range 2 7)]
+      (is (= (lsm/visible-rows raw-runs snapshot)
+             (lsm/visible-rows second-checkpoint snapshot))
+          (str "checkpoint replacement must preserve snapshot " snapshot)))
+    (is (= (mapv :cid second-checkpoint)
+           (mapv :cid reversed-checkpoint))
+        "enumeration order converges across CLJ and CLJS")
+    (is (= (count (get by-epoch 4)) (:count retry-run))
+        "an exact same-epoch retry does not survive as physical duplication")))
+
+(deftest visible-prefix-pages-are-bounded-and-tombstone-safe
+  (let [r1 (lsm/build-run
+            :eavt "t"
+            (mapv (fn [entity]
+                    {:components [entity "role" "admin"]
+                     :epoch 1 :op :assert :value "admin"})
+                  ["a" "b" "c" "d"]))
+        r2 (lsm/build-run
+            :eavt "t"
+            [{:components ["b" "role" "admin"]
+              :epoch 2 :op :retract :value "admin"}])
+        add (fn [state run after]
+              (lsm/visible-page-add-run
+               state (get-in run [:node "rows"]) 2 after 2 (constantly true)))
+        first-state (reduce #(add %1 %2 nil) {} [r1 r2])
+        first-page (lsm/visible-page-result first-state 2)
+        second-state (reduce #(add %1 %2 (:cursor first-page)) {} [r2 r1])
+        second-page (lsm/visible-page-result second-state 2)]
+    (is (= ["a"]
+           (mapv #(first (get % "components")) (:rows first-page))))
+    (is (false? (:done? first-page)))
+    (is (string? (:cursor first-page)))
+    (is (= ["c" "d"]
+           (mapv #(first (get % "components")) (:rows second-page))))
+    (is (true? (:done? second-page)))
+    (is (= 3 (count (concat (:rows first-page) (:rows second-page)))))
+    (is (= first-state
+           (reduce #(add %1 %2 nil) {} [r2 r1]))
+        "run fetch order cannot change the page")))
+
+(deftest large-runs-publish-logical-key-aligned-data-subblocks
+  (let [run (lsm/build-run
+             :aevt "tenant-a"
+             (mapv (fn [n]
+                     {:components ["member" (str "team-" n) "alice"]
+                      :epoch 1 :op :assert :value "alice"})
+                   (range 300))
+             {:block-rows 64})
+        descriptors (get-in run [:node "blocks"])
+        ref (lsm/run-ref run)]
+    (is (= 5 (count descriptors)))
+    (is (= 6 (count (:effects run)))
+        "five data blocks and the small run root are independently addressed")
+    (is (nil? (get-in run [:node "rows"])))
+    (is (= descriptors (get ref "blocks")))
+    (is (= #?(:clj (alength ^bytes (:bytes run))
+              :cljs (.-byteLength (:bytes run)))
+           (get ref "encoded-bytes")))
+    (is (= (range 5) (map #(get % "ordinal") descriptors)))
+    (is (every? #(<= (get % "count") 64) descriptors))
+    (is (every? (fn [[left right]]
+                  (neg? (compare (get left "logical-max")
+                                 (get right "logical-min"))))
+                (partition 2 1 descriptors)))
+    (is (= 300 (reduce + (map #(get % "count") descriptors))))))
+
+(deftest run-blocks-honor-canonical-encoded-byte-bound
+  (let [entries (mapv (fn [n]
+                        {:components ["member" (str "team-" n)
+                                      (apply str (repeat 160 (char (+ 65 (mod n 20)))))]
+                         :epoch 1 :op :assert :value n})
+                      (range 24))
+        run (lsm/build-run :aevt "tenant-bytes" entries
+                           {:block-rows 128 :max-block-bytes 2500})
+        descriptors (get-in run [:node "blocks"])]
+    (is (< 1 (count descriptors))
+        "byte pressure splits a run even below the row target")
+    (is (every? #(<= (get % "encoded-bytes") 2500) descriptors))
+    (is (= (mapv (fn [block]
+                   #?(:clj (alength ^bytes (:bytes block))
+                      :cljs (.-byteLength (:bytes block))))
+                 (:blocks run))
+           (mapv #(get % "encoded-bytes") descriptors)))
+    (is (= 24 (reduce + (map #(get % "count") descriptors))))))
+
+(deftest indivisible-hot-key-is-marked-when-it-exceeds-byte-bound
+  (let [run (lsm/build-run
+             :eavt "tenant-hot"
+             (mapv (fn [epoch]
+                     {:components ["hot" "history" (apply str (repeat 80 "x"))]
+                      :epoch epoch :op :assert :value epoch})
+                   (range 1 12))
+             {:block-rows 128 :max-block-bytes 256})
+        descriptor (first (get-in run [:node "blocks"]))]
+    (is (= 1 (count (get-in run [:node "blocks"]))))
+    (is (true? (get descriptor "oversized-logical-key")))
+    (is (> (get descriptor "encoded-bytes") 256))
+    (is (= 11 (get descriptor "count")))))
+
+(deftest partitioned-compaction-keeps-one-logical-key-whole
+  (let [run (lsm/build-run :eavt "t"
+                           (mapv (fn [epoch]
+                                   {:components ["hot" "counter"]
+                                    :epoch epoch :op :assert :value epoch})
+                                 (range 1 6)))
+        partitions (lsm/compact-runs-partitioned :eavt "t" 0 2 [run])]
+    (is (= 1 (count partitions)))
+    (is (= 5 (:count (first partitions))))))
+
+(deftest streaming-compaction-matches-compact-runs-partitioned-exactly
+  ;; ADR-2607244000 Stage A: identical output runs (same CIDs, same order,
+  ;; same bytes) as the materializing API, but delivered through emit! with
+  ;; nothing retained by the engine. Includes overlapping key ranges and
+  ;; retention (safe-epoch shadowing) so parity covers the merge AND the
+  ;; retention path.
+  (let [mk (fn [i]
+             (mapv (fn [j] {:components [(str "e" (mod (+ i j) 7)) "a" (str "v" i "-" j)]
+                            :epoch (+ (* i 10) j) :op :assert :value (str "v" i "-" j)})
+                   (range 5)))
+        runs (mapv #(lsm/build-run :eavt "t" (mk %)) (range 4))
+        baseline (lsm/compact-runs-partitioned :eavt "t" 15 4 runs)
+        emitted (atom [])
+        readers (mapv (fn [r] (fn [] (get (:node r) "rows"))) runs)
+        summary (lsm/compact-run-readers-streaming :eavt "t" 15 4 readers
+                                                   (fn [run] (swap! emitted conj run)))]
+    (is (= (mapv :cid baseline) (mapv :cid @emitted)) "same runs, same order")
+    (is (= (mapv (comp vec :bytes) baseline) (mapv (comp vec :bytes) @emitted)))
+    (is (= (count baseline) (:runs summary)))
+    (is (= (reduce + (map :count baseline)) (:rows summary))
+        "summary row count == materialized total, no re-reading emitted runs")))
+
+(deftest streaming-compaction-readers-can-decode-from-spilled-bytes
+  ;; The intended production shape: the caller spills run BYTES (not row
+  ;; values) and readers re-decode on demand -- byte-level round-trip parity.
+  (let [runs (mapv #(lsm/build-run :eavt "t" [{:components [(str "k" %)] :epoch %
+                                               :op :assert :value (str "v" %)}])
+                   (range 3))
+        spilled (mapv :bytes runs)
+        readers (mapv (fn [bytes] (fn [] (get (ipld/decode bytes) "rows"))) spilled)
+        emitted (atom [])
+        summary (lsm/compact-run-readers-streaming :eavt "t" 0 10 readers
+                                                   (fn [run] (swap! emitted conj (:cid run))))]
+    (is (= 3 (:rows summary)))
+    (is (= @emitted (mapv :cid (lsm/compact-runs-partitioned :eavt "t" 0 10 runs))))))
+
+(deftest streaming-compaction-retention-is-per-level-idempotent
+  ;; Hierarchical safety (Stage B relies on this): compacting subsets then
+  ;; compacting the compacted outputs yields the same retained set as one
+  ;; global pass.
+  (let [versions (fn [k] (mapv (fn [e] {:components [k "a" "x"] :epoch e
+                                        :op :assert :value (str k e)})
+                               (range 1 7)))
+        runs (mapv #(lsm/build-run :eavt "t" (versions (str "k" %))) (range 4))
+        global (lsm/compact-runs-partitioned :eavt "t" 3 100 runs)
+        level1a (lsm/compact-runs-partitioned :eavt "t" 3 100 (subvec runs 0 2))
+        level1b (lsm/compact-runs-partitioned :eavt "t" 3 100 (subvec runs 2 4))
+        level2 (lsm/compact-runs-partitioned :eavt "t" 3 100 (vec (concat level1a level1b)))]
+    (is (= (mapv :cid global) (mapv :cid level2)))))

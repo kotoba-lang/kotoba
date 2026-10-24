@@ -1,0 +1,241 @@
+(ns merkle-lsm.chunked-compaction-test
+  "ADR-2607244000 Stage B: compaction that is bounded by fan-in rather than by
+  dataset size, and resumable from a one-string cursor.
+
+  The four properties that matter, in the order they would bite:
+
+    equivalence  chunked compaction retains exactly what the existing
+                 single-pass primitive retains — otherwise it is a different
+                 algorithm wearing the same name
+    determinism  identical inputs produce a byte-identical run and CID —
+                 otherwise every cache lookup misses and every resume redoes
+                 work, while still looking correct
+    resumability stopping and resuming from :next-after gives the same total
+    boundedness  work for one chunk does not grow with total run size — the
+                 whole point"
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipld.core :as ipld]
+            [merkle-lsm.core :as lsm]))
+
+;; ── fixtures ────────────────────────────────────────────────────────────────
+
+(defn- pad6
+  "Fixed-width key component.  is Clojure-only, and this file is .cljc."
+  [i]
+  (let [s (str i)]
+    (str (subs "000000" 0 (max 0 (- 6 (count s)))) s)))
+
+(defn- entries
+  "N logical keys, each with `versions` epochs, in a deterministic order."
+  ([n] (entries n 1))
+  ([n versions]
+   (vec (for [i (range n)
+              v (range versions)]
+          {:components ["e" (str "a" (pad6 i))]
+           :epoch (inc v)
+           :op :assert
+           :value (str "v" i "-" v)}))))
+
+(defn- block-store
+  "cid -> decoded block node, for every block of RUNS, plus a fetch counter."
+  [runs]
+  (let [store (reduce (fn [acc run]
+                        (reduce (fn [acc b]
+                                  (assoc acc (str (ipld/link-cid (get-in b [:descriptor "cid"])))
+                                         (:node b)))
+                                acc
+                                (or (:blocks run) [])))
+                      {}
+                      runs)]
+    {:store store
+     :fetch (fn [cid]
+              (or (get store (str cid))
+                  (throw (ex-info "missing block" {:cid (str cid)}))))}))
+
+(defn- small-blocks
+  "Build a run with small blocks so multi-block behaviour is exercised without
+  needing a large fixture."
+  [es]
+  (lsm/build-run :eavt "t" es {:block-rows 8 :max-block-bytes 1048576}))
+
+(defn- rows-of [run]
+  (mapv (fn [r] [(get r "components") (get r "epoch") (get r "value")])
+        (:rows run)))
+
+(defn- chunked-rows [runs {:keys [target-rows safe-epoch]
+                          :or {target-rows 16 safe-epoch 0}}]
+  (let [{:keys [fetch]} (block-store runs)
+        out (atom [])
+        summary (lsm/compact-chunks
+                 {:index :eavt :tenant "t" :safe-epoch safe-epoch
+                  :target-rows target-rows
+                  :run-nodes (mapv :node runs)
+                  :fetch-block fetch}
+                 (fn [run] (swap! out conj run)))]
+    {:summary summary :runs @out :rows (vec (mapcat rows-of @out))}))
+
+;; ── equivalence ─────────────────────────────────────────────────────────────
+
+(deftest chunked-matches-single-pass
+  (testing "the same retained set as compact-runs, which is the reference"
+    (doseq [[label es] [["single version" (entries 40)]
+                        ["multi version" (entries 20 3)]]]
+      (let [runs [(small-blocks es)]
+            reference (rows-of (lsm/compact-runs :eavt "t" 0 runs))
+            {:keys [rows]} (chunked-rows runs {:target-rows 7})]
+        (is (= reference rows) label)))))
+
+(deftest chunked-matches-single-pass-across-runs
+  (testing "k-way merge over overlapping runs, which is the case that made the
+            old implementation co-reside every run's rows"
+    (let [a (small-blocks (vec (for [i (range 0 40 2)]
+                                 {:components ["e" (str "a" (pad6 i))]
+                                  :epoch 1 :op :assert :value (str "a" i)})))
+          b (small-blocks (vec (for [i (range 1 40 2)]
+                                 {:components ["e" (str "a" (pad6 i))]
+                                  :epoch 1 :op :assert :value (str "b" i)})))
+          runs [a b]
+          reference (rows-of (lsm/compact-runs :eavt "t" 0 runs))
+          {:keys [rows summary]} (chunked-rows runs {:target-rows 9})]
+      (is (= reference rows))
+      (is (< 1 (:chunks summary)) "fixture must actually span several chunks")
+      (is (= (count reference) (:rows summary))))))
+
+(deftest retention-is-per-chunk-safe
+  (testing "retention applied per chunk keeps the same versions as one global
+            pass — the property Stage B leans on"
+    (let [es (entries 12 4)
+          runs [(small-blocks es)]
+          reference (rows-of (lsm/compact-runs :eavt "t" 2 runs))
+          {:keys [rows]} (chunked-rows runs {:target-rows 5 :safe-epoch 2})]
+      (is (= reference rows)))))
+
+;; ── determinism ─────────────────────────────────────────────────────────────
+
+(deftest chunk-is-deterministic
+  (testing "identical arguments produce the same bytes and the same CID, so a
+            retry is a cache hit rather than recomputation"
+    (let [runs [(small-blocks (entries 30 2))]
+          {:keys [fetch]} (block-store runs)
+          args {:index :eavt :tenant "t" :safe-epoch 0 :target-rows 11
+                :run-nodes (mapv :node runs) :after nil :fetch-block fetch}
+          a (lsm/compact-chunk args)
+          b (lsm/compact-chunk args)]
+      (is (= (str (:cid (:run a))) (str (:cid (:run b)))))
+      ;; `vec`, NOT `seq`. Under ClojureScript `(:bytes run)` is a
+      ;; js/Uint8Array, and `seq` over a JS typed array yields an
+      ;; ES6IteratorSeq -- which implements ISeq but NOT IEquiv, so `=`
+      ;; degrades to reference identity and this assertion is false for
+      ;; byte-identical inputs. `vec` realises a PersistentVector and
+      ;; compares element-wise on both runtimes. (core-test has always used
+      ;; `vec` here; this file used `seq` and was never run under
+      ;; ClojureScript upstream, where CI was JVM-only.)
+      (is (= (vec (:bytes (:run a))) (vec (:bytes (:run b)))))
+      (is (= (:next-after a) (:next-after b))))))
+
+(deftest whole-run-is-deterministic
+  (testing "the full chunked compaction, not just one chunk"
+    (let [runs [(small-blocks (entries 25 2))]
+          one (chunked-rows runs {:target-rows 6})
+          two (chunked-rows runs {:target-rows 6})]
+      (is (= (mapv #(str (:cid %)) (:runs one))
+             (mapv #(str (:cid %)) (:runs two)))))))
+
+;; ── resumability ────────────────────────────────────────────────────────────
+
+(deftest resume-from-cursor-matches-uninterrupted
+  (testing "stopping after one chunk and resuming from :next-after produces the
+            same rows as never stopping"
+    (let [runs [(small-blocks (entries 30))]
+          {:keys [fetch]} (block-store runs)
+          base {:index :eavt :tenant "t" :safe-epoch 0 :target-rows 7
+                :run-nodes (mapv :node runs) :fetch-block fetch}
+          uninterrupted (:rows (chunked-rows runs {:target-rows 7}))
+          first-chunk (lsm/compact-chunk (assoc base :after nil))
+          resumed (loop [after (:next-after first-chunk)
+                         acc (rows-of (:run first-chunk))]
+                    (if (nil? after)
+                      acc
+                      (let [c (lsm/compact-chunk (assoc base :after after))]
+                        (recur (:next-after c)
+                               (into acc (rows-of (:run c)))))))]
+      (is (= uninterrupted resumed))))
+  (testing "the cursor is a plain string, not serialized iterator state"
+    (let [runs [(small-blocks (entries 30))]
+          {:keys [fetch]} (block-store runs)
+          c (lsm/compact-chunk {:index :eavt :tenant "t" :safe-epoch 0
+                                :target-rows 7 :run-nodes (mapv :node runs)
+                                :after nil :fetch-block fetch})]
+      (is (string? (:next-after c))))))
+
+(deftest exhausted-input-reports-done
+  (let [runs [(small-blocks (entries 5))]
+        {:keys [fetch]} (block-store runs)
+        c (lsm/compact-chunk {:index :eavt :tenant "t" :safe-epoch 0
+                              :target-rows 100 :run-nodes (mapv :node runs)
+                              :after nil :fetch-block fetch})]
+    (is (:done? c))
+    (is (nil? (:next-after c)))
+    (is (= 5 (:rows c)))))
+
+;; ── boundedness: the actual point ───────────────────────────────────────────
+
+(deftest first-chunk-work-does-not-grow-with-run-size
+  (testing "one chunk of a given target reads the same number of blocks whether
+            the run holds 40 rows or 4,000. This is the property the old path
+            lacked: `compact-run-readers-streaming` opened each run in full, so
+            work per merge tracked the dataset."
+    (let [chunk-blocks (fn [n]
+                         (let [runs [(small-blocks (entries n))]
+                               {:keys [fetch]} (block-store runs)]
+                           (:blocks-read
+                            (lsm/compact-chunk
+                             {:index :eavt :tenant "t" :safe-epoch 0
+                              :target-rows 16
+                              :run-nodes (mapv :node runs)
+                              :after nil :fetch-block fetch}))))
+          small (chunk-blocks 40)
+          large (chunk-blocks 4000)]
+      (is (pos? small))
+      (is (= small large)
+          (str "blocks read: " small " vs " large
+               " — a chunk must not scale with total run size")))))
+
+(deftest resuming-does-not-refetch-the-prefix
+  (testing "blocks entirely at or before the cursor are skipped without being
+            fetched, so resuming late in a run is as cheap as resuming early"
+    (let [runs [(small-blocks (entries 400))]
+          {:keys [fetch]} (block-store runs)
+          base {:index :eavt :tenant "t" :safe-epoch 0 :target-rows 16
+                :run-nodes (mapv :node runs) :fetch-block fetch}
+          ;; walk to a cursor deep into the run
+          deep-cursor (loop [after nil, i 0]
+                        (let [c (lsm/compact-chunk (assoc base :after after))]
+                          (if (or (>= i 8) (nil? (:next-after c)))
+                            (:next-after c)
+                            (recur (:next-after c) (inc i)))))
+          from-start (:blocks-read (lsm/compact-chunk (assoc base :after nil)))
+          from-deep (:blocks-read (lsm/compact-chunk (assoc base :after deep-cursor)))]
+      (is (some? deep-cursor) "fixture must be long enough to walk into")
+      (is (= from-start from-deep)
+          (str "blocks read from start " from-start
+               " vs from a deep cursor " from-deep)))))
+
+(deftest k-way-merge_work_scales_with_fan_in_not_dataset
+  (testing "with the fan-in fixed, per-chunk block reads stay put as the runs
+            grow — memory is O(k x block), not O(dataset)"
+    (let [reads (fn [rows-per-run]
+                  (let [runs (mapv (fn [offset]
+                                     (small-blocks
+                                      (vec (for [i (range rows-per-run)]
+                                             {:components ["e" (str "a" (pad6 (+ offset (* 4 i))))]
+                                              :epoch 1 :op :assert
+                                              :value (str offset "-" i)}))))
+                                   [0 1 2 3])
+                        {:keys [fetch]} (block-store runs)]
+                    (:blocks-read
+                     (lsm/compact-chunk {:index :eavt :tenant "t" :safe-epoch 0
+                                         :target-rows 16
+                                         :run-nodes (mapv :node runs)
+                                         :after nil :fetch-block fetch}))))]
+      (is (= (reads 50) (reads 500))))))
