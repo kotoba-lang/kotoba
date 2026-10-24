@@ -1,0 +1,427 @@
+(ns data-integrity.core-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [data-integrity.bytes :as b]
+            [data-integrity.core :as di]
+            [data-integrity.eddsa :as eddsa]
+            [ed25519.core :as ed]
+            [jcs.core :as jcs]
+            [multiformats.core :as mf]))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; W3C vc-di-eddsa Appendix B.3 — the specification's own test vector.
+;;
+;; This is the only test here that can catch a UNIFORMLY wrong implementation.
+;; Everything else in this file is self-consistency: issue-then-verify passes
+;; just as happily if the hash order, the canonicalization and the multibase
+;; prefix are all wrong in the same direction on both sides. These fixed values
+;; come from outside, so they cannot be wrong in the same direction as the code.
+;;
+;; Ed25519 (RFC 8032) is deterministic — no random nonce — so the exact
+;; proofValue string is reproducible and is asserted byte for byte.
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(def vector-public-multibase "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2")
+(def vector-private-multibase "z3u2en7t5LR2WtQH5PfFqMqwVHBeXouLzo6haApm8XHqvjxq")
+
+(def vector-verification-method
+  (str "did:key:" vector-public-multibase "#" vector-public-multibase))
+
+(def vector-unsecured-credential
+  {"@context" ["https://www.w3.org/ns/credentials/v2"
+               "https://www.w3.org/ns/credentials/examples/v2"]
+   "id" "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33"
+   "type" ["VerifiableCredential" "AlumniCredential"]
+   "name" "Alumni Credential"
+   "description" "A minimum viable example of an Alumni Credential."
+   "issuer" "https://vc.example/issuers/5678"
+   "validFrom" "2023-01-01T00:00:00Z"
+   "credentialSubject" {"id" "did:example:abcdefgh"
+                        "alumniOf" "The School of Examples"}})
+
+(def vector-proof-options
+  {"type" "DataIntegrityProof"
+   "cryptosuite" "eddsa-jcs-2022"
+   "created" "2023-02-24T23:36:38Z"
+   "verificationMethod" vector-verification-method
+   "proofPurpose" "assertionMethod"
+   "@context" ["https://www.w3.org/ns/credentials/v2"
+               "https://www.w3.org/ns/credentials/examples/v2"]})
+
+(def vector-transformed-document-hash
+  "59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19")
+(def vector-proof-config-hash
+  "66ab154f5c2890a140cb8388a22a160454f80575f6eae09e5a097cabe539a1db")
+(def vector-proof-value
+  "z2HnFSSPPBzR36zdDgK8PbEHeXbR56YF24jwMpt3R1eHXQzJDMWS93FCzpvJpwTWd3GAVFuUfjoJdcnTMuVor51aX")
+
+(def vector-secured-credential
+  (assoc vector-unsecured-credential
+         "proof" (assoc vector-proof-options "proofValue" vector-proof-value)))
+
+(defn- hex [bs]
+  (str/join (map #(format "%02x" %) (b/->ints bs))))
+
+(defn- multibase-priv->seed
+  "Multibase base58-btc + multicodec ed25519-priv (0x1300, varint 0x80 0x26) -> seed."
+  [s]
+  (let [bs (b/->ints (mf/base58btc-decode (subs s 1)))]
+    (is (= [0x80 0x26] (subvec bs 0 2)) "expected the ed25519-priv multicodec prefix")
+    (b/ints->bytes (subvec bs 2))))
+
+(def vector-seed (delay (multibase-priv->seed vector-private-multibase)))
+
+(deftest spec-vector-transformed-document-hash
+  (testing "our JCS + SHA-256 of the unsecured document matches the W3C vector.
+            This validates org-ietf-jcs against an external authority: any
+            deviation in key sorting, escaping or number form changes this hash."
+    (is (= vector-transformed-document-hash
+           (hex (mf/sha256 (jcs/canonicalize-bytes vector-unsecured-credential)))))))
+
+(deftest spec-vector-proof-config-hash
+  (testing "our JCS + SHA-256 of the proof options matches the W3C vector"
+    (is (= vector-proof-config-hash
+           (hex (mf/sha256 (eddsa/proof-configuration vector-proof-options)))))))
+
+(deftest spec-vector-hash-data-order
+  (testing "§3.3.4: hashData is proofConfigHash FIRST, then transformedDocumentHash"
+    (let [transformed (jcs/canonicalize-bytes vector-unsecured-credential)
+          proof-config (eddsa/proof-configuration vector-proof-options)
+          actual (hex (eddsa/hash-data transformed proof-config))]
+      (is (= (str vector-proof-config-hash vector-transformed-document-hash) actual))
+      ;; Pin the failure mode explicitly: the reversed order is a valid-looking
+      ;; 64-byte value whose signatures verify against nothing.
+      (is (not= (str vector-transformed-document-hash vector-proof-config-hash) actual)))))
+
+(deftest spec-vector-signature-is-reproduced-exactly
+  (testing "signing the W3C vector reproduces its exact proofValue.
+            Ed25519 is deterministic, so this is an equality test, not a
+            round-trip — it proves interoperability, not merely self-consistency."
+    (let [secured (di/issue-credential
+                   vector-unsecured-credential
+                   {:seed @vector-seed
+                    :verification-method vector-verification-method
+                    :created "2023-02-24T23:36:38Z"})]
+      (is (= vector-proof-value (get-in secured ["proof" "proofValue"])))
+      (is (= vector-secured-credential secured)))))
+
+(deftest spec-vector-verifies
+  (testing "the W3C vector's secured credential verifies as-is"
+    (let [r (di/verify-credential vector-secured-credential)]
+      (is (:verified r) (pr-str r))
+      (is (= vector-verification-method (:verification-method r)))
+      (is (= vector-unsecured-credential (:document r))))))
+
+(deftest spec-vector-public-key-derivation
+  (testing "the did:key in the verificationMethod resolves to the vector's public key"
+    (is (= (b/->ints (ed/did-key->pubkey (str "did:key:" vector-public-multibase)))
+           (vec (di/default-resolve-key vector-verification-method))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; Tamper detection
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(deftest tampering-is-detected
+  (testing "changing any signed byte invalidates the proof"
+    (doseq [[label tampered]
+            [["subject claim" (assoc-in vector-secured-credential
+                                        ["credentialSubject" "alumniOf"] "Another School")]
+             ["issuer" (assoc vector-secured-credential "issuer" "https://evil.example")]
+             ["id" (assoc vector-secured-credential "id" "urn:uuid:00000000")]
+             ["added field" (assoc vector-secured-credential "extra" "x")]
+             ["removed field" (dissoc vector-secured-credential "name")]
+             ["proof created" (assoc-in vector-secured-credential
+                                        ["proof" "created"] "2024-01-01T00:00:00Z")]
+             ["proof purpose" (assoc-in vector-secured-credential
+                                        ["proof" "proofPurpose"] "assertionMethod2")]]]
+      (let [r (di/verify vector-secured-credential {:expected-proof-purpose :any})]
+        (is (:verified r) "control: the untampered document must verify"))
+      (let [r (di/verify tampered {:expected-proof-purpose :any})]
+        (is (not (:verified r)) (str "tampering with " label " was not detected"))))))
+
+(deftest wrong-key-fails
+  (testing "a valid signature under a different key does not verify"
+    (let [other-seed (byte-array (repeat 32 (byte 7)))
+          other-did (ed/did-key-from-seed other-seed)
+          secured (di/issue-credential
+                   vector-unsecured-credential
+                   {:seed other-seed
+                    :verification-method (str other-did "#" (subs other-did (count "did:key:")))
+                    :created "2023-02-24T23:36:38Z"})
+          ;; keep the (valid) signature but claim it was made by the vector's key
+          forged (assoc-in secured ["proof" "verificationMethod"] vector-verification-method)
+          r (di/verify-credential forged)]
+      (is (not (:verified r)))
+      (is (= :data-integrity/bad-signature (:reason r))))))
+
+(deftest forged-proof-value-is-false-not-an-exception
+  (testing "an invalid proof is a :verified false, so a caller cannot mistake
+            'did not throw' for success"
+    (let [;; flip a byte inside the signature, keeping it 64 bytes and base58-valid
+          sig (eddsa/decode-proof-value vector-proof-value)
+          flipped (b/ints->bytes (update (b/->ints sig) 0 #(bit-xor % 0xff)))
+          forged (assoc-in vector-secured-credential
+                           ["proof" "proofValue"] (eddsa/encode-proof-value flipped))
+          r (di/verify-credential forged)]
+      (is (false? (:verified r)))
+      (is (= :data-integrity/bad-signature (:reason r))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; proofPurpose confusion
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(deftest proof-purpose-confusion-is-rejected
+  (testing "a credential signed for assertionMethod must not pass as a presentation"
+    (let [r (di/verify vector-secured-credential
+                       {:expected-proof-purpose "authentication"})]
+      (is (not (:verified r)))
+      (is (= :data-integrity/proof-purpose-mismatch (:reason r)))))
+
+  (testing "a presentation signed for authentication must not pass as a credential"
+    (let [seed (byte-array (repeat 32 (byte 3)))
+          d (ed/did-key-from-seed seed)
+          vm (str d "#" (subs d (count "did:key:")))
+          vp (di/issue-presentation
+              {"@context" ["https://www.w3.org/ns/credentials/v2"]
+               "type" ["VerifiablePresentation"]
+               "holder" d}
+              {:seed seed :verification-method vm
+               :created "2026-07-30T00:00:00Z" :challenge "abc123"})
+          r (di/verify-credential vp)]
+      (is (not (:verified r)))
+      (is (= :data-integrity/proof-purpose-mismatch (:reason r))))))
+
+(deftest expected-proof-purpose-is-mandatory
+  (testing "omitting it would silently accept the wrong purpose, so it throws"
+    (is (thrown? kerror/ExceptionInfo
+                 (di/verify vector-secured-credential {})))
+    (is (= :data-integrity/expected-proof-purpose-required
+           (:data-integrity/error
+            (ex-data (try (di/verify vector-secured-credential {})
+                          (catch kerror/ExceptionInfo e e))))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; Presentations: challenge and domain
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(def presentation-seed (byte-array (repeat 32 (byte 11))))
+(def presentation-did (delay (ed/did-key-from-seed presentation-seed)))
+(defn- presentation-vm []
+  (str @presentation-did "#" (subs @presentation-did (count "did:key:"))))
+
+(defn- a-presentation [opts]
+  (di/issue-presentation
+   {"@context" ["https://www.w3.org/ns/credentials/v2"]
+    "type" ["VerifiablePresentation"]
+    "holder" @presentation-did
+    "verifiableCredential" [vector-secured-credential]}
+   (merge {:seed presentation-seed
+           :verification-method (presentation-vm)
+           :created "2026-07-30T00:00:00Z"}
+          opts)))
+
+(deftest presentation-round-trip
+  (let [vp (a-presentation {:challenge "n-once-1" :domain "https://verifier.example"})]
+    (testing "verifies with the matching challenge and domain"
+      (is (:verified (di/verify-presentation
+                      vp {:challenge "n-once-1" :domain "https://verifier.example"}))))
+
+    (testing "a replayed proof answering a different challenge is rejected"
+      (let [r (di/verify-presentation vp {:challenge "n-once-2"})]
+        (is (not (:verified r)))
+        (is (= :data-integrity/challenge-mismatch (:reason r)))))
+
+    (testing "a proof bound to another verifier's domain is rejected"
+      (let [r (di/verify-presentation vp {:challenge "n-once-1"
+                                          :domain "https://other.example"})]
+        (is (not (:verified r)))
+        (is (= :data-integrity/domain-mismatch (:reason r)))))
+
+    (testing "the embedded credential still verifies independently of the VP"
+      (is (:verified (di/verify-credential
+                      (first (get vp "verifiableCredential"))))))))
+
+(deftest presentation-requires-a-challenge
+  (testing "issuing without one would produce a replayable proof"
+    (is (= :data-integrity/challenge-required
+           (:data-integrity/error
+            (ex-data (try (a-presentation {})
+                          (catch kerror/ExceptionInfo e e)))))))
+  (testing "verifying without one would accept a replay"
+    (let [vp (a-presentation {:challenge "c"})]
+      (is (= :data-integrity/challenge-required
+             (:data-integrity/error
+              (ex-data (try (di/verify-presentation vp {})
+                            (catch kerror/ExceptionInfo e e)))))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; @context prefix rule (§3.3.2 step 4)
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(deftest context-prefix-rule
+  (testing "APPENDING a context keeps the issuer's signature valid"
+    (let [appended (assoc vector-secured-credential
+                          "@context" ["https://www.w3.org/ns/credentials/v2"
+                                      "https://www.w3.org/ns/credentials/examples/v2"
+                                      "https://holder.example/ctx/v1"])]
+      (is (:verified (di/verify-credential appended)))))
+
+  (testing "PREPENDING a context the issuer never signed over is rejected"
+    (let [prepended (assoc vector-secured-credential
+                           "@context" ["https://evil.example/ctx/v1"
+                                       "https://www.w3.org/ns/credentials/v2"
+                                       "https://www.w3.org/ns/credentials/examples/v2"])
+          r (di/verify-credential prepended)]
+      (is (not (:verified r)))
+      (is (= :data-integrity/context-not-prefix (:reason r)))))
+
+  (testing "removing a signed context is rejected"
+    (let [shortened (assoc vector-secured-credential
+                           "@context" ["https://www.w3.org/ns/credentials/v2"])
+          r (di/verify-credential shortened)]
+      (is (not (:verified r)))
+      (is (= :data-integrity/context-not-prefix (:reason r))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; Encoding and input discipline
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(deftest proof-value-encoding
+  (testing "multibase base58-btc, `z` prefix, 64 signature bytes"
+    (is (str/starts-with? vector-proof-value "z"))
+    (is (= 64 (b/byte-count (eddsa/decode-proof-value vector-proof-value))))
+    (is (= vector-proof-value
+           (eddsa/encode-proof-value (eddsa/decode-proof-value vector-proof-value)))))
+
+  (testing "a non-`z` multibase prefix is refused rather than guessed at"
+    (is (= :data-integrity/bad-multibase
+           (:data-integrity/error
+            (ex-data (try (eddsa/decode-proof-value (str "f" (subs vector-proof-value 1)))
+                          (catch kerror/ExceptionInfo e e)))))))
+
+  (testing "a signature of the wrong length is refused"
+    (is (= :data-integrity/bad-signature-length
+           (:data-integrity/error
+            (ex-data (try (eddsa/decode-proof-value (eddsa/encode-proof-value
+                                                     (byte-array 32)))
+                          (catch kerror/ExceptionInfo e e))))))))
+
+(deftest keyword-and-string-keys-agree
+  (testing "a keyword-keyed document produces the same signature as its string form"
+    (let [kw {(keyword "@context") ["https://www.w3.org/ns/credentials/v2"]
+              :type ["VerifiableCredential"]
+              :issuer "did:example:1"
+              :credentialSubject {:id "did:example:2"}}
+          st {"@context" ["https://www.w3.org/ns/credentials/v2"]
+              "type" ["VerifiableCredential"]
+              "issuer" "did:example:1"
+              "credentialSubject" {"id" "did:example:2"}}
+          opts {:seed presentation-seed
+                :verification-method (presentation-vm)
+                :created "2026-07-30T00:00:00Z"}]
+      (is (= (di/issue-credential st opts) (di/issue-credential kw opts)))))
+
+  (testing "a document mixing :a and \"a\" is refused, not silently collapsed"
+    (is (= :data-integrity/duplicate-key
+           (:data-integrity/error
+            (ex-data (try (di/stringify {:a 1 "a" 2})
+                          (catch kerror/ExceptionInfo e e))))))))
+
+(deftest issue-input-discipline
+  (let [opts {:seed presentation-seed
+              :verification-method (presentation-vm)
+              :created "2026-07-30T00:00:00Z"}
+        doc {"@context" ["https://www.w3.org/ns/credentials/v2"]
+             "type" ["VerifiableCredential"]
+             "issuer" "did:example:1"
+             "credentialSubject" {"id" "did:example:2"}}]
+
+    (testing "re-signing an already-secured document would sign different bytes
+              than the caller believes, so it is refused"
+      (let [secured (di/issue-credential doc opts)]
+        (is (= :data-integrity/already-secured
+               (:data-integrity/error
+                (ex-data (try (di/issue-credential secured opts)
+                              (catch kerror/ExceptionInfo e e))))))))
+
+    (testing "`created` must be a real XSD dateTime and is never defaulted from a clock"
+      (is (= :data-integrity/bad-created
+             (:data-integrity/error
+              (ex-data (try (di/issue-credential doc (dissoc opts :created))
+                            (catch kerror/ExceptionInfo e e))))))
+      (is (= :data-integrity/bad-created
+             (:data-integrity/error
+              (ex-data (try (di/issue-credential doc (assoc opts :created "yesterday"))
+                            (catch kerror/ExceptionInfo e e)))))))
+
+    (testing "a signer is required"
+      (is (= :data-integrity/no-signer
+             (:data-integrity/error
+              (ex-data (try (di/issue-credential doc (dissoc opts :seed))
+                            (catch kerror/ExceptionInfo e e)))))))
+
+    (testing "a seed of the wrong length is refused"
+      (is (= :data-integrity/bad-seed
+             (:data-integrity/error
+              (ex-data (try (di/issue-credential doc (assoc opts :seed (byte-array 16)))
+                            (catch kerror/ExceptionInfo e e)))))))))
+
+(deftest injected-signer-keeps-key-material-out-of-this-library
+  (testing ":sign lets an HSM/KMS produce the signature; the result must match
+            what the default seed signer produces for the same input"
+    (let [calls (atom 0)
+          secured (di/issue-credential
+                   vector-unsecured-credential
+                   {:sign (fn [hash-bytes]
+                            (swap! calls inc)
+                            (ed/sign @vector-seed hash-bytes))
+                    :verification-method vector-verification-method
+                    :created "2023-02-24T23:36:38Z"})]
+      (is (= 1 @calls))
+      (is (= vector-proof-value (get-in secured ["proof" "proofValue"])))
+      (is (:verified (di/verify-credential secured))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; DID method boundaries
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(deftest did-web-needs-an-explicit-resolver
+  (testing "a verification library must not fetch URLs from document content on
+            its own; the error names where the document lives"
+      (let [vm "did:web:issuer.example#key-1"
+            e (try (di/verify (assoc-in vector-secured-credential
+                                        ["proof" "verificationMethod"] vm)
+                              {:expected-proof-purpose :any})
+                   (catch kerror/ExceptionInfo ex ex))]
+        (is (= :data-integrity/resolver-required (:data-integrity/error (ex-data e))))
+        (is (= "https://issuer.example/.well-known/did.json"
+               (:url (ex-data e))))))
+
+  (testing "an injected resolver makes did:web verifiable"
+    (let [vm "did:web:issuer.example#key-1"
+          secured (-> (di/issue-credential
+                       vector-unsecured-credential
+                       {:seed @vector-seed
+                        :verification-method vm
+                        :created "2023-02-24T23:36:38Z"}))
+          r (di/verify-credential
+             secured
+             {:resolve-key (fn [_] (ed/did-key->pubkey
+                                    (str "did:key:" vector-public-multibase)))})]
+      (is (:verified r)))))
+
+(deftest did-key-fragment-must-match-its-own-key
+  (testing "a proof naming a fragment other than the key its controller resolves
+            to is refused rather than quietly resolved to the controller"
+    (let [vm (str "did:key:" vector-public-multibase "#z6MkOTHER")
+          e (try (di/default-resolve-key vm)
+                 (catch kerror/ExceptionInfo ex ex))]
+      (is (= :data-integrity/verification-method-mismatch
+             (:data-integrity/error (ex-data e)))))))
+
+(deftest missing-proof-is-malformed-not-invalid
+  (testing "no proof at all is a malformed input, distinct from an invalid proof"
+    (is (= :data-integrity/missing-proof
+           (:data-integrity/error
+            (ex-data (try (di/verify-credential vector-unsecured-credential)
+                          (catch kerror/ExceptionInfo e e))))))))

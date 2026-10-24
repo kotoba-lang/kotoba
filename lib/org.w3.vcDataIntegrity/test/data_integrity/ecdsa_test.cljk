@@ -1,0 +1,141 @@
+(ns data-integrity.ecdsa-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [data-integrity.bytes :as b]
+            [data-integrity.core :as di]
+            [data-integrity.ecdsa :as ecdsa]
+            [multiformats.core :as mf])
+  (:import (java.security KeyPairGenerator SecureRandom)
+           (java.security.spec ECGenParameterSpec)))
+
+;; A P-256 key pair, and its did:key. Generated rather than fixed because the
+;; signature is randomized anyway (see the namespace docstring): there is no fixed
+;; proofValue to pin, so a fixed key would buy nothing.
+(def ^:private pair
+  (delay (let [g (KeyPairGenerator/getInstance "EC")]
+           (.initialize g (ECGenParameterSpec. "secp256r1") (SecureRandom.))
+           (.generateKeyPair g))))
+
+(defn- compressed-multibase []
+  (let [pub (.getPublic @pair)
+        point (.getW pub)
+        x (.toByteArray (.getAffineX point))
+        ;; toByteArray may carry a leading zero sign byte, or be short
+        x32 (let [v (vec (b/->ints x))]
+              (cond (> (count v) 32) (subvec v (- (count v) 32))
+                    (< (count v) 32) (into (vec (repeat (- 32 (count v)) 0)) v)
+                    :else v))
+        odd? (.testBit (.getAffineY point) 0)]
+    (str "z" (mf/base58btc (b/ints->bytes
+                            (into (into [] ecdsa/p256-multicodec)
+                                  (into [(if odd? 0x03 0x02)] x32)))))))
+
+(defn- did-key [] (str "did:key:" (compressed-multibase)))
+(defn- vm [] (str (did-key) "#" (compressed-multibase)))
+
+(def credential
+  {"@context" ["https://www.w3.org/ns/credentials/v2"]
+   "type" ["VerifiableCredential"]
+   "issuer" "https://issuer.example"
+   "credentialSubject" {"id" "did:example:alice" "role" "auditor"}})
+
+(defn- issue []
+  (di/issue-credential credential
+                       {:suite ecdsa/suite
+                        :sign (fn [hash-bytes]
+                                (ecdsa/sign-hash-data (.getPrivate @pair) hash-bytes))
+                        :verification-method (vm)
+                        :created "2026-07-31T00:00:00Z"}))
+
+(defn- verify [secured]
+  (di/verify-credential secured
+                        {:suite ecdsa/suite
+                         :resolve-key (fn [_] (.getPublic @pair))}))
+
+;; ── the compressed point ─────────────────────────────────────────────────────
+
+(deftest a-p256-did-key-round-trips-through-decompression
+  (testing "recovering y needs a square root mod p; the sign convention is the
+            part that silently produces a key verifying nothing"
+    (let [recovered (ecdsa/did-key->public-key (did-key))]
+      (is (= (.getAffineX (.getW (.getPublic @pair)))
+             (.getAffineX (.getW recovered))))
+      (is (= (.getAffineY (.getW (.getPublic @pair)))
+             (.getAffineY (.getW recovered)))
+          "y, not just x — a flipped sign byte would pass an x-only check"))))
+
+(deftest an-ed25519-did-key-is-refused-by-name
+  (testing "z6Mk… and zDna… are both valid did:keys; confusing them is a
+            configuration mistake and deserves a configuration error"
+    (is (= :data-integrity/wrong-curve
+           (:data-integrity/error
+            (ex-data (try (ecdsa/did-key->public-key
+                           "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2")
+                          (catch kerror/ExceptionInfo e e))))))))
+
+(deftest a-point-not-on-the-curve-is-refused
+  (testing "an x with no square root would otherwise yield a point off the curve"
+    (let [bad (str "z" (mf/base58btc
+                        (b/ints->bytes (into (into [] ecdsa/p256-multicodec)
+                                             (into [0x02] (repeat 32 0xff))))))]
+      (is (contains? #{:data-integrity/bad-public-key :data-integrity/wrong-curve}
+                     (:data-integrity/error
+                      (ex-data (try (ecdsa/did-key->public-key (str "did:key:" bad))
+                                    (catch kerror/ExceptionInfo e e)))))))))
+
+;; ── the suite ────────────────────────────────────────────────────────────────
+
+(deftest issue-and-verify-round-trip
+  (let [secured (issue)]
+    (is (= "DataIntegrityProof" (get-in secured ["proof" "type"])))
+    (is (= "ecdsa-jcs-2019" (get-in secured ["proof" "cryptosuite"])))
+    (is (str/starts-with? (get-in secured ["proof" "proofValue"]) "z"))
+    (is (:verified (verify secured)))))
+
+(deftest the-signature-is-p1363-not-der
+  (testing "§3.3.1 requires RFC 4754 / IEEE P1363 — exactly 64 bytes for P-256.
+            The JVM's ordinary SHA256withECDSA emits a variable-length DER
+            SEQUENCE, which nobody else would accept."
+    (let [sig (ecdsa/decode-proof-value (get-in (issue) ["proof" "proofValue"]))]
+      (is (= 64 (b/byte-count sig)))
+      (testing "and a DER-shaped value is refused rather than re-encoded"
+        ;; 0x30 is the DER SEQUENCE tag; a 70-72 byte value is the usual DER size
+        (is (= :data-integrity/bad-signature-length
+               (:data-integrity/error
+                (ex-data (try (ecdsa/encode-proof-value
+                               (b/ints->bytes (into [0x30 0x44] (repeat 68 0))))
+                              (catch kerror/ExceptionInfo e e))))))))))
+
+(deftest tampering-is-detected
+  (doseq [[label tampered]
+          [["role" (assoc-in (issue) ["credentialSubject" "role"] "owner")]
+           ["issuer" (assoc (issue) "issuer" "https://evil.example")]
+           ["created" (assoc-in (issue) ["proof" "created"] "2020-01-01T00:00:00Z")]]]
+    (is (not (:verified (verify tampered))) (str "tampering with " label))))
+
+(deftest signatures-are-not-reproducible
+  (testing "§3 only SHOULDs determinism and the JVM provider is randomized, which
+            is why no test here pins a fixed proofValue — and why this fact is
+            asserted rather than left as a surprise"
+    (let [a (get-in (issue) ["proof" "proofValue"])
+          c (get-in (issue) ["proof" "proofValue"])]
+      (is (not= a c) "two signings of the same document differ")
+      (is (:verified (verify (issue))) "and both verify"))))
+
+(deftest hash-data-puts-the-proof-configuration-first
+  (testing "§3.3.4 step 3, the same order eddsa-jcs-2022 uses and the same trap"
+    (let [doc {"a" 1}
+          options {"type" "DataIntegrityProof" "cryptosuite" "ecdsa-jcs-2019"}
+          transformed (ecdsa/transform doc options)
+          config (ecdsa/proof-configuration options)
+          expected (b/concat-bytes (mf/sha256 config) (mf/sha256 transformed))
+          reversed (b/concat-bytes (mf/sha256 transformed) (mf/sha256 config))]
+      (is (b/bytes= expected (ecdsa/hash-data transformed config)))
+      (is (not (b/bytes= reversed (ecdsa/hash-data transformed config)))))))
+
+(deftest the-suite-refuses-the-wrong-cryptosuite
+  (is (= :data-integrity/bad-cryptosuite
+         (:data-integrity/error
+          (ex-data (try (ecdsa/proof-configuration
+                         {"type" "DataIntegrityProof" "cryptosuite" "eddsa-jcs-2022"})
+                        (catch kerror/ExceptionInfo e e)))))))

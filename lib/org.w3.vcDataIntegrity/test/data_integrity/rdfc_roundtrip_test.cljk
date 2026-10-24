@@ -1,0 +1,163 @@
+(ns data-integrity.rdfc-roundtrip-test
+  "Proves `eddsa-rdfc-2022` is reachable through the PUBLIC api, not just correct
+  in isolation.
+
+  `data_integrity.eddsa-rdfc-test` pins the cryptosuite to W3C's vector, which
+  establishes that the algorithm is right. It says nothing about whether anyone can
+  *use* it: `core/issue` called `(:transform suite) doc proof` with two arguments,
+  and this suite needs a third for its pinned `:contexts`. So the suite was correct
+  and unreachable at the same time — a working component with no way in.
+
+  That is the third time in this stack that a layer has been right on its own and
+  unwired above it, so the round trip below goes through `issue-credential` and
+  `verify-credential` exactly as an application would, rather than calling the
+  suite's members directly."
+  (:require [kotoba.lang.error :as kerror] [kotoba.json :as json]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [data-integrity.core :as di]
+            [data-integrity.eddsa :as eddsa]
+            [data-integrity.eddsa-rdfc :as rdfc]
+            [ed25519.core :as ed]))
+
+(def ^:private contexts
+  (delay {"https://www.w3.org/ns/credentials/v2"
+          (json/read-str (slurp (io/resource "fixtures/credentials-v2.jsonld")))
+          "https://www.w3.org/ns/credentials/examples/v2"
+          (json/read-str (slurp (io/resource "fixtures/credentials-examples-v2.jsonld")))}))
+
+(def ^:private seed (byte-array (repeat 32 (byte 11))))
+(def ^:private did (delay (ed/did-key-from-seed seed)))
+(def ^:private vm (delay (str @did "#" (subs @did (count "did:key:")))))
+
+(def ^:private credential
+  {"@context" ["https://www.w3.org/ns/credentials/v2"
+               "https://www.w3.org/ns/credentials/examples/v2"]
+   "id" "urn:uuid:11111111-2222-3333-4444-555555555555"
+   "type" ["VerifiableCredential" "AlumniCredential"]
+   "issuer" "https://vc.example/issuers/5678"
+   "validFrom" "2026-07-31T00:00:00Z"
+   "credentialSubject" {"id" "did:example:abcdefgh"
+                        "alumniOf" "The School of Examples"}})
+
+(defn- issue []
+  (di/issue-credential credential
+                       {:suite rdfc/suite
+                        :suite-opts {:contexts @contexts}
+                        :seed seed
+                        :verification-method @vm
+                        :created "2026-07-31T00:00:00Z"}))
+
+(deftest a-credential-issues-and-verifies-through-the-public-api
+  (let [secured (issue)]
+    (testing "the proof names this cryptosuite, not the default"
+      (is (= "eddsa-rdfc-2022" (get-in secured ["proof" "cryptosuite"])))
+      (is (= "DataIntegrityProof" (get-in secured ["proof" "type"])))
+      (is (string? (get-in secured ["proof" "proofValue"]))))
+
+    (testing "and it verifies"
+      (is (:verified (di/verify-credential secured
+                                            {:suite rdfc/suite
+                                             :suite-opts {:contexts @contexts}}))))
+
+    (testing "a tampered claim fails verification — the point of signing the graph"
+      (let [tampered (assoc-in secured ["credentialSubject" "alumniOf"] "Another School")]
+        (is (not (:verified (di/verify-credential tampered
+                                                  {:suite rdfc/suite
+                                                   :suite-opts {:contexts @contexts}}))))))
+
+    (testing "while reordering the JSON does not. NOTE this alone does not
+              distinguish the suites — RFC 8785 sorts keys too, so JCS survives a
+              reordering as well. The real distinction is tested separately below."
+      (let [reordered (assoc (into (sorted-map-by #(compare %2 %1))
+                                   (dissoc secured "proof"))
+                             "proof" (get secured "proof"))]
+        (is (:verified (di/verify-credential reordered
+                                              {:suite rdfc/suite
+                                               :suite-opts {:contexts @contexts}})))))))
+
+(deftest each-suite-refuses-the-others-proof-as-malformed
+  (testing "the two suites are not interchangeable, and the library says so loudly.
+            Note WHICH way: a mismatched `cryptosuite` THROWS rather than returning
+            {:verified false}, because per `verify`'s own contract a malformed proof
+            is not the same event as an invalid one. A caller must branch on
+            `:verified` for the second and catch for the first."
+    (let [rdfc-secured (issue)
+          jcs-secured (di/issue-credential credential
+                                           {:suite eddsa/suite
+                                            :seed seed
+                                            :verification-method @vm
+                                            :created "2026-07-31T00:00:00Z"})]
+      (is (= "eddsa-jcs-2022" (get-in jcs-secured ["proof" "cryptosuite"])))
+      (is (not= (get-in rdfc-secured ["proof" "proofValue"])
+                (get-in jcs-secured ["proof" "proofValue"]))
+          "different transformations must produce different proofs")
+      (testing "and each refuses the other's proof, because the `cryptosuite` field
+                is checked rather than assumed"
+        (is (= :data-integrity/bad-cryptosuite
+               (:data-integrity/error
+                (ex-data (try (di/verify-credential jcs-secured
+                                                    {:suite rdfc/suite
+                                                     :suite-opts {:contexts @contexts}})
+                              (catch kerror/ExceptionInfo e e))))))
+        (is (= :data-integrity/bad-cryptosuite
+               (:data-integrity/error
+                (ex-data (try (di/verify-credential rdfc-secured {:suite eddsa/suite})
+                              (catch kerror/ExceptionInfo e e)))))))
+      (testing "but a genuinely invalid signature under the RIGHT suite is a
+                {:verified false}, not a throw — the distinction the contract makes"
+        (let [tampered (assoc-in rdfc-secured ["credentialSubject" "alumniOf"] "X")
+              r (di/verify-credential tampered {:suite rdfc/suite
+                                                :suite-opts {:contexts @contexts}})]
+          (is (false? (:verified r)))
+          (is (some? (:reason r))))))))
+
+(deftest rdfc-survives-a-RESPELLING-that-jcs-cannot
+  (testing "the actual reason to pay for canonicalization, and the thing key-order
+            stability does NOT show.
+
+            `alumniOf` reaches its IRI through the examples context's @vocab. Writing
+            that IRI out in full is a DIFFERENT JSON document expanding to the SAME
+            triple. A -rdfc- proof is over the graph, so it still verifies; a JCS
+            proof is over the JSON, so it cannot."
+    (let [respelt (-> credential
+                      (update "credentialSubject" dissoc "alumniOf")
+                      (assoc-in ["credentialSubject"
+                                 "https://www.w3.org/ns/credentials/examples#alumniOf"]
+                                "The School of Examples"))
+          rdfc-proof (get (issue) "proof")
+          jcs-proof (get (di/issue-credential credential
+                                              {:suite eddsa/suite :seed seed
+                                               :verification-method @vm
+                                               :created "2026-07-31T00:00:00Z"})
+                         "proof")]
+      (testing "the -rdfc- proof made over the original still verifies over the respelling"
+        (is (:verified (di/verify-credential (assoc respelt "proof" rdfc-proof)
+                                             {:suite rdfc/suite
+                                              :suite-opts {:contexts @contexts}}))))
+      (testing "the JCS proof does not, because the bytes changed"
+        (is (false? (:verified (di/verify-credential (assoc respelt "proof" jcs-proof)
+                                                    {:suite eddsa/suite}))))))))
+
+(deftest issuing-without-contexts-is-refused-not-guessed
+  (testing "no :suite-opts means no pinned contexts, and there is no fetch — so
+            issuance fails loudly instead of signing a graph missing every term
+            the remote context would have defined"
+    (is (= "context-not-provided"
+           (:json-ld/error
+            (ex-data (try (di/issue-credential credential
+                                               {:suite rdfc/suite
+                                                :seed seed
+                                                :verification-method @vm
+                                                :created "2026-07-31T00:00:00Z"})
+                          (catch kerror/ExceptionInfo e e))))))))
+
+(deftest the-default-suite-is-unchanged
+  (testing "adding an options-taking suite must not change what `issue` does when no
+            suite is named — existing credentials keep verifying"
+    (let [d (di/issue-credential credential
+                                 {:seed seed
+                                  :verification-method @vm
+                                  :created "2026-07-31T00:00:00Z"})]
+      (is (= "eddsa-jcs-2022" (get-in d ["proof" "cryptosuite"])))
+      (is (:verified (di/verify-credential d {}))))))

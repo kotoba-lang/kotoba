@@ -79,6 +79,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.rdf` | `org.w3.rdf/src` | `rdf.core`, `rdf.dataset`, `rdf.validate` (an external specification, publisher w3.org) |
 | `org.w3.rdfCanon` | `org.w3.rdfCanon/src` | `rdf-canon.core` (an external specification, publisher w3.org) |
 | `org.w3.vcBitstringStatusList` | `org.w3.vcBitstringStatusList/src` | `status-list.core` (an external specification, publisher w3.org) |
+| `org.w3.vcDataIntegrity` | `org.w3.vcDataIntegrity/src` | `data-integrity.bytes`, `data-integrity.core`, `data-integrity.ecdsa`, `data-integrity.eddsa` (an external specification, publisher w3.org) |
 | `kotoba.ioMultiformats` | `kotoba.ioMultiformats/src` | `multiformats.base32`, `multiformats.core`, `multiformats.multiaddr` (Kotoba project library) |
 | `com.google.snappy` | `com.google.snappy/src` | `snappy.core` (Kotoba project library) |
 | `kotoba.columnar` | `kotoba.columnar/src` | `columnar.aggregate`, `columnar.bytes`, `columnar.evolve`, `columnar.group` (Kotoba project library) |
