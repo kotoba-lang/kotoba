@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.nio` | `kotoba.nio/src` | `kotoba.nio.bytebuffer` (Kotoba project library) |
 | `kotoba.netcap` | `kotoba.netcap/src` | `kotoba.lang.netcap`, `kotoba.netcap`, `kotoba.netcap.call`, `kotoba.netcap.denied` (Kotoba project library) |
 | `kotoba.nerf` | `kotoba.nerf/src` | `nerf` (Kotoba project library) |
 | `kotoba.musicxml` | `kotoba.musicxml/src` | `kotoba.musicxml`, `musicxml.core` (Kotoba project library) |
