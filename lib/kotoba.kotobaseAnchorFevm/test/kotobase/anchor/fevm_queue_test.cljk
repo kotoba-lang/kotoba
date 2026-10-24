@@ -1,0 +1,156 @@
+(ns kotobase.anchor.fevm-queue-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.anchor.fevm.queue :as queue]))
+
+(def checkpoint
+  {:database-id "db/a"
+   :epoch 9
+   :logical-checkpoint-root "logical-root-9"
+   :physical-root "must-not-cross-anchor-boundary"})
+
+(def config
+  {:chain :calibration
+   :contract-address "t410f-checkpoint-contract"
+   :digest-fn (constantly (apply str (repeat 64 "a")))})
+
+(defn error-type [f]
+  (try
+    (f)
+    nil
+    (catch clojure.lang.ExceptionInfo error
+      (:type (ex-data error)))))
+
+(deftest enqueue-is-idempotent-and-storage-neutral
+  (let [a (queue/enqueue-plan checkpoint config 100)
+        b (queue/enqueue-plan checkpoint config 100)
+        record (:record a)]
+    (is (= a b))
+    (is (= :anchor-job/put-if-absent (get-in a [:effect :effect/type])))
+    (is (= (get-in a [:effect :key]) (:idempotency-key record)))
+    (is (nil? (get-in record [:submission-effect :payload :physical-root])))
+    (is (= :pending (get-in record [:anchor-state :status])))))
+
+(deftest claim-must-be-cas-persisted-before-work
+  (let [record (queue/new-job checkpoint config 0)
+        claimed (queue/claim record "worker-a" 0 {})
+        persist (queue/persist-plan record claimed)
+        work (queue/work-effect claimed "worker-a" 0)]
+    (is (= 1 (:revision claimed)))
+    (is (= 1 (:attempt claimed)))
+    (is (= :anchor-job/compare-and-set (:effect/type persist)))
+    (is (= 0 (:expected-revision persist)))
+    (is (= :fevm/submit-checkpoint (:effect/type work)))
+    (is (= 1 (:attempt work)))
+    (is (= :kotobase.anchor/job-leased
+           (error-type #(queue/claim claimed "worker-b" 1 {}))))))
+
+(deftest stale-workers-cannot-publish-results
+  (let [record (queue/new-job checkpoint config 0)
+        claimed (queue/claim record "worker-a" 0 {:lease-ms 10})
+        reclaimed (queue/claim claimed "worker-b" 10 {:lease-ms 10})]
+    (is (= :kotobase.anchor/stale-anchor-worker
+           (error-type #(queue/apply-result claimed "worker-a" 10
+                                            {:result/type :submitted :tx-hash "tx-a"} {}))))
+    (is (= :kotobase.anchor/stale-anchor-worker
+           (error-type #(queue/apply-result reclaimed "worker-a" 10
+                                            {:result/type :submitted :tx-hash "tx-a"} {}))))
+    (is (= "worker-b" (get-in reclaimed [:lease :owner])))
+    (is (= 2 (:revision reclaimed)))))
+
+(deftest receipt-observations-drive-ordered-finality
+  (let [record (queue/new-job checkpoint config 0)
+        submit-claim (queue/claim record "submitter" 0 {})
+        submitted (queue/apply-result submit-claim "submitter" 0
+                                      {:result/type :submitted :tx-hash "tx-1"} {})
+        confirm-claim (queue/claim submitted "poller-1" 15000 {})
+        receipt-effect (queue/work-effect confirm-claim "poller-1" 15000)
+        confirmed (queue/apply-result confirm-claim "poller-1" 15000
+                                      {:result/type :confirmed :height 1234
+                                       :block-hash "block-a"} {})
+        final-claim (queue/claim confirmed "poller-2" 30000 {})
+        finalized (queue/apply-result final-claim "poller-2" 30000
+                                      {:result/type :finalized :confirmations 900} {})]
+    (is (= :fevm/read-receipt (:effect/type receipt-effect)))
+    (is (= "tx-1" (:transaction-hash receipt-effect)))
+    (is (nil? (:expected-block-hash receipt-effect)))
+    (is (= :finalized (get-in finalized [:anchor-state :status])))
+    (is (= 900 (get-in finalized [:anchor-state :confirmations])))
+    (is (nil? (:next-at-ms finalized)))
+    (is (= :kotobase.anchor/terminal-anchor-job
+           (error-type #(queue/claim finalized "worker" 30001 {}))))))
+
+(deftest lifecycle-states-cannot-be-skipped
+  (let [record (queue/new-job checkpoint config 0)
+        claimed (queue/claim record "worker" 0 {})]
+    (is (= :kotobase.anchor/invalid-worker-result
+           (error-type #(queue/apply-result claimed "worker" 0
+                                            {:result/type :finalized :confirmations 10} {}))))
+    (is (= :kotobase.anchor/invalid-worker-result
+           (error-type #(queue/apply-result claimed "worker" 0
+                                            {:result/type :failed :reason ""} {}))))
+    (is (= :kotobase.anchor/invalid-worker-result
+           (error-type #(queue/apply-result claimed "worker" 0
+                                            {:result/type :submitted
+                                             :tx-hash "tx-1"
+                                             :token "must-not-be-ignored"} {}))))))
+
+(deftest reorg-evidence-retries-the-idempotent-submission
+  (let [record (queue/new-job checkpoint config 0)
+        submit-claim (queue/claim record "submitter" 0 {})
+        submitted (queue/apply-result submit-claim "submitter" 0
+                                      {:result/type :submitted :tx-hash "tx-1"} {})
+        receipt-claim (queue/claim submitted "poller" 15000 {})
+        confirmed (queue/apply-result receipt-claim "poller" 15000
+                                      {:result/type :confirmed :height 10
+                                       :block-hash "block-a"} {})
+        reorg-claim (queue/claim confirmed "poller" 30000 {})
+        reorged (queue/apply-result reorg-claim "poller" 30000
+                                    {:result/type :reorged} {})]
+    (is (= :failed (get-in reorged [:anchor-state :status])))
+    (is (= :chain-reorg (get-in reorged [:anchor-state :reason])))
+    (is (= (:idempotency-key record) (:idempotency-key reorged)))
+    (let [due (:next-at-ms reorged)
+          retry-claim (queue/claim reorged "submitter-2" due {})]
+      (is (= :pending (get-in retry-claim [:anchor-state :status])))
+      (is (nil? (get-in retry-claim [:anchor-state :block-hash])))
+      (is (nil? (get-in retry-claim [:anchor-state :tx-hash])))
+      (is (= :fevm/submit-checkpoint
+             (:effect/type (queue/work-effect retry-claim "submitter-2" due)))))))
+
+(deftest retry-is-bounded-and-keeps-idempotency
+  (let [policy {:lease-ms 10 :poll-ms 10 :retry-base-ms 5
+                :retry-max-ms 20 :max-attempts 2}
+        record (queue/new-job checkpoint config 0)
+        first-claim (queue/claim record "worker-1" 0 policy)
+        first-failure (queue/apply-result first-claim "worker-1" 0
+                                         {:result/type :failed :reason :rpc-timeout} policy)]
+    (is (= 5 (:next-at-ms first-failure)))
+    (is (= :kotobase.anchor/job-not-due
+           (error-type #(queue/claim first-failure "worker-2" 4 policy))))
+    (let [second-claim (queue/claim first-failure "worker-2" 5 policy)
+          second-failure (queue/apply-result second-claim "worker-2" 5
+                                             {:result/type :failed :reason :rpc-timeout} policy)]
+      (is (= (:idempotency-key record) (:idempotency-key second-claim)))
+      (is (= 2 (:attempt second-claim)))
+      (is (= 15 (:next-at-ms second-failure)))
+      (is (= :kotobase.anchor/retry-exhausted
+             (error-type #(queue/claim second-failure "worker-3" 15 policy)))))))
+
+(deftest persistence-cas-rejects-identity-or-revision-drift
+  (let [record (queue/new-job checkpoint config 0)
+        claimed (queue/claim record "worker" 0 {})]
+    (testing "the exact next revision is valid"
+      (is (= claimed (:record (queue/persist-plan record claimed)))))
+    (is (= :kotobase.anchor/invalid-persistence-transition
+           (error-type #(queue/persist-plan record (update claimed :revision inc)))))
+    (is (= :kotobase.anchor/invalid-anchor-job
+           (error-type #(queue/persist-plan
+                         record (assoc claimed :idempotency-key "different")))))
+    (is (= :kotobase.anchor/invalid-anchor-job
+           (error-type #(queue/persist-plan
+                         record (assoc-in claimed
+                                          [:anchor-state :logical-checkpoint-root]
+                                          "different-root")))))
+    (is (= :kotobase.anchor/invalid-anchor-job
+           (error-type #(queue/persist-plan
+                         record (assoc claimed :token "must-not-persist")))))))
