@@ -1,0 +1,250 @@
+(ns html.kotoba-parity-test
+  "Byte-equality gate between html.core and its `.kotoba` port
+  (kotoba/html_core.kotoba), the second step of the design-system migration in
+  ADR-2607270100 section 10 (after css).
+
+  The port is compiled here and executed through the KIR interpreter in this
+  same JVM, so nothing crosses a runtime boundary and no typed value has to be
+  marshalled from Clojure: each case is generated as a zero-argument `.kotoba`
+  function whose whole body is the call under test, and the interpreter hands
+  back the resulting string directly.
+
+  SCOPE. Form A means the Hiccup *tree* is not a value — class collections,
+  sequence children and pretty-print indentation stay in html.core. What is
+  gated is the string pipeline: escape, attribute/style emission, void vs
+  closed elements, RAWTEXT breakout refusal, tag sugar, and call-graph
+  composition of those pieces into the same bytes html.core emits for the
+  equivalent flat structure.
+
+  TAG SUGAR. html.core/parse-tag is gated below against the real function (its
+  two halves as separate string cases, plus the rendered base attribute string
+  and an end-to-end element). html.core/class-str is NOT ported and is not
+  gated: it dispatches on the *runtime type* of an arbitrary Clojure value
+  (string? / keyword? / symbol? / coll? / else `str`) and recursively folds an
+  arbitrarily nested, heterogeneous collection while dropping nils. Kotoba is
+  statically typed and has no untyped value to dispatch on, no `str` over
+  arbitrary host values, and no heterogeneous nested collection to fold — so
+  this is a genuine host-language dependency, not a missing head. It stays in
+  .cljc, and the port takes the already-resolved class string.
+
+  ORDERING. Attribute and style maps are walked by `typed-map-entry-at` in
+  sorted key order. Parity is asserted against a key-sorted run of html.core
+  (via sorted-map inputs), matching the css port's finding about Clojure map
+  order above 8 entries.
+
+  T5.2: multi-arg pure folded into guest records; cases call via record-new."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [html.core :as html]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def port-source (slurp "lib/kotoba.html/kotoba/html_core.kotoba"))
+
+(defn- kotoba-literal
+  "A `.kotoba` string literal for S. Only the two escapes the reader needs."
+  [s]
+  (str \" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) \"))
+
+(defn- compile-cases
+  "Compile the port plus one zero-arg function per case. Returns a map of
+  case-name -> the string that function evaluates to."
+  [cases]
+  (let [defs (for [[name body] cases]
+               (str "(defn " name " [] :string " body ")"))
+        kir (:kir (compiler/compile-source
+                   (str port-source "\n" (str/join "\n" defs)) :wasm32-kotoba-v1 {}))]
+    (into {} (map (fn [[name _]] [name (ir/execute kir (symbol name) [])]) cases))))
+
+(defn- typed-map-literal [m]
+  (str "(typed-map-new [:map :keyword :string] "
+       (str/join " " (mapcat (fn [[k v]] [(pr-str k) (kotoba-literal v)])
+                             (sort-by (comp str key) m)))
+       ")"))
+
+(defn- unwrap [expr]
+  (str "(result-value-of [:result :string :string] " expr " \"\")"))
+
+(defn- attr-call [name value]
+  (str "(attr (record-new [:ref :html/attr] "
+       (kotoba-literal name) " " (kotoba-literal value) "))"))
+
+(defn- void-el-call [tag attrs-expr]
+  (str "(void-el (record-new [:ref :html/void-el] "
+       (kotoba-literal tag) " " attrs-expr "))"))
+
+(defn- el-expr-call
+  "`el` where the tag is an arbitrary `.kotoba` expression, not a literal."
+  [tag-expr attrs-expr body-expr]
+  (str "(el (record-new [:ref :html/el] "
+       tag-expr " " attrs-expr " " body-expr "))"))
+
+(defn- el-call [tag attrs-expr body-expr]
+  (el-expr-call (kotoba-literal tag) attrs-expr body-expr))
+
+(defn- raw-text-el-call [tag content]
+  (str "(raw-text-el (record-new [:ref :html/raw-pair] "
+       (kotoba-literal tag) " " (kotoba-literal content) "))"))
+
+;; --- escape ---------------------------------------------------------------
+
+(def escape-corpus
+  {"empty" ""
+   "plain" "hello"
+   "amp" "a&b"
+   "lt-gt" "<tag>"
+   "quote" "a\"b"
+   "combo" "a<b>&\"c"
+   "already-entities" "a&amp;b"})
+
+(deftest esc-is-byte-identical-to-html-core
+  (let [cases (into {} (for [[name s] escape-corpus]
+                         [(str "esc_" name) (str "(esc " (kotoba-literal s) ")")]))
+        actual (compile-cases cases)]
+    (doseq [[name s] escape-corpus]
+      (testing name
+        (is (= (html/esc s) (get actual (str "esc_" name))))))))
+
+;; --- attributes and style -------------------------------------------------
+
+(deftest attr-and-bool-attr-match-html-core
+  (let [actual (compile-cases
+                {"attr_href" (attr-call "href" "a\"b")
+                 "bool_disabled" "(bool-attr \"disabled\")"
+                 "attrs_sorted" (str "(attrs " (typed-map-literal {:href "/x" :title "t"}) ")")
+                 "style_css" (str "(style-css " (typed-map-literal {:font-size "12px" :color "red"}) ")")
+                 "style_attr" (str "(style-attr " (typed-map-literal {:font-size "12px" :color "red"}) ")")})]
+    (testing "escaped attribute value"
+      (is (= (str " href=\"" (html/esc "a\"b") "\"")
+             (get actual "attr_href"))))
+    (testing "boolean attribute"
+      (is (= " disabled" (get actual "bool_disabled"))))
+    (testing "attrs map in key-sorted order"
+      ;; html.core/render-attrs walks the map; sorted-map makes order match the port
+      (is (= (html/render-attrs (into (sorted-map) {:href "/x" :title "t"}))
+             (get actual "attrs_sorted"))))
+    (testing "style map in key-sorted order"
+      (is (= (html/style-map->css (into (sorted-map) {:font-size "12px" :color "red"}))
+             (get actual "style_css")))
+      (is (= (html/render-attrs {:style (into (sorted-map) {:font-size "12px" :color "red"})})
+             (get actual "style_attr"))))))
+
+;; --- elements -------------------------------------------------------------
+
+(deftest void-and-closed-elements-match-html-core
+  (let [actual (compile-cases
+                {"br" (void-el-call "br" "\"\"")
+                 "img" (void-el-call "img" (attr-call "src" "x.png"))
+                 "hr" (void-el-call "hr" "\"\"")
+                 "h1" (el-call "h1" "\"\"" (str "(text " (kotoba-literal "Hello") ")"))
+                 "p_style" (el-call "p"
+                                    (str "(style-attr " (typed-map-literal {:font-size "12px" :color "red"}) ")")
+                                    (str "(text " (kotoba-literal "x") ")"))
+                 "demo" (el-call "div"
+                                 (str "(string-concat " (attr-call "class" "page x") " "
+                                      (attr-call "id" "app") ")")
+                                 (str "(string-concat "
+                                      (el-call "h1" "\"\"" (str "(text " (kotoba-literal "Hello") ")")) " "
+                                      (void-el-call "input" "(bool-attr \"disabled\")") ")"))
+                 "fragment" (str "(string-concat "
+                                 (el-call "span" "\"\"" (str "(text " (kotoba-literal "a") ")")) " "
+                                 (el-call "span" "\"\"" (str "(text " (kotoba-literal "b") ")")) ")")
+                 "doc" (str "(html5 "
+                            (el-call "html" "\"\""
+                                     (el-call "body" "\"\""
+                                              (str "(text " (kotoba-literal "hi") ")")))
+                            ")")})]
+    (testing "void tags"
+      (is (= (html/->html [:br]) (get actual "br")))
+      (is (= (html/->html [:img {:src "x.png"}]) (get actual "img")))
+      (is (= (html/->html [:hr]) (get actual "hr"))))
+    (testing "closed elements"
+      (is (= (html/->html [:h1 "Hello"]) (get actual "h1")))
+      (is (= (html/->html [:p {:style (into (sorted-map) {:font-size "12px" :color "red"})} "x"])
+             (get actual "p_style"))))
+    (testing "composed page fragment (contract test shape)"
+      (is (= (html/->html [:div.page#app {:class [:x nil]} [:h1 "Hello"] [:input {:disabled true}]])
+             (get actual "demo"))))
+    (testing "fragment composition via string-concat"
+      (is (= (html/->html [:<> [:span "a"] [:span "b"]])
+             (get actual "fragment"))))
+    (testing "html5 document wrapper (compact — pretty-print stays in html.core)"
+      ;; html.core pretty-prints block-only element children; form A emits
+      ;; the call-graph order with no inserted newlines. Assert the compact
+      ;; bytes the port owns, and keep the doctype prefix contract from html5.
+      (is (str/starts-with? (html/html5 [:html [:body "hi"]]) "<!DOCTYPE html>\n"))
+      (is (= "<!DOCTYPE html>\n<html><body>hi</body></html>"
+             (get actual "doc"))))))
+
+;; --- RAWTEXT breakout -----------------------------------------------------
+
+(deftest raw-text-guard-rejects-what-html-core-throws-on
+  (let [ok-script "const x = \"<b>\";"
+        ok-style "body{color:red}"
+        bad-script "x</SCRIPT><img src=x>"
+        bad-style "x</style><script>x</script>"
+        actual (compile-cases
+                {"script_ok" (unwrap (raw-text-el-call "script" ok-script))
+                 "style_ok" (unwrap (raw-text-el-call "style" ok-style))
+                 "script_bad" (str "(match-result " (raw-text-el-call "script" bad-script)
+                                   " [:result :string :string]"
+                                   " (ok text text) (err message \"REJECTED\"))")
+                 "style_bad" (str "(match-result " (raw-text-el-call "style" bad-style)
+                                  " [:result :string :string]"
+                                  " (ok text text) (err message \"REJECTED\"))")})]
+    (testing "safe RAWTEXT renders unescaped"
+      (is (= (html/->html [:script ok-script]) (get actual "script_ok")))
+      (is (= (html/->html [:style [:hiccup/raw ok-style]]) (get actual "style_ok"))))
+    (testing "breakout content is refused on both sides"
+      (is (thrown? clojure.lang.ExceptionInfo (html/->html [:script bad-script])))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (html/->html [:style [:hiccup/raw bad-style]])))
+      (is (= "REJECTED" (get actual "script_bad")))
+      (is (= "REJECTED" (get actual "style_bad"))))))
+
+;; --- tag sugar ------------------------------------------------------------
+
+(def tag-sugar-corpus
+  "Inputs for parse-tag, as the string `(name kw)` produces. Chosen to pin the
+  regex grammar's corners, not just the happy path: an empty leading run (tag
+  defaults to \"div\"), a `#`/`.` whose run is empty (the regex engine retries
+  at the next position rather than matching), a second `#` (only the first
+  matching one wins), multiple classes (joined by one space, in order), a
+  trailing delimiter, non-ASCII (byte offsets vs UTF-16 char offsets), and
+  characters the attribute escaper has to handle."
+  ["div" "div.a" "div.a.b" "div#id" "div.a#id" "div#id.a"
+   ".a" "#id" ".a#id" "" "a..b" "a##b" "a#.b" "a.#b"
+   "div.a.b.c#x" "#x#y" ".a.b" "x." "x#" "div#a#b"
+   "p.foo-bar#baz_1" "セ.クラス#識別" "div.a&b#\"q\"" "a.b#c.d"])
+
+(defn- tag-sugar-cases [corpus]
+  (into {} (mapcat (fn [i s]
+                     (let [lit (kotoba-literal s)]
+                       [[(str "tag_" i) (str "(tag-name " lit ")")]
+                        [(str "cls_" i) (str "(tag-classes " lit ")")]
+                        [(str "id_" i) (str "(tag-id " lit ")")]
+                        [(str "atr_" i) (str "(tag-attrs " lit ")")]
+                        [(str "el_" i) (el-expr-call (str "(tag-name " lit ")")
+                                                     (str "(tag-attrs " lit ")")
+                                                     "\"\"")]]))
+                   (range) corpus)))
+
+(deftest tag-sugar-matches-html-core-parse-tag
+  (let [actual (compile-cases (tag-sugar-cases tag-sugar-corpus))]
+    (doseq [[i s] (map vector (range) tag-sugar-corpus)]
+      (testing (pr-str s)
+        (let [[tag base] (html/parse-tag (keyword s))]
+          (testing "tag name"
+            (is (= tag (get actual (str "tag_" i)))))
+          (testing "class string (\"\" means the regex found no class)"
+            (is (= (get base :class "") (get actual (str "cls_" i)))))
+          (testing "id (\"\" means the regex found no id)"
+            (is (= (get base :id "") (get actual (str "id_" i)))))
+          (testing "rendered base attribute string"
+            (is (= (html/render-attrs base) (get actual (str "atr_" i)))))
+          (testing "end-to-end element"
+            ;; Every corpus tag resolves to a non-void element, so html.core
+            ;; emits an open+close pair with no children — the same shape `el`
+            ;; composes from tag-name + tag-attrs.
+            (is (not (contains? html/void-tags tag)))
+            (is (= (html/->html [(keyword s)]) (get actual (str "el_" i))))))))))
