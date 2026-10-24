@@ -1,0 +1,97 @@
+(ns face-liveness.core
+  "Challenge issuance + response scoring. Pure functions over already-
+   tracked landmark frames (face-liveness.model/frame) -- no image data,
+   no camera, no clock read internally (now-ms is always a param, matching
+   watchlist.model/stale?'s and ekyc's own 'caller controls the clock'
+   convention).
+
+   Detection is a clean boolean pattern match per challenge type (a dip-
+   then-recover EAR curve for :blink, a below-then-above MAR transition for
+   :smile, a centered-then-committed yaw-proxy transition for :turn-left/
+   :turn-right) -- confidence is reported as 1.0/0.0, not a fabricated
+   fractional score with no real statistical basis behind it.
+
+   KNOWN CALIBRATION RISK (do not remove): face-liveness.geometry/yaw-proxy
+   documents its own sign convention (positive = nose toward image-left),
+   but whether that corresponds to the SUBJECT'S left or right depends on
+   camera mirroring in the capture pipeline (a front-facing/selfie camera
+   is very commonly mirrored). This ns's :turn-left/:turn-right mapping
+   below is ONE choice, not a verified-correct one -- a real integration
+   must confirm this against its actual capture setup before relying on
+   it, not assume this repo got the mirroring right."
+  (:require [face-liveness.geometry :as geo]
+            [face-liveness.model :as model]))
+
+(defn issue-challenge [id type opts] (model/challenge id type opts))
+
+;; --- per-type detection -----------------------------------------------
+
+(defn- ear-series [frames eye-key]
+  (vec (keep (fn [f] (some-> (get-in f [:frame/landmarks eye-key]) geo/eye-aspect-ratio)) frames)))
+
+(defn- dip-then-recover?
+  "At least one value below `low`, with a value >= `high` observed BOTH
+   before and after that dip -- a real transition, not noise at either end
+   of the sequence."
+  [values low high]
+  (let [n (count values)]
+    (boolean
+     (some (fn [i]
+             (and (< (nth values i) low)
+                  (some #(>= % high) (subvec values 0 i))
+                  (some #(>= % high) (subvec values (inc i) n))))
+           (range n)))))
+
+(defn- score-blink [challenge frames]
+  (let [{:keys [ear-closed ear-open]} (:challenge/thresholds challenge)
+        left (ear-series frames :left-eye)
+        right (ear-series frames :right-eye)
+        left? (and (seq left) (dip-then-recover? left ear-closed ear-open))
+        right? (and (seq right) (dip-then-recover? right ear-closed ear-open))]
+    {:detected? (boolean (or left? right?))
+     :evidence {:left-samples (count left) :right-samples (count right)
+                :left-detected? left? :right-detected? right?}}))
+
+(defn- score-smile [challenge frames]
+  (let [{:keys [mar-smile]} (:challenge/thresholds challenge)
+        mar (vec (keep (fn [f] (some-> (get-in f [:frame/landmarks :mouth]) geo/mouth-aspect-ratio)) frames))
+        started-below? (and (seq mar) (< (first mar) mar-smile))
+        rose-above? (boolean (some #(>= % mar-smile) mar))]
+    {:detected? (boolean (and started-below? rose-above?))
+     :evidence {:samples (count mar) :max-mar (when (seq mar) (apply max mar))}}))
+
+(defn- score-turn [challenge frames direction]
+  (let [{:keys [yaw-asymmetry]} (:challenge/thresholds challenge)
+        yaws (vec (keep #(geo/yaw-proxy (:frame/landmarks %)) frames))
+        started-centered? (and (seq yaws) (< (Math/abs (double (first yaws))) yaw-asymmetry))
+        committed? (boolean (some (case direction
+                                     :turn-left #(> % yaw-asymmetry)
+                                     :turn-right #(< % (- yaw-asymmetry)))
+                                   yaws))]
+    {:detected? (boolean (and started-centered? committed?))
+     :evidence {:samples (count yaws)
+                :max-abs-yaw (when (seq yaws) (apply max (map #(Math/abs (double %)) yaws)))}}))
+
+(defn score-response
+  "Score `frames` (a seq of face-liveness.model/frame maps, in capture
+   order) against `challenge`. Always returns a face-liveness.model/result
+   -- an expired challenge or an empty frame sequence are their own
+   distinct :expired/:failed outcomes, never silently treated the same as
+   'attempted and failed the motion check'."
+  [challenge frames now-ms]
+  (cond
+    (model/expired? challenge now-ms)
+    (model/result challenge :expired {:confidence 0.0 :evidence {:reason :expired} :scored-at now-ms})
+
+    (empty? frames)
+    (model/result challenge :failed {:confidence 0.0 :evidence {:reason :no-frames} :scored-at now-ms})
+
+    :else
+    (let [{:keys [detected? evidence]}
+          (case (:challenge/type challenge)
+            :blink (score-blink challenge frames)
+            :smile (score-smile challenge frames)
+            :turn-left (score-turn challenge frames :turn-left)
+            :turn-right (score-turn challenge frames :turn-right))]
+      (model/result challenge (if detected? :verified :failed)
+                     {:confidence (if detected? 1.0 0.0) :evidence evidence :scored-at now-ms}))))

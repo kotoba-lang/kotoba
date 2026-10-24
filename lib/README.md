@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.faceLiveness` | `kotoba.faceLiveness/src` | `face-liveness.core`, `face-liveness.datom`, `face-liveness.geometry`, `face-liveness.model` (Kotoba project library) |
 | `kotoba.eduBerkeleySpice` | `kotoba.eduBerkeleySpice/src` | `spice`, `spice.analysis`, `spice.circuit`, `spice.model` (Kotoba project library) |
 | `kotoba.editor` | `kotoba.editor/src` | `editor.core` (Kotoba project library) |
 | `kotoba.phone` | `kotoba.phone/src` | `kotoba.phone`, `kotoba.phone.export`, `kotoba.phone.lifecycle`, `kotoba.phone.numbering` (Kotoba project library) |
