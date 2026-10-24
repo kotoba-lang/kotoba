@@ -1,0 +1,143 @@
+(ns search.validate-kotoba-parity-test
+  "Parity between `search.validate` (.cljc) and `search.validate.kotoba`.
+
+  The same document indexes are driven through both sides: the Clojure
+  namespace is called directly, the Kotoba side is compiled with the repo's
+  own `:kotoba` alias (js-browser target) and executed by node. Both sides
+  must return the identical problem sequence — severity, code, id, message,
+  and order: every id-key mismatch first, then every missing title — and the
+  identical `valid?` verdict.
+
+  The structural delta the guest documents in its header is honored here:
+  the guest index carries `:search/docs` as a vector of entry documents
+  (map key + doc) instead of a map, because the guest has no map-entry
+  iteration. The guest entries are built from the same case table the
+  Clojure index is built from, in the same order."
+  (:require [kotoba.io :as kio] [kotoba.process :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [search.validate :as validate]))
+
+(def ^:private repo-dir (System/getProperty "user.dir"))
+
+(def ^:private kotoba-path
+  (str repo-dir "/src/search/validate.kotoba"))
+
+(def ^:private artifact
+  (str repo-dir "/target/kotoba-validate-parity/validate.mjs"))
+
+(def ^:private runner
+  (str repo-dir "/target/kotoba-validate-parity/run.mjs"))
+
+;; One case table, both sides. `:id nil` means the doc carries no
+;; `:search/id` key at all; `:title nil` means no `:search/title`.
+(def ^:private cases
+  [{:name "clean-index"
+    :docs [{:key :a :id :a :title "Alpha"}
+           {:key :b :id :b :title "Beta"}]}
+   {:name "mismatch-then-missing-title"
+    :docs [{:key :a :id :a :title "A"}
+           {:key :b :id :a :title nil}
+           {:key :c :id nil :title "C"}]}
+   {:name "empty-title"
+    :docs [{:key :a :id :a :title ""}]}
+   {:name "warning-only-valid"
+    :docs [{:key :a :id :a :title nil}]}])
+
+(defn- clj-index [docs]
+  {:search/docs
+   (into {}
+         (map (fn [{:keys [key id title]}]
+                [key (cond-> {:search/id id}
+                       title (assoc :search/title title))]))
+         docs)})
+
+;; --- guest (compiled Kotoba, driven by node) -------------------------------
+
+(defn- guest-doc [{:keys [id title]}]
+  (str "['map', ["
+       (str/join ","
+                 (cond-> []
+                   id (conj (str "[':search/id', kw(':" (name id) "')]"))
+                   true (conj (str "[':search/title', ['string', '"
+                                   (or title "") "']]"))))
+       "]]"))
+
+(defn- guest-entry [{:keys [key] :as doc}]
+  (str "['map', [[':search/entry-doc', " (guest-doc doc)
+       "], [':search/entry-key', kw(':" (name key) "')]]]"))
+
+(defn- guest-index [c]
+  (let [docs (:docs c)]
+    (str "['map', [[':search/docs', ['vector', ["
+         (str/join "," (map guest-entry docs)) "]]]]]")))
+
+(defn- guest-runner-source []
+  (str "import { pathToFileURL } from 'node:url';\n"
+       "const { instantiateKotoba } = await import(pathToFileURL('" artifact "'));\n"
+       "const m = instantiateKotoba();\n"
+       "const kw = s => ['keyword', s];\n"
+       (str/join "\n"
+                 (map (fn [{:keys [name] :as c}]
+                        (let [var (str/replace name "-" "_")
+                              idx (str "const " var " = " (guest-index c) ";")]
+                          (str idx "\n"
+                               "for (const p of m.problems(" var ")[1])\n"
+                               "  console.log('" name " problem ' + p[1].map(e => e[1][1].replace(/^:/, '')).join(' '));\n"
+                               "console.log('" name " valid ' + m['valid?'](" var "));")))
+                      cases))))
+
+(defn- compile-and-run-guest []
+  (kio/mkdirs (kio/file (kio/parent (kio/file artifact))))
+  (let [{:keys [exit err out]}
+        (shell/sh "kbb" "-M:kotoba" "compile" kotoba-path
+                  "--target" "js-browser" "--output" artifact :dir repo-dir)]
+    (when-not (zero? exit)
+      (throw (ex-info "guest compile failed" {:exit exit :err err :out out}))))
+  (spit runner (guest-runner-source))
+  (let [{:keys [exit out err]} (shell/sh "node" runner :dir repo-dir)]
+    (when-not (zero? exit)
+      (throw (ex-info "guest run failed" {:exit exit :err err})))
+    out))
+
+(defn- guest-results [out]
+  (reduce (fn [acc line]
+            (let [[case kind & rest] (str/split line #" ")
+                  v (vec rest)]
+              (cond
+                (= kind "problem") (update-in acc [case :problems]
+                                              (fnil conj []) v)
+                (= kind "valid") (assoc-in acc [case :valid] (peek v))
+                :else acc)))
+          {}
+          (remove str/blank? (str/split-lines out))))
+
+;; --- host (the .cljc under test) -------------------------------------------
+
+(defn- clj-problems [c]
+  (mapv (fn [p]
+          [(subs (str (:search/severity p)) 1)
+           (subs (str (:search/code p)) 1)
+           (subs (str (:search/id p)) 1)
+           (:search/msg p)])
+        (validate/problems (clj-index (:docs c)))))
+
+(defn- clj-valid [c]
+  (str (validate/valid? (clj-index (:docs c)))))
+
+(deftest ^:parity guest-matches-clojure-on-every-case
+  ;; Named so the suite output carries the parity-test namespace.
+  (println "search.validate-kotoba-parity-test running")
+  (let [guest (guest-results (compile-and-run-guest))]
+    (doseq [c cases]
+      (testing (:name c)
+        (let [gp (mapv (fn [v]
+                         ;; guest prints map entries in canonical order:
+                         ;; code, id, message words, severity last.
+                         [(last v) (nth v 0) (nth v 1)
+                          (str/join " " (drop 2 (butlast v)))])
+                       (get-in guest [(:name c) :problems] []))]
+          (is (= (clj-problems c) gp)
+              "guest problem sequence differs from the .cljc")
+        (is (= (clj-valid c) (get-in guest [(:name c) :valid]))
+            "guest valid? differs from the .cljc"))))))
