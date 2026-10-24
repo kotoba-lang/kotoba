@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.wici` | `kotoba.wici/src` | `wici.device`, `wici.place`, `wici.protocol`, `wici.remote` (Kotoba project library) |
 | `kotoba.webrtc` | `kotoba.webrtc/src` | `kotoba.webrtc`, `kotoba.webrtc.export`, `kotoba.webrtc.room`, `kotoba.webrtc.session` (Kotoba project library) |
 | `kotoba.webModelb` | `kotoba.webModelb/src` | `kotoba.web-modelb`, `kotoba.web-modelb.config` (Kotoba project library) |
 | `kotoba.voxel` | `kotoba.voxel/src` | `voxel`, `voxel.nvdb`, `voxel.vdb`, `voxel.vdb-file` (Kotoba project library) |
