@@ -1,0 +1,199 @@
+;; x25519.core -- RFC 7748 X25519 as a pure Kotoba guest
+;; (oracle: src/x25519/core.cljk).
+;;
+;; The Montgomery ladder is product semantics: which scalar bits drive a swap,
+;; when x2/z2 and x3/z3 double or differential-add, and what a clamped scalar
+;; means. The guest owns all of it. Bytes arrive and leave as :vector-i64.
+;;
+;; ## Why :vector-i64 rather than :document
+;;
+;; See kotoba/x25519/field.kotoba's header: the native backend admits no typed
+;; document constructor, and a document vector has no fixed length, so a write
+;; past its end silently changes it. This module changed with the field on
+;; 2026-09-08.
+;;
+;; The rewrite also fixed three defects the previous revision had, none of
+;; which anything could have seen, because it had no entry to run and was
+;; never executed:
+;;
+;;   - the ladder took its bits from `x1`, the u-coordinate FIELD ELEMENT,
+;;     where RFC 7748 takes them from the clamped scalar's bytes
+;;   - `final-x` inverted `z3`, the unswapped third lane, where the oracle
+;;     inverts z2 AFTER the final conditional swap
+;;   - `f/swap` returned both halves as one pair and every caller used the
+;;     pair as if it were a field element
+;;
+;; ## State
+;;
+;; The oracle threads (x2 z2 x3 z3 swap) as loop bindings. A guest function
+;; takes at most five parameters (measured), and a :vector-i64 does not nest,
+;; so the four field elements travel as one flat 65-lane vector: lanes 0-15
+;; are x2, 16-31 z2, 32-47 x3, 48-63 z3, and lane 64 is the swap bit.
+;;
+;; ## Not constant-time -- see the field module's header.
+;;
+;; ## What is executed here
+;;
+;; `main` runs RFC 7748 section 5.2's first X25519 test vector and returns the
+;; NUMBER of output bytes that disagree with it, plus the number of clamped
+;; scalar bytes that disagree. Zero on wasm32.
+;;
+;; A native artifact is a different matter and the reason is measured, not
+;; assumed: every write to an immutable vector mints a new one, and amu's
+;; kexe_loader bounds the vector arena (KEXE_VECTOR_CAPACITY 4096,
+;; KEXE_VECTOR_ITEM_CAPACITY 65536). One ladder step is on the order of a
+;; thousand vectors and the ladder runs 255 of them, so this module is two
+;; orders of magnitude over that ceiling. The field module underneath it does
+;; run natively; this one cannot until that bound is a decision someone has
+;; made (amu's tools/kexe_loader.c says so where the bound is written).
+
+(ns x25519.core
+  (:require [x25519.field :as f])
+  (:export [clamp x25519-bytes public-key contributory? main]))
+
+;; --- clamp (RFC 7748 section 5, decodeScalar25519) ---------------------------
+;; Clearing the low three bits makes the scalar a cofactor multiple; bit 254
+;; set and bit 255 clear fix the ladder's length.
+
+(defn clamp [k :vector-i64] :vector-i64
+  (vector-assoc (vector-assoc k 0 (bit-and (vector-at k 0) 248))
+                31 (bit-or (bit-and (vector-at k 31) 127) 64)))
+
+;; --- ladder state -----------------------------------------------------------
+
+(defn- lane-loop [st :vector-i64 base :i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (lane-loop st base (vector-assoc acc i (vector-at st (+ base i))) (+ i 1))))
+
+(defn- lane [st :vector-i64 base :i64] :vector-i64
+  (lane-loop st base (vector-alloc 16) 0))
+
+(defn- put-lane [st :vector-i64 base :i64 v :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    st
+    (put-lane (vector-assoc st (+ base i) (vector-at v i)) base v (+ i 1))))
+
+;; --- scalar bits ------------------------------------------------------------
+;; bit (t mod 8) of byte (t div 8). i64 shift counts must be integer literals
+;; (measured), so the variable shift is a case tree over the eight positions.
+
+(defn- byte-shift [byte :i64 pos :i64] :i64
+  (if (= pos 0) (i64-shift-right byte 0)
+      (if (= pos 1) (i64-shift-right byte 1)
+          (if (= pos 2) (i64-shift-right byte 2)
+              (if (= pos 3) (i64-shift-right byte 3)
+                  (if (= pos 4) (i64-shift-right byte 4)
+                      (if (= pos 5) (i64-shift-right byte 5)
+                          (if (= pos 6) (i64-shift-right byte 6)
+                              (i64-shift-right byte 7)))))))))
+
+(defn- rem-8 [x :i64] :i64
+  (- x (* 8 (quot x 8))))
+
+(defn- scalar-bit [k :vector-i64 t :i64] :i64
+  (bit-and (byte-shift (vector-at k (quot t 8)) (rem-8 t)) 1))
+
+;; the ladder constant: 121665 = (a - 2) / 4 for a = 486662
+(defn- a24 [] :vector-i64
+  (vector-assoc (vector-alloc 16) 0 121665))
+
+;; --- the ladder (RFC 7748 section 5, transcribed) ---------------------------
+
+(defn- ladder-step [st :vector-i64 x1 :vector-i64 k :vector-i64 t :i64] :vector-i64
+  (let [kt (scalar-bit k t)
+        sw (bit-xor (vector-at st 64) kt)
+        x2 (lane st 0)
+        z2 (lane st 16)
+        x3 (lane st 32)
+        z3 (lane st 48)
+        x2s (f/swap-p x2 x3 sw)
+        x3s (f/swap-q x2 x3 sw)
+        z2s (f/swap-p z2 z3 sw)
+        z3s (f/swap-q z2 z3 sw)
+        a (f/add x2s z2s)
+        aa (f/square a)
+        b (f/sub x2s z2s)
+        bb (f/square b)
+        e (f/sub aa bb)
+        c (f/add x3s z3s)
+        d (f/sub x3s z3s)
+        da (f/mul d a)
+        cb (f/mul c b)
+        x3n (f/square (f/add da cb))
+        z3n (f/mul x1 (f/square (f/sub da cb)))
+        x2n (f/mul aa bb)
+        z2n (f/mul e (f/add aa (f/mul (a24) e)))]
+    (vector-assoc
+     (put-lane (put-lane (put-lane (put-lane st 0 x2n 0) 16 z2n 0) 32 x3n 0) 48 z3n 0)
+     64 kt)))
+
+(defn- ladder-loop [st :vector-i64 x1 :vector-i64 k :vector-i64 t :i64] :vector-i64
+  (if (< t 0)
+    st
+    (ladder-loop (ladder-step st x1 k t) x1 k (- t 1))))
+
+;; The oracle swaps one last time on the final bit and then divides: the x2
+;; and z2 that come out of THAT swap are the answer's numerator and
+;; denominator. Inverting the unswapped lane is the defect this replaced.
+(defn- final-x [st :vector-i64] :vector-i64
+  (let [sw (vector-at st 64)
+        x2 (f/swap-p (lane st 0) (lane st 32) sw)
+        z2 (f/swap-p (lane st 16) (lane st 48) sw)]
+    (f/mul x2 (f/invert z2))))
+
+;; --- entry points -----------------------------------------------------------
+
+(defn x25519-bytes [scalar :vector-i64 u :vector-i64] :vector-i64
+  (let [k (clamp scalar)
+        x1 (f/unpack u)
+        st0 (vector-assoc (put-lane (put-lane (put-lane (put-lane (vector-alloc 65)
+                                                                  0 (f/one) 0)
+                                                        16 (f/zero) 0)
+                                              32 (f/copy x1) 0)
+                                    48 (f/one) 0)
+                          64 0)]
+    (f/pack (final-x (ladder-loop st0 x1 k 254)))))
+
+(defn- base-point [] :vector-i64
+  (vector-assoc (vector-alloc 32) 0 9))
+
+(defn public-key [scalar :vector-i64] :vector-i64
+  (x25519-bytes scalar (base-point)))
+
+;; RFC 7748 section 6.1: an all-zero shared secret means the peer sent a
+;; low-order point, and the exchange contributed nothing.
+(defn- zero-loop [shared :vector-i64 i :i64] :bool
+  (if (>= i 32)
+    true
+    (if (= (vector-at shared i) 0)
+      (zero-loop shared (+ i 1))
+      false)))
+
+(defn contributory? [shared :vector-i64] :bool
+  (if (zero-loop shared 0) false true))
+
+;; --- self-check -------------------------------------------------------------
+;; RFC 7748 section 5.2, the first X25519 test vector.
+
+(defn- rfc-scalar [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 165) 1 70) 2 227) 3 107) 4 240) 5 82) 6 124) 7 157) 8 59) 9 22) 10 21) 11 75) 12 130) 13 70) 14 94) 15 221) 16 98) 17 20) 18 76) 19 10) 20 193) 21 252) 22 90) 23 24) 24 80) 25 106) 26 34) 27 68) 28 186) 29 68) 30 154) 31 196))
+
+(defn- rfc-u [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 230) 1 219) 2 104) 3 103) 4 88) 5 48) 6 48) 7 219) 8 53) 9 148) 10 193) 11 164) 12 36) 13 177) 14 95) 15 124) 16 114) 17 102) 18 36) 19 236) 20 38) 21 179) 22 53) 23 59) 24 16) 25 169) 26 3) 27 166) 28 208) 29 171) 30 28) 31 76))
+
+(defn- rfc-out [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 195) 1 218) 2 85) 3 55) 4 157) 5 233) 6 198) 7 144) 8 142) 9 148) 10 234) 11 77) 12 242) 13 141) 14 8) 15 79) 16 50) 17 236) 18 207) 19 3) 20 73) 21 28) 22 113) 23 247) 24 84) 25 180) 26 7) 27 85) 28 119) 29 162) 30 133) 31 82))
+
+(defn- rfc-clamped [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 160) 1 70) 2 227) 3 107) 4 240) 5 82) 6 124) 7 157) 8 59) 9 22) 10 21) 11 75) 12 130) 13 70) 14 94) 15 221) 16 98) 17 20) 18 76) 19 10) 20 193) 21 252) 22 90) 23 24) 24 80) 25 106) 26 34) 27 68) 28 186) 29 68) 30 154) 31 68))
+
+(defn- diff [got :vector-i64 want :vector-i64 i :i64 acc :i64] :i64
+  (if (>= i 32)
+    acc
+    (diff got want (+ i 1)
+          (if (= (vector-at got i) (vector-at want i)) acc (+ acc 1)))))
+
+(defn main [] :i64
+  (+ (diff (clamp (rfc-scalar)) (rfc-clamped) 0 0)
+     (diff (x25519-bytes (rfc-scalar) (rfc-u)) (rfc-out) 0 0)))
