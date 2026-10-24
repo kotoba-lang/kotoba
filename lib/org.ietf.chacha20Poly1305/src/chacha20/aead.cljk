@@ -1,0 +1,134 @@
+(ns chacha20.aead
+  "[RFC 8439](https://www.rfc-editor.org/rfc/rfc8439) §2.8
+  AEAD_CHACHA20_POLY1305, in portable `.cljc`, with no dependencies.
+
+  Written because `kotoba-lang/noise` reaches this cipher through
+  `provider/{jvm.clj, noble.cljs, node.cljs}` — the AEAD is host-injected
+  there, not implemented — and because HPKE (RFC 9180) needs one AEAD it can
+  actually run. The workspace's dependency ledger recorded ChaCha20-Poly1305
+  as available; that was a call site, not an implementation, and this closes
+  the difference.
+
+  ## Use
+
+      (seal key nonce aad plaintext)   ; -> ciphertext || 16-byte tag
+      (open key nonce aad sealed)      ; -> plaintext, or an :error
+
+  `key` is 32 bytes, `nonce` 12. Bytes are `Sequential` collections of ints
+  in 0..255.
+
+  ## Three rules the format depends on
+
+  **The nonce must never repeat under one key.** ChaCha20 is a stream cipher:
+  two messages under the same key and nonce expose their exclusive-or, and
+  the Poly1305 one-time key is derived from the same pair, so a repeat also
+  reveals `r` and forgery becomes arithmetic rather than search. Nothing here
+  can check this — it is a property of the caller's counter.
+
+  **`open` compares the whole tag before returning anything.** A partial
+  comparison that stopped at the first differing byte would leak the position
+  of the mismatch; more importantly, returning plaintext alongside a tag
+  failure at all is how unauthenticated data reaches an application.
+
+  **This is not constant-time.** The tag comparison reduces over all sixteen
+  bytes rather than short-circuiting, which is the shape a constant-time
+  comparison needs, but timing is a property of machine code and no portable
+  Clojure can promise what two JITs emit."
+  (:require [kotoba.bytes :as kbytes] [chacha20.core :as c]
+            [chacha20.poly1305 :as poly]
+            [chacha20.word :as w]))
+
+(def key-bytes 32)
+(def nonce-bytes 12)
+(def tag-bytes 16)
+
+(defn- otk
+  "RFC 8439 §2.6: the Poly1305 one-time key is the first 32 bytes of the
+  ChaCha20 keystream at **counter 0**, while the payload uses counter 1. The
+  counter split is what keeps the two from overlapping."
+  [key nonce]
+  (vec (take 32 (c/block key 0 nonce))))
+
+(defn- pad16 [n] (if (zero? (rem n 16)) [] (repeat (- 16 (rem n 16)) 0)))
+
+(defn- mac-input
+  "RFC 8439 §2.8: aad, padding to 16, ciphertext, padding to 16, then the two
+  lengths as 64-bit little-endian.
+
+  The lengths are the part that stops a byte moving from the aad into the
+  ciphertext without changing the tag."
+  [aad ct]
+  (vec (concat aad (pad16 (count aad))
+               ct (pad16 (count ct))
+               (w/le64 (count aad)) (w/le64 (count ct)))))
+
+(defn- check-params [key nonce]
+  (cond
+    (not= key-bytes (count key)) {:status :error :reason :bad-key-length :length (count key)}
+    (not= nonce-bytes (count nonce)) {:status :error :reason :bad-nonce-length :length (count nonce)}
+    :else nil))
+
+(defn seal
+  "Encrypt and authenticate. Returns `{:status :ok :bytes (ciphertext ++ tag)}`.
+
+  The tag is appended rather than returned separately, because a caller who
+  has to carry two values will eventually carry only one."
+  [key nonce aad plaintext]
+  (let [key (vec key) nonce (vec nonce) aad (vec aad) pt (vec plaintext)]
+    (or (check-params key nonce)
+        (let [ct (c/encrypt! key 1 nonce pt)
+              tag (poly/mac! (otk key nonce) (mac-input aad ct))]
+          {:status :ok :bytes (into ct tag) :ciphertext ct :tag tag}))))
+
+(defn open
+  "Verify and decrypt. Returns `{:status :ok :bytes plaintext}` or
+  `{:status :error :reason :authentication-failed}`.
+
+  **No plaintext is returned on failure**, not even partially. A caller that
+  receives `:error` has nothing to be tempted by."
+  [key nonce aad sealed]
+  (let [key (vec key) nonce (vec nonce) aad (vec aad) sealed (vec sealed)]
+    (or (check-params key nonce)
+        (if (< (count sealed) tag-bytes)
+          {:status :error :reason :too-short-for-a-tag :length (count sealed)}
+          (let [split (- (count sealed) tag-bytes)
+                ct (subvec sealed 0 split)
+                got (subvec sealed split)
+                want (poly/mac! (otk key nonce) (mac-input aad ct))]
+            ;; Reduce over all sixteen bytes rather than stopping at the first
+            ;; difference. See this namespace's docstring about what that does
+            ;; and does not promise.
+            (if (zero? (reduce bit-or 0 (map bit-xor got want)))
+              {:status :ok :bytes (c/encrypt! key 1 nonce ct)}
+              {:status :error :reason :authentication-failed}))))))
+
+(defn seal!
+  [key nonce aad plaintext]
+  (let [r (seal key nonce aad plaintext)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "aead: " (name (:reason r))) r)))))
+
+(defn open!
+  [key nonce aad sealed]
+  (let [r (open key nonce aad sealed)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "aead: " (name (:reason r))) r)))))
+
+(defn hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(defn unhex [s]
+  (mapv (fn [p] #?(:clj (Integer/parseInt (apply str p) 16)
+                   :cljs (js/parseInt (apply str p) 16)))
+        (partition 2 s)))
+
+(defn utf8
+  "A string as UTF-8 bytes. Present so callers do not reach for `(map int s)`,
+  which gives code points on the JVM and a vector of zeros under
+  ClojureScript."
+  [s]
+  #?(:clj (mapv #(bit-and % 0xFF) (kbytes/utf8-bytes ^String s))
+     :cljs (vec (array-seq (.encode (js/TextEncoder.) s)))))
