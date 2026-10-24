@@ -1,0 +1,93 @@
+(ns kotoba.lang.mst-projector.mem-index
+  "Reference `IIndex` implementation for `kotoba.lang.mst-projector.indexer`:
+  an in-memory atom-backed store, with OPTIONAL EDN-file persistence for
+  durability across restarts.
+
+  Why not LanceDB (or any other real embedded DB)? Per this repo's README
+  and the session's substrate policy: LanceDB has no real JVM/Clojure
+  story, and this ecosystem is deliberately wary of bolting a specific
+  centralized DB dependency onto a `kotoba-lang` library -- the whole point
+  of `IIndex` (mirroring `kotoba.lang.ipfs/IHttp`) is that the pure core
+  never commits to one. This reference implementation stays in the
+  'minimal deps, pure/portable' spirit this session's sibling ports
+  established: zero extra dependencies beyond Clojure core + `clojure.edn`
+  (already transitively available), an atom, and (optionally) a flat file.
+
+  Storage model: a single atom holds `{collection-name(String) ->
+  [row-map ...]}` (rows in insertion order; see `IIndex/-upsert!`'s
+  replace-moves-to-end contract). This is adequate for the projector's own
+  workload (test/dev-scale record counts; production-scale deployments
+  should write a heavier `IIndex` backend, e.g. an actual embedded/columnar
+  store, when that's justified -- the protocol itself does not change).
+
+  Persistence: when constructed with `:persist-path`, the ENTIRE atom
+  contents are re-serialised (via `pr-str`) to that file after every
+  mutating call and read back (via `clojure.edn/read-string`) at
+  construction time. This is a full-rewrite-per-write strategy -- simple
+  and correct, but O(total data size) per write, so it is a reference/
+  small-scale durability option, not a production write path. Values are
+  restricted to plain EDN (rows only ever contain String/number/boolean/
+  nil per `flatten-record`'s contract), so no custom EDN reader is needed
+  and `read-string` is always safe here (no `#`-tagged literals ever
+  written)."
+  (:require [kotoba.io :as kio] [kotoba.lang.edn :as edn]
+            [kotoba.lang.mst-projector.indexer :as indexer]))
+
+(defn- remove-key
+  [rows did rkey]
+  (vec (remove #(and (= did (get % "did")) (= rkey (get % "rkey"))) rows)))
+
+(defn- filter-rows
+  [rows filter-map]
+  (if (nil? filter-map)
+    rows
+    (let [{:keys [field value]} filter-map]
+      (filter #(= (str value) (str (get % field))) rows))))
+
+(defn- load-edn
+  [persist-path]
+  (when (and persist-path (kio/exists? (kio/file ^String persist-path)))
+    ;; `{:eof nil}`: a persist file that exists but is empty is a normal state
+    ;; (created, not yet written). clojure.edn/read-string answered nil for it;
+    ;; kotoba.lang.edn refuses empty input unless :eof says what to answer, so
+    ;; the intent that used to be implicit is now written down.
+    (edn/read-string {:eof nil} (slurp persist-path))))
+
+(defn- persist!
+  [new-state persist-path]
+  (when persist-path
+    (spit persist-path (pr-str new-state)))
+  new-state)
+
+(defrecord MemIndex [state persist-path]
+  indexer/IIndex
+  (-upsert! [_ collection row]
+    (persist!
+      (swap! state update collection
+             (fn [rows] (conj (remove-key (or rows []) (get row "did") (get row "rkey")) row)))
+      persist-path)
+    nil)
+  (-delete! [_ collection did rkey]
+    (when (contains? @state collection)
+      (persist! (swap! state update collection remove-key did rkey) persist-path))
+    nil)
+  (-query [_ collection filter-map limit]
+    (vec (take limit (filter-rows (get @state collection []) filter-map))))
+  (-count-rows [_ collection]
+    (count (get @state collection [])))
+  (-list-collections [_]
+    (vec (keys @state)))
+  (-describe [_]
+    (if persist-path
+      (str "in-memory (persisted: " persist-path ")")
+      "in-memory")))
+
+(defn make-mem-index
+  "Construct a reference `IIndex`. `opts` (all optional):
+    :persist-path -- a file path; if given, existing state is loaded from
+                     it (if present) and every mutation re-persists the
+                     full state to it. Omit for a pure in-memory index
+                     (e.g. tests)."
+  ([] (make-mem-index {}))
+  ([{:keys [persist-path]}]
+   (->MemIndex (atom (or (load-edn persist-path) {})) persist-path)))

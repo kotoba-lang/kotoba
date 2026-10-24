@@ -1,0 +1,153 @@
+(ns optimal-transport.mesh-morph
+  "The actual feature: turn two vertex-position arrays (possibly with
+  DIFFERENT vertex counts and no shared topology/index correspondence) into
+  a glTF-morph-target-shaped `{:name :deltas}` map, using the entropic-OT
+  transport plan from `optimal-transport.sinkhorn` to find a per-source-
+  vertex matched target position -- the 'barycentric projection of the
+  transport map' (Peyre & Cuturi, 'Computational Optimal Transport',
+  Section 4 -- disintegrating a transport plan into a transport map by
+  taking, for each source point, the mass-weighted average of everywhere
+  its mass is sent).
+
+  Why not naive index-aligned linear blend shapes: the standard glTF/VRM
+  morph-target convention (also `character.blendshape`'s own hand-authored
+  targets, `orgs/kotoba-lang/character/src/character/blendshape.cljc`)
+  assumes `verts-a[i]` and `verts-b[i]` are THE SAME logical vertex on two
+  topologically-identical meshes (shared index buffer), so a morph target
+  is just `verts-b[i] - verts-a[i]` per index. That assumption breaks the
+  moment the two meshes have different vertex counts or vertex ordering
+  (different mesh generator, different LOD, different asset pipeline, a
+  scan vs. a procedural mesh, ...) -- there is no `i`-to-`i` correspondence
+  to subtract. Optimal transport sidesteps this: it finds the cheapest way
+  (under squared-Euclidean cost by default) to move all of `verts-a`'s mass
+  onto `verts-b`'s mass, and `mesh-morph` turns that many-to-many transport
+  plan into a well-defined per-source-vertex target via the barycentric
+  projection below -- `verts-a` and `verts-b` need NOT have the same length
+  or index order. This is the concrete advantage OT buys over plain
+  lerp-blend-shapes, and the actual reason to reach for this namespace
+  instead of a one-line vector subtraction.
+
+  Barycentric projection: for each source vertex `i`, the OT plan
+  `P[i][j]` gives the fraction of vertex `i`'s mass matched to target
+  vertex `j`. `matched_i = sum_j (P[i][j] / mu_i) * verts-b[j]` -- the
+  mass-weighted average of every target point vertex `i` sends mass to.
+  This reduces to a single point (`= verts-b[i]`, exactly) when `plan`
+  happens to be a permutation matrix, and degrades gracefully to a genuine
+  average when it isn't (large `epsilon`, `n != m`, ambiguous
+  correspondences).
+
+  Output shape matches `character.blendshape`'s per-target map exactly
+  (`{:name ... :deltas [[dx dy dz] ...]}`, the same shape
+  `character.blendshape/generate-arkit-targets` returns per element) so
+  `morph-target`'s return value slots directly into
+  `character-creator.gpu-adapter`
+  (`orgs/kotoba-lang/kami-app-character-creator/src/character_creator/
+  gpu_adapter.cljc`) and from there into `kami.webgpu.mesh`'s
+  `:morph-target-deltas` (`orgs/kotoba-lang/webgpu/src/kami/webgpu/
+  mesh.cljs`) -- no adapter code needed.
+
+  Performance: this runs Sinkhorn (O(n*m) per iteration, see
+  `optimal-transport.sinkhorn`'s docstring) -- OFFLINE/AUTHOR-TIME use
+  only (precompute a mesh pair's morph target once, bake the resulting
+  `:deltas` into the static asset `kami.webgpu.mesh/draw!` blends at draw
+  time via a scalar `morph-weights` entry), never per-frame.
+
+  First-class runtime is ClojureScript per this org's 2026-07-10 runtime-
+  priority policy; tested here via `kbb -M:test` for CI convenience
+  like every sibling `.cljc` repo."
+  (:require [optimal-transport.sinkhorn :as sinkhorn]))
+
+;; -- tiny inline vec3 helpers (dependency-free -- see README; every
+;; sibling repo in this org vendors its own handful of vec3 helpers rather
+;; than share one, so this follows the same convention). --
+
+(defn- vec3+ [[ax ay az] [bx by bz]] [(+ ax bx) (+ ay by) (+ az bz)])
+(defn- vec3- [[ax ay az] [bx by bz]] [(- ax bx) (- ay by) (- az bz)])
+(defn- vec3-scale [[x y z] s] [(* x s) (* y s) (* z s)])
+
+(defn squared-euclidean-distance
+  "Default `cost-fn`: squared Euclidean distance between two `[x y z]`
+  points. Squared (not plain Euclidean) distance is the standard OT cost
+  for point-cloud/mesh matching -- it is what makes the resulting transport
+  plan a Wasserstein-2 coupling, and avoids a `sqrt` per cost-matrix
+  entry."
+  [[ax ay az] [bx by bz]]
+  (+ (* (- ax bx) (- ax bx)) (* (- ay by) (- ay by)) (* (- az bz) (- az bz))))
+
+(defn- build-cost-matrix [verts-a verts-b cost-fn]
+  (mapv (fn [a] (mapv (fn [b] (cost-fn a b)) verts-b)) verts-a))
+
+(defn uniform-mass
+  "`n` equal-mass point weights (each `1/n`), summing to `1.0` -- the
+  default `mu`/`nu` `morph-target` uses when the caller doesn't supply
+  custom per-vertex weights."
+  [n]
+  (vec (repeat n (/ 1.0 n))))
+
+(defn barycentric-projection
+  "`plan` (an `n x m` transport plan whose rows sum to `mu`) + `verts-b`
+  (length `m`) + `mu` (length `n`, the SAME mass vector `plan`'s rows sum
+  to) -> length-`n` matched positions, `matched_i = sum_j (plan[i][j] /
+  mu_i) * verts-b[j]`. Public because it's independently useful (e.g. to
+  project any transport plan onto matched positions without going through
+  `morph-target`'s delta/name wrapping)."
+  [plan verts-b mu]
+  (mapv (fn [row mu-i]
+          (if (zero? mu-i)
+            [0.0 0.0 0.0]
+            (reduce vec3+ [0.0 0.0 0.0]
+                    (map (fn [p-ij b] (vec3-scale b (/ p-ij mu-i))) row verts-b))))
+        plan mu))
+
+(defn morph-target
+  "`verts-a`/`verts-b` are `[[x y z] ...]` vertex-position arrays -- they
+  MAY have different lengths (see namespace docstring for why that's the
+  actual point of using OT here instead of index-aligned linear blend
+  shapes). Returns `{:name <name> :deltas [[dx dy dz] ...]}`, `:deltas`
+  the same length as `verts-a` (indexed by SOURCE vertex, `delta_i =
+  matched_i - verts-a[i]`) -- this is exactly `character.blendshape`'s
+  per-target map shape, ready for `kami.webgpu.mesh`'s
+  `:morph-target-deltas`.
+
+  Options (all optional):
+  - `:name` -- target name, default `\"morph-target\"`.
+  - `:cost-fn` -- `(fn [a b] cost)`, default `squared-euclidean-distance`.
+  - `:mu`/`:nu` -- custom per-vertex mass weights (length `n`/`m`), default
+    `(uniform-mass n)`/`(uniform-mass m)` (every point equally weighted).
+  - `:epsilon`/`:max-iters`/`:tol` -- forwarded to
+    `optimal-transport.sinkhorn/sinkhorn`, see its docstring for defaults
+    and meaning."
+  ([verts-a verts-b] (morph-target verts-a verts-b {}))
+  ([verts-a verts-b {:keys [name cost-fn mu nu epsilon max-iters tol]
+                      :or {name "morph-target" cost-fn squared-euclidean-distance}}]
+   (let [n (count verts-a)
+         m (count verts-b)
+         mu (or mu (uniform-mass n))
+         nu (or nu (uniform-mass m))
+         cost-matrix (build-cost-matrix verts-a verts-b cost-fn)
+         sinkhorn-opts (cond-> {}
+                         epsilon (assoc :epsilon epsilon)
+                         max-iters (assoc :max-iters max-iters)
+                         tol (assoc :tol tol))
+         plan (sinkhorn/sinkhorn cost-matrix mu nu sinkhorn-opts)
+         ;; sinkhorn normalizes mu/nu to sum to 1.0 internally -- recompute
+         ;; that SAME normalization here so dividing by mu_i below matches
+         ;; what plan's rows actually sum to (barycentric-projection's
+         ;; `plan[i][j] / mu_i` contract).
+         mu-sum (reduce + 0.0 mu)
+         mu-normalized (mapv #(/ % mu-sum) mu)
+         matched (barycentric-projection plan verts-b mu-normalized)]
+     {:name name
+      :deltas (mapv (fn [a t] (vec3- t a)) verts-a matched)})))
+
+(defn interpolate
+  "Convenience wrapper: same computation as `morph-target`, but returns
+  interpolated vertex POSITIONS directly (`[[x+t*dx y+t*dy z+t*dz] ...]`,
+  length = `(count verts-a)`) for a blend weight `t` in `[0,1]` -- for
+  callers that want positions rather than a delta/weight pair (e.g. a
+  quick CPU preview without going through `kami.webgpu.mesh`'s GPU morph
+  blend)."
+  ([verts-a verts-b t] (interpolate verts-a verts-b t {}))
+  ([verts-a verts-b t opts]
+   (let [{:keys [deltas]} (morph-target verts-a verts-b opts)]
+     (mapv (fn [a d] (vec3+ a (vec3-scale d t))) verts-a deltas))))

@@ -1,0 +1,172 @@
+(ns nuno.core
+  "布（nuno）—— 1 つの紋の網。多くの糸が交わってできる布（ADR-2610082200）。
+
+  ノードは 紋 ごとの Kademlia keyspace（`kad.key`）に並び、各 basis（多くは
+  糸の持ち主の DID）について、その basis に近い k 台が **authority** になる。
+  ノードは受け入れた op を authority に配り、authority は op を検証して保持
+  する。矛盾（同じ糸の分岐など）を見つけたノードは **warrant** を作り、知って
+  いる全ノードに 1 回だけ流す。受け取ったノードは自分でも検証し、その basis を
+  網から締め出す。
+
+  ## ここに無いもの —— 意図して
+
+  - **検証。** op が正しいか、2 つの op が矛盾するか、warrant の証拠が本物かは
+    紋 の規則で決まり、署名の検証は多くの host で非同期になる。だから判定は
+    host が行い、ここは `inspect` で『何を判定してほしいか』を返し、`settle` で
+    判定結果を受け取る。`kad.lookup` と同じく `state + 入力 → state + 出力`。
+  - **通信。** 出力は `[[宛先 op] …]` の値で、送るのは host。HTTPS でも libp2p
+    でもよい。
+  - **ハッシュ。** `sha256` は注入する（`kad.key/dht-key` と同じ）。
+
+  ## 一時制約（撤去条件つき）
+
+  ADR-2610082200 §15 は、kotoba app より下の層を pure Kotoba で書くと決めて
+  いる。この ns は `.cljk` で書いた。2026-10-13 時点で amu の実行物が置かれた
+  外付けディスクが I/O エラーを返し、`.kotoba` をコンパイルも検査もできな
+  かったため。**amu が使えるようになったら `.kotoba` に移す。** 関数は全部
+  純粋で、効果は戻り値に出しているので、移す時に形を変える必要は無い。"
+  (:require [kad.key :as key]))
+
+(def schema "nuno.v1")
+
+(def default-k
+  "1 つの basis の authority の数。ADR-2610082200 は arc と冗長度の既定値を
+  未決にしている。小さな網でも 1 台の故障で証拠が消えないよう 3 にする。"
+  3)
+
+(def op-kinds #{:head :warrant})
+
+;; ------------------------------------------------------------------ ノード
+
+(defn- dht-key [sha256 s]
+  (key/dht-key sha256 #?(:clj (.getBytes (str s) "UTF-8")
+                         :cljs (.encode (js/TextEncoder.) (str s)))))
+
+(defn node
+  "ノードを作る。`id` は自分の名前（URL でも DID でもよい、網の中で一意なら）、
+  `peers` は知っている他のノードの id、`sha256` は bytes -> 32 octets。"
+  [{:keys [id peers k sha256]}]
+  {:nuno/schema schema
+   :nuno/id id
+   :nuno/k (or k default-k)
+   :nuno/sha256 sha256
+   :nuno/members (into {} (map (fn [p] [p (dht-key sha256 p)]))
+                       (cons id (remove #{id} peers)))
+   :nuno/held {}
+   :nuno/warrants {}
+   :nuno/seen #{}})
+
+(defn add-peer [n peer]
+  (if (contains? (:nuno/members n) peer)
+    n
+    (assoc-in n [:nuno/members peer] (dht-key (:nuno/sha256 n) peer))))
+
+(defn peers
+  "自分以外の全ノード。"
+  [n]
+  (vec (sort (remove #{(:nuno/id n)} (keys (:nuno/members n))))))
+
+(defn authorities
+  "basis に近い k 台（自分を含みうる）。網の全員が同じメンバー表を持っていれば、
+  全員が同じ答えに至る。"
+  [n basis]
+  (let [target (dht-key (:nuno/sha256 n) basis)]
+    (->> (:nuno/members n)
+         (sort-by (fn [[_ k]] (key/xor-distance k target)) key/compare-distance)
+         (take (:nuno/k n))
+         (mapv first))))
+
+(defn authority? [n basis]
+  (boolean (some #{(:nuno/id n)} (authorities n basis))))
+
+(defn held [n basis] (get-in n [:nuno/held basis]))
+(defn warrant [n basis] (get-in n [:nuno/warrants basis]))
+
+;; --------------------------------------------------------------------- op
+
+(defn op
+  "op を作る。`id` は内容から決まる一意な名前（head なら糸の head の CID、
+  warrant なら証拠から作る）。同じ id の op は 2 回処理しない。"
+  [kind basis id payload]
+  {:nuno/kind kind :nuno/basis basis :nuno/id id :nuno/payload payload})
+
+(defn- valid-op? [o]
+  (and (contains? op-kinds (:nuno/kind o))
+       (some? (:nuno/basis o))
+       (some? (:nuno/id o))))
+
+(defn- flood
+  "warrant を `except` 以外の全員へ。"
+  [n o except]
+  (vec (for [p (peers n) :when (not (contains? except p))] [p o])))
+
+(defn publish
+  "自分が受け入れた head を網に出す。authority 全員へ送る —— 自分が authority
+  なら自分宛ても出す。自分の保持も他の authority と同じ判定（`inspect` →
+  `settle`）を通すためで、ここで黙って置き換えると、古い head を出した
+  authority が自分の保持を巻き戻せてしまう。
+
+  -> {:nuno/node … :nuno/out [[宛先 op] …]}"
+  [n o]
+  {:nuno/node n
+   :nuno/out (mapv (fn [a] [a o]) (authorities n (:nuno/basis o)))})
+
+(defn inspect
+  "届いた op をどう扱うか。
+
+  -> {:nuno/action :ignore :nuno/why …}     もう見た・形が壊れている・締め出し済み
+     {:nuno/action :judge-head :nuno/held 保持中の op か nil}
+     {:nuno/action :judge-warrant}
+
+  `:judge-*` のとき host は検証して `settle` を呼ぶ。"
+  [n o]
+  (let [basis (:nuno/basis o)]
+    (cond
+      (not (valid-op? o)) {:nuno/action :ignore :nuno/why :nuno/malformed}
+      (contains? (:nuno/seen n) (:nuno/id o)) {:nuno/action :ignore :nuno/why :nuno/seen}
+      (= :warrant (:nuno/kind o))
+      (if (warrant n basis)
+        {:nuno/action :ignore :nuno/why :nuno/already-warranted}
+        {:nuno/action :judge-warrant})
+      (warrant n basis) {:nuno/action :ignore :nuno/why :nuno/warranted}
+      :else {:nuno/action :judge-head :nuno/held (held n basis)})))
+
+(defn settle
+  "host の判定を受け取る。
+
+  head の判定:
+    {:verdict :hold}                     保持中のものより新しい。置き換える
+    {:verdict :ignore}                   同じ・古い・壊れている
+    {:verdict :conflict :warrant op}     保持中のものと矛盾した。warrant を全員へ
+  warrant の判定:
+    {:verdict :valid}                    証拠は本物。保持して、来た相手以外の全員へ
+    {:verdict :invalid}                  証拠が偽物。何もしない（流さない）
+
+  `from` は op を送ってきたノード（自分で見つけたなら nil）。
+  -> {:nuno/node … :nuno/out [[宛先 op] …]}"
+  [n o from {:keys [verdict] :as v}]
+  (let [basis (:nuno/basis o)
+        n (update n :nuno/seen conj (:nuno/id o))
+        except (cond-> #{} from (conj from))]
+    (case [(:nuno/kind o) verdict]
+      [:head :hold]
+      {:nuno/node (assoc-in n [:nuno/held basis] o) :nuno/out []}
+
+      [:head :ignore]
+      {:nuno/node n :nuno/out []}
+
+      [:head :conflict]
+      (let [w (:warrant v)]
+        {:nuno/node (-> n
+                        (assoc-in [:nuno/warrants basis] w)
+                        (update :nuno/seen conj (:nuno/id w)))
+         :nuno/out (flood n w #{})})
+
+      [:warrant :valid]
+      {:nuno/node (assoc-in n [:nuno/warrants basis] o)
+       :nuno/out (flood n o except)}
+
+      [:warrant :invalid]
+      {:nuno/node n :nuno/out []}
+
+      (throw (ex-info "nuno: unknown verdict" {:kind (:nuno/kind o) :verdict verdict})))))

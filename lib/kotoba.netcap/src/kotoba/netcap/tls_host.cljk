@@ -1,0 +1,229 @@
+(ns kotoba.netcap.tls-host
+  "TLS client streams -- the HOST half: the driver that does the socket work
+  for kotoba.netcap.tls, on each host's own TLS stack.
+
+    JVM   JSSE (javax.net.ssl). `connect` returns the connected
+          javax.net.ssl.SSLSocket with the handshake COMPLETED, SNI sent,
+          and the read timeout (SO_TIMEOUT) set. Host I/O failures are thrown
+          as JSSE throws them (IOException / SSLHandshakeException ...), so a
+          caller's existing catch clauses keep their meaning.
+    kbb   node:tls. Node sockets are asynchronous: `connect` returns a
+          js/Promise of the connected tls.TLSSocket (resolved on
+          'secureConnect', rejected with the Node error). The idle timeout
+          (socket.setTimeout) is :timeout-ms; Node emits 'timeout' without
+          closing, as it always does.
+
+  Trust stores differ by host and that is not hidden: :system is the JDK's
+  cacerts on the JVM and Node's bundled Mozilla store on kbb.
+
+  `connect` is the host's own door: a connector over `system-driver` granted
+  `:any`, exactly where kotoba.lang.process-host/sh stands for processes. Code
+  that is not the host is handed a connector (kotoba.netcap.tls/connector)
+  and calls kotoba.netcap.tls/connect!.
+
+  Also here, JVM only: `ssl-context` (the javax.net.ssl.SSLContext a request's
+  :trust / :identity describe, for code that must hand one to a JDK server or
+  HTTP client) and `tls-exception?`."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.netcap.tls :as tls])
+  #?(:clj (:import [java.io ByteArrayInputStream]
+                   [java.net InetSocketAddress Socket]
+                   [java.security KeyFactory KeyStore MessageDigest]
+                   [java.security.cert CertificateException CertificateFactory X509Certificate]
+                   [java.security.spec PKCS8EncodedKeySpec]
+                   [java.util Base64]
+                   [javax.net.ssl KeyManagerFactory SNIHostName SSLContext SSLException
+                    SSLSocket TrustManager TrustManagerFactory X509TrustManager])))
+
+(defn- hex [bs]
+  (str/join (map (fn [b] (let [v (bit-and (int b) 0xff)] (str (when (< v 16) "0") #?(:clj (Integer/toHexString v) :cljs (.toString v 16)))))
+                 bs)))
+
+;; ---------------------------------------------------------------------------
+;; JVM: JSSE
+;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (do
+     (defn- pem->certificates [^String pem]
+       (vec (.generateCertificates (CertificateFactory/getInstance "X.509")
+                                   (ByteArrayInputStream. (.getBytes pem "US-ASCII")))))
+
+     (defn- pem->private-key [^String pem]
+       (let [b64 (-> pem
+                     (str/replace #"-----BEGIN PRIVATE KEY-----" "")
+                     (str/replace #"-----END PRIVATE KEY-----" "")
+                     (str/replace #"\s" ""))
+             spec (PKCS8EncodedKeySpec. (.decode (Base64/getDecoder) ^String b64))]
+         (or (some (fn [alg] (try (.generatePrivate (KeyFactory/getInstance alg) spec) (catch Exception _ nil)))
+                   ["EC" "RSA" "Ed25519" "EdDSA" "RSASSA-PSS"])
+             (tls/refuse! :identity-invalid {:identity :redacted}))))
+
+     (defn spki-sha256
+       "Lower-case hex SHA-256 of a certificate's SubjectPublicKeyInfo (DER)."
+       [^X509Certificate cert]
+       (hex (.digest (MessageDigest/getInstance "SHA-256") (.getEncoded (.getPublicKey cert)))))
+
+     (defn- pin-trust-manager [pins]
+       (reify X509TrustManager
+         (getAcceptedIssuers [_] (make-array X509Certificate 0))
+         (checkClientTrusted [_ _ _] (throw (CertificateException. "kotoba.netcap.tls: not a server")))
+         (checkServerTrusted [_ chain _]
+           (let [leaf ^X509Certificate (first chain)
+                 got (when leaf (spki-sha256 leaf))]
+             (when-not (contains? pins got)
+               (throw (CertificateException. (str "spki-pin-mismatch: " got))))))))
+
+     (defn- trust-managers [trust]
+       (cond
+         (= :system trust) nil
+         (contains? trust :pin-spki-sha256) (into-array TrustManager [(pin-trust-manager (:pin-spki-sha256 trust))])
+         :else (let [ks (doto (KeyStore/getInstance "PKCS12") (.load nil nil))]
+                 (doseq [[i c] (map-indexed vector (pem->certificates (:anchors-pem trust)))]
+                   (.setCertificateEntry ks (str "anchor-" i) c))
+                 (.getTrustManagers (doto (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
+                                      (.init ks))))))
+
+     (defn- key-managers [identity]
+       (when identity
+         (let [pw (char-array 0)
+               chain (pem->certificates (:cert-chain-pem identity))
+               ks (doto (KeyStore/getInstance "PKCS12") (.load nil nil)
+                    (.setKeyEntry "identity" (pem->private-key (:key-pem identity)) pw
+                                  (into-array java.security.cert.Certificate chain)))]
+           (.getKeyManagers (doto (KeyManagerFactory/getInstance (KeyManagerFactory/getDefaultAlgorithm))
+                              (.init ks pw))))))
+
+     (defn ssl-context
+       "The javax.net.ssl.SSLContext a request's :trust and :identity describe
+       (either may be absent: :system trust, no client certificate). The
+       request is validated as far as those two keys go."
+       ^SSLContext [{:keys [trust identity] :as req}]
+       (let [probe (cond-> {:host "localhost" :port 1}
+                     (contains? req :trust) (assoc :trust trust)
+                     (contains? req :identity) (assoc :identity identity))]
+         (when-let [kw (tls/validate-connect probe)] (tls/refuse! kw req)))
+       (let [trust (or trust :system)]
+         (if (and (= :system trust) (nil? identity))
+           (SSLContext/getDefault)
+           (doto (SSLContext/getInstance "TLS")
+             (.init (key-managers identity) (trust-managers trust) nil)))))
+
+     (defn- jsse-connect [{:keys [host port timeout-ms connect-timeout-ms server-name verify-hostname? protocols] :as req}]
+       (let [ctx (ssl-context (select-keys req [:trust :identity]))
+             raw (Socket.)]
+         (try
+           (.connect raw (InetSocketAddress. ^String host (int port)) (int connect-timeout-ms))
+           (let [^SSLSocket s (.createSocket (.getSocketFactory ctx) raw ^String host (int port) true)
+                 params (.getSSLParameters s)]
+             (try
+               (when verify-hostname? (.setEndpointIdentificationAlgorithm params "HTTPS"))
+               (when server-name (.setServerNames params [(SNIHostName. ^String server-name)]))
+               (when protocols (.setProtocols params (into-array String (sort protocols))))
+               (.setSSLParameters s params)
+               (.setSoTimeout s (int timeout-ms))
+               (.startHandshake s)
+               s
+               (catch Throwable t (.close s) (throw t))))
+           (catch Throwable t (.close raw) (throw t)))))
+
+     (defn tls-exception?
+       "Is `t` a TLS failure (JVM: an instance of javax.net.ssl.SSLException,
+       which SSLHandshakeException and SSLPeerUnverifiedException are)?"
+       [t]
+       (instance? SSLException t))
+
+     (defn session-info
+       "{:protocol :cipher-suite :peer-spki-sha256} of a connected SSLSocket."
+       [^SSLSocket s]
+       (let [sess (.getSession s)
+             leaf (first (.getPeerCertificates sess))]
+         {:protocol (.getProtocol sess)
+          :cipher-suite (.getCipherSuite sess)
+          :peer-spki-sha256 (when (instance? X509Certificate leaf) (spki-sha256 leaf))}))))
+
+;; ---------------------------------------------------------------------------
+;; kbb: node:tls
+;; ---------------------------------------------------------------------------
+
+#?(:cljs
+   (do
+     (def ^:private node-tls (js/require "node:tls"))
+     (def ^:private node-crypto (js/require "node:crypto"))
+
+     (defn- sha256-hex [buf] (.digest (.update (.createHash node-crypto "sha256") buf) "hex"))
+
+     (defn- peer-spki-sha256
+       "SHA-256 of the peer leaf's SubjectPublicKeyInfo DER. (Node's
+       getPeerCertificate().pubkey is NOT the SPKI: for an EC key it is the
+       bare point, so the certificate is re-read from its DER.)"
+       [s]
+       (let [raw (.-raw (.getPeerCertificate s))
+             x509 (new (.-X509Certificate node-crypto) raw)]
+         (sha256-hex (.export (.-publicKey x509) #js {:type "spki" :format "der"}))))
+
+     (defn- node-connect [{:keys [host port timeout-ms connect-timeout-ms server-name trust identity protocols verify-hostname?]}]
+       (js/Promise.
+        (fn [resolve reject]
+          (let [pins (when (map? trust) (:pin-spki-sha256 trust))
+                opts (cond-> {:host host :port port
+                              :rejectUnauthorized (not pins)}
+                       server-name (assoc :servername server-name)
+                       (and (map? trust) (:anchors-pem trust)) (assoc :ca (:anchors-pem trust))
+                       identity (assoc :cert (:cert-chain-pem identity) :key (:key-pem identity))
+                       protocols (assoc :minVersion (first (sort protocols)) :maxVersion (last (sort protocols)))
+                       (not verify-hostname?) (assoc :checkServerIdentity (fn [_ _] js/undefined))
+                       ;; no SNI for an IP literal, but the certificate is still
+                       ;; checked against the address itself
+                       (and verify-hostname? (nil? server-name))
+                       (assoc :checkServerIdentity (fn [_ cert] (.checkServerIdentity node-tls host cert))))
+                s (.connect node-tls (clj->js opts))
+                settled (atom false)
+                fail! (fn [e] (when (compare-and-set! settled false true) (.destroy s) (reject e)))]
+            (.setTimeout s connect-timeout-ms)
+            (.once s "timeout" (fn [] (when-not @settled
+                                        (fail! (doto (js/Error. "kotoba.netcap.tls: TLS connect timed out") (aset "code" "ETIMEDOUT"))))))
+            (.once s "error" fail!)
+            (.once s "secureConnect"
+                   (fn []
+                     (if (and pins (not (contains? pins (peer-spki-sha256 s))))
+                       (fail! (doto (js/Error. (str "spki-pin-mismatch: " (peer-spki-sha256 s)))
+                                (aset "code" "ERR_TLS_SPKI_PIN_MISMATCH")))
+                       (when (compare-and-set! settled false true)
+                         (.setTimeout s timeout-ms)
+                         (resolve s)))))))))
+
+     (def ^:private tls-codes
+       #"^(ERR_TLS_|ERR_SSL_|ERR_OSSL_|CERT_|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_GET_ISSUER_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE|HOSTNAME_MISMATCH)")
+
+     (defn tls-exception?
+       "Is `e` a TLS failure (Node: an error whose .code is a TLS / OpenSSL /
+       certificate code)?"
+       [e]
+       (boolean (some->> (when e (.-code e)) str (re-find tls-codes))))
+
+     (defn session-info
+       "{:protocol :cipher-suite :peer-spki-sha256} of a connected TLSSocket."
+       [s]
+       (let [c (.getPeerCertificate s)]
+         {:protocol (.getProtocol s)
+          :cipher-suite (some-> (.getCipher s) .-standardName)
+          :peer-spki-sha256 (when (some-> c .-raw) (peer-spki-sha256 s))}))
+
+     (defn ssl-context [_]
+       (throw (ex-info "kotoba.netcap.tls-host/ssl-context is JVM-only (a javax.net.ssl.SSLContext)"
+                       {::tls/error :unsupported-host})))))
+
+(def system-driver
+  "The host's TLS stack as a kotoba.netcap.tls/TlsDriver."
+  (reify tls/TlsDriver
+    (-connect [_ req] #?(:clj (jsse-connect req) :cljs (node-connect req)))))
+
+(def ^:private host-connector (tls/connector system-driver {:allow :any}))
+
+(defn connect
+  "Open a TLS client stream on the host's own TLS stack (see the ns doc):
+  kotoba.netcap.tls/connect! through a connector over `system-driver`
+  granted :any. JVM: the connected SSLSocket; kbb: a promise of it."
+  [req]
+  (tls/connect! host-connector req))

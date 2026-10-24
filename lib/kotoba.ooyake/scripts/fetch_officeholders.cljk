@@ -1,0 +1,434 @@
+#!/usr/bin/env kbb
+;; scripts/fetch_officeholders.cljk — ooyake 公 — 公人（現職の公職者）を Wikidata から
+;; 取得して registry/gov-officeholders.*.edn を生成する（ADR-2607253000）。
+;;
+;;   kbb --backend sci scripts/fetch_officeholders.cljk            # 全対象グループ
+;;   kbb --backend sci scripts/fetch_officeholders.cljk executive  # 1グループだけ
+;;   kbb --backend sci scripts/fetch_officeholders.cljk --dry-run  # 取得して件数だけ出す（書かない）
+;;
+;; ## 設計の要点
+;;
+;; **既存の :gov.unit/wikidata を主キーにして引く。** 人物名から検索するのではなく、
+;; ooyake が既に持っている 7,087 の政府組織 QID それぞれについて「その組織の現職者は
+;; 誰か」を訊く。だから取得した瞬間に :gov.person/unit → :gov.unit/id の連動が成立して
+;; いて、後から名寄せする工程が要らない。組織側に QID が無ければその組織の公人も出ない
+;; ——カバレッジの穴が構造的に見えるということでもある。
+;;
+;; **現職のみ。** P582（終了日）を持つ statement は除外し、deprecated rank も落とす。
+;; 退任済みの人物を「現職」として記録しないための最低条件。ただし Wikidata の更新が
+;; 遅れている国では退任者が残る——だから :gov.person/last-verified に取得日を必ず書き、
+;; 「この日の Wikidata ではこうだった」以上のことを主張しない（G5）。
+;;
+;; **人間だけ。** ?person wdt:P31 wd:Q5 で絞る。P488（chairperson）等は組織が入って
+;; いることがある。
+;;
+;; ## G6 の範囲（2026-07-25 改訂後）
+;;
+;; 取るのは「公職としての役職・氏名・在任開始・公式URL・QID」だけ。生年月日・出生地・
+;; 家族・私的連絡先・住所・宗教・所属政党といった属性は **クエリに含めない**——
+;; 取得してから捨てるのではなく、最初から要求しない。G10（never a target-list）は
+;; 不変なので、個人の所在や日程に類する情報はこの経路に一切載らない。
+
+(require '[kotoba.lang.edn :as edn]
+         '[kotoba.lang.text :as str]
+         '["node:fs" :as fs])
+
+(def argv (vec *command-line-args*))
+(def dry-run? (contains? (set argv) "--dry-run"))
+(def only-group (first (remove #(str/starts-with? % "--") argv)))
+
+(def endpoint "https://query.wikidata.org/sparql")
+
+(def user-agent
+  "WDQS は実在の連絡先を含む User-Agent を要求する（匿名の bot は遮断される）。"
+  "ooyake/1.0 (+https://github.com/etzhayyim/com-etzhayyim-ooyake; world government atlas, public-office holders only)")
+
+(def batch-size 60)
+(def inter-batch-delay-ms 1500)
+
+(def groups
+  "取得対象。:file は registry の入力、:out は出力先の suffix。
+  範囲は owner 指示（2026-07-25）の『元首＋政府首脳＋主要閣僚＋議会指導部＋監督機関トップ』。
+  ministry 全体（1,642 件）ではなく外務・財務・国防の3分野に限っているのはその指示どおり。"
+  ;; 国レベル unit は3ファイルに分かれている: world-countries.edn(174) は G20 級を
+  ;; 含まず、それらは g20.edn(14) と seed.edn(5) に居る。world-countries.edn だけを
+  ;; 引くと日本・米国・英国・独・中・仏・印・伯の元首/首脳が丸ごと欠ける（実測して
+  ;; 気付いた）。level :country を持つファイルは3つとも入れる。
+  [{:out "heads-of-state"      :files ["gov-units.world-countries.edn"
+                                       "gov-units.g20.edn"
+                                       "gov-units.seed.edn"]}
+   {:out "executive"           :files ["gov-units.executive.edn"]}
+   {:out "legislatures"        :files ["gov-units.world-legislatures.edn"]}
+   {:out "courts"              :files ["gov-units.constitutional-courts.edn"]}
+   {:out "centralbanks"        :files ["gov-units.world-centralbanks.edn"]}
+   {:out "ministries-core"     :files ["gov-units.world-foreign.edn"
+                                       "gov-units.world-finance.edn"
+                                       "gov-units.world-defense.edn"]}
+   {:out "oversight"           :files ["gov-units.oversight-anticorruption.edn"
+                                       "gov-units.oversight-audit.edn"
+                                       "gov-units.oversight-competition.edn"
+                                       "gov-units.oversight-dataprotection.edn"
+                                       "gov-units.oversight-electoral.edn"
+                                       "gov-units.oversight-financial-regulator.edn"
+                                       "gov-units.oversight-nhri.edn"
+                                       "gov-units.oversight-ombudsman.edn"
+                                       "gov-units.oversight-prosecutor.edn"
+                                       "gov-units.oversight-revenue.edn"]}])
+
+(def role-of
+  "Wikidata property → ooyake の役職ラベル。ここに無い property は引かない。"
+  {"head-of-state"   "Head of State"
+   "head-of-government" "Head of Government"
+   "chairperson"     "Chairperson"
+   "director"        "Director / Head"
+   "chief-executive" "Chief Executive"
+   "officeholder"    "Officeholder"})
+
+(def min-retained-ratio
+  "回帰ガード（ADR-2607253200）。既存ファイルの件数に対してこの割合を下回る結果しか
+  得られなかったら、そのグループは **書き戻さずに失敗する**。
+
+  毎週 CI から無人で回す以上、一番危ないのは『WDQS の一時障害や SPARQL の書き間違いで
+  結果が空に近くなり、1,000件の公人が一斉に消えて commit される』こと。1回の実行結果は
+  測定値だが、測定装置の故障まで測定値として書き込んではいけない。個々の在任者が
+  入れ替わるのは正常な変動なので通し、グループ全体が崩れたときだけ止める。
+  OOYAKE_FETCH_MIN_RETAINED で上書き可（0 で無効。初回生成時は既存が0件なので素通り）。"
+  (js/parseFloat (or (.. js/process -env -OOYAKE_FETCH_MIN_RETAINED) "0.7")))
+
+(defn- read-units [file]
+  (:units (edn/read-string (str (.readFileSync fs (str "registry/" file) "utf8")))))
+
+(defn- existing-people [path]
+  (try (:people (edn/read-string (str (.readFileSync fs path "utf8")))) (catch :default _ [])))
+
+(defn- existing-count [path] (count (existing-people path)))
+
+(defn- carry-primary-confirmations
+  "既に当局側で確認済み（:authoritative + :source-url）だった行は、その確認を持ち越す。
+
+  週次 refetch は Wikidata を読み直すだけなので、そのままでは
+  verify-primary-sources.cljs が積み上げた1次確認を毎週消してしまう。持ち越す条件は
+  **同じ組織・同じ職・同じ人物**であること — 人が替わっていれば前任者に対する確認は
+  無効なので落とす（それが1次確認の意味）。"
+  [prev people]
+  (let [k (juxt :gov.person/unit :gov.person/role-property :gov.person/wikidata)
+        confirmed (into {} (for [p prev
+                                 :when (and (= :authoritative (:gov.person/sourcing p))
+                                            (:gov.person/source-url p))]
+                             [(k p) p]))]
+    (mapv (fn [p]
+            (if-let [c (get confirmed (k p))]
+              (assoc p :gov.person/sourcing :authoritative
+                       :gov.person/source-url (:gov.person/source-url c)
+                       :gov.person/source-checked (:gov.person/source-checked c))
+              p))
+          people)))
+
+(defn- sparql-positions
+  "PASS B（ADR-2607253200）— 役職エンティティ経由で現職を引く。
+
+  Pass A（下の `sparql`）は組織 → 人物の直リンク（P35/P6/P488/P1037…）だけを見るので、
+  Wikidata がその形で持っていない組織を丸ごと取りこぼす。実測: 外務・財務・国防省は
+  389 組織中 61 しか取れず、議会は 186 中 31 だった。実際には多くの閣僚・議長は
+  『人物 → P39 → 役職 → P2389 → 組織』という形で入っている。
+
+  副産物として **役職の実名が取れる**（\"Minister of Foreign Affairs\"）。Pass A は
+  結んだ property 名しか分からず \"Director / Head\" のような構造的ラベルになる。
+
+  現職判定が Pass A と違う点: **P580（就任日）を必須にし、(組織, 役職) ごとに最新を
+  採る**。P39 は歴代の在任者が終了日なしで大量に残っていることが多く（実測: アルバニア
+  外務省に終了日なしの歴代大臣が20名以上、うち日付を持つ最新が現職の Ferit Hoxha
+  2026-03-05）、『終了日が無い＝現職』という Pass A の判定はここでは通用しない。
+  日付を持たない行は現職の証拠にならないので落とす — 推測で現職に昇格させない。"
+  [qids]
+  (str "SELECT ?unit ?position ?positionLabel ?person ?personLabel ?native ?start WHERE {\n"
+       "  VALUES ?unit { " (str/join " " (map #(str "wd:" %) qids)) " }\n"
+       ;; P2389 = organisation directed by this office。P361(part of)/P1001(applies to
+       ;; jurisdiction) も繋がるが、前者は組織の下部組織、後者は国そのものを指すので
+       ;; 「この組織の長」以外を大量に拾う。精度を優先して P2389 のみ。
+       "  ?position wdt:P2389 ?unit .\n"
+       "  ?person p:P39 ?st .\n"
+       "  ?st ps:P39 ?position .\n"
+       "  ?person wdt:P31 wd:Q5 .\n"
+       "  FILTER NOT EXISTS { ?st pq:P582 ?endTime }\n"
+       "  FILTER NOT EXISTS { ?st wikibase:rank wikibase:DeprecatedRank }\n"
+       "  ?st pq:P580 ?start .\n"
+       "  OPTIONAL { ?person wdt:P1559 ?native }\n"
+       "  SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". }\n"
+       "}"))
+
+(defn- sparql [qids]
+  (str "SELECT ?unit ?prop ?person ?personLabel ?native ?start WHERE {\n"
+       "  VALUES ?unit { " (str/join " " (map #(str "wd:" %) qids)) " }\n"
+       "  VALUES (?p ?ps ?prop) {\n"
+       "    (p:P35 ps:P35 \"head-of-state\")\n"
+       "    (p:P6 ps:P6 \"head-of-government\")\n"
+       "    (p:P488 ps:P488 \"chairperson\")\n"
+       "    (p:P1037 ps:P1037 \"director\")\n"
+       "    (p:P169 ps:P169 \"chief-executive\")\n"
+       "    (p:P1308 ps:P1308 \"officeholder\")\n"
+       "  }\n"
+       "  ?unit ?p ?st .\n"
+       "  ?st ?ps ?person .\n"
+       "  ?person wdt:P31 wd:Q5 .\n"
+       ;; 現職のみ: 終了日を持つ statement と deprecated rank を落とす。
+       "  FILTER NOT EXISTS { ?st pq:P582 ?endTime }\n"
+       "  FILTER NOT EXISTS { ?st wikibase:rank wikibase:DeprecatedRank }\n"
+       "  OPTIONAL { ?st pq:P580 ?start }\n"
+       "  OPTIONAL { ?person wdt:P1559 ?native }\n"
+       "  SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". }\n"
+       "}"))
+
+(defn- query! [query-fn qids]
+  (-> (js/fetch endpoint
+                #js {:method "POST"
+                     :headers #js {"User-Agent" user-agent
+                                   "Accept" "application/sparql-results+json"
+                                   "Content-Type" "application/x-www-form-urlencoded"}
+                     :body (str "query=" (js/encodeURIComponent (query-fn qids)))})
+      (.then (fn [resp]
+               (if (.-ok resp)
+                 (.then (.json resp) (fn [j] {:rows (js->clj (.. j -results -bindings) :keywordize-keys true)}))
+                 (.then (.text resp) (fn [t] {:error (str "HTTP " (.-status resp) " " (subs t 0 (min 200 (count t))))})))))
+      (.catch (fn [e] {:error (or (.-message e) (str e))}))))
+
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+(defn- qid-of [uri] (last (str/split uri #"/")))
+
+(defn- slug [s]
+  (-> (str s) str/lower (str/replace #"[^a-z0-9]+" "-") (str/replace #"^-|-$" "")))
+
+(defn- today [] (subs (.toISOString (js/Date.)) 0 10))
+
+(defn- ->person
+  "1 SPARQL row + 元の unit → :gov.person/* エンティティ。"
+  [by-qid row]
+  (let [unit-qid (qid-of (get-in row [:unit :value]))
+        unit (get by-qid unit-qid)
+        prop (get-in row [:prop :value])
+        person-qid (qid-of (get-in row [:person :value]))
+        label (get-in row [:personLabel :value])
+        native (get-in row [:native :value])
+        start (get-in row [:start :value])]
+    (when (and unit label (not (re-matches #"Q\d+" label)))
+      (cond-> {:gov.person/id (str "person."
+                                   (str/replace (:gov.unit/id unit) #"^gov\." "")
+                                   "." (slug prop))
+               :gov.person/unit (:gov.unit/id unit)
+               :gov.person/jurisdiction (:gov.unit/jurisdiction unit)
+               :gov.person/role-en (get role-of prop prop)
+               :gov.person/role-property prop
+               :gov.person/name-en label
+               :gov.person/wikidata person-qid
+               :gov.person/unit-wikidata unit-qid
+               :gov.person/sourcing :third-party
+               :gov.person/provenance "wikidata"
+               :gov.person/last-verified (today)}
+        (and native (not= native label)) (assoc :gov.person/name-native native)
+        start (assoc :gov.person/since (subs start 0 10))
+        (:gov.unit/official-url unit) (assoc :gov.person/official-url (:gov.unit/official-url unit))))))
+
+(defn- ->person-from-position
+  "PASS B の 1 row → :gov.person/* エンティティ。Pass A との違いは2点だけ:
+  `:gov.person/role-en` が役職の**実名**（\"Minister of Foreign Affairs\"）になり、
+  id を役職 QID で作る。id を役職ラベルから作らないのは、上流がラベルを直したときに
+  週次 refresh の diff が id 変更で埋まるから — QID なら在任者が替わっても id は不変で、
+  『同じ職の担当者が替わった』という1行の diff になる。"
+  [by-qid row]
+  (let [unit-qid (qid-of (get-in row [:unit :value]))
+        unit (get by-qid unit-qid)
+        position-qid (qid-of (get-in row [:position :value]))
+        position-label (get-in row [:positionLabel :value])
+        person-qid (qid-of (get-in row [:person :value]))
+        label (get-in row [:personLabel :value])
+        native (get-in row [:native :value])
+        start (get-in row [:start :value])]
+    (when (and unit label (not (re-matches #"Q\d+" label)))
+      (cond-> {:gov.person/id (str "person."
+                                   (str/replace (:gov.unit/id unit) #"^gov\." "")
+                                   "." (str/lower position-qid))
+               :gov.person/unit (:gov.unit/id unit)
+               :gov.person/jurisdiction (:gov.unit/jurisdiction unit)
+               :gov.person/role-en (if (re-matches #"Q\d+" (str position-label))
+                                     "Officeholder"
+                                     position-label)
+               :gov.person/role-property "position-held"
+               :gov.person/position-wikidata position-qid
+               :gov.person/name-en label
+               :gov.person/wikidata person-qid
+               :gov.person/unit-wikidata unit-qid
+               :gov.person/sourcing :third-party
+               :gov.person/provenance "wikidata"
+               :gov.person/last-verified (today)
+               :gov.person/since (subs start 0 10)}
+        (and native (not= native label)) (assoc :gov.person/name-native native)
+        (:gov.unit/official-url unit) (assoc :gov.person/official-url (:gov.unit/official-url unit))))))
+
+(defn- current-per-position
+  "PASS B の現職判定。(組織, 役職) ごとに **就任日が最新の1件**だけを残す。
+
+  P39 は終了日を書かないまま歴代の在任者が積み上がるのが普通なので、Pass A の
+  『終了日が無い＝現職』はここでは効かない。クエリ側で就任日を必須にしたうえで、
+  ここで最新を採る。同着（同日就任の共同ポスト）は両方残す。"
+  [people]
+  (->> people
+       (group-by (juxt :gov.person/unit :gov.person/position-wikidata))
+       (mapcat (fn [[_ group]]
+                 (let [latest (apply max-key identity (map :gov.person/since group))]
+                   (filter #(= latest (:gov.person/since %)) group))))
+       vec))
+
+(defn- merge-passes
+  "Pass A と Pass B を束ねる。2つの規則。
+
+  (1) **同じ (組織, 人物) が両方に出たら Pass B を採る** — Pass B の方が役職の実名を
+  持っているため（\"Prime Minister of France\" 対 \"Director / Head\"）。
+
+  (2) **日付を持たない Pass A の行は、同じ組織に日付つきの Pass B 行があるなら落とす。**
+  Pass A の現職判定は『終了日が無い＝現職』だが、Wikidata では退任時に終了日を書き
+  忘れた statement がそのまま残る。実測: フランス経済・財務省に Antoine Armand
+  （2024年12月に退任）が日付なしで残り、正しい後任 Éric Lombard（2024-12-23 就任）と
+  並んでいた。日付が無く、かつ同じ組織に日付つきの在職者が居るなら、前者は現職の
+  証拠として後者に負ける。日付つきの Pass A 行、および Pass B が触れていない組織の
+  行はそのまま残す（P35 元首のように役職エンティティを経由しない形は Pass B では
+  構造的に取れないため、落としてはいけない）。"
+  [pass-a pass-b]
+  (let [b-keys (into #{} (map (juxt :gov.person/unit :gov.person/wikidata) pass-b))
+        b-units-dated (into #{} (map :gov.person/unit (filter :gov.person/since pass-b)))]
+    (into (vec pass-b)
+          (remove (fn [a]
+                    (or (contains? b-keys ((juxt :gov.person/unit :gov.person/wikidata) a))
+                        (and (nil? (:gov.person/since a))
+                             (contains? b-units-dated (:gov.person/unit a)))))
+                  pass-a))))
+
+(defn- dedupe-ids
+  "2段階。
+
+  (1) **同一人物の重複行をまとめる。** SPARQL の `OPTIONAL ?native`（P1559 母語表記）は
+  多言語表記を持つ人物で行を掛け算する — インドの Narendra Modi / Droupadi Murmu は
+  それぞれ4行、高市早苗は2行になっていた（実測）。同じ (unit, 役職, 人物QID) は1件に
+  畳む。
+
+  (2) **本当に別人が同じ職に並ぶ場合だけ連番を振る。** スイスの連邦参事会のような
+  合議制や共同元首を『1人の長が居る』と潰さないため、ここでは人を落とさない。"
+  [people]
+  (->> people
+       (group-by (juxt :gov.person/unit :gov.person/role-property :gov.person/wikidata))
+       (map (fn [[_ dupes]] (first (sort-by #(- (count (str %))) dupes))))
+       (group-by :gov.person/id)
+       (mapcat (fn [[id group]]
+                 (let [sorted (sort-by :gov.person/wikidata group)]
+                   (if (= 1 (count sorted))
+                     sorted
+                     (map-indexed (fn [i p] (assoc p :gov.person/id (str id "." (inc i)))) sorted)))))
+       (sort-by :gov.person/id)
+       vec))
+
+(defn- render [out people source-files]
+  (str ";; ooyake 公 — gov-officeholders." out ".edn — 現職の公職者（公人）。自動生成、手編集しない。\n"
+       ";; 生成: kbb --backend sci scripts/fetch_officeholders.cljk " out "   (" (today) ")\n"
+       ";; 出典: Wikidata（P35 元首 / P6 政府首脳 / P488 議長 / P1037 長 / P169 CEO /\n"
+       ";;       P1308 現職者）。P582(終了日) を持つ statement と deprecated rank は除外\n"
+       ";;       済み＝取得時点の現職のみ。:gov.person/last-verified がその取得日。\n"
+       ";; 主キー: 既存 registry の :gov.unit/wikidata。したがって :gov.person/unit は\n"
+       ";;       常に実在の :gov.unit/id を指す（名寄せ不要）。入力: " (str/join ", " source-files) "\n"
+       ";;\n"
+       ";; :gov.person/sourcing は :third-party（Wikidata 由来、当局未確認）で出す。当局自身の
+;; ページで確認できた行だけを scripts/verify-primary-sources.cljs が :authoritative へ
+;; 昇格させ、:gov.person/source-url にその引用を付ける（ADR-2607253400）。
+;;
+;; G6（2026-07-25 改訂）: 公職としての役職・氏名・在任開始・公式URL のみ。生年月日・\n"
+       ";; 出生地・家族・私的連絡先・住所・政党はクエリに含めていない（捨てているのではなく\n"
+       ";; 要求していない）。G10 civic-wayfinding-never-a-target-list は不変。\n"
+       ";; G11 politically neutral: 記録するのは『誰がその職に就いているか』だけで、評価・\n"
+       ";; ランキング・スコアは持たない。\n"
+       "\n{:graph {:name \"gov-atlas-v1\" :visibility :public}\n\n :people\n ["
+       (str/join "\n\n  " (map pr-str people))
+       "]}\n"))
+
+(defn- run-group! [{:keys [out files]}]
+  (let [units (mapcat read-units files)
+        with-qid (filter :gov.unit/wikidata units)
+        by-qid (into {} (map (juxt :gov.unit/wikidata identity) with-qid))
+        batches (partition-all batch-size (map :gov.unit/wikidata with-qid))]
+    (println (str "\n[" out "] " (count units) " units, " (count with-qid) " with QID, "
+                  (count batches) " batches"))
+    (letfn [(run-pass [label query-fn row->person]
+              (letfn [(step [remaining acc n-err]
+                        (if (empty? remaining)
+                          (js/Promise.resolve [acc n-err])
+                          (-> (query! query-fn (first remaining))
+                              (.then (fn [{:keys [rows error]}]
+                                       (if error
+                                         (do (println (str "  " label " batch "
+                                                           (- (count batches) (count remaining) -1)
+                                                           "/" (count batches) " FAILED: " error))
+                                             (-> (sleep inter-batch-delay-ms)
+                                                 (.then #(step (rest remaining) acc (inc n-err)))))
+                                         (let [people (keep #(row->person by-qid %) rows)]
+                                           (println (str "  " label " batch "
+                                                         (- (count batches) (count remaining) -1)
+                                                         "/" (count batches) " → " (count people) " row(s)"))
+                                           (-> (sleep inter-batch-delay-ms)
+                                               (.then #(step (rest remaining) (into acc people) n-err))))))))))]
+                (step (vec batches) [] 0)))]
+      (-> (run-pass "A(direct)  " sparql ->person)
+          (.then (fn [[pass-a err-a]]
+                   (-> (run-pass "B(position)" sparql-positions ->person-from-position)
+                       (.then (fn [[pass-b-raw err-b]]
+                                (let [pass-b (current-per-position pass-b-raw)
+                                      path (str "registry/gov-officeholders." out ".edn")
+                                      final (carry-primary-confirmations
+                                             (existing-people path)
+                                             (dedupe-ids (merge-passes pass-a pass-b)))]
+                                  (println (str "[" out "] " (count final) " officeholders across "
+                                                (count (distinct (map :gov.person/unit final))) " units"
+                                                " (A " (count pass-a) " + B " (count pass-b)
+                                                " of " (count pass-b-raw) " dated position rows)"
+                                                (when (pos? (+ err-a err-b))
+                                                  (str "; " (+ err-a err-b) " batch(es) failed"))))
+                                  (let [prev (existing-count path)
+                                        collapsed? (and (pos? min-retained-ratio)
+                                                        (pos? prev)
+                                                        (< (count final) (* min-retained-ratio prev)))]
+                                    (cond
+                                      dry-run? nil
+
+                                      collapsed?
+                                      (do (println (str "[" out "] REFUSED to write: " prev " → "
+                                                        (count final) " (< "
+                                                        (Math/round (* 100 min-retained-ratio))
+                                                        "% retained). A whole group emptying out is an"
+                                                        " upstream/query failure far more often than that"
+                                                        " many offices falling vacant at once, and this run"
+                                                        " will not record a broken probe as a finding."
+                                                        " Set OOYAKE_FETCH_MIN_RETAINED=0 to override"
+                                                        " deliberately."))
+                                          (.exit js/process 1))
+
+                                      :else
+                                      (do (.writeFileSync fs path (render out final files))
+                                          (println (str "[" out "] wrote " path
+                                                        (when (pos? prev) (str " (was " prev ")"))))))
+                                    {:out out :n (count final) :errors (+ err-a err-b)})))))))))))
+
+(defn -main []
+  (let [targets (if only-group (filter #(= only-group (:out %)) groups) groups)]
+    (when (empty? targets)
+      (println (str "unknown group " (pr-str only-group) "; known: "
+                    (str/join " " (map :out groups))))
+      (.exit js/process 2))
+    (letfn [(step [remaining acc]
+              (if (empty? remaining)
+                (js/Promise.resolve acc)
+                (-> (run-group! (first remaining))
+                    (.then #(step (rest remaining) (conj acc %))))))]
+      (-> (step (vec targets) [])
+          (.then (fn [results]
+                   (println (str "\ntotal: " (reduce + (map :n results)) " officeholders, "
+                                 (reduce + (map :errors results)) " failed batch(es)"
+                                 (when dry-run? " (dry-run — nothing written)")))))))))
+
+(-main)
