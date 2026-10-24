@@ -65,6 +65,7 @@ The bundled standard libraries live in this repository:
 | `org.iso.pdf` | `org.iso.pdf/src` | `pdf.core` (an external specification, publisher iso.org) |
 | `org.omg.bpmn` | `org.omg.bpmn/src` | `bpmn.execute`, `bpmn.model`, `bpmn.ports`, `bpmn.validate` (an external specification, publisher omg.org) |
 | `org.omg.cmmn` | `org.omg.cmmn/src` | `cmmn.execute`, `cmmn.model`, `cmmn.ports`, `cmmn.validate` (an external specification, publisher omg.org) |
+| `org.omg.dmn` | `org.omg.dmn/src` | `dmn.execute`, `dmn.model`, `dmn.ports`, `dmn.validate` (an external specification, publisher omg.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
