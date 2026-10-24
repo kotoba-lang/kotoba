@@ -1,0 +1,136 @@
+(ns parquet.lake-e2e-test
+  "The whole chain, over a real Parquet file: catalog → authorization →
+  triple pattern → column chunk.
+
+  Every layer has its own tests against its own fakes, and each of those is
+  worth having — but a fake column source cannot show that a triple pattern
+  survives four translations and arrives as a byte range, and a fake catalog
+  cannot show that the authorization gate stands between a query and a file
+  that really exists. This is the one test where nothing is stubbed except the
+  transport, and the transport is stubbed only to count what it moved.
+
+  A `.clj` rather than a `.cljc`: it is JVM-only on purpose (the fixture is
+  read with `clojure.java.io`, and the point here is the composition rather
+  than a platform conditional — each library carries its own cross-runtime
+  suite). Saying so in the extension rather than the docstring is what keeps
+  clj-kondo from linting it as portable code and reporting `with-open` as an
+  unresolved symbol."
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
+            [columnar.aggregate :as agg]
+            [datom.source :as dsrc]
+            [kotobase.lake.acquire :as acq]
+            [kotobase.lake.catalog :as cat]
+            [kotobase.lake.columnar :as lcol]
+            [kotobase.lake.reader :as reader]
+            [parquet.bytes :as pbytes]
+            [parquet.source :as psrc]))
+
+(def ^:private parquet-type "application/vnd.apache.parquet")
+
+(defn- fixture-bytes [name]
+  (with-open [in (io/input-stream (io/file "lib/org.apache.parquet/test/fixtures" name))]
+    (let [out (java.io.ByteArrayOutputStream.)]
+      (io/copy in out)
+      (mapv #(bit-and % 0xff) (.toByteArray out)))))
+
+(def file (delay (fixture-bytes "plain.parquet")))
+(def cid "bafkreiadsbmmn4waznesyuz3bjgrj33xzqhxrk6mz3ksq7meugrachh3qe")
+
+(defn- catalogued []
+  (:quads (cat/admit {:cid cid :size (count @file) :tenant "acme"
+                      :ingested-at "2026-08-04T09:00:00Z"
+                      :filename "sales.parquet"
+                      :declared-media-type parquet-type})))
+
+(defn- registry+meter
+  "A registry whose Parquet reader records every byte range it pulls.
+
+  The meter sits at the transport, below everything: whatever the query
+  layers decide, this is what actually moved."
+  []
+  (let [meter (atom nil)]
+    {:meter meter
+     :registry
+     (reader/register-scan
+      (reader/registry) parquet-type
+      (lcol/scan-reader
+       (fn [{:keys [read-range size-bytes]}]
+         (let [c (pbytes/counting
+                  (reify pbytes/IByteSource
+                    (-size [_] size-bytes)
+                    (-read-range [_ s e] (read-range s e))))]
+           (reset! meter c)
+           (psrc/open (:source c))))))}))
+
+(defn- range-fn [] (fn [s e] (subvec @file s e)))
+
+;; ── the chain ───────────────────────────────────────────────────────────────
+
+(deftest a-triple-pattern-becomes-a-column-chunk-range
+  (let [{:keys [registry meter]} (registry+meter)
+        {:keys [ok? source via]} (acq/source-for registry (catalogued)
+                                                 {:cid cid :tenant "acme"
+                                                  :size-bytes (count @file)
+                                                  :read-range (range-fn)})
+        oid (cat/object-id cid)]
+    (is ok?)
+    (is (= parquet-type via))
+    (let [after-open (:bytes (pbytes/read-counts @meter))
+          answer (dsrc/scan-set source [nil "price" 120])]
+      (testing "the answer is a datom pointing back at the object it came from"
+        (is (= #{{:s (str oid "#row4") :p "price" :o 120}} answer)))
+      (testing "and only one row group's price chunk was moved to get it"
+        (let [{:keys [bytes ranges]} (pbytes/read-counts @meter)
+              m (psrc/metadata @file)
+              chunk (first (:columns (second (:row-groups m))))]
+          (is (= (:total-compressed-size chunk) (- bytes after-open))
+              "two of three row groups ruled out by footer statistics, and the
+               third fetched at exactly its own size")
+          (is (= [(:data-page-offset chunk)
+                  (+ (:data-page-offset chunk) (:total-compressed-size chunk))]
+                 (last ranges))))))))
+
+(deftest an-aggregate-crosses-the-whole-stack-without-touching-a-page
+  (let [{:keys [registry]} (registry+meter)
+        {:keys [source]} (acq/source-for registry (catalogued)
+                                         {:cid cid :tenant "acme"
+                                          :size-bytes (count @file)
+                                          :read-range (range-fn)})]
+    ;; Reach past the pattern surface to the engine underneath — this is the
+    ;; aggregate path, which a triple pattern has no way to express.
+    (is (some? source))
+    (let [c (pbytes/counting (reify pbytes/IByteSource
+                               (-size [_] (count @file))
+                               (-read-range [_ s e] (subvec @file s e))))
+          col (psrc/open (:source c))
+          after-open (:bytes (pbytes/read-counts c))]
+      (is (= {:value 230 :from :statistics :read 0}
+             (agg/aggregate col {:agg :max :column "price"})))
+      (is (= after-open (:bytes (pbytes/read-counts c)))
+          "max came out of the footer; not one page byte moved"))))
+
+;; ── the gate, against a file that really exists ─────────────────────────────
+
+(deftest the-gate-stands-between-a-query-and-a-real-file
+  (let [{:keys [registry meter]} (registry+meter)
+        quads (catalogued)
+        mine (acq/source-for registry quads {:cid cid :tenant "acme"
+                                             :size-bytes (count @file)
+                                             :read-range (range-fn)})
+        theirs (acq/source-for registry quads {:cid cid :tenant "globex"
+                                               :size-bytes (count @file)
+                                               :read-range (range-fn)})]
+    (is (:ok? mine))
+    (is (false? (:ok? theirs)))
+    (is (= theirs (acq/source-for registry quads
+                                  {:cid "bafkreibpugzxpp3hgcpwlzphxsozeq2fzjsi33comandtcu4wsl5zorxmu"
+                                   :tenant "globex"}))
+        "a real object the caller does not hold, and one that does not exist,
+         are the same answer")
+    (testing "and the refused caller moved no bytes of a file that is right there"
+      (reset! meter nil)
+      (acq/source-for registry quads {:cid cid :tenant "globex"
+                                      :size-bytes (count @file)
+                                      :read-range (range-fn)})
+      (is (nil? @meter) "the reader was never constructed, so nothing opened"))))
