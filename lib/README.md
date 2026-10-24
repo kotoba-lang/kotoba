@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.mesher` | `kotoba.mesher/src` | `mesher`, `mesher.mc-tables` (Kotoba project library) |
 | `kotoba.kamiEngineSculpt` | `kotoba.kamiEngineSculpt/src` | `kami.paint`, `kami.sculpt` (Kotoba project library) |
 | `kotoba.kamiEngineInputMap` | `kotoba.kamiEngineInputMap/src` | `input-map` (Kotoba project library) |
 | `kotoba.kamiEngineHudGpu` | `kotoba.kamiEngineHudGpu/src` | `ui_gpu` (Kotoba project library) |
