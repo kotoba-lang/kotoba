@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.treasury` | `kotoba.treasury/src` | `treasury.core` (Kotoba project library) |
 | `kotoba.states` | `kotoba.states/src` | `states.execute`, `states.json`, `states.model`, `states.ports` (Kotoba project library) |
 | `kotoba.statechart` | `kotoba.statechart/src` | `statechart.execute`, `statechart.model`, `statechart.ports`, `statechart.validate` (Kotoba project library) |
 | `kotoba.standardModel` | `kotoba.standardModel/src` | `kotoba.sm.complex`, `kotoba.sm.gauge`, `kotoba.sm.gtg`, `kotoba.sm.spinor` (Kotoba project library) |

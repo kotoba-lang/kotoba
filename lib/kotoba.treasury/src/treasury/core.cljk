@@ -1,0 +1,617 @@
+(ns treasury.core
+  "Domain-agnostic USDC payment quoting + on-chain verification + append-only
+  ledger entries (ADR-2607051621). Extracted from gftdcojp/local-murakumo's
+  itonami.cljc: pricing/units (credits-per-usd, plans, verticals, protocol-fee
+  rate, …) stay in the consuming project and are injected as `fee-frac`; this
+  namespace only knows USD, USDC, EVM chains, and a signed append-only run
+  ledger shape.
+
+  No custody: a payer sends USDC from their OWN wallet to a treasury address
+  supplied by the caller (typically a Safe/multisig) — this library never
+  holds keys or moves funds. A payment produces a ledger entry only AFTER
+  on-chain confirmation; an unverified claim stays :pending so a fake or
+  underpaid tx can't confirm anything."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── chains ───────────────────────────────────────────────────────────────
+;; USDC contract + block-explorer API per EVM chain.
+;;
+;; ⚠ DO NOT ASSUME A SAFE EXISTS ON A CHAIN JUST BECAUSE ITS ADDRESS IS FREE
+;; THERE. This comment used to say a Safe's address is the same across chains
+;; (CREATE2), so switching `chain` moved the rail to a cheaper L2 without
+;; changing the recipient. The first half is often true and the CONCLUSION IS
+;; DANGEROUS: a Safe is a CONTRACT, deployed per chain. The address being
+;; unoccupied elsewhere does not mean a Safe is deployed there, and USDC sent to
+;; an address with no code is not recoverable by anyone.
+;;
+;; Measured 2026-07-26 on a real Safe (0x640404B5…A881): deployed on Ethereum
+;; mainnet (v1.4.1), and `eth_getCode` returns EMPTY on BSC, Avalanche, Base,
+;; Polygon, Arbitrum and Optimism. Routing that recipient to an L2 on the strength
+;; of the old comment would have burned the funds.
+;;
+;; So `verify-recipient-deployed` below must pass before a treasury address is used
+;; on a chain it has not already received on.
+
+(def chains
+  {"ethereum" {:chain "ethereum" :usdc "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+               :explorer-api "https://api.etherscan.io/api"
+               :rpc "https://ethereum-rpc.publicnode.com"
+               :fee-hint "gas 高め（$数）— 少額決済には L2 推奨"}
+   "base"     {:chain "base" :usdc "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+               :explorer-api "https://api.basescan.org/api"
+               ;; keyless JSON-RPC verify path (receipt->onchain). Preferred over
+               ;; the explorer API — Basescan V1 is deprecated and Etherscan V2
+               ;; requires a PAID plan for Base (chainid 8453). Primary + fallbacks
+               ;; because Cloudflare Workers sometimes get 403/empty from a single
+               ;; public endpoint (ADR-2607093100 verify-path robustness).
+               :rpc "https://mainnet.base.org"
+               :rpcs ["https://1rpc.io/base"
+                      "https://base.meowrpc.com"
+                      "https://base-rpc.publicnode.com"]
+               :fee-hint "gas 数セント — 少額決済向き"}
+   "arbitrum" {:chain "arbitrum" :usdc "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+               :explorer-api "https://api.arbiscan.io/api"
+               :rpc "https://arbitrum-one-rpc.publicnode.com"
+               :fee-hint "gas 安い"}
+   ;; The one chain here whose money is not money. It exists so a paid path
+   ;; can be exercised end to end without a transfer of funds — a rail whose
+   ;; only proof of life costs $0.05 a run gets exercised once and then
+   ;; assumed.
+   ;;
+   ;; Contract, chain id, symbol and decimals were read off the chain
+   ;; (eth_chainId 0x14a34 = 84532; symbol() "USDC"; decimals() 6) rather
+   ;; than copied from a doc page, because this address is what
+   ;; `receipt->onchain` matches Transfer logs against: a wrong one here does
+   ;; not fail, it silently admits nothing.
+   "base-sepolia"
+   {:chain "base-sepolia" :usdc "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+    :explorer-api "https://api-sepolia.basescan.org/api"
+    ;; The same fallback list `base` has, for the same measured reason: a
+    ;; single public endpoint is not a reliable oracle, and when it does not
+    ;; answer, `receipt->onchain` sees no receipt and the caller reports
+    ;; `the transaction does not exist` to someone who paid. Shipping the
+    ;; testnet with one endpoint would have carried that fragility straight
+    ;; into the rail whose whole purpose is to be exercised often.
+    ;;
+    ;; Each of these was probed for eth_chainId 0x14a34 (84532) on
+    ;; 2026-08-31; a sixth candidate (base-sepolia.public.blastapi.io)
+    ;; answered -32000 and is not listed.
+    :rpc "https://sepolia.base.org"
+    :rpcs ["https://base-sepolia-rpc.publicnode.com"
+           "https://base-sepolia.drpc.org"
+           "https://84532.rpc.thirdweb.com"
+           "https://base-sepolia.gateway.tenderly.co"]
+    :testnet? true
+    :fee-hint "testnet — 価値の無い USDC。faucet で入手する"}})
+
+;; keccak256("Transfer(address,address,uint256)")
+(def transfer-topic
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
+(def default-chain "ethereum")
+
+(defn chain-cfg
+  "Config for CHAIN, or **nil when this library does not know it**.
+
+  `nil` means *unspecified* and takes the default. A NAME that is not in
+  `chains` returns nil, and that distinction is the whole point of this
+  docstring.
+
+  Until 2026-08-31 both cases fell back to Ethereum mainnet, so
+  `(chain-cfg \"base-sepolia\")` answered with Ethereum's USDC contract and
+  Ethereum's RPC. Nothing threw. What happened instead was worse than a
+  throw, in three different places:
+
+    * `receipt->onchain` matched Transfer logs against the WRONG USDC
+      contract, so a real payment contributed no entries and the payer was
+      told the transaction does not exist — `could not answer` printed as
+      `answered, and the answer is no`;
+    * `pending-entry` / `confirmed-entry` wrote `:chain \"ethereum\"` into an
+      append-only ledger for a payment that settled somewhere else;
+    * `crypto-quote` quoted a payment on a chain nobody asked for.
+
+  Callers that cannot proceed without a real config use `cfg!`, which
+  refuses by name."
+  [chain]
+  (if (nil? chain)
+    (get chains default-chain)
+    (get chains chain)))
+
+(defn known-chain? [chain] (some? (chain-cfg chain)))
+
+(defn- cfg!
+  "`chain-cfg`, or throw. For every path where an unknown chain must not
+  become a different chain's answer."
+  [chain]
+  (or (chain-cfg chain)
+      (throw (ex-info (str "unknown chain: " (pr-str chain))
+                      {:type :treasury/unknown-chain
+                       :chain chain
+                       :known (vec (sort (keys chains)))}))))
+
+(defn chain-rpcs
+  "Ordered keyless JSON-RPC endpoints for `chain`. Primary `:rpc` first, then
+  any `:rpcs` fallbacks (deduped, blanks dropped). Host code should try these
+  in order until eth_getTransactionReceipt returns a receipt.
+
+  Exists because a single public endpoint is not a reliable oracle: measured on
+  nexus-x402 (network-awai/nexus-x402#12), Cloudflare Workers intermittently
+  get 403 or an empty result from one Base RPC, and `receipt->onchain` then
+  sees no receipt — which this library's callers report to the payer as
+  `the transaction does not exist`. A paid buyer being told their payment is
+  not real is the same failure ADR-2608010000's materialized view exists to
+  remove; this is the cheap half of that fix, and it belongs here rather than
+  in each host, because every host that verifies a Base payment needs it.
+
+  An unknown chain throws rather than returning `[]`. An empty list means
+  `this chain has no endpoints configured`, and a host walking it would
+  report `no receipt` — which is `tx-not-found` to the payer, i.e. the same
+  lie `chain-cfg` used to tell one level down."
+  [chain]
+  (let [{:keys [rpc rpcs]} (cfg! chain)]
+    (into [] (distinct (remove #(or (nil? %) (= % "")) (cons rpc (or rpcs [])))))))
+
+(def crypto-asset {:asset "USDC" :decimals 6 :custody "safe-multisig"})
+(def usdc-per-usd 1)
+(def min-confirmations 3)
+
+;; ── recipient safety ──────────────────────────────────────────────────────
+
+(defn code-request
+  "An `eth_getCode` JSON-RPC request for `address`, as data (this library performs
+  no I/O — the caller supplies the transport).
+
+  Use it before trusting a treasury address on a chain it has not received on
+  before. A Safe or any other contract recipient exists ONLY where it was
+  deployed; funds sent to an address with no code on that chain are unrecoverable."
+  [address]
+  {:jsonrpc "2.0" :id 1 :method "eth_getCode" :params [address "latest"]})
+
+(defn contract-deployed?
+  "Does an `eth_getCode` result indicate deployed code? An empty result (0x, or
+  nil) means the address is an EOA or nothing at all ON THIS CHAIN."
+  [code-result]
+  (boolean (and code-result
+                (string? code-result)
+                (> (count (str/replace code-result #"^0x" "")) 0))))
+
+(defn verify-recipient-deployed
+  "Check that a contract treasury recipient actually exists on the chain it is
+  about to be paid on. Returns `{:ok? true}` or
+  `{:ok? false :problem :recipient-has-no-code …}`.
+
+  `expect-contract?` is the caller's own statement about what the recipient IS. A
+  Safe/multisig must be a contract, so a missing code result is fatal. A plain EOA
+  recipient legitimately has no code, and passing `false` says so explicitly rather
+  than letting the check silently pass for both cases."
+  [{:keys [address chain expect-contract?] :or {expect-contract? true}} code-result]
+  (let [deployed? (contract-deployed? code-result)]
+    (cond
+      (and expect-contract? (not deployed?))
+      {:ok? false :problem :recipient-has-no-code :address address :chain chain
+       :note (str "no contract code at this address on " chain
+                  " — a Safe is deployed PER CHAIN, and funds sent to an address"
+                  " with no code there cannot be moved by anyone")}
+
+      (and (not expect-contract?) deployed?)
+      {:ok? false :problem :recipient-unexpectedly-a-contract :address address :chain chain
+       :note "caller said EOA but this address has code; confirm what it is"}
+
+      :else {:ok? true :deployed? deployed?})))
+
+;; ── fee split (pure pricing primitive — no unit conversion) ────────────────
+
+(defn fee-split
+  "usd + fee-frac (e.g. 0.05 = 5%) -> {:usd :fee :net}. Pure. The caller
+   decides what :net means downstream (credits minted, a registration marked
+   paid, a protocol-fee credit accrued — this library doesn't know)."
+  [usd fee-frac]
+  (let [usd (double usd)
+        fee (* usd (double fee-frac))]
+    {:usd usd :fee fee :net (- usd fee)}))
+
+;; ── quote / pending / confirmed entries ────────────────────────────────────
+
+(defn crypto-quote
+  "usd + fee-frac + treasury address (+ optional chain) -> the payment
+   request as data: how much USDC to send, on which chain, to which treasury,
+   and the fee split. Destination address is always caller-supplied, never
+   hardcoded. Pure."
+  ([usd fee-frac treasury] (crypto-quote usd fee-frac treasury default-chain))
+  ([usd fee-frac treasury chain]
+   (let [{:keys [usd fee net]} (fee-split usd fee-frac)
+         {:keys [chain usdc fee-hint]} (cfg! chain)]
+     (merge crypto-asset
+            {:usd usd :chain chain :usdc-contract usdc :fee-hint fee-hint
+             :treasury treasury
+             :amount (* usd usdc-per-usd)
+             :fee fee :net net}))))
+
+(defn pending-entry
+  "An UNVERIFIED crypto claim -> a pending ledger record (nothing confirmed
+   yet). `kind` tags what this payment is FOR (:topup, :protocol-fee,
+   :registration, …) — this library is agnostic to the meaning, it only
+   round-trips the tag."
+  ([kind did usd tx] (pending-entry kind did usd tx default-chain))
+  ([kind did usd tx chain]
+   {:run/kind :pending
+    :run/for kind
+    :treasury/pending-payer (name did)
+    :treasury/payment {:asset (:asset crypto-asset) :chain (:chain (cfg! chain))
+                        :usd usd :tx tx}
+    :treasury/proof :crypto-pending}))
+
+(defn confirmed-entry
+  "A CONFIRMED crypto payment -> a ledger record. `net`/`fee` come from
+   fee-split; the caller decides what :net triggers downstream."
+  ([kind did usd fee-frac tx] (confirmed-entry kind did usd fee-frac tx default-chain))
+  ([kind did usd fee-frac tx chain]
+   (let [{:keys [fee net]} (fee-split usd fee-frac)]
+     {:run/kind :confirmed
+      :run/for kind
+      :treasury/payer (name did)
+      :treasury/net net
+      :treasury/fee fee
+      :treasury/payment {:asset (:asset crypto-asset) :chain (:chain (cfg! chain))
+                          :usd usd :tx tx}
+      :treasury/proof :crypto-confirmed})))
+
+;; ── verification ────────────────────────────────────────────────────────
+
+(defn- run-payment [run]
+  (or (:treasury/payment run) (get run "treasury/payment") (:payment run) (get run "payment") {}))
+
+(defn- run-proof [run]
+  (or (:treasury/proof run) (get run "treasury/proof") (:proof run) (get run "proof")))
+
+(defn- run-kind* [run]
+  (or (:run/kind run) (get run "run/kind") (:kind run) (get run "kind")))
+
+(defn- pending-payer [run]
+  (or (:treasury/pending-payer run) (get run "treasury/pending-payer")))
+
+(defn verify-payment
+  "Decide whether a PENDING crypto claim is confirmed on-chain. Pure — the
+   on-chain tx record is INJECTED (a real RPC/indexer fetches it; tests stub
+   it), so the decision logic is unit-testable without a chain.
+     pending : a pending-entry
+     onchain : {:to <addr> :amount <usdc> :confirmations <n> :asset \"USDC\"}
+               (nil = tx not found yet -> not confirmed)
+     opts    : {:treasury <addr> :fee-frac <n> :min-confirmations <n>}
+   -> {:ok? bool :reason kw :entry <confirmed-entry when ok>}. Wrong recipient
+   / underpaid / too few confirmations / wrong (or missing) asset all reject —
+   a fake or insufficient tx cannot confirm.
+
+   The :asset check exists because onchain's two real producers differ in how
+   trustworthy their :asset is: receipt->onchain only matches a Transfer log
+   whose contract address equals the chain's real USDC contract, so its
+   :asset is always genuinely \"USDC\"; but etherscan-row->onchain copies
+   whatever tokenSymbol string is in the explorer-API row verbatim, which is
+   attacker-chosen ERC-20 metadata, not chain-enforced identity -- a payer
+   could send a worthless token whose symbol happens to be \"USDC\", or any
+   token at all if this check didn't exist. Confirmed bug this closes: the
+   :asset field this docstring has always documented onchain as carrying was
+   never actually read anywhere in this function."
+  [pending onchain {:keys [treasury fee-frac min-confirmations]
+                    :or {min-confirmations min-confirmations}}]
+  (let [pay (run-payment pending)
+        want-usd (or (:usd pay) (get pay "usd"))
+        did (pending-payer pending)
+        kind (or (:run/for pending) (get pending "run/for"))
+        lc (fn [x] (some-> x str str/lower))
+        to (or (:to onchain) (get onchain "to"))
+        amount (or (:amount onchain) (get onchain "amount") 0)
+        confs (or (:confirmations onchain) (get onchain "confirmations") 0)
+        asset (or (:asset onchain) (get onchain "asset"))
+        tx (or (:tx pay) (get pay "tx"))
+        chain (or (:chain pay) (get pay "chain") default-chain)]
+    (cond
+      (nil? onchain)                {:ok? false :reason :tx-not-found}
+      (not= (lc to) (lc treasury))  {:ok? false :reason :wrong-recipient}
+      (< (double amount) (double (* want-usd usdc-per-usd)))
+                                    {:ok? false :reason :underpaid}
+      (< confs min-confirmations)  {:ok? false :reason :insufficient-confirmations}
+      (not= (lc asset) (lc (:asset crypto-asset)))
+                                    {:ok? false :reason :wrong-asset}
+      :else {:ok? true :reason :confirmed
+             :entry (confirmed-entry kind did want-usd fee-frac tx chain)})))
+
+(defn pending-payments
+  "Ledger runs -> the crypto claims still awaiting confirmation: pending
+   entries whose tx has NOT yet been confirmed. Pure and idempotent — a
+   confirmed tx drops off, so a verifier loop never double-confirms."
+  [runs]
+  (let [confirmed-txs (into #{}
+                             (comp (filter #(#{:crypto-confirmed "crypto-confirmed"} (run-proof %)))
+                                   (keep (comp :tx run-payment)))
+                             runs)]
+    (for [r runs
+          :when (#{:pending "pending"} (run-kind* r))
+          :let [tx (:tx (run-payment r))
+                did (pending-payer r)
+                usd (or (:usd (run-payment r)) (get (run-payment r) "usd"))]
+          :when (and tx did (not (confirmed-txs tx)))]
+      {:did did :usd usd :tx tx})))
+
+(defn payment-status
+  "A payer's crypto payment status from the ledger -> {:pending [{:tx :usd}]
+   :confirmed [{:tx :net}]}. Pure."
+  [runs did]
+  (let [mine? (fn [r] (= (name did)
+                        (name (or (pending-payer r)
+                                  (:treasury/payer r) (get r "treasury/payer") ""))))]
+    {:pending (vec (for [r runs
+                         :when (and (= "crypto-pending" (str (name (or (run-proof r) :none)))) (mine? r))]
+                     {:tx (:tx (run-payment r)) :usd (:usd (run-payment r))}))
+     :confirmed (vec (for [r runs
+                           :when (and (= "crypto-confirmed" (str (name (or (run-proof r) :none)))) (mine? r))]
+                       {:tx (:tx (run-payment r))
+                        :net (or (:treasury/net r) (get r "treasury/net"))}))}))
+
+(defn etherscan-row->onchain
+  "Parse one Etherscan-family (Etherscan/Basescan/Arbiscan share the same
+   `account/tokentx` shape) incoming ERC-20 transfer row into the on-chain
+   record verify-payment expects. USDC has 6 decimals. Pure."
+  [row]
+  (let [g #(or (get row %) (get row (keyword %)))
+        decimals (or (some-> (g "tokenDecimal") str parse-long) 6)
+        raw (or (some-> (g "value") str parse-long) 0)]
+    {;; the same field, from the explorer row's own `from` column, so a
+     ;; caller cannot tell which producer built the record by whether the
+     ;; payer is in it
+     :from (g "from")
+     :to (g "to")
+     :amount (/ (double raw) (Math/pow 10 decimals))
+     :confirmations (or (some-> (g "confirmations") str parse-long) 0)
+     :asset (g "tokenSymbol")
+     :tx (g "hash")}))
+
+;; ── keyless JSON-RPC verify path (no explorer API) ─────────────────────────
+;; The host fetches eth_getTransactionReceipt (the tx) and eth_blockNumber (the
+;; head) from the chain's public :rpc and passes both here. Pure parsing of the
+;; USDC Transfer log → the same on-chain record etherscan-row->onchain yields,
+;; so verify-payment is unchanged. Survives Basescan V1 deprecation + avoids
+;; Etherscan V2's paid-plan requirement for Base.
+
+(defn hex->long
+  "Parse a 0x-prefixed hex string to a long (nil on blank/garbage). USDC micros
+   stay well under 2^53 so long is safe for amounts and block numbers. Public
+   so callers parsing an eth_blockNumber RPC result (the `current-block` arg
+   to receipt->onchain below) use this validating parser instead of a raw
+   js/parseInt, which silently yields NaN on malformed/missing RPC output
+   instead of nil."
+  [h]
+  (let [s (some-> h str str/lower (str/replace #"^0x" ""))]
+    (when (and s (not= s "") (re-matches #"[0-9a-f]+" s))
+      #?(:clj (Long/parseLong s 16)
+         :cljs (js/parseInt s 16)))))
+
+(defn- finite-number?
+  "true for a real, non-NaN number. NaN is truthy in Clojure/ClojureScript's
+   `if`/`and`/`when` (only nil/false are falsy) and NaN comparisons
+   (`<`/`>`/`>=`/`<=`) are always false -- an un-validated NaN silently
+   passes any `(and ... x)` truthiness gate yet defeats any numeric bound
+   check downstream. receipt->onchain guards `current-block` with this
+   because it is EXTERNAL I/O-derived (a caller-supplied eth_blockNumber
+   result) and a caller might not use hex->long to parse it.
+
+   NOT `(= x x)` -- that idiom reliably catches NaN on :cljs, but on :clj a
+   boxed Double NaN passed through a function boundary compares `.equals`
+   (which Java specifically defines as NaN.equals(NaN) => true), not IEEE754
+   `==` (NaN == NaN => false) -- `(= x x)` silently returns true for NaN
+   there instead of false, confirmed empirically against a real JVM (a
+   top-level `(let [x Double/NaN] (= x x))` returns false, but the exact
+   same value routed through a fn argument returns true). Double/isNaN
+   sidesteps this entirely."
+  [x]
+  (and (number? x) #?(:clj (not (Double/isNaN (double x)))
+                       :cljs (not (js/isNaN x)))))
+
+(defn- topic->address
+  "A 32-byte log topic (0x + 24 zero-bytes + 20-byte address) → 0x<40hex> addr."
+  [topic]
+  (let [s (some-> topic str str/lower (str/replace #"^0x" ""))]
+    (when (and s (>= (count s) 40))
+      (str "0x" (subs s (- (count s) 40))))))
+
+(defn receipt->onchain
+  "Parse an eth_getTransactionReceipt result + the current head block number
+   into the on-chain record verify-payment expects, for the USDC Transfer to
+   the treasury. Pure — the RPC I/O is the host's. Returns nil when the tx
+   reverted or carries no matching USDC Transfer log. The record carries
+   `:from` (Transfer topics[1], the payer) as well as `:to`.
+     receipt      : {\"status\" \"0x1\" \"blockNumber\" \"0x…\"
+                     \"transactionHash\" \"0x…\"
+                     \"logs\" [{\"address\" \"0x…\" \"topics\" [t0 from to] \"data\" \"0x…\"}]}
+     current-block: integer head block (from eth_blockNumber)
+     usdc-contract: the chain's USDC address"
+  [receipt current-block usdc-contract]
+  (let [g #(or (get receipt %) (get receipt (keyword %)))
+        status (g "status")
+        logs (or (g "logs") [])
+        usdc (str/lower (str usdc-contract))
+        tx-block (hex->long (g "blockNumber"))
+        transfer (some (fn [lg]
+                         (let [la #(or (get lg %) (get lg (keyword %)))
+                               topics (or (la "topics") [])]
+                           (when (and (= (str/lower (str (la "address"))) usdc)
+                                      (= (str/lower (str (first topics))) transfer-topic)
+                                      (>= (count topics) 3))
+                             lg)))
+                       logs)]
+    (when (and transfer
+               ;; success only ("0x1"); "0x0" = reverted → nil (cannot confirm)
+               (contains? #{"0x1" 1 "0x01"} status)
+               tx-block
+               ;; NOT just `current-block` -- a NaN current-block (e.g. a
+               ;; caller that parsed a failed/malformed eth_blockNumber RPC
+               ;; result with a raw js/parseInt instead of hex->long) is
+               ;; truthy here and would otherwise flow into :confirmations
+               ;; below as NaN, silently defeating verify-payment's
+               ;; `(< confs min-confirmations)` guard (NaN < n is always
+               ;; false), so an unconfirmed payment could be accepted as
+               ;; confirmed.
+               (finite-number? current-block))
+      (let [la #(or (get transfer %) (get transfer (keyword %)))
+            topics (la "topics")
+            raw (or (hex->long (la "data")) 0)]
+        {;; topics[1] is the Transfer's `from`, i.e. who paid. `logs->view`
+         ;; has always reported it and this producer did not, so the two
+         ;; halves of this library disagreed about whether the payer is part
+         ;; of an on-chain record. Three vendored copies carried the missing
+         ;; half as a LOCAL EDIT -- net-kotobase's gateway, cloud-murakumo and
+         ;; cloud-murakumo-llms-codex -- which is exactly what makes a copy
+         ;; unverifiable against any upstream commit, and a local edit here is
+         ;; invisible to the other repos running the same verify path.
+         :from (topic->address (nth topics 1))
+         :to (topic->address (nth topics 2))
+         :amount (/ (double raw) (Math/pow 10 6))     ; USDC 6 decimals
+         :confirmations (max 0 (inc (- current-block tx-block)))
+         :asset "USDC"
+         :tx (g "transactionHash")}))))
+
+;; ── materialized view: USDC transfers to a watched address ──────────────
+;;
+;; com-junkawasaki/root ADR-2608010000. `receipt->onchain` answers ONE question
+;; by asking a chain node about ONE transaction; every verification is a live
+;; dependency on an RPC endpoint. That dependency failed in production
+;; 2026-08-01 (Cloudflare egress rate-limited by every public Base RPC) and the
+;; failure was reported to the payer as "your transaction does not exist".
+;;
+;; The alternative is not to hold the chain — full Base archive grows ~500 GB
+;; per week, which is unbounded. It is to hold a VIEW: the confirmed USDC
+;; Transfers into addresses we actually watch. That is bounded by our own
+;; payment count, not by chain activity, and it is derived from LOGS rather
+;; than state, which is the cheap half of a node's job.
+;;
+;; The view is content-addressed and therefore memoizable forever: a view over
+;; a fixed block range never changes, so a digest of it is a stable key and
+;; there is no invalidation path to get wrong (ADR-2607310900's property).
+;;
+;; THE INVARIANT THAT MATTERS MOST: a view knows a block RANGE, and a question
+;; about a transaction outside that range is :not-covered — NEVER :not-found.
+;; Collapsing those is the same defect class already fixed once on this path
+;; (an RPC failure reported as :tx-not-found), and it is worse here, because a
+;; view is by construction incomplete.
+
+(defn logs->view
+  "Raw `eth_getLogs` results → a materialized view of confirmed USDC Transfers
+   into `watched` addresses. Ingest-agnostic: the caller fetched these logs from
+   a node, a relay, an archive, wherever — this is pure.
+
+     logs    : [{\"address\" \"0x…\" \"topics\" [t0 from to] \"data\" \"0x…\"
+                 \"blockNumber\" \"0x…\" \"transactionHash\" \"0x…\"}]
+     opts    : {:chain \"base\" :watched #{addr…} :from-block n :to-block n}
+
+   → {:chain :from-block :to-block :watched #{…} :entries [{…}]}
+
+   Only logs on the chain's REAL USDC contract and carrying the canonical
+   Transfer topic are admitted, so a worthless token whose symbol happens to be
+   \"USDC\" contributes nothing — the same reasoning `verify-payment`'s :asset
+   check exists for, applied at ingest instead of at decision time."
+  [logs {:keys [chain watched from-block to-block]}]
+  (let [usdc (str/lower (str (:usdc (cfg! chain))))
+        watched (into #{} (map #(str/lower (str %))) watched)
+        entries (->> logs
+                     (keep (fn [lg]
+                             (let [g #(or (get lg %) (get lg (keyword %)))
+                                   topics (or (g "topics") [])
+                                   to (some-> (nth topics 2 nil) topic->address)]
+                               (when (and (= (str/lower (str (g "address"))) usdc)
+                                          (= (str/lower (str (first topics))) transfer-topic)
+                                          (>= (count topics) 3)
+                                          (contains? watched to))
+                                 {:tx (str/lower (str (g "transactionHash")))
+                                  :block (hex->long (g "blockNumber"))
+                                  :from (topic->address (nth topics 1))
+                                  :to to
+                                  :micros (or (hex->long (g "data")) 0)}))))
+                     (filter :block)
+                     ;; canonical order so the digest is deterministic
+                     (sort-by (juxt :block :tx :from :micros))
+                     vec)]
+    {:chain chain :watched watched
+     :from-block from-block :to-block to-block
+     :entries entries}))
+
+(defn view-digest
+  "A stable content address for `view`. Two views over the same range with the
+   same entries digest identically regardless of the order the logs arrived in
+   (logs->view canonicalises), which is what makes this usable as a memo key.
+
+   Deliberately a plain string built from the canonical fields rather than a
+   cryptographic hash: this library is zero-dep and runs on the JVM, in a
+   Worker and under nbb, and a caller who wants a CID can hash this. What
+   matters here is that the identity is CANONICAL, not that it is short."
+  [{:keys [chain from-block to-block watched entries]}]
+  (str "usdc-transfer-view/v1:" chain
+       ":" from-block "-" to-block
+       ":" (str/join "," (sort watched))
+       ":" (count entries)
+       ":" (str/join "|" (map #(str (:block %) "," (:tx %) "," (:from %) "," (:micros %)) entries))))
+
+(defn view-covers?
+  "Does `view` cover `block`? A nil block is not covered — an unknown position
+   cannot be inside a known range."
+  [{:keys [from-block to-block]} block]
+  (boolean (and (number? block) (number? from-block) (number? to-block)
+                (<= from-block block to-block))))
+
+(defn view-lookup
+  "Find the entry for `tx` in `view`.
+   → {:status :found :entry {…}} | {:status :not-in-view}
+
+   `:not-in-view` deliberately does NOT say :not-found. Whether that means the
+   transfer does not exist, or merely that this view does not cover it, is a
+   question only `view-covers?` can answer — and it needs the tx's block, which
+   is exactly what we do not have when we cannot find it. The caller must treat
+   :not-in-view as INCONCLUSIVE unless it has independent evidence of the
+   block."
+  [{:keys [entries]} tx]
+  (let [t (some-> tx str str/lower)]
+    (if-let [e (first (filter #(= (:tx %) t) entries))]
+      {:status :found :entry e}
+      {:status :not-in-view})))
+
+(defn verify-from-view
+  "Verify a payment against a materialized view instead of a live chain query.
+
+     view      from logs->view
+     opts      {:tx :treasury :usd :head-block :min-confirmations}
+
+   → {:ok? bool :reason kw :onchain {…}}
+
+   `:reason` distinguishes THREE outcomes that must never be collapsed:
+     :confirmed      the view has it and it satisfies the requirements
+     :not-in-view    the view does not contain it — INCONCLUSIVE, ask a node
+     :underpaid / :wrong-recipient / :insufficient-confirmations
+                     the view has it and it FAILS — conclusive, do not re-ask
+
+   The middle one is the whole point. A view is incomplete by construction, so
+   `absent from my index` is not evidence about the chain. Answering
+   :tx-not-found there would tell someone who has paid that their payment does
+   not exist — the exact production defect this design exists to remove."
+  [view {:keys [tx treasury usd head-block min-confirmations]
+         :or {min-confirmations min-confirmations}}]
+  (let [{:keys [status entry]} (view-lookup view tx)]
+    (if (= :not-in-view status)
+      {:ok? false :reason :not-in-view}
+      (let [confs (if (and (number? head-block) (number? (:block entry)))
+                    (max 0 (inc (- head-block (:block entry))))
+                    0)
+            onchain {:to (:to entry)
+                     :amount (/ (double (:micros entry)) (Math/pow 10 6))
+                     :confirmations confs
+                     :asset "USDC"
+                     :tx (:tx entry)}]
+        (cond
+          (not= (str/lower (str (:to entry))) (str/lower (str treasury)))
+          {:ok? false :reason :wrong-recipient :onchain onchain}
+
+          (< (:micros entry) (* (double usd) usdc-per-usd 1e6))
+          {:ok? false :reason :underpaid :onchain onchain}
+
+          (< confs min-confirmations)
+          {:ok? false :reason :insufficient-confirmations :onchain onchain}
+
+          :else {:ok? true :reason :confirmed :onchain onchain})))))
