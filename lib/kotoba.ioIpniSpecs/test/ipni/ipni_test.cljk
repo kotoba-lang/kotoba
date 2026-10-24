@@ -1,0 +1,416 @@
+(ns ipni.ipni-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipni.ad :as ad]
+            [ipni.advertise :as advertise]
+            [ipni.announce :as announce]
+            [ipni.find :as find]
+            [ipni.hamt :as hamt]
+            [ipni.head :as head]
+            [ipni.http :as http]
+            [ipni.metadata :as metadata]))
+
+(def content-cid "bafkreicidcontent000000000000000000000000000000000000000")
+(def peer "12D3KooWproviderpeer")
+(def retrieval ["/dns4/ipfs.kotobase.net/tcp/443/https"])
+(def publisher
+  "A PUBLISHER address: the ipni host, and carrying a peer.
+
+  It used to be `/dns4/ipfs.kotobase.net/tcp/443/https` -- the retrieval
+  gateway, with no `/p2p/`. That fixture was the exact mistake this
+  library's docstrings warn about, and cid.contact rejects it twice over
+  (`invalid p2p multiaddr`, and a chain that is not there)."
+  ["/dns4/ipni.kotobase.net/tcp/443/https/p2p/12D3KooWTestPublisherPeerId"])
+
+(defn- addr-bytes
+  "Stand-in for multiformats.multiaddr/->octets. The real encoder is
+  injected; these tests only need it to be deterministic."
+  [s] (mapv #(bit-and (int %) 0xFF) (seq s)))
+(def mh [0x12 0x20 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+         17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32])
+
+(def rec {:cid content-cid :peer peer :addrs retrieval})
+
+;; ── metadata ──────────────────────────────────────────────────────────────
+
+(deftest gateway-http-carries-a-zero-length-payload
+  ;; Two bytes was this library's answer until 2026-09-06 and it is the one
+  ;; IPNI.md's prose implies ("no following metadata"). go-libipni v0.8.2 --
+  ;; what the indexers run -- rejects it: `expected 3 readable bytes but read
+  ;; 2`. Its `ipfsGatewayHttpBytes` is the identifier plus varint(0), so the
+  ;; payload is empty and its LENGTH is still on the wire.
+  (is (= [0xA0 0x12 0x00] (metadata/gateway-http-bytes)))
+  (is (metadata/gateway-http? (metadata/gateway-http-bytes)))
+  (is (= 0x0920 (:protocol (metadata/decode (metadata/gateway-http-bytes)))))
+  (is (= "transport-ipfs-gateway-http"
+         (:name (metadata/decode (metadata/gateway-http-bytes))))))
+
+(deftest empty-metadata-is-not-protocol-zero
+  (is (= :empty (:error (metadata/decode []))))
+  (is (= :negative (:error (metadata/uvarint-encode -1)))))
+
+;; ── IPQ: the selection transport, in the private-use area ─────────────────
+
+(deftest ipq-code-sits-inside-the-multicodec-private-use-area
+  ;; multicodec README, Reserved Code Ranges: 0x300000-0x3FFFFF is
+  ;; "reserved for internal use by applications and will never be assigned any
+  ;; meaning as part of the Multicodec specification". A code outside it that
+  ;; the table does not carry is squatting, not a private extension.
+  (is (<= 0x300000 metadata/ipq-selection-http 0x3FFFFF))
+  (is (= 0x0940 metadata/ipq-selection-http-registration-request))
+  (is (zero? (mod metadata/ipq-selection-http-registration-request 0x10)))
+  (is (= metadata/ipq-selection-http-registration-request
+         (- metadata/ipq-selection-http 0x300000))))
+
+(deftest ipq-metadata-is-identifier-length-then-profile
+  ;; Pinned as bytes, not recomputed from the constants: recomputing asserts
+  ;; that the encoder is self-consistent, which is not the claim. The claim is
+  ;; that THESE bytes go on the wire, and they were measured -- go-libipni
+  ;; accepts `a01200c092c0010101` and remarshals it byte-identically, and
+  ;; rejects the same thing without the length byte with EOF.
+  (is (= [0xC0 0x92 0xC0 0x01 0x01 0x01] (metadata/ipq-selection-http-bytes)))
+  (let [d (metadata/decode-sequence (metadata/ipq-selection-http-bytes))]
+    (is (true? (:ok? d)))
+    (is (= [metadata/ipq-selection-http] (mapv :protocol (:entries d))))
+    (is (= [[1]] (mapv :payload (:entries d))))))
+
+(deftest the-metadata-kotobase-should-publish
+  (is (= [0xA0 0x12 0x00 0xC0 0x92 0xC0 0x01 0x01 0x01]
+         (metadata/kotobase-metadata-bytes)))
+  (let [d (metadata/decode-sequence (metadata/kotobase-metadata-bytes))]
+    (is (true? (:ok? d)))
+    (is (= [metadata/gateway-http metadata/ipq-selection-http]
+           (mapv :protocol (:entries d))))
+    (is (true? (:ordered? d)) "0x0920 < 0x300940, the order the spec asks for")
+    (is (= [[] [1]] (mapv :payload (:entries d))))))
+
+(deftest the-metadata-kotobase-publishes-today-is-well-formed
+  ;; Measured 2026-09-06 on the live advertisement `bafyreiaupk64…`: A0 12 00.
+  ;; This test asserted the OPPOSITE when it was first written -- that the third
+  ;; byte was a stray, because IPNI.md says the gateway has "no following
+  ;; metadata". go-libipni settled it: A0 12 00 is accepted and A0 12 is not.
+  ;; The prose describes the payload; the wire also carries its length.
+  (let [live [0xA0 0x12 0x00]
+        d (metadata/decode-sequence live)]
+    (is (true? (:ok? d)))
+    (is (= [metadata/gateway-http] (mapv :protocol (:entries d))))
+    (is (= [[]] (mapv :payload (:entries d))))
+    (is (= live (metadata/gateway-http-bytes))
+        "and this library now agrees with the wire instead of with the prose"))
+  (is (= :not-ipq (:reason (metadata/read-ipq [0xA0 0x12 0x00])))
+      "IPQ is genuinely absent from it — an answer, not a parse failure"))
+
+(deftest read-ipq-keeps-four-answers-apart
+  (testing "ours alone, at a profile we implement"
+    (let [r (metadata/read-ipq (metadata/ipq-selection-http-bytes))]
+      (is (true? (:ok? r)))
+      (is (= 1 (:profile r)))))
+  (testing "ours ALONGSIDE the gateway — the shape that goes on the wire"
+    ;; Reading only the first entry cannot find IPQ here, which is what this
+    ;; function did when it landed. One transport is the easy case; two is the
+    ;; case the spec exists for.
+    (let [r (metadata/read-ipq (metadata/kotobase-metadata-bytes))]
+      (is (true? (:ok? r)))
+      (is (= 1 (:profile r)))))
+  (testing "another transport is :not-ipq, and says what it did find"
+    (let [r (metadata/read-ipq (metadata/gateway-http-bytes))]
+      (is (false? (:ok? r)))
+      (is (= :not-ipq (:reason r)))
+      (is (= [metadata/gateway-http] (:protocols r)))))
+  (testing "a newer profile is NOT the same answer as a different transport"
+    (let [r (metadata/read-ipq (metadata/ipq-selection-http-bytes 99))]
+      (is (false? (:ok? r)))
+      (is (= :profile-unsupported (:reason r)))
+      (is (= 99 (:profile r)))
+      (is (not= :not-ipq (:reason r)))))
+  (testing "could not be read is NOT the same answer as read and IPQ is absent"
+    (is (= :undecodable (:reason (metadata/read-ipq []))))
+    (is (= :undecodable (:reason (metadata/read-ipq [0xC0 0x92 0xC0 0x01])))
+        "our identifier with no length after it is truncated, not profile 0")
+    (is (not= :not-ipq (:reason (metadata/read-ipq []))))))
+
+(deftest bitswap-is-unframed-and-cannot-be-concatenated
+  ;; The exception, and it is in the reference itself: `bitswapBytes` is the
+  ;; bare identifier with no length, so nothing can follow it. Measured:
+  ;; go-libipni rejects `801200a01200`. Refusing to emit it is better than
+  ;; emitting bytes we know an indexer will not read.
+  (is (= [0x80 0x12] (metadata/entry-bytes metadata/bitswap)))
+  (let [d (metadata/decode-sequence (metadata/entry-bytes metadata/bitswap))]
+    (is (false? (:ok? d)))
+    (is (= :unframed (:reason d))))
+  (let [r (metadata/encode-sequence [{:protocol metadata/bitswap :payload []}
+                                     {:protocol metadata/gateway-http :payload []}])]
+    (is (= :unframed-in-sequence (:error r)))))
+
+(deftest a-truncated-payload-is-refused-not-shortened
+  (let [truncated (into (metadata/gateway-http-bytes)
+                        [0xC0 0x92 0xC0 0x01 0x04 0x01])   ; declares 4, carries 1
+        d (metadata/decode-sequence truncated)]
+    (is (false? (:ok? d)))
+    (is (= :truncated (:reason d)))
+    (is (= metadata/ipq-selection-http (:protocol d)))
+    (is (= [metadata/gateway-http] (mapv :protocol (:entries d)))
+        "the entry before it read fine — the answer is still refused")))
+
+(deftest writing-is-strict-about-order-where-reading-is-not
+  (testing "encode refuses to reorder for the caller"
+    (is (= :out-of-order
+           (:error (metadata/encode-sequence
+                    [{:protocol metadata/ipq-selection-http :payload [1]}
+                     {:protocol metadata/gateway-http :payload []}])))))
+  (testing "and refuses a protocol announced twice"
+    (is (= :duplicate-protocol
+           (:error (metadata/encode-sequence
+                    [{:protocol metadata/gateway-http :payload []}
+                     {:protocol metadata/gateway-http :payload []}])))))
+  (testing "reading reports the order instead of rejecting it"
+    ;; go-libipni accepts unordered input and sorts it on remarshal, so
+    ;; refusing here would reject data that is live somewhere.
+    (let [unordered (into (metadata/ipq-selection-http-bytes)
+                          (metadata/gateway-http-bytes))
+          d (metadata/decode-sequence unordered)]
+      (is (true? (:ok? d)))
+      (is (false? (:ordered? d)))
+      (is (true? (:ok? (metadata/read-ipq unordered)))))))
+
+;; ── advertisement does not rewrite the content CID ────────────────────────
+
+(deftest advertisement-keeps-the-content-cid
+  (let [a (ad/advertisement {:cid content-cid :peer peer :addrs retrieval
+                             :context-id "pin:t1" :entries [mh]})]
+    (is (= content-cid (:cid a)))
+    (is (false? (:mutates-cid? a)))
+    (is (= :ipni.advertisement (:schema a)))
+    ;; three bytes since 2026-09-06: identifier, zero length, no payload.
+    ;; go-libipni rejects the two-byte form this line used to pin.
+    (is (= [0xA0 0x12 0x00] (:metadata a)))))
+
+(deftest advertisement-refuses-empty-entries-unless-rm
+  (is (= :empty-entries
+         (:error (ad/advertisement {:cid content-cid :peer peer :addrs retrieval
+                                    :context-id "pin:t1"}))))
+  (let [rm (ad/advertisement {:cid content-cid :peer peer :addrs retrieval
+                              :context-id "pin:t1" :is-rm true})]
+    (is (true? (:is-rm rm)))
+    (is (= content-cid (:cid rm)))))
+
+(deftest advertisement-refuses-missing-context-id
+  (is (= :invalid-context-id
+         (:error (ad/advertisement {:cid content-cid :peer peer :addrs retrieval
+                                    :entries [mh]})))))
+
+(deftest from-discover-does-not-swap-identity
+  (let [a (ad/from-discover rec {:context-id "pin:t1" :entries [mh]})]
+    (is (= content-cid (:cid a)))
+    (is (= peer (:provider a)))))
+
+;; ── announce message is advertisement CID, not content CID ────────────────
+
+(deftest announce-rejects-a-content-cid-passed-as-cid
+  (is (= :content-cid-is-not-an-advertisement
+         (:error (announce/message {:cid content-cid :addrs publisher
+                                    :addr-encode-fn addr-bytes}))))
+  (let [m (announce/message {:ad-cid "baguqeeraad" :addrs publisher
+                             :addr-encode-fn addr-bytes})]
+    (is (= {"/" "baguqeeraad"} (get-in m [:wire :cid])))
+    (is (= publisher (:addrs m)))))
+
+(deftest announce-refuses-empty-publisher-addrs
+  (is (= :empty-publisher-addrs
+         (:error (announce/message {:ad-cid "baguqeeraad" :addrs []
+                                    :addr-encode-fn addr-bytes})))))
+
+;; ── the wire form, as measured against production cid.contact 2026-08-20 ──
+;; Each of these was sent to https://cid.contact/ingest/announce and the
+;; quoted text is what came back. They are pinned because all three fail as
+;; a bare HTTP 400: a publisher that records only the status learns nothing.
+
+(deftest announce-cid-is-a-dag-json-link-not-a-string
+  ;; sent {"cid": "bafk…"} -> json: cannot unmarshal string into Go value
+  ;; of type struct { CidTarget string "json:\"/\"" }
+  (let [m (announce/message {:ad-cid "baguqeeraad" :addrs publisher
+                             :addr-encode-fn addr-bytes})]
+    (is (map? (get-in m [:wire :cid])))
+    (is (= "baguqeeraad" (get-in m [:wire :cid "/"])))
+    (is (not (string? (get-in m [:wire :cid]))))))
+
+(deftest announce-addrs-are-base64-of-binary-multiaddrs
+  ;; sent the text multiaddr -> illegal base64 data at input byte 10
+  (let [m (announce/message {:ad-cid "baguqeeraad" :addrs publisher
+                             :addr-encode-fn addr-bytes})
+        wire (first (get-in m [:wire :addrs]))]
+    (is (string? wire))
+    (is (re-matches #"[A-Za-z0-9+/]+=*" wire))
+    (is (not= (first publisher) wire) "the text form must not go on the wire")
+    (testing "base64 of exactly what addr-encode-fn returned"
+      (is (= wire (#'ipni.announce/b64 (addr-bytes (first publisher))))))))
+
+(deftest announce-requires-a-p2p-component
+  ;; sent /dns4/host/tcp/443/https -> invalid p2p multiaddr
+  (is (= :missing-p2p-component
+         (:error (announce/message {:ad-cid "baguqeeraad"
+                                    :addrs ["/dns4/ipni.kotobase.net/tcp/443/https"]
+                                    :addr-encode-fn addr-bytes}))))
+  (is (announce/p2p-component? (first publisher)))
+  (is (not (announce/p2p-component? "/dns4/ipni.kotobase.net/tcp/443/https"))))
+
+(deftest announce-without-an-addr-encoder-is-not-a-pass
+  (let [m (announce/message {:ad-cid "baguqeeraad" :addrs publisher})]
+    (is (= :addr-encode-fn-required (:error m)))
+    (is (nil? (:wire m)) "no wire map may escape without a real encoder")))
+
+;; ── HTTP paths ────────────────────────────────────────────────────────────
+
+(deftest publisher-paths-are-ipni-v1
+  (is (= "/ipni/v1/ad/baguqeeraad" (http/ad-path "baguqeeraad")))
+  (is (= "/ipni/v1/head" (http/head-path)))
+  (is (= "https://ipfs.kotobase.net/ipni/v1/ad/baguqeeraad"
+         (http/ad-url "https://ipfs.kotobase.net" "baguqeeraad"))))
+
+(deftest production-announce-is-ingest
+  (is (= "https://cid.contact/ingest/announce"
+         (http/announce-url "https://cid.contact")))
+  (is (= "https://cid.contact/announce"
+         (http/announce-url "https://cid.contact" {:path "/announce"}))))
+
+(deftest providers-url-keeps-the-asked-cid
+  (is (= (str "https://cid.contact/routing/v1/providers/" content-cid)
+         (http/providers-url nil content-cid)))
+  (is (= (str "https://cid.contact/cid/" content-cid)
+         (http/cid-url nil content-cid))))
+
+;; ── HAMT is specified and not silently empty ──────────────────────────────
+
+(deftest hamt-as-set-is-not-an-empty-success
+  (let [r (hamt/as-set [mh])]
+    (is (false? (:ok? r)))
+    (is (= :not-yet-implemented (:error r)))))
+
+(deftest signed-head-requires-a-signer
+  (is (= :sign-fn-required (:error (head/signed-head {:ad-cid "baguqeeraad"}))))
+  (is (= "baguqeeraad"
+         (:ad-cid (head/signed-head {:ad-cid "baguqeeraad" :sign-fn (fn [x] x)})))))
+
+;; ── find: empty is not an outage ──────────────────────────────────────────
+
+(deftest get-providers-does-not-rewrite-cid
+  (let [http-fn (fn [{:keys [url]}]
+                  (is (re-find (re-pattern content-cid) url))
+                  {:status 200
+                   :body {:Providers [{:ID peer :Addrs retrieval}]}})
+        r (find/get-providers http-fn "https://cid.contact/routing/v1" content-cid)]
+    (is (true? (:ok? r)))
+    (is (= content-cid (:cid r)))
+    (is (= content-cid (:cid (first (:providers r)))))
+    (is (false? (:mutates-cid? (first (:providers r)))))))
+
+(deftest find-tells-empty-from-down
+  (let [empty (find/find-providers (constantly {:status 404}) content-cid
+                                   {:routers ["https://cid.contact/routing/v1"]})
+        down (find/find-providers (fn [_] (throw (ex-info "x" {}))) content-cid
+                                  {:routers ["https://cid.contact/routing/v1"]})]
+    (is (true? (:ok? empty)))
+    (is (= [] (:providers empty)))
+    (is (false? (:ok? down)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest get-cid-reads-native-provider-results
+  (let [http-fn (constantly {:status 200
+                             :body {:MultihashResults
+                                    [{:ProviderResults
+                                      [{:ContextID "pin:t1"
+                                        :Metadata [0xA0 0x12]
+                                        :Provider {:ID peer :Addrs retrieval}}]}]}})
+        r (find/get-cid http-fn "https://cid.contact" content-cid)]
+    (is (true? (:ok? r)))
+    (is (= "pin:t1" (:context-id (first (:providers r)))))
+    (is (= content-cid (:cid (first (:providers r)))))))
+
+;; ── advertise putter contract ─────────────────────────────────────────────
+
+(defn- hash-as [s] (fn [_] s))
+
+(deftest advertise-returns-the-content-cid
+  (let [stored (atom nil)
+        http-fn (fn [{:keys [url body]}]
+                  (is (= "https://cid.contact/ingest/announce" url))
+                  (is (= {"/" "baguqeeraad"} (:cid body)))
+                  (is (not= content-cid (get (:cid body) "/")))
+                  {:status 204})
+        r (advertise/advertise http-fn rec
+                               {:hash-fn (hash-as "baguqeeraad")
+                                :publisher-addrs publisher
+                                :addr-encode-fn addr-bytes
+                                :context-id "pin:t1"
+                                :entries [mh]
+                                :put-fn (fn [b] (reset! stored b))})]
+    (is (true? (:ok? r)))
+    (is (= content-cid (:cid r)))
+    (is (= "baguqeeraad" (:ad-cid r)))
+    (is (false? (:mutates-cid? r)))
+    (is (= "baguqeeraad" (:cid @stored)))))
+
+(deftest advertise-missing-hash-fn-is-not-a-pass
+  (let [r (advertise/advertise (constantly {:status 204}) rec
+                               {:publisher-addrs publisher
+                                :addr-encode-fn addr-bytes
+                                :context-id "pin:t1"
+                                :entries [mh]})]
+    (is (false? (:ok? r)))
+    (is (= :hash-fn-required (:reason r)))
+    (is (= content-cid (:cid r)))))
+
+(deftest advertise-rejection-is-not-a-pass
+  (let [r (advertise/advertise (constantly {:status 400 :body "need sig"}) rec
+                               {:hash-fn (hash-as "baguqeeraad")
+                                :publisher-addrs publisher
+                                :addr-encode-fn addr-bytes
+                                :context-id "pin:t1"
+                                :entries [mh]})]
+    (is (false? (:ok? r)))
+    (is (= [] (:accepted r)))))
+
+(deftest advertise-any-indexer-accepting-is-enough
+  (let [http-fn (fn [{:keys [url]}]
+                  (if (re-find #"cid.contact" url)
+                    {:status 400}
+                    {:status 204}))
+        r (advertise/advertise http-fn rec
+                               {:hash-fn (hash-as "baguqeeraad")
+                                :publisher-addrs publisher
+                                :addr-encode-fn addr-bytes
+                                :context-id "pin:t1"
+                                :entries [mh]
+                                :indexers ["https://cid.contact" "https://other.example"]})]
+    (is (true? (:ok? r)))
+    (is (= 1 (count (:accepted r))))))
+
+;; ── base64 golden vector ───────────────────────────────────────────────────
+;; This namespace hand-rolls base64 to stay dependency-free, so it is checked
+;; against a real encoder rather than against itself. The octets are the
+;; actual binary multiaddr for /dns4/ipni.kotobase.net/tcp/443/https, produced
+;; by multiformats.multiaddr/->octets; the expected string is what Node's
+;; Buffer.toString("base64") gave for those same bytes on 2026-08-20.
+;;
+;; A wrong encoder here is not a visible bug -- it is an HTTP 400 from
+;; cid.contact reading "illegal base64 data", which is what this whole
+;; namespace exists to stop producing.
+
+(def ^:private publisher-multiaddr-octets
+  [0x36 0x11 0x69 0x70 0x6e 0x69 0x2e 0x6b 0x6f 0x74 0x6f 0x62 0x61
+   0x73 0x65 0x2e 0x6e 0x65 0x74 0x06 0x01 0xbb 0xbb 0x03])
+
+(deftest base64-agrees-with-a-real-encoder
+  (let [m (announce/message {:ad-cid "baguqeeraad"
+                             :addrs publisher
+                             :addr-encode-fn (constantly publisher-multiaddr-octets)})]
+    (is (= "NhFpcG5pLmtvdG9iYXNlLm5ldAYBu7sD"
+           (first (get-in m [:wire :addrs])))))
+  (testing "padding: 1, 2 and 0 leftover bytes"
+    (let [b64 #(first (get-in (announce/message
+                               {:ad-cid "baguqeeraad" :addrs publisher
+                                :addr-encode-fn (constantly %)})
+                              [:wire :addrs]))]
+      (is (= "AA==" (b64 [0])))
+      (is (= "AAA=" (b64 [0 0])))
+      (is (= "AAAA" (b64 [0 0 0])))
+      (is (= "TWFu" (b64 [0x4d 0x61 0x6e]))))))
