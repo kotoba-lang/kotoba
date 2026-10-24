@@ -1,0 +1,142 @@
+(ns oncrpc.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [oncrpc.core :as rpc]
+            [oncrpc.record :as record]
+            [xdr.core :as xdr]))
+
+(defn- b [& octets] (xdr/->bytes octets))
+
+(defn- call-bytes
+  [{:keys [xid prog vers proc cred]
+    :or {xid 1 prog 100003 vers 3 proc 0
+         cred {:flavor rpc/AUTH-NONE :body (xdr/->bytes [])}}}]
+  (xdr/encode rpc/call-header
+              {:xid xid :mtype rpc/CALL :rpcvers 2
+               :prog prog :vers vers :proc proc
+               :cred cred
+               :verf {:flavor rpc/AUTH-NONE :body (xdr/->bytes [])}}))
+
+;; ── the envelope ──────────────────────────────────────────────────────────
+
+(deftest a-call-reports-where-its-arguments-start
+  (testing "the arguments are program-specific, so the envelope decoder has
+            to hand back an offset rather than a value"
+    (let [header (call-bytes {:xid 42 :proc 1})
+          args (xdr/encode [:uint] 7)
+          whole (xdr/->bytes (concat (map #(bit-and (int %) 0xff) (seq header))
+                                     (map #(bit-and (int %) 0xff) (seq args))))
+          call (rpc/decode-call whole)]
+      (is (= 42 (:xid call)))
+      (is (= 100003 (:prog call)))
+      (is (= 1 (:proc call)))
+      (is (= (count (seq header)) (:args-at call)))
+      (is (= 7 (xdr/decode-value [:uint] whole (:args-at call)))))))
+
+(deftest auth-sys-is-parsed-only-when-it-is-auth-sys
+  (let [parms {:stamp 1 :machinename "mac" :uid 501 :gid 20 :gids [12 20]}
+        cred {:flavor rpc/AUTH-SYS :body (xdr/encode rpc/auth-sys-parms parms)}
+        call (rpc/decode-call (call-bytes {:cred cred}))]
+    (is (= parms (rpc/auth-sys call)))
+    (is (nil? (rpc/auth-sys (rpc/decode-call (call-bytes {})))))))
+
+(deftest a-reply-carries-a-verifier-before-its-status
+  (testing "omitting it shifts every later field by two words, which decodes
+            as garbage rather than as an error"
+    (let [reply (rpc/accepted 9 (xdr/encode [:uint] 0))
+          decoded (xdr/decode [:struct
+                               [:xid [:uint]]
+                               [:mtype [:enum]]
+                               [:reply-stat [:enum]]
+                               [:verf [:struct [:flavor [:enum]]
+                                       [:body [:opaque* 400]]]]
+                               [:accept-stat [:enum]]]
+                              reply)]
+      (is (= 9 (get-in decoded [:value :xid])))
+      (is (= rpc/REPLY (get-in decoded [:value :mtype])))
+      (is (= rpc/MSG-ACCEPTED (get-in decoded [:value :reply-stat])))
+      (is (= rpc/SUCCESS (get-in decoded [:value :accept-stat])))
+      (is (= 0 (xdr/decode-value [:uint] reply (:end decoded)))))))
+
+;; ── dispatch answers every path ───────────────────────────────────────────
+
+(def ^:private programs
+  {100003 {3 {0 (fn [_ _ _] (xdr/encode [:uint] 0))
+              1 (fn [_ bs at] (xdr/encode [:uint]
+                                          (inc (xdr/decode-value [:uint] bs at))))}}})
+
+(defn- accept-stat-of [reply]
+  (get-in (xdr/decode [:struct
+                       [:xid [:uint]] [:mtype [:enum]] [:reply-stat [:enum]]
+                       [:verf [:struct [:flavor [:enum]] [:body [:opaque* 400]]]]
+                       [:accept-stat [:enum]]]
+                      reply)
+          [:value :accept-stat]))
+
+(deftest a-known-procedure-runs
+  (let [header (call-bytes {:proc 1})
+        args (xdr/encode [:uint] 41)
+        whole (xdr/->bytes (concat (map #(bit-and (int %) 0xff) (seq header))
+                                   (map #(bit-and (int %) 0xff) (seq args))))
+        reply (rpc/dispatch programs whole)]
+    (is (= rpc/SUCCESS (accept-stat-of reply)))))
+
+(deftest every-refusal-is-still-a-reply
+  (testing "a client that receives nothing does not fail — it retries
+            forever and the mount hangs with no indication of why"
+    (is (= rpc/PROG-UNAVAIL
+           (accept-stat-of (rpc/dispatch programs (call-bytes {:prog 999})))))
+    (is (= rpc/PROC-UNAVAIL
+           (accept-stat-of (rpc/dispatch programs (call-bytes {:proc 99})))))
+    (is (= rpc/PROG-MISMATCH
+           (accept-stat-of (rpc/dispatch programs (call-bytes {:vers 2})))))))
+
+(deftest a-version-mismatch-names-the-range-it-does-speak
+  (let [reply (rpc/dispatch programs (call-bytes {:vers 2}))
+        v (:value (xdr/decode [:struct
+                               [:xid [:uint]] [:mtype [:enum]] [:reply-stat [:enum]]
+                               [:verf [:struct [:flavor [:enum]] [:body [:opaque* 400]]]]
+                               [:accept-stat [:enum]]
+                               [:low [:uint]] [:high [:uint]]]
+                              reply))]
+    (is (= 3 (:low v)))
+    (is (= 3 (:high v)))))
+
+;; ── record marking ────────────────────────────────────────────────────────
+
+(deftest a-framed-message-round-trips
+  (let [msg (b 1 2 3 4 5)
+        framed (record/frame msg)
+        parsed (record/parse framed)]
+    (is (= "800000050102030405" (xdr/hexify framed)))
+    (is (= [1 2 3 4 5] (mapv #(bit-and (int %) 0xff) (seq (:message parsed)))))
+    (is (= 9 (:end parsed)))))
+
+(deftest an-incomplete-record-is-not-yet-rather-than-never
+  (testing "a stream reader has to tell those apart or it drops a message
+            every time a read lands mid-fragment"
+    (is (nil? (record/parse (b 0x80 0x00))))
+    (is (nil? (record/parse (b 0x80 0x00 0x00 0x05 1 2))))
+    (is (some? (record/parse (b 0x80 0x00 0x00 0x05 1 2 3 4 5))))))
+
+(deftest fragments-accumulate-until-the-last-bit
+  (testing "the failure this exists to catch: treating every fragment as a
+            message works until the first payload big enough to split"
+    (let [two (xdr/->bytes (concat [0x00 0x00 0x00 0x03 0xaa 0xbb 0xcc]
+                                   [0x80 0x00 0x00 0x02 0xdd 0xee]))
+          parsed (record/parse two)]
+      (is (= [0xaa 0xbb 0xcc 0xdd 0xee]
+             (mapv #(bit-and (int %) 0xff) (seq (:message parsed)))))
+      (is (= 13 (:end parsed))))))
+
+(deftest a-stream-carrying-two-messages-stops-at-the-first
+  (let [a (record/frame (b 1))
+        c (record/frame (b 2))
+        both (xdr/->bytes (concat (map #(bit-and (int %) 0xff) (seq a))
+                                  (map #(bit-and (int %) 0xff) (seq c))))
+        parsed (record/parse both)]
+    (is (= [1] (mapv #(bit-and (int %) 0xff) (seq (:message parsed)))))
+    (is (= 5 (:end parsed)) "the caller resumes from :end")))
+
+(deftest the-framing-ceiling-is-enforced
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (record/parse (b 0x00 0x10 0x00 0x00) {:max-message 16}))))

@@ -1,0 +1,293 @@
+;; `kotoba/jws/verify.kotoba` against `jws.core/verify`.
+;;
+;; The slice is the decision: may this token be verified at all, and over
+;; what bytes. The guest is handed the three base64url parts and the decoded
+;; header's fields; it never sees a key, a signature byte, or a decoded
+;; payload. So the two are handed the SAME token and the same allow-list and
+;; compared on the verdict and the reason for it.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+;;
+;; ## The host loop is the point
+;;
+;; `drive` is the deployment: base64url, JSON, and the signature check all
+;; happen here, and each one is handed to the guest as the smallest thing
+;; that answers a question -- the header as fields, the signature check as a
+;; bool. If the guest refuses before `:want-signature`, the `:verify` fn is
+;; never called at all, which is asserted rather than assumed
+;; (`a-refusal-happens-before-the-key-is-touched`).
+;;
+;; ## The negative controls
+;;
+;; Each is a decision with a CVE-shaped history, and each is invisible to a
+;; test that only ever verifies a good token:
+;;
+;;   * `unsecured-cannot-be-allowed-in` — `alg: none` is refused even when
+;;     the caller names it in the allow-list. A reader that checks the
+;;     allow-list first would let it through, and the allow-list is exactly
+;;     where an operator would put it while debugging;
+;;   * `the-header-does-not-choose-the-algorithm` — §10. A token signed with
+;;     an algorithm the caller did not name is refused BY NAME, not reported
+;;     as a bad signature: those are different facts;
+;;   * `no-allowed-algorithms-is-refused-before-parsing` — a verifier with
+;;     no names has not decided anything, and the only place left for the
+;;     decision to come from is the token;
+;;   * `crit-naming-an-unimplemented-header-invalidates` — §4.1.11. The
+;;     producer used `crit` to say "reject this if you do not handle it", so
+;;     ignoring it inverts the one thing it means;
+;;   * `the-signing-input-is-built-from-the-encoded-parts` — §5.1. A
+;;     verifier that re-encodes the decoded header signs a different string
+;;     than the producer did, and the failure looks like a bad key.
+
+(ns jws.verify-kotoba-parity-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.json :as json]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [jws.core :as jws]
+            [jws.guest-document :refer [->doc]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "jws" "verify.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'jws.verify (slurp guest-file)}
+                                         'jws.verify
+                                         :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+;; --- the host: base64url, JSON, and the key ---------------------------------
+
+(defn- header->doc
+  "The decoded protected header, as the fields the decision needs. JSON
+  member names are strings and a `:document` key is a compile-time keyword,
+  so this translation is the host's -- the same shape `json-decode` already
+  is in the oracle."
+  [header]
+  (->doc (cond-> {}
+           (get header "alg") (assoc :alg (get header "alg"))
+           (get header "crit") (assoc :crit (vec (get header "crit"))))))
+
+(defn- drive
+  "Verify `compact` the way a deployment does.
+
+  `verify-fn` is the cryptography and is called ONLY if the guest reaches
+  `:want-signature`; `calls` records whether it was, so a test can assert
+  that a refusal happened before the key was touched."
+  [compact allowed verify-fn]
+  (let [calls (atom 0)
+        state (call 'init [(->doc {:allowed (vec allowed)})])
+        state (call 'offer-compact [state compact])
+        state (if (= :want-header (call 'phase [state]))
+                (call 'offer-header
+                      [state (header->doc
+                              (json/read-str
+                               (jws/b64url->string (call 'header-b64 [state]))))])
+                state)
+        state (if (= :want-signature (call 'phase [state]))
+                (call 'signature-checked
+                      [state (boolean
+                              (do (swap! calls inc)
+                                  (verify-fn (jws/signing-input
+                                              (call 'header-b64 [state])
+                                              (call 'payload-b64 [state]))
+                                             (jws/b64url->bytes
+                                              (call 'signature-b64 [state])))))])
+                state)]
+    {:state state
+     :phase (call 'phase [state])
+     :reason (call 'reason [state])
+     :alg (call 'alg [state])
+     :verify-calls @calls
+     ;; The payload is decoded HERE, and only on success.
+     :payload (when (= :verified (call 'phase [state]))
+                (jws/b64url->string (call 'payload-b64 [state])))}))
+
+(defn- oracle [compact allowed verify-fn]
+  (try
+    (jws/verify compact {:expected-alg (set allowed)
+                         :verify verify-fn
+                         :json-decode json/read-str})
+    (catch clojure.lang.ExceptionInfo e
+      {:threw (:jws/error (ex-data e))})))
+
+;; --- fixtures ---------------------------------------------------------------
+;; A toy signer: the "signature" is the signing input itself. The point of
+;; this file is the decision, not the cryptography -- `jws.core`'s own suite
+;; wires a real Ed25519 key, and this one must not be able to pass by
+;; accident because the crypto happened to agree.
+
+(defn- toy-sign [signing-input] signing-input)
+
+(defn- toy-verify [signing-input sig]
+  (= (vec (seq signing-input)) (vec (seq sig))))
+
+(defn- always-false [_ _] false)
+
+(defn- token
+  ([header payload] (token header payload toy-sign))
+  ([header payload signer]
+   (jws/sign header payload {:sign signer :json-encode json/write-str})))
+
+;; `sign` refuses `alg: none`, so an unsecured token has to be built the way
+;; an attacker builds one: by hand.
+(defn- unsecured-token [payload]
+  (str (jws/b64url (json/write-str {"alg" "none"})) "."
+       (jws/b64url payload) "."))
+
+(def ^:private good (token {"alg" "EdDSA"} "hello"))
+
+;; --- the tests ---------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-good-token-verifies-the-same-on-both-sides
+  (let [g (drive good ["EdDSA"] toy-verify)
+        o (oracle good ["EdDSA"] toy-verify)]
+    (is (= :verified (:phase g)) (:reason g))
+    (is (true? (:valid? o)))
+    (is (= "hello" (:payload g)))
+    (is (= (:payload o) (:payload g)))
+    (is (= 1 (:verify-calls g)))))
+
+(deftest unsecured-cannot-be-allowed-in
+  (testing "RFC 7515 §6. `alg: none` is refused unconditionally -- INCLUDING
+            when the caller names it in the allow-list, which is exactly
+            where an operator would put it while debugging. A verifier that
+            consults the allow-list first lets it through."
+    (let [t (unsecured-token "hello")]
+      (doseq [allowed [["EdDSA"] ["none"] ["EdDSA" "none"]]]
+        (let [g (drive t allowed always-false)
+              o (oracle t allowed always-false)]
+          (is (= :rejected (:phase g)) (str "allowed=" allowed))
+          (is (= :jws/unsecured (:reason g)) (str "allowed=" allowed))
+          (is (= :jws/unsecured (:reason o)) (str "allowed=" allowed))
+          (is (= 0 (:verify-calls g))
+              "and the key was never touched"))))))
+
+(deftest the-header-does-not-choose-the-algorithm
+  (testing "RFC 7515 §10. `alg` is supplied by whoever produced the token,
+            so a verifier that reads it and then uses it to pick the check
+            lets the attacker choose the check."
+    (let [t (token {"alg" "HS256"} "hello")
+          g (drive t ["EdDSA"] toy-verify)
+          o (oracle t ["EdDSA"] toy-verify)]
+      (is (= :rejected (:phase g)))
+      (testing "refused BY NAME, not as a bad signature -- a token may be
+                perfectly signed with an algorithm this caller does not
+                accept, and those are different facts"
+        (is (= :jws/unexpected-alg (:reason g)))
+        (is (= :jws/unexpected-alg (:reason o)))
+        (is (= "HS256" (:alg g))))
+      (is (= 0 (:verify-calls g)) "and the key was never touched"))))
+
+(deftest no-allowed-algorithms-is-refused-before-parsing
+  (testing "a verifier with no named algorithms has not decided anything,
+            and the only place left for the decision to come from is the
+            token. The oracle throws :jws/expected-alg-required; the guest
+            refuses at construction, before a byte is parsed."
+    (let [state (call 'init [(->doc {:allowed []})])]
+      (is (= :rejected (call 'phase [state])))
+      (is (= :jws/expected-alg-required (call 'reason [state])))
+      (testing "and offering a token to it changes nothing"
+        (let [after (call 'offer-compact [state good])]
+          (is (= :rejected (call 'phase [after])))
+          (is (= "" (call 'header-b64 [after]))))))
+    (testing "the oracle refuses the same way"
+      (is (= :jws/expected-alg-required
+             (:threw (try (jws/verify good {:verify toy-verify
+                                            :json-decode json/read-str})
+                          (catch clojure.lang.ExceptionInfo e
+                            {:threw (:jws/error (ex-data e))}))))))))
+
+(deftest crit-naming-an-unimplemented-header-invalidates
+  (testing "RFC 7515 §4.1.11. The producer used `crit` precisely to say
+            \"reject this if you do not handle it\", so ignoring it inverts
+            the one thing it means."
+    (let [t (token {"alg" "EdDSA" "crit" ["b64"] "b64" false} "hello")
+          g (drive t ["EdDSA"] toy-verify)
+          o (oracle t ["EdDSA"] toy-verify)]
+      (is (= :rejected (:phase g)))
+      (is (= :jws/unsupported-critical-header (:reason g)))
+      (is (= :jws/unsupported-critical-header (:reason o)))
+      (is (= "b64" (call 'unsupported-critical [(:state g)]))
+          "and it names which one")
+      (is (= 0 (:verify-calls g)) "the key was never touched")))
+  (testing "a crit listing only understood headers is not an obstacle"
+    (let [t (token {"alg" "EdDSA" "crit" ["kid"] "kid" "k1"} "hello")
+          g (drive t ["EdDSA"] toy-verify)]
+      (is (= :verified (:phase g)) (:reason g)))))
+
+(deftest a-bad-signature-is-a-bad-signature-and-nothing-else
+  (let [g (drive good ["EdDSA"] always-false)
+        o (oracle good ["EdDSA"] always-false)]
+    (is (= :rejected (:phase g)))
+    (is (= :jws/bad-signature (:reason g)))
+    (is (= :jws/bad-signature (:reason o)))
+    (is (= 1 (:verify-calls g)) "and the check DID run -- that is the point")
+    (is (nil? (:payload g)) "no payload is decoded for a token that failed")))
+
+(deftest the-signing-input-is-built-from-the-encoded-parts
+  (testing "RFC 7515 §5.1. A verifier that re-encodes the decoded header
+            signs a different string than the producer did -- JSON member
+            order and whitespace are not preserved -- and the failure looks
+            like a bad key."
+    (let [state (call 'offer-compact [(call 'init [(->doc {:allowed ["EdDSA"]})])
+                                      good])
+          parts (str/split good #"\." -1)]
+      (is (= (str (first parts) "." (second parts))
+             (call 'signing-input [state])))
+      (testing "which is byte-for-byte what the oracle signs"
+        (is (= (vec (seq (jws/signing-input (first parts) (second parts))))
+               (vec (seq (kbytes/utf8-bytes ^String (call 'signing-input [state]))))))))))
+
+(deftest a-token-without-three-parts-is-malformed
+  (doseq [bad ["a.b" "a.b.c.d" "" "abc"]]
+    (let [g (drive bad ["EdDSA"] toy-verify)]
+      (is (= :rejected (:phase g)) (str "input=" (pr-str bad)))
+      (is (= :jws/malformed (:reason g)) (str "input=" (pr-str bad)))
+      (is (= 0 (:verify-calls g))))))
+
+(deftest an-empty-signature-is-refused-before-the-check
+  (let [t (str (jws/b64url (json/write-str {"alg" "EdDSA"})) "."
+               (jws/b64url "hello") ".")
+        g (drive t ["EdDSA"] toy-verify)
+        o (oracle t ["EdDSA"] toy-verify)]
+    (is (= :rejected (:phase g)))
+    (is (= :jws/empty-signature (:reason g)))
+    (is (= :jws/empty-signature (:reason o)))
+    (is (= 0 (:verify-calls g)))))
+
+(deftest a-header-without-alg-is-refused
+  (let [t (str (jws/b64url (json/write-str {"typ" "JWT"})) "."
+               (jws/b64url "hello") "." (jws/b64url "sig"))
+        g (drive t ["EdDSA"] toy-verify)
+        o (oracle t ["EdDSA"] toy-verify)]
+    (is (= :rejected (:phase g)))
+    (is (= :jws/missing-alg (:reason g)))
+    (is (= :jws/missing-alg (:reason o)))
+    (is (= 0 (:verify-calls g)))))
+
+(deftest a-refusal-happens-before-the-key-is-touched
+  (testing "asserted rather than assumed: every refusal above reports
+            verify-calls 0, and this collects the claim in one place. A
+            verifier that runs the cryptography and then decides has already
+            used the key on input it had decided not to trust."
+    (let [refusals [[(unsecured-token "x") ["EdDSA" "none"]]
+                    [(token {"alg" "HS256"} "x") ["EdDSA"]]
+                    [(token {"alg" "EdDSA" "crit" ["b64"] "b64" false} "x") ["EdDSA"]]
+                    ["a.b" ["EdDSA"]]]]
+      (doseq [[t allowed] refusals]
+        (let [g (drive t allowed (fn [_ _] (throw (AssertionError. "key touched"))))]
+          (is (= :rejected (:phase g)) (str "token=" (subs (str t) 0 (min 20 (count (str t))))))
+          (is (= 0 (:verify-calls g))))))))
+
+(deftest the-allowed-list-is-carried-not-inferred
+  (let [state (call 'init [(->doc {:allowed ["EdDSA" "ES256"]})])]
+    (is (= 2 (call 'allowed-count [state])))
+    (is (= :want-compact (call 'phase [state])))))

@@ -1,0 +1,201 @@
+;; `kotoba/ers/chain.kotoba` — the evidence-record verdict.
+;;
+;; The companion to `path_kotoba_parity_test`, which checked whether one
+;; document is in one archive. This checks what a whole record CLAIMS.
+;;
+;; The parity here is against the rules `ers.core/verify` states in its own
+;; docstring and implements in its final `let`, driven directly rather than
+;; through a full record: building real RFC 3161 tokens for a hash-renewed
+;; multi-chain record would test the TSA plumbing, which is the host's and
+;; already has its own tests. What is under test is the VERDICT — and the
+;; verdict is computed from per-stamp results, which is exactly what the
+;; guest is handed.
+;;
+;; `.cljc` stays the oracle for the rules and is not required from the guest
+;; (require-graph).
+;;
+;; ## The negative controls
+;;
+;; Three of the four rules are about not overclaiming, and every one of them
+;; passes on a verifier that reports the confident-sounding answer:
+;;
+;;   * `the-claim-is-the-earliest-verified-timestamp` — a verifier that
+;;     reports the newest date reports the weakest version of what it proved,
+;;     and it looks like the strongest;
+;;   * `an-unverified-stamps-time-is-not-a-date` — letting one set the claim
+;;     would let anyone with a forged token move it;
+;;   * `trusted-is-three-valued` — collapsing :unknown into either answer
+;;     undoes the distinction rfc3161.core keeps deliberately;
+;;   * `an-empty-record-is-not-verified` — no evidence is not good evidence,
+;;     and `verify`'s own `(seq flat)` guard exists for this;
+;;   * `a-hash-renewal-without-the-data-is-not-verified` — reported, not
+;;     skipped, and distinguishable from a signature that failed.
+
+(ns ers.chain-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [ers.chain-guest-document :refer [->doc]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "ers" "chain.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'ers.chain (slurp guest-file)}
+                                         'ers.chain :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+(defn- verdict
+  "Drive the guest over `chains` -- a vector of vectors of per-stamp results
+  as the host would report them -- and read the verdict."
+  [chains config]
+  (let [lengths (mapv count chains)
+        s0 (call 'offer-shape [(call 'init [(->doc config)]) (->doc lengths)])]
+    (if (= :refused (call 'phase [s0]))
+      {:state s0 :phase :refused :reason (call 'reason [s0])
+       :verified? (call 'verified? [s0]) :trusted (call 'trusted [s0])
+       :oldest (call 'oldest [s0])}
+      (loop [state s0 stamps (vec (apply concat chains)) seen []]
+        (if (empty? stamps)
+          {:state state
+           :phase (call 'phase [state])
+           :reason (call 'reason [state])
+           :verified? (call 'verified? [state])
+           :trusted (call 'trusted [state])
+           :oldest (call 'oldest [state])
+           :newest (call 'newest [state])
+           :verified-count (call 'verified-count [state])
+           :covers seen}
+          (let [c (call 'covers [state])]
+            (recur (call 'offer-stamp [state (->doc (first stamps))])
+                   (rest stamps)
+                   (conj seen c))))))))
+
+;; --- fixtures ----------------------------------------------------------------
+
+(defn- ok
+  ([t] (ok t :yes))
+  ([t trust] {:verified? true :trusted trust :gen-time t}))
+
+(defn- bad
+  ([t] {:verified? false :trusted :unknown :gen-time t}))
+
+(def ^:private has-data {:has-data? true})
+
+;; --- the tests ----------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-single-verified-chain-is-verified
+  (let [v (verdict [[(ok 1000) (ok 2000)]] has-data)]
+    (is (= :decided (:phase v)))
+    (is (true? (:verified? v)))
+    (is (= :yes (:trusted v)))
+    (is (= 2 (:verified-count v)))))
+
+(deftest what-each-stamp-covers-is-structural
+  (testing "§5.2 and §5.3 are different operations, and the guest says which
+            is which from the shape alone -- before any of them is checked"
+    (let [v (verdict [[(ok 1000) (ok 1100) (ok 1200)]
+                      [(ok 2000) (ok 2100)]]
+                     has-data)]
+      (is (= [:data :previous-token :previous-token :hash-renewal :previous-token]
+             (:covers v))))))
+
+(deftest the-claim-is-the-earliest-verified-timestamp
+  (testing "an evidence record proves the data existed before the EARLIEST
+            verified timestamp; later ones exist to keep the older ones
+            checkable, not to move the date forward. A verifier that reports
+            the newest reports the weakest version of what it proved -- and
+            it looks like the strongest."
+    (let [v (verdict [[(ok 1000) (ok 5000)] [(ok 9000)]] has-data)]
+      (is (= 1000 (:oldest v)) "the claim")
+      (is (= 9000 (:newest v)) "reported alongside, and deliberately not it"))
+    (testing "and the order the stamps arrive in does not change it"
+      (let [v (verdict [[(ok 9000) (ok 1000) (ok 5000)]] has-data)]
+        (is (= 1000 (:oldest v)))))))
+
+(deftest an-unverified-stamps-time-is-not-a-date
+  (testing "letting an unverified stamp set the claim would let anyone with
+            a forged token move it"
+    (let [v (verdict [[(bad 100) (ok 5000) (ok 9000)]] has-data)]
+      (is (false? (:verified? v)) "the record as a whole did not verify")
+      (is (= 5000 (:oldest v))
+          "and the forged stamp's earlier time is not the claim")
+      (is (= 2 (:verified-count v))))))
+
+(deftest trusted-is-three-valued
+  (testing "collapsing :unknown into either answer undoes the distinction
+            rfc3161.core keeps deliberately"
+    (testing ":yes only when EVERY TSA was vouched for"
+      (is (= :yes (:trusted (verdict [[(ok 1 :yes) (ok 2 :yes)]] has-data)))))
+    (testing "one unvouched-for TSA makes the whole record :unknown, not :yes"
+      (is (= :unknown (:trusted (verdict [[(ok 1 :yes) (ok 2 :unknown)]] has-data)))))
+    (testing "and an explicitly rejected one makes it :no, not :unknown"
+      (is (= :no (:trusted (verdict [[(ok 1 :yes) (ok 2 :no)]] has-data)))))
+    (testing "a rejection outweighs an unknown"
+      (is (= :no (:trusted (verdict [[(ok 1 :unknown) (ok 2 :no)]] has-data)))))
+    (testing "and trust is not verification: a fully verified record can be
+              untrusted"
+      (let [v (verdict [[(ok 1 :no)]] has-data)]
+        (is (true? (:verified? v)))
+        (is (= :no (:trusted v)))))))
+
+(deftest an-empty-record-is-not-verified
+  (testing "no evidence is not good evidence -- `verify`'s own `(seq flat)`
+            guard exists for exactly this, and a record with no timestamps
+            reporting verified would be the most dangerous possible answer"
+    (let [v (verdict [] has-data)]
+      (is (= :refused (:phase v)))
+      (is (= :ers/empty-record (:reason v)))
+      (is (false? (:verified? v)))
+      (is (= -1 (:oldest v)) "and it claims no date"))
+    (testing "nor is a record whose chain holds no stamps"
+      (let [v (verdict [[]] has-data)]
+        (is (= :refused (:phase v)))
+        (is (= :ers/empty-chain (:reason v)))
+        (is (false? (:verified? v)))))))
+
+(deftest a-hash-renewal-without-the-data-is-not-verified
+  (testing "a hash renewal computed without the original data would carry the
+            new algorithm's name over the old algorithm's digests, which is
+            the failure the operation exists to prevent. So it is reported,
+            not skipped."
+    (let [chains [[(ok 1000)] [(ok 2000)]]
+          with (verdict chains has-data)
+          without (verdict chains {:has-data? false})]
+      (is (true? (:verified? with)))
+      (is (false? (:verified? without))
+          "the hash renewal could not be checked, so the record did not verify")
+      (is (= :ers/hash-renewal-needs-data (:reason without))
+          "and it says why -- not the same fact as a signature that failed")
+      (testing "while the first chain's own stamp still verified"
+        (is (= 1 (:verified-count without)))))
+    (testing "and a single-chain record needs no data at all"
+      (is (true? (:verified? (verdict [[(ok 1000) (ok 2000)]]
+                                      {:has-data? false})))))))
+
+(deftest an-undecided-record-is-not-a-verified-one
+  (testing "a verdict is only a verdict once every stamp has been seen"
+    (let [s (call 'offer-shape [(call 'init [(->doc has-data)]) (->doc [2])])]
+      (is (= :want-stamp (call 'phase [s])))
+      (is (false? (call 'verified? [s])))
+      (is (= :unknown (call 'trusted [s])) "and trust is not yet claimed")
+      (is (= -1 (call 'oldest [s])) "nor is a date")
+      (testing "not even after the first of two"
+        (let [s1 (call 'offer-stamp [s (->doc (ok 1000))])]
+          (is (= :want-stamp (call 'phase [s1])))
+          (is (false? (call 'verified? [s1])))
+          (is (= -1 (call 'oldest [s1]))))))))
+
+(deftest a-stamp-with-no-time-does-not-become-the-claim
+  (testing "a token that carried no genTime reports -1, and -1 is not an
+            earlier date than every real one"
+    (let [v (verdict [[{:verified? true :trusted :yes :gen-time -1}
+                       (ok 5000)]]
+                     has-data)]
+      (is (true? (:verified? v)))
+      (is (= 5000 (:oldest v))))))

@@ -1,0 +1,150 @@
+(ns argon2.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [argon2.core :as a]
+            [argon2.u32 :as u]
+            [argon2.vectors :as v]))
+
+;; ── the known answers ────────────────────────────────────────────────────────
+
+(deftest rfc-9106-section-5
+  (doseq [{:keys [name type tag]} v/rfc]
+    (is (= tag (a/hex (a/argon2! (assoc v/rfc-params :type type))))
+        name)))
+
+(deftest pqh-vectors-at-owasp-parameters
+  (doseq [{:keys [name opts tag]} v/pqh]
+    (is (= tag (a/hex (a/argon2! opts))) name)))
+
+;; ── the variants are actually different ──────────────────────────────────────
+
+(deftest the-three-variants-disagree
+  ;; A bug that made `:type` inert would leave every vector above passing
+  ;; only if all three happened to be checked -- they are, but this states
+  ;; the property directly rather than relying on that.
+  (let [tags (mapv #(a/hex (a/argon2! (assoc v/rfc-params :type %)))
+                   [:argon2d :argon2i :argon2id])]
+    (is (= 3 (count (set tags))))))
+
+;; ── parameters change the answer ─────────────────────────────────────────────
+
+(deftest every-parameter-is-load-bearing
+  (let [base {:password (a/utf8 "password") :salt (a/utf8 "somesalt1234")
+              :memory-kib 64 :iterations 2 :parallelism 1 :tag-length 32}
+        h (fn [o] (a/hex (a/argon2! (merge base o))))
+        b (h {})]
+    (testing "each of these must move the tag; a parameter that does not is not a parameter"
+      (is (not= b (h {:iterations 3})))
+      (is (not= b (h {:memory-kib 128})))
+      (is (not= b (h {:parallelism 2})))
+      (is (not= b (h {:salt (a/utf8 "othersalt123")})))
+      (is (not= b (h {:password (a/utf8 "Password")})))
+      (is (not= b (h {:secret [1 2 3]})))
+      (is (not= b (h {:associated-data [1 2 3]})))
+      (is (not= b (h {:type :argon2i}))))
+    (testing "and a longer tag extends rather than repeats"
+      (let [t64 (h {:tag-length 64})]
+        (is (= 128 (count t64)))
+        (is (not= b (subs t64 0 64))
+            "H' past 64 bytes is a chain, not a truncation, so the prefix must differ")))))
+
+(deftest tag-length-boundaries
+  (let [base {:password [1] :salt (vec (repeat 8 2)) :memory-kib 32
+              :iterations 1 :parallelism 1}]
+    (doseq [tau [4 16 32 63 64 65 96 128 1024]]
+      (is (= tau (count (a/argon2! (assoc base :tag-length tau))))
+          (str "tag-length " tau))))
+  (testing "64 and 65 take different code paths in H' and must both be right"
+    ;; <=64 is one BLAKE2b call; >64 is the 32-byte chain. A boundary error
+    ;; here produces a plausible-looking digest of the wrong length or the
+    ;; wrong bytes.
+    (let [base {:password [1] :salt (vec (repeat 8 2)) :memory-kib 32
+                :iterations 1 :parallelism 1}]
+      (is (= 64 (count (a/argon2! (assoc base :tag-length 64)))))
+      (is (= 65 (count (a/argon2! (assoc base :tag-length 65))))))))
+
+;; ── rejections ───────────────────────────────────────────────────────────────
+
+(deftest parameters-outside-the-spec-are-refused
+  (let [ok {:password [1] :salt (vec (repeat 8 2)) :memory-kib 32
+            :iterations 1 :parallelism 1 :tag-length 32}]
+    (is (= :ok (:status (a/argon2 ok))))
+    (is (= :salt-too-short (:reason (a/argon2 (assoc ok :salt [1 2 3])))))
+    (is (= :tag-too-short (:reason (a/argon2 (assoc ok :tag-length 3)))))
+    (is (= :iterations-too-few (:reason (a/argon2 (assoc ok :iterations 0)))))
+    (is (= :parallelism-out-of-range (:reason (a/argon2 (assoc ok :parallelism 0)))))
+    (is (= :memory-too-small (:reason (a/argon2 (assoc ok :memory-kib 8 :parallelism 4))))
+        "m must be at least 8p")
+    (is (= :unknown-type (:reason (a/argon2 (assoc ok :type :argon2x)))))))
+
+(deftest memory-is-rounded-down-to-a-multiple-of-four-p
+  ;; RFC 9106 section 3.1. The tag depends on m as ASKED through H0 and on m'
+  ;; as USED through the arena, so these two are different hashes even though
+  ;; they run over the same amount of memory.
+  (let [base {:password [1] :salt (vec (repeat 8 2)) :iterations 1
+              :parallelism 3 :tag-length 32}]
+    (is (not= (a/hex (a/argon2! (assoc base :memory-kib 36)))
+              (a/hex (a/argon2! (assoc base :memory-kib 47))))
+        "both round to m'=36, and both must still hash m itself")))
+
+;; ── the arithmetic underneath ────────────────────────────────────────────────
+
+(deftest thirty-two-bit-lane-arithmetic
+  (testing "mul32 is the full 64-bit product"
+    (is (= [0 0] (u/mul32 0 12345)))
+    (is (= [0 1] (u/mul32 1 1)))
+    ;; 2^32-1 squared = 0xFFFFFFFE00000001
+    (is (= [0xFFFFFFFE 0x00000001] (u/mul32 0xFFFFFFFF 0xFFFFFFFF)))
+    (is (= [0x00000001 0x00000000] (u/mul32 0x10000 0x10000)))
+    (is (= [0 0xFFFFFFFF] (u/mul32 0xFFFFFFFF 1))))
+  (testing "add64 wraps rather than growing"
+    ;; 0xFFFFFFFF_FFFFFFFF + 0x00000000_00000001 = 0 (mod 2^64)
+    (is (= [0 0] (u/add64 0xFFFFFFFF 0xFFFFFFFF 0 1)))
+    ;; 0x00000000_FFFFFFFF + 1 = 0x00000001_00000000 -- the carry crosses lanes
+    (is (= [1 0] (u/add64 0 0xFFFFFFFF 0 1)))
+    ;; 0xFFFFFFFF_FFFFFFFF + 0x00000000_FFFFFFFF = 0x00000000_FFFFFFFE (mod 2^64)
+    (is (= [0 0xFFFFFFFE] (u/add64 0xFFFFFFFF 0xFFFFFFFF 0 0xFFFFFFFF))))
+  (testing "rotr64 at the widths GB uses, including the 32 that a shift cannot express"
+    ;; 32 is exactly a lane swap
+    (is (= [0x00000000 0x89ABCDEF] (u/rotr64 0x89ABCDEF 0x00000000 32)))
+    (is (= [0x11111111 0x22222222] (u/rotr64 0x22222222 0x11111111 32)))
+    ;; 0x00000000_00000001 rotated right by 32 puts the bit in the high lane
+    (is (= [0x00000001 0x00000000] (u/rotr64 0x00000000 0x00000001 32)))
+    (testing "the widths GB actually asks for, against hand-computed answers"
+      ;; >>> 16 : 0xCDEF0123_456789AB
+      (is (= [0xCDEF0123 0x456789AB] (u/rotr64 0x01234567 0x89ABCDEF 16)))
+      ;; >>> 24 : 0xABCDEF01_23456789
+      (is (= [0xABCDEF01 0x23456789] (u/rotr64 0x01234567 0x89ABCDEF 24))))
+    (testing "rotating by 64 in four steps of 16 returns the original"
+      (let [[h l] (reduce (fn [[h l] _] (u/rotr64 h l 16)) [0x01234567 0x89ABCDEF] (range 4))]
+        (is (= [0x01234567 0x89ABCDEF] [h l]))))
+    (testing "and in a full sweep of every width GB and P can ask for"
+      ;; rotr(n) then rotr(64-n) is the identity for every n. A width that is
+      ;; wrong in only one direction survives a single-direction check.
+      (doseq [n (range 1 64)]
+        (let [[h l] (u/rotr64 0x01234567 0x89ABCDEF n)
+              [h2 l2] (u/rotr64 h l (- 64 n))]
+          (is (= [0x01234567 0x89ABCDEF] [h2 l2]) (str "rotr " n " then " (- 64 n))))))
+    (testing "63 is a left-rotate by one"
+      ;; 0x00000000_00000001 <<< 1 = 2
+      (is (= [0x00000000 0x00000002] (u/rotr64 0x00000000 0x00000001 63)))
+      ;; 0x80000000_00000000 <<< 1 wraps the top bit round to the bottom
+      (is (= [0x00000000 0x00000001] (u/rotr64 0x80000000 0x00000000 63)))))
+  (testing "le32 and le64 are little-endian"
+    (is (= [0x78 0x56 0x34 0x12] (u/le32 0x12345678)))
+    (is (= [0xFF 0xFF 0xFF 0xFF] (u/le32 0xFFFFFFFF)))
+    (is (= [1 0 0 0 0 0 0 0] (u/le64 1)))
+    (is (= [0 0 0 0 1 0 0 0] (u/le64 4294967296)))))
+
+(deftest utf8-is-not-map-int
+  ;; The bug this helper exists to prevent: on ClojureScript a character is a
+  ;; one-character string and `int` of one is 0, so `(mapv int s)` turns every
+  ;; distinct password into the same vector of zeros. On the JVM it happens to
+  ;; work, which is why only one of the two runners ever saw it.
+  (is (= [112 97 115 115] (a/utf8 "pass")))
+  (is (not= (a/utf8 "password") (a/utf8 "Password")))
+  (is (= [0xE3 0x81 0x82] (a/utf8 "\u3042")) "multi-byte code points encode as UTF-8")
+  (testing "and two different passwords must not hash alike"
+    (let [base {:salt (a/utf8 "somesalt1234") :memory-kib 32 :iterations 1
+                :parallelism 1 :tag-length 32}]
+      (is (not= (a/hex (a/argon2! (assoc base :password (a/utf8 "password"))))
+                (a/hex (a/argon2! (assoc base :password (a/utf8 "Password")))))))))
