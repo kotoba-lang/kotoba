@@ -1,0 +1,336 @@
+(ns datalog.order-limit-test
+  "ADR-2608021000 §6-2: :order-by / :limit, so a top-N query is expressible in
+  the query instead of in host code. Every LDBC SNB complex read is a
+  'most recent N' query."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [datalog.index :as index]
+            [datalog.core :as d]))
+
+(def ^:private everything (constantly true))
+
+(def ^:private no-refs
+  "`datalog.index/assert-quad`'s `ref?`, which is REQUIRED here (arrangement
+  defaulted it to `ipld.core/link?`; this library has no IPLD to default to).
+  These fixtures use no reverse-reference lookup, so nothing is `:vaet`-indexed."
+  (constantly false))
+
+(defn- db []
+  (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} no-refs))
+          (index/empty-db)
+          [["m1" "creator" "alice"] ["m1" "date" "300"]
+           ["m2" "creator" "alice"] ["m2" "date" "100"]
+           ["m3" "creator" "alice"] ["m3" "date" "200"]
+           ["m4" "creator" "bob"]   ["m4" "date" "400"]]))
+
+(def ^:private by-alice
+  '{:find [?msg ?date]
+    :in [?person]
+    :where [[?msg "creator" ?person] [?msg "date" ?date]]})
+
+(deftest without-order-or-limit-the-result-is-still-a-set
+  ;; The return type only changes when the caller asks for order. Existing
+  ;; callers must not start receiving vectors.
+  (let [r (d/q (db) by-alice everything ["alice"])]
+    (is (set? r))
+    (is (= #{["m1" "300"] ["m2" "100"] ["m3" "200"]} r))))
+
+(deftest order-by-descending-then-limit-is-top-n
+  (let [r (d/q (db) (assoc by-alice :order-by '[[?date :desc]] :limit 2)
+               everything ["alice"])]
+    (is (vector? r) "an ordered result is a sequence, not a set")
+    (is (= [["m1" "300"] ["m3" "200"]] r))))
+
+(deftest order-by-defaults-to-ascending-and-takes-a-bare-var
+  (let [r (d/q (db) (assoc by-alice :order-by '[?date]) everything ["alice"])]
+    (is (= [["m2" "100"] ["m3" "200"] ["m1" "300"]] r))))
+
+(deftest secondary-key-breaks-ties
+  ;; Both m5 and m6 share a date; the second key decides, and it decides the
+  ;; same way every run -- a top-N that is not deterministic is not a top-N.
+  (let [db2 (-> (db)
+                (index/assert-quad {:s "m5" :p "creator" :o "alice"} no-refs)
+                (index/assert-quad {:s "m5" :p "date" :o "300"} no-refs)
+                (index/assert-quad {:s "m6" :p "creator" :o "alice"} no-refs)
+                (index/assert-quad {:s "m6" :p "date" :o "300"} no-refs))
+        r (d/q db2 (assoc by-alice :order-by '[[?date :desc] [?msg :asc]] :limit 3)
+               everything ["alice"])]
+    (is (= [["m1" "300"] ["m5" "300"] ["m6" "300"]] r))))
+
+(deftest limit-larger-than-the-result-is-not-an-error
+  (is (= 3 (count (d/q (db) (assoc by-alice :order-by '[?date] :limit 99)
+                       everything ["alice"])))))
+
+(deftest ordering-by-a-key-outside-find-is-rejected
+  ;; Silently ignoring it would return an arbitrary order that looks sorted.
+  (is (thrown? js/Error
+               (d/q (db) (assoc by-alice :order-by '[?person]) everything ["alice"]))))
+
+;; ── the ordered drive (2026-09-11, ayatori iteration 19) ──────────────────────
+;; `q` may answer :order-by/:limit by walking the ordering attribute's values
+;; in order and stopping at the limit; the independent half of the join runs
+;; once and meets the per-value half in a hash semi-join. Every assertion
+;; below compares the drive against the plain join on the SAME query --
+;; `*ordered-drive*` bound to false is the reference -- and one checks the
+;; drive actually stops early, counted in `visible?` calls, because a drive
+;; that walks everything is the plain join with extra steps.
+
+(defn- pad3
+  "`(format \"%03d\" n)` -- spelled out because `format` does not exist on
+  ClojureScript, where this suite also runs (found 2026-09-11: the cljs
+  runner was red on main since iteration 31 for this one symbol)."
+  [n]
+  (let [s (str n)] (str (apply str (repeat (- 3 (count s)) "0")) s)))
+
+(defn- social-db
+  "A small LDBC-shaped graph with ties on dates, a person with no friends,
+  and messages by strangers. Dates are fixed-width strings, as the SNB
+  harness stores them."
+  []
+  (let [persons ["p1" "p2" "p3" "p4" "p5" "p6"]
+        knows [["p1" "p2"] ["p1" "p3"] ["p2" "p4"] ["p3" "p4"] ["p4" "p5"] ["p2" "p3"]]
+        ;; 30 messages, creator round-robin, dates with deliberate ties
+        msgs (for [i (range 30)]
+               [(str "m" i) (nth persons (mod i 6)) (pad3 (* 10 (quot i 3)))])
+        replies (for [i (range 10)] [(str "r" i) (str "m" (* 2 i)) (nth persons (mod (+ i 2) 6)) (pad3 (+ 5 (* 10 i)))])]
+    (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} no-refs))
+            (index/empty-db)
+            (concat
+             (for [[a b] knows q [[a "knows" b] [b "knows" a]]] q)
+             (for [[m c dt] msgs q [[m "hasCreator" c] [m "date" dt]]] q)
+             (for [[r m c dt] replies q [[r "replyOf" m] [r "hasCreator" c] [r "date" dt]]] q)))))
+
+(defn- both-ways [db query inputs]
+  [(d/q db query everything inputs)
+   (binding [d/*ordered-drive* false] (d/q db query everything inputs))])
+
+(deftest the-drive-agrees-with-the-plain-join-on-every-ldbc-shape
+  (let [db (social-db)
+        ic02 (fn [max] {:find '[?x ?m ?d] :in '[?p]
+                        :where [['?p "knows" '?x] ['?m "hasCreator" '?x] ['?m "date" '?d]
+                                [(list '< '?d max)]]
+                        :order-by '[[?d :desc] [?m :asc]] :limit 5})
+        ic09 (fn [max] {:find '[?x ?m ?d] :in '[?p]
+                        :where [['?p "knows" '?f] ['?f "knows" '?x] ['?m "hasCreator" '?x] ['?m "date" '?d]
+                                [(list '< '?d max)]]
+                        :order-by '[[?d :desc] [?m :asc]] :limit 4})
+        ic08 {:find '[?a ?r ?d] :in '[?p]
+              :where '[[?m "hasCreator" ?p] [?r "replyOf" ?m] [?r "hasCreator" ?a] [?r "date" ?d]]
+              :order-by '[[?d :desc] [?r :asc]] :limit 3}
+        asc-no-range {:find '[?m ?d] :in '[?p]
+                      :where '[[?p "knows" ?x] [?m "hasCreator" ?x] [?m "date" ?d]]
+                      :order-by '[[?d :asc] [?m :desc]] :limit 7}]
+    (doseq [p ["p1" "p2" "p4" "p6" "nobody"]
+            max ["999" "055" "000"]]
+      (let [[drive plain] (both-ways db (ic02 max) [p])]
+        (is (= plain drive) (str "ic02 " p " " max)))
+      (let [[drive plain] (both-ways db (ic09 max) [p])]
+        (is (= plain drive) (str "ic09 " p " " max))))
+    (doseq [p ["p1" "p3" "p6"]]
+      (let [[drive plain] (both-ways db ic08 [p])]
+        (is (= plain drive) (str "ic08 " p)))
+      (let [[drive plain] (both-ways db asc-no-range [p])]
+        (is (= plain drive) (str "asc " p))))
+    (is (vector? (d/q db (ic02 "999") everything ["p1"])))
+    (is (= 5 (count (d/q db (ic02 "999") everything ["p1"]))))
+    (is (= [] (d/q db (ic02 "000") everything ["p1"])) "an empty range is an empty answer")))
+
+(deftest the-drive-stops-at-the-limit
+  ;; visible? is called once per quad the engine looks at; the drive must look
+  ;; at fewer quads than the plain join when the limit is small.
+  (let [db (social-db)
+        query {:find '[?x ?m ?d] :in '[?p]
+               :where '[[?p "knows" ?f] [?f "knows" ?x] [?m "hasCreator" ?x] [?m "date" ?d]]
+               :order-by '[[?d :desc] [?m :asc]] :limit 2}
+        count-with (fn [drive?]
+                     (let [n (atom 0)]
+                       (binding [d/*ordered-drive* drive?]
+                         (d/q db query (fn [_] (swap! n inc) true) ["p1"]))
+                       @n))
+        with-drive (count-with true)
+        plain (count-with false)]
+    (is (pos? with-drive))
+    (is (< with-drive plain) (str "drive looked at " with-drive " quads, plain join " plain))))
+
+(deftest the-drive-keeps-a-predicate-on-the-independent-half
+  ;; `[(not= ?x ?p)]` excludes the start person from a two-hop expansion
+  ;; INSIDE the query, so the limit is taken after the exclusion. Applied by
+  ;; the harness afterwards, the limit would have been taken first and rows
+  ;; the answer needed could be cut -- found by the startup gate on full SF1
+  ;; (ayatori iteration 25, one IC09 parameter disagreed). The drive must
+  ;; agree with the plain join on the same query.
+  (let [db (social-db)
+        query (fn [max] {:find '[?x ?m ?d] :in '[?p]
+                         :where [['?p "knows" '?f] ['?f "knows" '?x] '[(not= ?x ?p)]
+                                 ['?m "hasCreator" '?x] ['?m "date" '?d] [(list '< '?d max)]]
+                         :order-by '[[?d :desc] [?m :asc]] :limit 4})]
+    (doseq [p ["p1" "p2" "p4"] max ["999" "055"]]
+      (let [[drive plain] (both-ways db (query max) [p])]
+        (is (= plain drive) (str "ic09 with not= " p " " max))
+        (is (not-any? (fn [[x _ _]] (= x p)) drive) "the start person is excluded")))))
+
+(deftest the-value-order-is-carried-across-writes-not-rebuilt
+  ;; A write through assert-quad carries the tracked order forward with one
+  ;; conj; a stale entry would be rebuilt (a sort of every value) on the next
+  ;; read. Same answer either way, so the test counts rebuilds.
+  (let [db (social-db)
+        query {:find '[?m ?d] :in '[?p]
+               :where '[[?p "knows" ?x] [?m "hasCreator" ?x] [?m "date" ?d]]
+               :order-by '[[?d :desc] [?m :asc]] :limit 3}
+        _ (d/q db query everything ["p1"])
+        rebuilds-before (index/value-order-rebuild-count)
+        db2 (-> db (index/assert-quad {:s "m99" :p "hasCreator" :o "p2"} no-refs)
+                   (index/assert-quad {:s "m99" :p "date" :o "999"} no-refs))
+        answer (d/q db2 query everything ["p1"])]
+    (is (= "m99" (ffirst answer)) "the new, newest message leads the answer")
+    (is (= rebuilds-before (index/value-order-rebuild-count)) "no rebuild: the order was carried across the two writes")
+    (is (= answer (binding [d/*ordered-drive* false] (d/q db2 query everything ["p1"]))))
+    (testing "a retract carries too, and the value leaves the order when no subject holds it"
+      (let [db3 (index/retract-quad db2 {:s "m99" :p "date" :o "999"} no-refs)
+            a3 (d/q db3 query everything ["p1"])]
+        (is (not= "m99" (ffirst a3)))
+        (is (= rebuilds-before (index/value-order-rebuild-count)))
+        (is (= a3 (binding [d/*ordered-drive* false] (d/q db3 query everything ["p1"]))))))))
+
+(deftest a-snapshot-reader-behind-the-head-still-hits-the-order
+  ;; Serving shape: a reader holds a db a few writes older than the head.
+  ;; Its read must hit a tracked version, and must not untrack the head.
+  (let [db0 (social-db)
+        query {:find '[?m ?d] :in '[?p]
+               :where '[[?p "knows" ?x] [?m "hasCreator" ?x] [?m "date" ?d]]
+               :order-by '[[?d :desc] [?m :asc]] :limit 3}
+        _ (d/q db0 query everything ["p1"])
+        head (reduce (fn [db i] (-> db (index/assert-quad {:s (str "n" i) :p "hasCreator" :o "p2"} no-refs)
+                                       (index/assert-quad {:s (str "n" i) :p "date" :o (str 900 i)} no-refs)))
+                     db0 (range 5))
+        rebuilds (index/value-order-rebuild-count)]
+    (is (= "n4" (ffirst (d/q head query everything ["p1"]))))
+    (is (= rebuilds (index/value-order-rebuild-count)) "the head is tracked")
+    (is (= 3 (count (d/q db0 query everything ["p1"]))) "the old snapshot still answers")
+    (is (= rebuilds (index/value-order-rebuild-count)) "and hits its own version, no rebuild")
+    (let [head2 (index/assert-quad (index/assert-quad head {:s "n9" :p "hasCreator" :o "p2"} no-refs) {:s "n9" :p "date" :o "999"} no-refs)]
+      (is (= "n9" (ffirst (d/q head2 query everything ["p1"]))))
+      (is (= rebuilds (index/value-order-rebuild-count)) "the old snapshot's read did not untrack the head"))))
+
+;; ── the grouped drive (ayatori iteration 35) ────────────────────────────────
+;; IC02 on the full SF1: 11 friends, 21k candidate messages, and the global
+;; value walk is 0.3% hits, so the plain join touched every candidate (80 ms).
+;; When the driver's entity is tied to a small bound set through another
+;; attribute, the drive merges that attribute's groups in value order and
+;; reads at most `limit` entries from each.
+
+(defn- grouped-plan [db query inputs]
+  (#'d/ordered-drive-plan (#'d/fuse-value-ranges (:where query)) (:find query) (:order-by query) (:limit query) {}
+                          (into {} (map vector (remove #{'$} (:in query)) inputs))))
+
+(deftest the-grouped-drive-is-planned-for-the-ic02-shape-and-not-without-a-bound-group
+  (let [ic02 {:find '[?x ?m ?d] :in '[?p]
+              :where '[[?p "knows" ?x] [?m "hasCreator" ?x] [?m "date" ?d] [(< ?d "999")]]
+              :order-by '[[?d :desc] [?m :asc]] :limit 5}
+        ;; ?x is bound by nothing but the message itself: no group to merge
+        ungrouped {:find '[?x ?m ?d]
+                   :where '[[?m "hasCreator" ?x] [?m "date" ?d]]
+                   :order-by '[[?d :desc] [?m :asc]] :limit 5}]
+    (is (= {:g "hasCreator" :f '?x} (dissoc (:group (grouped-plan (social-db) ic02 ["p1"])) :clause)))
+    (is (nil? (:group (grouped-plan (social-db) ungrouped []))) "control: no bound group, no group plan")))
+
+(deftest the-grouped-drive-agrees-with-the-plain-join-and-reads-fewer-quads
+  (let [db (social-db)
+        ic02 (fn [max] {:find '[?x ?m ?d] :in '[?p]
+                        :where [['?p "knows" '?x] ['?m "hasCreator" '?x] ['?m "date" '?d] [(list '< '?d max)]]
+                        :order-by '[[?d :desc] [?m :asc]] :limit 5})
+        ic09 (fn [max] {:find '[?x ?m ?d] :in '[?p]
+                        :where [['?p "knows" '?f] ['?f "knows" '?x] '[(not= ?x ?p)] ['?m "hasCreator" '?x] ['?m "date" '?d]
+                                [(list '< '?d max)]]
+                        :order-by '[[?d :desc] [?m :asc]] :limit 4})
+        is2 {:find '[?m ?d] :in '[?p]
+             :where '[[?m "hasCreator" ?p] [?m "date" ?d]]
+             :order-by '[[?d :desc] [?m :asc]] :limit 3}
+        asc-closed (fn [lo] {:find '[?x ?m ?d] :in '[?p]
+                             :where [['?p "knows" '?x] ['?m "hasCreator" '?x] ['?m "date" '?d] [(list '>= '?d lo)]]
+                             :order-by '[[?d :asc] [?m :desc]] :limit 6})
+        ;; ties: three messages share every date in social-db, and the tie
+        ;; rule is ?m asc -- a chunk that split a value would misorder them
+        many {:find '[?x ?m ?d] :in '[?p]
+              :where '[[?p "knows" ?x] [?m "hasCreator" ?x] [?m "date" ?d]]
+              :order-by '[[?d :desc] [?m :asc]] :limit 25}]
+    (doseq [p ["p1" "p2" "p4" "p6" "nobody"] max ["999" "055" "050" "000"]]
+      (let [[drive plain] (both-ways db (ic02 max) [p])]
+        (is (= plain drive) (str "ic02 " p " " max)))
+      (let [[drive plain] (both-ways db (ic09 max) [p])]
+        (is (= plain drive) (str "ic09 " p " " max)))
+      (let [[drive plain] (both-ways db (asc-closed max) [p])]
+        (is (= plain drive) (str "asc closed lo " p " " max))))
+    (doseq [p ["p1" "p3" "p5" "nobody"]]
+      (let [[drive plain] (both-ways db is2 [p])]
+        (is (= plain drive) (str "is2 " p)))
+      (let [[drive plain] (both-ways db many [p])]
+        (is (= plain drive) (str "ties across chunks " p))))
+    (testing "the grouped drive looks at fewer quads than the plain join"
+      (let [count-with (fn [drive?]
+                         (let [n (atom 0)]
+                           (binding [d/*ordered-drive* drive?]
+                             (d/q db (ic02 "999") (fn [_] (swap! n inc) true) ["p1"]))
+                           @n))]
+        (is (< (count-with true) (count-with false)))))))
+
+(deftest the-group-order-is-carried-across-writes
+  (let [db (social-db)
+        is2 {:find '[?m ?d] :in '[?p]
+             :where '[[?m "hasCreator" ?p] [?m "date" ?d]]
+             :order-by '[[?d :desc] [?m :asc]] :limit 3}
+        run (fn [db p] (d/q db is2 everything [p]))]
+    (run db "p1")
+    (let [before (index/group-order-rebuild-count)
+          db2 (-> db
+                  (index/assert-quad {:s "new1" :p "hasCreator" :o "p1"} no-refs)
+                  (index/assert-quad {:s "new1" :p "date" :o "500"} no-refs))
+          seen (run db2 "p1")
+          db3 (index/retract-quad db2 {:s "new1" :p "date" :o "500"} no-refs)
+          gone (run db3 "p1")]
+      (is (= before (index/group-order-rebuild-count)) "two asserts and a retract, zero rebuilds")
+      (is (= ["new1" "500"] (first seen)) "the new message leads its creator's group")
+      (is (not-any? #(= "new1" (first %)) gone) "and leaves it on retract")
+      (is (= gone (binding [d/*ordered-drive* false] (run db3 "p1")))))))
+
+(defn- iterate-indexed [f x]
+  (map second (iterate (fn [[i v]] [(inc i) (f v i)]) [0 x])))
+
+(deftest the-version-window-trims-and-still-finds-a-reader-behind-the-head
+  ;; push past the window and check that (a) the head is found, (b) a reader
+  ;; a few writes behind is found, (c) a reader older than the window is not
+  ;; (it rebuilds -- the count moves), and (d) the window does not grow
+  ;; without bound.
+  (let [db0 (social-db)
+        is2 {:find '[?m ?d] :in '[?p] :where '[[?m "hasCreator" ?p] [?m "date" ?d]]
+             :order-by '[[?d :desc] [?m :asc]] :limit 3}
+        run (fn [db] (d/q db is2 everything ["p1"]))
+        write (fn [db i] (-> db (index/assert-quad {:s (str "w" i) :p "hasCreator" :o "p1"} no-refs)
+                                (index/assert-quad {:s (str "w" i) :p "date" :o (pad3 (mod i 900))} no-refs)))]
+    (run db0)
+    (let [dbs (vec (take 2600 (iterate-indexed write db0)))
+          before (index/group-order-rebuild-count)]
+      (run (peek dbs))
+      (run (nth dbs 2590))
+      (is (= before (index/group-order-rebuild-count)) "head and a reader 10 writes behind: no rebuild")
+      (run (nth dbs 1))
+      (is (= (inc before) (index/group-order-rebuild-count)) "a reader older than the window rebuilds once"))))
+
+(deftest the-drive-chooses-the-global-walk-when-the-group-set-is-large
+  ;; The global walk is chosen when limit * N_e / E_G (its expected steps) is
+  ;; under both half the value budget and |G|. On social-db every creator
+  ;; holds ~1/6 of the 40 dated messages; IC09 from p1 reaches 4 creators
+  ;; (E_G ~ 27 of 40): limit 2 -> ~3 steps < 4 groups, global; limit 10 ->
+  ;; ~15 steps >= 4, grouped. Both walks must agree with the plain join, and
+  ;; the limit-2 query must still stop early (fewer visible? calls).
+  (let [db (social-db)
+        ic09 (fn [limit] {:find '[?x ?m ?d] :in '[?p]
+                          :where '[[?p "knows" ?f] [?f "knows" ?x] [(not= ?x ?p)] [?m "hasCreator" ?x] [?m "date" ?d]]
+                          :order-by '[[?d :desc] [?m :asc]] :limit limit})
+        count-with (fn [q drive?]
+                     (let [n (atom 0)]
+                       (binding [d/*ordered-drive* drive?] (d/q db q (fn [_] (swap! n inc) true) ["p1"]))
+                       @n))]
+    (doseq [limit [2 4 10]]
+      (let [[drive plain] (both-ways db (ic09 limit) ["p1"])]
+        (is (= plain drive) (str "ic09 limit " limit))))
+    (is (< (count-with (ic09 2) true) (count-with (ic09 2) false)) "the global walk still stops early")))

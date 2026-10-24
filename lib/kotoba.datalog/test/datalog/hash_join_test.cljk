@@ -1,0 +1,107 @@
+(ns datalog.hash-join-test
+  "ADR-2608021000 §6-4-1: when a clause's whole relation is small relative to
+  the number of keyed scans a step would issue for it, read it once and hash
+  join.
+
+  The property that matters is not that it is faster -- it is that it cannot
+  change an answer. Every test here runs the SAME query twice, once with the
+  planner's cardinality hint and once without, and asserts the two results are
+  equal. That is the whole safety argument: the hint selects a strategy, never
+  a semantics."
+  (:require [kotoba.test :refer [deftest is]]
+            [datalog.index :as index]
+            [datalog.core :as d]))
+
+(def ^:private everything (constantly true))
+
+(def ^:private no-refs
+  "`datalog.index/assert-quad`'s `ref?`, which is REQUIRED here (arrangement
+  defaulted it to `ipld.core/link?`; this library has no IPLD to default to).
+  These fixtures use no reverse-reference lookup, so nothing is `:vaet`-indexed."
+  (constantly false))
+
+(defn- db-of [quads]
+  (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} no-refs)) (index/empty-db) quads))
+
+(defn- social
+  "n people in a ring where everyone knows the next two, each authoring two
+  messages. Small, but the same SHAPE as the workload that motivated this: a
+  two-hop expansion feeding a clause whose relation is much smaller than the
+  number of distinct keys reaching it."
+  [n]
+  (db-of (concat
+          (for [i (range n) d [1 2]] [(str "p" i) "knows" (str "p" (mod (+ i d) n))])
+          (for [i (range n) m [0 1]] [(str "m" i "-" m) "creator" (str "p" i)])
+          (for [i (range n) m [0 1]] [(str "m" i "-" m) "date" (str (+ (* i 10) m))]))))
+
+(def ^:private two-hop
+  '{:find [?f2 ?msg ?date]
+    :in [?person]
+    :where [[?person "knows" ?f1]
+            [?f1 "knows" ?f2]
+            [?msg "creator" ?f2]
+            [?msg "date" ?date]]})
+
+(defn- both-ways
+  "The query with and without the hint. Returns [keyed hashed]."
+  [db query hint inputs]
+  [(d/q db query everything inputs)
+   (d/q db (assoc query :clause-cardinality hint) everything inputs)])
+
+(deftest hint-does-not-change-a-two-hop-answer
+  (let [db (social 40)
+        ;; real relation sizes, as a planner would estimate them
+        hint '{[?person "knows" ?f1] 80
+               [?f1 "knows" ?f2] 80
+               [?msg "creator" ?f2] 80
+               [?msg "date" ?date] 80}
+        [keyed hashed] (both-ways db two-hop hint ["p0"])]
+    (is (seq keyed) "the fixture actually produces rows")
+    (is (= keyed hashed))))
+
+(deftest a-hint-that-is-wildly-wrong-still-does-not-change-the-answer
+  ;; A stale or bogus estimate must cost time at worst, never correctness.
+  (let [db (social 40)
+        [keyed hashed] (both-ways db two-hop '{[?msg "creator" ?f2] 0
+                                               [?f1 "knows" ?f2] 999999999}
+                                  ["p0"])]
+    (is (= keyed hashed))))
+
+(deftest hint-does-not-change-an-answer-with-a-literal-in-the-clause
+  ;; The broad pattern keeps literal constants and drops only variables; a
+  ;; clause whose object is a literal must still index and match on it.
+  (let [db (social 20)
+        query '{:find [?m] :in [?person]
+                :where [[?m "creator" ?person] [?m "date" "10"]]}
+        [keyed hashed] (both-ways db query '{[?m "creator" ?person] 40
+                                             [?m "date" "10"] 1}
+                                  ["p1"])]
+    (is (= keyed hashed))))
+
+(deftest hint-does-not-change-an-answer-under-negation
+  (let [db (social 20)
+        query '{:find [?f] :in [?person]
+                :where [[?person "knows" ?f]
+                        (not [?f "knows" ?person])]}
+        [keyed hashed] (both-ways db query '{[?person "knows" ?f] 40} ["p0"])]
+    (is (= keyed hashed))))
+
+(deftest hint-does-not-change-an-answer-under-or-join
+  ;; `or` branches can reach the same clause with different variables bound,
+  ;; which is the case that needs one hash index per distinct key shape.
+  (let [db (social 20)
+        query '{:find [?m] :in [?person]
+                :where [(or-join [?m ?person]
+                                 [?m "creator" ?person]
+                                 (and [?person "knows" ?f] [?m "creator" ?f]))]}
+        [keyed hashed] (both-ways db query '{[?m "creator" ?person] 40
+                                             [?m "creator" ?f] 40}
+                                  ["p0"])]
+    (is (= keyed hashed))))
+
+(deftest an-unhinted-clause-stays-on-the-keyed-path
+  ;; Partial hints are normal -- a planner may only estimate some clauses.
+  ;; Mixing the two strategies within one query must still agree.
+  (let [db (social 30)
+        [keyed hashed] (both-ways db two-hop '{[?msg "creator" ?f2] 60} ["p0"])]
+    (is (= keyed hashed))))
