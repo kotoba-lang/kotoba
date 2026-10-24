@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.mail` | `kotoba.mail/src` | `mail.draft`, `mail.inbound`, `mail.mailbox`, `mail.message` (Kotoba project library) |
 | `kotoba.macosInventory` | `kotoba.macosInventory/src` | `macos-inventory.cli`, `macos-inventory.core`, `macos-inventory.host` (Kotoba project library) |
 | `kotoba.loopUxKaizen` | `kotoba.loopUxKaizen/src` | `loop.ux-kaizen` (Kotoba project library) |
 | `kotoba.loopMaturityAudit` | `kotoba.loopMaturityAudit/src` | `loop-maturity-audit.core` (Kotoba project library) |
