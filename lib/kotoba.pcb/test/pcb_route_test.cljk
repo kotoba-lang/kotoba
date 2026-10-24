@@ -1,0 +1,146 @@
+(ns pcb-route-test
+  "Tests for `pcb.route` (Lee's-algorithm maze autorouting) — new
+  functionality, not a restoration, so unlike `pcb_test.cljc` there is
+  no original Rust test to mirror. Every assertion here reproduces a
+  value verified independently via REPL before being hardcoded (see
+  ADR for the PCB routing feature)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [pcb.layout :as layout]
+            [pcb.route :as route]))
+
+(defn- path-length-mm [points]
+  (reduce + (map (fn [[[x0 y0] [x1 y1]]]
+                    (Math/sqrt (+ (Math/pow (- x1 x0) 2) (Math/pow (- y1 y0) 2))))
+                  (partition 2 1 points))))
+
+(deftest namespace-loads
+  (testing "the new routing namespace loads"
+    (is (some? (find-ns 'pcb.route)))))
+
+;; ─────────────────────── maze-route-cells (low-level) ───────────────────────
+
+(deftest maze-route-cells-shortest-path
+  (let [path (route/maze-route-cells [5 5] #{} [0 0] [4 4])]
+    (is (= [0 0] (first path)))
+    (is (= [4 4] (last path)))
+    ;; Manhattan distance 8 -> 9 cells inclusive on an unobstructed grid
+    (is (= 9 (count path)))))
+
+(deftest maze-route-cells-same-cell
+  (is (= [[2 2]] (route/maze-route-cells [5 5] #{} [2 2] [2 2]))))
+
+(deftest maze-route-cells-unreachable
+  (let [wall (into #{} (for [r (range 5)] [2 r]))]
+    (is (nil? (route/maze-route-cells [5 5] wall [0 0] [4 0])))))
+
+;; ────────────────────────── footprint-pad-positions ──────────────────────────
+
+(deftest footprint-pad-positions-rotation
+  (testing "a pad's local center is rotated by the footprint's rotation, then translated"
+    (let [fp {:id 99 :x 5.0 :y 5.0 :rotation 90.0
+              :pads [(layout/pad {:center [1.0 0.0] :size [1.0 1.0] :shape :round
+                                   :drill nil :layers [:front] :net-id 3})]}
+          [{:keys [net-id footprint-id absolute]}] (route/footprint-pad-positions fp)]
+      (is (= 3 net-id))
+      (is (= 99 footprint-id))
+      (is (< (Math/abs (- 5.0 (first absolute))) 1e-9))
+      (is (< (Math/abs (- 6.0 (second absolute))) 1e-9)))))
+
+;; ─────────────────────────────── route-net ───────────────────────────────
+
+(defn- two-pad-layout [board net-id]
+  (let [pad-a (layout/pad {:center [0.0 0.0] :size [1.0 1.0] :shape :round
+                            :drill nil :layers [:front] :net-id net-id})
+        pad-b (layout/pad {:center [0.0 0.0] :size [1.0 1.0] :shape :round
+                            :drill nil :layers [:front] :net-id net-id})
+        [_id lay1] (layout/place-footprint (layout/pcb-layout board) "R" "R1" 2.0 10.0 0 :front [pad-a])
+        [_id lay2] (layout/place-footprint lay1 "R" "R2" 18.0 10.0 0 :front [pad-b])]
+    lay2))
+
+(deftest route-net-basic-connectivity
+  (let [board (layout/pcb-board [[0.0 0.0] [20.0 20.0]] [(layout/layer-def :front "F.Cu" 0.035)])
+        [status lay] (route/route-net (two-pad-layout board 1) 1)
+        trace (first (:traces lay))]
+    (is (= :routed status))
+    (is (= 1 (count (:traces lay))))
+    (is (= [2.0 10.0] (first (:points trace))))
+    (is (= [18.0 10.0] (last (:points trace))))
+    (is (< (Math/abs (- 16.0 (path-length-mm (:points trace)))) 1e-9))
+    (is (empty? (layout/run-drc lay)))))
+
+(deftest route-net-obstacle-forces-genuine-detour
+  (testing "a wall pad placed directly on the straight-line path forces a longer, DRC-clean detour"
+    (let [board (layout/pcb-board [[0.0 0.0] [20.0 20.0]] [(layout/layer-def :front "F.Cu" 0.035)])
+          wall (layout/pad {:center [0.0 0.0] :size [6.0 10.0] :shape :rect
+                             :drill nil :layers [:front] :net-id 2})
+          [_id blocked-lay] (layout/place-footprint (two-pad-layout board 1) "WALL" "U1" 10.0 10.0 0 :front [wall])
+          [status lay] (route/route-net blocked-lay 1)
+          trace (first (:traces lay))
+          len (path-length-mm (:points trace))]
+      (is (= :routed status))
+      ;; unobstructed Manhattan minimum between these two pads is 16.0mm
+      ;; (proven by route-net-basic-connectivity above) -- a genuinely
+      ;; longer routed path is the only way this obstacle test isn't
+      ;; vacuous (an earlier version of build-obstacle-set ignored pad
+      ;; :size entirely, so this assertion would have failed to catch it:
+      ;; the router found the same 16.0mm path regardless of the wall).
+      (is (> len 16.0))
+      (is (< (Math/abs (- 28.5 len)) 1e-9))
+      (is (empty? (layout/run-drc lay))))))
+
+(deftest route-net-multi-pin-net-uses-mst
+  (testing "an N-pin net routes as N-1 traces (minimum spanning tree over pads)"
+    (let [board (layout/pcb-board [[0.0 0.0] [20.0 20.0]] [(layout/layer-def :front "F.Cu" 0.035)])
+          mk-pad #(layout/pad {:center [0.0 0.0] :size [1.0 1.0] :shape :round
+                                :drill nil :layers [:front] :net-id 5})
+          lay0 (layout/pcb-layout board)
+          [_i1 l1] (layout/place-footprint lay0 "R" "R1" 2.0 2.0 0 :front [(mk-pad)])
+          [_i2 l2] (layout/place-footprint l1 "R" "R2" 18.0 2.0 0 :front [(mk-pad)])
+          [_i3 l3] (layout/place-footprint l2 "R" "R3" 10.0 18.0 0 :front [(mk-pad)])
+          [status lay] (route/route-net l3 5)]
+      (is (= :routed status))
+      (is (= 2 (count (:traces lay))))
+      (is (empty? (layout/run-drc lay))))))
+
+(deftest route-net-fewer-than-two-pads-is-a-noop
+  (let [board (layout/pcb-board [[0.0 0.0] [20.0 20.0]] [(layout/layer-def :front "F.Cu" 0.035)])
+        pad-a (layout/pad {:center [0.0 0.0] :size [1.0 1.0] :shape :round
+                            :drill nil :layers [:front] :net-id 1})
+        lay0 (layout/pcb-layout board)
+        [_id lay1] (layout/place-footprint lay0 "R" "R1" 2.0 2.0 0 :front [pad-a])
+        [status lay2] (route/route-net lay1 1)]
+    (is (= :ok status))
+    (is (= lay1 lay2))
+    ;; a net-id with zero pads at all
+    (let [[status0 lay0'] (route/route-net lay0 99)]
+      (is (= :ok status0))
+      (is (= lay0 lay0')))))
+
+(deftest route-net-boxed-in-net-is-unrouted
+  (testing "a net with no obstacle-free path leaves the layout unchanged and reports :unrouted"
+    (let [board (layout/pcb-board [[0.0 0.0] [10.0 10.0]] [(layout/layer-def :front "F.Cu" 0.035)])
+        lay0 (layout/pcb-layout board)
+        pad-l (layout/pad {:center [0.0 0.0] :size [1.0 1.0] :shape :round
+                            :drill nil :layers [:front] :net-id 1})
+        pad-r (layout/pad {:center [0.0 0.0] :size [1.0 1.0] :shape :round
+                            :drill nil :layers [:front] :net-id 1})
+        wall-pads (mapv (fn [dy]
+                           (layout/pad {:center [0.0 dy] :size [1.4 1.4] :shape :round
+                                        :drill nil :layers [:front] :net-id 2}))
+                         (range 0.0 10.01 1.0))
+        [_i1 l1] (layout/place-footprint lay0 "R" "R1" 1.0 5.0 0 :front [pad-l])
+        [_i2 l2] (layout/place-footprint l1 "R" "R2" 9.0 5.0 0 :front [pad-r])
+        [_i3 l3] (layout/place-footprint l2 "WALL" "U1" 5.0 0.0 0 :front wall-pads)
+        [status lay4] (route/route-net l3 1)]
+    (is (= :unrouted status))
+    (is (= (:traces l3) (:traces lay4)))
+    (is (empty? (:traces lay4))))))
+
+;; ─────────────────────────────── route-all ───────────────────────────────
+
+(deftest route-all-routes-every-net
+  (let [board (layout/pcb-board [[0.0 0.0] [20.0 20.0]] [(layout/layer-def :front "F.Cu" 0.035)])
+        result (route/route-all (two-pad-layout board 1))]
+    (is (= [1] (:routed result)))
+    (is (= [] (:failed result)))
+    (is (= 1 (count (:traces (:layout result)))))))
