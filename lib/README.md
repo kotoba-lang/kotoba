@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.crypto` | `kotoba.crypto/src` | `kotoba.crypto`, `kotoba.crypto.-to-bytes`, `kotoba.crypto.aead`, `kotoba.crypto.aead-provider` (Kotoba project library) |
 | `kotoba.briefing` | `kotoba.briefing/src` | `briefing.model`, `briefing.validate` (Kotoba project library) |
 | `kotoba.bmc` | `kotoba.bmc/src` | `bmc.canvas`, `bmc.gate`, `bmc.io`, `bmc.ledger` (Kotoba project library) |
 | `kotoba.blockCache` | `kotoba.blockCache/src` | `block.cache`, `block.cache.worker` (Kotoba project library) |
