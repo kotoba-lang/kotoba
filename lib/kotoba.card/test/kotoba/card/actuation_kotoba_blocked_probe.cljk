@@ -1,0 +1,198 @@
+#!/usr/bin/env kbb
+;; Why `kotoba.card.actuation` has NOT been migrated to `.kotoba`, asserted
+;; rather than written down.
+;;
+;; ## The measurement
+;;
+;; Protocols are NOT missing from the language. Measured 2026-09-09, a protocol
+;; whose implementations are in the same compiled graph compiles, runs, and
+;; answers correctly -- this probe builds `extend-protocol` over two records and
+;; checks the emitted artifact returns 103. That is control #1, and without it
+;; the refusal below could not be attributed to anything.
+;;
+;; What is refused is the PORT shape: a protocol method called on a value the
+;; module does not statically know the record of.
+;;
+;;   error :kotoba.error/protocol-dispatch
+;;   "protocol method requires a statically known implemented record; got :i64"
+;;
+;; That is precisely what `ICardActuation` and `ICardholderActuation` are.
+;; `lang/surface-status.edn` names the profile: `:protocol-and-record-dispatch`
+;; is `:bounded-closed-world-static-dispatch`, with `:dynamic-fallback false` and
+;; `:default :sealed-module-record-specialization`. The implementers here are
+;; deliberately outside the graph and in another repository --
+;; `io.stripe.issuing.core/StripeIssuing` is a JVM record holding a live HTTP
+;; transport, and `cardissuing.http` dispatches on an actuator injected at
+;; runtime. An open world is the whole point of a port.
+;;
+;; ⚠ That entry's `:missing []` is scoped to the closed-world profile. It does
+;; NOT mean protocols are complete, and it is not a statement that open-world
+;; dispatch is refused by design.
+;;
+;; ## This is backend state, not a permanent design decision
+;;
+;; The question this probe was written to answer. `:disposition` is
+;; `:implemented-partial`, which ADR-2608650000 classifies as TEMPORARY -- the
+;; permanent dispositions are `:intentional-security-constraint` and
+;; `:intentional-semantic-simplification`, and neither is on this profile. So the
+;; component is not redesigned to fit the backend (the skill's rule: a backend
+;; gap is a block, not a rewrite). Nothing here is folded into predicates to make
+;; a gate green.
+;;
+;; ## Why `:blocked` and not a partial migration
+;;
+;; The pure half of this namespace -- `approval-issues`, `authorised?`,
+;; `idempotency-issues`, `state-mapping-complete?`, `unrepresentable-states`,
+;; `refusal`, `precheck` -- would each move today. Moving only those and leaving
+;; the two protocols behind is a decision-only slice, and
+;; `kotoba-lang/lang/q9-migration.edn` v3 sets
+;; `:decision-only-slices-allowed false` with `:migration-unit :whole-component`.
+;;
+;; Replacing the protocols with declared capability imports is the other way a
+;; port can cross, and it is rejected here for a reason that is not about the
+;; compiler: this library is provider-agnostic on purpose ("No credential,
+;; endpoint or SDK lives in this library"), so a capability that issued a card
+;; would have to name a provider's wire format, which lives in the provider. It
+;; would also delete two public exports that two other repositories implement --
+;; a versioned API decision, not a migration step.
+;;
+;; ## Removal condition
+;;
+;; When a protocol method may be called on a value whose record is not statically
+;; known, this probe goes RED and the migration is unblocked. Nobody has to
+;; remember.
+;;
+;;   kbb --backend sci test/kotoba/card/actuation_kotoba_blocked_probe.cljk
+;;
+;; Exit 0 still blocked / 1 unblocked, migrate / 2 REFUSED to report.
+
+(ns actuation-kotoba-blocked-probe
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8"})]
+    {:exit (or (.-status r) -1) :out (str (.-stdout r) (.-stderr r))}))
+
+;; Measured by RUNNING the CLI, not by `which`: a shim that resolves and fails to
+;; exec turns a skip into a red for the wrong reason (measured in org-ietf-smtp,
+;; where that cost 16 assertions).
+(defn- cli-usable? [] (zero? (:exit (sh "kotoba" ["--help"]))))
+
+(def ^:private tmp
+  (fs/mkdtempSync (path/join (os/tmpdir) "card-actuation-blocked-")))
+
+(defn- write! [name text]
+  (let [p (path/join tmp name)] (fs/writeFileSync p text) p))
+
+;; --- control #1: closed-world dispatch compiles, RUNS, and is correct -------
+;;
+;; Not `-M check`. `:ok true` means "it built", and a backend that accepts and
+;; answers wrongly is worse than one that refuses (amu#835). So the artifact is
+;; instantiated and its value compared.
+
+(def ^:private closed-world-source
+  (str "(ns probe.closed (:export [main]))\n\n"
+       "(defprotocol Value\n  (value [this]))\n\n"
+       "(defrecord Special [x])\n(defrecord Ordinary [x])\n\n"
+       "(extend-protocol Value\n"
+       "  Special\n  (value [this] (+ 100 (:x this)))\n\n"
+       "  default\n  (value [this] (:x this)))\n\n"
+       "(defn main [] :i64\n  (+ (value (->Special 1))\n     (value (->Ordinary 2))))\n"))
+
+(defn- closed-world-runs-correctly? []
+  (let [src (write! "closed.kotoba" closed-world-source)
+        out (path/join tmp "closed.mjs")
+        c (sh "kotoba" ["-M" "compile" src "--target" "js-browser" "--output" out])]
+    (if-not (zero? (:exit c))
+      {:ok false :why (str "the closed-world control did not compile: " (:out c))}
+      (let [runner (write! "run.mjs"
+                           (str "import { instantiateKotoba } from '" out "';\n"
+                                "const ex = instantiateKotoba();\n"
+                                "console.log(String(ex['main']()));\n"))
+            r (sh "node" [runner])
+            got (.trim (:out r))]
+        (if (and (zero? (:exit r)) (= "103" got))
+          {:ok true :got got}
+          {:ok false :why (str "the closed-world control ran but answered " (pr-str got)
+                               " (want \"103\"): " (:out r))})))))
+
+;; --- the port shape --------------------------------------------------------
+;;
+;; `ICardActuation/card-state` reduced to its smallest honest form: a method
+;; called on a parameter, which is what a caller holding an injected actuator
+;; does.
+
+(def ^:private port-source
+  (str "(ns probe.port (:export [effect]))\n\n"
+       "(defprotocol ICardActuation\n  (card-state [this reference]))\n\n"
+       "(defn effect [provider reference :string] :keyword\n"
+       "  (card-state provider reference))\n"))
+
+(def ^:private expected-reason ":kotoba.error/protocol-dispatch")
+
+(defn- port-verdict []
+  (let [src (write! "port.kotoba" port-source)
+        {:keys [exit out]} (sh "kotoba" ["-M" "check" src])]
+    (cond
+      (and (zero? exit) (re-find #":ok true" out))
+      {:verdict :admitted :out out}
+
+      ;; Refused for the reason this probe names. Pinning the literal is the
+      ;; point: if upstream renames the code, this goes to :other and REFUSES
+      ;; rather than quietly counting a different failure as the same block.
+      (re-find (re-pattern expected-reason) out)
+      {:verdict :refused-as-recorded :out out}
+
+      :else {:verdict :other :out out})))
+
+(defn -main []
+  (if-not (cli-usable?)
+    (do (println "SKIP: the kotoba CLI did not run (non-zero exit).")
+        (println "      A skip, not a pass: the block is UNVERIFIED today.")
+        (js/process.exit 0))
+    (let [control (closed-world-runs-correctly?)
+          {:keys [verdict out]} (port-verdict)]
+      (println "protocol dispatch, measured against the kotoba CLI:")
+      (println "  control: closed-world protocol, compiled AND run ->"
+               (if (:ok control) (str "correct (" (:got control) ")") "FAILED"))
+      (println "  port shape (method on a value of unknown record) ->"
+               (case verdict
+                 :admitted "ADMITTED"
+                 :refused-as-recorded (str "refused, " expected-reason)
+                 :other "refused for a DIFFERENT reason"))
+      (println)
+      (cond
+        (not (:ok control))
+        (do (println "REFUSED to report: the control failed, so nothing below can be")
+            (println "attributed to open-world dispatch. Fix the probe first.")
+            (println (:why control))
+            (js/process.exit 2))
+
+        (= verdict :admitted)
+        (do (println "A protocol method may now be called on a value whose record is not")
+            (println "statically known. kotoba.card.actuation is UNBLOCKED and can move")
+            (println "whole: the pure half was always expressible, and the two ports were")
+            (println "the only thing missing.")
+            (js/process.exit 1))
+
+        (= verdict :other)
+        (do (println "REFUSED to report: the port shape was refused, but NOT for")
+            (println (str "  " expected-reason "  -- the reason this block is recorded under."))
+            (println "Read the diagnostic and decide whether the block still holds:")
+            (println out)
+            (js/process.exit 2))
+
+        :else
+        (do (println "Still blocked: the implementers of ICardActuation /")
+            (println "ICardholderActuation live outside the compiled graph on purpose")
+            (println "(io.stripe.issuing.core/StripeIssuing, and cardissuing.http")
+            (println "dispatches on an injected actuator), and the profile is")
+            (println "closed-world. Recording it beats migrating the decisions and")
+            (println "leaving the ports behind -- q9-migration.edn v3 sets")
+            (println ":decision-only-slices-allowed false.")
+            (js/process.exit 0))))))
+
+(-main)
