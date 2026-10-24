@@ -58,6 +58,10 @@ yet perform full semantic admission or compilation, nor expose the CID on the
 public CLI. The public launcher, other `check` modes, and the remaining command
 execution paths are still open.
 
+The same native fixture is wired to the x86 controller job using the complete
+native x86 F3 compiler and x86 runner. That x86 CLI check requires a terminal
+CI run and artifact readback before qualification.
+
 An input path for `cli-contract` and unsupported `--source-path`, `--json`,
 `--safe=false`, or non-Kotoba target forms are refused rather than silently accepted.
 
