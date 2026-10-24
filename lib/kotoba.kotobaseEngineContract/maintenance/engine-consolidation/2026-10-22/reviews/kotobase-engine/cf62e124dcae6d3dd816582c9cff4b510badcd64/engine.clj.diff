@@ -1,0 +1,166 @@
+--- cf62e124:src/kotobase/engine.clj
++++ main:src/kotobase/engine.clj.cljk
+@@ -3,7 +3,9 @@
+ 
+   The historical kotobase-peer implementation is deliberately hidden behind
+   this database-shaped API."
+-  (:require [kotobase-peer.core :as peer]
++  (:require [arrangement.core :as qs]
++            [arrangement.query :as kqe]
++            [kotobase-peer.core :as peer]
+             [kotobase.storage.core :as storage]))
+ 
+ (defrecord Database
+@@ -16,7 +18,8 @@
+ (defn open
+   [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
+            tx-functions]
+-    :or {ref-name "main" max-retries 16 tx-functions {}}}]
++    :or {ref-name "main" tx-functions {}}
++    :as opts}]
+   (storage/validate-backend! storage)
+   (doseq [[control value]
+           [[:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
+@@ -28,8 +31,18 @@
+   (when-not (every? ifn? (vals tx-functions))
+     (throw (ex-info "Every transaction function must be callable"
+                     {:type :kotobase.datomic/invalid-tx-functions})))
+-  (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
+-              max-retries tx-functions (atom {})))
++  (when (contains? opts :merge)
++    ;; Merge commits are written and verified on the Promise facade only; a
++    ;; JVM connection configured for them would read merges unverified.
++    (throw (ex-info ":merge is not supported on the JVM facade"
++                    {:type :kotobase.engine/unsupported-platform})))
++  (let [max-retries (if (nil? max-retries) 16 max-retries)]
++    (when-not (and (integer? max-retries) (not (neg? max-retries)))
++      (throw (ex-info ":max-retries must be a non-negative integer"
++                      {:type :kotobase.engine/invalid-option
++                       :max-retries max-retries})))
++    (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
++                max-retries tx-functions (atom {}))))
+ 
+ (defn head [^Database database]
+   (if (instance? Db database)
+@@ -48,6 +61,21 @@
+ 
+ (defn- connection [database]
+   (if (instance? Db database) (:connection database) database))
++
++(defn at-cid
++  "Return an immutable database value pinned to exactly COMMIT-CID.
++
++  The commit is not trusted merely because a caller names it. Its block and
++  every block reached while reading it are still fetched through the
++  provider-neutral storage contract and verified by kotobase-peer. A missing
++  or forged commit therefore fails on the first read instead of falling back
++  to the mutable head."
++  [database commit-cid]
++  (when-not (and (string? commit-cid) (seq commit-cid))
++    (throw (ex-info "Kotobase requires a non-empty commit CID"
++                    {:type :kotobase.engine/invalid-commit-cid
++                     :commit-cid commit-cid})))
++  (->Db (connection database) commit-cid :current nil nil))
+ 
+ (defn tx-function [database ident]
+   (let [functions (:tx-functions (connection database))]
+@@ -60,7 +88,7 @@
+     (throw (ex-info "Listener must be callable"
+                     {:type :kotobase.datomic/invalid-listener})))
+   (let [database (connection database)
+-        id (str (java.util.UUID/randomUUID))]
++        id (str (random-uuid))]
+     (swap! (:listeners database) assoc id listener)
+     id))
+ 
+@@ -123,6 +151,26 @@
+     (peer/commit-serialized!
+      put! get-fn cas! (:ref-name database) (head database) tx-data
+      (:encrypt-fn database) (:max-retries database))))
++
++(defn commit-at!
++  "Append TX-DATA to exactly EXPECTED-BASIS and return the new commit CID.
++
++  This is the immutable canonical write primitive. It writes CID-addressed
++  blocks but does not read, publish, or retry through a mutable ref. Concurrent
++  callers using the same basis therefore produce explicit branches for a
++  later deterministic merge instead of silently rebasing one caller's intent."
++  [^Database database expected-basis tx-data]
++  (when (instance? Db database)
++    (throw (ex-info "Cannot commit through an immutable database value"
++                    {:type :kotobase.datomic/immutable-db})))
++  (when-not (or (nil? expected-basis)
++                (and (string? expected-basis) (seq expected-basis)))
++    (throw (ex-info "Kotobase requires nil or a non-empty basis CID"
++                    {:type :kotobase.engine/invalid-commit-cid
++                     :commit-cid expected-basis})))
++  (let [{:keys [put! get-fn]} (storage/ports (:storage database))]
++    (peer/commit! put! get-fn tx-data expected-basis
++                  (:encrypt-fn database))))
+ 
+ (defn novelty-size
+   "How many not-yet-folded tx blocks sit on `chain-cid` (kotobase-peer.core/
+@@ -186,6 +234,39 @@
+            true vec))
+        (peer/datoms (db-value snapshot) options (:visible? database))))))
+ 
++(defn- row-in-value-range? [start end {:keys [v_edn]}]
++  (let [value (read-string v_edn)]
++    (and (or (nil? start) (not (neg? (compare value start))))
++         (or (nil? end) (neg? (compare value end))))))
++
++(defn- quads->datom-rows [quads visible?]
++  (->> quads
++       (map (fn [{:keys [s p o]}]
++              {:e s :a p :v_edn (pr-str (qs/link->edn o)) :added true}))
++       (filter visible?)
++       vec))
++
++(defn index-range
++  "AVET datoms for ATTRIBUTE whose stored values fall in [START, END).
++
++  Exclusive hi. The hot in-memory db answers this via
++  `arrangement.query/query-range` (datalog `:pos`). History is an
++  assertion log, so that mode still filters decoded values after a
++  prefix read. HMAC-blinded persisted covering keys are not
++  order-preserving; this path does not claim they can prune by value."
++  [database attribute start end]
++  (let [{:keys [mode] :as snapshot} (ensure-db database)
++        conn (connection snapshot)
++        visible? (:visible? conn)]
++    (if (= :history mode)
++      (->> (datoms snapshot {:index :avet :components [attribute]})
++           (filter #(row-in-value-range? start end %))
++           vec)
++      (quads->datom-rows
++       (kqe/query-range (db-value snapshot) attribute start end
++                        (constantly true))
++       visible?))))
++
+ (defn q [database pattern]
+   (peer/q (db-value database) pattern (:visible? (connection database))))
+ 
+@@ -237,3 +318,23 @@
+       (let [conn (connection database)
+             {:keys [get-fn]} (storage/ports (:storage conn))]
+         (peer/view-rows get-fn current view-name (:visible? conn) (:decrypt-fn conn))))))
++
++;; ---------------------------------------------------------------------------
++;; Multi-parent merge (kotobase ADR-2610101200) is implemented and tested on
++;; the Promise facade only (engine.cljs.cljk, run by kbb). These JVM entry
++;; points exist for API symmetry and refuse: the kotoba dependency tree no
++;; longer loads on the JVM, so an implementation here could not be tested.
++;; JVM reads do not verify merge commits either; read through merges on the
++;; Promise facade.
++
++(defn- unsupported [fn-name]
++  (throw (ex-info (str fn-name " is not supported on the JVM facade; "
++                       "use the Promise facade (kotobase.engine on cljs)")
++                  {:type :kotobase.engine/unsupported-platform
++                   :fn fn-name})))
++
++(defn merge-at! [& _] (unsupported "merge-at!"))
++(defn merge! [& _] (unsupported "merge!"))
++(defn branch-heads [& _] (unsupported "branch-heads"))
++(defn logical-projection [& _] (unsupported "logical-projection"))
++(defn verify-at [& _] (unsupported "verify-at"))

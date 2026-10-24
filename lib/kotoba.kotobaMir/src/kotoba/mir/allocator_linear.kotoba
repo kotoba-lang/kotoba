@@ -1,0 +1,442 @@
+;; Linear allocation is the primary owning policy. Persistent state preserves
+;; free/reserve ordering, definition-store placement and call/reentry homes.
+(ns kotoba.mir.allocator-linear
+  {:kotoba/export [allocate]}
+  (:require [kotoba.gmir.node :as node] [kotoba.gmir.identity :as identity]
+            [kotoba.mir.table :as table] [kotoba.mir.operands :as operands]
+            [kotoba.mir.allocator-data :as data] [kotoba.mir.allocator-cfg :as cfg]
+            [kotoba.mir.allocator-phi :as phi] [kotoba.mir.allocator-spill :as spill]
+            [kotoba.mir.catalog :as catalog] [kotoba.mir.flat :as flat] [kotoba.mir.outcome :as outcome]
+            [kotoba.mir.schedule :as schedule])
+  (:schemas
+   {:mir.linear/state [:record :mir.linear/state [[:assigned [:ref :mir.table/tree]] [:backed [:ref :mir.table/tree]]
+      [:positions [:ref :mir.table/tree]] [:data [:ref :gmir.node/value]]]]
+    :mir.linear/env [:record :mir.linear/env [[:target :keyword] [:pool [:ref :gmir.node/value]] [:code [:ref :gmir.node/value]]
+      [:last-use [:ref :mir.table/tree]] [:indexes [:ref :mir.table/tree]] [:crossing [:ref :mir.table/tree]] [:preserved [:ref :mir.table/tree]]
+      [:current [:ref :gmir.node/value]] [:homes [:ref :gmir.node/value]] [:recur-homes [:ref :mir.table/tree]]
+      [:direct :bool] [:calls :bool] [:return [:ref :gmir.node/value]]]]}))
+(defn- assigned [state [:ref :mir.linear/state]] [:ref :mir.table/tree] (record-get [:ref :mir.linear/state] state :assigned))
+(defn- backed [state [:ref :mir.linear/state]] [:ref :mir.table/tree] (record-get [:ref :mir.linear/state] state :backed))
+(defn- positions [state [:ref :mir.linear/state]] [:ref :mir.table/tree] (record-get [:ref :mir.linear/state] state :positions))
+(defn- state-data [state [:ref :mir.linear/state]] [:ref :gmir.node/value] (record-get [:ref :mir.linear/state] state :data))
+(defn- part [state [:ref :mir.linear/state] key :keyword] [:ref :gmir.node/value] (node/key (state-data state) key))
+(defn- number [state [:ref :mir.linear/state] key :keyword] :i64 (arena-scope (node/number (part state key))))
+(defn- with-part [state [:ref :mir.linear/state] key :keyword value [:ref :gmir.node/value]] [:ref :mir.linear/state]
+  (record-new [:ref :mir.linear/state] (assigned state) (backed state) (positions state) (node/put-key (state-data state) key value)))
+(defn- with-number [state [:ref :mir.linear/state] key :keyword value :i64] [:ref :mir.linear/state] (with-part state key (node/i64-value value)))
+(defn- with-assigned [state [:ref :mir.linear/state] values [:ref :mir.table/tree]] [:ref :mir.linear/state]
+  (record-new [:ref :mir.linear/state] values (backed state) (positions state) (state-data state)))
+(defn- with-backed [state [:ref :mir.linear/state] values [:ref :mir.table/tree]] [:ref :mir.linear/state]
+  (record-new [:ref :mir.linear/state] (assigned state) values (positions state) (state-data state)))
+(defn- with-positions [state [:ref :mir.linear/state] values [:ref :mir.table/tree]] [:ref :mir.linear/state]
+  (record-new [:ref :mir.linear/state] (assigned state) (backed state) values (state-data state)))
+(defn- empty-state [] [:ref :mir.linear/state]
+  (record-new [:ref :mir.linear/state] (table/empty) (table/empty) (table/empty) (node/empty-map)))
+(defn- ok [state [:ref :mir.linear/state]] [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (result-ok-of [:result [:ref :mir.linear/state] [:ref :mir/refusal]] state))
+(defn- fail [problem :keyword value [:ref :gmir.node/value]] [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (result-err-of [:result [:ref :mir.linear/state] [:ref :mir/refusal]] (outcome/refusal problem value)))
+(defn- ok? [result [:result [:ref :mir.linear/state] [:ref :mir/refusal]]] :bool
+  (arena-scope (result-ok?-of [:result [:ref :mir.linear/state] [:ref :mir/refusal]] result)))
+(defn- value [result [:result [:ref :mir.linear/state] [:ref :mir/refusal]]] [:ref :mir.linear/state]
+  (result-value-of [:result [:ref :mir.linear/state] [:ref :mir/refusal]] result (empty-state)))
+(defn- emit [state [:ref :mir.linear/state] instruction [:ref :gmir.node/value]] [:ref :mir.linear/state]
+  (with-part state :out (node/append (part state :out) instruction)))
+(defn- emit-all [state [:ref :mir.linear/state] instructions [:ref :gmir.node/value]] [:ref :mir.linear/state]
+  (with-part state :out (data/append-all (part state :out) instructions)))
+(defn- ins [op :keyword] [:ref :gmir.node/value] (node/put-key (node/empty-map) :mir/op (node/keyword-literal op)))
+(defn- call? [instruction [:ref :gmir.node/value]] :bool
+  (arena-scope (or (data/op? instruction :mir/call) (data/op? instruction :mir/tail-call) (data/op? instruction :mir/runtime-call) (data/op? instruction :mir/capability-call))))
+(defn- bank [target :keyword banks [:list [:ref :mir.catalog/bank]]] [:ref :gmir.node/value]
+  (let [list (option-match [:option [:list :keyword]] (catalog/registers-for banks target :all) (typed-list-new [:list :keyword]) found-value found-value)]
+    (loop [index 0 out (node/empty-vector)]
+      (if (>= index (vector-count list)) out (recur (+ index 1) (node/append out (node/keyword-literal (typed-list-nth [:list :keyword] list index))))))))
+(defn- set-of [values [:ref :gmir.node/value]] [:ref :mir.table/tree]
+  (loop [index 0 out (table/empty)]
+    (if (>= index (node/child-count values)) out (recur (+ index 1) (data/include out (operands/key-of (data/at values index)))))))
+(defn- without [values [:ref :gmir.node/value] omitted [:ref :mir.table/tree]] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-vector)]
+    (if (>= index (node/child-count values)) out
+      (let [value (data/at values index)] (recur (+ index 1) (if (data/member? omitted (operands/key-of value)) out (node/append out value)))))))
+(defn- owned [values [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (loop [index 0 out (table/empty)]
+    (if (>= index (table/count values)) out (recur (+ index 1) (data/include out (operands/key-of (data/lookup values (data/key-at values index))))))))
+(defn- rebuild [env [:ref :mir.linear/env] state [:ref :mir.linear/state]] [:ref :mir.linear/state]
+  (let [target (record-get [:ref :mir.linear/env] env :target) pool (record-get [:ref :mir.linear/env] env :pool)
+        split (node/child-count (bank target (catalog/physical-registers))) owners (owned (assigned state))]
+    (-> state (with-part :free (without (data/slice pool 0 split) owners))
+              (with-part :reserve (without (data/slice pool split (node/child-count pool)) owners)))))
+(defn- expire [env [:ref :mir.linear/env] state [:ref :mir.linear/state] expired [:ref :mir.table/tree] tiered :bool] [:ref :mir.linear/state]
+  (let [old (assigned state) remaining (loop [index 0 out old]
+                                       (if (>= index (table/count expired)) out (recur (+ index 1) (table/remove out (data/key-at expired index)))))
+        still-owned (owned remaining)
+        released (loop [index 0 out (node/empty-vector)]
+                   (if (>= index (table/count expired)) out
+                     (let [register (data/lookup old (data/key-at expired index))]
+                       (recur (+ index 1) (if (data/member? still-owned (operands/key-of register)) out (node/append out register))))))
+        next (-> state (with-assigned remaining) (with-part :free (data/append-all (part state :free) released)))]
+    (if (not tiered) next
+      (let [scratch (set-of (bank (record-get [:ref :mir.linear/env] env :target) (catalog/physical-registers)))
+            scratch-released (loop [index 0 out (node/empty-vector)]
+                               (if (>= index (node/child-count released)) out
+                                 (let [register (data/at released index)]
+                                   (recur (+ index 1) (if (data/member? scratch (operands/key-of register)) (node/append out register) out)))))
+            preserved-released (without released scratch)]
+        (-> next (with-part :free (data/append-all (without (part next :free) (set-of released)) scratch-released))
+                 (with-part :reserve (data/append-all preserved-released (part next :reserve))))))))
+(defn- store-at-definition [state [:ref :mir.linear/state] key [:ref :mir.table/key] register [:ref :gmir.node/value] slot :i64]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (if (not (data/present? (positions state) key))
+    (fail :spill-required (-> (node/empty-map) (node/put-key :problem (node/keyword-literal :no-definition-to-store-at)) (node/put-key :value (data/key-node key))))
+    (let [position (data/get-number (positions state) key -1) out (part state :out)
+          store (-> (ins :mir/spill-store) (node/put-key :mir/src register) (node/put-key :mir/slot (node/i64-value slot)))
+          shifted (loop [index 0 result (table/empty)]
+                    (if (>= index (table/count (positions state))) result
+                      (let [other (data/key-at (positions state) index) before (data/get-number (positions state) other -1)]
+                        (recur (+ index 1) (data/put-number result other (if (>= before position) (+ before 1) before))))))]
+      (ok (-> state (with-positions shifted)
+                    (with-part :out (data/append-all (node/append (data/slice out 0 position) store) (data/slice out position (node/child-count out)))))))))
+(defn- spill-assigned [state [:ref :mir.linear/state] key [:ref :mir.table/key] instruction [:ref :gmir.node/value]]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (if (not (data/present? (assigned state) key)) (fail :spill-required instruction)
+    (let [register (data/lookup (assigned state) key) existing (data/present? (backed state) key)
+          slot (if existing (data/get-number (backed state) key -1) (number state :next-slot))
+          next-slot (+ (number state :next-slot) (if existing 0 1))]
+      (if (> next-slot 4095) (fail :spill-frame-too-large (node/put-key (node/empty-map) :frame-slots (node/i64-value next-slot)))
+        (let [next (-> state (with-backed (data/put-number (backed state) key slot)) (with-number :next-slot next-slot)
+                            (with-assigned (table/remove (assigned state) key)) (with-part :free (node/append (part state :free) register)))]
+          (if existing (ok next) (store-at-definition next key register slot)))))))
+(defn- next-use [indexes [:ref :mir.table/tree] key [:ref :mir.table/key] index :i64] :i64
+  (arena-scope (let [uses (data/lookup indexes key)]
+    (loop [cursor 0]
+      (cond (>= cursor (node/child-count uses)) -1 (>= (node/number (data/at uses cursor)) index) (node/number (data/at uses cursor)) :else (recur (+ cursor 1)))))))
+(defn- furthest [env [:ref :mir.linear/env] state [:ref :mir.linear/state] protected [:ref :mir.table/tree]] [:option [:ref :mir.table/key]]
+  (let [all (assigned state) indexes (record-get [:ref :mir.linear/env] env :indexes) position (number state :index)]
+    (loop [index 0 best (option-none-of [:option [:ref :mir.table/key]]) best-use -1]
+      (if (>= index (table/count all)) best
+        (let [key (data/key-at all index) use (next-use indexes key position)]
+          (if (or (data/member? protected key) (and (option-some?-of [:option [:ref :mir.table/key]] best) (<= use best-use)))
+            (recur (+ index 1) best best-use) (recur (+ index 1) (option-some-of [:option [:ref :mir.table/key]] key) use)))))))
+(defn- take-register [env [:ref :mir.linear/env] state [:ref :mir.linear/state] instruction [:ref :gmir.node/value] protected [:ref :mir.table/tree] preserved :bool]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (let [primary (if preserved :reserve :free) secondary (if preserved :free :reserve)
+        a (part state primary) b (part state secondary)]
+    (cond (> (node/child-count a) 0) (ok (-> state (with-part primary (data/slice a 1 (node/child-count a))) (with-part :taken-register (data/at a 0))))
+          (> (node/child-count b) 0) (ok (-> state (with-part secondary (data/slice b 1 (node/child-count b))) (with-part :taken-register (data/at b 0))))
+          :else (let [victim (furthest env state protected)]
+            (if (not (option-some?-of [:option [:ref :mir.table/key]] victim)) (fail :spill-required instruction)
+              (let [key (option-match [:option [:ref :mir.table/key]] victim (table/nil-key) found-value found-value) register (data/lookup (assigned state) key)
+                    spilled (spill-assigned state key instruction)]
+                (if (not (ok? spilled)) spilled
+                  (let [next (value spilled) free (part next :free)]
+                    (ok (-> next (with-part :free (data/slice free 1 (node/child-count free))) (with-part :taken-register register)))))))))))
+(defn- crossing-values [code [:ref :gmir.node/value] last-use [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (loop [index 0 out (table/empty)]
+    (if (>= index (node/child-count code)) out
+      (let [definition (data/instruction-def (data/at code index)) key (operands/key-of definition)
+            crosses (and (identity/vreg? definition)
+              (loop [cursor (+ index 1)]
+                (cond (>= cursor (data/get-number last-use key -1)) false
+                      (call? (data/at code cursor)) true :else (recur (+ cursor 1)))))]
+        (recur (+ index 1) (if crosses (data/include out key) out))))))
+(defn- prefix-count [code [:ref :gmir.node/value]] :i64
+  (arena-scope (loop [index 0]
+    (if (and (< index (node/child-count code)) (data/op? (data/at code index) :mir/argument)) (recur (+ index 1)) index))))
+(defn- entry-plan [env [:ref :mir.linear/env] merge-slots :i64 preserved-values [:ref :mir.table/tree]]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (let [code (record-get [:ref :mir.linear/env] env :code) pool (record-get [:ref :mir.linear/env] env :pool)
+        last-use (record-get [:ref :mir.linear/env] env :last-use) target (record-get [:ref :mir.linear/env] env :target)
+        count (prefix-count code) split (node/child-count (bank target (catalog/physical-registers)))
+        abi (bank target (catalog/call-argument-registers))
+        misplaced (loop [index count]
+                    (cond (>= index (node/child-count code)) false (data/op? (data/at code index) :mir/argument) true :else (recur (+ index 1))))
+        initial (-> (empty-state) (with-part :free (data/slice pool 0 split))
+                    (with-part :reserve (data/slice pool split (node/child-count pool)))
+                    (with-part :register-inputs (node/empty-vector)) (with-part :spill-inputs (node/empty-vector)))
+        placement (loop [index 0 state initial]
+                    (if (>= index count) state
+                      (let [instruction (data/at code index) key (operands/key-of (node/key instruction :mir/dst))
+                            primary (if (data/member? preserved-values key) :reserve :free) secondary (if (= primary :reserve) :free :reserve)
+                            tier (cond (> (node/child-count (part state primary)) 0) primary
+                                       (> (node/child-count (part state secondary)) 0) secondary :else :none)]
+                        (recur (+ index 1)
+                          (cond (not (data/present? last-use key)) state
+                                (= tier :none) (with-part state :spill-inputs (node/append (part state :spill-inputs) instruction))
+                                :else (let [available (part state tier) register (data/at available 0)]
+                                  (-> state (with-part tier (data/slice available 1 (node/child-count available)))
+                                            (with-assigned (data/put-data (assigned state) key register))
+                                            (with-part :register-inputs (node/append (part state :register-inputs)
+                                              (-> (node/empty-map) (node/put-key :instruction instruction) (node/put-key :register register)))))))))))]
+    (if misplaced (fail :spill-required (node/put-key (node/empty-map) :problem (node/keyword-literal :non-prefix-argument)))
+      (let [markers (loop [index 0 state (with-part placement :out (node/empty-vector))]
+                      (if (>= index count) (ok state)
+                        (let [instruction (data/at code index) argument-index (node/number (node/key instruction :mir/index))]
+                          (if (or (< argument-index 0) (>= argument-index (node/child-count abi))) (fail :spill-required instruction)
+                            (recur (+ index 1) (emit state (node/put-key instruction :mir/dst (data/at abi argument-index))))))))]
+        (if (not (ok? markers)) markers
+          (let [placed (value markers) spills (part placed :spill-inputs)
+                spilled (loop [index 0 state placed]
+                          (if (>= index (node/child-count spills)) state
+                            (let [instruction (data/at spills index) slot (+ merge-slots index)]
+                              (recur (+ index 1) (-> state
+                                (with-backed (data/put-number (backed state) (operands/key-of (node/key instruction :mir/dst)) slot))
+                                (emit (-> (ins :mir/spill-store) (node/put-key :mir/src (data/at abi (node/number (node/key instruction :mir/index))))
+                                          (node/put-key :mir/slot (node/i64-value slot)))))))))
+                register-inputs (part placed :register-inputs)
+                copies (loop [index 0 out (node/empty-vector)]
+                         (if (>= index (node/child-count register-inputs)) out
+                           (let [row (data/at register-inputs index) instruction (node/key row :instruction)]
+                             (recur (+ index 1) (node/append out (-> (node/empty-map) (node/put-key :mir/dst (node/key row :register))
+                               (node/put-key :mir/src (data/at abi (node/number (node/key instruction :mir/index))))))))))
+                next-slot (+ merge-slots (node/child-count spills)) scheduled (phi/parallel-copies copies next-slot)
+                homes (if (and (= (node/child-count spills) 0) (= count (table/count (assigned placed))))
+                        (loop [index 0 out (node/empty-vector)]
+                          (if (>= index count) out
+                            (recur (+ index 1) (node/append out (data/lookup (assigned placed) (operands/key-of (node/key (data/at code index) :mir/dst)))))))
+                        (node/nil-value))]
+            (ok (-> spilled (emit-all (phi/instructions scheduled)) (with-number :argument-count count)
+                            (with-number :next-slot (+ next-slot (if (phi/used-temp? scheduled) 1 0)))
+                            (with-part :used-temp? (node/bool-value (phi/used-temp? scheduled)))
+                            (with-part :temp-slot (if (phi/used-temp? scheduled) (node/i64-value next-slot) (node/nil-value)))
+                            (with-part :parameter-homes homes)))))))))
+(defn- recur-homes [code [:ref :gmir.node/value] current [:ref :gmir.node/value] homes [:ref :gmir.node/value] indexes [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (let [sites (loop [index 0 out (node/empty-vector)]
+                (if (>= index (node/child-count code)) out
+                  (let [instruction (data/at code index)]
+                    (recur (+ index 1) (if (and (data/op? instruction :mir/tail-call) (node/same-name? current (node/key instruction :mir/callee))
+                      (= (node/child-count homes) (node/child-count (node/key instruction :mir/arguments)))) (node/append out (node/i64-value index)) out)))))]
+    (if (not= (node/child-count sites) 1) (table/empty)
+      (let [position (node/number (data/at sites 0)) arguments (node/key (data/at code position) :mir/arguments)]
+        (loop [index 0 out (table/empty)]
+          (if (>= index (node/child-count arguments)) out
+            (let [value (data/at arguments index) key (operands/key-of value) uses (data/lookup indexes key)
+                  frequency (loop [cursor 0 count 0]
+                              (if (>= cursor (node/child-count arguments)) count
+                                (recur (+ cursor 1) (+ count (if (node/same-name? value (data/at arguments cursor)) 1 0)))))]
+              (recur (+ index 1) (if (and (identity/vreg? value) (= frequency 1) (= (node/child-count uses) 1)
+                                         (= (node/number (data/at uses 0)) position))
+                (data/put-data out key (data/at homes index)) out)))))))))
+(defn- control? [instruction [:ref :gmir.node/value]] :bool
+  (arena-scope (or (call? instruction) (data/op? instruction :mir/label) (data/op? instruction :mir/jump) (data/op? instruction :mir/branch-zero)
+      (data/op? instruction :mir/branch-nonzero) (data/op? instruction :mir/return) (data/op? instruction :mir/recur) (data/op? instruction :mir/reentry))))
+(defn- straight-to-recur? [code [:ref :gmir.node/value] index :i64 recur-index :i64] :bool
+  (arena-scope (loop [cursor (+ index 1)]
+    (cond (>= cursor recur-index) true (control? (data/at code cursor)) false :else (recur (+ cursor 1))))))
+(defn- pin-copies [state [:ref :mir.linear/state] copies [:ref :mir.phi/copies] temp-slot :i64] [:ref :mir.linear/state]
+  (let [used (= (node/number (part state :used-temp?)) 1) now (phi/used-temp? copies)]
+    (-> state (emit-all (phi/instructions copies)) (with-number :next-slot (+ (number state :next-slot) (if (and now (not used)) 1 0)))
+              (with-part :used-temp? (node/bool-value (or used now)))
+              (with-part :temp-slot (if now (node/i64-value temp-slot) (part state :temp-slot))))))
+(defn- expire-at [env [:ref :mir.linear/env] state [:ref :mir.linear/state] index :i64 dst [:ref :gmir.node/value] include-unused :bool] [:ref :mir.linear/state]
+  (let [last-use (record-get [:ref :mir.linear/env] env :last-use)
+        expired (loop [cursor 0 out (table/empty)]
+                  (if (>= cursor (table/count (assigned state))) out
+                    (let [key (data/key-at (assigned state) cursor)]
+                      (recur (+ cursor 1) (if (or (= (data/get-number last-use key -1) index)
+                        (and include-unused (node/same-name? dst (data/key-node key)) (not (data/present? last-use key)))) (data/include out key) out)))))]
+    (expire env state expired (record-get [:ref :mir.linear/env] env :calls))))
+(defn- emit-call [env [:ref :mir.linear/env] state [:ref :mir.linear/state] instruction [:ref :gmir.node/value]]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (let [arguments (node/key instruction :mir/arguments) n (node/child-count arguments) dst (node/key instruction :mir/dst)
+        index (number state :index) homes (record-get [:ref :mir.linear/env] env :homes)
+        direct (and (record-get [:ref :mir.linear/env] env :direct) (data/op? instruction :mir/tail-call)
+                 (node/same-name? (record-get [:ref :mir.linear/env] env :current) (node/key instruction :mir/callee))
+                 (loop [cursor 0]
+                   (if (>= cursor n) true (if (data/present? (assigned state) (operands/key-of (data/at arguments cursor))) (recur (+ cursor 1)) false))))
+        temp-slot (if (= (node/kind (part state :temp-slot)) :nil) (number state :next-slot) (number state :temp-slot))]
+    (if direct
+      (let [copies (loop [cursor 0 out (node/empty-vector)]
+                     (if (>= cursor n) out (recur (+ cursor 1) (node/append out (-> (node/empty-map)
+                       (node/put-key :mir/dst (data/at homes cursor)) (node/put-key :mir/src (data/lookup (assigned state) (operands/key-of (data/at arguments cursor)))))))))
+            scheduled (phi/parallel-copies copies temp-slot)]
+        (ok (emit (pin-copies state scheduled temp-slot) (node/put-key (ins :mir/recur) :mir/arguments homes))))
+      (let [preserved (record-get [:ref :mir.linear/env] env :preserved) last-use (record-get [:ref :mir.linear/env] env :last-use)
+            across (loop [cursor 0 out (table/empty)]
+                     (if (>= cursor (table/count (assigned state))) out
+                       (let [key (data/key-at (assigned state) cursor)]
+                         (recur (+ cursor 1) (if (> (data/get-number last-use key -1) index) (data/include out key) out)))))
+            spilled (loop [cursor 0 result (ok state)]
+                      (if (or (not (ok? result)) (>= cursor (table/count across))) result
+                        (let [current (value result) key (data/key-at across cursor) register (data/lookup (assigned current) key)]
+                          (recur (+ cursor 1) (if (data/member? preserved (operands/key-of register)) result (spill-assigned current key instruction))))))]
+        (if (not (ok? spilled)) spilled
+          (let [current (value spilled) target (record-get [:ref :mir.linear/env] env :target)
+                call-temp-slot (if (= (node/kind (part current :temp-slot)) :nil) (number current :next-slot) (number current :temp-slot))
+                registers (data/slice (spill/call-registers target instruction) 0 n)
+                copies (loop [cursor 0 out (node/empty-vector)]
+                         (if (>= cursor n) out
+                           (let [key (operands/key-of (data/at arguments cursor))]
+                             (recur (+ cursor 1) (if (data/present? (assigned current) key)
+                               (node/append out (-> (node/empty-map) (node/put-key :mir/dst (data/at registers cursor)) (node/put-key :mir/src (data/lookup (assigned current) key)))) out)))))
+                loaded (loop [cursor 0 result (ok (with-part current :argument-loads (node/empty-vector)))]
+                         (if (or (not (ok? result)) (>= cursor n)) result
+                           (let [next (value result) key (operands/key-of (data/at arguments cursor))]
+                             (cond (data/present? (assigned next) key) (recur (+ cursor 1) result)
+                                   (not (data/present? (backed next) key)) (fail :spill-required instruction)
+                                   :else (recur (+ cursor 1) (ok (with-part next :argument-loads (node/append (part next :argument-loads)
+                                     (-> (ins :mir/spill-load) (node/put-key :mir/dst (data/at registers cursor)) (node/put-key :mir/slot (data/lookup (backed next) key)))))))))))]
+            (if (not (ok? loaded)) loaded
+              (let [before (value loaded) return-register (record-get [:ref :mir.linear/env] env :return)
+                    emitted (-> (pin-copies before (phi/parallel-copies copies call-temp-slot) call-temp-slot)
+                                (emit-all (part before :argument-loads)) (emit (spill/physicalize-call instruction registers return-register)))
+                    kept (loop [cursor 0 out (table/empty)]
+                           (if (>= cursor (table/count (assigned emitted))) out
+                             (let [key (data/key-at (assigned emitted) cursor) register (data/lookup (assigned emitted) key)]
+                               (recur (+ cursor 1) (if (data/member? preserved (operands/key-of register)) (data/put-data out key register) out)))))
+                    with-dst (if (and (identity/vreg? dst) (not (data/op? instruction :mir/tail-call))) (data/put-data kept (operands/key-of dst) return-register) kept)
+                    rebuilt (rebuild env (with-assigned emitted with-dst)) reserve (part rebuilt :reserve)
+                    moved (if (and (identity/vreg? dst) (data/member? (record-get [:ref :mir.linear/env] env :crossing) (operands/key-of dst)) (> (node/child-count reserve) 0))
+                            (let [register (data/at reserve 0)]
+                              (-> rebuilt (emit (-> (ins :mir/move) (node/put-key :mir/dst register) (node/put-key :mir/src return-register)))
+                                          (with-assigned (data/put-data (assigned rebuilt) (operands/key-of dst) register))
+                                          (with-part :reserve (data/slice reserve 1 (node/child-count reserve))) (with-part :free (node/append (part rebuilt :free) return-register)))) rebuilt)
+                    expired (expire-at env moved index dst false)]
+                (ok (if (identity/vreg? dst) (with-positions expired (data/put-number (positions expired) (operands/key-of dst) (node/child-count (part expired :out)))) expired))))))))))
+(defn- ordered-sources [instruction [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [sources (data/instruction-sources instruction)]
+    (loop [index 0 seen (table/empty) out (node/empty-vector)]
+      (if (>= index (node/child-count sources)) out
+        (let [value (data/at sources index) key (operands/key-of value) novel (and (identity/vreg? value) (not (data/member? seen key)))]
+          (recur (+ index 1) (if novel (data/include seen key) seen) (if novel (node/append out value) out)))))))
+(defn- load-sources [env [:ref :mir.linear/env] state [:ref :mir.linear/state] instruction [:ref :gmir.node/value]]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (let [sources (ordered-sources instruction) protected (data/source-set instruction)]
+    (loop [index 0 result (ok state)]
+      (if (or (not (ok? result)) (>= index (node/child-count sources))) result
+        (let [current (value result) key (operands/key-of (data/at sources index))]
+          (cond (data/present? (assigned current) key) (recur (+ index 1) result)
+                (not (data/present? (backed current) key)) (fail :spill-required instruction)
+                :else (let [taken (take-register env current instruction protected (data/member? (record-get [:ref :mir.linear/env] env :crossing) key))]
+                  (if (not (ok? taken)) taken
+                    (let [next (value taken) register (part next :taken-register)]
+                      (recur (+ index 1) (ok (-> next (with-assigned (data/put-data (assigned next) key register))
+                        (emit (-> (ins :mir/spill-load) (node/put-key :mir/dst register) (node/put-key :mir/slot (data/lookup (backed next) key))))))))))))))))
+(defn- home-owner [all [:ref :mir.table/tree] home [:ref :gmir.node/value]] [:option [:ref :mir.table/key]]
+  (loop [index 0]
+    (if (>= index (table/count all)) (option-none-of [:option [:ref :mir.table/key]])
+      (let [key (data/key-at all index)]
+        (if (node/same-name? home (data/lookup all key)) (option-some-of [:option [:ref :mir.table/key]] key) (recur (+ index 1)))))))
+(defn- allocate-destination [env [:ref :mir.linear/env] state [:ref :mir.linear/state] instruction [:ref :gmir.node/value]]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (let [dst (node/key instruction :mir/dst) key (operands/key-of dst) all (assigned state)
+        last-use (record-get [:ref :mir.linear/env] env :last-use) index (number state :index)]
+    (cond (not (identity/vreg? dst)) (ok state) (data/present? all key) (fail :multiple-definition instruction)
+      :else
+      (let [protected (data/source-set instruction) preserved (data/member? (record-get [:ref :mir.linear/env] env :crossing) key)
+            desired (data/lookup (record-get [:ref :mir.linear/env] env :recur-homes) key) owner (home-owner all desired)
+            owner-key (option-match [:option [:ref :mir.table/key]] owner (table/nil-key) found-value found-value)
+            recur-use (node/number (data/at (data/lookup (record-get [:ref :mir.linear/env] env :indexes) key) 0))
+            direct (and (not= (node/kind desired) :nil) (schedule/schedulable? instruction)
+                        (straight-to-recur? (record-get [:ref :mir.linear/env] env :code) index recur-use)
+                        (or (not (option-some?-of [:option [:ref :mir.table/key]] owner))
+                            (and (data/member? protected owner-key) (= (data/get-number last-use owner-key -1) index))))
+            left (node/key instruction :mir/left)
+            dying (if (and (not preserved) (identity/vreg? left) (= (data/get-number last-use (operands/key-of left) -1) index))
+                    (data/lookup all (operands/key-of left)) (node/nil-value))
+            primary (part state (if preserved :reserve :free)) from-primary (data/at primary 0)
+            register (cond direct desired (not= (node/kind from-primary) :nil) from-primary :else dying)
+            taken (if (= (node/kind register) :nil) (take-register env state instruction protected preserved)
+                    (ok (-> state (with-part :taken-register register)
+                      (with-part :free (cond direct (without (part state :free) (set-of (node/append (node/empty-vector) register)))
+                        (and (not preserved) (not= (node/kind from-primary) :nil)) (data/slice primary 1 (node/child-count primary)) :else (part state :free)))
+                      (with-part :reserve (cond direct (without (part state :reserve) (set-of (node/append (node/empty-vector) register)))
+                        (and preserved (not= (node/kind from-primary) :nil)) (data/slice primary 1 (node/child-count primary)) :else (part state :reserve))))))]
+        (if (not (ok? taken)) taken
+          (let [next (value taken)] (ok (with-assigned next (data/put-data (assigned next) key (part next :taken-register))))))))))
+(defn- physical-instruction [instruction [:ref :gmir.node/value] assigned [:ref :mir.table/tree]] [:ref :gmir.node/value]
+  (let [mapped (loop [index 0 out (node/empty-map)]
+                 (if (>= index (node/child-count instruction)) out
+                   (let [key (data/at instruction index) value (data/at instruction (+ index 1))
+                         transformed (cond (identity/vreg? value) (data/lookup assigned (operands/key-of value))
+                           (and (data/named? key :mir/arguments) (= (node/kind value) :vector))
+                           (loop [cursor 0 values (node/empty-vector)]
+                             (if (>= cursor (node/child-count value)) values
+                               (recur (+ cursor 1) (node/append values (data/lookup assigned (operands/key-of (data/at value cursor))))))) :else value)]
+                     (recur (+ index 2) (node/append (node/append out key) transformed)))))]
+    (cond (data/op? mapped :mir/merge-store) (-> (ins :mir/spill-store) (node/put-key :mir/src (node/key mapped :mir/src)) (node/put-key :mir/slot (node/key mapped :mir/slot)))
+          (data/op? mapped :mir/merge-load) (-> (ins :mir/spill-load) (node/put-key :mir/dst (node/key mapped :mir/dst)) (node/put-key :mir/slot (node/key mapped :mir/slot))) :else mapped)))
+(defn- emit-ordinary [env [:ref :mir.linear/env] state [:ref :mir.linear/state] instruction [:ref :gmir.node/value]]
+  [:result [:ref :mir.linear/state] [:ref :mir/refusal]]
+  (let [drop (and (data/op? instruction :mir/label) (> (number state :index) 0)
+               (loop [index 0]
+                 (if (>= index (table/count (assigned state))) false
+                   (if (data/present? (backed state) (data/key-at (assigned state) index)) true (recur (+ index 1))))))
+        entered (if drop
+                  (rebuild env (with-assigned state (loop [index 0 out (table/empty)]
+                    (if (>= index (table/count (assigned state))) out
+                      (let [key (data/key-at (assigned state) index)]
+                        (recur (+ index 1) (if (data/present? (backed state) key) out (data/put-data out key (data/lookup (assigned state) key))))))))) state)
+        loaded (load-sources env entered instruction)]
+    (if (not (ok? loaded)) loaded
+      (let [allocated (allocate-destination env (value loaded) instruction)]
+        (if (not (ok? allocated)) allocated
+          (let [current (value allocated) dst (node/key instruction :mir/dst)
+                emitted (emit current (physical-instruction instruction (assigned current)))
+                expired (expire-at env emitted (number current :index) dst true)]
+            (ok (if (identity/vreg? dst) (with-positions expired (data/put-number (positions expired) (operands/key-of dst) (node/child-count (part emitted :out)))) expired))))))))
+(defn- flag? [flags [:ref :gmir.node/value] key :keyword] :bool (arena-scope (= (node/number (node/key flags key)) 1)))
+(defn- flags [code [:ref :gmir.node/value] current [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-map)]
+    (if (>= index (node/child-count code)) out
+      (let [instruction (data/at code index)]
+        (recur (+ index 1) (-> out
+          (node/put-key :calls (node/bool-value (or (flag? out :calls) (call? instruction))))
+          (node/put-key :quotients (node/bool-value (or (flag? out :quotients) (data/op? instruction :mir/quotient) (data/op? instruction :mir/quotient-constant))))
+          (node/put-key :control (node/bool-value (or (flag? out :control) (data/op? instruction :mir/label) (data/op? instruction :mir/jump)
+            (data/op? instruction :mir/branch-zero) (data/op? instruction :mir/branch-nonzero) (data/op? instruction :mir/phi))))
+          (node/put-key :self (node/bool-value (or (flag? out :self) (and (data/op? instruction :mir/tail-call) (node/same-name? current (node/key instruction :mir/callee))))))
+          (node/put-key :host (node/bool-value (or (flag? out :host) (data/op? instruction :mir/runtime-call) (data/op? instruction :mir/capability-call))))))))))
+(defn- final-result [program [:ref :gmir.node/value] result [:result [:ref :mir.linear/state] [:ref :mir/refusal]]]
+  [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (if (not (ok? result)) (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+    (result-error-of [:result [:ref :mir.linear/state] [:ref :mir/refusal]] result (outcome/refusal :unexpected-linear-result program)))
+    (let [state (value result) out (part state :out)
+          recurs (loop [index 0]
+                   (cond (>= index (node/child-count out)) false (data/op? (data/at out index) :mir/recur) true :else (recur (+ index 1))))
+          code (if recurs out (loop [index 0 values (node/empty-vector)]
+                               (if (>= index (node/child-count out)) values
+                                 (let [instruction (data/at out index)] (recur (+ index 1)
+                                   (if (data/op? instruction :mir/reentry) values (node/append values instruction)))))))
+          frame (+ (number state :next-slot) (if (= (node/number (part state :used-temp?)) 1) 1 0))]
+      (flat/validate! (-> (node/empty-map) (node/put-key :mir/version (node/key program :mir/version))
+        (node/put-key :mir/target (node/key program :mir/target)) (node/put-key :mir/registers (node/keyword-literal :physical))
+        (node/put-key :mir/frame-slots (node/i64-value frame)) (node/put-key :mir/instructions code))))))
+(defn allocate [program [:ref :gmir.node/value] merge-slots :i64 current [:ref :gmir.node/value]]
+  [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (if (not (data/named? (node/key program :mir/registers) :virtual))
+    (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] (outcome/refusal :registers-not-virtual program))
+    (let [target (if (data/named? (node/key program :mir/target) :x86-64) :x86-64 :aarch64)
+          code (node/key program :mir/instructions) summary (flags code current) calls (flag? summary :calls)
+          list (catalog/allocator-pool target (node/put-key (node/empty-map) :leaf? (node/bool-value (not calls))))
+          normal-pool (loop [index 0 out (node/empty-vector)]
+                        (if (>= index (vector-count list)) out
+                          (recur (+ index 1) (node/append out (node/keyword-literal (typed-list-nth [:list :keyword] list index))))))
+          pool (if (and (= target :x86-64) (flag? summary :quotients) (not calls) (not (flag? summary :control)))
+                 (without normal-pool (set-of (-> (node/empty-vector) (node/append (node/keyword-literal :x86-64/rax)) (node/append (node/keyword-literal :x86-64/rdx))))) normal-pool)
+          last-use (cfg/last-uses code) indexes (cfg/use-indexes code)
+          crossing (if calls (crossing-values code last-use) (table/empty))
+          preserved (set-of (bank target (catalog/preserved-registers)))
+          return-register (data/at (bank target (catalog/return-registers)) 0)
+          x86-direct (and (= target :x86-64) (flag? summary :self) (not (flag? summary :host)))
+          entry-preserved (cond (= target :aarch64) crossing x86-direct
+                            (loop [index 0 out (table/empty)]
+                              (if (>= index (node/child-count code)) out
+                                (let [instruction (data/at code index)]
+                                  (recur (+ index 1) (if (data/op? instruction :mir/argument) (data/include out (operands/key-of (node/key instruction :mir/dst))) out))))) :else (table/empty))
+          initial-env (record-new [:ref :mir.linear/env] target pool code last-use indexes crossing preserved current (node/nil-value) (table/empty) false calls return-register)
+          entry (entry-plan initial-env merge-slots entry-preserved)]
+      (if (not (ok? entry)) (final-result program entry)
+        (let [initial (value entry) homes (part initial :parameter-homes)
+              direct (and (flag? summary :self) (or (= target :aarch64) x86-direct) (not= (node/kind homes) :nil))
+              candidates (if direct (recur-homes code current homes indexes) (table/empty))
+              env (record-new [:ref :mir.linear/env] target pool code last-use indexes crossing preserved current homes candidates direct calls return-register)
+              marked (if direct (emit initial (node/put-key (ins :mir/reentry) :mir/parameters homes)) initial)
+              positions (loop [index 0 out (table/empty)]
+                          (if (>= index (table/count (assigned initial))) out
+                            (recur (+ index 1) (data/put-number out (data/key-at (assigned initial) index) (node/child-count (part marked :out))))))
+              result (loop [index (number initial :argument-count) state (with-positions marked positions)]
+                       (if (>= index (node/child-count code)) (ok state)
+                         (let [instruction (data/at code index) entered (with-number state :index index)
+                               next (if (call? instruction) (emit-call env entered instruction) (emit-ordinary env entered instruction))]
+                           (if (not (ok? next)) next (recur (+ index 1) (value next))))))]
+          (final-result program result))))))

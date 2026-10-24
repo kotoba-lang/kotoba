@@ -1,0 +1,209 @@
+(ns kotobase.engine.canonical
+  "Canonical logical forms shared by engine receipts and conformance checks.
+
+  This namespace intentionally does not hash. A caller supplies a digest
+  function so the contract does not impose a codec or crypto implementation on
+  every engine. Physical encodings and their CIDs remain engine-specific.")
+
+(def logical-format "kotobase.logical/v1")
+
+(def logical-domains
+  "Closed v1 identity domains. The same value in two domains must never share
+  an identity merely because its payload happens to have the same shape."
+  #{:datom :transaction :checkpoint :schema :entity-id
+    :logical-commit :physical-publication :signature})
+
+(def max-safe-integer 9007199254740991)
+(def min-safe-integer -9007199254740991)
+
+(defn- reject! [problem value]
+  (throw (ex-info (str "Kotobase logical value is not canonical: " (name problem))
+                  {:type :kotobase.engine/non-canonical-logical-value
+                   :problem problem
+                   :value value
+                   :logical-format logical-format})))
+
+(defn- negative-zero? [x]
+  (and (number? x) (zero? x) (neg? (/ 1.0 x))))
+
+(defn- finite-number? [x]
+  #?(:clj (and (number? x)
+               (not (Double/isNaN (double x)))
+               (not (Double/isInfinite (double x))))
+     :cljs (and (number? x) (js/Number.isFinite x))))
+
+(defn canonical-value
+  "Turn the portable Kotobase logical value domain into a recursively ordered,
+  explicitly tagged value suitable for stable `pr-str`.
+
+  V1 intentionally rejects runtime-specific records, floating point values,
+  ratios and integers outside JavaScript's exact range. Future value kinds must
+  be added under a new logical format or an explicit tagged representation;
+  silently inheriting host printer behaviour would move database identities."
+  [x]
+  (cond
+    ;; Records satisfy map? on both Clojure and ClojureScript. This check must
+    ;; precede the map branch or a runtime-specific type silently acquires a
+    ;; logical identity from its implementation fields.
+    (record? x) (reject! :record-requires-explicit-codec x)
+
+    (map? x)
+    [:map (->> x
+               (map (fn [[k v]] [(canonical-value k) (canonical-value v)]))
+               (sort-by (comp pr-str first))
+               vec)]
+
+    (set? x)
+    [:set (->> x (map canonical-value) (sort-by pr-str) vec)]
+
+    (vector? x)
+    [:vector (mapv canonical-value x)]
+
+    (sequential? x)
+    [:seq (mapv canonical-value x)]
+
+    (nil? x) [:nil]
+    (boolean? x) [:boolean x]
+    (string? x) [:string x]
+    (keyword? x) [:keyword (namespace x) (name x)]
+    (symbol? x) [:symbol (namespace x) (name x)]
+
+    ;; JavaScript reports `(integer? -0.0)` as true. Detect it before the
+    ;; integer branch or JVM and CLJS assign different identities.
+    (negative-zero? x) (reject! :negative-zero x)
+
+    (integer? x)
+    (if (<= min-safe-integer x max-safe-integer)
+      [:integer x]
+      (reject! :integer-out-of-range x))
+
+    (number? x)
+    (cond
+      (not (finite-number? x)) (reject! :non-finite-number x)
+      :else (reject! :floating-point-requires-explicit-codec x))
+
+    :else (reject! :unsupported-type x)))
+
+(defn canonical-string [x]
+  (pr-str (canonical-value x)))
+
+(defn canonical-domain-value
+  "Canonical logical envelope for DOMAIN and VALUE. DOMAIN is closed in v1 so
+  misspellings cannot create accidental, apparently valid identity domains."
+  [domain value]
+  (when-not (contains? logical-domains domain)
+    (throw (ex-info "Unknown Kotobase logical identity domain"
+                    {:type :kotobase.engine/unknown-logical-domain
+                     :domain domain
+                     :allowed logical-domains
+                     :logical-format logical-format})))
+  [:kotobase.logical/envelope
+   [:format logical-format]
+   [:domain domain]
+   [:value (canonical-value value)]])
+
+(defn canonical-domain-string [domain value]
+  (pr-str (canonical-domain-value domain value)))
+
+(defn restore-canonical-value
+  "Inverse of `canonical-value` for the EDN value domain."
+  [x]
+  (if (vector? x)
+    (let [[tag body extra] x]
+      (case tag
+        :map (into {} (map (fn [[k v]] [(restore-canonical-value k)
+                                        (restore-canonical-value v)])) body)
+        :set (into #{} (map restore-canonical-value) body)
+        :vector (mapv restore-canonical-value body)
+        :seq (map restore-canonical-value body)
+        :nil nil
+        :boolean body
+        :string body
+        :integer body
+        :keyword (if body (keyword body extra) (keyword extra))
+        :symbol (if body (symbol body extra) (symbol extra))
+        x))
+    x))
+
+(defn- tx-map->datom [m]
+  (when-not (and (contains? m :e) (contains? m :a) (contains? m :v))
+    (throw (ex-info "transaction map requires :e, :a and :v"
+                    {:type :kotobase.engine/invalid-datom :datom m})))
+  {:e (:e m)
+   :a (:a m)
+   :v (:v m)
+   :op (cond
+         (contains? m :op) (:op m)
+         (contains? m :added) (if (:added m) :assert :retract)
+         :else :assert)})
+
+(defn normalize-datom
+  "Normalize the common Datom transaction forms into
+  `{:e e :a a :v v :op :assert|:retract}`."
+  [x]
+  (let [d (cond
+            (map? x) (tx-map->datom x)
+            (and (vector? x) (= 4 (count x)) (= :db/add (first x)))
+            {:e (nth x 1) :a (nth x 2) :v (nth x 3) :op :assert}
+            (and (vector? x) (= 4 (count x)) (= :db/retract (first x)))
+            {:e (nth x 1) :a (nth x 2) :v (nth x 3) :op :retract}
+            (and (vector? x) (= 3 (count x)))
+            {:e (nth x 0) :a (nth x 1) :v (nth x 2) :op :assert}
+            :else
+            (throw (ex-info "unsupported transaction datom"
+                            {:type :kotobase.engine/invalid-datom :datom x})))]
+    (when-not (#{:assert :retract} (:op d))
+      (throw (ex-info "datom :op must be :assert or :retract"
+                      {:type :kotobase.engine/invalid-datom :datom x})))
+    d))
+
+(defn normalize-tx [tx-data]
+  (when-not (sequential? tx-data)
+    (throw (ex-info ":tx-data must be sequential"
+                    {:type :kotobase.engine/invalid-transaction})))
+  (mapv normalize-datom tx-data))
+
+(defn logical-datom-key [{:keys [e a v]}]
+  (canonical-string [e a v]))
+
+(defn canonical-datoms [datoms]
+  (->> datoms
+       (map #(select-keys % [:e :a :v :t :added]))
+       (sort-by (juxt logical-datom-key :t :added))
+       vec))
+
+(defn checkpoint-datoms
+  "Canonical visible-state projection used for cross-engine logical roots.
+  Transaction coordinates are audit metadata and are deliberately excluded."
+  [datoms]
+  (->> datoms
+       (map #(select-keys % [:e :a :v]))
+       (sort-by logical-datom-key)
+       vec))
+
+(defn transaction-string [tx-data]
+  (canonical-domain-string :transaction (normalize-tx tx-data)))
+
+(defn checkpoint-string [datoms]
+  (canonical-domain-string :checkpoint (checkpoint-datoms datoms)))
+
+(defn checkpoint-datom-fragment
+  "The canonical text of one datom inside `checkpoint-string`. Callers that
+  checkpoint many overlapping states (the merge replay) encode each datom
+  once and assemble with `checkpoint-string-from-fragments`."
+  [datom]
+  (pr-str (canonical-value (select-keys datom [:e :a :v]))))
+
+(def ^:private checkpoint-envelope
+  (let [empty-string (checkpoint-string [])
+        ;; ...[:value [:vector []]]] : split inside the empty datom vector.
+        cut (- (count empty-string) 4)]
+    [(subs empty-string 0 cut) (subs empty-string cut)]))
+
+(defn checkpoint-string-from-fragments
+  "Byte-identical to `checkpoint-string` for datoms whose fragments are given
+  in `logical-datom-key` order."
+  [fragments]
+  (let [[prefix suffix] checkpoint-envelope]
+    (str prefix (apply str (interpose " " fragments)) suffix)))
+

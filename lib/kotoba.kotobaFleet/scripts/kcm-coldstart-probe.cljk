@@ -1,0 +1,93 @@
+#!/usr/bin/env kbb
+(ns kcm-coldstart-probe
+  "Build the real pinned Kotoba provider and measure a cold/warm KCM check.
+  Also corrupts a transport copy and proves it is rejected before execution."
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]))
+
+(def tmp (fs/mkdtempSync (path/join (os/tmpdir) "kcm-coldstart-")))
+(def repo (path/join tmp "repo"))
+(def tarball (path/join tmp "repo.tgz"))
+(def spec-path (path/join tmp "spec.edn"))
+(def compiler (path/resolve "../compiler"))
+(def provider-prefix (path/join tmp "kotoba-provider"))
+
+(defn sha256-file [p]
+  (-> (crypto/createHash "sha256")
+      (.update (fs/readFileSync p))
+      (.digest "hex")))
+
+(fs/mkdirSync repo #js {:recursive true})
+(fs/copyFileSync (path/join compiler "examples/list.kotoba")
+                 (path/join repo "main.kotoba"))
+(cp/execFileSync "tar" #js ["czf" tarball "-C" tmp "repo"])
+
+(def build
+  (-> (cp/execFileSync
+       "nbb" #js ["--classpath" "hosts/nbb" "scripts/build-kcm-provider.cljk"
+                   "--compiler" compiler "--out" provider-prefix]
+       #js {:encoding "utf8" :maxBuffer 33554432})
+      str/split-lines last reader/read-string))
+
+(def base-spec
+  {:work-id "kcm-coldstart-probe"
+   :root (path/join tmp "root")
+   :tarball tarball
+   :machine :kotoba-capability-machine
+   :exec-backing :sandbox-exec
+   :kcm/cache-root (path/join tmp "cache")
+   :kcm/provider {:archive (:archive build)
+                  :manifest (:manifest build)
+                  :archive-sha256 (:archive-sha256 build)}
+   :kcm/identity {:definition-closure-cid (str "sha256:" (sha256-file (path/join repo "main.kotoba")))
+                  :compiler-cid (:compiler-cid build)
+                  :module-lock-cid (:module-lock-cid build)
+                  :target-abi :kotoba-check-v1
+                  :hostcaps-policy-cid "sha256:deny-network-home-and-outside-write-v1"
+                  :provider-closure-sha256 (:provider-closure-sha256 build)
+                  :runtime-sha256 (:runtime-sha256 build)
+                  :effects []}
+   :kcm/capabilities #{:code/read :build/check :build/compile}
+   :kcm/checks [{:id :check :args ["check" "main.kotoba"] :pure? true}]
+   :kcm/builds [{:id :wasm :args ["compile" "main.kotoba" "--target"
+                                  "wasm32-wasi" "--output" "main.wasm"]}]})
+
+(fs/writeFileSync spec-path (pr-str base-spec))
+
+(let [out (cp/execFileSync
+           "nbb" #js ["--classpath" "hosts/nbb"
+                      "hosts/nbb/fleet/sandbox_agent.cljk"
+                      "--spec" spec-path "--kcm-probe"]
+           #js {:encoding "utf8" :maxBuffer 33554432})
+      result (reader/read-string (last (str/split-lines out)))
+      first-cache (mapv :cache (:first result))
+      second-cache (mapv :cache (:second result))
+      artifact-produced? (fs/existsSync (path/join (:root base-spec) "work/main.wasm"))
+      bad-archive (path/join tmp "substituted-provider.tar")
+      bad-spec-path (path/join tmp "bad-spec.edn")
+      _ (fs/copyFileSync (:archive build) bad-archive)
+      _ (fs/appendFileSync bad-archive "substitution")
+      _ (fs/writeFileSync bad-spec-path
+                          (pr-str (assoc-in base-spec [:kcm/provider :archive] bad-archive)))
+      bad (cp/spawnSync
+           "nbb" #js ["--classpath" "hosts/nbb"
+                      "hosts/nbb/fleet/sandbox_agent.cljk"
+                      "--spec" bad-spec-path "--kcm-probe"]
+           #js {:encoding "utf8" :maxBuffer 33554432})
+      provider-rejected? (and (not= 0 (.-status bad))
+                              (.includes (str (.-stderr bad)) "archive digest mismatch"))]
+  (println (pr-str (assoc result :provider-build build
+                         :substituted-provider-rejected provider-rejected?)))
+  (when-not (and (= [:miss] first-cache) (= [:hit] second-cache)
+                 provider-rejected?
+                 (every? zero? (map :exit (concat (:first result) (:second result)
+                                                  (:builds result))))
+                 artifact-produced?)
+    (println "KCM real-provider cold/warm probe FAILED")
+    (js/process.exit 1))
+  (println "KCM real-provider cold/warm probe PASSED; substituted closure rejected"))

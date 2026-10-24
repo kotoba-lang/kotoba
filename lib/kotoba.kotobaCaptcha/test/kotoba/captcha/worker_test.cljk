@@ -1,0 +1,102 @@
+(ns kotoba.captcha.worker-test
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.captcha.audit :as audit]
+            [kotoba.captcha.domain :as domain]
+            [kotoba.captcha.provider :as provider]
+            [kotoba.captcha.store :as store]
+            [kotoba.captcha.worker :as worker]
+            [kotoba.captcha.worker-store :as worker-store]))
+
+(defn fixture [task]
+  (let [tasks (store/memory-store)
+        now (atom 1000)
+        sink (audit/memory-audit {:clock #(deref now) :retention-ms 10000})
+        queue (worker-store/task-store-adapter tasks (constantly "lease-1"))]
+    (store/put-task! tasks task)
+    {:tasks tasks :now now :audit sink :queue queue
+     :runtime {:queue queue :audit sink :worker-id "w1" :clock #(deref now)}}))
+
+(defn task [id type payload authorization]
+  (domain/new-task {:type type :payload payload :authorization authorization} 100 id))
+
+(deftest synthetic-worker-completes-and-redacts-audit
+  (let [{:keys [tasks audit runtime]}
+        (fixture (task "t1" "SyntheticChallengeTask"
+                       {:expected-answer "secret-answer" :api-key "never-log"}
+                       {:scope :synthetic :reason "test"}))
+        result (worker/run-once! (assoc runtime :providers [(provider/synthetic-provider)]))]
+    (is (= :ready (:status result)))
+    (is (= :ready (:task/status (store/get-task tasks "t1"))))
+    (is (= {:text "secret-answer"} (:task/result (store/get-task tasks "t1"))))
+    (is (not (re-find #"secret-answer|never-log" (pr-str (audit/events audit "t1")))))))
+
+(deftest lease-is-exclusive-and-expired-work-is-reclaimed
+  (let [{:keys [queue now]} (fixture (task "t2" "SyntheticChallengeTask" {}
+                                           {:scope :synthetic :reason "test"}))
+        first-claim (worker-store/claim-next! queue "w1" 50 @now)]
+    (is (= "w1" (:task/worker-id first-claim)))
+    (is (nil? (worker-store/claim-next! queue "w2" 50 @now)))
+    (swap! now + 51)
+    (let [second-claim (worker-store/claim-next! queue "w2" 50 @now)]
+      (is (= "w2" (:task/worker-id second-claim)))
+      (is (= 2 (:task/attempt second-claim))))))
+
+(deftest retries-are-bounded
+  (let [{:keys [tasks now runtime]}
+        (fixture (task "t3" "SyntheticChallengeTask" {}
+                       {:scope :synthetic :reason "test"}))
+        flaky (reify provider/Provider
+                (provider-id [_] :flaky)
+                (supports-task? [_ _] true)
+                (solve! [_ _ _] {:status :retry :error "temporary"}))
+        runtime (assoc runtime :providers [flaky]
+                       :options {:max-attempts 2 :base-retry-ms 10})]
+    (is (= :retry (:status (worker/run-once! runtime))))
+    (swap! now + 10)
+    (is (= :retry (:status (worker/run-once! runtime))))
+    (is (= :failed (:task/status (store/get-task tasks "t3"))))))
+
+(deftest provider-timeout-returns-within-bound
+  (let [{:keys [tasks runtime]}
+        (fixture (task "slow" "SyntheticChallengeTask" {}
+                       {:scope :synthetic :reason "test"}))
+        slow (reify provider/Provider
+               (provider-id [_] :slow)
+               (supports-task? [_ _] true)
+               (solve! [_ _ _] (Thread/sleep 2000) {:status :ready :solution {}}))
+        started (System/nanoTime)
+        result (worker/run-once! (assoc runtime :providers [slow]
+                                        :options {:timeout-ms 20 :max-attempts 2}))
+        elapsed-ms (/ (- (System/nanoTime) started) 1000000.0)]
+    (is (= :retry (:status result)))
+    (is (< elapsed-ms 1000))
+    (is (= :processing (:task/status (store/get-task tasks "slow"))))))
+
+(deftest cancellation-invalidates-a-lease
+  (let [{:keys [tasks runtime]} (fixture (task "t4" "HumanVerificationTask" {}
+                                              {:scope :human-assisted :reason "accessibility"}))]
+    (worker/cancel! runtime "t4" "caller request")
+    (is (= :cancelled (:task/status (store/get-task tasks "t4"))))
+    (is (nil? (worker/run-once! (assoc runtime :providers [(provider/human-provider)]))))))
+
+(deftest vision-requires-first-party-ownership
+  (let [called (atom 0)
+        backend (reify provider/VisionBackend
+                  (analyze-first-party! [_ _ _] (swap! called inc) {:text "owned"}))
+        vision (provider/vision-provider backend)
+        denied (task "v1" "ImageToTextTask" {} {:scope :human-assisted :reason "no"})
+        allowed (task "v2" "ImageToTextTask" {}
+                      {:scope :first-party :owner-confirmed? true :reason "owned test"})]
+    (is (= :failed (:status (provider/solve! vision denied {}))))
+    (is (= :ready (:status (provider/solve! vision allowed {}))))
+    (is (= 1 @called))))
+
+(deftest human-provider-waits-then-consumes-submission
+  (let [human (provider/human-provider)
+        human-task (task "h1" "HumanVerificationTask" {}
+                         {:scope :human-assisted :reason "accessibility"})]
+    (is (= :waiting-human (:status (provider/solve! human human-task {}))))
+    (provider/submit-human-solution! human "h1" {:approved? true})
+    (is (= {:status :ready :solution {:approved? true}}
+           (provider/solve! human human-task {})))
+    (is (= :waiting-human (:status (provider/solve! human human-task {}))))))

@@ -1,0 +1,293 @@
+(ns kotoba.kip.core
+  "KIP (Kotoba Improvement Proposal) documents and the transitions between
+  their states.
+
+  The judgement itself — may this KIP move from this state to that one, and if
+  not, why — is duplicated in `kotoba/kip_gate_core.kotoba` as a word-typed
+  decision core, and `test/kotoba/kip/kip_gate_kotoba_parity_test.cljk` compares
+  the two on every branch. `transition-code` below is the Clojure half of that
+  pair: keep the two in step or the parity test fails, which is the point.
+
+  Everything that is not a scalar judgement lives here and only here: the
+  keyword <-> code tables, the cumulative field requirements, date arithmetic,
+  quorum counting, and reading the document off disk.
+
+  Nothing in this namespace does IO. `read-kip` takes already-parsed tx-data."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]))
+
+;; ---------------------------------------------------------------- code tables
+;; These are the wire between this namespace, the .kotoba core, and the gate's
+;; output. lang/kip-process.edn :diagnostics is the authority for the numbers.
+
+(def state->code
+  {:draft 0 :review 1 :last-call 2 :final 3
+   :withdrawn 4 :rejected 5 :superseded 6})
+
+(def code->state (set/map-invert state->code))
+
+(def role->code {:author 0 :editor 1 :quorum 2})
+(def code->role (set/map-invert role->code))
+
+(def track->code {:standards 0 :process 1 :informational 2})
+(def code->track (set/map-invert track->code))
+
+(def diagnostics
+  {0 :kip/ok
+   1 :kip/unknown-from-state
+   2 :kip/unknown-to-state
+   3 :kip/no-such-transition
+   4 :kip/role-not-permitted
+   5 :kip/last-call-too-short
+   6 :kip/quorum-below-threshold
+   7 :kip/missing-surfaces
+   8 :kip/missing-evidence
+   9 :kip/missing-migration
+   10 :kip/missing-superseded-by
+   11 :kip/track-not-permitted})
+
+(def terminal-states #{:final :withdrawn :rejected :superseded})
+
+;; -------------------------------------------------------- the decision core
+;; Mirror of kotoba/kip_gate_core.kotoba. Scalars only, no lookups into the
+;; process map: everything it needs is an argument, so the parity test can
+;; enumerate the whole input space without constructing documents.
+
+(defn requires-last-call?
+  "Only the standards track has a last call and a quorum."
+  [track-code]
+  (= track-code 0))
+
+(defn final-guard-code
+  "The five guards on last-call -> final, most-specific-complaint order."
+  [last-call-days min-last-call-days signers threshold
+   has-surfaces? has-evidence? has-migration?]
+  (cond
+    (< last-call-days min-last-call-days) 5
+    (< signers threshold) 6
+    (not has-surfaces?) 7
+    (not has-evidence?) 8
+    (not has-migration?) 9
+    :else 0))
+
+(defn- valid-state? [s] (and (>= s 0) (<= s 6)))
+
+(defn transition-code
+  "Diagnostic code for a proposed transition. 0 means admitted.
+
+  All arguments are scalars; `from`, `to`, `role` and `track` are the integer
+  codes above, not keywords. See `check-transition` for the document-level entry
+  point that resolves those and reads the guards off a KIP."
+  [{:keys [from to role track last-call-days min-last-call-days
+           signers threshold has-surfaces? has-evidence? has-migration?
+           has-superseded-by?]}]
+  (cond
+    (not (valid-state? from)) 1
+    (not (valid-state? to)) 2
+
+    (= to 4) (if (contains? #{0 1 2} from) (if (= role 0) 0 4) 3)
+    (= to 5) (if (contains? #{1 2} from) (if (= role 1) 0 4) 3)
+
+    (= to 1) (cond (= from 0) (if (= role 0) 0 4)
+                   (= from 2) (if (= role 1) 0 4)
+                   :else 3)
+
+    (= to 0) (if (= from 1) (if (= role 1) 0 4) 3)
+
+    (= to 2) (if (= from 1)
+               (if (= role 1)
+                 (if (requires-last-call? track) 0 11)
+                 4)
+               3)
+
+    (= to 3) (if (requires-last-call? track)
+               (cond (= from 2) (if (= role 2)
+                                  (final-guard-code last-call-days min-last-call-days
+                                                    signers threshold
+                                                    has-surfaces? has-evidence? has-migration?)
+                                  4)
+                     (= from 1) 11
+                     :else 3)
+               (if (= from 1) (if (= role 1) 0 4) 3))
+
+    (= to 6) (if (= from 3)
+               (if (= role 2) (if has-superseded-by? 0 10) 4)
+               3)
+
+    :else 3))
+
+;; ------------------------------------------------------------------- dates
+;; Plain arithmetic rather than a host date library: this namespace is .cljc and
+;; the two hosts disagree about everything else in that area. Hinnant's
+;; days_from_civil, which is exact for any proleptic Gregorian date.
+
+(defn parse-date
+  "\"YYYY-MM-DD\" -> [y m d], or nil. Anything else is nil rather than an
+  exception: a malformed date is a finding to report, not a crash."
+  [s]
+  (when (string? s)
+    (let [m (re-matches #"(\d{4})-(\d{2})-(\d{2})" (str/trim s))]
+      (when m
+        (mapv #?(:clj #(Long/parseLong %) :cljs #(js/parseInt % 10)) (rest m))))))
+
+(defn epoch-day
+  "[y m d] -> days since 1970-01-01."
+  [[y m d]]
+  (let [y (if (<= m 2) (dec y) y)
+        era (quot (if (>= y 0) y (- y 399)) 400)
+        yoe (- y (* era 400))
+        doy (+ (quot (+ (* 153 (+ m (if (> m 2) -3 9))) 2) 5) (dec d))
+        doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn days-between
+  "Whole days from `from` to `to`, both \"YYYY-MM-DD\". nil if either is
+  unparseable — callers must treat nil as \"could not answer\", never as 0."
+  [from to]
+  (let [a (parse-date from) b (parse-date to)]
+    (when (and a b) (- (epoch-day b) (epoch-day a)))))
+
+;; ------------------------------------------------------------- the document
+;; A KIP on disk is DataScript/Datomic tx-data, one entity, matching the
+;; workspace's 90-docs convention (ADR-2607171600): scalars are scalars, nested
+;; collections are pr-str'd blobs so the file stays transactable as-is.
+
+(def ^:private blob-fields
+  #{:kip/surfaces :kip/quorum :kip/requires :kip/evidence :kip/discussion})
+
+(defn- unblob [v]
+  (if (string? v)
+    (let [parsed (try (edn/read-string v) (catch #?(:clj Exception :cljs :default) _ ::fail))]
+      (if (coll? parsed) parsed v))
+    v))
+
+(defn read-kip
+  "tx-data (a vector holding exactly one entity map) -> the entity map with
+  known blob fields parsed back into collections.
+
+  Returns `{:kip/error ...}` rather than throwing: the registry check wants to
+  report every bad file, not stop at the first."
+  [tx-data]
+  (cond
+    (not (vector? tx-data)) {:kip/error :kip/not-tx-data}
+    (not= 1 (count tx-data)) {:kip/error :kip/expected-exactly-one-entity}
+    (not (map? (first tx-data))) {:kip/error :kip/not-an-entity-map}
+    :else (reduce-kv (fn [m k v] (assoc m k (if (blob-fields k) (unblob v) v)))
+                     {} (dissoc (first tx-data) :db/id))))
+
+;; The four states a KIP climbs through, in order. :withdrawn / :rejected /
+;; :superseded are exits, not rungs — they sit outside this vector on purpose.
+(def ^:private ladder [:draft :review :last-call :final])
+(def ^:private rung (zipmap ladder (range)))
+
+(defn required-fields
+  "Cumulative required field set for `state`: entering :review requires
+  everything :draft required, and so on.
+
+  An exit state (:withdrawn / :rejected / :superseded) adds nothing — you may
+  withdraw a draft that never had a specification, and demanding one in order
+  to abandon it would be a reason not to abandon it.
+
+  **The ladder is per-track.** Process and informational KIPs never enter
+  :last-call and never carry a quorum, so requiring those fields at :final
+  would make them unadmittable — measured 2026-08-16 by trying to admit
+  kip-0000, which came back missing :kip/last-call-started and :kip/quorum, two
+  fields its track is defined as not having. The 2-arity keeps the strict
+  (standards) reading for callers that do not know the track."
+  ([process state] (required-fields process state :standards))
+  ([process state track]
+   (let [rungs (if-let [n (rung state)] (take (inc n) ladder) [:draft])
+         base (reduce (fn [acc s] (into acc (get-in process [:requirements s] #{})))
+                      #{} rungs)
+         ;; Remove the individual fields a track has no capability for, not the
+         ;; whole rung: :kip/surfaces lives on the :last-call rung but is about
+         ;; what the KIP changes, not about the clock, so a process KIP still
+         ;; owes it.
+         gated (:track-gated-fields process)]
+     (reduce-kv (fn [acc cap fields]
+                  (if (get-in process [:tracks track cap] true)
+                    acc
+                    (apply disj acc fields)))
+                base gated))))
+
+(defn- present?
+  "Blank counts as absent. An empty :kip/migration is exactly the absence the
+  requirement exists to catch, and it is the shape a template leaves behind."
+  [v]
+  (cond (nil? v) false
+        (string? v) (not (str/blank? v))
+        (coll? v) (boolean (seq v))
+        :else true))
+
+(defn missing-fields
+  "Which of the fields required at `state` this KIP does not have."
+  [process kip state]
+  (into (sorted-set)
+        (remove #(present? (get kip %)))
+        (required-fields process state (:kip/track kip :standards))))
+
+;; ------------------------------------------------------------------ quorum
+(defn quorum-signers
+  "Distinct signer identifiers on a KIP.
+
+  `verify-fn`, when supplied, is called with each signature map and must return
+  truthy for a signature that cryptographically checks out; unverified
+  signatures are then dropped before counting. Without it this counts *claimed*
+  signers, and `:verified?` is false so every caller can say which it did — the
+  distinction between `skipped` and `passed` is the whole reason this returns a
+  map instead of a number."
+  ([kip] (quorum-signers kip nil))
+  ([kip verify-fn]
+   (let [sigs (filter map? (:kip/quorum kip))
+         kept (if verify-fn (filter verify-fn sigs) sigs)]
+     {:signers (into (sorted-set) (keep :signer) kept)
+      :claimed (count sigs)
+      :verified? (boolean verify-fn)})))
+
+;; ------------------------------------------------------- document-level entry
+(defn check-transition
+  "Resolve a proposed transition against the process authority and a KIP.
+
+  opts:
+    :today      \"YYYY-MM-DD\" — required to evaluate the last-call clock
+    :verify-fn  signature verifier; see `quorum-signers`
+
+  Returns a map that always carries `:ok?`, `:code` and `:diagnostic`, plus
+  `:missing` (required fields absent at the destination state) and
+  `:quorum`. When the last-call clock cannot be evaluated — no `:today`, or an
+  unparseable `:kip/last-call-started` — it returns `:ok? false` with
+  `:kip/last-call-too-short` and `:undetermined #{:last-call-elapsed}` rather
+  than assuming the window elapsed. A check that could not run is not a pass."
+  [process kip to-state role {:keys [today verify-fn] :as _opts}]
+  (let [from (get state->code (:kip/status kip) -1)
+        to (get state->code to-state -1)
+        role-code (get role->code role -1)
+        track (get track->code (:kip/track kip) -1)
+        min-days (get-in process [:guards :last-call-elapsed :min-days] 14)
+        threshold (get-in process [:guards :quorum-met :threshold] 2)
+        elapsed (days-between (:kip/last-call-started kip) today)
+        q (quorum-signers kip verify-fn)
+        missing (missing-fields process kip to-state)
+        code (transition-code
+              {:from from :to to :role role-code :track track
+               ;; -1 can never satisfy `>= min-days` for a non-negative
+               ;; min-days, so an unknown clock fails closed as :too-short and
+               ;; is reported separately in :undetermined.
+               :last-call-days (or elapsed -1)
+               :min-last-call-days min-days
+               :signers (count (:signers q))
+               :threshold threshold
+               :has-surfaces? (boolean (seq (:kip/surfaces kip)))
+               :has-evidence? (boolean (seq (:kip/evidence kip)))
+               :has-migration? (boolean (not (str/blank? (:kip/migration kip))))
+               :has-superseded-by? (boolean (not (str/blank? (:kip/superseded-by kip))))})]
+    (cond-> {:ok? (and (zero? code) (empty? missing))
+             :code code
+             :diagnostic (get diagnostics code :kip/unknown-diagnostic)
+             :from (:kip/status kip)
+             :to to-state
+             :role role
+             :missing missing
+             :quorum q}
+      (nil? elapsed) (assoc :undetermined #{:last-call-elapsed}))))

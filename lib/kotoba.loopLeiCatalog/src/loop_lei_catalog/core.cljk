@@ -1,0 +1,225 @@
+(ns loop-lei-catalog.core
+  "Continuous orchestrator for the cloud-itonami-lei corporate catalog:
+  observe -> evaluate -> decide -> act -> record-evidence.
+
+  Role boundary (com-junkawasaki/root `manifest/repository-rules.edn`): a `loop-*`
+  repo runs cycles and must NOT own domain scoring truth. The rubric -- what
+  the axes are, how they are weighted, what counts as unmeasured -- lives in
+  the `catalog-maturity` library and is tested there. This namespace only
+  observes real state, asks that library what is weakest, runs a bounded
+  amount of work, and writes down what actually happened.
+
+  Observation is a live read of the catalog's EDN in git (via the superproject's
+  `scripts/lei-catalog-observe.cljs`). It is never estimated and never carried
+  over from a previous cycle: an unreadable catalog makes the cycle FAIL rather
+  than produce a plan from stale numbers, because a plan built on last week's
+  coverage would look identical to one built on today's.
+
+  Every action shells out to the existing superproject scripts rather than
+  reimplementing acquisition or discovery here. Those scripts are the tested
+  path, they already refuse to fabricate data or bypass bot checks, and
+  duplicating them inside a scheduler is how two implementations start to
+  drift."
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            ["child_process" :refer [execSync]]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as edn]
+            [catalog-maturity.core :as cm]))
+
+(defn- repo-root
+  "The superproject root, taken from LEI_LOOP_ROOT or the current directory.
+  Not hardcoded and not derived from this file's location: the loop is meant
+  to be runnable from a checkout anywhere, including a CI workspace, and the
+  taxonomy forbids binding a loop-* repo to one provider's layout."
+  []
+  (or (aget js/process.env "LEI_LOOP_ROOT") (.cwd js/process)))
+
+;; ── observe ─────────────────────────────────────────────────────────────────
+
+(defn observe
+  "Live counts from the catalog's SOURCE OF TRUTH -- the blueprint.edn and ToS
+  journal in each repo -- by shelling out to the superproject's
+  `scripts/lei-catalog-observe.cljs`.
+
+  It used to be a set of `SELECT`s against the D1 projection. Owner direction
+  2026-08-04 (「なぜ sql ? edn で datalad 保存では?」) removed SQL from this path.
+  The projection was not merely redundant, it lagged: D1 answered 78 reachable
+  companies at a moment when git already held 84, so a cycle could have scored
+  itself against a stale denominator and concluded its own action did nothing.
+
+  Reading is shelled out rather than reimplemented for the same reason acting
+  is: two readers of one catalog drift, and the drift shows up as a maturity
+  score that moves while the catalog stands still."
+  []
+  (let [out (execSync (str "kbb --backend sci --classpath scripts scripts/lei-catalog-observe.cljk")
+                      #js {:encoding "utf8" :maxBuffer (* 40 1024 1024) :stdio "pipe"
+                           :cwd (repo-root)})
+        obs (edn/read-string (str/trim out))]
+    (when-not (:companies obs)
+      (throw (js/Error. (str "lei-catalog-observe returned no companies: " (subs (str out) 0 200)))))
+    ;; An incomplete read fails the cycle rather than scoring against it: a
+    ;; maturity computed over 170 of 185 repos looks exactly like one computed
+    ;; over all of them, and the difference is invisible in the ledger.
+    (when (pos? (or (:unreadable obs) 0))
+      (throw (js/Error. (str (:unreadable obs) " repo(s) unreadable — refusing to score a partial catalog"))))
+    obs))
+
+;; ── evaluate ────────────────────────────────────────────────────────────────
+
+(defn- target-countries []
+  (let [f (path/join (repo-root) "orgs/kotoba-lang/loop-lei-catalog/resources/target-countries.edn")
+        f (if (fs/existsSync f) f (path/join (.cwd js/process) "resources/target-countries.edn"))]
+    (set (edn/read-string (fs/readFileSync f "utf8")))))
+
+(defn evaluate
+  "Delegates entirely to `catalog-maturity`. No scoring logic here by design."
+  [obs targets]
+  (cm/plan (assoc obs :target-countries (count targets)) targets))
+
+;; ── decide ──────────────────────────────────────────────────────────────────
+
+(defn decide
+  "The top-ranked action the loop can actually execute this cycle.
+
+  An action is only chosen if there is a concrete script that performs it.
+  Ranking something the loop cannot do would produce a plan that looks like
+  progress and never moves -- so unexecutable actions are reported as
+  `:no-runner` and the next executable one is chosen instead."
+  [plan]
+  (let [runnable #{:acquire-new-country :acquire-outside-dominant-country
+                   :discover-contact-routes :archive-missing-documents}
+        ranked (:actions plan)
+        chosen (first (filter #(and (runnable (:action %))
+                                    (not= :unmeasured (:score %)))
+                              ranked))]
+    {:chosen chosen
+     :skipped (vec (remove #(runnable (:action %)) ranked))
+     :ranked ranked}))
+
+;; ── act ─────────────────────────────────────────────────────────────────────
+
+(defn- sh [cmd]
+  (try
+    {:ok true :out (execSync cmd #js {:encoding "utf8" :maxBuffer (* 40 1024 1024)
+                                      :stdio "pipe" :cwd (repo-root)})}
+    (catch :default e
+      {:ok false :out (str (some-> (.-stdout e) str) (some-> (.-stderr e) str))
+       :error (.-message e)})))
+
+(defn- summary-line
+  "The acting script's own SUMMARY line, whichever script ran.
+
+  Matching only `candidates:` (lei-acquire's wording) meant every
+  discover-contact-routes cycle recorded `:action-summary nil` -- the ledger
+  could say the score moved but not that 40 sites were checked and N published a
+  route. lei-contact-discover's summary starts with `checked:`."
+  [out]
+  (->> (str/split-lines (str out))
+       (filter #(or (str/includes? % "candidates:") (str/includes? % "checked:")))
+       last))
+
+(defn act
+  "Runs ONE bounded step for the chosen action.
+
+  Bounded on purpose: a cycle that tried to close the whole gap would run for
+  hours, and its evidence entry could not say which change produced which
+  movement in the score. One step per cycle keeps each ledger entry a readable
+  before/after."
+  [{:keys [chosen]} {:keys [dry-run? contact-limit]}]
+  (if-not chosen
+    {:action :none :note "no runnable action -- every executable axis is already at its ceiling or unmeasured"}
+    (let [action (:action chosen)
+          cmd (case action
+                :discover-contact-routes
+                (str "kbb --backend sci --classpath scripts scripts/lei-contact-discover.cljk --concurrency 6"
+                     (when contact-limit (str " --limit " contact-limit))
+                     (when dry-run? " --dry-run"))
+                (:acquire-new-country :acquire-outside-dominant-country :archive-missing-documents)
+                (str "kbb --backend sci scripts/lei-acquire.cljk --concurrency 4" (when dry-run? " --dry-run"))
+                nil)]
+      (if-not cmd
+        {:action action :note ":no-runner"}
+        ;; No re-projection step. It used to run `d1-ingest` after every action
+        ;; so the NEXT observation would see what had landed -- necessary only
+        ;; while observation came from D1. Observation now reads git directly,
+        ;; so whatever the action wrote is already visible, and re-projecting
+        ;; would be ~185 HTTP fetches spent keeping a cache nothing in this loop
+        ;; reads. `scripts/d1-ingest-cloud-itonami-lei.cljs` still exists for
+        ;; anyone who wants the SQL view; it is just no longer on this path.
+        (let [r (sh cmd)]
+          {:action action
+           :command cmd
+           :ok (:ok r)
+           :summary (summary-line (:out r))
+           :error (:error r)})))))
+
+;; ── record evidence ─────────────────────────────────────────────────────────
+
+(defn- ledger-path
+  "Inside the loop repo when it is checked out, else beside the caller.
+
+  Resolved from the REPO directory, not from the ledger directory: git does not
+  track an empty directory, so a freshly cloned checkout has `src/` and
+  `resources/` but no `ledger/`, and testing for the ledger dir sent the first
+  cycle's evidence to a stray `ledger/` at the superproject root -- outside the
+  repo that owns it, and outside version control."
+  []
+  (let [repo (path/join (repo-root) "orgs/kotoba-lang/loop-lei-catalog")]
+    (if (fs/existsSync repo)
+      (path/join repo "ledger" "lei-catalog-ledger.edn")
+      (path/join (.cwd js/process) "ledger" "lei-catalog-ledger.edn"))))
+
+(defn record-evidence!
+  "Appends ONE line to the append-only ledger. Records the measured before and
+  after, not just the after: a score with nothing to compare against cannot
+  show whether the cycle helped, and a cycle that made things worse must be as
+  visible as one that helped.
+
+  A dry run is LABELLED, never omitted. Without the flag its entry is
+  indistinguishable from a real cycle -- same axes, same `:action-ok true`,
+  same before == after -- so an operator verifying the loop silently writes a
+  cycle that appears to have run and moved nothing. Omitting the entry instead
+  would be worse: the ledger would stop being a record of every time this loop
+  ran."
+  [{:keys [before after action dry-run?]}]
+  (let [p (ledger-path)
+        entry {:event/as-of (first (str/split (.toISOString (js/Date.)) #"T"))
+               :event/at (.toISOString (js/Date.))
+               :event/dry-run (boolean dry-run?)
+               :event/companies-before (:companies (:observed before))
+               :event/companies-after (:companies (:observed after))
+               :event/countries-before (count (:country-counts (:observed before)))
+               :event/countries-after (count (:country-counts (:observed after)))
+               :event/maturity-before (:score (:maturity before))
+               :event/maturity-after (:score (:maturity after))
+               :event/measured-weight (:measured-weight (:maturity after))
+               :event/weakest-axis (:axis (first (:actions after)))
+               :event/action (:action action)
+               :event/action-ok (:ok action)
+               :event/action-summary (:summary action)
+               :event/dominant (get-in (:gaps after) [:dominant])
+               :event/countries-absent (count (:absent (:gaps after)))}]
+    (fs/mkdirSync (path/dirname p) #js {:recursive true})
+    (fs/appendFileSync p (str (pr-str entry) "\n"))
+    {:ledger-path p :entry entry}))
+
+;; ── cycle ───────────────────────────────────────────────────────────────────
+
+(defn run-cycle!
+  "observe -> evaluate -> decide -> act -> record-evidence.
+
+  Observes a SECOND time after acting rather than predicting the outcome:
+  what the scripts report and what actually landed in the catalog have already
+  diverged once in this project's history (a transact returned ok for rows that
+  never became readable), so the after-score is measured, never inferred."
+  [{:keys [dry-run? contact-limit] :as opts}]
+  (let [targets (target-countries)
+        before (evaluate (observe) targets)
+        decision (decide before)
+        result (act decision opts)
+        after (if dry-run? before (evaluate (observe) targets))
+        ev (record-evidence! {:before before :after after :action result
+                              :dry-run? dry-run?})]
+    {:before before :after after :decision decision :action result
+     :ledger-path (:ledger-path ev) :entry (:entry ev)}))

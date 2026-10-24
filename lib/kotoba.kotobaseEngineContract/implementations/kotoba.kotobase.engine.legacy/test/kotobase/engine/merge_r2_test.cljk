@@ -1,0 +1,321 @@
+(ns kotobase.engine.merge-r2-test
+  "Round-2 review reproductions for kotobase-engine#10 (each asserts the
+  correct behaviour; all failed at c98df5b), plus round-2 minors."
+  (:require #?(:clj [kotoba.test :refer [deftest is async]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is async]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is async]])
+            [arrangement.core :as qs]
+            [chain.core :as chain]
+            [ipld.core :as ipld]
+            [kotobase-peer.core :as peer]
+            [kotobase.engine :as engine]
+            [kotobase.engine.logical :as logical]
+            [kotobase.storage.memory :as memory]))
+
+(def settings {:database-id "tenant/db"
+               :schema {":doc/status" {:db/cardinality :db.cardinality/one}}})
+
+(defn- open
+  ([store] (open store settings))
+  ([store merge-settings]
+   (engine/open (cond-> {:storage store
+                         :encrypt-fn #(js/Promise.resolve %)
+                         :decrypt-fn #(js/Promise.resolve %)
+                         :blind-fn #(js/Promise.resolve (pr-str %))
+                         :visible? (constantly true)}
+                  merge-settings (assoc :merge merge-settings :trust-scope "r2")))))
+
+(defn- ref-cid [store] (get-in @(:state store) [:refs "main" :cid]))
+
+(defn- problem-of [e]
+  (loop [e e] (when e (or (:problem (ex-data e)) (recur (ex-cause e))))))
+
+(defn- outcome [p]
+  (-> p
+      (.then (fn [r] [:ok r]))
+      (.catch (fn [e] [:err (or (problem-of e) (ex-message e))]))))
+
+(defn- fail! [done]
+  (fn [e]
+    (is false (str "unexpected: " (ex-message e) " " (pr-str (ex-data e))))
+    (done)))
+
+(defn- ports [store]
+  [(fn [cid] (get (:blocks @(:state store)) cid))
+   (fn [cid bytes] (swap! (:state store) assoc-in [:blocks cid] bytes) cid)])
+
+(def evil-views
+  {"tags" {"spec" {"attrs" [":doc/tag"]}
+           "rows" [["evil" ":doc/tag" "\"forged-view-row\""]]}})
+
+(defn- forge-with-views!
+  "Chain commit over PREV/CAUSES with an HONEST snapshot of QUADS but a
+  forged views block."
+  [store prev causes quads views]
+  (let [[get-fn put!] (ports store)
+        db (peer/transact (peer/empty-db) quads)]
+    (-> (js/Promise.all
+         #js [(qs/commit! put! db nil qs/current-schema-version
+                          #(js/Promise.resolve (pr-str %)) #(js/Promise.resolve %))
+              (#'peer/put-views-block! put! views #(js/Promise.resolve %))])
+        (.then (fn [[snap views-cid]]
+                 (chain/commit! put! get-fn
+                                {"indexed" (ipld/link snap)
+                                 "novelty-front" nil "novelty-back" nil
+                                 "novelty-count" 0
+                                 "views" (ipld/link views-cid)}
+                                prev
+                                (when (seq causes) {:causes (vec causes)})))))))
+
+(defn- forge-plain!
+  [store prev quads]
+  (let [[get-fn put!] (ports store)
+        db (peer/transact (peer/empty-db) quads)]
+    (-> (js/Promise.resolve
+         (qs/commit! put! db nil qs/current-schema-version
+                     #(js/Promise.resolve (pr-str %)) #(js/Promise.resolve %)))
+        (.then (fn [snap]
+                 (chain/commit! put! get-fn
+                                {"indexed" (ipld/link snap)
+                                 "novelty-front" nil "novelty-back" nil
+                                 "novelty-count" 0}
+                                prev nil))))))
+
+(defn- view-values [v]
+  (some->> (:rows v) (map #(cljs.reader/read-string (:v_edn %))) set))
+
+;; R2-1 (no attacker): merge! fast-forwards onto a branch from before a
+;; fold! that declared a view; the ref leaves the fold and the view is gone.
+(deftest ff-to-pre-fold-branch-drops-views
+  (async done
+    (let [store (memory/memory-store) conn (open store) st (atom {})]
+      (-> (engine/transact! conn [["doc" ":doc/tag" "v0"]])
+          (.then (fn [_]
+                   (swap! st assoc :h0 (ref-cid store))
+                   (engine/fold! conn {:threshold 1 :views {"tags" {"attrs" [":doc/tag"]}}})))
+          (.then (fn [_] (engine/view conn "tags")))
+          (.then (fn [before]
+                   (swap! st assoc :before before)
+                   (engine/commit-at! conn (:h0 @st) [["doc" ":doc/tag" "offline"]])))
+          (.then (fn [x] (swap! st assoc :x x) (engine/merge! conn [x])))
+          (.then (fn [r] (swap! st assoc :r r) (engine/view conn "tags")))
+          (.then (fn [after]
+                   (let [{:keys [before r x]} @st]
+                     (println "R2-1 before" (view-values before) "status" (:status r)
+                              "ref=x?" (= x (ref-cid store)) "after" (pr-str after))
+                     (is (= #{"v0"} (view-values before)))
+                     (is (= :fast-forward (:status r)))
+                     (is (some? after) "BUG if nil: the declared view was dropped by the fast-forward")
+                     (done))))
+          (.catch (fail! done))))))
+
+;; R2-2: forged views on a carry commit over a legit descendant pass
+;; verify-physical and merge! publishes them.
+(deftest forged-views-on-carry-are-published-by-merge!
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (-> (engine/transact! conn [["doc" ":doc/title" "v0"]])
+          (.then (fn [_] (engine/commit-at! conn (ref-cid store) [["doc" ":doc/tag" "a"]])))
+          (.then (fn [x]
+                   (forge-with-views! store x nil
+                                      [["doc" ":doc/title" "v0"] ["doc" ":doc/tag" "a"]]
+                                      evil-views)))
+          (.then (fn [forged]
+                   (-> (outcome (engine/merge! conn [forged]))
+                       (.then (fn [r]
+                                (-> (outcome (engine/view conn "tags"))
+                                    (.then (fn [v] [forged r v]))))))))
+          (.then (fn [[forged r v]]
+                   (println "R2-2 merge!" (pr-str (update r 1 #(select-keys % [:status :ref-advanced?])))
+                            "ref=forged?" (= forged (ref-cid store)) "view" (pr-str v))
+                   (is (not= forged (ref-cid store)) "BUG if equal: ref moved to forged commit")
+                   (done)))
+          (.catch (fail! done))))))
+
+;; R2-3: a merge commit with an honest snapshot but forged views passes
+;; read verification; `view` returns the forged rows.
+(deftest forged-views-on-merge-commit-are-read
+  (async done
+    (let [sa (memory/memory-store) a (open sa)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]]
+                   (-> (engine/merge-at! a [a1 b1])
+                       (.then (fn [m]
+                                (let [[p c] (:heads m)]
+                                  (forge-with-views! sa p [c]
+                                                     (map logical/datom->quad (:datoms m))
+                                                     evil-views)))))))
+          (.then (fn [forged]
+                   (swap! (:state sa) assoc-in [:refs "main"] {:cid forged :version 1})
+                   (let [reader (open sa)]
+                     (js/Promise.all
+                      #js [(outcome (engine/q reader [nil nil nil]))
+                           (outcome (engine/view reader "tags"))]))))
+          (.then (fn [[q v]]
+                   (println "R2-3 q" (first q) "view" (pr-str v))
+                   (is (not= :ok (first v)) "BUG if :ok: forged view rows read through a 'verified' merge")
+                   (done)))
+          (.catch (fail! done))))))
+
+;; R2-5: no merges anywhere, but a long linear history becomes unreadable
+;; once it exceeds :max-closure (default 100000) on a connection with :merge.
+(deftest linear-history-read-hits-max-closure
+  (async done
+    (let [store (memory/memory-store) w (open store nil)]
+      (-> (reduce (fn [p n] (.then p (fn [_] (engine/transact! w [["doc" ":doc/n" (str n)]]))))
+                  (js/Promise.resolve nil) (range 12))
+          (.then (fn [_]
+                   (js/Promise.all
+                    #js [(outcome (engine/q (open store (assoc settings :max-closure 5)) [nil nil nil]))
+                         (outcome (engine/q (open store nil) [nil nil nil]))])))
+          (.then (fn [[with-merge without]]
+                   (println "R2-5 with :merge" (first with-merge) (when (= :err (first with-merge)) (second with-merge))
+                            "without" (first without))
+                   (is (= :ok (first with-merge)) "BUG if err: linear read refused by merge closure bound")
+                   (done)))
+          (.catch (fail! done))))))
+
+;; R2-6: reads after a merge re-project the whole closure; adding linear
+;; commits after a merge makes reads fail at a budget the merge passed.
+(deftest reads-after-merge-grow-with-history
+  (async done
+    (let [sa (memory/memory-store) a (open sa)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [m]
+                   (swap! (:state sa) assoc-in [:refs "main"] {:cid (:cid m) :version 1})
+                   (-> (reduce (fn [p n] (.then p (fn [_] (engine/transact! a [[(str "e" n) ":doc/n" (str n)]]))))
+                               (js/Promise.resolve nil) (range 30))
+                       (.then (fn [_]
+                                (let [budget (* 2 (:work m))]
+                                  (js/Promise.all
+                                   #js [(:work m)
+                                        (.then (engine/logical-projection a [(ref-cid sa)]) (fn [p] (:work p)))
+                                        (outcome (engine/q (engine/at-cid (open sa (assoc settings :max-work budget)) (:cid m)) [nil nil nil]))
+                                        (outcome (engine/q (open sa (assoc settings :max-work budget)) [nil nil nil]))])))))))
+          (.then (fn [[merge-work head-work at-merge at-head]]
+                   (println "R2-6 merge work" merge-work "head projection work" head-work
+                            "q@merge" (first at-merge) "q@head" at-head)
+                   (is (= :ok (first at-head)) "BUG if err: linear commits after a merge make reads fail closed")
+                   (done)))
+          (.catch (fail! done))))))
+
+;; R2-7: trust of a forged child of a merge depends on the per-connection
+;; cache: a fresh reader rejects it, a reader that verified the merge reads it.
+(deftest forged-child-of-merge-trust-depends-on-cache
+  (async done
+    (let [sa (memory/memory-store) a (open sa)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [m]
+                   (let [warm (open sa)]
+                     (-> (engine/q (engine/at-cid warm (:cid m)) [nil nil nil])
+                         (.then (fn [_] (forge-plain! sa (:cid m) [["evil" ":admin" "true"]])))
+                         (.then (fn [h]
+                                  (js/Promise.all
+                                   #js [(outcome (engine/q (engine/at-cid warm h) [nil nil nil]))
+                                        (outcome (engine/q (engine/at-cid (open sa) h) [nil nil nil]))])))))))
+          (.then (fn [[warm fresh]]
+                   (println "R2-7 warm" (pr-str warm) "fresh" (pr-str fresh))
+                   (is (= (first warm) (first fresh)) "BUG if different: cache-dependent trust")
+                   (done)))
+          (.catch (fail! done))))))
+
+;; R2-8: transact! does not enforce the serial-validity rule reads require;
+;; one raw card-one overwrite after a merge makes every read of the head fail.
+(deftest raw-write-after-merge-bricks-reads
+  (async done
+    (let [sa (memory/memory-store) a (open sa)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/status" "open"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [m]
+                   (swap! (:state sa) assoc-in [:refs "main"] {:cid (:cid m) :version 1})
+                   (outcome (engine/transact! a [["doc" ":doc/status" "closed"]]))))
+          (.then (fn [w]
+                   (-> (js/Promise.all #js [(outcome (engine/q (open sa) [nil nil nil]))
+                                            (outcome (engine/q (open sa nil) [nil nil nil]))])
+                       (.then (fn [[r r2]]
+                                (println "R2-8 transact!" (first w) "q head" (pr-str r) "no-settings" (pr-str r2))
+                                (is (= :ok (first r)) "BUG if err: published head unreadable")
+                                (done))))))
+          (.catch (fail! done))))))
+
+;; ---------------------------------------------------------------------------
+;; Round-2 minors
+
+(defn- exchange! [a b]
+  (let [blocks (merge (:blocks @(:state a)) (:blocks @(:state b)))]
+    (swap! (:state a) assoc :blocks blocks)
+    (swap! (:state b) assoc :blocks blocks)))
+
+;; M-R2-4: the :merge schema is cross-checked against schema datoms the
+;; kotobase.datomic layer stores ([e ":db/ident" a] [e ":db/cardinality" ..]).
+(deftest merge-schema-must-match-stored-schema-datoms
+  (async done
+    (let [store (memory/memory-store)
+          raw (open store nil)
+          many-conn (open store {:database-id "tenant/db" :schema {}})
+          schema-tx [["s1" ":db/ident" ":doc/status"]
+                     ["s1" ":db/cardinality" ":db.cardinality/one"]]]
+      (-> (js/Promise.all
+           #js [(outcome (engine/commit-at! many-conn nil schema-tx))
+                (engine/commit-at! raw nil schema-tx)])
+          (.then (fn [[refused g]]
+                   (is (= [:err :schema-mismatch] refused)
+                       "a transaction installing schema the settings contradict is refused")
+                   (js/Promise.all #js [(engine/commit-at! raw g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! raw g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]]
+                   (js/Promise.all
+                    #js [(outcome (engine/merge-at! many-conn [a1 b1]))
+                         (outcome (engine/merge-at! (open store) [a1 b1]))])))
+          (.then (fn [[mismatch ok]]
+                   (is (= [:err :schema-mismatch] mismatch))
+                   (is (= :merged (:status (second ok))))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; R2-7 minor: trust is keyed by settings, not shared across connections
+;; whose settings differ.
+(deftest merge-trust-is-keyed-by-settings
+  (async done
+    (let [store (memory/memory-store) a (open store)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/status" "open"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [[:db/retract "doc" ":doc/status" "open"]
+                                                                ["doc" ":doc/status" "x"]])
+                                        (engine/commit-at! a g [[:db/retract "doc" ":doc/status" "open"]
+                                                                ["doc" ":doc/status" "y"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [m]
+                   (-> (engine/q (engine/at-cid a (:cid m)) [nil nil nil])
+                       (.then (fn [_]
+                                (outcome (engine/q (engine/at-cid (open store {:database-id "tenant/db"
+                                                                               :schema {}})
+                                                                  (:cid m))
+                                                   [nil nil nil])))))))
+          (.then (fn [other]
+                   (is (= [:err :physical-mismatch] other)
+                       "a card-many reader does not inherit the card-one reader's verification")
+                   (done)))
+          (.catch (fail! done))))))
+
+(deftest branch-heads-bounds-its-input
+  (async done
+    (-> (outcome (engine/branch-heads (open (memory/memory-store))
+                                      (mapv #(str "bafy" %) (range 257))))
+        (.then (fn [r]
+                 (is (= [:err :too-many-heads] r))
+                 (done))))))

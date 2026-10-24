@@ -1,0 +1,175 @@
+(ns kotoba.logistics.readback-test
+  "Tests for the oracle itself.
+
+  `readback` exists so the export tests can decode instead of pattern-matching.
+  That only helps if the decoder is right, and a decoder written by the same
+  hand as the encoder is the classic way to be wrong in both places at once.
+  So every expectation below is the answer an outside implementation gives for
+  the same bytes -- Python 3's `csv` module (`strict=True`, `newline=''`) and
+  its `json` module -- recorded on 2026-08-31.
+
+  The refusal cases matter as much as the accepting ones. An oracle that reads
+  a corrupt document as a plausible one reports a green round trip for an
+  exporter that has stopped working."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.logistics.readback :as rb]))
+
+;; ---------------------------------------------------------------------------
+;; RFC 4180
+;; ---------------------------------------------------------------------------
+
+(def ^:private header "shipment_id,origin,destination,carrier,tracking,status")
+
+(def ^:private head-row
+  ["shipment_id" "origin" "destination" "carrier" "tracking" "status"])
+
+(def ^:private csv-fixtures
+  "document -> records, as Python's csv module read them on 2026-08-31."
+  [["a quoted comma stays inside one field"
+    (str header "\nS1,\"a,b\",B,C,,booked")
+    [head-row ["S1" "a,b" "B" "C" "" "booked"]]]
+   ["a doubled quote is one literal quote"
+    (str header "\nS1,\"a\"\"b\",B,C,,booked")
+    [head-row ["S1" "a\"b" "B" "C" "" "booked"]]]
+   ["a quoted LF does not end the record"
+    (str header "\nS1,\"a\nb\",B,C,,booked")
+    [head-row ["S1" "a\nb" "B" "C" "" "booked"]]]
+   ["a quoted CR does not end the record"
+    (str header "\nS1,\"a\rb\",B,C,,booked")
+    [head-row ["S1" "a\rb" "B" "C" "" "booked"]]]
+   ["a quoted CRLF is a pair inside the field, not a boundary"
+    (str header "\nS1,\"a\r\nb\",B,C,,booked")
+    [head-row ["S1" "a\r\nb" "B" "C" "" "booked"]]]
+   ["surrounding spaces are part of the field"
+    (str header "\nS1, lead ,B,C,,booked")
+    [head-row ["S1" " lead " "B" "C" "" "booked"]]]
+   ["a tab needs no quoting and is not a separator"
+    (str header "\nS1,a\tb,B,C,,booked")
+    [head-row ["S1" "a\tb" "B" "C" "" "booked"]]]
+   ["a header with no rows is one record"
+    header
+    [head-row]]
+   ["a trailing terminator does not add an empty record"
+    (str header "\nS1,A,B,C,,booked\n")
+    [head-row ["S1" "A" "B" "C" "" "booked"]]]])
+
+(deftest csv-reader-agrees-with-an-external-implementation
+  (doseq [[label doc expected] csv-fixtures]
+    (testing label
+      (is (= expected (rb/read-csv doc)) (rb/describe doc)))))
+
+(deftest csv-reader-reads-an-unquoted-bare-cr-as-a-record-boundary
+  ;; This is the whole reason `csv-cell` quotes a bare CR, and the reason this
+  ;; oracle has to agree with Python rather than be forgiving: if the reader
+  ;; treated a lone CR as ordinary text, an exporter that stopped quoting it
+  ;; would round-trip cleanly here and corrupt every real reader downstream.
+  ;; Python returns three records for these bytes; so does this.
+  (let [corrupt (str header "\nS1,a\rb,B,C,,booked")]
+    (is (= [["shipment_id" "origin" "destination" "carrier" "tracking" "status"]
+            ["S1" "a"]
+            ["b" "B" "C" "" "booked"]]
+           (rb/read-csv corrupt)))))
+
+(defn- refusal
+  "Run `f` and return the `:readback/why` of the refusal it raises, or the value
+  it returned if it did not raise. Naming the reason is the point: a test that
+  only asserts \"something was thrown\" counts an unrelated crash as the
+  rejection it was looking for, which is the defect ADR-2608136000 question 6
+  describes."
+  [f]
+  (try (f) (catch #?(:clj Exception :cljs :default) e (rb/why e))))
+
+(deftest csv-reader-refuses-what-python-also-refuses
+  (testing "an unterminated quoted field (Python: 'unexpected end of data')"
+    (is (= :unterminated-quoted-field (refusal #(rb/read-csv "a,\"b")))))
+  (testing "text after the closing quote (Python: \"',' expected after '\\\"'\")"
+    (is (= :text-after-closing-quote (refusal #(rb/read-csv "a,\"b\"c"))))))
+
+(deftest csv-reader-is-stricter-than-python-in-exactly-one-place
+  ;; Python's reader accepts `a,b"c` and hands back the field as `b"c`. RFC 4180
+  ;; does not: a non-escaped field is `*TEXTDATA`, and TEXTDATA (section 2 ABNF)
+  ;; excludes %x22, the double quote. This reader follows the grammar, because
+  ;; an oracle that repairs a malformed field cannot tell a writer that quotes
+  ;; correctly from one that has stopped quoting at all.
+  ;;
+  ;; Recorded so the divergence is a decision on the page rather than a surprise
+  ;; the next person finds by running Python.
+  (is (= :bare-quote-in-unquoted-field (refusal #(rb/read-csv "a,b\"c")))))
+
+(deftest csv-records-refuses-a-document-with-no-header
+  ;; Every exporter here writes a header even with nothing to report, so an
+  ;; empty document means the export did not run. Python reads it as zero
+  ;; records, which is the same shape a successful empty export would have if
+  ;; the header were dropped.
+  (is (= :no-header (refusal #(rb/csv-records "")))))
+
+(deftest csv-column-addresses-by-name
+  (let [doc (rb/csv-records (str header "\nS1,Tokyo,Osaka,Yamato,1Z999AA101234,booked"))
+        row (first (:rows doc))]
+    (is (= "Tokyo" (rb/csv-column doc row "origin")))
+    (is (= "booked" (rb/csv-column doc row "status")))
+    (testing "and refuses a column the header does not publish"
+      (is (= :no-such-column (refusal #(rb/csv-column doc row "weight")))))))
+
+;; ---------------------------------------------------------------------------
+;; RFC 8259
+;; ---------------------------------------------------------------------------
+
+(deftest json-reader-agrees-with-an-external-implementation
+  (testing "each expectation is what Python's json module returned for these bytes"
+    (is (= [{"origin" "a\"b"}]   (rb/read-json "[{\"origin\":\"a\\\"b\"}]")))
+    (is (= [{"origin" "a\\b"}]   (rb/read-json "[{\"origin\":\"a\\\\b\"}]")))
+    (is (= [{"origin" "a\nb"}]   (rb/read-json "[{\"origin\":\"a\\nb\"}]")))
+    (is (= [{"origin" "a\tb"}]   (rb/read-json "[{\"origin\":\"a\\tb\"}]")))
+    (is (= [{"origin" (str "a" (char 1) "b")}]    (rb/read-json "[{\"origin\":\"a\\u0001b\"}]")))
+    (is (= [{"origin" (str "a" (char 0x1f) "b")}] (rb/read-json "[{\"origin\":\"a\\u001fb\"}]")))
+    (is (= [{"origin" "日本語"}]  (rb/read-json "[{\"origin\":\"日本語\"}]")))
+    (is (= [] (rb/read-json "[]")))
+    (is (= [{"valid" true} {"valid" false}]
+           (rb/read-json "[{\"valid\":true},{\"valid\":false}]")))))
+
+(deftest json-reader-refuses-a-raw-control-character
+  ;; Python raises "Invalid control character at ..." for both of these. If this
+  ;; reader accepted them, an exporter that stopped escaping control characters
+  ;; would keep passing its round-trip test while emitting documents that no
+  ;; conforming parser will read. RFC 8259 section 7.
+  (doseq [n (range 0x20)]
+    (is (= :raw-control-character-in-string
+           (refusal #(rb/read-json (str "[{\"origin\":\"a" (char n) "b\"}]"))))
+        (str "a raw control character at code point " n " must be refused"))))
+
+(deftest json-reader-refuses-what-python-also-refuses
+  (testing "a truncated document"
+    (is (= :unterminated-array (refusal #(rb/read-json "[{\"a\":\"b\"}")))))
+  (testing "an unterminated string"
+    (is (= :unterminated-string (refusal #(rb/read-json "[{\"a\":\"b}]")))))
+  (testing "a trailing comma"
+    (is (= :trailing-comma (refusal #(rb/read-json "[{\"a\":\"b\"},]")))))
+  (testing "content after the value"
+    (is (= :trailing-content (refusal #(rb/read-json "[] junk")))))
+  (testing "an unknown escape"
+    (is (= :unknown-escape (refusal #(rb/read-json "[{\"a\":\"\\x\"}]")))))
+  (testing "a short unicode escape"
+    (is (= :bad-unicode-escape (refusal #(rb/read-json "[{\"a\":\"\\u01\"}]"))))))
+
+(deftest json-reader-is-stricter-than-python-in-exactly-one-place
+  ;; RFC 8259 section 4 says member names SHOULD be unique and that the
+  ;; behaviour of a parser receiving duplicates is unpredictable. Python picks
+  ;; last-wins and returns {"a": "c"}. This reader refuses, because a duplicated
+  ;; key is something only a broken writer emits, and last-wins would hide it:
+  ;; the round trip would still produce the value the test expected.
+  (is (= :duplicate-member (refusal #(rb/read-json "[{\"a\":\"b\",\"a\":\"c\"}]")))))
+
+(deftest json-reader-refuses-values-outside-the-grammar-this-repo-emits
+  ;; Narrow on purpose, and loud about it. Neither a number nor null appears in
+  ;; any document `kotoba.logistics.export` writes, so supporting them would put
+  ;; an untested branch inside the judge.
+  ;; Python accepts both (1 and None). The refusal here is not a disagreement
+  ;; about JSON -- it is a refusal to carry a branch of the oracle that no
+  ;; document in this repo exercises.
+  (testing "a number" (is (= :unsupported-value (refusal #(rb/read-json "[{\"n\":1}]")))))
+  (testing "null"     (is (= :unsupported-value (refusal #(rb/read-json "[{\"n\":null}]"))))))
+
+(deftest json-reader-keeps-member-order
+  (let [[o] (rb/read-json "[{\"b\":\"1\",\"a\":\"2\",\"c\":\"3\"}]")]
+    (is (= ["b" "a" "c"] (rb/member-order o)))))

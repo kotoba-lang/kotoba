@@ -1,0 +1,127 @@
+#!/usr/bin/env kbb
+;; run-lei-catalog-tick.cljs — LaunchAgent entry for the cloud-itonami-lei
+;; corporate-catalog loop. One tick = one bounded cycle of
+;; kotoba-lang/loop-lei-catalog: observe (live D1) -> evaluate (catalog-maturity)
+;; -> decide -> act (lei-acquire | lei-contact-discover, then re-project into D1)
+;; -> record-evidence.
+;;
+;; Why this script exists: the loop was fully written and verified but had no
+;; runner. Its ledger held ONE cycle from 2026-07-25, and ADR-2607182400's
+;; murakumo cell was never registered. A loop that only runs when a human
+;; remembers it is not a loop.
+;;
+;; Why tamaki exec rather than plain nbb: the tick is deterministic (no model in
+;; the loop), and `tamaki exec` records it as a real :agent.run/mode :external
+;; AgentRun with the actual argv and exit code, so `tamaki status` shows every
+;; tick without pretending an agent ran it. Mirrors run-toshokan-patents-tick.
+;;
+;; The ledger is committed and pushed HERE, not by the loop: the loop's job is
+;; to measure and act, and a cycle whose evidence never leaves this machine is
+;; indistinguishable from one that never ran. The child repo is synced BEFORE
+;; the cycle so the append lands on top of upstream -- an append-only file that
+;; diverged has to be merged by hand, and this repo forbids rebase.
+(ns run-lei-catalog-tick
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]))
+
+(def root
+  (or (.-env.LEI_LOOP_ROOT js/process)
+      "/Users/junkawasaki/github/com-junkawasaki"))
+
+(def loop-repo (str root "/orgs/kotoba-lang/loop-lei-catalog"))
+
+(def tamaki
+  (or (.-env.TAMAKI_BIN js/process)
+      "/Users/junkawasaki/github/com-junkawasaki/orgs/etzhayyim/tamaki/bin/tamaki"))
+
+;; Bounded on purpose. The contact work list is every catalogued company with no
+;; published contact route (~107 of 185 as of 2026-08-04), and draining it in one
+;; tick would make the ledger entry unable to say which fetch moved the score.
+(def contact-limit (or (.-env.LEI_CONTACT_LIMIT js/process) "40"))
+
+(def child-env
+  (js/Object.assign
+   #js {}
+   (.-env js/process)
+   #js {:PATH (str "/usr/bin:/bin:/opt/homebrew/bin:" (.-env.PATH js/process))
+        :GIT_SSH_COMMAND "/usr/bin/ssh"
+        :GIT_TERMINAL_PROMPT "0"
+        :LEI_LOOP_ROOT root
+        :TAMAKI_STATE_DIR (or (.-env.TAMAKI_STATE_DIR js/process) "/Users/junkawasaki/.tamaki")
+        :TAMAKI_WORKER_ID (or (.-env.TAMAKI_WORKER_ID js/process) "lei-catalog-tick")}))
+
+(defn- git
+  "Run git in the loop repo. Returns {:ok :out}; never throws, so a failed
+  sync is reported and skips the cycle rather than aborting mid-tick."
+  [& args]
+  (let [r (.spawnSync cp "git" (clj->js (into ["-C" loop-repo] args))
+                      #js {:encoding "utf8" :env child-env})]
+    {:ok (zero? (or (.-status r) 1))
+     :out (str (.-stdout r) (.-stderr r))}))
+
+(defn- log [& xs] (println (apply str "[lei-catalog-tick] " xs)))
+
+(defn- sync-loop-repo!
+  "Fast-forward the loop repo to origin/main before the cycle appends to the
+  ledger. Returns false if the checkout has diverged -- which happens if a
+  previous tick's push was rejected -- because appending to a diverged
+  append-only ledger produces a conflict no scheduler should resolve on its own."
+  []
+  (git "fetch" "origin")
+  (let [counts (:out (git "rev-list" "--left-right" "--count" "origin/main...HEAD"))
+        [behind ahead] (map js/parseInt (.split (.trim counts) #"\s+"))]
+    (cond
+      (js/isNaN behind) (do (log "cannot read ahead/behind: " counts) false)
+      (pos? ahead) (do (log "loop repo is " ahead " commit(s) ahead of origin/main "
+                            "-- a previous push was probably rejected. Land it by hand "
+                            "(no rebase); skipping this cycle.")
+                       false)
+      (pos? behind) (let [r (git "merge" "--ff-only" "origin/main")]
+                      (if (:ok r)
+                        (do (log "fast-forwarded " behind " commit(s) from origin/main") true)
+                        (do (log "ff-only merge failed: " (:out r)) false)))
+      :else true)))
+
+(defn- run-cycle! []
+  (.spawnSync cp tamaki
+              #js ["exec"
+                   "cloud-itonami-lei catalog loop tick: observe -> evaluate -> decide -> act -> record-evidence"
+                   "--project" root
+                   "--"
+                   "kbb" "--backend" "sci" "--classpath"
+                   "orgs/kotoba-lang/loop-lei-catalog/src:orgs/kotoba-lang/loop-lei-catalog/resources:orgs/kotoba-lang/catalog-maturity/src"
+                   "orgs/kotoba-lang/loop-lei-catalog/bin/run.cljk"
+                   "--contact-limit" contact-limit]
+              #js {:cwd root :encoding "utf8" :stdio "inherit" :env child-env}))
+
+(defn- publish-ledger!
+  "Commit and push the one appended line. A tick that changed nothing appends
+  nothing new to commit -- that is a normal outcome, not a failure."
+  []
+  (let [dirty (.trim (:out (git "status" "--porcelain" "--" "ledger/lei-catalog-ledger.edn")))]
+    (if (empty? dirty)
+      (log "ledger unchanged -- nothing to publish")
+      (do
+        (git "add" "ledger/lei-catalog-ledger.edn")
+        (let [c (git "commit" "-m" "evidence(loop): lei-catalog cycle")]
+          (if-not (:ok c)
+            (log "commit failed: " (:out c))
+            (let [p (git "push" "origin" "HEAD:main")]
+              (if (:ok p)
+                (log "ledger published to origin/main")
+                (log "push rejected -- the commit stays local and the next tick "
+                     "will skip until it is landed: " (:out p))))))))))
+
+(defn -main []
+  (doseq [[label path] [["LEI_LOOP_ROOT" root] ["loop repo" loop-repo] ["TAMAKI_BIN" tamaki]]]
+    (when-not (fs/existsSync path)
+      (println (str "[lei-catalog-tick] " label " missing: " path))
+      (js/process.exit 1)))
+  (log (.toISOString (js/Date.)) " root=" root " contact-limit=" contact-limit)
+  (if-not (sync-loop-repo!)
+    (js/process.exit 1)
+    (let [r (run-cycle!)]
+      (publish-ledger!)
+      (js/process.exit (or (.-status r) 1)))))
+
+(-main)

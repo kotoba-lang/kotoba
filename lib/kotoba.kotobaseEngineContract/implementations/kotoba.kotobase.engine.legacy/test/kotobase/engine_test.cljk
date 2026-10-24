@@ -1,0 +1,395 @@
+(ns kotobase.engine-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
+            [kotobase.datomic :as d]
+            [kotobase.engine :as engine]
+            [kotobase.storage.memory :as memory]))
+
+(deftest open-fails-closed-without-security-controls
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (engine/open {:storage (memory/memory-store)}))))
+
+(deftest public-engine-round-trips-a-transaction
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        committed (engine/transact!
+                   database [["alice" "role" "admin"]])]
+    (is (string? committed))
+    (is (= #{{:s "alice" :p "role" :o "admin"}}
+           (engine/q database ["alice" "role" nil])))))
+
+(deftest exact-cid-values-do-not-drift-with-the-mutable-head
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        first-cid (engine/transact!
+                   database [["alice" "role" "member"]])
+        at-first (engine/at-cid database first-cid)
+        _second-cid (engine/transact!
+                     database [["alice" "role" "admin"]])]
+    (is (= first-cid (engine/basis-cid at-first)))
+    (is (= #{{:s "alice" :p "role" :o "member"}}
+           (engine/q at-first ["alice" "role" nil])))
+    (is (= #{{:s "alice" :p "role" :o "member"}
+             {:s "alice" :p "role" :o "admin"}}
+           (engine/q database ["alice" "role" nil])))
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+         #"non-empty commit CID"
+         (engine/at-cid database "")))))
+
+(deftest canonical-commits-branch-from-the-callers-exact-basis
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        root (engine/commit-at! database nil [["root" "value" 1]])
+        left (engine/commit-at! database root [["left" "value" 2]])
+        right (engine/commit-at! database root [["right" "value" 3]])]
+    (is (nil? (engine/head database)))
+    (is (not= left right))
+    (is (= #{{:s "root" :p "value" :o "1"}
+             {:s "left" :p "value" :o "2"}}
+           (engine/q (engine/at-cid database left) [nil "value" nil])))
+    (is (= #{{:s "root" :p "value" :o "1"}
+             {:s "right" :p "value" :o "3"}}
+           (engine/q (engine/at-cid database right) [nil "value" nil])))))
+
+(deftest datomic-query-syntax-and-argument-order
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (is (string?
+         (:db-after
+           (d/transact
+           database
+           {:tx-data [{:db/id "alice"
+                       :person/name "Alice"
+                       :person/role "admin"}
+                      {:db/id "bob" :person/name "Bob"}]}))))
+    (is (= #{["alice" "Alice"]}
+           (d/q '[:find ?e ?name
+                  :where
+                  [?e :person/role "admin"]
+                  [?e :person/name ?name]]
+                (d/db database))))
+    (is (= "Alice"
+           (d/q '[:find ?name .
+                  :where ["alice" :person/name ?name]]
+                database)))
+    (is (= ["Alice" "Bob"]
+           (sort
+            (d/q '[:find [?name ...]
+                   :where [_ :person/name ?name]]
+                 database))))
+    (is (= [{:person "alice" :name "Alice"}]
+           (d/q '[:find ?person ?name
+                  :keys person name
+                  :where
+                  [?person :person/role "admin"]
+                  [?person :person/name ?name]]
+                database)))
+    (is (= #{["alice"]}
+           (d/q '[:find ?e
+                  :in $ ?role
+                  :where [?e :person/role ?role]]
+                database "admin")))
+    (is (= #{:e :a :v_edn :added}
+           (set (keys (first (d/datoms database
+                                       {:index :eavt
+                                        :components ["alice"]
+                                        :limit 1}))))))
+    (is (= #{":person/name"}
+           (set (keys (d/pull database [:person/name] "alice")))))
+    (is (= 2 (count (d/pull-many database [:person/name]
+                                  ["alice" "bob"]))))
+    (is (= #{"Alice"}
+           (get (d/touch (d/entity database "alice")) ":person/name")))
+    (is (= 2 (count (d/seek-datoms database :aevt :person/name))))
+    (is (= #{"Alice" "Bob"}
+           (set (map (comp read-string :v_edn)
+                     (d/index-range database :person/name "A" "C")))))
+    (is (= #{"Alice"}
+           (set (map (comp read-string :v_edn)
+                     (d/index-range database :person/name "A" "B")))))
+    (is (= #{"Alice" "Bob"}
+           (set (map (comp read-string :v_edn)
+                     (d/index-range database :person/name "A" nil)))))))
+
+(deftest datomic-identity-tempid-lookup-ref-and-transaction-functions
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)
+                   :tx-functions
+                   {:user/set-name
+                    (d/function
+                     {:impl
+                      (fn [_database lookup-ref name]
+                        [[:db/add lookup-ref :user/name name]])})}})
+        schema
+        [{:db/id :user/email
+          :db/ident :user/email
+          :db/valueType :db.type/string
+          :db/cardinality :db.cardinality/one
+          :db/unique :db.unique/identity}
+         {:db/id :user/name
+          :db/ident :user/name
+          :db/valueType :db.type/string
+          :db/cardinality :db.cardinality/one}
+         {:db/id :user/manager
+          :db/ident :user/manager
+          :db/valueType :db.type/ref
+          :db/cardinality :db.cardinality/one}]
+        _ (d/transact database {:tx-data schema})
+        alice-tempid (d/tempid :db.part/user)
+        alice-report
+        (d/transact database
+                    {:tx-data [{:db/id alice-tempid
+                                :user/email "alice@example.test"
+                                :user/name "Alice"}]})
+        alice (d/resolve-tempid alice-report alice-tempid)
+        bob-tempid (d/tempid :db.part/user)
+        bob-report
+        (d/transact database
+                    {:tx-data [{:db/id bob-tempid
+                                :user/email "bob@example.test"
+                                :user/name "Bob"
+                                :user/manager
+                                [:user/email "alice@example.test"]}]})
+        bob (d/resolve-tempid bob-report bob-tempid)
+        upsert-tempid (d/tempid :db.part/user)
+        upsert-report
+        (d/transact database
+                    {:tx-data [{:db/id upsert-tempid
+                                :user/email "alice@example.test"
+                                :user/name "Alice Updated"}]})]
+    (is (string? alice))
+    (is (string? bob))
+    (is (= alice (d/resolve-tempid upsert-report upsert-tempid)))
+    (is (= "Alice Updated"
+           (d/q '[:find ?name .
+                  :where
+                  [?e :user/email "alice@example.test"]
+                  [?e :user/name ?name]]
+                database)))
+    (is (= alice
+           (d/q '[:find ?manager .
+                  :where
+                  [?e :user/email "bob@example.test"]
+                  [?e :user/manager ?manager]]
+                database)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (d/transact database
+                             {:tx-data [[:db/add
+                                         [:user/name "Bob"]
+                                         :user/name
+                                         "Not a lookup ref"]]})))
+    (d/transact database
+                {:tx-data [[:db.fn/cas
+                            [:user/email "alice@example.test"]
+                            :user/name "Alice Updated" "Alice CAS"]]})
+    (is (= "Alice CAS"
+           (d/q '[:find ?name .
+                  :where
+                  [?e :user/email "alice@example.test"]
+                  [?e :user/name ?name]]
+                database)))
+    (d/transact database
+                {:tx-data [[:user/set-name
+                            [:user/email "alice@example.test"]
+                            "Alice Function"]]})
+    (is (= "Alice Function"
+           (d/q '[:find ?name .
+                  :where
+                  [?e :user/email "alice@example.test"]
+                  [?e :user/name ?name]]
+                database)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (d/transact database
+                             {:tx-data [[:db.fn/cas alice :user/name
+                                         "wrong" "never"]]})))
+    (d/transact database
+                {:tx-data [[:db.fn/retractAttribute
+                            [:user/email "alice@example.test"]
+                            :user/name]]})
+    (is (nil? (d/q '[:find ?name .
+                     :where
+                     [?e :user/email "alice@example.test"]
+                     [?e :user/name ?name]]
+                   database)))))
+
+(deftest datomic-immutable-db-as-of-since-and-history
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        _ (d/transact database
+                      {:tx-data [[:db/add "e" :item/value "v1"]]})
+        at-v1 (d/db database)
+        t-v1 (d/basis-t at-v1)
+        _ (d/transact database
+                      {:tx-data [[:db/retract "e" :item/value "v1"]
+                                 [:db/add "e" :item/value "v2"]]})
+        current (d/db database)
+        historical (d/history current)
+        speculative (d/with current
+                            {:tx-data [[:db/add "e" :item/draft "draft"]]})]
+    (is (= "v1"
+           (d/q '[:find ?v . :where ["e" :item/value ?v]] at-v1)))
+    (is (= "v1"
+           (d/q '[:find ?v . :where ["e" :item/value ?v]]
+                (d/as-of current t-v1))))
+    (is (= "v2"
+           (d/q '[:find ?v . :where ["e" :item/value ?v]] current)))
+    (is (= "draft"
+           (d/q '[:find ?v . :where ["e" :item/draft ?v]]
+                (:db-after speculative))))
+    (is (nil?
+         (d/q '[:find ?v . :where ["e" :item/draft ?v]] current)))
+    (is (= #{["v2"]}
+           (d/q '[:find ?v :where ["e" :item/value ?v]]
+                (d/since current t-v1))))
+    (is (= [true false true]
+           (mapv :added
+                 (filter #(= ":item/value" (:a %))
+                         (d/datoms historical
+                                   {:index :eavt
+                                    :components ["e"]})))))))
+
+(deftest datomic-tuples-persisted-functions-listeners-and-tx-range
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        reports (atom [])
+        listener-id (d/listen database #(swap! reports conj %))]
+    (d/transact
+     database
+     {:tx-data
+      [{:db/id :account/tenant
+        :db/ident :account/tenant
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :account/external-id
+        :db/ident :account/external-id
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :account/tenant+external
+        :db/ident :account/tenant+external
+        :db/valueType :db.type/tuple
+        :db/tupleAttrs [:account/tenant :account/external-id]
+        :db/cardinality :db.cardinality/one
+        :db/unique :db.unique/identity}
+       {:db/id :account/status
+        :db/ident :account/status
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :fn/set-status
+        :db/ident :fn/set-status
+        :db/fn {:lang "kotobase/tx-ir-v1"
+                :params '[db entity status]
+                :code '[[:db/add entity :account/status status]]}}]})
+    (let [first-id (d/tempid :db.part/user)
+          first-report
+          (d/transact database
+                      {:tx-data [{:db/id first-id
+                                  :account/tenant "tenant-1"
+                                  :account/external-id "external-1"
+                                  :account/status "new"}]})
+          account-id (d/resolve-tempid first-report first-id)
+          upsert-id (d/tempid :db.part/user)
+          upsert-report
+          (d/transact database
+                      {:tx-data [{:db/id upsert-id
+                                  :account/tenant "tenant-1"
+                                  :account/external-id "external-1"}]})]
+      (is (= account-id (d/resolve-tempid upsert-report upsert-id)))
+      (d/transact
+       database
+       {:tx-data [[:fn/set-status
+                   [:account/tenant+external
+                    ["tenant-1" "external-1"]]
+                   "active"]]})
+      (is (= "active"
+             (d/q '[:find ?status .
+                    :where [?e :account/status ?status]]
+                  database)))
+      (is (= 4 (count @reports)))
+      (is (= 4 (count (d/tx-range database 0 nil))))
+      (is (true? (d/unlisten database listener-id)))
+      (d/transact database
+                  {:tx-data [[:db/add account-id :account/status "inactive"]]})
+      (is (= 4 (count @reports))))))
+
+(deftest fold-declares-a-view-then-view-reads-it-fresh
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}
+                                     {:db/id "e2" :other/attr "x"}]})
+    (let [fold-result
+          (d/fold database
+                  {:views {"names" {"attrs" [":person/name"]}}})]
+      (is (true? (:committed? fold-result))
+          ":views forces the fold even though there's plenty of novelty to spare too"))
+    (d/transact database {:tx-data [{:db/id "e3" :person/name "Bob"}]})
+    (let [view (d/view database "names")]
+      (is (some? view))
+      (is (= 2 (count (:rows view)))
+          "1 folded row + 1 fresh novelty row for the declared attr")
+      (is (every? #(= ":person/name" (:a %)) (:rows view))))
+    (is (nil? (d/view database "nope"))
+        "an undeclared view is nil, not an empty read")))
+
+(deftest fold-with-views-forces-below-threshold
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}]})
+    (is (false? (:committed? (d/fold database {:threshold 1000})))
+        "ordinarily a no-op this far below threshold")
+    (let [forced
+          (d/fold database
+                  {:threshold 1000
+                   :views {"names" {"attrs" [":person/name"]}}})]
+      (is (true? (:committed? forced))))
+    (is (= 1 (count (:rows (d/view database "names")))))))
+
+(deftest transact-reports-novelty-size
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (is (= 1 (:novelty-size (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}]})))
+        "1 not-yet-folded tx block after the first commit")
+    (is (= 2 (:novelty-size (d/transact database {:tx-data [{:db/id "e2" :person/name "Bob"}]})))
+        "novelty accumulates across commits between folds")
+    (is (true? (:committed? (d/fold database {:threshold 1}))))
+    (is (= 2 (:novelty-size (d/transact database {:tx-data [{:db/id "e3" :person/name "Carol"}]})))
+        "novelty drops back down after a fold, instead of continuing to accumulate")))

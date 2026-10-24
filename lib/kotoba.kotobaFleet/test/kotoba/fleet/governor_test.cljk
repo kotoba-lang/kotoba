@@ -1,0 +1,91 @@
+(ns kotoba.fleet.governor-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.fleet.core :as core]
+            [kotoba.fleet.governor :as gov]
+            [kotoba.fleet.store :as store]))
+
+(deftest record-drains-proposal
+  (testing "record! receipts a proposal so it is no longer pending (drains once)"
+    (let [db  (store/mem-store)
+          pid (gov/submit-proposal! db {:work "w" :agent "A" :payload 1})]
+      (is (= 1 (count (gov/pending-proposals db))) "pending before receipt")
+      (gov/record! db {:proposal-id pid :work "w" :verdict :accepted})
+      (is (empty? (gov/pending-proposals db)) "no longer pending after receipt"))))
+
+(deftest fifty-concurrent-submissions-get-fifty-distinct-t-values
+  (testing "regression: submit-proposal! used to read next-t and call
+            transact! as two separate steps -- a TOCTOU race where
+            concurrent submitters could compute the SAME :proposal/t,
+            silently corrupting causal ordering (pending-proposals sorts by
+            :proposal/t). Verified with REAL concurrent JVM threads: the old
+            two-step pattern produced as few as 23 distinct t values out of
+            50 submissions"
+    (let [db (store/mem-store)
+          n  50
+          futures (doall (for [i (range n)]
+                           (future (gov/submit-proposal! db {:work "w" :agent (str "agent-" i)
+                                                             :payload {}}))))]
+      (doseq [f futures] @f)
+      (is (= n (count (gov/pending-proposals db))) "no proposals collided/overwrote each other")
+      (is (= n (count (distinct (map :proposal/t (gov/pending-proposals db)))))
+          "every submission got a distinct causal ordinal"))))
+
+(deftest gate-accepts-and-rejects
+  (testing "governor materializes accepted proposals, rejects the rest"
+    (let [db        (store/mem-store)
+          wrote     (atom [])]
+      (gov/submit-proposal! db {:work "w1" :agent "A" :payload {:ok true}  :now 0})
+      (gov/submit-proposal! db {:work "w2" :agent "B" :payload {:ok false} :now 1})
+      (let [receipts (gov/drain! db {:gate        #(get-in % [:proposal/payload :ok])
+                                     :materialize #(swap! wrote conj (:proposal/work %))
+                                     :now 2})]
+        (is (= 2 (count receipts)))
+        (is (= ["w1"] @wrote) "only the accepted proposal is materialized")
+        (is (= #{:accepted :rejected} (set (map :receipt/verdict receipts))))))))
+
+(deftest single-writer-serialization
+  (testing "proposals drain once, in causal order; re-draining is a no-op"
+    (let [db    (store/mem-store)
+          order (atom [])]
+      (gov/submit-proposal! db {:work "w" :agent "A" :payload 1 :now 0})
+      (gov/submit-proposal! db {:work "w" :agent "B" :payload 2 :now 1})
+      (gov/drain! db {:gate (constantly true)
+                      :materialize #(swap! order conj (:proposal/payload %))
+                      :now 2})
+      (is (= [1 2] @order) "drained in submit order (single writer)")
+      (is (empty? (gov/pending-proposals db)) "nothing pending after drain")
+      (gov/drain! db {:gate (constantly true)
+                      :materialize #(swap! order conj (:proposal/payload %))
+                      :now 3})
+      (is (= [1 2] @order) "second drain materializes nothing (idempotent)"))))
+
+(deftest idempotent-proposal-submission-has-one-pending-entity
+  (let [db (store/mem-store)
+        input {:work "cloud-murakumo/model-catalog/qwen" :agent "shinka"
+               :payload {:kind :catalog-reconcile} :idempotency-key "catalog/qwen/runtime-v1"}
+        first-id (gov/submit-proposal! db input)
+        retry-id (gov/submit-proposal! db input)]
+    (is (= first-id retry-id))
+    (is (= 1 (count (gov/pending-proposals db))))
+    (is (= "catalog/qwen/runtime-v1"
+           (:proposal/idempotency-key (first (gov/pending-proposals db)))))))
+
+(deftest materialize-error-rejects-not-crashes
+  (testing "a throwing materialize is caught and recorded as a rejection"
+    (let [db (store/mem-store)]
+      (gov/submit-proposal! db {:work "w" :agent "A" :payload :boom :now 0})
+      (let [[r] (gov/drain! db {:gate (constantly true)
+                                :materialize (fn [_] (throw (ex-info "boom" {})))
+                                :now 1})]
+        (is (= :rejected (:receipt/verdict r)))
+        (is (re-find #"materialize-error" (:receipt/reason r)))))))
+
+(deftest tick-produces-view
+  (testing "one tick drains and returns a fleet snapshot"
+    (let [db (store/mem-store)]
+      (gov/submit-proposal! db {:work "w" :agent "A" :payload 1 :now 0})
+      (let [{:keys [receipts view]} (core/tick! db {:now 1})]
+        (is (= 1 (count receipts)))
+        (is (= 1 (:now view)) "snapshot stamped with tick time")
+        (is (= 0 (:pending view)) "no proposals left pending")
+        (is (pos? (:datoms view)))))))

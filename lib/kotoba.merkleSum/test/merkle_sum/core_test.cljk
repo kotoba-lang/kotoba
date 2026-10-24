@@ -1,0 +1,119 @@
+(ns merkle-sum.core-test
+  "Spec for the generic Merkle-sum tree: root sum == total, inclusion
+  proofs verify, sum-shrinking is rejected, odd nodes carry up, and the
+  root is cross-runtime deterministic (pinned). Runs on JVM
+  (`kbb -M:test`) and — same portable `.cljc` — under ClojureScript
+  (`merkle-sum.cljs-runner`)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [merkle-sum.core :as ms]))
+
+;; A concrete injected hasher for the tests (the lib itself is
+;; hasher-agnostic). Portable SHA-256 hex: JVM MessageDigest / Node crypto.
+#?(:cljs (def ^:private node-crypto (js/require "crypto")))
+
+(defn sha256-hex [s]
+  #?(:clj
+     (let [d (java.security.MessageDigest/getInstance "SHA-256")]
+       (apply str (map #(format "%02x" (bit-and % 0xff))
+                       (.digest d (.getBytes ^String s "UTF-8")))))
+     :cljs
+     (-> (.createHash node-crypto "sha256") (.update s "utf8") (.digest "hex"))))
+
+(defn- leaf [label amount]
+  {:id label :hash (sha256-hex (str "leaf|" label "|" amount)) :sum amount})
+
+(defn- tree-of [pairs]
+  (ms/build-tree sha256-hex (mapv (fn [[l a]] (leaf l a)) pairs)))
+
+(def ^:private five [["alice" 300] ["bob" 200] ["carol" 100] ["dave" 70] ["erin" 30]])
+
+(deftest root-sum-is-the-total
+  (let [t (tree-of five)]
+    (is (= 700 (get-in t [:root :sum])))
+    (is (= 5 (count (:leaves t))))
+    (is (= [5 3 2 1] (mapv count (:levels t)))
+        "odd node carries up (never duplicated)")))
+
+(deftest root-is-deterministic
+  (testing "pinned root hash — the cross-runtime determinism lock (JVM must
+            equal ClojureScript byte-for-byte)"
+    (is (= "532c7aa9efe91f0d33b73dd10971fea6d168c2b92e8ce0ccdd3248cbfa6267c4"
+           (get-in (tree-of five) [:root :hash]))
+        "if this fails, re-pin from the JVM value AND confirm CLJS matches")))
+
+(deftest every-leaf-proof-verifies
+  (doseq [n [1 2 3 4 5 6 7 8]]
+    (let [pairs (mapv #(vector (str "a" %) (* 10 (inc %))) (range n))
+          t (tree-of pairs)]
+      (doseq [[label amount] pairs]
+        (is (true? (ms/verify sha256-hex
+                              (sha256-hex (str "leaf|" label "|" amount))
+                              amount
+                              (ms/inclusion-proof t label)
+                              (:root t)))
+            (str "proof for " label " in an " n "-leaf tree must verify"))))))
+
+(deftest proofs-reject-lies
+  (let [t (tree-of five)
+        root (:root t)
+        alice-lh (sha256-hex "leaf|alice|300")
+        proof (ms/inclusion-proof t "alice")]
+    (testing "wrong amount / negative amount / shrunk root sum"
+      (is (false? (ms/verify sha256-hex alice-lh 299 proof root)))
+      (is (false? (ms/verify sha256-hex alice-lh -300 proof root)))
+      (is (false? (ms/verify sha256-hex alice-lh 300 proof (assoc root :sum 400)))))
+    (testing "negative sibling sum is rejected (sum-shrinking attack)"
+      (is (false? (ms/verify sha256-hex alice-lh 300
+                             (assoc-in (vec proof) [0 :sum] -100) root))))
+    (testing "tampered sibling hash fails the root check"
+      (is (false? (ms/verify sha256-hex alice-lh 300
+                             (assoc-in (vec proof) [0 :hash] "deadbeef") root))))
+    (testing "an unknown id has no proof"
+      (is (nil? (ms/inclusion-proof t "mallory"))))))
+
+(def ^:private big-pairs
+  (mapv #(vector (str "acct" %) (inc %)) (range 37)))  ; distinct ids, amounts 1..37
+
+(deftest adversarial-proof-hardening
+  (let [t (tree-of big-pairs)
+        root (:root t)]
+    (testing "every leaf verifies in a 37-leaf tree (odd counts exercise
+              carry-up at several levels)"
+      (doseq [[label amount] big-pairs]
+        (is (true? (ms/verify sha256-hex (sha256-hex (str "leaf|" label "|" amount))
+                              amount (ms/inclusion-proof t label) root))
+            (str label " must verify"))))
+    (testing "tampering ANY position of a proof — hash, sum, or side — is
+              rejected (a verification bypass at some depth would be critical)"
+      (doseq [[label amount] (take 6 big-pairs)]
+        (let [lh (sha256-hex (str "leaf|" label "|" amount))
+              proof (vec (ms/inclusion-proof t label))]
+          (dotimes [i (count proof)]
+            (is (false? (ms/verify sha256-hex lh amount (assoc-in proof [i :hash] "00") root))
+                (str label " step " i " hash-tamper must reject"))
+            (is (false? (ms/verify sha256-hex lh amount (update-in proof [i :sum] inc) root))
+                (str label " step " i " sum+1 must reject"))
+            (is (false? (ms/verify sha256-hex lh amount
+                                   (update-in proof [i :side] {:left :right :right :left}) root))
+                (str label " step " i " side-flip must reject"))))))
+    (testing "one leaf's proof cannot verify a DIFFERENT leaf's claim"
+      (let [[l0 _] (first big-pairs)
+            [l1 a1] (second big-pairs)]
+        (is (false? (ms/verify sha256-hex (sha256-hex (str "leaf|" l1 "|" a1))
+                               a1 (ms/inclusion-proof t l0) root)))))
+    (testing "leaf ordering is input-independent (the tree sorts by :id), so the
+              root is identical under any permutation of the input"
+      (let [interleaved (vec (concat (take-nth 2 big-pairs) (take-nth 2 (rest big-pairs))))]
+        (is (= root (:root (tree-of (reverse big-pairs)))))
+        (is (= root (:root (tree-of interleaved))))))))
+
+(deftest empty-and-singleton-trees
+  (testing "empty tree has a defined empty root"
+    (let [t (ms/build-tree sha256-hex [])]
+      (is (= 0 (get-in t [:root :sum])))
+      (is (= (ms/empty-root-hash sha256-hex) (get-in t [:root :hash])))))
+  (testing "a single leaf is its own root; empty proof verifies"
+    (let [t (tree-of [["solo" 42]])]
+      (is (= 42 (get-in t [:root :sum])))
+      (is (= [] (ms/inclusion-proof t "solo")))
+      (is (true? (ms/verify sha256-hex (sha256-hex "leaf|solo|42") 42 [] (:root t)))))))

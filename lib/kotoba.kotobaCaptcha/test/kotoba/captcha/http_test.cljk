@@ -1,0 +1,92 @@
+(ns kotoba.captcha.http-test
+  (:require [kotoba.bytes :as kbytes] [json.compat :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.captcha.http :as http]
+            [kotoba.captcha.store :as store]))
+
+(defn request
+  ([uri body] (request uri body {}))
+  ([uri body headers]
+   {:request-method :post :uri uri :headers headers
+    :body (java.io.ByteArrayInputStream.
+           (kbytes/utf8-bytes (json/generate-string body)))}))
+
+(defn parsed [response] (json/parse-string (:body response) true))
+
+(def authorized-task
+  {:type "SyntheticChallengeTask"
+   :authorization {:scope "synthetic" :reason "contract test fixture"}
+   :prompt "2 + 2"})
+
+(deftest capsolver-compatible-contract
+  (let [handler (http/make-handler {:task-store (store/memory-store)
+                                    :api-keys ["test-secret"]})
+        created (handler (request "/createTask"
+                                  {:clientKey "test-secret" :task authorized-task}))
+        task-id (:taskId (parsed created))
+        result (handler (request "/getTaskResult"
+                                 {:clientKey "test-secret" :taskId task-id}))]
+    (is (= 200 (:status created)))
+    (is (string? task-id))
+    (is (= {:errorId 0 :status "processing"} (parsed result)))))
+
+(deftest authentication-is-fail-closed-and-supports-bearer
+  (let [seen (atom nil)
+        handler (http/make-handler
+                 {:api-keys ["correct"]
+                  :service {:create-task! #(do (reset! seen %) {:errorId 0 :taskId "x"})}})]
+    (is (= 401 (:status (handler (request "/createTask"
+                                          {:clientKey "wrong" :task authorized-task})))))
+    (is (= 200 (:status (handler (request "/createTask" {:task authorized-task}
+                                          {"authorization" "Bearer correct"})))))
+    (is (nil? (:clientKey @seen)))
+    (is (= 503 (:status ((http/make-handler {})
+                         (request "/createTask" {:clientKey "anything"})))))))
+
+(deftest limits-errors-and-operational-endpoints
+  (let [limiter (http/fixed-window-limiter {:limit 1 :clock (constantly 1000)})
+        metrics (atom {})
+        handler (http/make-handler {:api-keys ["key"] :max-body-bytes 64
+                                    :rate-limiter limiter :metrics metrics
+                                    :service {:get-task-result
+                                              (constantly {:errorId 0 :status "processing"})}})]
+    (is (= 200 (:status (handler (request "/getTaskResult"
+                                         {:clientKey "key" :taskId "1"})))))
+    (is (= 429 (:status (handler (request "/getTaskResult"
+                                         {:clientKey "key" :taskId "1"})))))
+    (is (= 413 (:status (handler (assoc (request "/createTask" {})
+                                        :headers {"content-length" "100"})))))
+    (is (= 200 (:status (handler {:request-method :get :uri "/health"}))))
+    (is (str/includes? (:body (handler {:request-method :get :uri "/metrics"}))
+                       "kotoba_captcha_http_requests_total"))))
+
+(deftest redaction-is-recursive
+  (is (= {:clientKey "[REDACTED]"
+          :nested [{:authorization "[REDACTED]" :safe "yes"}]}
+         (http/redact {:clientKey "secret"
+                       :nested [{:authorization "Bearer secret" :safe "yes"}]}))))
+
+(defn raw-request
+  "A request whose body is arbitrary bytes rather than encoded JSON, so the
+  handler's own parse failure is what is under test."
+  [uri ^String raw]
+  {:request-method :post :uri uri :headers {}
+   :body (java.io.ByteArrayInputStream. (kbytes/utf8-bytes raw))})
+
+(deftest malformed-body-is-400-not-500
+  "This path had NO test while it was guarded by a Jackson class, and the class
+  was load-bearing: the handler caught JsonProcessingException -> 400 BEFORE a
+  general ExceptionInfo -> 500. Moving to json.compat makes a parse failure an
+  ExceptionInfo too, so clause order stops separating them and :type has to.
+  Untested, that swap would have turned every malformed body into a 500 without
+  failing a single test.
+
+  Break: change the :json/parse-error branch in http.clj to :else and this
+  returns 500."
+  (let [handler (http/make-handler {:task-store (store/memory-store)
+                                    :api-keys ["test-secret"]})]
+    (doseq [bad ["{" "not json at all" "" "{\"clientKey\":}"]]
+      (let [resp (handler (raw-request "/createTask" bad))]
+        (is (= 400 (:status resp)) (str "body " (pr-str bad) " -> " (:status resp)))
+        (is (= "ERROR_BAD_PARAMETERS" (:errorCode (parsed resp))))))))

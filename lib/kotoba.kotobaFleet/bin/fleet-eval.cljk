@@ -1,0 +1,93 @@
+#!/usr/bin/env kbb
+(ns fleet-eval
+  "Measure what the fleet's agent can actually do, on graded tasks, repeated.
+
+  The fleet had exactly one datapoint — a ~10-line helper plus a test, which
+  passed — and no idea whether that generalised. This runs a ladder of tasks
+  through the REAL path (leased work-unit, sandboxed run on a fleet node, the
+  fleet's own gate) N times each, and scores every run mechanically
+  (`fleet.eval`).
+
+  Repetition is the point: one green run tells you a task is possible, not that
+  it is reliable, and the pass rate reported here is over attempts rather than
+  best-of-N because a fleet gets one attempt per work-unit.
+
+  Usage:
+    kbb --backend sci --classpath src:hosts/nbb:<libs> bin/fleet-eval.cljk \\
+        --tasks examples/eval --reps 3 --node naphtali [--out eval.edn]"
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]
+            [fleet.cli :as cli]
+            [fleet.dispatch :as dispatch]
+            [fleet.eval :as ev]
+            [fleet.filestore :as filestore]
+            [fleet.identity :as fid]
+            [kotoba.fleet.governor :as gov]
+            [kotoba.fleet.store :as store]))
+
+(def tasks-dir (cli/opt "--tasks" "examples/eval"))
+(def reps (js/parseInt (cli/opt "--reps" "3")))
+(def node-name (cli/opt "--node" "naphtali"))
+(def state-dir (path/resolve (cli/opt "--state" ".eval")))
+(def out-path (cli/opt "--out" (path/join state-dir "eval.edn")))
+
+(defn- tasks []
+  (->> (fs/readdirSync tasks-dir) (filter #(str/ends-with? % ".edn")) sort
+       (mapv #(reader/read-string (fs/readFileSync (path/join tasks-dir %) "utf8")))))
+
+(defn- run-once!
+  "One attempt. Each rep gets its own work-unit id so leases and closed work
+  from an earlier rep cannot make a later one look different."
+  [me spec rep]
+  (let [id (str (:work-id spec) "-r" rep)
+        spec' (assoc spec :work-id id :unit (str (:unit spec) "#" id))
+        db (filestore/file-store (path/join state-dir (str id ".log.edn")))
+        result (try (dispatch/dispatch!
+                     {:spec spec' :agent-name (str "eval-" rep) :identity me :db db
+                      :state-dir state-dir :agent-src "hosts/nbb/fleet/sandbox_agent.cljk"
+                      :node-name node-name :materialize :none :publish? false
+                      :settle-ms 0 :signoff-dids []})
+                    (catch :default e {:status :error :error (ex-message e)}))
+        ;; the payload is the proposal the run produced, whatever the verdict
+        payload (->> (store/datoms db)
+                     (filter #(= :proposal/payload (second %)))
+                     last (#(nth % 2)))]
+    (ev/score-run {:task (:work-id spec) :rep rep
+                   :payload (or payload {})
+                   :verdict (first (:verdicts result))
+                   :expect (:expect spec)})))
+
+(defn -main []
+  (fs/mkdirSync state-dir #js {:recursive true})
+  (let [me (fid/resolve-identity (cli/opt "--identity" "kagi:fleet-agent-sandbox-dispatch"))
+        ts (tasks)
+        started (js/Date.now)]
+    (cli/say (str "eval: " (count ts) " task(s) × " reps " rep(s) on " node-name))
+    (let [rows (vec (for [spec ts, rep (range 1 (inc reps))]
+                      (do (cli/say (str "\n— " (:work-id spec) " rep " rep "/" reps
+                                        " (" (:level spec) ")"))
+                          (let [row (run-once! me spec rep)]
+                            (cli/say (str "  → " (if (:pass row) "PASS" "FAIL")
+                                          " accepted=" (:accepted row)
+                                          " meets-spec=" (:meets-spec row)
+                                          " turns=" (:turns row)
+                                          (when (seq (:failures row))
+                                            (str "\n    " (str/join "\n    " (:failures row))))))
+                            row))))
+          summary (ev/summarize rows)]
+      (fs/writeFileSync out-path (pr-str {:at (.toISOString (js/Date.))
+                                          :node node-name :reps reps
+                                          :rows rows :summary summary}))
+      (cli/say (str "\n=== " (quot (- (js/Date.now) started) 1000) "s ==="))
+      (doseq [[t s] (sort (:tasks summary))]
+        (cli/say (str "  " t ": " (:passed s) "/" (:attempts s) " pass"
+                      "  (gate accepted " (:accepted s) ", met spec " (:met-spec s)
+                      ", median turns " (:median-turns s) ")")))
+      (let [{:keys [attempts passed accepted met-spec]} (:total summary)]
+        (cli/say (str "  TOTAL: " passed "/" attempts " pass — accepted " accepted
+                      ", met spec " met-spec)))
+      (cli/say (str "wrote " out-path)))))
+
+(-main)

@@ -1,0 +1,90 @@
+#!/usr/bin/env kbb
+(ns kcm-node-probe
+  "Run the real KCM provider on one Murakumo node without installing anything.
+  Every remote artifact lives below a unique /tmp root and is removed after the
+  probe. Usage: kbb --backend sci scripts/kcm-node-probe.cljk --node naphtali"
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]))
+
+(def args (vec *command-line-args*))
+(defn opt [flag default] (or (second (drop-while #(not= flag %) args)) default))
+(def node-name (opt "--node" "naphtali"))
+(def compiler (path/resolve (opt "--compiler" "../compiler")))
+(def tmp (fs/mkdtempSync (path/join (os/tmpdir) "kcm-node-probe-")))
+(def remote-root (str "/tmp/kcm-node-probe-" (.-pid js/process)))
+(def provider-prefix (path/join tmp "kotoba-provider"))
+
+(defn run [cmd argv & [opts]]
+  (cp/execFileSync cmd (clj->js argv)
+                   (clj->js (merge {:encoding "utf8" :maxBuffer 33554432} opts))))
+(defn ssh [command] (run "ssh" ["-o" "BatchMode=yes" "-o" "ConnectTimeout=8"
+                                node-name command]))
+(defn scp [source destination]
+  (run "scp" ["-q" "-o" "BatchMode=yes" "-o" "ConnectTimeout=8"
+              source (str node-name ":" destination)]))
+(defn sha256-file [p]
+  (-> (crypto/createHash "sha256") (.update (fs/readFileSync p)) (.digest "hex")))
+
+(let [repo (path/join tmp "repo")
+      repo-tar (path/join tmp "repo.tgz")
+      spec-file (path/join tmp "spec.edn")
+      build (-> (run "nbb" ["--classpath" "hosts/nbb" "scripts/build-kcm-provider.cljk"
+                             "--compiler" compiler "--out" provider-prefix])
+                str/split-lines last reader/read-string)
+      runtime-info (-> (ssh "p=$(kbb --backend sci -e '(println js/process.execPath)' | tail -1); printf '%s ' \"$p\"; shasum -a 256 \"$p\" | awk '{print $1}'")
+                       str/trim (str/split #" "))
+      runtime-path (first runtime-info)
+      runtime-sha (second runtime-info)]
+  (fs/mkdirSync repo #js {:recursive true})
+  (fs/copyFileSync (path/join compiler "examples/list.kotoba") (path/join repo "main.kotoba"))
+  (run "tar" ["czf" repo-tar "-C" tmp "repo"])
+  (let [spec {:work-id "kcm-node-probe"
+              :root remote-root
+              :tarball (str remote-root "/repo.tgz")
+              :machine :kotoba-capability-machine
+              :exec-backing :sandbox-exec
+              :kcm/cache-root (str remote-root "/cache")
+              :kcm/provider {:archive (str remote-root "/kotoba-provider.tar")
+                             :manifest (str remote-root "/kotoba-provider.manifest.edn")
+                             :archive-sha256 (:archive-sha256 build)}
+              :kcm/identity {:definition-closure-cid (str "sha256:" (sha256-file (path/join repo "main.kotoba")))
+                             :compiler-cid (:compiler-cid build)
+                             :module-lock-cid (:module-lock-cid build)
+                             :target-abi :kotoba-check-v1
+                             :hostcaps-policy-cid "sha256:deny-network-home-and-outside-write-v1"
+                             :provider-closure-sha256 (:provider-closure-sha256 build)
+                             :runtime-sha256 runtime-sha
+                             :effects []}
+              :kcm/capabilities #{:code/read :build/check :build/compile}
+              :kcm/checks [{:id :check :args ["check" "main.kotoba"] :pure? true}]
+              :kcm/builds [{:id :wasm :args ["compile" "main.kotoba" "--target"
+                                             "wasm32-wasi" "--output" "main.wasm"]}]}
+        files [[repo-tar "repo.tgz"]
+               [(:archive build) "kotoba-provider.tar"]
+               [(:manifest build) "kotoba-provider.manifest.edn"]
+               ["hosts/nbb/fleet/sandbox_agent.cljk" "sandbox_agent.cljk"]
+               ["hosts/nbb/fleet/kcm.cljk" "fleet/kcm.cljk"]
+               ["hosts/nbb/fleet/kcm_provider.cljk" "fleet/kcm_provider.cljk"]]]
+    (fs/writeFileSync spec-file (str (pr-str spec) "\n"))
+    (try
+      (ssh (str "rm -rf " remote-root " && mkdir -p " remote-root "/fleet"))
+      (doseq [[source target] files] (scp source (str remote-root "/" target)))
+      (scp spec-file (str remote-root "/spec.edn"))
+      (let [out (ssh (str "cd " remote-root
+                          " && kbb --backend sci sandbox_agent.cljk --spec spec.edn --kcm-probe"))
+            result (reader/read-string (last (remove str/blank? (str/split-lines out))))]
+        (println (pr-str {:node node-name :runtime runtime-path
+                          :runtime-sha256 runtime-sha :provider build
+                          :result result}))
+        (when-not (and (= [:miss] (mapv :cache (:first result)))
+                       (= [:hit] (mapv :cache (:second result)))
+                       (every? zero? (map :exit (concat (:first result) (:second result)
+                                                        (:builds result))))
+                       (empty? (get-in result [:backing :leaked])))
+          (throw (ex-info "remote KCM probe failed" {:result result}))))
+      (finally (ssh (str "rm -rf " remote-root))))))

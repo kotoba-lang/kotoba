@@ -1,0 +1,115 @@
+#!/usr/bin/env kbb
+(ns build-kcm-release-matrix
+  "Build KCM provider assets from SHA-256-verified official Node distributions.
+
+  Output stays platform-separated so signing and release publication cannot
+  accidentally mix runtimes. The result is EDN."
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]))
+
+(def args (vec *command-line-args*))
+(defn opt [flag default] (or (second (drop-while #(not= flag %) args)) default))
+(defn required [flag]
+  (or (opt flag nil) (throw (ex-info (str "missing " flag) {:usage true}))))
+
+(when (some #{"--help" "-h"} args)
+  (println "usage: build-kcm-release-matrix.cljs --compiler DIR --out DIR --platforms darwin-arm64,linux-x64,linux-arm64 [--node-version VERSION]")
+  (js/process.exit 0))
+
+(def node-version (opt "--node-version" "24.14.0"))
+(def compiler (path/resolve (required "--compiler")))
+(def out-root (path/resolve (required "--out")))
+(def requested (->> (str/split (required "--platforms") #",")
+                    (map str/trim) (remove str/blank?) distinct vec))
+(def supported #{"darwin-arm64" "linux-x64" "linux-arm64"})
+(def temp-root (fs/mkdtempSync (path/join (os/tmpdir) "kcm-release-matrix-")))
+
+(defn sha256 [bytes]
+  (-> (crypto/createHash "sha256") (.update bytes) (.digest "hex")))
+
+(defn fetch-bytes! [url]
+  (-> (js/fetch url)
+      (.then (fn [response]
+               (when-not (.-ok response)
+                 (throw (ex-info (str "download failed " (.-status response) ": " url) {})))
+               (.arrayBuffer response)))
+      (.then #(js/Buffer.from %))))
+
+(defn run [cmd argv]
+  (cp/execFileSync cmd (clj->js argv)
+                   #js {:encoding "utf8" :maxBuffer 33554432}))
+
+(defn archive-name [platform]
+  (let [[os arch] (str/split platform #"-" 2)]
+    (str "node-v" node-version "-" os "-" arch
+         (if (= os "darwin") ".tar.gz" ".tar.xz"))))
+
+(defn expected-sha [sums filename]
+  (some (fn [line]
+          (let [[digest name] (str/split (str/trim line) #"\s+" 2)]
+            (when (= filename name) digest)))
+        (str/split-lines sums)))
+
+(defn build-platform! [sums platform]
+  (when-not (contains? supported platform)
+    (throw (ex-info (str "unsupported KCM release platform: " platform)
+                    {:supported (sort supported)})))
+  (let [filename (archive-name platform)
+        base-url (str "https://nodejs.org/dist/v" node-version)
+        expected (or (expected-sha sums filename)
+                     (throw (ex-info (str "official SHASUMS has no " filename) {})))
+        download (path/join temp-root filename)
+        extracted (path/join temp-root (str/replace filename #"\.tar\.(?:gz|xz)$" ""))
+        platform-out (path/join out-root platform)
+        prefix (path/join platform-out (str "kotoba-kcm-provider-" platform))]
+    (-> (fetch-bytes! (str base-url "/" filename))
+        (.then
+         (fn [bytes]
+           (let [actual (sha256 bytes)]
+             (when-not (= expected actual)
+               (throw (ex-info "official Node distribution digest mismatch"
+                               {:file filename :expected expected :actual actual})))
+             (fs/writeFileSync download bytes)
+             (run "tar" ["xf" download "-C" temp-root])
+             (fs/mkdirSync platform-out #js {:recursive true})
+             (fs/copyFileSync "scripts/install-kcm-provider.mjs"
+                              (path/join platform-out "install-kcm-provider.mjs"))
+             (let [raw (run "nbb" ["--classpath" "hosts/nbb"
+                                    "scripts/build-kcm-provider.cljk"
+                                    "--compiler" compiler "--out" prefix
+                                    "--runtime-node" (path/join extracted "bin/node")
+                                    "--runtime-license" (path/join extracted "LICENSE")])
+                   build (reader/read-string (last (str/split-lines raw)))]
+               {:platform platform
+                :node {:version node-version :archive filename :sha256 actual
+                       :source (str base-url "/" filename)}
+                :provider build})))))))
+
+(defn build-all! [sums]
+  (reduce
+   (fn [promise platform]
+     (.then promise
+            (fn [results]
+              (-> (build-platform! sums platform)
+                  (.then #(conj results %))))))
+   (js/Promise.resolve [])
+   requested))
+
+(let [sums-url (str "https://nodejs.org/dist/v" node-version "/SHASUMS256.txt")]
+  (-> (fetch-bytes! sums-url)
+      (.then #(.toString % "utf8"))
+      (.then build-all!)
+      (.then (fn [results]
+               (println (pr-str {:format :kotoba-kcm-release-matrix/v1
+                                 :node-shasums sums-url
+                                 :builds results}))))
+      (.catch (fn [e]
+                (binding [*print-fn* *print-err-fn*]
+                  (println (.-message e)))
+                (set! (.-exitCode js/process) (if (:usage (ex-data e)) 64 2))))
+      (.finally #(fs/rmSync temp-root #js {:recursive true :force true}))))

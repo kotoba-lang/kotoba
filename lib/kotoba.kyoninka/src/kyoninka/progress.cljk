@@ -1,0 +1,127 @@
+(ns kyoninka.progress
+  "許認可案件(case)の進行: 状態機械・チェックリスト・next-action 提案・
+  append-only 台帳イベント。純関数のみ(I/O は呼び出し側)。ADR-2607141620。
+
+  human gate: 提出・官庁接触・支払いを伴う遷移(schema/transitions の :human)と
+  step(:step/requires-human true)は、event に :human-approved true が無い限り
+  進められない。このライブラリは提案するだけで実行しない。"
+  (:require [kotoba.lang.text :as str]
+            [kyoninka.schema :as schema]))
+
+;; --- case ---------------------------------------------------------------------
+
+(defn new-case
+  [procedure {:keys [case-id applicant]}]
+  {:case/id case-id
+   :case/procedure (:procedure/id procedure)
+   :case/applicant applicant
+   :case/status :not-started
+   :case/done-steps #{}
+   :case/collected-docs #{}
+   :case/notes []})
+
+(defn advance
+  "状態遷移。無効な遷移・human gate 未承認は {:ok? false :reason ...}。"
+  [case' {:keys [to human-approved note] :as _event}]
+  (let [from (:case/status case')
+        kind (schema/transition-kind from to)]
+    (cond
+      (nil? kind)
+      {:ok? false :reason (str "invalid transition " from " -> " to)}
+
+      (and (= kind :human) (not human-approved))
+      {:ok? false :reason (str "transition " from " -> " to " requires human approval")}
+
+      :else
+      {:ok? true
+       :case (cond-> (assoc case' :case/status to)
+               note (update :case/notes conj note))})))
+
+(defn mark-step
+  "step 完了を記録。:step/requires-human true の step は human-approved 必須。"
+  [procedure case' step-id {:keys [human-approved]}]
+  (let [step (first (filter #(= step-id (:step/id %)) (:procedure/steps procedure)))]
+    (cond
+      (nil? step) {:ok? false :reason (str "unknown step " step-id)}
+      (and (:step/requires-human step) (not human-approved))
+      {:ok? false :reason (str "step " step-id " requires human approval")}
+      :else {:ok? true :case (update case' :case/done-steps conj step-id)})))
+
+(defn collect-doc [procedure case' doc-id]
+  (if (some #(= doc-id (:document/id %)) (:procedure/documents procedure))
+    {:ok? true :case (update case' :case/collected-docs conj doc-id)}
+    {:ok? false :reason (str "unknown document " doc-id)}))
+
+;; --- 照会(純関数) ---------------------------------------------------------------
+
+(defn checklist
+  "書類チェックリスト: [{:document/id ... :collected? bool} ...]"
+  [procedure case']
+  (mapv #(assoc % :collected? (contains? (:case/collected-docs case') (:document/id %)))
+        (:procedure/documents procedure)))
+
+(defn open-legal-questions [procedure]
+  (filterv #(= :open (:question/status %)) (:procedure/legal-questions procedure)))
+
+(defn next-actions
+  "未完了 step を順序どおりに返す(最初の未完了 blocking 群)。
+  各 action は :requires-human を持ち、提出系は必ず true。"
+  [procedure case']
+  (let [done (:case/done-steps case')]
+    (->> (:procedure/steps procedure)
+         (sort-by :step/order)
+         (remove #(contains? done (:step/id %)))
+         (mapv #(select-keys % [:step/id :step/order :step/title :step/detail :step/requires-human])))))
+
+(defn ready-to-submit?
+  "全書類収集済み かつ 提出前 step(順序が :submit より小さいもの)完了。"
+  [procedure case']
+  (let [docs (set (map :document/id (:procedure/documents procedure)))
+        submit-order (:step/order (first (filter #(= :submit (:step/id %)) (:procedure/steps procedure))))
+        pre-steps (->> (:procedure/steps procedure)
+                       (filter #(< (:step/order %) submit-order))
+                       (map :step/id) set)]
+    (and (= docs (:case/collected-docs case'))
+         (empty? (remove (:case/done-steps case') pre-steps)))))
+
+(defn summary
+  [procedure case']
+  (let [cl (checklist procedure case')]
+    {:case (:case/id case')
+     :procedure (:procedure/id procedure)
+     :status (:case/status case')
+     :docs {:collected (count (filter :collected? cl)) :total (count cl)}
+     :steps {:done (count (:case/done-steps case'))
+             :total (count (:procedure/steps procedure))}
+     :open-legal-questions (mapv :question/id (open-legal-questions procedure))
+     :ready-to-submit? (ready-to-submit? procedure case')
+     :next (take 3 (next-actions procedure case'))}))
+
+;; --- 台帳イベント(append-only、design-quality/BMC ledger と同型の1行1map) --------
+
+(def event-types
+  #{:case/opened :case/status-changed :case/step-done :case/doc-collected
+    :case/note :legal-question/resolved})
+
+(defn event
+  [type at case-id data]
+  {:pre [(contains? event-types type) (string? at)]}
+  (assoc data :event/type type :event/at at :case/id case-id))
+
+(defn event-line [ev] (pr-str ev))
+
+(defn replay
+  "台帳イベント列から case を再構成する(台帳が正、case map はその射影)。
+  human gate は追記時に検査済みなので replay では検査しない。"
+  [procedure events]
+  (reduce
+   (fn [c {:event/keys [type] :as ev}]
+     (case type
+       :case/opened (new-case procedure {:case-id (:case/id ev) :applicant (:applicant ev)})
+       :case/status-changed (assoc c :case/status (:to ev))
+       :case/step-done (update c :case/done-steps conj (:step ev))
+       :case/doc-collected (update c :case/collected-docs conj (:doc ev))
+       :case/note (update c :case/notes conj (:note ev))
+       c))
+   nil
+   events))

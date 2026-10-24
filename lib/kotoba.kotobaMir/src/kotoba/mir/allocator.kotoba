@@ -1,0 +1,106 @@
+;; Complete public allocation dispatch and owning policy order. A spill-required
+;; refusal alone selects the all-vreg fallback; other full refusals propagate.
+(ns kotoba.mir.allocator
+  {:kotoba/export [allocate-registers]}
+  (:require [kotoba.gmir.node :as node] [kotoba.mir.catalog :as catalog]
+            [kotoba.mir.allocator-data :as data] [kotoba.mir.allocator-linear :as linear]
+            [kotoba.mir.allocator-spill :as spill] [kotoba.mir.allocator-phi :as phi]
+            [kotoba.mir.flat :as flat] [kotoba.mir.validation :as validation]
+            [kotoba.mir.schedule :as schedule] [kotoba.mir.outcome :as outcome])
+  (:schemas
+   {:mir.allocator/allocation [:record :mir.allocator/allocation [[:program [:ref :gmir.node/value]] [:policy :keyword]]]}))
+(defn- has-calls? [code [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (node/child-count code)) false
+      (let [instruction (data/at code index)]
+        (if (or (data/op? instruction :mir/call) (data/op? instruction :mir/tail-call)
+                (data/op? instruction :mir/runtime-call) (data/op? instruction :mir/capability-call)) true (recur (+ index 1))))))))
+(defn- schedule-result [result [:result [:ref :gmir.node/value] [:ref :mir/refusal]]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result)) result
+    (schedule/schedule-program (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (node/nil-value)))))
+(defn- policy [program [:ref :gmir.node/value] current [:ref :gmir.node/value]] [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]]
+  (let [checked (flat/validate! program)]
+    (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] checked))
+      (result-err-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]]
+        (result-error-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] checked (outcome/refusal :unexpected-flat-result program)))
+      (let [lowered (phi/lower program) input (phi/program lowered) calls (has-calls? (node/key input :mir/instructions))
+            allocated (linear/allocate input (phi/merge-slots lowered) current)
+            coalesced (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] allocated)) allocated
+                        (phi/coalesce (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] allocated (node/nil-value)) (phi/merge-slots lowered)))
+            scheduled (schedule-result coalesced)
+            error (result-error-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled (outcome/refusal :unexpected-allocation-result program))
+            fallback (and (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled)) (= (outcome/problem error) :spill-required))
+            result (if fallback (schedule-result (spill/allocate input (phi/merge-destinations lowered))) scheduled)]
+        (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result))
+          (result-err-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]]
+            (result-error-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result error))
+          (result-ok-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]]
+            (record-new [:ref :mir.allocator/allocation] (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (node/nil-value))
+              (if calls (if fallback :all-vregs :call-live) :allocator))))))))
+(defn- stack-argument-rewrite [code [:ref :gmir.node/value] target :keyword] [:ref :gmir.node/value]
+  (let [bank (option-match [:option [:list :keyword]] (catalog/registers-for (catalog/call-argument-registers) target :all) (typed-list-new [:list :keyword]) found-value found-value)
+        limit (vector-count bank)
+        needed (loop [index 0]
+                 (if (>= index (node/child-count code)) false
+                   (let [value (data/at code index)]
+                     (if (or (and (data/op? value :mir/argument) (>= (node/number (node/key value :mir/index)) limit))
+                             (and (or (data/op? value :mir/call) (data/op? value :mir/tail-call)) (> (node/child-count (node/key value :mir/arguments)) limit)))
+                       true (recur (+ index 1))))))]
+    (if (not needed) code
+      (let [prefix (loop [index 0]
+                     (if (and (< index (node/child-count code)) (data/op? (data/at code index) :mir/argument)) (recur (+ index 1)) index))
+            arguments (loop [index 0 out (node/empty-vector)]
+                        (if (>= index prefix) out
+                          (let [value (data/at code index)]
+                            (recur (+ index 1) (if (< (node/number (node/key value :mir/index)) limit) (node/append out value) out)))))
+            loads (loop [index 0 out arguments]
+                    (if (>= index prefix) out
+                      (let [value (data/at code index)]
+                        (recur (+ index 1) (if (>= (node/number (node/key value :mir/index)) limit)
+                          (node/append out (-> (node/empty-map) (node/put-key :mir/op (node/keyword-literal :mir/incoming-load))
+                            (node/put-key :mir/dst (node/key value :mir/dst)) (node/put-key :mir/index (node/key value :mir/index)))) out)))))]
+        (loop [index prefix out loads]
+          (if (>= index (node/child-count code)) out
+            (let [value (data/at code index) args (node/key value :mir/arguments) n (node/child-count args)]
+              (if (and (or (data/op? value :mir/call) (data/op? value :mir/tail-call)) (> n limit))
+                (let [op (if (data/op? value :mir/call) :mir/outgoing-argument :mir/incoming-argument-store)
+                      stored (loop [argument limit values out]
+                               (if (>= argument n) values
+                                 (recur (+ argument 1) (node/append values (-> (node/empty-map) (node/put-key :mir/op (node/keyword-literal op))
+                                   (node/put-key :mir/src (data/at args argument)) (node/put-key :mir/index (node/i64-value argument)))))))]
+                  (recur (+ index 1) (node/append stored (node/put-key value :mir/arguments (data/slice args 0 limit)))))
+                (recur (+ index 1) (node/append out value))))))))))
+(defn allocate-registers [program [:ref :gmir.node/value]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [checked (validation/validate! program)]
+    (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] checked)) checked
+      (if (= (node/number (node/key program :mir/version)) 3)
+        (if (not (data/named? (node/key program :mir/registers) :virtual))
+          (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] (outcome/refusal :registers-not-virtual program))
+          (let [functions (node/key program :mir/functions) target (if (data/named? (node/key program :mir/target) :x86-64) :x86-64 :aarch64)]
+            (loop [index 0 out (node/empty-vector)]
+              (if (>= index (node/child-count functions))
+                (validation/validate! (-> (node/empty-map) (node/put-key :mir/version (node/i64-value 3))
+                  (node/put-key :mir/target (node/key program :mir/target)) (node/put-key :mir/registers (node/keyword-literal :physical))
+                  (node/put-key :mir/entry (node/key program :mir/entry)) (node/put-key :mir/functions out)))
+                (let [function (data/at functions index)
+                      input (-> (node/empty-map) (node/put-key :mir/version (node/i64-value 3))
+                        (node/put-key :mir/target (node/key program :mir/target)) (node/put-key :mir/registers (node/keyword-literal :virtual))
+                        (node/put-key :mir/instructions (stack-argument-rewrite (node/key function :mir/instructions) target)))
+                      result (policy input (node/key function :mir/name))]
+                  (if (not (result-ok?-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]] result))
+                    (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+                      (result-error-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]] result (outcome/refusal :unexpected-policy-result function)))
+                    (let [allocation (result-value-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]] result
+                                       (record-new [:ref :mir.allocator/allocation] (node/nil-value) :invalid))
+                          allocated (record-get [:ref :mir.allocator/allocation] allocation :program)]
+                      (recur (+ index 1) (node/append out (-> (node/empty-map) (node/put-key :mir/name (node/key function :mir/name))
+                        (node/put-key :mir/arity (node/key function :mir/arity)) (node/put-key :mir/frame-slots (node/key allocated :mir/frame-slots))
+                        (node/put-key :mir/frame-policy (node/keyword-literal (record-get [:ref :mir.allocator/allocation] allocation :policy)))
+                        (node/put-key :mir/instructions (node/key allocated :mir/instructions))))))))))))
+        (let [result (policy program (node/nil-value))]
+          (if (not (result-ok?-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]] result))
+            (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+              (result-error-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]] result (outcome/refusal :unexpected-policy-result program)))
+            (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+              (record-get [:ref :mir.allocator/allocation]
+                (result-value-of [:result [:ref :mir.allocator/allocation] [:ref :mir/refusal]] result (record-new [:ref :mir.allocator/allocation] (node/nil-value) :invalid)) :program))))))))

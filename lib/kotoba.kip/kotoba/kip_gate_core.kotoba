@@ -1,0 +1,163 @@
+(ns kip-gate-core
+  (:schemas {;; A proposed move: where from, where to, by whom, on which track.
+             :kip/move [:record :kip/move
+                        [[:from :i64] [:to :i64] [:role :i64] [:track :i64]]]
+             ;; Everything the last-call -> final guards need to decide.
+             :kip/guards [:record :kip/guards
+                          [[:last-call-days :i64] [:min-last-call-days :i64]
+                           [:signers :i64] [:threshold :i64]
+                           [:surfaces :bool] [:evidence :bool]
+                           [:migration :bool] [:superseded-by :bool]]]})
+  (:export [state-draft state-review state-last-call state-final
+            state-withdrawn state-rejected state-superseded
+            role-author role-editor role-quorum
+            track-standards track-process track-informational
+            valid-state? requires-last-call? final-guard-code transition-code]))
+
+;; The decision core of the KIP process: given a proposed state change and the
+;; scalar facts about it, may it happen, and if not, which diagnostic.
+;;
+;; Everything here is word-typed on purpose (:i64, :bool, and two sealed scalar
+;; records) so it stays inside the native admission gate in
+;; `kotoba-lang/kotoba-kir` (`only-native-word-typed-features?`). The
+;; keyword <-> code mapping, the registry, the file IO and every collection live
+;; in `src/kotoba/kip/core.cljk`, which calls this.
+;;
+;; This is the decision-core split described in the workspace rule "移行の単位は
+;; 決定核" — the same shape as murakumo's `kotoba/*_core.kotoba`. It is NOT here
+;; because collections are unavailable in Kotoba (they are: `:implemented-partial`
+;; on :compiler/:kotoba-wasm/:kotoba-cljs). It is here because a judgement that
+;; can run on every backend is worth more than one that cannot.
+;;
+;; ## Why records rather than a long parameter list
+;;
+;; Measured 2026-08-16 against amu 1e21a1f: `max-parameters` is **5**, and a
+;; 12-parameter `transition-code` is rejected at :subset with
+;; :kotoba.error/max-parameters. Two sealed records carry twelve fields through
+;; two parameters. Packing the flags into a bitmask would also fit, and is the
+;; wrong answer — murakumo already went the other way (T5.3, murakumo#193–#206
+;; replaced base-N packing with records), because a packed i64 loses the field
+;; names that make the guard readable.
+;;
+;; Parity oracle: test/kotoba/kip/kip_gate_kotoba_parity_test.cljk compares every
+;; branch below against the .cljc implementation. If you edit one, edit both;
+;; the parity test is what stops them drifting.
+;;
+;; Diagnostic codes are the :diagnostics map in lang/kip-process.edn. Keep them
+;; stable — they are the wire between this file, the .cljc, and the gate output.
+;;
+;;   0 ok                      6 quorum-below-threshold
+;;   1 unknown-from-state      7 missing-surfaces
+;;   2 unknown-to-state        8 missing-evidence
+;;   3 no-such-transition      9 missing-migration
+;;   4 role-not-permitted     10 missing-superseded-by
+;;   5 last-call-too-short    11 track-not-permitted
+
+(defn state-draft [] :i64 0)
+(defn state-review [] :i64 1)
+(defn state-last-call [] :i64 2)
+(defn state-final [] :i64 3)
+(defn state-withdrawn [] :i64 4)
+(defn state-rejected [] :i64 5)
+(defn state-superseded [] :i64 6)
+
+(defn role-author [] :i64 0)
+(defn role-editor [] :i64 1)
+(defn role-quorum [] :i64 2)
+
+(defn track-standards [] :i64 0)
+(defn track-process [] :i64 1)
+(defn track-informational [] :i64 2)
+
+(defn valid-state? [s :i64] :bool
+  (and (>= s 0) (<= s 6)))
+
+;; Only the standards track has a last call and a quorum. Process and
+;; informational KIPs are decided by the editors of what they touch, because
+;; on those tracks the editors *are* the affected party.
+(defn requires-last-call? [track :i64] :bool
+  (= track 0))
+
+;; The five guards on last-call -> final, in the order that produces the most
+;; specific complaint. Time first: a KIP that is simply not old enough should
+;; say so rather than list its missing fields, because waiting fixes it.
+(defn final-guard-code [g [:ref :kip/guards]] :i64
+  (let [days (record-get g :last-call-days)
+        min-days (record-get g :min-last-call-days)
+        signers (record-get g :signers)
+        threshold (record-get g :threshold)]
+    (if (< days min-days)
+      5
+      (if (< signers threshold)
+        6
+        (if (not (record-get g :surfaces))
+          7
+          (if (not (record-get g :evidence))
+            8
+            (if (not (record-get g :migration))
+              9
+              0)))))))
+
+;; -> :i64 diagnostic. 0 means the transition is admitted.
+(defn transition-code [m [:ref :kip/move] g [:ref :kip/guards]] :i64
+  (let [from (record-get m :from)
+        to (record-get m :to)
+        role (record-get m :role)
+        track (record-get m :track)]
+    (if (not (valid-state? from))
+      1
+      (if (not (valid-state? to))
+        2
+        ;; ------------------------------------------------ to = withdrawn (4)
+        (if (= to 4)
+          (if (or (= from 0) (or (= from 1) (= from 2)))
+            (if (= role 0) 0 4)
+            3)
+          ;; ----------------------------------------------- to = rejected (5)
+          (if (= to 5)
+            (if (or (= from 1) (= from 2))
+              (if (= role 1) 0 4)
+              3)
+            ;; --------------------------------------------- to = review (1)
+            ;; draft -> review is the author saying "please look". last-call ->
+            ;; review is an editor reopening on a substantive objection, which
+            ;; is the whole point of having a window.
+            (if (= to 1)
+              (if (= from 0)
+                (if (= role 0) 0 4)
+                (if (= from 2)
+                  (if (= role 1) 0 4)
+                  3))
+              ;; ------------------------------------------- to = draft (0)
+              (if (= to 0)
+                (if (= from 1)
+                  (if (= role 1) 0 4)
+                  3)
+                ;; ---------------------------------------- to = last-call (2)
+                (if (= to 2)
+                  (if (= from 1)
+                    (if (= role 1)
+                      (if (requires-last-call? track) 0 11)
+                      4)
+                    3)
+                  ;; -------------------------------------- to = final (3)
+                  (if (= to 3)
+                    (if (requires-last-call? track)
+                      ;; standards: only out of last-call, only by quorum
+                      (if (= from 2)
+                        (if (= role 2)
+                          (final-guard-code g)
+                          4)
+                        (if (= from 1) 11 3))
+                      ;; process / informational: editors close it out of review
+                      (if (= from 1)
+                        (if (= role 1) 0 4)
+                        3))
+                    ;; ------------------------------------ to = superseded (6)
+                    (if (= to 6)
+                      (if (= from 3)
+                        (if (= role 2)
+                          (if (record-get g :superseded-by) 0 10)
+                          4)
+                        3)
+                      3)))))))))))

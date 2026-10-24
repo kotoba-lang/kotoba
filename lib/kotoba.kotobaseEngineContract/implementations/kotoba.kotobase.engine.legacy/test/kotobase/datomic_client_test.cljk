@@ -1,0 +1,198 @@
+(ns kotobase.datomic-client-test
+  "Maturity suite for the official Client API surface."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
+            [kotobase.datomic.client :as d]))
+
+(defn- fresh-conn []
+  (let [client (d/client {:server-type :kotobase-local :system "test"})]
+    (d/create-database client {:db-name "mbrainz-sample"})
+    (d/connect client {:db-name "mbrainz-sample"})))
+
+(deftest client-lifecycle-matches-datomic-client-api
+  (let [client (d/client {:server-type :kotobase-local :system "life"})
+        _a (d/create-database client {:db-name "a"})
+        _b (d/create-database client {:db-name "b"})
+        names-before (d/list-databases client {})
+        conn (d/connect client {:db-name "a"})
+        _del (d/delete-database client {:db-name "b"})
+        names-after (d/list-databases client {})]
+    (is (true? _a))
+    (is (true? _b))
+    (is (= ["a" "b"] names-before))
+    (is (= "a" (:db-name conn)))
+    (is (some? (d/db conn)))
+    (is (true? _del))
+    (is (= ["a"] names-after))
+    (is (= {:action :upgrade-schema :db-name "a"
+            :status :current :base-schema :kotobase/v1}
+           (d/administer-system client {:action :upgrade-schema :db-name "a"})))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (d/administer-system client {:action :not-public :db-name "a"})))))
+
+(deftest transact-q-pull-datoms-client-shapes
+  (let [conn (fresh-conn)
+        tx (d/transact
+            conn
+            {:tx-data [{:db/id "alice" :person/name "Alice" :person/role "admin"}
+                       {:db/id "bob" :person/name "Bob" :person/role "member"}]})
+        db (d/db conn)
+        q1 (d/q '[:find ?e ?name
+                  :where
+                  [?e :person/role "admin"]
+                  [?e :person/name ?name]]
+                db)
+        q2 (d/q {:query '[:find ?e ?name
+                          :where
+                          [?e :person/role "admin"]
+                          [?e :person/name ?name]]
+                 :args [db]})
+        q3 (d/q {:query '[:find ?e ?name
+                          :where [_ :person/name ?name]
+                          [?e :person/name ?name]]
+                 :args [db]
+                 :limit 1})
+        entity (d/pull db [:person/name :person/role] "alice")
+        row (first (d/datoms db {:index :eavt :components ["alice"]}))
+        speculative (d/with (d/with-db conn)
+                            {:tx-data [{:db/id "carol" :person/name "Carol"}]})
+        durable (d/q '[:find ?name :where [_ :person/name ?name]]
+                     (d/db conn))]
+    (is (contains? tx :db-before))
+    (is (contains? tx :db-after))
+    (is (map? (:tempids tx)))
+    (is (= #{["alice" "Alice"]} q1))
+    (is (= #{["alice" "Alice"]} q2))
+    (is (= 1 (count q3)))
+    (is (seq (d/qseq '[:find ?e :where [?e :person/name _]] db)))
+    (is (= "Alice" (or (:person/name entity) (get entity :person/name))))
+    (is (keyword? (:a row)))
+    (is (contains? row :v))
+    (is (contains? row :tx))
+    (is (contains? row :added))
+    (is (seq (d/seek-datoms db {:index :aevt :components [:person/name]})))
+    (is (seq (d/index-range db {:attrid :person/name :start "A" :end "C"})))
+    (is (seq (d/index-pull db {:index :avet :selector [:person/name] :start [:person/name]})))
+    (is (number? (:datoms (d/db-stats db))))
+    (is (some? (d/history db)))
+    (is (some? (d/as-of db (:t db))))
+    (is (contains? speculative :db-after))
+    (is (= #{["Alice"] ["Bob"]} durable))))
+
+(deftest sync-and-tx-range-exist
+  (let [conn (fresh-conn)
+        _ (d/transact conn {:tx-data [{:db/id "x" :n 1}]})
+        synced (d/sync conn 0)
+        txs (d/tx-range conn {:start 0})]
+    (is (some? synced))
+    (is (vector? txs))))
+
+(defn- remote-fixture []
+  (let [requests (atom [])
+        page (atom 0)
+        request-fn
+        (fn [{:keys [url body] :as request}]
+          (swap! requests conj request)
+          (let [path (.getPath (java.net.URI/create url))
+                input (clojure.edn/read-string body)
+                value
+                (case path
+                  "/api/create-database" true
+                  "/api/delete-database" true
+                  "/api/list-databases" ["alpha"]
+                  "/api/connect" {:kotobase/db-value true :db-name "alpha"
+                                    :graph "bafygraph" :basis-t 7}
+                  "/api/db" {:kotobase/db-value true :db-name "alpha"
+                              :graph "bafygraph" :basis-t 7}
+                  "/api/q" #{[1 "Alice"]}
+                  "/api/qseq" (if (zero? (swap! page inc))
+                                 {:items [[1]] :cursor "1" :done false}
+                                 (if (= 1 @page)
+                                   {:items [[1]] :cursor "1" :done false}
+                                   {:items [[2]] :cursor nil :done true}))
+                  "/api/pull" {:person/name "Alice"}
+                  "/api/datoms" [{:e 1 :a :person/name :v "Alice" :tx 7 :added true}]
+                  "/api/seek-datoms" [{:e 1 :a :person/name :v "Alice" :tx 7 :added true}]
+                  "/api/rseek-datoms" [{:e 2 :a :person/name :v "Bob" :tx 8 :added true}]
+                  "/api/index-range" [{:e 1 :a :person/name :v "Alice" :tx 7 :added true}]
+                  "/api/index-pull" [{:person/name "Alice"}]
+                  "/api/db-stats" {:datoms 1}
+                  "/api/tx-range" [{:t 7 :data []}]
+                  "/api/sync" {:kotobase/db-value true :db-name "alpha"
+                                :graph "bafygraph" :basis-t (:t input)}
+                  "/api/with-db" {:kotobase/db-value true :db-name "alpha"
+                                   :graph "bafygraph" :basis-t 7 :with true}
+                  "/api/with" {:db-before {:kotobase/db-value true :db-name "alpha"
+                                            :graph "bafygraph" :basis-t 7}
+                               :db-after {:kotobase/db-value true :db-name "alpha"
+                                          :graph "bafygraph" :basis-t 7 :with true
+                                          :with-tx-data (:tx-data input)}
+                               :tx-data [] :tempids {}}
+                  "/api/administer-system" {:action :upgrade-schema :db-name "alpha"
+                                             :status :current :base-schema :kotobase/v1}
+                  "/api/transact" {:db-before {:kotobase/db-value true :db-name "alpha"
+                                                :graph "bafygraph" :basis-t 7}
+                                   :db-after {:kotobase/db-value true :db-name "alpha"
+                                              :graph "bafygraph" :basis-t 8}
+                                   :tx-data [] :tempids {"new" 42}})]
+            {:status 200 :body (pr-str value)}))]
+    {:requests requests
+     :client (d/client {:server-type :kotobase
+                        :system "remote-test"
+                        :endpoint "https://datomic.example"
+                        :token "test-token"
+                        :request-fn request-fn})}))
+
+(deftest remote-client-lifecycle-and-db-values
+  (let [{:keys [client requests]} (remote-fixture)
+        _ (d/create-database client {:db-name "alpha"})
+        conn (d/connect client {:db-name "alpha"})
+        db (d/db conn)
+        old (d/as-of db 3)
+        recent (d/since db 4)
+        hist (d/history db)]
+    (is (= ["alpha"] (d/list-databases client {})))
+    (is (= "alpha" (:db-name conn)))
+    (is (= 7 (:t db)))
+    (is (= 3 (:as-of-t old)))
+    (is (= 4 (:since-t recent)))
+    (is (:history? hist))
+    (is (true? (d/delete-database client {:db-name "alpha"})))
+    (is (every? #(= "Bearer test-token" (get-in % [:headers "authorization"]))
+                @requests))))
+
+(deftest remote-client-data-plane-preserves-official-shapes
+  (let [{:keys [client requests]} (remote-fixture)
+        conn (d/connect client {:db-name "alpha"})
+        db (d/as-of (d/db conn) 3)
+        query '[:find ?e ?n :where [?e :person/name ?n]]]
+    (is (= #{[1 "Alice"]} (d/q query db)))
+    (is (= '([1] [2]) (d/qseq query db)))
+    (is (= {:person/name "Alice"} (d/pull db [:person/name] 1)))
+    (is (= 1 (count (d/datoms db {:index :eavt}))))
+    (is (= 1 (count (d/seek-datoms db {:index :aevt :components [:person/name]}))))
+    (is (= 2 (:e (first (d/rseek-datoms db {:index :aevt})))))
+    (is (= 1 (count (d/index-range db {:attrid :person/name :start "A" :end "B"}))))
+    (is (= [{:person/name "Alice"}]
+           (d/index-pull db {:index :avet :selector [:person/name]
+                             :start [:person/name]})))
+    (is (= 1 (:datoms (d/db-stats db))))
+    (is (= 1 (count (d/tx-range conn {:start 0}))))
+    (is (= 8 (:t (:db-after (d/transact conn {:tx-data [{:db/id "new"}]})))))
+    (let [spec-db (:db-after (d/with (d/with-db conn)
+                                     {:tx-data [{:db/id "spec" :person/name "Spec"}]}))]
+      (is (:with? spec-db))
+      (is (= [{:db/id "spec" :person/name "Spec"}] (:with-tx-data spec-db)))
+      (d/q query spec-db)
+      (let [wire (->> @requests
+                      (filter #(.endsWith ^String (:url %) "/api/q"))
+                      last :body clojure.edn/read-string :args first)]
+        (is (= (:with-tx-data spec-db) (:with-tx-data wire)))))
+    (is (= :current (:status (d/administer-system client
+                                                   {:action :upgrade-schema
+                                                    :db-name "alpha"}))))
+    (let [q-request (first (filter #(.endsWith ^String (:url %) "/api/q") @requests))
+          body (clojure.edn/read-string (:body q-request))
+          wire-db (first (:args body))]
+      (is (= true (:kotobase/db-value wire-db)))
+      (is (= 3 (:as-of wire-db)))
+      (is (= "alpha" (get-in q-request [:headers "x-datomic-db-name"]))))))

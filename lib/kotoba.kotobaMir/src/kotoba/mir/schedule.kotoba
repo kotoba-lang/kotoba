@@ -1,0 +1,253 @@
+;; Owning dependency-aware list scheduler transcribed to nominal tables.
+;; Portable modeled cycles are not wall-clock performance evidence.
+(ns kotoba.mir.schedule
+  {:kotoba/export [segment-predecessors valid-scheduled-segment? segment-completion-times
+                  segment-sum-completion-times schedule-integer-segment-indices schedule-instructions schedule-program schedulable?]}
+  (:require [kotoba.gmir.node :as node] [kotoba.gmir.identity :as identity]
+            [kotoba.mir.operands :as operands] [kotoba.mir.registers :as registers]
+            [kotoba.mir.table :as table] [kotoba.mir.outcome :as outcome]))
+
+(defn- at [value [:ref :gmir.node/value] index :i64] [:ref :gmir.node/value]
+  (option-match [:option [:ref :gmir.node/value]] (node/child value index) (node/nil-value) item item))
+(defn- named? [value [:ref :gmir.node/value] key :keyword] :bool (arena-scope (node/keyword-is? value key)))
+(defn- op? [instruction [:ref :gmir.node/value] key :keyword] :bool (arena-scope (named? (node/key instruction :mir/op) key)))
+(defn- register? [target :keyword value [:ref :gmir.node/value]] :bool
+  (arena-scope (or (identity/vreg? value) (registers/physical-register? target value))))
+(defn- scalar [value :i64] [:ref :mir.table/value] (table/scalar (node/i64-value value)))
+(defn- present? [value [:option [:ref :mir.table/value]]] :bool (arena-scope (option-some?-of [:option [:ref :mir.table/value]] value)))
+(defn- data-of [value [:option [:ref :mir.table/value]]] [:ref :gmir.node/value]
+  (table/data (option-match [:option [:ref :mir.table/value]] value (table/scalar (node/nil-value)) found-value found-value)))
+(defn- members-of [value [:option [:ref :mir.table/value]]] [:ref :mir.table/tree]
+  (if (present? value) (table/members (option-match [:option [:ref :mir.table/value]] value (table/scalar (node/nil-value)) found-value found-value)) (table/empty)))
+(defn- set-index [set [:ref :mir.table/tree] index :i64] [:ref :mir.table/tree]
+  (table/put set (table/index-key index) (scalar index)))
+(defn- index-at [set [:ref :mir.table/tree] rank :i64] :i64
+  (arena-scope ;; Only rank<count on internally constructed ordinal sets reaches this call.
+  (node/number (data-of (table/value-at set rank)))))
+(defn- members-at [map [:ref :mir.table/tree] index :i64] [:ref :mir.table/tree]
+  (members-of (table/get map (table/index-key index))))
+(defn- union-indices [left [:ref :mir.table/tree] right [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (if (= (table/count left) 0) right
+    (loop [index 0 out left]
+      (if (>= index (table/count right)) out (recur (+ index 1) (set-index out (index-at right index)))))))
+(defn- has-source? [values [:ref :gmir.node/value] value [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (node/child-count values)) false
+      (if (node/same-name? (at values index) value) true (recur (+ index 1)))))))
+(defn- unique-sources [target :keyword instruction [:ref :gmir.node/value] empty-values [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [sources (operands/instruction-sources instruction)]
+    (loop [index 0 out empty-values]
+      (if (>= index (node/child-count sources)) out
+        (let [value (at sources index)]
+          (recur (+ index 1) (if (and (register? target value) (not (has-source? out value))) (node/append out value) out)))))))
+(defn- reader-values [readers [:ref :mir.table/tree] key [:ref :mir.table/key] empty-values [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (option-match [:option [:ref :mir.table/value]] (table/get readers key) empty-values
+    found (table/data found)))
+(defn- reader-set [values [:ref :gmir.node/value] empty-tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  ;; Read ordinals arrive in strict instruction order. Keep a persistent paged
+  ;; sequence until a write consumes the WAR set; rebuilding a balanced path
+  ;; for every still-pending read retains O(n log n) dead tree nodes in a region.
+  ;; The externally returned dependency graph remains the same ordinal set.
+  (if (= (node/child-count values) 0) empty-tree
+   (let [pages (loop [rank 0 out (table/sorted-pages)]
+                (if (>= rank (node/child-count values)) out
+                  (let [index (node/number (at values rank))]
+                    (recur (+ rank 1) (table/sorted-append out (table/index-key index) (scalar index))))))]
+    (table/sorted-build pages))))
+(defn segment-predecessors [target :keyword instructions [:ref :gmir.node/value]] [:ref :mir.table/tree]
+  (let [empty-tree (table/empty) empty-values (node/empty-vector)]
+  (loop [index 0 last-def empty-tree readers empty-tree predecessors (table/sorted-pages)]
+    (if (>= index (node/child-count instructions)) (table/sorted-build predecessors)
+      (let [instruction (at instructions index) sources (unique-sources target instruction empty-values)
+            dst (node/key instruction :mir/dst) defines (register? target dst) key (operands/key-of dst)
+            raw (loop [source 0 out empty-tree]
+                  (if (>= source (node/child-count sources)) out
+                    (let [value (at sources source) previous (table/get last-def (operands/key-of value))]
+                      (recur (+ source 1) (if (present? previous) (set-index out (node/number (data-of previous))) out)))))
+            war (if defines (reader-set (reader-values readers key empty-values) empty-tree) empty-tree)
+            waw (if defines (table/get last-def key) (option-none-of [:option [:ref :mir.table/value]]))
+            combined (union-indices raw war)
+            inputs (if (present? waw) (set-index combined (node/number (data-of waw))) combined)
+            ;; Capture anti-dependencies BEFORE adding this read. A read/write
+            ;; instruction must never acquire an edge to itself.
+            added-readers (loop [source 0 out readers]
+                            (if (>= source (node/child-count sources)) out
+                              (let [value (at sources source) source-key (operands/key-of value)
+                                    prior (reader-values out source-key empty-values)]
+                                (recur (+ source 1) (table/put out source-key (table/scalar (node/append prior (node/i64-value index))))))))
+            next-readers (if defines (table/put added-readers key (table/scalar empty-values)) added-readers)
+            next-def (if defines (table/put last-def key (scalar index)) last-def)]
+        (recur (+ index 1) next-def next-readers (table/sorted-append predecessors (table/index-key index) (table/members-value inputs))))))))
+(defn- ready? [predecessors [:ref :mir.table/tree] completion [:ref :mir.table/tree] cycle :i64 index :i64] :bool
+  (arena-scope (let [inputs (members-at predecessors index)]
+    (loop [rank 0]
+      (if (>= rank (table/count inputs)) true
+        (let [done (table/get completion (table/index-key (index-at inputs rank)))]
+          (if (and (present? done) (<= (node/number (data-of done)) cycle)) (recur (+ rank 1)) false)))))))
+(defn- order-count [order [:ref :gmir.node/value]] [:option :i64]
+  (let [kind (node/kind order)]
+    (cond (or (= kind :vector) (= kind :list) (= kind :set)) (option-some-of [:option :i64] (node/child-count order))
+          (= kind :nil) (option-some-of [:option :i64] 0)
+          (= kind :bytes) (option-some-of [:option :i64] (node/text-count (node/name-of order)))
+          (and (or (= kind :string) (= kind :map)) (= (node/child-count order) 0) (= (node/text-count (node/name-of order)) 0)) (option-some-of [:option :i64] 0)
+          :else (option-none-of [:option :i64]))))
+(defn- order-index [order [:ref :gmir.node/value] position :i64] [:option :i64]
+  (if (= (node/kind order) :bytes) (option-some-of [:option :i64] (node/text-at (node/name-of order) position))
+    (identity/integer-i64 (at order position))))
+(defn- positions [order [:ref :gmir.node/value] count :i64] [:option [:ref :mir.table/tree]]
+  (let [size (order-count order)]
+    (if (not (and (option-some?-of [:option :i64] size) (= (option-match [:option :i64] size -1 found-value found-value) count)))
+      (option-none-of [:option [:ref :mir.table/tree]])
+      (loop [index 0 out (table/empty)]
+        (if (>= index count) (option-some-of [:option [:ref :mir.table/tree]] out)
+          (let [n (order-index order index) value (option-match [:option :i64] n -1 found-value found-value) key (table/index-key value)]
+            (if (and (option-some?-of [:option :i64] n) (>= value 0) (< value count) (not (present? (table/get out key))))
+              (recur (+ index 1) (table/put out key (scalar index))) (option-none-of [:option [:ref :mir.table/tree]]))))))))
+(defn valid-scheduled-segment? [target :keyword instructions [:ref :gmir.node/value] order [:ref :gmir.node/value]] :bool
+  (arena-scope (let [count (node/child-count instructions) found (positions order count)]
+    (and (option-some?-of [:option [:ref :mir.table/tree]] found)
+         (let [places (option-match [:option [:ref :mir.table/tree]] found (table/empty) found-value found-value)
+               predecessors (segment-predecessors target instructions)]
+           (loop [index 0]
+             (if (>= index count) true
+               (let [inputs (members-at predecessors index) place (table/get places (table/index-key index))]
+                 (if (and (present? place)
+                          (loop [rank 0]
+                            (if (>= rank (table/count inputs)) true
+                              (let [prior (table/get places (table/index-key (index-at inputs rank)))]
+                                (if (and (present? prior) (< (node/number (data-of prior)) (node/number (data-of place)))) (recur (+ rank 1)) false)))))
+                   (recur (+ index 1)) false)))))))))
+(defn- refusal [instructions [:ref :gmir.node/value] order [:ref :gmir.node/value]] [:ref :mir/refusal]
+  (outcome/refusal :schedule-violates-register-dependencies
+    (-> (node/empty-map) (node/put-key :segment instructions) (node/put-key :scheduled-indexes order))))
+(defn- verified [target :keyword instructions [:ref :gmir.node/value] order [:ref :gmir.node/value]]
+  [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (if (valid-scheduled-segment? target instructions order)
+    (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] order)
+    (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] (refusal instructions order))))
+(defn- latency [target :keyword instruction [:ref :gmir.node/value]] :i64
+  (arena-scope (if (and (or (= target :x86-64) (= target :aarch64)) (op? instruction :mir/multiply)) 3 1)))
+(defn segment-completion-times [target :keyword instructions [:ref :gmir.node/value] order [:ref :gmir.node/value]]
+  [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [check (verified target instructions order)]
+    (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] check)) check
+      (let [predecessors (segment-predecessors target instructions) count (node/child-count instructions)
+            completion (loop [cycle 0 position 0 out (table/empty)]
+                         (if (>= position count) out
+                           (let [index (option-match [:option :i64] (order-index order position) -1 found-value found-value)]
+                             (if (ready? predecessors out cycle index)
+                               (recur (+ cycle 1) (+ position 1) (table/put out (table/index-key index) (scalar (+ cycle (latency target (at instructions index))))))
+                               (recur (+ cycle 1) position out)))))]
+        (loop [index 0 out (node/empty-vector)]
+          (if (>= index count) (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] out)
+            (let [done (table/get completion (table/index-key index))]
+              (if (present? done) (recur (+ index 1) (node/append out (data-of done)))
+                (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] (refusal instructions order))))))))))
+(defn segment-sum-completion-times [target :keyword instructions [:ref :gmir.node/value] order [:ref :gmir.node/value]]
+  [:result :i64 [:ref :mir/refusal]]
+  (let [result (segment-completion-times target instructions order)]
+    (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result))
+      (result-err-of [:result :i64 [:ref :mir/refusal]]
+        (result-error-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (refusal instructions order)))
+      (let [times (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (node/empty-vector))]
+        (result-ok-of [:result :i64 [:ref :mir/refusal]]
+          (loop [index 0 sum 0]
+            (if (>= index (node/child-count times)) sum (recur (+ index 1) (+ sum (node/number (at times index)))))))))))
+(defn- successors [predecessors [:ref :mir.table/tree] count :i64] [:ref :mir.table/tree]
+  (let [initial (loop [index 0 out (table/empty)]
+                  (if (>= index count) out (recur (+ index 1) (table/put out (table/index-key index) (table/members-value (table/empty))))))]
+    (loop [index 0 out initial]
+      (if (>= index count) out
+        (let [inputs (members-at predecessors index)
+              updated (loop [rank 0 result out]
+                        (if (>= rank (table/count inputs)) result
+                          (let [input (index-at inputs rank)]
+                            (recur (+ rank 1) (table/put result (table/index-key input)
+                              (table/members-value (set-index (members-at result input) index)))))))]
+          (recur (+ index 1) updated))))))
+(defn- height-at [heights [:ref :mir.table/tree] index :i64] :i64
+  (arena-scope (let [value (table/get heights (table/index-key index))]
+    (if (present? value) (node/number (data-of value)) 0))))
+(defn- heights [target :keyword instructions [:ref :gmir.node/value] successors [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (loop [index (- (node/child-count instructions) 1) out (table/empty)]
+    (if (< index 0) out
+      (let [uses (members-at successors index)
+            maximum (loop [rank 0 best 0]
+                      (if (>= rank (table/count uses)) best
+                        (let [value (height-at out (index-at uses rank))]
+                          (recur (+ rank 1) (if (> value best) value best)))))]
+        (recur (- index 1) (table/put out (table/index-key index) (scalar (+ (latency target (at instructions index)) maximum))))))))
+(defn- choose-ready [predecessors [:ref :mir.table/tree] heights [:ref :mir.table/tree]
+                     completion [:ref :mir.table/tree] count :i64 cycle :i64] :i64
+  (arena-scope (loop [index 0 best -1 best-height 0]
+    (if (>= index count) best
+      (let [height (height-at heights index)]
+        (if (and (not (present? (table/get completion (table/index-key index)))) (ready? predecessors completion cycle index)
+                 (or (< best 0) (> height best-height) (and (= height best-height) (< index best))))
+          (recur (+ index 1) index height) (recur (+ index 1) best best-height)))))))
+(defn schedule-integer-segment-indices [target :keyword instructions [:ref :gmir.node/value]]
+  [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [count (node/child-count instructions)]
+    (if (< count 2)
+      (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+        (if (= count 0) (node/empty-vector) (node/append (node/empty-vector) (node/i64-value 0))))
+      (let [predecessors (segment-predecessors target instructions)
+            heights (heights target instructions (successors predecessors count))
+            order (loop [cycle 0 completion (table/empty) out (node/empty-vector)]
+                    (if (= (table/count completion) count) out
+                      (let [ready (choose-ready predecessors heights completion count cycle)]
+                        (if (< ready 0) (recur (+ cycle 1) completion out)
+                          (recur (+ cycle 1) (table/put completion (table/index-key ready) (scalar (+ cycle (latency target (at instructions ready)))))
+                            (node/append out (node/i64-value ready)))))))]
+        (verified target instructions order)))))
+(defn- schedule-segment [target :keyword instructions [:ref :gmir.node/value]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [result (schedule-integer-segment-indices target instructions)]
+    (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result)) result
+      (let [order (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (node/empty-vector))]
+        (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+          (loop [index 0 out (node/empty-vector)]
+            (if (>= index (node/child-count order)) out
+              (recur (+ index 1) (node/append out (at instructions (node/number (at order index))))))))))))
+(defn schedulable? [instruction [:ref :gmir.node/value]] :bool
+  (arena-scope (or (op? instruction :mir/add) (op? instruction :mir/subtract) (op? instruction :mir/multiply)
+      (op? instruction :mir/bit-and) (op? instruction :mir/bit-or) (op? instruction :mir/bit-xor)
+      (op? instruction :mir/shift-left) (op? instruction :mir/shift-right-signed) (op? instruction :mir/shift-right-unsigned)
+      (op? instruction :mir/equal) (op? instruction :mir/less-than) (op? instruction :mir/greater-than)
+      (op? instruction :mir/less-or-equal) (op? instruction :mir/greater-or-equal))))
+(defn- fusion-pair? [target :keyword instructions [:ref :gmir.node/value] uses [:ref :mir.table/tree] index :i64] :bool
+  (arena-scope (let [multiply (at instructions index) consumer (at instructions (+ index 1)) product (node/key multiply :mir/dst)]
+    (and (op? multiply :mir/multiply) (register? target product) (= (operands/count-of uses product) 1)
+         (or (and (op? consumer :mir/add) (or (node/same-name? product (node/key consumer :mir/left)) (node/same-name? product (node/key consumer :mir/right))))
+             (and (op? consumer :mir/subtract) (node/same-name? product (node/key consumer :mir/right))))))))
+(defn- protected-indices [target :keyword instructions [:ref :gmir.node/value]] [:ref :mir.table/tree]
+  (if (not= target :aarch64) (table/empty)
+    (let [uses (operands/counts target true instructions)]
+      (loop [index 0 out (table/empty)]
+        (if (>= (+ index 1) (node/child-count instructions)) out
+          (recur (+ index 1) (if (fusion-pair? target instructions uses index) (set-index (set-index out index) (+ index 1)) out)))))))
+(defn- append-all [out [:ref :gmir.node/value] values [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0 result out]
+    (if (>= index (node/child-count values)) result (recur (+ index 1) (node/append result (at values index))))))
+(defn schedule-instructions [target :keyword instructions [:ref :gmir.node/value]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [protected (protected-indices target instructions)]
+    (loop [index 0 out (node/empty-vector) segment (node/empty-vector)]
+      (if (>= index (node/child-count instructions))
+        (let [scheduled (schedule-segment target segment)]
+          (if (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled)
+            (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+              (append-all out (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled (node/empty-vector)))) scheduled))
+        (let [instruction (at instructions index)]
+          (if (and (not (present? (table/get protected (table/index-key index)))) (schedulable? instruction))
+            (recur (+ index 1) out (node/append segment instruction))
+            (let [scheduled (schedule-segment target segment)]
+              (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled)) scheduled
+                (recur (+ index 1) (node/append (append-all out (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled (node/empty-vector))) instruction)
+                  (node/empty-vector))))))))))
+(defn schedule-program [program [:ref :gmir.node/value]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (if (not= (node/kind program) :map)
+    (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] (outcome/refusal :non-canonical-program program))
+   (let [target (node/key program :mir/target) key (cond (named? target :x86-64) :x86-64 (named? target :aarch64) :aarch64 :else :unknown)
+        scheduled (schedule-instructions key (node/key program :mir/instructions))]
+    (if (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled)
+      (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+        (node/put-key program :mir/instructions (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] scheduled (node/empty-vector)))) scheduled))))
