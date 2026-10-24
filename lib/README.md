@@ -55,6 +55,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.rtsp` | `org.ietf.rtsp/src` | `rtsp.bytes`, `rtsp.interleaved`, `rtsp.message`, `rtsp.session-header` (an external specification, publisher ietf.org) |
 | `org.ietf.ospf` | `org.ietf.ospf/src` | `ospf.bytes`, `ospf.checksum`, `ospf.dd`, `ospf.header` (an external specification, publisher ietf.org) |
 | `org.ietf.csv` | `org.ietf.csv/src` | `csv.core` (an external specification, publisher ietf.org) |
+| `org.ieee.systemverilog` | `org.ieee.systemverilog/src` | `systemverilog.assertion`, `systemverilog.class`, `systemverilog.datatype`, `systemverilog.interface` (an external specification, publisher ieee.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
