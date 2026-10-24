@@ -41,6 +41,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.blake2` | `org.ietf.blake2/src` | `blake2.core`, `blake2.word` (an external specification, publisher ietf.org) |
 | `org.ietf.zstd` | `org.ietf.zstd/src` | `zstd.bits`, `zstd.core`, `zstd.fse`, `zstd.huff` (an external specification, publisher ietf.org) |
 | `org.ietf.mime` | `org.ietf.mime/src` | `mime.address`, `mime.codec`, `mime.header`, `mime.parse` (an external specification, publisher ietf.org) |
+| `org.ietf.brotli` | `org.ietf.brotli/src` | `brotli.bits`, `brotli.core`, `brotli.data`, `brotli.dictionary` (an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package

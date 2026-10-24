@@ -1,0 +1,130 @@
+(ns brotli.portable-test
+  "Runtime-agnostic suite: no shell, no reference binary. Runs under
+   `kbb -M:test` and `kbb --backend sci run-tests.cljk`.
+
+   Real compressed streams still come from the reference encoder — a decoder can
+   only be checked against data somebody else produced — but here they are
+   *recorded* in `brotli.fixtures` rather than generated, so the same decode paths
+   are exercised on a runtime with no shell. The broad sweep across every quality
+   and window size is in `brotli.oracle-test`."
+  (:require [kotoba.bytes :as kbytes] [brotli.core :as brotli]
+            [brotli.data :as data]
+            [brotli.dictionary :as dict]
+            [brotli.fixtures :as fixtures]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- b64->bytes [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff)
+                (kbytes/base64-decode-bytes ^String s))
+     :cljs (let [d (js/atob s)]
+             (vec (map-indexed (fn [i _] (.charCodeAt d i)) (repeat (.-length d) nil))))))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+;; ---------------------------------------------------------------------------
+;; The tables, against the RFC's own check values
+;; ---------------------------------------------------------------------------
+
+(deftest static-tables-are-the-rfcs
+  (testing "the dictionary is the full 122,784 bytes"
+    (is (= 122784 dict/size)))
+  (testing "word counts and offsets follow §8"
+    (is (= 0 (dict/words-of-length 3)))
+    (is (= 1024 (dict/words-of-length 4)))
+    (is (= 2048 (dict/words-of-length 6)))
+    (is (= 32 (dict/words-of-length 24)))
+    ;; The first word of length 4 is "time" — the dictionary opens with it.
+    (is (= [116 105 109 101] (dict/word 4 0)))
+    (is (= "time" (apply str (map char (dict/word 4 0)))))
+    (is (= "down" (apply str (map char (dict/word 4 1))))))
+  (testing "121 transformations, and the ones the RFC prints as examples"
+    (is (= 121 dict/transform-count))
+    (is (= "time" (apply str (map char (dict/transform (dict/word 4 0) 0)))) "0: identity")
+    (is (= "time " (apply str (map char (dict/transform (dict/word 4 0) 1)))) "1: suffix space")
+    (is (= " time " (apply str (map char (dict/transform (dict/word 4 0) 2)))) "2: space both sides")
+    (is (= "ime" (apply str (map char (dict/transform (dict/word 4 0) 3)))) "3: OmitFirst1")
+    (is (= "Time " (apply str (map char (dict/transform (dict/word 4 0) 4)))) "4: FermentFirst")
+    (is (= "time the " (apply str (map char (dict/transform (dict/word 4 0) 5)))) "5: suffix ' the '")
+    (testing "transform 22's suffix is a newline, not a backslash and an n"
+      ;; This one caught a real bug: the generator emitted the RFC's C literals
+      ;; verbatim, so "\\n" arrived as two characters.
+      (is (= [116 105 109 101 10] (dict/transform (dict/word 4 0) 22)))))
+  (testing "the context lookup tables are 256 entries with the documented ranges"
+    (is (= 256 (count data/lut0)))
+    (is (= 256 (count data/lut1)))
+    (is (= 256 (count data/lut2)))
+    (is (every? #(<= 0 % 63) data/lut0))
+    ;; Signed mode combines two lut2 values as (lut2[p1] << 3) | lut2[p2], so
+    ;; each entry spans 0..7, not 0..3.
+    (is (every? #(<= 0 % 7) data/lut2))))
+
+;; ---------------------------------------------------------------------------
+;; Recorded reference streams
+;; ---------------------------------------------------------------------------
+
+(deftest decodes-reference-streams
+  (doseq [{:keys [name quality raw brotli]} fixtures/cases]
+    (testing (str name " q" quality)
+      (is (= (b64->bytes raw) (brotli/decompress (b64->bytes brotli)))))))
+
+(deftest decodes-the-empty-stream
+  (let [{:keys [raw brotli]} (first (filter #(= "empty" (:name %)) fixtures/cases))]
+    (is (= [] (b64->bytes raw)))
+    (is (= [] (brotli/decompress (b64->bytes brotli))))))
+
+(deftest uses-the-static-dictionary
+  ;; The "dict" fixture is a list of stock words, so a correct decode is only
+  ;; possible with the dictionary and its transforms wired up.
+  (doseq [{:keys [raw brotli quality]} (filter #(= "dict" (:name %)) fixtures/cases)]
+    (testing (str "quality " quality)
+      (is (= (b64->bytes raw) (brotli/decompress (b64->bytes brotli))))
+      (when (>= quality 5)
+        (is (< (count (b64->bytes brotli)) (count (b64->bytes raw)))
+            "and above quality 5 it compresses, so the words came from somewhere")))))
+
+(deftest handles-utf8-content
+  (doseq [{:keys [raw brotli quality]} (filter #(= "utf8" (:name %)) fixtures/cases)]
+    (testing (str "quality " quality)
+      (is (= (b64->bytes raw) (brotli/decompress (b64->bytes brotli)))))))
+
+;; ---------------------------------------------------------------------------
+;; Strictness
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-truncated-input
+  (let [{:keys [brotli]} (first (filter #(and (= "text" (:name %)) (= 11 (:quality %)))
+                                        fixtures/cases))
+        bs (b64->bytes brotli)]
+    (is (= :truncated (reason-of #(brotli/decompress (subvec bs 0 (quot (count bs) 2))))))
+    (is (= :truncated (reason-of #(brotli/decompress []))))))
+
+(deftest rejects-a-corrupt-stream
+  (let [{:keys [brotli]} (first (filter #(and (= "text" (:name %)) (= 11 (:quality %)))
+                                        fixtures/cases))
+        bs (b64->bytes brotli)
+        broken (assoc bs 3 (bit-xor (nth bs 3) 0xff))]
+    ;; Any of these is a legitimate way to notice; the point is that it does not
+    ;; return quietly wrong bytes.
+    (is (contains? #{:bad-prefix-code :bad-metablock :truncated :bad-context-map
+                     :bad-window-size :bad-distance :bad-transform :bad-dictionary-word
+                     :bad-block-type :bad-context-mode}
+                   (let [r (reason-of #(brotli/decompress broken))]
+                     (if (= r ::no-throw)
+                       ;; It may also decode to something — as long as it differs.
+                       (do (is (not= (brotli/decompress bs) (brotli/decompress broken)))
+                           :bad-metablock)
+                       r))))))
+
+(deftest enforces-an-output-ceiling
+  (let [{:keys [raw brotli]} (first (filter #(= "runs" (:name %)) fixtures/cases))]
+    (is (= 5000 (count (b64->bytes raw))))
+    (is (= :output-limit (reason-of #(brotli/decompress (b64->bytes brotli) {:max-output 100}))))
+    (is (= 5000 (count (brotli/decompress (b64->bytes brotli) {:max-output 5000}))))))
+
+(deftest rejects-an-invalid-window-size
+  ;; Window code 0010001 is explicitly reserved (§9.1).
+  (is (= :bad-window-size (reason-of #(brotli/decompress [0x11 0x00 0x00])))))
