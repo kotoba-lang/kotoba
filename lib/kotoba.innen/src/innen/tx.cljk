@@ -1,0 +1,171 @@
+(ns innen.tx
+  "Datomic / DataScript projection of an 因縁 record.
+
+   One attribute table (`attributes`) generates three things, so the shapes can
+   never drift apart:
+
+     * `datomic-schema`    -- `[{:db/ident ... :db/valueType ...} ...]`, transactable
+                              against Datomic / kotobase directly.
+     * `datascript-schema` -- the `{attr {:db/valueType ...}}` map DataScript wants
+                              (only the attrs that actually need declaring).
+     * `->tx` / `->flat-tx` -- entity maps for the two consumers.
+
+   Two projections, on purpose:
+
+   `->tx` is the RELATIONAL one: an edge is an entity whose `:innen.edge/from`
+   and `:innen.edge/to` are `:db.type/ref` values expressed as lookup refs
+   (`[:innen.node/id :node/x]`), so Datalog can join through an edge to both
+   endpoints' attributes in one query. `:innen.node/id` is
+   `:db.unique/identity`, which is what makes those lookup refs resolvable and
+   makes re-transacting the same corpus upsert instead of duplicate.
+
+   `->flat-tx` is the FLAT one, for `com-junkawasaki/root`'s unified query plane
+   (`manifest/edn-query.cljs`, ADR-2607252000): that loader reads vectors of
+   plain maps, converts keyword attrs to bare strings, and has no notion of
+   refs -- so there, an edge's endpoints stay keyword ids and nested maps are
+   flattened to scalars. Same facts, no refs to resolve.
+
+   Interval handling is the same in both, and it matters: `:innen.edge/valid` is
+   a nested map, which neither Datomic nor the flat plane can store as a value,
+   so it is flattened to `-from` / `-to` strings PLUS `-from-key` / `-to-key`
+   integers from `innen.time`. The integer keys exist because ISO date strings
+   only sort correctly for CE dates -- `\"-0221\"` sorts before everything as a
+   string -- and a record covering human history has to be able to ask
+   `[(< ?k 0)]` for 'before the common era' and have it be true."
+  (:require [innen.core :as c]
+            [innen.time :as t]))
+
+(def attributes
+  "attr -> {:type :cardinality :unique :doc}. `:type` uses Datomic value-type
+   keywords without the `:db.type/` prefix for brevity."
+  {;; ---- nodes ----
+   :innen.node/id            {:type :keyword :unique :identity :doc "Stable node id. The join key across every corpus file."}
+   :innen.node/kind          {:type :keyword :doc "One of innen.schema/node-kinds."}
+   :innen.node/label         {:type :string :doc "Human-readable name as the source gives it."}
+   :innen.node/label-local   {:type :string :doc "Name in the entity's own language/script, when known."}
+   :innen.node/wikidata      {:type :string :doc "Wikidata QID, when the entity has one. Not required -- much of the historical record is not in Wikidata."}
+   :innen.node/jurisdiction  {:type :string :doc "ISO 3166 code or historical polity id."}
+   :innen.node/polity-level  {:type :keyword :doc "For :polity nodes: :state / :region / :municipality / :empire / :supranational."}
+   :innen.node/historical?   {:type :boolean :doc "Set on :person nodes to affirm the documented-historical-actor condition."}
+   :innen.node/kind-basis    {:type :string :doc "How :innen.node/kind was arrived at when it was inferred rather than stated (e.g. which Wikidata P31 label matched), so a reader can check the inference instead of trusting it."}
+   :innen.node/existed-from  {:type :string :doc "Flattened from :innen.node/existed."}
+   :innen.node/existed-to    {:type :string}
+   :innen.node/existed-from-key {:type :long :doc "innen.time key -- orders correctly across BCE/CE."}
+   :innen.node/existed-to-key   {:type :long}
+   :innen.node/source        {:type :string :doc "Citation for the node's own existence/identity."}
+   :innen.node/note          {:type :string}
+   :company/lei              {:type :string :doc "Deliberately NOT :innen.node/lei -- this is the same attribute the unified query plane's market-intel / cloud-itonami-lei corpora use, so an innen node joins to SEC financials and legal-entity blueprints with no translation. Renaming it into an innen namespace would break exactly the join this record exists to make."}
+
+   ;; ---- edges ----
+   :innen.edge/id            {:type :keyword :unique :identity :doc "Stable edge id, so re-ingest upserts."}
+   :innen.edge/from          {:type :ref :doc "The DEPENDENT. Always reads: from depends on to."}
+   :innen.edge/to            {:type :ref :doc "The DEPENDENCY."}
+   :innen.edge/from-id       {:type :keyword :doc "Same as :innen.edge/from, kept as a plain keyword for the flat plane and for queries that do not want to join."}
+   :innen.edge/to-id         {:type :keyword}
+   :innen.edge/kind          {:type :keyword :doc "One of innen.schema/edge-kinds."}
+   :innen.edge/necessity     {:type :keyword :doc ":required / :substitutable / :incidental -- drives cascade."}
+   :innen.edge/confidence    {:type :keyword :doc ":documented / :attested / :contested / :estimate."}
+   :innen.edge/share         {:type :double :doc "Stated share of the dependency (0..1) when a source gives one. Absent means unknown, never assumed equal."}
+   :innen.edge/valid-from    {:type :string}
+   :innen.edge/valid-to      {:type :string}
+   :innen.edge/valid-from-key {:type :long}
+   :innen.edge/valid-to-key   {:type :long}
+   :innen.edge/as-of         {:type :string :doc "When this observation was made -- distinct from when the relation held."}
+   :innen.edge/source        {:type :string :doc "Citation. Fail-closed: innen.schema rejects edges without one."}
+   :innen.edge/causal-basis  {:type :string :doc "Required on :causation edges: what in the source asserts the causal link."}
+   :innen.edge/note          {:type :string}
+   :innen.edge/valid-edn     {:type :string :doc "pr-str of the original nested :innen.edge/valid map, so the projection is lossless (the workspace's nested-value convention, AGENTS.md 'docs / ADR は EDN only')."}
+
+   ;; ---- provenance shared with the unified plane ----
+   :source/dataset           {:type :string :doc "Which corpus a datom came from. Same attribute the unified plane already uses."}
+   :source/file              {:type :string}})
+
+(defn datomic-schema
+  "Transactable Datomic/kotobase schema."
+  []
+  (vec (for [[attr {:keys [type cardinality unique doc]}] (sort-by (comp str key) attributes)]
+         (cond-> {:db/ident attr
+                  :db/valueType (keyword "db.type" (name type))
+                  :db/cardinality (keyword "db.cardinality" (name (or cardinality :one)))}
+           unique (assoc :db/unique (keyword "db.unique" (name unique)))
+           doc (assoc :db/doc doc)))))
+
+(defn datascript-schema
+  "DataScript only needs the attrs that are refs, many, or unique."
+  []
+  (into {}
+        (keep (fn [[attr {:keys [type cardinality unique]}]]
+                (let [m (cond-> {}
+                          (= :ref type) (assoc :db/valueType :db.type/ref)
+                          (= :many cardinality) (assoc :db/cardinality :db.cardinality/many)
+                          unique (assoc :db/unique (keyword "db.unique" (name unique))))]
+                  (when (seq m) [attr m]))))
+        attributes))
+
+(defn- clean [m] (into {} (remove (comp nil? val)) m))
+
+(defn node->entity [n]
+  (let [iv (:innen.node/existed n)]
+    (clean (merge (dissoc n :innen.node/existed)
+                  (when iv
+                    {:innen.node/existed-from (:from iv)
+                     :innen.node/existed-to (:to iv)
+                     :innen.node/existed-from-key (t/lower-key (:from iv))
+                     :innen.node/existed-to-key (t/upper-key (:to iv))})))))
+
+(defn edge-id
+  "Deterministic edge id when a corpus does not supply one: from~kind~to plus
+   the validity start, so two ownership edges over different centuries between
+   the same pair stay distinct entities instead of upserting over each other."
+  [{:innen.edge/keys [from to kind valid id]}]
+  (or id
+      (keyword "innen.edge"
+               (str (namespace from) "." (name from)
+                    "~" (name kind) "~"
+                    (namespace to) "." (name to)
+                    (when-let [f (:from valid)] (str "~" f))))))
+
+(defn edge->entity
+  "Relational projection: endpoints as lookup refs."
+  [e]
+  (let [iv (:innen.edge/valid e)]
+    (clean (merge (dissoc e :innen.edge/valid)
+                  {:innen.edge/id (edge-id e)
+                   :innen.edge/from [:innen.node/id (:innen.edge/from e)]
+                   :innen.edge/to [:innen.node/id (:innen.edge/to e)]
+                   :innen.edge/from-id (:innen.edge/from e)
+                   :innen.edge/to-id (:innen.edge/to e)}
+                  (when iv
+                    {:innen.edge/valid-from (:from iv)
+                     :innen.edge/valid-to (:to iv)
+                     :innen.edge/valid-from-key (t/lower-key (:from iv))
+                     :innen.edge/valid-to-key (t/upper-key (:to iv))
+                     :innen.edge/valid-edn (pr-str iv)})))))
+
+(defn edge->flat-entity
+  "Flat projection: no refs, endpoints stay keyword ids."
+  [e]
+  (-> (edge->entity e)
+      (dissoc :innen.edge/from :innen.edge/to)))
+
+(defn ->tx
+  "Full relational tx-data: nodes first (so lookup refs resolve), then edges.
+   `dataset` is stamped onto every entity as `:source/dataset` -- the unified
+   plane distinguishes corpora that way rather than by renaming attributes."
+  ([g] (->tx g nil))
+  ([g {:keys [dataset file]}]
+   (let [stamp (fn [m] (cond-> m
+                         dataset (assoc :source/dataset dataset)
+                         file (assoc :source/file file)))]
+     (into (mapv (comp stamp node->entity) (sort-by (comp str :innen.node/id) (c/nodes g)))
+           (mapv (comp stamp edge->entity) (c/edges g))))))
+
+(defn ->flat-tx
+  "Flat tx-data for the unified query plane."
+  ([g] (->flat-tx g nil))
+  ([g {:keys [dataset file]}]
+   (let [stamp (fn [m] (cond-> m
+                         dataset (assoc :source/dataset dataset)
+                         file (assoc :source/file file)))]
+     (into (mapv (comp stamp node->entity) (sort-by (comp str :innen.node/id) (c/nodes g)))
+           (mapv (comp stamp edge->flat-entity) (c/edges g))))))

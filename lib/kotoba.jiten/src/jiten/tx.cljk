@@ -1,0 +1,288 @@
+(ns jiten.tx
+  "Datomic / DataScript projection of a 事典 corpus.
+
+   One attribute table (`attributes`) generates four things, so the shapes can
+   never drift apart:
+
+     * `datomic-schema`    -- `[{:db/ident ... :db/valueType ...} ...]`, transactable
+                              against Datomic or kotobase directly.
+     * `datascript-schema` -- the `{attr {...}}` map DataScript wants.
+     * `->tx`              -- relational entity maps, refs as lookup refs.
+     * `->flat-tx`         -- ref-free entity maps for `com-junkawasaki/root`'s
+                              unified query plane (`manifest/edn-query.cljs`),
+                              whose loader reads vectors of plain maps, converts
+                              keyword attrs to bare strings, and has no notion of refs.
+
+   THREE ENTITY TYPES, and the middle one is the reason this projection is worth
+   having. An entry is an entity; a section is an entity; and every STATEMENT is
+   its own entity with its own identity, its own source, and its own confidence.
+   That is what turns 'which claims rest on this citation' and 'how many of our
+   claims are estimates' from a scraping problem into a Datalog query. Sections
+   are entities rather than a denormalised heading on each statement so that a
+   section a writer opened and left empty survives the round trip -- if it
+   vanished, the corpus would silently lose the record that a topic was
+   considered.
+
+   EVERYTHING GOES IN ONE REF. Per ADR-260726 (`kotobase.core/open` takes one
+   `:ref-name`, and `q` / `pull` / `datoms` reach exactly that far), entries,
+   sections, statements, links, and the dependency and company records they join
+   to must live in the same kotobase ref. Splitting statements into their own
+   database for write throughput would make 'which claims cite this source'
+   unanswerable, which is most of why the projection is shaped this way.
+
+   `:company/lei` and `:innen.node/wikidata` are carried VERBATIM, not renamed
+   into a `jiten` namespace. They describe the entry's subject, and they are here
+   precisely so an entry joins to `market-intel`, `cloud-itonami-lei`, and the
+   `innen` dependency record with no translation. Renaming them would break the
+   only reason they are present. `innen.tx` makes the same choice for the same
+   reason -- see its note on `:company/lei`."
+  (:require [kotoba.lang.text :as str]
+            [jiten.core :as c]
+            [jiten.link :as link]))
+
+(def attributes
+  "attr -> {:type :cardinality :unique :doc}. `:type` uses Datomic value-type
+   keywords without the `:db.type/` prefix for brevity."
+  {;; ---- entries ----
+   :jiten.entry/id           {:type :keyword :unique :identity :doc "Stable entry id. The join key across every corpus file, and what links point at."}
+   :jiten.entry/title        {:type :string :doc "Human-readable title in :jiten.entry/lang."}
+   :jiten.entry/lang         {:type :string :doc "BCP-47. Entries are per-language and joined by :jiten.entry/subject, so a translation is a relation rather than a fork."}
+   :jiten.entry/form         {:type :keyword :doc "One of jiten.schema/entry-forms: :article / :disambiguation / :index / :glossary."}
+   :jiten.entry/topic-kind   {:type :keyword :doc "One of jiten.schema/topic-kinds. The first ten values are innen.schema/node-kinds verbatim."}
+   :jiten.entry/subject      {:type :keyword :doc "The :innen.node/id this entry is about. A value join, not a ref -- the node may live in a corpus this entry's file has never seen."}
+   :jiten.entry/public-role? {:type :boolean :doc "Set on :person entries to affirm the documented-public-actor condition."}
+   :jiten.entry/summary-of   {:type :keyword :doc "For an :index entry: the subject whose parts it enumerates."}
+   :jiten.entry/note         {:type :string}
+   :company/lei              {:type :string :doc "Deliberately NOT :jiten.entry/lei -- same attribute market-intel / cloud-itonami-lei / innen use, so an entry joins to SEC financials and legal-entity blueprints untranslated."}
+   :innen.node/wikidata      {:type :string :doc "Deliberately NOT :jiten.entry/wikidata -- same attribute innen nodes use. Set it when the subject has a QID but no innen node yet; when a node exists, the node's value is authoritative and the two must agree."}
+
+   ;; ---- notability ----
+   :jiten.notability/basis   {:type :keyword :doc "Why this subject gets an entry: :independent-sources / :registry / :workspace. Declared as data because 'is this notable' settled by argument is not available to a query."}
+   :jiten.notability/sources {:type :string :cardinality :many :doc "Citations establishing notability. Counted against the basis's :min-sources."}
+   :jiten.notability/note    {:type :string :doc "Required for basis :workspace: which workspace record establishes the entity."}
+
+   ;; ---- sections ----
+   :jiten.section/id         {:type :keyword :unique :identity :doc "Composed from entry id + local section id by section-id, so section ids need only be unique within their entry."}
+   :jiten.section/local-id   {:type :keyword :doc "The id as written in the corpus file."}
+   :jiten.section/entry      {:type :ref}
+   :jiten.section/entry-id   {:type :keyword :doc "Same as :jiten.section/entry, kept as a plain keyword for the flat plane."}
+   :jiten.section/heading    {:type :string}
+   :jiten.section/ordinal    {:type :long :doc "Position within the entry. Order is editorial and has to survive the round trip."}
+
+   ;; ---- statements ----
+   :jiten.statement/id         {:type :keyword :unique :identity :doc "Stable claim id. What jiten.revision/diff compares by, so a reflowed paragraph is not mistaken for a changed claim."}
+   :jiten.statement/entry      {:type :ref}
+   :jiten.statement/entry-id   {:type :keyword}
+   :jiten.statement/section    {:type :ref}
+   :jiten.statement/section-id {:type :keyword}
+   :jiten.statement/ordinal    {:type :long :doc "Position within the section."}
+   :jiten.statement/text       {:type :string :doc "The claim itself, as one assertion. Prose spanning several claims should be several statements -- that is what makes the sourcing checkable."}
+   :jiten.statement/source     {:type :string :doc "Citation. Fail-closed: jiten.schema rejects statements without one."}
+   :jiten.statement/confidence {:type :keyword :doc ":documented / :attested / :contested / :estimate. Same vocabulary as innen.edge/confidence."}
+   :jiten.statement/dissent    {:type :string :doc "Required on :contested: what the disagreeing sources hold."}
+   :jiten.statement/method     {:type :string :doc "Required on :estimate: how it was derived."}
+   :jiten.statement/as-of      {:type :string :doc "When the source was consulted. Distinct from when the claim was true."}
+   :jiten.statement/links      {:type :keyword :cardinality :many :doc "Entry ids mentioned inline by this claim."}
+
+   ;; ---- links ----
+   :jiten.link/id            {:type :keyword :unique :identity :doc "Composed by link-id, so re-transacting a corpus upserts rather than duplicates."}
+   :jiten.link/from          {:type :ref}
+   :jiten.link/from-id       {:type :keyword}
+   :jiten.link/to            {:type :ref :doc "Present only when the target exists. A red link carries :jiten.link/to-id alone -- which is the whole point of a red link, and why this is not a required ref."}
+   :jiten.link/to-id         {:type :keyword}
+   :jiten.link/resolved?     {:type :boolean :doc "Whether the target existed when the corpus was projected. Redundant with the presence of :jiten.link/to in the relational form, and NOT redundant in the flat form: the flat plane has no refs, so without this attribute every link there looks like a red link and 'what is this corpus missing' becomes unanswerable on exactly the plane most likely to be asked."}
+   :jiten.link/kind          {:type :keyword :doc "One of jiten.link/link-kinds."}
+   :jiten.link/inline?       {:type :boolean :doc "True when the link came from a statement's :jiten.statement/links rather than a declared :jiten.entry/links."}
+   :jiten.link/statement     {:type :keyword :doc "For an inline link: which claim made the mention."}
+   :jiten.link/note          {:type :string}
+
+   ;; ---- revisions ----
+   :jiten.rev/entry          {:type :keyword :doc "Entry the revision applies to."}
+   :jiten.rev/author         {:type :string :doc "DID of the editor -- the identity the kotobase request was authenticated with."}
+   :jiten.rev/at             {:type :string :doc "ISO-8601."}
+   :jiten.rev/reason         {:type :string :doc "Edit summary. jiten.revision rejects a blank one."}
+   :jiten.rev/basis          {:type :string :doc "kotobase :basis-cid the edit was made against, so a concurrent edit can be told from a sequential one."}
+
+   ;; ---- provenance shared with the unified plane ----
+   :source/dataset           {:type :string :doc "Which corpus a datom came from. Same attribute the unified plane already uses."}
+   :source/file              {:type :string}})
+
+(defn datomic-schema
+  "Transactable Datomic/kotobase schema."
+  []
+  (vec (for [[attr {:keys [type cardinality unique doc]}] (sort-by (comp str key) attributes)]
+         (cond-> {:db/ident attr
+                  :db/valueType (keyword "db.type" (name type))
+                  :db/cardinality (keyword "db.cardinality" (name (or cardinality :one)))}
+           unique (assoc :db/unique (keyword "db.unique" (name unique)))
+           doc (assoc :db/doc doc)))))
+
+(defn datascript-schema
+  "The subset DataScript actually needs declared: refs, cardinality/many, and
+   uniqueness. DataScript infers the rest from the values."
+  []
+  (into {}
+        (for [[attr {:keys [type cardinality unique]}] attributes
+              :when (or (= :ref type) (= :many cardinality) unique)]
+          [attr (cond-> {}
+                  (= :ref type) (assoc :db/valueType :db.type/ref)
+                  (= :many cardinality) (assoc :db/cardinality :db.cardinality/many)
+                  unique (assoc :db/unique (keyword "db.unique" (name unique))))])))
+
+(defn- clean [m] (into {} (remove (comp nil? val)) m))
+
+(def ^:private sep
+  "Separator for composed ids. `$` and not `~`, because `~` IS NOT A LEGAL EDN
+   KEYWORD CHARACTER: a keyword containing it prints fine and throws on the way
+   back in (\"Invalid character: ~ found while reading keyword\").
+
+   That difference is invisible until the projection crosses an EDN wire.
+   Locally it round-trips through data structures and never touches the reader;
+   through datascript.js the attrs are bare strings so the reader is not
+   involved either. It surfaced only when this projection was POSTed to
+   kotobase's `/v1/transact`, whose server-side EDN reader rejected the whole
+   body as InvalidDatomicRequest. Same failure innen recorded for
+   `:node/1973-oil-crisis` — printable, unreadable — reached by a different
+   road. `id-readable?` below is the regression guard."
+  "$")
+
+(defn section-id
+  "Global section id from entry id + local section id. Section ids in a corpus
+   file only have to be unique within their entry, which is how a writer thinks
+   about them; uniqueness across the corpus is this function's job."
+  [entry-id local-id]
+  (keyword "jiten.section"
+           (str (namespace entry-id) "." (name entry-id) sep (name local-id))))
+
+(defn link-id
+  "Stable id for a link, so re-ingest upserts. Inline links include the
+   statement, because the same entry may mention the same target from two
+   different claims and those are two facts, not one."
+  [{:jiten.link/keys [from to kind statement]}]
+  (keyword "jiten.link"
+           (str (namespace from) "." (name from)
+                sep (name kind) sep
+                (if (keyword? to) (str (namespace to) "." (name to)) (str to))
+                (when statement (str sep (name statement))))))
+
+(def ^:private edn-keyword-re
+  "The characters EDN actually allows in a keyword's name. Anything outside
+   this set produces a keyword that prints and cannot be read."
+  #"[A-Za-z0-9.*+!\-_?$%&=<>:#]+")
+
+(defn id-readable?
+  "True when `k` survives a print/read round trip as EDN. Applied to every
+   composed id by the test suite, because a projection that only ever moves
+   through memory will never notice that it cannot."
+  [k]
+  (boolean (and (keyword? k)
+                (re-matches edn-keyword-re (name k))
+                (or (nil? (namespace k))
+                    (re-matches edn-keyword-re (namespace k))))))
+
+(defn entry->entity [e]
+  (let [n (:jiten.entry/notability e)]
+    (clean (merge (dissoc e :jiten.entry/body :jiten.entry/links :jiten.entry/notability)
+                  (when n
+                    {:jiten.notability/basis (:jiten.notability/basis n)
+                     :jiten.notability/sources (vec (:jiten.notability/sources n))
+                     :jiten.notability/note (:jiten.notability/note n)})))))
+
+(defn- entry-sections [e]
+  (for [[i sec] (map-indexed vector (filter map? (:jiten.entry/body e)))]
+    [i sec]))
+
+(defn section->entity [entry-id [ordinal sec]]
+  (clean {:jiten.section/id (section-id entry-id (:jiten.section/id sec))
+          :jiten.section/local-id (:jiten.section/id sec)
+          :jiten.section/entry [:jiten.entry/id entry-id]
+          :jiten.section/entry-id entry-id
+          :jiten.section/heading (:jiten.section/heading sec)
+          :jiten.section/ordinal ordinal}))
+
+(defn statement->entity [entry-id sec ordinal s]
+  (clean (merge (dissoc s :jiten.statement/links)
+                {:jiten.statement/entry [:jiten.entry/id entry-id]
+                 :jiten.statement/entry-id entry-id
+                 :jiten.statement/section [:jiten.section/id (section-id entry-id (:jiten.section/id sec))]
+                 :jiten.statement/section-id (section-id entry-id (:jiten.section/id sec))
+                 :jiten.statement/ordinal ordinal}
+                (when (seq (:jiten.statement/links s))
+                  {:jiten.statement/links (vec (:jiten.statement/links s))}))))
+
+(defn link->entity
+  "`existing?` decides whether the `:jiten.link/to` ref is emitted. A red link
+   deliberately carries only `:jiten.link/to-id`: there is no entity to point
+   at, and inventing one would turn a known gap into a phantom entry.
+
+   `:jiten.link/resolved?` says the same thing as a plain boolean, because the
+   flat projection strips refs and would otherwise report every link as red."
+  [existing? l]
+  (let [to (:jiten.link/to l)
+        resolved? (boolean (and (keyword? to) (existing? to)))]
+    (clean (merge (dissoc l :jiten.link/to)
+                  {:jiten.link/id (link-id l)
+                   :jiten.link/from [:jiten.entry/id (:jiten.link/from l)]
+                   :jiten.link/from-id (:jiten.link/from l)
+                   :jiten.link/to-id to
+                   :jiten.link/resolved? resolved?}
+                  (when resolved?
+                    {:jiten.link/to [:jiten.entry/id to]})))))
+
+(defn- de-ref
+  "Strip lookup refs for the flat plane."
+  [m]
+  (dissoc m :jiten.section/entry :jiten.statement/entry :jiten.statement/section
+          :jiten.link/from :jiten.link/to))
+
+(defn- entities
+  "Entries, then sections, then statements, then links -- in that order so
+   lookup refs resolve in a single transaction."
+  [corpus]
+  (let [es (c/entries corpus)
+        existing? (set (map :jiten.entry/id es))]
+    (concat
+     (map entry->entity (sort-by (comp str :jiten.entry/id) es))
+     (for [e es, sec (entry-sections e)]
+       (section->entity (:jiten.entry/id e) sec))
+     (for [e es
+           [_ sec] (entry-sections e)
+           [i s] (map-indexed vector (:jiten.section/statements sec))]
+       (statement->entity (:jiten.entry/id e) sec i s))
+     (map (partial link->entity existing?) (:links (:index corpus))))))
+
+(defn- stamp [{:keys [dataset file]}]
+  (fn [m] (cond-> m
+            dataset (assoc :source/dataset dataset)
+            file (assoc :source/file file))))
+
+(defn ->tx
+  "Relational tx-data. `dataset` is stamped onto every entity as
+   `:source/dataset` -- the unified plane distinguishes corpora that way rather
+   than by renaming attributes."
+  ([corpus] (->tx corpus nil))
+  ([corpus opts] (mapv (stamp opts) (entities corpus))))
+
+(defn ->flat-tx
+  "Ref-free tx-data for the unified query plane."
+  ([corpus] (->flat-tx corpus nil))
+  ([corpus opts] (mapv (comp (stamp opts) de-ref) (entities corpus))))
+
+(defn revision->entity
+  "A revision record is projected as-is; it has no refs. It is kept out of
+   `->tx` because revisions accumulate per edit while a corpus projection is a
+   snapshot, and transacting them together would re-assert the whole corpus on
+   every edit."
+  [r]
+  (clean r))
+
+(defn attribute-doc
+  "The attribute table as a readable table. Useful when a writer asks what they
+   are allowed to say."
+  []
+  (str/join "\n"
+            (for [[attr {:keys [type cardinality unique doc]}] (sort-by (comp str key) attributes)]
+              (str attr "  " (name type)
+                   (when (= :many cardinality) " many")
+                   (when unique (str " unique/" (name unique)))
+                   (when doc (str "\n    " doc))))))

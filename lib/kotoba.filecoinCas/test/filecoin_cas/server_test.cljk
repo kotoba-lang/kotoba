@@ -1,0 +1,194 @@
+(ns filecoin-cas.server-test
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.test :refer [deftest is async]]
+            [promesa.core :as p]
+            [multiformats.core :as mf]
+            [filecoin-cas.cid :as cid]
+            [filecoin-cas.engine :as eng]
+            [filecoin-cas.server :as srv]))
+
+(defn- bytes-of [s] (js/Uint8Array. (.encode (js/TextEncoder.) s)))
+(defn- cid-of [b] (cid/install-fast-sha256!) (mf/cidv1-raw b))
+(defn- tmpdir [] (.mkdtempSync fs (.join path (.tmpdir os) "fcas-srv-")))
+
+(defn- memory-cas []
+  (let [pieces (atom {}) n (atom 0)]
+    (eng/open {:dir (tmpdir)
+               :upload! (fn [bytes _]
+                          (let [pc (str "piece-" (swap! n inc))]
+                            (swap! pieces assoc pc bytes)
+                            (p/resolved {:piece-cid pc :complete? true :copies [{:provider-id "1"}]})))
+               :download (fn [pc] (p/resolved (get @pieces pc)))})))
+
+(defn- run-async [done pf]
+  (-> pf
+      (.catch (fn [e] (is (nil? e) (str "unexpected rejection: " (.-message e)))))
+      (.finally done)))
+
+(defn- with-server
+  "Start a server over `cas` on a free port, run (f base-url) -> promise, close."
+  [cas opts f]
+  (p/let [server (srv/start! cas (merge {:port 0} opts))
+          base (str "http://127.0.0.1:" (.-port (.address server)))
+          out (-> (f base) (p/finally (fn [_ _] (.close server))))]
+    out))
+
+(defn- req [base method p & [{:keys [body token]}]]
+  (p/let [r (js/fetch (str base p)
+                      (clj->js (cond-> {:method method}
+                                 body (assoc :body body)
+                                 token (assoc :headers {"authorization" (str "Bearer " token)}))))
+          buf (.arrayBuffer r)]
+    {:status (.-status r) :body (js/Uint8Array. buf)}))
+
+(defn- text [{:keys [body]}] (.decode (js/TextDecoder.) body))
+
+(deftest put-then-get-through-http
+  (async done
+    (let [cas (memory-cas) b (bytes-of "over http") c (cid-of b)]
+      (run-async done
+        (with-server cas {}
+          (fn [base]
+            (p/let [put (req base "PUT" (str "/obj/" c) {:body b})
+                    got (req base "GET" (str "/obj/" c))
+                    _ (eng/drain! cas)
+                    again (req base "PUT" (str "/obj/" c) {:body b})
+                    from-fil (req base "GET" (str "/obj/" c))
+                    st (req base "GET" (str "/status/" c))]
+              (is (= 202 (:status put)))
+              (is (= 200 (:status got)))
+              (is (= (vec b) (vec (:body got))))
+              (is (= 200 (:status again)) "already stored")
+              (is (= (vec b) (vec (:body from-fil))) "served after the spool is gone")
+              (is (re-find #":state :stored" (text st))))))))))
+
+(deftest rejects-bad-input
+  (async done
+    (let [cas (memory-cas) b (bytes-of "real") c (cid-of b)]
+      (run-async done
+        (with-server cas {}
+          (fn [base]
+            (p/let [mismatch (req base "PUT" (str "/obj/" c) {:body (bytes-of "fake")})
+                    malformed (req base "PUT" "/obj/not-a-cid" {:body b})
+                    unknown (req base "GET" (str "/obj/" c))
+                    method (req base "DELETE" (str "/obj/" c))
+                    nowhere (req base "GET" "/nope")
+                    health (req base "GET" "/health")]
+              (is (= 422 (:status mismatch)))
+              (is (= 400 (:status malformed)))
+              (is (= 404 (:status unknown)) "the mismatched PUT left nothing behind")
+              (is (= 405 (:status method)))
+              (is (= 404 (:status nowhere)))
+              (is (= 200 (:status health))))))))))
+
+(deftest enforces-size-limit
+  (async done
+    (let [cas (memory-cas) b (bytes-of "0123456789") c (cid-of b)]
+      (run-async done
+        (with-server cas {:max-object-bytes 4}
+          (fn [base]
+            (p/let [r (req base "PUT" (str "/obj/" c) {:body b})]
+              (is (= 413 (:status r)))
+              (is (nil? (eng/status cas c))))))))))
+
+(deftest token-is-required-when-configured
+  (async done
+    (let [cas (memory-cas) b (bytes-of "secret-guarded") c (cid-of b)]
+      (run-async done
+        (with-server cas {:token "s3cret"}
+          (fn [base]
+            (p/let [none (req base "GET" "/health")
+                    wrong (req base "GET" "/health" {:token "nope"})
+                    ok (req base "PUT" (str "/obj/" c) {:body b :token "s3cret"})]
+              (is (= 401 (:status none)))
+              (is (= 401 (:status wrong)))
+              (is (= 202 (:status ok))))))))))
+
+(deftest refuses-non-loopback-bind-without-token
+  (is (= :insecure-bind
+         (try (srv/start! (memory-cas) {:host "0.0.0.0" :port 0})
+              (catch :default e (cid/error-reason e))))))
+
+;; ---- streaming ---------------------------------------------------------------
+
+(defn- temp-leftovers [cas]
+  (let [dirs [(.join path (:dir cas) "spool") (.join path (:dir cas) "fetch")]]
+    (vec (for [d dirs :when (.existsSync fs d)
+               f (.readdirSync fs d) :when (.startsWith f ".tmp-")]
+           f))))
+
+(defn- leftovers-after-settling
+  "Temp files still present after waiting up to 3 s for the server's own
+  cleanup, which runs just after the client sees the last byte."
+  [cas]
+  (js/Promise.
+    (fn [resolve _]
+      (letfn [(check [tries]
+                (let [left (temp-leftovers cas)]
+                  (if (or (empty? left) (zero? tries))
+                    (resolve left)
+                    (js/setTimeout #(check (dec tries)) 100))))]
+        (check 30)))))
+
+(deftest a-large-object-streams-in-and-out
+  (async done
+    (let [cas (memory-cas)
+          b (let [x (js/Buffer.alloc (* 16 1024 1024))]
+              (dotimes [i (.-length x)] (aset x i (mod (* i 31) 256)))
+              (js/Uint8Array. x))
+          c (cid-of b)]
+      (run-async done
+        (with-server cas {}
+          (fn [base]
+            (p/let [put (req base "PUT" (str "/obj/" c) {:body b})
+                    got (req base "GET" (str "/obj/" c))
+                    _ (eng/drain! cas)
+                    from-tier (req base "GET" (str "/obj/" c))
+                    left (leftovers-after-settling cas)]
+              (is (= 202 (:status put)))
+              (is (= (.-length b) (.-length (:body got))))
+              (is (= (vec (.subarray b 0 4096)) (vec (.subarray (:body got) 0 4096))))
+              (is (= (vec (.subarray b (- (.-length b) 4096)))
+                     (vec (.subarray (:body from-tier) (- (.-length b) 4096))))
+                  "served after the spool is gone, from the downloaded temp file")
+              (is (empty? left) (str "no temp file outlives a request: " (pr-str left))))))))))
+
+(deftest failed-uploads-leave-no-temp-files
+  (async done
+    (let [cas (memory-cas) real (bytes-of "the genuine bytes") c (cid-of real)
+          big (js/Uint8Array. (* 64 1024))]
+      (run-async done
+        (with-server cas {:max-object-bytes 1024}
+          (fn [base]
+            (p/let [mismatch (req base "PUT" (str "/obj/" c) {:body (bytes-of "not the bytes")})
+                    ;; no Content-Length: the limit is enforced while streaming
+                    chunked (js/fetch (str base "/obj/" c)
+                                      #js {:method "PUT" :duplex "half"
+                                           :body (js/ReadableStream.
+                                                   #js {:start (fn [controller]
+                                                                 (.enqueue controller big)
+                                                                 (.close controller))})})]
+              (is (= 422 (:status mismatch)))
+              (is (= 413 (.-status chunked)) "over the limit even without a declared length")
+              (is (nil? (eng/status cas c)) "nothing was queued")
+              (is (empty? (temp-leftovers cas)) "both temp files were removed"))))))))
+
+(deftest a-known-cid-is-answered-without-reading-the-body
+  (async done
+    (let [cas (memory-cas) b (bytes-of "the first, verified copy") c (cid-of b)]
+      (run-async done
+        (with-server cas {}
+          (fn [base]
+            (p/let [first-put (req base "PUT" (str "/obj/" c) {:body b})
+                    ;; a body that does NOT hash to the CID is ignored, not stored
+                    again (req base "PUT" (str "/obj/" c) {:body (bytes-of "different bytes")})
+                    got (req base "GET" (str "/obj/" c))
+                    _ (eng/drain! cas)
+                    stored (req base "PUT" (str "/obj/" c) {:body b})]
+              (is (= 202 (:status first-put)))
+              (is (= 202 (:status again)) "still queued: idempotent by CID")
+              (is (= (vec b) (vec (:body got))) "what is served is what was verified")
+              (is (= 200 (:status stored)) "and 200 once stored")
+              (is (empty? (temp-leftovers cas))))))))))

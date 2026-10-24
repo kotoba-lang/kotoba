@@ -87,6 +87,67 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kamiArticulated` | `kotoba.kamiArticulated/src` | `kami_articulated`, `kami_articulated.urdf` (Kotoba project library) |
+| `kotoba.kamiAppQuarryWalk` | `kotoba.kamiAppQuarryWalk/src` | `kami-app-quarry-walk` (Kotoba project library) |
+| `kotoba.nagare` | `kotoba.nagare/src` | `nagare.demo`, `nagare.diagnostics`, `nagare.field`, `nagare.fvm` (Kotoba project library) |
+| `kotoba.kamiAppGiemonFactory` | `kotoba.kamiAppGiemonFactory/src` | `kami-app-giemon-factory`, `kami-app-giemon-factory.clashes`, `kami-app-giemon-factory.construction-order`, `kami-app-giemon-factory.factory` (Kotoba project library) |
+| `kotoba.kamiAppGiemon` | `kotoba.kamiAppGiemon/src` | `kami-app-giemon`, `kami-app-giemon.armcrawler`, `kami-app-giemon.caterpillar`, `kami-app-giemon.geom` (Kotoba project library) |
+| `kotoba.kamiAppCarSim` | `kotoba.kamiAppCarSim/src` | `kotoba.car-sim`, `kotoba.car-sim.color`, `kotoba.car-sim.controls`, `kotoba.car-sim.garage` (Kotoba project library) |
+| `kotoba.kaiyu` | `kotoba.kaiyu/src` | `kaiyu.core`, `kaiyu.diagnose`, `kaiyu.session` (Kotoba project library) |
+| `kotoba.kaisha` | `kotoba.kaisha/src` | `kaisha.model`, `kaisha.validate` (Kotoba project library) |
+| `kotoba.jsonlogic` | `kotoba.jsonlogic/src` | `jsonlogic.core`, `jsonlogic.ports`, `jsonlogic.validate` (Kotoba project library) |
+| `kotoba.jsonLd` | `kotoba.jsonLd/src` | `json-ld.core` (Kotoba project library) |
+| `kotoba.jpHiroshibaVoicevox` | `kotoba.jpHiroshibaVoicevox/src` | `voicevox.client`, `voicevox.speakers`, `voicevox.synthesize` (Kotoba project library) |
+| `kotoba.jiten` | `kotoba.jiten/src` | `jiten.core`, `jiten.link`, `jiten.revision`, `jiten.schema` (Kotoba project library) |
+| `kotoba.itinerary` | `kotoba.itinerary/src` | `kotoba.itinerary` (Kotoba project library) |
+| `kotoba.ipXact` | `kotoba.ipXact/src` | `ip-xact`, `ip-xact.bus-protocol`, `ip-xact.cdc`, `ip-xact.component` (Kotoba project library) |
+| `kotoba.ip` | `kotoba.ip/src` | `kotoba.ip.bus-protocol`, `kotoba.ip.cdc`, `kotoba.ip.ip-xact`, `kotoba.ip.noc` (Kotoba project library) |
+| `kotoba.sigv4` | `kotoba.sigv4/src` | `sigv4.core`, `sigv4.crypto`, `sigv4.protocols`, `sigv4.request` (Kotoba project library) |
+| `kotoba.ioIpniSpecs` | `kotoba.ioIpniSpecs/src` | `ipni.ad`, `ipni.advertise`, `ipni.announce`, `ipni.find` (Kotoba project library) |
+| `kotoba.ioIpfs` | `kotoba.ioIpfs/src` | `kotoba.lang.ipfs` (Kotoba project library) |
+| `kotoba.intWhoIcd10` | `kotoba.intWhoIcd10/src` | `icd10.chapters`, `icd10.claml`, `icd10.code`, `icd10.compare` (Kotoba project library) |
+| `kotoba.insurance` | `kotoba.insurance/src` | `kotoba.insurance`, `kotoba.insurance.eu`, `kotoba.insurance.export`, `kotoba.insurance.jp` (Kotoba project library) |
+| `kotoba.input` | `kotoba.input/src` | `input` (Kotoba project library) |
+| `kotoba.innen` | `kotoba.innen/src` | `innen.algo`, `innen.core`, `innen.schema`, `innen.time` (Kotoba project library) |
+| `kotoba.identify` | `kotoba.identify/src` | `identify.adapters.edn-resolver`, `identify.adapters.production-resolvers`, `identify.adapters.resolver`, `identify.core` (Kotoba project library) |
+| `kotoba.icPackaging` | `kotoba.icPackaging/src` | `ic-packaging`, `ic-packaging.bonding`, `ic-packaging.package`, `ic-packaging.thermal` (Kotoba project library) |
+| `kotoba.kotobaseLake` | `kotoba.kotobaseLake/src` | `kotobase.lake.acquire`, `kotobase.lake.catalog`, `kotobase.lake.columnar`, `kotobase.lake.compact` (Kotoba project library) |
+| `kotoba.ioIpldCar` | `kotoba.ioIpldCar/src` | `ipld.car`, `ipld.car.bytes`, `ipld.car.index`, `ipld.car.trustless` (Kotoba project library) |
+| `kotoba.i18nActor` | `kotoba.i18nActor/src` | `i18n.murakumo` (Kotoba project library) |
+| `kotoba.http` | `kotoba.http/src` | `kotoba.http`, `kotoba.http.decode-json-body`, `kotoba.http.fold-headers`, `kotoba.http.form-urlencoded` (Kotoba project library) |
+| `kotoba.hinshitsu` | `kotoba.hinshitsu/src` | `hinshitsu.core`, `hinshitsu.mokushi` (Kotoba project library) |
+| `kotoba.haishin` | `kotoba.haishin/src` | `haishin.adapt`, `haishin.artifact`, `haishin.constraints`, `haishin.core` (Kotoba project library) |
+| `kotoba.groot` | `kotoba.groot/src` | `kotoba.groot`, `kotoba.groot.embodiment`, `kotoba.groot.episode`, `kotoba.groot.modality` (Kotoba project library) |
+| `kotoba.graphql` | `kotoba.graphql/src` | `graphql.emit`, `graphql.execute`, `graphql.model`, `graphql.ports` (Kotoba project library) |
+| `kotoba.graphml` | `kotoba.graphml/src` | `graphml.core`, `kotoba.graphml` (Kotoba project library) |
+| `kotoba.graph` | `kotoba.graph/src` | `graph`, `graph.data`, `graph.layout` (Kotoba project library) |
+| `kotoba.governor` | `kotoba.governor/src` | `governor.core` (Kotoba project library) |
+| `kotoba.govDefenseMilStd1553` | `kotoba.govDefenseMilStd1553/src` | `mil1553.command`, `mil1553.data`, `mil1553.message`, `mil1553.mode` (Kotoba project library) |
+| `kotoba.gitWorkspace` | `kotoba.gitWorkspace/src` | `kotoba.git-workspace` (Kotoba project library) |
+| `kotoba.geojson` | `kotoba.geojson/src` | `geojson.core`, `kotoba.geojson` (Kotoba project library) |
+| `kotoba.geo` | `kotoba.geo/src` | `kotoba.geo`, `kotoba.geo.billboard`, `kotoba.geo.constants`, `kotoba.geo.math` (Kotoba project library) |
+| `kotoba.gameProduction` | `kotoba.gameProduction/src` | `game-production.audio`, `game-production.balance`, `game-production.knobs`, `game-production.spec` (Kotoba project library) |
+| `kotoba.foundationIdentityDidwebvh` | `kotoba.foundationIdentityDidwebvh/src` | `didwebvh.did`, `didwebvh.entry`, `didwebvh.hash`, `didwebvh.log` (Kotoba project library) |
+| `kotoba.forms` | `kotoba.forms/src` | `forms.model`, `forms.responses`, `forms.validate`, `forms.wire` (Kotoba project library) |
+| `kotoba.transit` | `kotoba.transit/src` | `transit.core` (Kotoba project library) |
+| `kotoba.force3d` | `kotoba.force3d/src` | `kotoba.lang.force3d.core` (Kotoba project library) |
+| `kotoba.floorplanLab` | `kotoba.floorplanLab/src` | `floorplan-lab.ble`, `floorplan-lab.fusion`, `floorplan-lab.motion`, `floorplan-lab.sensing-bridge` (Kotoba project library) |
+| `kotoba.filecoinCas` | `kotoba.filecoinCas/src` | `filecoin-cas.cid`, `filecoin-cas.engine`, `filecoin-cas.index`, `filecoin-cas.server` (Kotoba project library) |
+| `kotoba.ffi` | `kotoba.ffi/src` | `kotoba.ffi` (Kotoba project library) |
+| `kotoba.fea` | `kotoba.fea/src` | `kotoba.fea`, `kotoba.fea.boundary`, `kotoba.fea.convergence`, `kotoba.fea.fatigue` (Kotoba project library) |
+| `kotoba.fare` | `kotoba.fare/src` | `kotoba.fare` (Kotoba project library) |
+| `kotoba.expr` | `kotoba.expr/src` | `expr.core`, `kotoba.expr` (Kotoba project library) |
+| `kotoba.examlaw` | `kotoba.examlaw/src` | `kotoba.examlaw` (Kotoba project library) |
+| `kotoba.esim` | `kotoba.esim/src` | `kotoba.esim`, `kotoba.esim.export`, `kotoba.esim.lifecycle`, `kotoba.esim.ports` (Kotoba project library) |
+| `kotoba.erc20` | `kotoba.erc20/src` | `erc20.core`, `erc20.permit` (Kotoba project library) |
+| `kotoba.engineerRender` | `kotoba.engineerRender/src` | `engineer-render`, `engineer-render.color-map`, `engineer-render.draw-list`, `engineer-render.viewport` (Kotoba project library) |
+| `kotoba.engineerIo` | `kotoba.engineerIo/src` | `engineer-io`, `engineer-io.format`, `engineer-io.gerber`, `engineer-io.step` (Kotoba project library) |
+| `kotoba.engineer` | `kotoba.engineer/src` | `engineer`, `engineer.constraint`, `engineer.drc`, `engineer.grid` (Kotoba project library) |
+| `kotoba.faceMatch` | `kotoba.faceMatch/src` | `face-match.core`, `face-match.model`, `face-match.ports` (Kotoba project library) |
+| `kotoba.faceLiveness` | `kotoba.faceLiveness/src` | `face-liveness.core`, `face-liveness.datom`, `face-liveness.geometry`, `face-liveness.model` (Kotoba project library) |
+| `kotoba.eduBerkeleySpice` | `kotoba.eduBerkeleySpice/src` | `spice`, `spice.analysis`, `spice.circuit`, `spice.model` (Kotoba project library) |
+| `kotoba.editor` | `kotoba.editor/src` | `editor.core` (Kotoba project library) |
 | `kotoba.phone` | `kotoba.phone/src` | `kotoba.phone`, `kotoba.phone.export`, `kotoba.phone.lifecycle`, `kotoba.phone.numbering` (Kotoba project library) |
 | `kotoba.wire` | `kotoba.wire/src` | `kotoba.wire.edn`, `kotoba.wire.framing`, `kotoba.wire.tcp` (Kotoba project library) |
 | `kotoba.techIpfsSpecsIpns` | `kotoba.techIpfsSpecsIpns/src` | `ipns.core`, `ipns.head`, `ipns.pubsub`, `ipns.record` (Kotoba project library) |

@@ -1,0 +1,73 @@
+(ns filecoin-cas.index
+  "Pure state for the Filecoin tier: which CIDs are queued for upload, which
+  are stored, and under which PieceCID. No I/O and no clock: callers pass
+  `now` (epoch ms). The whole value is plain EDN so it can be persisted as-is.
+
+  {:objects {cid {:cid :size :state :queued|:stored
+                  :attempts n :next-at ms :error str
+                  :queued-at ms :stored-at ms
+                  :piece-cid str :complete? bool :copies [...]}}
+   :pieces  {piece-cid cid}}")
+
+(def base-backoff-ms 5000)
+(def max-backoff-ms 3600000)
+
+(defn empty-index [] {:objects {} :pieces {}})
+
+(defn backoff-ms
+  "Delay before retry number `attempts` (1-based): 5 s doubling, capped at 1 h."
+  [attempts]
+  (min max-backoff-ms
+       (* base-backoff-ms (js/Math.pow 2 (max 0 (dec attempts))))))
+
+(defn lookup [idx cid] (get-in idx [:objects cid]))
+
+(defn cid-for-piece [idx piece-cid] (get-in idx [:pieces piece-cid]))
+
+(defn enqueue
+  "Register `cid` for upload. Idempotent: a queued or stored CID is left alone
+  (a stored one is never re-uploaded, so re-putting the same object is free)."
+  [idx cid size now]
+  (if (lookup idx cid)
+    idx
+    (assoc-in idx [:objects cid]
+              {:cid cid :size size :state :queued
+               :attempts 0 :next-at now :queued-at now})))
+
+(defn due
+  "CIDs that are queued and past their backoff, oldest first, at most `limit`."
+  [idx now limit]
+  (->> (vals (:objects idx))
+       (filter #(and (= :queued (:state %)) (<= (:next-at %) now)))
+       (sort-by :queued-at)
+       (map :cid)
+       (take limit)
+       vec))
+
+(defn mark-stored
+  "Record a finished upload. `result` is filecoin-cas.synapse/upload!'s map."
+  [idx cid {:keys [piece-cid complete? copies]} now]
+  (-> idx
+      (update-in [:objects cid] #(-> %
+                                     (assoc :state :stored :stored-at now
+                                            :piece-cid piece-cid
+                                            :complete? (boolean complete?)
+                                            :copies (vec copies))
+                                     (dissoc :error :next-at)))
+      (assoc-in [:pieces piece-cid] cid)))
+
+(defn mark-failed
+  "Record a failed attempt and schedule the retry with capped backoff. The
+  object stays :queued: nothing here gives up on data."
+  [idx cid error now]
+  (update-in idx [:objects cid]
+             (fn [o]
+               (let [n (inc (:attempts o 0))]
+                 (assoc o :attempts n :error (str error)
+                        :next-at (+ now (backoff-ms n)))))))
+
+(defn stats [idx]
+  (let [os (vals (:objects idx))]
+    {:queued (count (filter #(= :queued (:state %)) os))
+     :stored (count (filter #(= :stored (:state %)) os))
+     :bytes-queued (reduce + 0 (map :size (filter #(= :queued (:state %)) os)))}))

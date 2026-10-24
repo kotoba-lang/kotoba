@@ -1,0 +1,169 @@
+(ns ipld.car.replay-test
+  "Replaying a selector against a CAR, and the five ways that must fail.
+
+  The producer (`selection-car`) may trust its own store. The verifier may
+  trust nothing: not the archive's roots header, not its frame CIDs, and not
+  that it carries everything the traversal needs. Each of those is silent by
+  default -- `car/decode` keys blocks by the CID the frame declares and never
+  rehashes them -- so each gets a case here.
+
+  The fixtures are the four ADR-2609060000 names: missing blocks, shared
+  links, unsupported forms, and limits."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipld.car :as car]
+            [ipld.car.trustless :as tl]
+            [ipld.core :as ipld]
+            [ipld.selector :as selector]))
+
+(defn- err [f]
+  (try (f) nil
+       (catch #?(:clj Exception :cljs :default) e (:type (ex-data e)))))
+
+(def limits {:max-blocks 64 :max-bytes 65536 :max-depth 16 :max-matches 64})
+
+;; ── a small graph with a SHARED child ────────────────────────────────────────
+;; leaf is linked from both "a" and "b": one block, two traversal paths.
+
+(def leaf (ipld/node->block {"n" 42}))
+
+;; The branches must differ in content, or they are the SAME block: content
+;; addressing would collapse them and the fixture would stop testing a shared
+;; child reached by two paths.
+(def branch-a (ipld/node->block {"side" "a" "to" (ipld/link (:cid leaf))}))
+(def branch-b (ipld/node->block {"side" "b" "to" (ipld/link (:cid leaf))}))
+
+(def root
+  (ipld/node->block {"a" (ipld/link (:cid branch-a))
+                     "b" (ipld/link (:cid branch-b))}))
+
+(def all-blocks [root branch-a branch-b leaf])
+
+(defn- car-of [blocks]
+  (:bytes (car/encode {:roots [(:cid root)] :blocks blocks})))
+
+;; Reach the same leaf down both branches.
+(def both-branches
+  {:selector :explore-fields
+   :fields {"a" {:selector :explore-fields
+                 :fields {"to" {:selector :matcher}}}
+            "b" {:selector :explore-fields
+                 :fields {"to" {:selector :matcher}}}}})
+
+(def sel-bytes (selector/encode both-branches))
+
+;; ── the happy path, so the failures below mean something ─────────────────────
+
+(deftest a_complete_archive_replays_and_reports_what_it_needed
+  (let [r (tl/replay-selection (car-of all-blocks) (:cid root) sel-bytes limits)]
+    (testing "the shared leaf is matched once per path, not deduplicated away"
+      (is (= 2 (count (:matches r)))
+          "identity of bytes is not identity of traversal state")
+      (is (= [{"n" 42} {"n" 42}] (mapv :value (:matches r))))
+      (is (= [["a" "to"] ["b" "to"]] (mapv :path (:matches r)))))
+    (testing "but it is only carried once"
+      (is (= 4 (count (:loaded r))))
+      (is (= 1 (count (filter #(= (:cid leaf) (:cid %)) (:loaded r))))))
+    (is (= [] (:unused r)))))
+
+(deftest unused_blocks_are_reported_not_rejected
+  ;; Shared physical blocks may legitimately carry rows outside the selection.
+  (let [extra (ipld/node->block {"unrelated" true})
+        r (tl/replay-selection (car-of (conj all-blocks extra))
+                               (:cid root) sel-bytes limits)]
+    (is (= 2 (count (:matches r))))
+    (is (= [(:cid extra)] (:unused r))
+        "reported because it is unverified -- only touched blocks were rehashed")))
+
+;; ── fixture: missing blocks ──────────────────────────────────────────────────
+
+(deftest a_missing_block_is_no_answer_not_a_shorter_one
+  (doseq [[label omitted] [["a leaf" leaf] ["an interior branch" branch-b]]]
+    (testing label
+      (let [partial-car (car-of (remove #(= (:cid omitted) (:cid %)) all-blocks))]
+        (is (= :ipld/missing-block
+               (err #(tl/replay-selection partial-car (:cid root) sel-bytes limits)))))))
+  (testing "an archive with no blocks at all does not replay as zero matches"
+    (is (= :ipld/missing-block
+           (err #(tl/replay-selection (car-of []) (:cid root) sel-bytes limits))))))
+
+;; ── fixture: the archive is about a different graph ──────────────────────────
+
+(deftest the_callers_root_binds_the_graph_not_the_archives_header
+  (let [other (ipld/node->block {"other" true})
+        foreign (:bytes (car/encode {:roots [(:cid other)]
+                                     :blocks (conj all-blocks other)}))]
+    (is (= :ipld/car-root-mismatch
+           (err #(tl/replay-selection foreign (:cid root) sel-bytes limits)))
+        "the roots header is a claim by whoever wrote the archive")))
+
+(deftest frame_cids_are_not_believed
+  ;; car/decode keys blocks by the DECLARED cid and never rehashes. Measured:
+  ;; a frame claiming leaf's CID while carrying other bytes decodes silently.
+  (let [substituted (ipld/node->block {"n" 43})
+        lying (:bytes (car/encode
+                       {:roots [(:cid root)]
+                        :blocks (conj (vec (remove #(= (:cid leaf) (:cid %)) all-blocks))
+                                      {:cid (:cid leaf) :bytes (:bytes substituted)})}))]
+    (is (= 4 (count (:blocks (car/decode lying))))
+        "the archive itself decodes without complaint -- that is the hazard")
+    (is (= :ipld/cid-mismatch
+           (err #(tl/replay-selection lying (:cid root) sel-bytes limits))))))
+
+;; ── fixture: unsupported forms ───────────────────────────────────────────────
+
+(deftest a_form_outside_the_supported_subset_is_refused_not_matched_less
+  (doseq [[label data] [["an unknown top-level member" {"ExploreSomethingElse" {}}]
+                        ["an unknown nested member" {"f" {"f>" {"x" {"nope" {}}}}}]
+                        ["not a selector at all" {"hello" "world"}]]]
+    (testing label
+      (is (= :ipld/invalid-selector
+             (err #(tl/replay-selection (car-of all-blocks) (:cid root)
+                                        (ipld/encode data) limits)))))))
+
+(deftest a_recursive_edge_without_a_parent_is_refused
+  (is (= :ipld/invalid-selector
+         (err #(tl/replay-selection (car-of all-blocks) (:cid root)
+                                    (selector/encode {:selector :explore-recursive-edge})
+                                    limits)))))
+
+;; ── fixture: limits ──────────────────────────────────────────────────────────
+
+(deftest exhausting_a_budget_is_incomplete_retrieval_not_a_smaller_success
+  (doseq [[k v] [[:max-blocks 2] [:max-bytes 40] [:max-depth 1] [:max-matches 1]]]
+    (testing (str "budget " k)
+      (is (= :ipld/resource-limit
+             (err #(tl/replay-selection (car-of all-blocks) (:cid root) sel-bytes
+                                        (assoc limits k v))))
+          "a work limit reached mid-traversal must not return the partial set")))
+  (testing "the same traversal completes when the budget allows it"
+    (is (= 2 (count (:matches (tl/replay-selection (car-of all-blocks) (:cid root)
+                                                   sel-bytes limits)))))))
+
+(deftest missing_or_non_positive_limits_are_refused
+  (doseq [absent [:max-blocks :max-bytes :max-depth :max-matches]]
+    (is (some? (err #(tl/replay-selection (car-of all-blocks) (:cid root) sel-bytes
+                                          (dissoc limits absent))))
+        "an absent budget must not read as an unlimited one")))
+
+;; ── the producer/verifier round trip ─────────────────────────────────────────
+
+(deftest what_the_producer_emits_is_what_the_verifier_needs
+  (let [produced (tl/selection-car #(some (fn [b] (when (= % (:cid b)) (:bytes b)))
+                                          all-blocks)
+                                   (:cid root) both-branches limits)
+        replayed (tl/verify-selection-car (get-in produced [:car :bytes]) (:cid root)
+                                          both-branches limits)]
+    (is (= (mapv :value (:matches produced)) (mapv :value (:matches replayed))))
+    (is (= (mapv :cid (:blocks produced)) (mapv :cid (:loaded replayed)))
+        "the producer's touched set is exactly what replay re-derives")
+    (is (= [] (:unused replayed)))))
+
+(deftest a_producer_that_under_sends_fails_rather_than_matching_less
+  (let [produced (tl/selection-car #(some (fn [b] (when (= % (:cid b)) (:bytes b)))
+                                          all-blocks)
+                                   (:cid root) both-branches limits)
+        truncated (:bytes (car/encode
+                           {:roots [(:cid root)]
+                            :blocks (butlast (:blocks produced))}))]
+    (is (= :ipld/missing-block
+           (err #(tl/verify-selection-car truncated (:cid root) both-branches limits))))))

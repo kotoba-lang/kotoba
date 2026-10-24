@@ -1,0 +1,126 @@
+(ns kotoba-tests
+  "The Kotoba percent-encoder held to the Clojure one, as a suite a gate can
+  read.
+
+  `kotoba/pct_encode.kotoba` reimplements `sigv4.core/uri-encode` in Kotoba and
+  is compiled to WebAssembly by the released CLI. Two implementations of one
+  function are only worth having if something makes them agree, and \"it
+  compiled\" is not agreement -- so this feeds both the same bytes and requires
+  byte-identical output across every ASCII code point, multi-byte UTF-8, and
+  realistic S3 keys.
+
+  This was `scripts/verify-kotoba.cljs`, which printed `ok <label>` lines. The
+  shared fleet gate parses a clojure.test summary and refuses to report a pass
+  without one, so being gated meant speaking that format.
+
+  ## It builds the module rather than assuming one
+
+  The `.wasm` is a build artifact and is not committed, so a suite that only
+  read it would pass or fail on whether someone happened to have built it. It
+  invokes the CLI, and **fails loudly when the CLI is absent** -- a skipped
+  parity check must not report the same thing as a satisfied one.
+
+  That is not hypothetical here. Measured 2026-08-17: `kotoba wasm emit` had
+  been failing `check-failed` since the language grew its T1 memory-safety
+  gate, so this comparison could not run at all, and nothing said so because
+  nothing ran it.
+
+      kbb --backend sci --classpath src:test kotoba-tests.cljk"
+  (:require [cljs.test :as t :refer-macros [deftest is testing async]]
+            [kotoba.lang.text :as str]
+            ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            [sigv4.core :as v4]))
+
+(def wasm-path "target/pct_encode.wasm")
+
+(defn- build!
+  "Emit the module. Throws with the CLI's own diagnostic on failure."
+  []
+  (when-not (.existsSync fs "target") (.mkdirSync fs "target"))
+  (let [r (.spawnSync cp "kotoba"
+                      #js ["wasm" "emit" "kotoba/pct_encode.kotoba"
+                           "--package-lock" "kotoba.lock.edn"
+                           "--output" wasm-path "--json"]
+                      #js {:encoding "utf8"})]
+    (when (.-error r)
+      (throw (js/Error. (str "kotoba CLI unavailable: " (.-message (.-error r))
+                             " — this suite requires it and will not pass without it"))))
+    (when-not (.existsSync fs wasm-path)
+      (throw (js/Error. (str "kotoba wasm emit produced no module: "
+                             (str/trim (str (.-stdout r) (.-stderr r)))))))
+    (.-size (.statSync fs wasm-path))))
+
+(def ^:private encoder (js/TextEncoder.))
+(def ^:private decoder (js/TextDecoder. "latin1"))
+
+(defn- kotoba-encoder
+  "→ a fn of string → percent-encoded string, backed by the Wasm module."
+  [exports]
+  (let [mem #(js/Uint8Array. (.-buffer (.-memory exports)))
+        src ((.-scratch exports) 1024)
+        dst ((.-scratch exports) 4096)]
+    (fn [s]
+      (let [bs (.encode encoder s)]
+        (when (> (.-length bs) 1024)
+          (throw (js/Error. "input exceeds the scratch buffer")))
+        (.set (mem) bs src)
+        (let [n ((.-encode exports) src (.-length bs) 0 dst 0)]
+          (.decode decoder (.subarray (mem) dst (+ dst n))))))))
+
+(def ^:private ascii-inputs
+  (mapv js/String.fromCharCode (range 0 128)))
+
+(def ^:private utf8-inputs
+  ["é" "ü" "日" "本語" "🗄" "🇯🇵" "café" "日本/語" "Ω≈ç√" " " "�"])
+
+(def ^:private key-inputs
+  ["docs/readme.txt" "a b/c+d.png" "!'()*" "" "~-._"
+   "AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
+   "prefix/2026-07-25T12:00:00.000Z/日本語 file (1).pdf"
+   (str/join (map js/String.fromCharCode (range 32 127)))])
+
+(defn- agrees-on
+  "One assertion per GROUP, not per input: 147 passing assertions would drown
+  the summary, and the first mismatch is what a reader needs. The failure
+  message names the input."
+  [enc label inputs]
+  (let [bad (->> inputs
+                 (keep (fn [s]
+                         (let [expected (v4/uri-encode s)
+                               actual (enc s)]
+                           (when-not (= expected actual)
+                             (str (pr-str s) " -> clojure " (pr-str expected)
+                                  ", kotoba " (pr-str actual))))))
+                 (take 5)
+                 vec)]
+    (is (= [] bad) (str label ": " (count inputs) " inputs"))))
+
+(deftest kotoba-and-clojure-agree-byte-for-byte
+  (async done
+    (let [size (build!)]
+      (is (pos? size) (str "module emitted, " size " bytes"))
+      (-> (js/WebAssembly.instantiate (.readFileSync fs wasm-path) #js {})
+          (.then
+           (fn [m]
+             (let [exports (.. m -instance -exports)
+                   enc (kotoba-encoder exports)]
+               ;; The module's own self-test: the five characters
+               ;; encodeURIComponent wrongly exempts, three bytes each.
+               (is (= 15 ((.-main exports))) "main() self-test")
+               (testing "every ASCII code point — the classifier's whole decision surface"
+                 (agrees-on enc "ascii" ascii-inputs))
+               (testing "multi-byte UTF-8, where a charCodeAt encoder emits UTF-16"
+                 (agrees-on enc "utf8" utf8-inputs))
+               (testing "realistic S3 keys and query values"
+                 (agrees-on enc "key" key-inputs)))
+             (done)))
+          (.catch (fn [e]
+                    (is false (str "instantiate/compare threw: " (or (.-stack e) e)))
+                    (done)))))))
+
+(defmethod t/report [::t/default :end-run-tests] [m]
+  (when-not (t/successful? m)
+    (js/process.exit 1)))
+
+(t/run-tests 'kotoba-tests)

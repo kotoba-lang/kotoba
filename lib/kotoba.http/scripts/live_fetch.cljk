@@ -1,0 +1,176 @@
+;; A live composition: kotoba-lang/org-ietf-tls as the byte transport,
+;; kotoba.lang.http.wire as the HTTP/1.1 client on top of it.
+;;
+;;   kbb -M:live scripts/live_fetch.cljk
+;;
+;; org-ietf-tls is a SCRIPT-SCOPE dependency (the :live alias) and nothing
+;; else. `http` itself must not depend on TLS: it is Layer 3 of the
+;; foundational stdlib and the superproject enforces a layer DAG. The whole
+;; of the coupling is `tls-transport` below -- twenty lines that turn
+;; tls.client/write! and read! into the {:write :read} pair the wire layer
+;; asks for. Anything else that can move bytes both ways would do as well,
+;; which is the point.
+;;
+;; The provider is org-ietf-tls's SHIPPED `tls.provider.jvm`, passed straight
+;; to `client/handshake` with no adaptation. Measured at org-ietf-tls b91d4a1:
+;; `handshake` runs `tls.provider.vectors/adapt` on the raw provider itself, so
+;; the byte-array/byte-vector conversion happens once at the seam rather than at
+;; each call site. An earlier revision of this script carried a shim for that;
+;; it is deleted, because a documented workaround that is no longer needed reads
+;; as a live constraint to the next person.
+;;
+;; Exit 0 only if every check passed AND at least `check-floor` checks ran:
+;; a run that measured nothing must not report success (root ADR-2608136000).
+
+(require '[tls.client :as tls]
+         '[tls.provider.jvm :as provider]
+         '[tls.transport.jvm :as tp]
+         '[tls.result :as r]
+         '[kotoba.lang.http :as http]
+         '[kotoba.lang.http.wire :as w])
+
+(import '[java.security MessageDigest])
+
+(def host "kotobase.net")
+(def port 443)
+(def pin "50602ad366823fcf5274a7c917baa4fd24b9de4fd15635ff501177c83d05473e")
+(def check-floor 11)
+
+(def checks (atom {:ran 0 :failed 0}))
+
+(defn check! [label expected actual]
+  (let [pass (= expected actual)]
+    (swap! checks (fn [m] (-> m (update :ran inc) (update :failed #(if pass % (inc %))))))
+    (println (format "  [%s] %-28s expected %s  actual %s"
+                     (if pass "PASS" "FAIL") label (pr-str expected) (pr-str actual)))))
+
+(defn sha256-hex
+  "JDK digest, deliberately: the point is to check our assembled body against
+  something that is not our own code."
+  [octets]
+  (let [md (MessageDigest/getInstance "SHA-256")
+        ba (byte-array (map #(unchecked-byte %) octets))]
+    (apply str (map #(format "%02x" (bit-and % 0xff)) (.digest md ba)))))
+
+(defn tls-transport
+  "Adapt a live TLS 1.3 connection to the wire layer's transport seam.
+
+  This is the ENTIRE coupling between TLS and HTTP. `read!` hands back one
+  record at a time and signals close_notify as a value; the socket underneath
+  it signals a timeout by throwing, so that one throw is converted here --
+  at the seam, so that nothing above this line ever has to catch."
+  [conn]
+  {:write (fn [octets]
+            (let [res (tls/write! conn (vec octets))]
+              (if (r/ok? res) [:ok (count octets)] [:error :tls-write-failed (r/err res)])))
+   :read (fn []
+           (try
+             (let [res (tls/read! conn)]
+               (cond
+                 (r/error? res) [:error :tls-read-failed (r/err res)]
+                 (:tls/closed (r/val res)) [:eof]
+                 :else [:ok (:tls/content (r/val res))]))
+             (catch Exception e
+               [:error :transport-io {:message (.getMessage e)
+                                      :class (.getName (class e))}])))})
+
+(defn fetch
+  "One request over one fresh TLS connection. Returns the wire layer's own
+  [:ok resp] / [:error reason detail] value, plus handshake facts."
+  [path & [{:keys [spki-pin]}]]
+  (let [t (tp/socket-transport host port {:timeout-ms 15000})]
+    (try
+      (let [hs (tls/handshake (provider/provider) t
+                              {:server-name host
+                               :pin-spki-sha256 (or spki-pin pin)})]
+        (if (r/error? hs)
+          {:handshake-error (r/err hs)}
+          (let [conn (r/val hs)
+                res (w/exchange (tls-transport conn)
+                                (http/request :get (str "https://" host path)
+                                              {:headers {"Connection" "close"
+                                                         "User-Agent" "kotoba-lang/http.wire"}}))]
+            (tls/close! conn)
+            {:suite (:tls/suite conn)
+             :scheme (:tls/certificate-verify-scheme conn)
+             :auth (:tls/authentication conn)
+             :result res})))
+      (finally ((:close t))))))
+
+(defn report [label path expect-status expect-len expect-sha]
+  (println)
+  (println (str "=== GET " path " ==="))
+  (let [{:keys [suite scheme auth result handshake-error]} (fetch path)]
+    (if handshake-error
+      (do (println "  handshake FAILED:" (pr-str handshake-error))
+          (swap! checks (fn [m] (-> m (update :ran inc) (update :failed inc)))))
+      (do
+        (println (format "  tls          %s / %s / %s" suite scheme (pr-str auth)))
+        (if (w/error? result)
+          (do (println "  http ERROR   " (w/reason result) (pr-str (w/detail result)))
+              (swap! checks (fn [m] (-> m (update :ran inc) (update :failed inc)))))
+          (let [resp (w/value result)
+                body (:http/body resp)
+                declared (http/header (:http/headers resp) "content-length")]
+            (println (format "  status       %d %s (%s)"
+                             (:http/status resp) (:http/reason-phrase resp) (:http/version resp)))
+            (println (format "  content-type %s" (pr-str (http/header (:http/headers resp) "content-type"))))
+            (println (format "  declared CL  %s" (pr-str declared)))
+            (println (format "  assembled    %d octets" (count body)))
+            (println (format "  sha256       %s" (sha256-hex body)))
+            (check! (str label " status") expect-status (:http/status resp))
+            (check! (str label " bytes") expect-len (count body))
+            (when declared
+              (check! (str label " CL vs bytes") (str (count body)) declared))
+            (when expect-sha
+              (check! (str label " sha256") expect-sha (sha256-hex body)))))))))
+
+(println (str "live composition: org-ietf-tls transport + kotoba.lang.http.wire client"))
+(println (str "host " host ":" port "  spki-pin " pin))
+
+(report "llms.txt" "/llms.txt" 200 6391 nil)
+
+(report "empty-block"
+        "/ipfs/bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        200 0 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+(println)
+(println "=== GET /ipfs/bafkreicjlihajri6k5g4n66xvq3xsffb45qddog7q2wpolck5kddammoey ===")
+(let [{:keys [result handshake-error]}
+      (fetch "/ipfs/bafkreicjlihajri6k5g4n66xvq3xsffb45qddog7q2wpolck5kddammoey")]
+  (if (or handshake-error (w/error? result))
+    (do (println "  FAILED:" (pr-str (or handshake-error result)))
+        (swap! checks (fn [m] (-> m (update :ran inc) (update :failed inc)))))
+    (let [resp (w/value result)]
+      (println (format "  status       %d %s" (:http/status resp) (:http/reason-phrase resp)))
+      (println (format "  assembled    %d octets" (count (:http/body resp))))
+      (check! "missing-block status" 404 (:http/status resp)))))
+
+;; The pin must be load-bearing. A check that has never refused has not
+;; discriminated, and a green run of it means nothing.
+(println)
+(println "=== negative control: wrong SPKI pin ===")
+(let [{:keys [handshake-error]} (fetch "/llms.txt" {:spki-pin (apply str (repeat 64 "a"))})]
+  (check! "wrong pin refused" true (some? handshake-error))
+  (when handshake-error
+    (println "  refusal      " (pr-str handshake-error))
+    ;; Assert the ALERT and the REASON, not just that something failed. The
+    ;; first version of this control passed while the handshake was dying at
+    ;; ServerHello for an unrelated reason -- "it was refused" was true, and
+    ;; meaningless, because the pin was never reached. Checking the reason is
+    ;; what caught that.
+    ;;
+    ;; The literal reason is deliberate. It was :spki-pin-mismatch at
+    ;; org-ietf-tls b37f912 and is :peer-not-pinned at b91d4a1; this check is
+    ;; where that rename became visible instead of passing silently.
+    (check! "refusal alert" :bad_certificate (:tls/alert handshake-error))
+    (check! "refusal reason" :peer-not-pinned (:tls/reason handshake-error))))
+
+(println)
+(let [{:keys [ran failed]} @checks]
+  (println (format "LIVE-CHECKS\t%d\tFAILED\t%d\tFLOOR\t%d" ran failed check-floor))
+  (cond
+    (zero? ran) (do (println "REFUSING TO REPORT A PASS: no checks ran") (System/exit 2))
+    (< ran check-floor) (do (println "REFUSING TO REPORT A PASS: below check floor") (System/exit 2))
+    (pos? failed) (System/exit 1)
+    :else (println "all live checks passed")))
