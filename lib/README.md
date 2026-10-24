@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.wire` | `kotoba.wire/src` | `kotoba.wire.edn`, `kotoba.wire.framing`, `kotoba.wire.tcp` (Kotoba project library) |
 | `kotoba.techIpfsSpecsIpns` | `kotoba.techIpfsSpecsIpns/src` | `ipns.core`, `ipns.head`, `ipns.pubsub`, `ipns.record` (Kotoba project library) |
 | `kotoba.ioLibp2pSpecsTransport` | `kotoba.ioLibp2pSpecsTransport/src` | `libp2p.multistream`, `libp2p.provider.node`, `libp2p.provider.node-muxed`, `libp2p.yamux` (Kotoba project library) |
 | `kotoba.ioLibp2pSpecsKadDht` | `kotoba.ioLibp2pSpecsKadDht/src` | `kad.key`, `kad.lookup`, `kad.message`, `kad.routing` (Kotoba project library) |
