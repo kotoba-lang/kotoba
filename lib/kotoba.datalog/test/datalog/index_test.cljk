@@ -1,0 +1,203 @@
+(ns datalog.index-test
+  "Ported from `arrangement`'s `arrangement.core-test` -- the deftests that
+  cover the four covering indexes and nothing else. `arrangement`'s
+  `link-edn-safe-roundtrip` and `ref-indexing-naturalizes-to-ipld-link` are
+  deliberately NOT ported: they test the IPLD default this extraction
+  removed, and they belong to the persistence half that stayed behind."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [datalog.index :as index]))
+
+(def ^:private no-refs
+  "This fixture's objects are never references -- nothing reaches `:vaet`."
+  (constantly false))
+
+(deftest assert-and-lookup
+  (let [db (-> (index/empty-db)
+               (index/assert-quad {:s "alice" :p "role" :o "admin"} no-refs)
+               (index/assert-quad {:s "alice" :p "name" :o "Alice"} no-refs)
+               (index/assert-quad {:s "bob" :p "role" :o "user"} no-refs))]
+    (is (= {"role" #{"admin"} "name" #{"Alice"}} (index/entity-attrs db "alice")))
+    (is (= {"alice" #{"admin"} "bob" #{"user"}} (index/by-predicate db "role")))
+    (is (= #{"alice"} (index/by-predicate-value db "role" "admin")))
+    (is (= #{"bob"} (index/by-predicate-value db "role" "user")))))
+
+(deftest retract-removes-from-all-4-indices
+  (let [db (-> (index/empty-db)
+               (index/assert-quad {:s "alice" :p "role" :o "admin"} no-refs)
+               (index/retract-quad {:s "alice" :p "role" :o "admin"} no-refs))]
+    (is (= {} (index/entity-attrs db "alice")))
+    (is (= {} (index/by-predicate db "role")))
+    (is (= #{} (index/by-predicate-value db "role" "admin")))
+    (testing "the index maps are pruned empty, not left holding empty sets"
+      (is (= (index/empty-db) db)))))
+
+(deftest ref-indexing-is-opt-in
+  (let [ref? #(str/starts-with? % "bafy")
+        db (-> (index/empty-db)
+               (index/assert-quad {:s "alice" :p "knows" :o "bafybob"} ref?)
+               (index/assert-quad {:s "alice" :p "name" :o "Alice"} ref?))]
+    (is (= {"knows" #{"alice"}} (index/refs-to db "bafybob")))
+    (is (= {} (index/refs-to db "Alice")) "non-ref object is not reverse-indexed")
+    (testing "a matching ref? un-indexes it again"
+      (let [db2 (index/retract-quad db {:s "alice" :p "knows" :o "bafybob"} ref?)]
+        (is (= {} (index/refs-to db2 "bafybob")))))))
+
+(deftest ref-predicate-is-required-not-defaulted
+  ;; The one coupling this extraction cut: in `arrangement` these had an
+  ;; arity-2 form defaulting `ref?` to `ipld.core/link?`, which is the only
+  ;; reason the quad index ever mentioned IPLD. Here the caller must say.
+  ;; Called through `apply` so the ClojureScript compiler does not reject
+  ;; the arity statically -- the point is the RUNTIME behaviour. The two
+  ;; platforms fail for different reasons and that is fine: on the JVM a
+  ;; missing arity is an ArityException, while ClojureScript emits no arity
+  ;; check for a single-arity fn and instead dies calling the `nil` `ref?`.
+  ;; Either way there is no arity-2 form quietly supplying a default.
+  (testing "there is no arity-2 assert-quad/retract-quad to fall back on"
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 (apply index/assert-quad [(index/empty-db) {:s "a" :p "b" :o "c"}])))
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 (apply index/retract-quad [(index/empty-db) {:s "a" :p "b" :o "c"}]))))
+  (testing "(constantly false) is the no-reverse-index choice"
+    (let [db (index/assert-quad (index/empty-db) {:s "a" :p "b" :o "c"} no-refs)]
+      (is (= {} (:vaet db)))
+      (is (= {} (index/refs-to db "c")))))
+  (testing "(constantly true) reverse-indexes every object"
+    (let [db (index/assert-quad (index/empty-db) {:s "a" :p "b" :o "c"} (constantly true))]
+      (is (= {"b" #{"a"}} (index/refs-to db "c"))))))
+
+(deftest indexes-hold-values-not-just-strings
+  ;; s/p/o are opaque to this namespace -- it only uses them as map keys, so
+  ;; keywords/numbers/maps work exactly as well as strings. Nothing here
+  ;; decodes, hashes, or content-addresses a value.
+  (let [db (-> (index/empty-db)
+               (index/assert-quad {:s 1 :p :age :o 42} no-refs)
+               (index/assert-quad {:s 1 :p :tags :o #{:a :b}} no-refs))]
+    (is (= {:age #{42} :tags #{#{:a :b}}} (index/entity-attrs db 1)))
+    (is (= #{1} (index/by-predicate-value db :age 42)))))
+
+(deftest duplicate-assert-is-idempotent
+  (let [once (-> (index/empty-db)
+                 (index/assert-quad {:s "a" :p "b" :o "c"} no-refs))
+        twice (index/assert-quad once {:s "a" :p "b" :o "c"} no-refs)]
+    (is (= once twice))))
+
+;; ---------------------------------------------------------------- bulk ingest
+
+(deftest assert-quads-equals-reducing-assert-quad
+  ;; The whole contract. It is also what caught the first version: `assoc!` on a
+  ;; transient array-map returns a DIFFERENT object once it passes eight
+  ;; entries, and discarding that return value truncated every inner map at
+  ;; exactly eight -- a corruption no smaller fixture would have shown.
+  (let [ref? #(and (string? %) (str/starts-with? % "e"))
+        quads (vec (for [i (range 500)]
+                     {:s (str "e" (mod i 40)) :p (str "p" (mod i 7)) :o (str "o" (mod i 23))}))]
+    (is (= (reduce #(index/assert-quad %1 %2 ref?) (index/empty-db) quads)
+           (index/assert-quads (index/empty-db) quads ref?)))))
+
+(deftest assert-quads-crosses-the-array-map-boundary
+  ;; Nine inner keys, one more than a transient array-map holds.
+  (let [quads (vec (for [i (range 9)] {:s "one-subject" :p (str "p" i) :o "v"}))
+        db (index/assert-quads (index/empty-db) quads (constantly false))]
+    (is (= 9 (count (index/entity-attrs db "one-subject"))))))
+
+(deftest assert-quads-merges-into-a-non-empty-db
+  (let [ref? (constantly false)
+        a (vec (for [i (range 30)] {:s (str "s" i) :p "p" :o (str "o" i)}))
+        b (vec (for [i (range 30 60)] {:s (str "s" i) :p "p" :o (str "o" i)}))]
+    (is (= (reduce #(index/assert-quad %1 %2 ref?) (index/assert-quads (index/empty-db) a ref?) b)
+           (index/assert-quads (index/assert-quads (index/empty-db) a ref?) b ref?)))))
+
+(deftest assert-quads-indexes-refs-like-assert-quad
+  (let [ref? #(and (string? %) (str/starts-with? % "e"))
+        quads [{:s "e1" :p "knows" :o "e2"} {:s "e1" :p "name" :o "Ada"}]]
+    (is (= (reduce #(index/assert-quad %1 %2 ref?) (index/empty-db) quads)
+           (index/assert-quads (index/empty-db) quads ref?)))
+    (is (seq (index/refs-to (index/assert-quads (index/empty-db) quads ref?) "e2")))))
+
+(deftest assert-quads-on-an-empty-batch-changes-nothing
+  (let [db (index/assert-quads (index/empty-db) [{:s "a" :p "b" :o "c"}] (constantly false))]
+    (is (= db (index/assert-quads db [] (constantly false))))))
+
+(deftest builder-in-batches-equals-one-call
+  ;; The reason the builder exists: `assert-quads` walks the existing db's outer
+  ;; keys on every call, so looping it over batches is quadratic in the number
+  ;; of batches. The builder must produce the identical db without that walk.
+  (let [ref? (constantly false)
+        quads (vec (for [i (range 900)]
+                     {:s (str "s" (mod i 120)) :p (str "p" (mod i 9)) :o (str "o" (mod i 37))}))
+        one (index/assert-quads (index/empty-db) quads ref?)
+        batched (index/persist-db
+                 (reduce (fn [m b] (index/assert-quads! m b ref?))
+                         (index/mutable-db (index/empty-db))
+                         (partition-all 100 quads)))]
+    (is (= one batched))
+    (is (= (reduce #(index/assert-quad %1 %2 ref?) (index/empty-db) quads) batched))))
+
+(deftest builder-starts-from-a-non-empty-db
+  (let [ref? (constantly false)
+        a (vec (for [i (range 50)] {:s (str "s" i) :p "p" :o (str "o" i)}))
+        b (vec (for [i (range 50 130)] {:s (str "s" i) :p "p" :o (str "o" i)}))
+        base (index/assert-quads (index/empty-db) a ref?)]
+    (is (= (index/assert-quads base b ref?)
+           (index/persist-db
+            (reduce (fn [m x] (index/assert-quads! m x ref?))
+                    (index/mutable-db base) (partition-all 20 b)))))))
+
+(deftest builder-with-no-batches-round-trips
+  (let [db (index/assert-quads (index/empty-db) [{:s "a" :p "b" :o "c"}] (constantly false))]
+    (is (= db (index/persist-db (index/mutable-db db))))))
+
+(deftest by-predicate-range-is-half-open
+  (let [db (reduce (fn [d i]
+                     (index/assert-quad d {:s (str "s" i) :p "age" :o i} no-refs))
+                   (index/empty-db)
+                   (range 10))]
+    (is (= {"s3" #{3} "s4" #{4} "s5" #{5}}
+           (index/by-predicate-range db "age" 3 6)))
+    (is (not (contains? (index/by-predicate-range db "age" 3 6) "s6"))
+        "hi is exclusive")
+    (is (= {"s0" #{0} "s1" #{1}}
+           (index/by-predicate-range db "age" nil 2))
+        "nil lo is unbounded")
+    (is (= {"s8" #{8} "s9" #{9}}
+           (index/by-predicate-range db "age" 8 nil {:hi-open? true})))))
+
+;; ---------------------------------------------------------------------------
+;; The rename's own safety net.
+;;
+;; Both directions, deliberately: a guard that only ever passes and a guard
+;; that only ever throws are the same amount of evidence, which is none.
+
+(def ^:private legacy-db
+  "What `empty-db` returned before the four indexes were renamed to their
+  sort orders. Written out as a literal on purpose -- reconstructing it by
+  renaming keys back would make this test agree with whatever the current
+  code happens to do."
+  {:spo {"alice" {"role" #{"admin"}}}
+   :pso {"role" {"alice" #{"admin"}}}
+   :pos {"role" {"admin" #{"alice"}}}
+   :ocp {}})
+
+(deftest legacy-shape-is-detected
+  (is (index/legacy-db? legacy-db))
+  (is (not (index/legacy-db? (index/empty-db))))
+  (is (not (index/legacy-db? nil)))
+  (testing "a half-migrated db -- old keys plus new ones -- is still legacy"
+    (is (index/legacy-db? (merge legacy-db (index/empty-db))))))
+
+(deftest legacy-shape-throws-instead-of-answering-zero
+  (testing "the failure this replaces: the renamed index simply is not there"
+    (is (nil? (:eavt legacy-db)))
+    (is (empty? (get (:eavt legacy-db) "alice" {}))))
+  (testing "so the guard raises, and names both what it found and what it wants"
+    (let [e (is (thrown? js/Error
+                         (index/check-shape! legacy-db)))
+          d (ex-data e)]
+      (is (= :datalog.index/legacy-index-keys (:problem d)))
+      (is (= [:spo :pso :pos :ocp] (:found d)))
+      (is (= [:eavt :aevt :avet :vaet] (:expected d)))))
+  (testing "and a current db passes through unchanged"
+    (let [db (index/assert-quad (index/empty-db)
+                                {:s "alice" :p "role" :o "admin"} no-refs)]
+      (is (identical? db (index/check-shape! db))))))

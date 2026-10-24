@@ -1,0 +1,101 @@
+(ns datalog.projection-test
+  "ADR-2608021000 §6-5 B-3: drop variables no remaining clause and no output
+  needs, so bindings that differed only in a column nobody reads collapse.
+
+  Every test asserts the SAME query returns the same answer as it did before,
+  because pruning is only ever allowed to change how many intermediate rows
+  exist -- never which rows come out. The one case where it is NOT allowed is
+  aggregates, where multiplicity is the answer, and that has its own test."
+  (:require [kotoba.test :refer [deftest is]]
+            [datalog.index :as index]
+            [datalog.core :as d]))
+
+(def ^:private everything (constantly true))
+
+(def ^:private no-refs
+  "`datalog.index/assert-quad`'s `ref?`, which is REQUIRED here (arrangement
+  defaulted it to `ipld.core/link?`; this library has no IPLD to default to).
+  These fixtures use no reverse-reference lookup, so nothing is `:vaet`-indexed."
+  (constantly false))
+
+(defn- db-of [quads]
+  (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} no-refs)) (index/empty-db) quads))
+
+(defn- social
+  "Every person knows the next two; each authors two messages. The two-hop
+  shape: ?f1 is a join key on the way in and dead weight afterwards."
+  [n]
+  (db-of (concat
+          (for [i (range n) delta [1 2]] [(str "p" i) "knows" (str "p" (mod (+ i delta) n))])
+          (for [i (range n) m [0 1]] [(str "m" i "-" m) "creator" (str "p" i)])
+          (for [i (range n) m [0 1]] [(str "m" i "-" m) "date" (str (+ (* i 10) m))]))))
+
+(def ^:private two-hop
+  '{:find [?f2 ?msg ?date]
+    :in [?person]
+    :where [[?person "knows" ?f1]
+            [?f1 "knows" ?f2]
+            [?msg "creator" ?f2]
+            [?msg "date" ?date]]})
+
+(deftest a-dead-join-variable-does-not-change-the-answer
+  ;; ?f1 is bound by step 0, used by step 1, and never read again. The rows
+  ;; must be identical whether or not it is carried to the end.
+  (let [db (social 30)
+        answer (d/q db two-hop everything ["p0"])
+        ;; same query with ?f1 kept alive by naming it in :find, then dropped
+        with-f1 (d/q db (assoc two-hop :find '[?f2 ?msg ?date ?f1]) everything ["p0"])]
+    (is (seq answer))
+    (is (= answer (into #{} (map (comp vec butlast)) with-f1))
+        "projecting ?f1 away yields exactly the rows the pruned query returns")))
+
+(deftest pruning-does-not-drop-a-variable-a-later-clause-joins-on
+  ;; ?msg is bound at step 2 and joined at step 3, and is not in :find. If
+  ;; pruning were keyed on :find alone it would be dropped, step 3 would run
+  ;; with ?msg unbound, and the query would return EVERY date in the database
+  ;; instead of the four belonging to p0's friends.
+  (let [db (social 20)
+        q '{:find [?date] :in [?person]
+            :where [[?person "knows" ?f] [?msg "creator" ?f] [?msg "date" ?date]]}
+        answer (d/q db q everything ["p0"])]
+    (is (= #{["10"] ["11"] ["20"] ["21"]} answer)
+        "p0 knows p1 and p2; their four messages carry dates 10, 11, 20, 21")
+    (is (= 40 (count (d/q db (assoc q :where '[[?msg "date" ?date]]) everything ["p0"])))
+        "and the whole database has 40 dates, which is what a dropped ?msg would have returned")))
+
+(deftest a-variable-used-only-inside-a-negation-survives
+  (let [db (social 20)
+        q '{:find [?f] :in [?person]
+            :where [[?person "knows" ?f]
+                    (not [?f "knows" ?person])]}]
+    (is (= #{["p1"] ["p2"]} (d/q db q everything ["p0"]))
+        "p0 knows p1 and p2; neither knows p0 back in a 20-ring with +1/+2")))
+
+(deftest a-variable-used-only-inside-an-or-join-survives
+  (let [db (social 20)
+        q '{:find [?m] :in [?person]
+            :where [(or-join [?m ?person]
+                             [?m "creator" ?person]
+                             (and [?person "knows" ?f] [?m "creator" ?f]))]}]
+    (is (= 6 (count (d/q db q everything ["p0"])))
+        "own two messages plus two friends' two each")))
+
+(deftest aggregates-are-not-pruned-because-multiplicity-is-the-answer
+  ;; ?f1 is dead for OUTPUT but alive for COUNTING: each ?msg is reachable
+  ;; through one ?f1 here, but a shape where it is reachable through two must
+  ;; count two. Pruning would merge them.
+  (let [db (db-of [["p0" "knows" "a"] ["p0" "knows" "b"]
+                   ["a" "knows" "z"] ["b" "knows" "z"]
+                   ["m1" "creator" "z"]])
+        q '{:find [(count ?msg)] :in [?person]
+            :where [[?person "knows" ?f1]
+                    [?f1 "knows" ?f2]
+                    [?msg "creator" ?f2]]}]
+    (is (= #{[2]} (d/q db q everything ["p0"]))
+        "z is reached through both a and b, so ?msg is counted twice -- pruning ?f1 would say 1")))
+
+(deftest order-by-keys-survive-pruning
+  (let [db (social 20)
+        r (d/q db (assoc two-hop :order-by '[[?date :desc]] :limit 3) everything ["p0"])]
+    (is (= 3 (count r)))
+    (is (apply >= (map #(parse-long (nth % 2)) r)) "still ordered by the pruned-through key")))
