@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.ooyake` | `kotoba.ooyake/src` | `ooyake.cells.reconcile.cell`, `ooyake.cells.reconcile.state-machine`, `ooyake.cells.social-post.state-machine`, `ooyake.cells.world-model.cell` (Kotoba project library) |
 | `kotoba.ontology` | `kotoba.ontology/src` | `kotoba.ontology`, `kotoba.ontology.connector` (Kotoba project library) |
 | `kotoba.ongaku` | `kotoba.ongaku/src` | `ongaku.catalog`, `ongaku.commission`, `ongaku.compose`, `ongaku.holdings` (Kotoba project library) |
 | `kotoba.oneTimeLink` | `kotoba.oneTimeLink/src` | `one-time-link.core` (Kotoba project library) |

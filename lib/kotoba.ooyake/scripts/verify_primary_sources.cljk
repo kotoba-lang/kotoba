@@ -1,0 +1,202 @@
+#!/usr/bin/env kbb
+;; scripts/verify_primary_sources.cljk — ooyake 公 — 公人の在任を **当局自身のページ**で
+;; 裏取りし、確認できた行だけを :third-party → :authoritative へ昇格させる
+;; （com-junkawasaki/root ADR-2607253400）。
+;;
+;;   kbb --backend sci scripts/verify_primary_sources.cljk            # 測るだけ
+;;   kbb --backend sci scripts/verify_primary_sources.cljk --apply    # 昇格を registry に書き戻す
+;;
+;; ## なぜ要るか
+;;
+;; 公人 1,046 行は provenance が全件 `wikidata`（＝ aggregator ＝3次）なのに、
+;; `:sourcing` は `:authoritative` を名乗っていた。ooyake の語彙で authoritative は
+;; 「当局から得た」を意味する（gov-units 7,085 行は official-url を provenance に持つ）
+;; ので、これは**行われていない1次確認を主張していた**ことになる。
+;;
+;; 直し方は2つあった: 語彙を緩めるか、主張を実測に合わせるか。後者を採った。
+;; fetch 側は今後 `:third-party` で出し、このスクリプトが確認できた行だけを昇格させる。
+;;
+;; ## 何をもって「確認」とするか
+;;
+;; その組織の `:gov.unit/official-url` を取得し、**人物名がそのページに現れるか**を見る。
+;; 現れたら `:authoritative` + `:gov.person/source-url`（その URL）+ `:source-checked`
+;; （確認日）を付ける。
+;;
+;; これは弱い証拠であることを承知で使う——「名前がトップページに載っている」は
+;; 「その職に就いている」の証明ではない。だが *記載が無い* ことは確実に「未確認」で
+;; あり、今主張している `:authoritative` よりは厳密に真に近い。強い証拠（官報の
+;; 任命告示、閣僚一覧ページの構造化取得）は国ごとに形が違うので、汎用の第一歩として
+;; ここから始める。昇格した行は `:source-url` を持つので、後から人が1本ずつ検証できる。
+;;
+;; 名前は英語表記と現地表記の両方で探す。政府サイトは自国語なので、英語名しか持たない
+;; 行は原理的に不利になる——これは手法の限界としてそのまま出る（隠さない）。
+;;
+;; ## しないこと
+;;
+;; 403 を返すサイトを UA 偽装で抜けない。検索エンジンや第三者サイトで代用しない
+;; （それでは3次のまま名前を変えるだけになる）。ページに無ければ未確認のまま置く。
+
+(require '[kotoba.lang.edn :as edn]
+         '[kotoba.lang.text :as str]
+         '["node:fs" :as fs])
+
+(def argv (vec *command-line-args*))
+(def apply? (contains? (set argv) "--apply"))
+(def timeout-ms (js/parseInt (or (.. js/process -env -OOYAKE_PRIMARY_TIMEOUT_MS) "10000") 10))
+(def concurrency 6)
+
+(def user-agent
+  "ooyake/1.0 (+https://github.com/etzhayyim/com-etzhayyim-ooyake; world government atlas, public-office holders only)")
+
+(defn- registry-files [prefix]
+  (filter #(and (str/starts-with? % prefix) (str/ends-with? % ".edn")
+                (not (str/includes? % ".schema.")))
+          (js->clj (.readdirSync fs "registry"))))
+
+(defn- read-edn [p] (edn/read-string (str (.readFileSync fs (str "registry/" p) "utf8"))))
+
+(defn- today [] (subs (.toISOString (js/Date.)) 0 10))
+
+(defn fetch-text [url]
+  (if (str/blank? (str url))
+    (js/Promise.resolve {:error "no URL"})
+    (let [c (js/AbortController.)
+          t (js/setTimeout #(.abort c) timeout-ms)]
+      (-> (js/fetch url #js {:signal (.-signal c) :redirect "follow"
+                             :headers #js {"User-Agent" user-agent
+                                           "Accept" "text/html,application/xhtml+xml,*/*"}})
+          (.then (fn [r] (.then (.text r) (fn [b] {:status (.-status r) :body b}))))
+          (.catch (fn [e] {:error (or (.-message e) (str e))}))
+          (.finally (fn [] (js/clearTimeout t)))))))
+
+(defn- strip-tags [html]
+  (-> html
+      (str/replace #"(?s)<script.*?</script>" " ")
+      (str/replace #"(?s)<style.*?</style>" " ")
+      (str/replace #"<[^>]*>" " ")
+      (str/replace #"\s+" " ")))
+
+(defn- normalize [s]
+  (-> (str s)
+      str/lower
+      ;; アクセント記号を落として比較する（政府サイトの表記ゆれ吸収）。
+      (.normalize "NFD")
+      (str/replace #"[̀-ͯ]" "")
+      (str/replace #"\s+" " ")
+      str/trim))
+
+(defn name-present?
+  "人物名がページ本文に現れるか。姓名を丸ごと含むか、または **姓が独立した語として**
+  現れることを条件にする。姓だけの部分一致を許すと `Li` のような短い姓が誤爆するので、
+  4文字以上の姓に限る。"
+  [text person]
+  (let [t (normalize text)
+        candidates (keep identity [(:gov.person/name-en person) (:gov.person/name-native person)])]
+    (boolean
+     (some (fn [nm]
+             (let [n (normalize nm)]
+               (or (and (>= (count n) 6) (str/includes? t n))
+                   (let [surname (last (str/split n #" "))]
+                     (and surname (>= (count surname) 4)
+                          (re-find (re-pattern (str "(?:^| )" (str/re-quote surname) "(?:$| |,|\\.)")) t))))))
+           candidates))))
+
+(defn check-one [person]
+  (let [url (:gov.person/official-url person)]
+    (if (str/blank? (str url))
+      (js/Promise.resolve {:person person :ok false :reason "no official-url on the unit"})
+      (-> (fetch-text url)
+          (.then (fn [{:keys [status body error]}]
+                   (cond
+                     error {:person person :ok false :reason (str "unreachable: " error)}
+                     (not= 200 status) {:person person :ok false :reason (str "HTTP " status)}
+                     :else (if (name-present? (strip-tags body) person)
+                             {:person person :ok true :url url}
+                             ;; ページには届いたが名前が無い = 積極的な反証。到達不能とは
+                             ;; 区別する（前者は降格の根拠になり、後者はならない）。
+                             {:person person :ok false :contradicted true
+                              :reason "name not found on the authority's page"}))))))))
+
+(defn check-batch [people]
+  (letfn [(step [acc remaining n]
+            (if (empty? remaining)
+              (js/Promise.resolve acc)
+              (let [[b r] (split-at concurrency remaining)]
+                (-> (js/Promise.all (clj->js (map check-one b)))
+                    (.then (fn [rs]
+                             (let [rs (js->clj rs :keywordize-keys true)
+                                   n (+ n (count rs))]
+                               (when (zero? (mod n 120))
+                                 (println (str "  … " n "/" (count people) " checked")))
+                               (step (into acc rs) r n))))))))]
+    (step [] (vec people) 0)))
+
+(defn decide-sourcing
+  "1行の :sourcing を今回の結果から決める。**昇格だけでなく降格もする** — これが
+  このスクリプトの存在理由なので、確認できなかった行を放置して :authoritative の
+  ままにするのは、直そうとしていた嘘をそのまま残すことになる（実測: 初回実行後、
+  1,046 行すべてが :authoritative なのに :source-url を持つのは 181 行だけ、という
+  状態が出来ていた）。
+
+  3つに分ける:
+
+  - **確認できた** → :authoritative ＋ :source-url ＋ :source-checked。
+  - **ページには届いたが名前が無い** → :third-party に落とし、:source-url も外す。
+    届いて載っていないのは積極的な反証で、多くは在任者が交代している。
+  - **そもそも届かなかった**（403 / timeout / DNS）→ **前回の判断を保持する**。
+    情報がゼロなのだから、それを降格の根拠にしてはいけない。政府サイトが今日
+    こちらの bot を断ったことは、その人が退任した証拠ではない。"
+  [person result]
+  (cond
+    (:ok result)
+    (assoc person :gov.person/sourcing :authoritative
+                  :gov.person/source-url (:url result)
+                  :gov.person/source-checked (today))
+
+    (:contradicted result)
+    (-> person
+        (assoc :gov.person/sourcing :third-party)
+        (dissoc :gov.person/source-url :gov.person/source-checked))
+
+    ;; 到達不能: 既に確認済みならそれを保持、まだなら :third-party のまま。
+    (:gov.person/source-url person) person
+
+    :else (assoc person :gov.person/sourcing :third-party)))
+
+(defn -main []
+  (let [files (registry-files "gov-officeholders.")
+        by-file (into {} (for [f files] [f (:people (read-edn f))]))
+        people (mapcat val by-file)]
+    (println (str "checking " (count people) " office holders against their authority's own page"
+                  " (timeout " timeout-ms "ms, concurrency " concurrency ")"))
+    (-> (check-batch people)
+        (.then
+         (fn [results]
+           (let [ok (filter :ok results)
+                 by-key (into {} (for [r results] [[(:gov.person/id (:person r))] r]))
+                 reasons (frequencies (map #(or (:reason %) "confirmed") results))]
+             (println (str "\nconfirmed on the authority's own page: " (count ok) "/" (count results)
+                           "  (" (Math/round (* 100.0 (/ (count ok) (max 1 (count results))))) "%)"))
+             (doseq [[r n] (sort-by (comp - val) reasons)] (println (str "  " n "  " r)))
+             (if-not apply?
+               (println "\n(report only — pass --apply to promote confirmed rows to :authoritative)")
+               (do
+                 (doseq [[f people] by-file]
+                   (let [updated (mapv (fn [p] (decide-sourcing p (get by-key [(:gov.person/id p)])))
+                                       people)
+                         path (str "registry/" f)
+                         raw (str (.readFileSync fs path "utf8"))
+                         header (subs raw 0 (str/index-of raw "\n{:graph"))]
+                     (.writeFileSync fs path
+                                     (str header
+                                          "\n{:graph {:name \"gov-atlas-v1\" :visibility :public}\n\n :people\n ["
+                                          (str/join "\n\n  " (map pr-str updated))
+                                          "]}\n"))))
+                 (println (str "wrote " (count by-file) " registry file(s); "
+                               (count ok) " row(s) :authoritative with a :source-url, "
+                               (count (filter :contradicted results)) " demoted to :third-party"
+                               " (page reachable, name absent), "
+                               (count (remove #(or (:ok %) (:contradicted %)) results))
+                               " left unchanged (unreachable — no evidence either way)"))))))))))
+
+(-main)

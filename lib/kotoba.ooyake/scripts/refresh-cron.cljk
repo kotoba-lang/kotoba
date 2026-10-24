@@ -1,0 +1,117 @@
+#!/usr/bin/env kbb
+;; scripts/refresh-cron.cljk — ooyake 公 — 週次の feed 再測定を無人で回す
+;; （com-junkawasaki/root ADR-2607253200）。
+;;
+;; launchd（`scripts/launchd/com.etzhayyim.ooyake.refresh-officeholders.plist`）から
+;; 呼ばれる。GitHub Actions を使わない経路 — `.github/workflows/` への書き込みには
+;; OAuth token の `workflow` scope が要り、このワークスペースのトークンは持っていない。
+;; 等価な Actions 版は `.github/workflows-pending/refresh-officeholders.yml` に温存してあり、
+;; scope が付いた日に `git mv` すれば置き換えられる。どちらもこのスクリプトと同じ
+;; `verify-feeds.cljs` を同じ引数で叩くだけなので、二重メンテにはならない。
+;;
+;; ## 専用 clone で動く
+;;
+;; このスクリプトは **`~/.ooyake/refresh-clone`** という専用 clone の中から走る。
+;; west 管理下の共有 checkout（`orgs/etzhayyim/com-etzhayyim-ooyake`）では走らせない
+;; — 無人ジョブが `git reset --hard` / `git clean -fd` する場所と、人や他セッションが
+;; 編集する場所を同じにしてはいけない（root AGENTS.md「共有 checkout には直接
+;; commit/push しない」）。
+;;
+;; この危険は机上の話ではない: 2026-07-25、このスクリプト自身をまだ commit する前に
+;; clone 内でテスト実行したところ、下の `clean -fd` が untracked だった自分自身を
+;; 消した。共有 checkout で同じことが起きれば、消えるのは他人の未コミット作業になる。
+;;
+;; ## 毎回 origin/main から始める
+;;
+;; 前回の実行が途中で落ちていても残骸を引き継がないように、まず `fetch` +
+;; `reset --hard origin/main` + `clean -fd` で既知の状態に戻す。無人ジョブが積み上げた
+;; 半端な状態を「変更」として commit するのが一番たちが悪い。
+;;
+;; ## 測定が壊れたら何も書かない
+;;
+;; `fetch_officeholders.cljs` 自身が、あるグループの件数が前回比 70% を割ったら書き込みを
+;; 拒否して非ゼロ終了する。WDQS の一時障害を「これらの役職は空席になった」として commit
+;; するのが、この無人化で一番避けたい事故。
+;;
+;; さらに `verify_officeholders.cljs` を **必須ステップ**として通す。孤児参照・id 重複・
+;; G6 の私的属性・provenance 欠落のいずれかがあれば commit しない。つまり **G6 の境界が
+;; 自動書き込みのたびに強制される**（人が見たときだけでなく）。
+
+(require '[kotoba.lang.text :as str]
+         '["node:child_process" :as cp]
+         '["node:path" :as path])
+
+(def repo-dir
+  "このスクリプトが置かれている clone のルート。plist が絶対パスで叩くので cwd では
+  決められず、`process.argv[1]` も nbb バイナリ自身を指す（実測: `/opt/homebrew` に
+  解決されて全ファイルが見つからなくなった）。nbb が束縛する `*file*` が正しい出所。"
+  (path/resolve (path/dirname *file*) ".."))
+
+(defn- run!
+  "同期実行して {:code n} を返す。出力は親の stdout にそのまま流す
+  （launchd のログファイルが唯一の観測窓なので握り潰さない）。"
+  [cmd args]
+  (println (str "$ " cmd " " (str/join " " args)))
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      #js {:cwd repo-dir :stdio "inherit" :env (.. js/process -env)})]
+    {:code (or (.-status r) 1)}))
+
+(defn- git-out [args]
+  (let [r (.spawnSync cp "git" (clj->js args) #js {:cwd repo-dir :encoding "utf8"})]
+    (str/trim (or (.-stdout r) ""))))
+
+(defn- fail! [msg code]
+  (println (str "refresh-cron: ABORT — " msg))
+  (.exit js/process code))
+
+(println (str "refresh-cron (ooyake) — " (.toISOString (js/Date.)) " — " repo-dir))
+
+;; 1. 既知の状態へ
+(when (pos? (:code (run! "git" ["fetch" "--quiet" "origin"])))
+  (fail! "git fetch failed — no network or no credential; nothing measured, nothing written" 1))
+(run! "git" ["reset" "--quiet" "--hard" "origin/main"])
+(run! "git" ["clean" "-qfd"])
+
+;; 2. 測り直す（失敗したらここで止まる — 部分的な結果を commit しない）
+(let [{:keys [code]} (run! "kbb" ["--backend" "sci" "scripts/fetch_officeholders.cljk"])]
+  (when (pos? code)
+    (fail! (str "fetch_officeholders exited " code
+                " — either the run failed or its collapse guard refused to write."
+                " The registry is untouched, which is the correct outcome.")
+           code)))
+
+;; 3. 憲章ゲートを通す（孤児・id 重複・G6 私的属性・provenance）
+(let [{:keys [code]} (run! "kbb" ["--backend" "sci" "scripts/verify_officeholders.cljk"])]
+  (when (pos? code)
+    (fail! "verify_officeholders failed — the registry violates the linkage/G6/provenance gate and will not be committed" 1)))
+
+;; 3b. official-url の到達率を測ってログに残す（ADR-2607253400）。
+;;
+;; これは **ゲートではない**。到達しない政府サイトがあっても registry は書き換えないし
+;; ジョブも失敗させない — 403 や DNS 障害は「その省庁が存在しない」を意味しないし、
+;; こちらから届かないことと相手が公表していないことは別物だから。measurement を毎週
+;; ログに残して推移が見えるようにするのが目的で、feed 側にだけ再測定があってこちらに
+;; 無いという非対称を埋める。失敗しても後続に進む。
+(run! "kbb" ["--backend" "sci" "scripts/verify_unit_urls.cljk"])
+
+;; 4. 差分があれば着地させる
+(if (str/blank? (git-out ["status" "--porcelain" "--" "registry"]))
+  (println "refresh-cron: no change — every office holder reads the same as last run")
+  (do
+    (run! "git" ["config" "user.name" "ooyake-refresh"])
+    (run! "git" ["config" "user.email" "ooyake-refresh@localhost"])
+    (run! "git" ["add" "registry"])
+    (when (pos? (:code (run! "git" ["commit" "-q" "-m"
+                                    (str "chore(registry): scheduled office-holder refresh\n\n"
+                                         "Automated by scripts/refresh-cron.cljk via launchd\n"
+                                         "(ADR-2607253200). :gov.person/last-verified carries this run's date;\n"
+                                         "changed rows are office turnovers or upstream corrections.")])))
+      (fail! "git commit failed" 1))
+    (when (pos? (:code (run! "git" ["push" "--quiet" "origin" "HEAD:main"])))
+      (fail! (str "git push failed — the commit exists only in this clone and the next run's"
+                  " reset will discard it. Nothing is lost: the next run re-measures from"
+                  " scratch.")
+             1))
+    (println "refresh-cron: pushed")))
+
+(println "refresh-cron: done")

@@ -1,0 +1,130 @@
+(ns ooyake.query
+  "query.clj — ooyake 公 の registry を DataScript にロードして datalog で問い合わせる
+  CLI（com-junkawasaki/root ADR-2607253400 の follow-up）。
+
+      kbb -M:query count
+      kbb -M:query coverage
+      kbb -M:query holders --jurisdiction jpn
+      kbb -M:query q '[:find ?name ?unit
+                           :where [?p :gov.person/name-en ?name]
+                                  [?p :gov.person/unit ?uid]
+                                  [?u :gov.unit/id ?uid]
+                                  [?u :gov.unit/name-en ?unit]]'
+
+  ## なぜ要るか
+
+  kawaraban には `kbb -M:query` があり、ooyake には無かった。7,089 の政府組織と
+  1,046 の公人を持ちながら、それを datalog で引くには各自がローダを書くしかない、
+  という非対称。registry は既に datom 形で、`gov-officeholders.schema.edn` という
+  transact 可能なスキーマまである——足りなかったのは読み手だけ。
+
+  ## 1次確認の別勘定（これがこの CLI の要点）
+
+  `count` は `:authoritative`（当局自身のページで在任を確認し `:source-url` を持つ）と
+  `:third-party`（Wikidata 由来・当局未確認）を **別々に数える**。合算すると
+  「1,046 名を把握している」に見えるが、当局で裏が取れているのは 185 名で、これは
+  別の事実。まとめて1つの数字にすることが、そもそもこの registry が長らく全行
+  `:authoritative` を名乗っていた原因だった。"
+  (:require [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.pprint :as pp]
+            [kotoba.lang.text :as str]
+            [datascript.core :as d]))
+
+(def ^:private ds-schema-keys
+  #{:db/cardinality :db/unique :db/index :db/isComponent :db/tupleAttrs})
+
+(defn ->datascript-schema
+  "Datomic 形（:db/ident 付き map の vector）→ DataScript 形 {attr {…}}。
+  :db/valueType は :db.type/ref のときだけ意味を持つ（他は Datomic 専用の型宣言）。"
+  [datomic-schema]
+  (reduce (fn [m {:db/keys [ident valueType] :as attr-def}]
+            (let [kept (cond-> (select-keys attr-def ds-schema-keys)
+                         (= valueType :db.type/ref) (assoc :db/valueType :db.type/ref))]
+              (cond-> m (seq kept) (assoc ident kept))))
+          {}
+          datomic-schema))
+
+(defn- registry-files [prefix]
+  (->> (.listFiles (io/file "registry"))
+       (map #(.getName ^java.io.File %))
+       (filter #(and (str/starts-with? % prefix) (str/ends-with? % ".edn")
+                     (not (str/includes? % ".schema."))))
+       sort))
+
+(defn- read-registry [name] (edn/read-string (slurp (io/file "registry" name))))
+
+(def ^:private unit-schema
+  "gov-units は :gov.unit/id を一意キーとして持つが、その宣言は seed ファイルの
+  :schema ブロックに埋まっている。ここで最低限を明示しておくと、seed が無い構成でも
+  同じ upsert 規則で読める。"
+  [#:db{:ident :gov.unit/id :valueType :db.type/string
+        :cardinality :db.cardinality/one :unique :db.unique/identity}
+   #:db{:ident :gov.unit/cofog :valueType :db.type/string
+        :cardinality :db.cardinality/many}
+   #:db{:ident :gov.unit/external-code :valueType :db.type/string
+        :cardinality :db.cardinality/many}])
+
+(defn load-db []
+  (let [person-schema (:schema (read-registry "gov-officeholders.schema.edn"))
+        schema (->datascript-schema (concat unit-schema person-schema))
+        units (mapcat #(:units (read-registry %)) (registry-files "gov-units."))
+        people (mapcat #(:people (read-registry %)) (registry-files "gov-officeholders."))
+        conn (d/create-conn schema)]
+    (d/transact! conn (vec units))
+    (d/transact! conn (vec people))
+    {:db (d/db conn) :counts {:units (count units) :people (count people)}}))
+
+(defn -main [& argv]
+  (let [{:keys [db counts]} (load-db)
+        n (fn [q] (or (d/q q db) 0))]
+    (binding [*out* *err*]
+      (println (str "loaded " (:units counts) " gov unit(s) + "
+                    (:people counts) " office holder(s) from registry/")))
+    (case (first argv)
+      (nil "count")
+      (pp/pprint
+       {:units (n '[:find (count ?u) . :where [?u :gov.unit/id]])
+        :units-with-official-url (n '[:find (count ?u) . :where [?u :gov.unit/official-url]])
+        :jurisdictions (count (d/q '[:find ?j :where [?u :gov.unit/jurisdiction ?j]] db))
+        :office-holders (n '[:find (count ?p) . :where [?p :gov.person/id]])
+        ;; 別勘定にする理由は ns docstring 参照。
+        :holders-authoritative (n '[:find (count ?p) . :where [?p :gov.person/sourcing :authoritative]])
+        :holders-third-party (n '[:find (count ?p) . :where [?p :gov.person/sourcing :third-party]])
+        :holders-with-source-url (n '[:find (count ?p) . :where [?p :gov.person/source-url]])
+        :jurisdictions-with-a-primary-confirmation
+        (count (d/q '[:find ?j :where [?p :gov.person/sourcing :authoritative]
+                      [?p :gov.person/jurisdiction ?j]] db))})
+
+      "coverage"
+      (doseq [row (sort (d/q '[:find ?j (count ?p)
+                               :where [?p :gov.person/jurisdiction ?j]] db))]
+        (println (format "%-5s %d" (nth row 0) (nth row 1))))
+
+      "holders"
+      (let [j (second (drop-while #(not= "--jurisdiction" %) argv))
+            rows (d/q '[:find ?role ?name ?since ?sourcing ?unit-name
+                        :in $ ?j
+                        :where
+                        [?p :gov.person/jurisdiction ?j]
+                        [?p :gov.person/role-en ?role]
+                        [?p :gov.person/name-en ?name]
+                        [?p :gov.person/sourcing ?sourcing]
+                        [?p :gov.person/unit ?uid]
+                        [?u :gov.unit/id ?uid]
+                        [?u :gov.unit/name-en ?unit-name]
+                        [(get-else $ ?p :gov.person/since "—") ?since]]
+                      db j)]
+        (doseq [row (sort rows)]
+          (println (format "%-34s %-28s %-11s %-13s %s"
+                           (nth row 0) (nth row 1) (nth row 2)
+                           (name (nth row 3)) (nth row 4)))))
+
+      "q"
+      (if-let [qs (second argv)]
+        (pp/pprint (d/q (edn/read-string qs) db))
+        (binding [*out* *err*] (println "usage: kbb -M:query q '<datalog edn>'") (System/exit 2)))
+
+      (binding [*out* *err*]
+        (println "usage: kbb -M:query count|coverage|holders --jurisdiction <iso3>|q '<datalog>'")
+        (System/exit 2)))))
