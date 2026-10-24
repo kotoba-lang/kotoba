@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.annotation` | `kotoba.annotation/src` | `annotation.core` (Kotoba project library) |
 | `kotoba.agent` | `kotoba.agent/src` | `agent.run` (Kotoba project library) |
 | `kotoba.adnet` | `kotoba.adnet/src` | `adnet.billing`, `adnet.core`, `adnet.entitlement` (Kotoba project library) |
 | `kotoba.activity` | `kotoba.activity/src` | `kotoba.activity` (Kotoba project library) |
