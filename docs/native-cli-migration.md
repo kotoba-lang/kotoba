@@ -54,6 +54,8 @@ Amu selfhost compiler. These are internal check modes. The lock mode does not
 yet read and verify its whole source closure or expose the computed CID on the
 public CLI. The public launcher, other `check` modes, and the remaining command
 execution paths are still open.
+An input path for `cli-contract` and unsupported `--source-path`, `--json`, or
+`--safe=false` forms are refused rather than silently accepted.
 
 `src/kotoba/cli.kotoba` produces validated requests. Parsing a command does
 not execute it, approve a provider operation, admit a package or qualify a
