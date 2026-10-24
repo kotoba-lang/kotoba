@@ -1,0 +1,167 @@
+;; Persistent AVL tables for internal compiler identities and ordinal sets.
+;; No document wrapping, keyword/string flattening or 32-entry map/set ceiling.
+;; Native invariants and large-case receipts: docs/canonical-native-migration.md.
+(ns kotoba.mir.table
+  {:kotoba/export [empty nil-key index-key keyword-key symbol-key compare-key scalar members-value data members
+                  count height get put remove key-at value-at valid?
+                  sorted-pages sorted-append sorted-build]}
+  (:require [kotoba.gmir.node :as node])
+  (:schemas
+   {:mir.table/entry [:record :mir.table/entry [[:key [:ref :mir.table/key]] [:value [:ref :mir.table/value]]]]
+    :mir.table/page [:record :mir.table/page [[:items [:list [:ref :mir.table/entry]]]]]
+    :mir.table/key [:record :mir.table/key
+      [[:kind :keyword] [:index :i64] [:namespace [:option [:ref :gmir.node/text]]]
+       [:name [:ref :gmir.node/text]]]]
+    :mir.table/value [:record :mir.table/value
+      [[:data [:ref :gmir.node/value]] [:members [:option [:ref :mir.table/tree]]]]]
+    :mir.table/tree [:record :mir.table/tree
+      [[:key [:ref :mir.table/key]] [:value [:ref :mir.table/value]]
+       [:left [:option [:ref :mir.table/tree]]] [:right [:option [:ref :mir.table/tree]]]
+       [:height :i64] [:count :i64]]]}))
+
+(defn nil-key [] [:ref :mir.table/key]
+  (record-new [:ref :mir.table/key] :nil 0 (option-none-of [:option [:ref :gmir.node/text]]) (node/empty-text)))
+(defn index-key [index :i64] [:ref :mir.table/key]
+  (record-new [:ref :mir.table/key] :index index (option-none-of [:option [:ref :gmir.node/text]]) (node/empty-text)))
+(defn keyword-key [namespace [:option [:ref :gmir.node/text]] name [:ref :gmir.node/text]] [:ref :mir.table/key]
+  (record-new [:ref :mir.table/key] :keyword 0 namespace name))
+(defn symbol-key [namespace [:option [:ref :gmir.node/text]] name [:ref :gmir.node/text]] [:ref :mir.table/key]
+  (record-new [:ref :mir.table/key] :symbol 0 namespace name))
+(defn- text-order [left [:ref :gmir.node/text] right [:ref :gmir.node/text]] :i64
+  (arena-scope (let [a (node/text-count left) b (node/text-count right)]
+    (loop [index 0]
+      (cond (>= index a) (if (= a b) 0 -1) (>= index b) 1
+            (< (node/text-at left index) (node/text-at right index)) -1
+            (> (node/text-at left index) (node/text-at right index)) 1 :else (recur (+ index 1)))))))
+(defn- rank [key [:ref :mir.table/key]] :i64
+  (arena-scope (case (record-get [:ref :mir.table/key] key :kind) :nil 0 :index 1 :keyword 2 :symbol 3 4)))
+(defn compare-key [left [:ref :mir.table/key] right [:ref :mir.table/key]] :i64
+  (arena-scope (let [a (rank left) b (rank right)]
+    (cond (< a b) -1 (> a b) 1 (= a 0) 0
+      (= a 1) (let [x (record-get [:ref :mir.table/key] left :index) y (record-get [:ref :mir.table/key] right :index)]
+                (cond (< x y) -1 (> x y) 1 :else 0))
+      :else
+      (let [x (record-get [:ref :mir.table/key] left :namespace) y (record-get [:ref :mir.table/key] right :namespace)
+            xp (option-some?-of [:option [:ref :gmir.node/text]] x) yp (option-some?-of [:option [:ref :gmir.node/text]] y)
+            ns-order (if xp (if yp (text-order (option-match [:option [:ref :gmir.node/text]] x (node/empty-text) found-value found-value)
+                                              (option-match [:option [:ref :gmir.node/text]] y (node/empty-text) found-value found-value)) 1)
+                            (if yp -1 0))]
+        (if (not= ns-order 0) ns-order
+          (text-order (record-get [:ref :mir.table/key] left :name) (record-get [:ref :mir.table/key] right :name))))))))
+(defn scalar [data [:ref :gmir.node/value]] [:ref :mir.table/value]
+  (record-new [:ref :mir.table/value] data (option-none-of [:option [:ref :mir.table/tree]])))
+(defn members-value [members [:ref :mir.table/tree]] [:ref :mir.table/value]
+  (record-new [:ref :mir.table/value] (node/nil-value) (option-some-of [:option [:ref :mir.table/tree]] members)))
+(defn empty [] [:ref :mir.table/tree]
+  (record-new [:ref :mir.table/tree] (nil-key) (scalar (node/nil-value))
+    (option-none-of [:option [:ref :mir.table/tree]]) (option-none-of [:option [:ref :mir.table/tree]]) 0 0))
+(defn data [value [:ref :mir.table/value]] [:ref :gmir.node/value] (record-get [:ref :mir.table/value] value :data))
+(defn members [value [:ref :mir.table/value]] [:ref :mir.table/tree]
+  (option-match [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/value] value :members) (empty) found-value found-value))
+(defn count [tree [:ref :mir.table/tree]] :i64 (arena-scope (record-get [:ref :mir.table/tree] tree :count)))
+(defn height [tree [:ref :mir.table/tree]] :i64 (arena-scope (record-get [:ref :mir.table/tree] tree :height)))
+(defn- left [tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  ;; Every nonempty constructor stores both Some children. An empty root's
+  ;; None child is itself empty; this default creates no dummy leaf allocation.
+  (option-match [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/tree] tree :left) tree found-value found-value))
+(defn- right [tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (option-match [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/tree] tree :right) tree found-value found-value))
+(defn- branch [key [:ref :mir.table/key] value [:ref :mir.table/value] a [:ref :mir.table/tree] b [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (record-new [:ref :mir.table/tree] key value (option-some-of [:option [:ref :mir.table/tree]] a)
+    (option-some-of [:option [:ref :mir.table/tree]] b) (+ 1 (if (> (height a) (height b)) (height a) (height b)))
+    (+ 1 (+ (count a) (count b)))))
+(defn- replace-children [tree [:ref :mir.table/tree] a [:ref :mir.table/tree] b [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (branch (record-get [:ref :mir.table/tree] tree :key) (record-get [:ref :mir.table/tree] tree :value) a b))
+(defn- rotate-right [tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (let [a (left tree)] (replace-children a (left a) (replace-children tree (right a) (right tree)))))
+(defn- rotate-left [tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (let [b (right tree)] (replace-children b (replace-children tree (left tree) (left b)) (right b))))
+(defn- balance [tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (let [a (left tree) b (right tree) difference (- (height a) (height b))]
+    (cond (> difference 1)
+          (rotate-right (if (< (height (left a)) (height (right a))) (replace-children tree (rotate-left a) b) tree))
+          (< difference -1)
+          (rotate-left (if (> (height (left b)) (height (right b))) (replace-children tree a (rotate-right b)) tree))
+          :else tree)))
+(defn get [tree [:ref :mir.table/tree] key [:ref :mir.table/key]] [:option [:ref :mir.table/value]]
+  (if (= (count tree) 0) (option-none-of [:option [:ref :mir.table/value]])
+    (let [order (compare-key key (record-get [:ref :mir.table/tree] tree :key))]
+      (cond (< order 0) (get (left tree) key) (> order 0) (get (right tree) key)
+            :else (option-some-of [:option [:ref :mir.table/value]] (record-get [:ref :mir.table/tree] tree :value))))))
+(defn put [tree [:ref :mir.table/tree] key [:ref :mir.table/key] value [:ref :mir.table/value]] [:ref :mir.table/tree]
+  (if (= (count tree) 0) (branch key value tree tree)
+    (let [order (compare-key key (record-get [:ref :mir.table/tree] tree :key))]
+      (cond (< order 0) (balance (replace-children tree (put (left tree) key value) (right tree)))
+            (> order 0) (balance (replace-children tree (left tree) (put (right tree) key value)))
+            :else (branch key value (left tree) (right tree))))))
+
+;; Internal bulk construction for callers already producing strictly ordered,
+;; distinct keys. General put/remove remain persistent and unchanged. Paging
+;; retains the existing 16,384-element bound of each individual typed list.
+(defn sorted-pages [] [:list [:ref :mir.table/page]] (typed-list-new [:list [:ref :mir.table/page]]))
+(defn sorted-append [pages [:list [:ref :mir.table/page]] key [:ref :mir.table/key] value [:ref :mir.table/value]]
+  [:list [:ref :mir.table/page]]
+  (let [n (vector-count pages)
+        last (if (= n 0) (typed-list-new [:list [:ref :mir.table/entry]])
+               (record-get [:ref :mir.table/page] (typed-list-nth [:list [:ref :mir.table/page]] pages (- n 1)) :items))
+        full (>= (vector-count last) 16384)
+        items (typed-list-conj [:list [:ref :mir.table/entry]]
+                (if full (typed-list-new [:list [:ref :mir.table/entry]]) last)
+                (record-new [:ref :mir.table/entry] key value))
+        page (record-new [:ref :mir.table/page] items)]
+    (if (or (= n 0) full) (typed-list-conj [:list [:ref :mir.table/page]] pages page)
+      (loop [index 0 out (sorted-pages)]
+        (if (>= index n) out
+          (recur (+ index 1) (typed-list-conj [:list [:ref :mir.table/page]] out
+            (if (= index (- n 1)) page (typed-list-nth [:list [:ref :mir.table/page]] pages index)))))))))
+(defn- sorted-range [pages [:list [:ref :mir.table/page]] low :i64 high :i64 empty-tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (if (>= low high) empty-tree
+    (let [middle (+ low (quot (- high low) 2)) page-index (quot middle 16384)
+          page (typed-list-nth [:list [:ref :mir.table/page]] pages page-index)
+          entry (typed-list-nth [:list [:ref :mir.table/entry]] (record-get [:ref :mir.table/page] page :items)
+                    (- middle (* page-index 16384)))]
+      (branch (record-get [:ref :mir.table/entry] entry :key) (record-get [:ref :mir.table/entry] entry :value)
+        (sorted-range pages low middle empty-tree) (sorted-range pages (+ middle 1) high empty-tree)))))
+(defn sorted-build [pages [:list [:ref :mir.table/page]]] [:ref :mir.table/tree]
+  (let [size (loop [index 0 n 0]
+               (if (>= index (vector-count pages)) n
+                 (recur (+ index 1) (+ n (vector-count (record-get [:ref :mir.table/page]
+                   (typed-list-nth [:list [:ref :mir.table/page]] pages index) :items))))))]
+    (sorted-range pages 0 size (empty))))
+(defn value-at [tree [:ref :mir.table/tree] index :i64] [:option [:ref :mir.table/value]]
+  (if (or (< index 0) (>= index (count tree))) (option-none-of [:option [:ref :mir.table/value]])
+    (let [n (count (left tree))]
+      (cond (< index n) (value-at (left tree) index) (> index n) (value-at (right tree) (- index (+ n 1)))
+            :else (option-some-of [:option [:ref :mir.table/value]] (record-get [:ref :mir.table/tree] tree :value))))))
+(defn key-at [tree [:ref :mir.table/tree] index :i64] [:option [:ref :mir.table/key]]
+  (if (or (< index 0) (>= index (count tree))) (option-none-of [:option [:ref :mir.table/key]])
+    (let [n (count (left tree))]
+      (cond (< index n) (key-at (left tree) index) (> index n) (key-at (right tree) (- index (+ n 1)))
+            :else (option-some-of [:option [:ref :mir.table/key]] (record-get [:ref :mir.table/tree] tree :key))))))
+(defn- minimum [tree [:ref :mir.table/tree]] [:ref :mir.table/tree]
+  (if (= (count (left tree)) 0) tree (minimum (left tree))))
+(defn remove [tree [:ref :mir.table/tree] key [:ref :mir.table/key]] [:ref :mir.table/tree]
+  (if (= (count tree) 0) tree
+    (let [order (compare-key key (record-get [:ref :mir.table/tree] tree :key)) a (left tree) b (right tree)]
+      (cond (< order 0) (balance (replace-children tree (remove a key) b))
+            (> order 0) (balance (replace-children tree a (remove b key)))
+            (= (count a) 0) b (= (count b) 0) a
+            :else (let [successor (minimum b) successor-key (record-get [:ref :mir.table/tree] successor :key)]
+                    (balance (branch successor-key (record-get [:ref :mir.table/tree] successor :value) a (remove b successor-key))))))))
+(defn- valid-between? [tree [:ref :mir.table/tree] low [:option [:ref :mir.table/key]] high [:option [:ref :mir.table/key]]] :bool
+  (arena-scope (if (= (count tree) 0)
+    (and (= (height tree) 0) (not (option-some?-of [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/tree] tree :left)))
+         (not (option-some?-of [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/tree] tree :right))))
+    (let [key (record-get [:ref :mir.table/tree] tree :key) a (left tree) b (right tree)]
+      (and (>= (rank key) 0) (<= (rank key) 3)
+           (option-some?-of [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/tree] tree :left))
+           (option-some?-of [:option [:ref :mir.table/tree]] (record-get [:ref :mir.table/tree] tree :right))
+           (or (not (option-some?-of [:option [:ref :mir.table/key]] low)) (> (compare-key key (option-match [:option [:ref :mir.table/key]] low key found-value found-value)) 0))
+           (or (not (option-some?-of [:option [:ref :mir.table/key]] high)) (< (compare-key key (option-match [:option [:ref :mir.table/key]] high key found-value found-value)) 0))
+           (= (count tree) (+ 1 (+ (count a) (count b))))
+           (= (height tree) (+ 1 (if (> (height a) (height b)) (height a) (height b))))
+           (<= (- (height a) (height b)) 1) (>= (- (height a) (height b)) -1)
+           (valid-between? a low (option-some-of [:option [:ref :mir.table/key]] key))
+           (valid-between? b (option-some-of [:option [:ref :mir.table/key]] key) high))))))
+(defn valid? [tree [:ref :mir.table/tree]] :bool
+  (arena-scope (valid-between? tree (option-none-of [:option [:ref :mir.table/key]]) (option-none-of [:option [:ref :mir.table/key]]))))
