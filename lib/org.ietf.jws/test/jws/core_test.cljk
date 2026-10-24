@@ -1,0 +1,224 @@
+(ns jws.core-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ed25519.core]
+            [jws.core :as jws]))
+
+(def codec {:json-encode json/write-str :json-decode #(json/read-str %)})
+
+;; A toy signer: not cryptography, deliberately. What is under test is the JWS
+;; structure and the algorithm discipline, and a real signer would make the
+;; assertions about bytes rather than about behaviour.
+(defn- toy-sig [signing-input]
+  (jws/b64url->bytes (jws/b64url (str "SIG:" (kbytes/utf8-string (byte-array (map unchecked-byte (seq signing-input))))))))
+
+(defn- signer [] (fn [input] (toy-sig input)))
+(defn- verifier []
+  (fn [input sig]
+    (= (vec (map #(bit-and % 0xff) (seq (toy-sig input))))
+       (vec (map #(bit-and % 0xff) (seq sig))))))
+
+(defn- opts [& {:as extra}]
+  (merge codec {:sign (signer) :verify (verifier)} extra))
+
+(def payload "{\"iss\":\"https://acme.example\"}")
+
+;; ── §5.1 structure ───────────────────────────────────────────────────────────
+
+(deftest compact-serialization-has-three-parts
+  (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))]
+    (is (= 3 (count (str/split compact #"\." -1))))
+    (testing "and the parts are the header, the payload and the signature"
+      (let [[h p _] (str/split compact #"\.")]
+        (is (= {"alg" "EdDSA"} (json/read-str (jws/b64url->string h))))
+        (is (= payload (jws/b64url->string p)))))))
+
+(deftest the-signing-input-is-the-two-encoded-parts-joined-by-a-dot
+  (testing "§5.1: ASCII(BASE64URL(UTF8(header)) || '.' || BASE64URL(payload))"
+    (let [h (jws/b64url (json/write-str {"alg" "EdDSA"}))
+          p (jws/b64url payload)
+          input (jws/signing-input h p)]
+      (is (= (str h "." p)
+             (kbytes/utf8-string (byte-array (map unchecked-byte (seq input))))))
+      (testing "the SIGNATURE part is not in it — signing it would be circular"
+        (is (not (str/includes?
+                  (kbytes/utf8-string (byte-array (map unchecked-byte (seq input))))
+                  "..")))))))
+
+(deftest a-round-trip-verifies
+  (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))
+        r (jws/verify compact (opts :expected-alg "EdDSA"))]
+    (is (:valid? r))
+    (is (= payload (:payload r)))
+    (is (= {"alg" "EdDSA"} (:header r)))))
+
+(deftest tampering-with-either-signed-part-invalidates
+  (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))
+        [h p s] (str/split compact #"\.")]
+    (testing "the payload"
+      (let [swapped (str h "." (jws/b64url "{\"iss\":\"https://evil.example\"}") "." s)]
+        (is (= :jws/bad-signature
+               (:reason (jws/verify swapped (opts :expected-alg "EdDSA")))))))
+    (testing "and the header, which is why it is called the PROTECTED header"
+      (let [swapped (str (jws/b64url (json/write-str {"alg" "EdDSA" "kid" "other"}))
+                         "." p "." s)]
+        (is (= :jws/bad-signature
+               (:reason (jws/verify swapped (opts :expected-alg "EdDSA")))))))))
+
+;; ── the algorithm discipline ─────────────────────────────────────────────────
+
+(deftest the-verifier-must-be-told-the-algorithm
+  (testing "reading it from the header and using it to decide how to verify lets
+            whoever produced the token choose the check (§10)"
+    (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))]
+      (is (= :jws/expected-alg-required
+             (:jws/error (ex-data (try (jws/verify compact (opts))
+                                       (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest an-unexpected-algorithm-is-named-not-called-a-bad-signature
+  (testing "a token may be perfectly signed with an algorithm this caller does not
+            accept; those are different facts"
+    (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))
+          r (jws/verify compact (opts :expected-alg "ES256"))]
+      (is (false? (:valid? r)))
+      (is (= :jws/unexpected-alg (:reason r)))
+      (is (= "EdDSA" (:alg r))))))
+
+(deftest a-set-of-accepted-algorithms-is-allowed
+  (testing "callers who accept several must write down WHICH"
+    (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))]
+      (is (:valid? (jws/verify compact (opts :expected-alg #{"EdDSA" "ES256"}))))
+      (is (false? (:valid? (jws/verify compact (opts :expected-alg #{"ES256" "RS256"}))))))))
+
+(deftest alg-none-is-refused-on-both-sides
+  (testing "§6 Unsecured JWS. RFC 7515 stops short of prohibiting it; this library
+            has no use for a signature-shaped object with no signature."
+    (is (= :jws/unsecured
+           (:jws/error (ex-data (try (jws/sign {"alg" "none"} payload (opts))
+                                     (catch clojure.lang.ExceptionInfo e e))))))
+    (testing "and a token that arrives claiming it is refused even if asked for"
+      (let [forged (str (jws/b64url (json/write-str {"alg" "none"})) "."
+                        (jws/b64url payload) "." "")]
+        (is (= :jws/unsecured
+               (:reason (jws/verify forged (opts :expected-alg "none")))))))))
+
+(deftest a-missing-alg-is-refused
+  (is (= :jws/missing-alg
+         (:jws/error (ex-data (try (jws/sign {} payload (opts))
+                                   (catch clojure.lang.ExceptionInfo e e))))))
+  (let [headerless (str (jws/b64url (json/write-str {"kid" "k"})) "."
+                        (jws/b64url payload) "." (jws/b64url "x"))]
+    (is (= :jws/missing-alg
+           (:reason (jws/verify headerless (opts :expected-alg "EdDSA")))))))
+
+;; ── §4.1.11 crit ─────────────────────────────────────────────────────────────
+
+(deftest an-unrecognised-critical-header-invalidates
+  (testing "§4.1.11: the producer used `crit` to say 'reject this if you do not
+            handle it', so ignoring it inverts the one thing it means"
+    (let [compact (jws/sign {"alg" "EdDSA" "crit" ["b64"] "b64" false} payload (opts))
+          r (jws/verify compact (opts :expected-alg "EdDSA"))]
+      (is (false? (:valid? r)))
+      (is (= :jws/unsupported-critical-header (:reason r)))
+      (is (= ["b64"] (:unsupported r)))))
+
+  (testing "a crit listing only headers we do understand is fine"
+    (let [compact (jws/sign {"alg" "EdDSA" "crit" ["kid"] "kid" "k1"} payload (opts))]
+      (is (:valid? (jws/verify compact (opts :expected-alg "EdDSA")))))))
+
+;; ── malformed vs invalid ─────────────────────────────────────────────────────
+
+(deftest malformed-throws-while-invalid-returns-false
+  (testing "a caller may want to log the two differently"
+    (doseq [bad ["", "onlyonepart" "two.parts" "a.b.c.d"]]
+      (is (= :jws/malformed
+             (:jws/error (ex-data (try (jws/verify bad (opts :expected-alg "EdDSA"))
+                                       (catch clojure.lang.ExceptionInfo e e)))))
+          (str "malformed: " (pr-str bad))))
+    (let [compact (jws/sign {"alg" "EdDSA"} payload (opts))]
+      (is (false? (:valid? (jws/verify (str compact "tamper")
+                                       (opts :expected-alg "EdDSA"))))))))
+
+(deftest an-empty-signature-is-refused
+  (let [empty-sig (str (jws/b64url (json/write-str {"alg" "EdDSA"})) "."
+                       (jws/b64url payload) "." "")]
+    (is (= :jws/empty-signature
+           (:reason (jws/verify empty-sig (opts :expected-alg "EdDSA")))))))
+
+(deftest decode-header-is-named-so-it-cannot-be-mistaken-for-verification
+  (testing "it exists for key selection by kid, which necessarily precedes the
+            signature check — so nothing it returns is trustworthy yet"
+    (let [compact (jws/sign {"alg" "EdDSA" "kid" "key-1"} payload (opts))]
+      (is (= "key-1" (get (jws/decode-header compact codec) "kid"))))
+    (testing "and it works on a token whose signature is nonsense, by design"
+      (let [forged (str (jws/b64url (json/write-str {"alg" "EdDSA" "kid" "k"})) "."
+                        (jws/b64url payload) "." (jws/b64url "nonsense"))]
+        (is (= "k" (get (jws/decode-header forged codec) "kid")))
+        (is (false? (:valid? (jws/verify forged (opts :expected-alg "EdDSA")))))))))
+
+(deftest the-codecs-must-be-supplied
+  (is (= :jws/no-signer
+         (:jws/error (ex-data (try (jws/sign {"alg" "EdDSA"} payload codec)
+                                   (catch clojure.lang.ExceptionInfo e e))))))
+  (is (= :jws/no-verifier
+         (:jws/error (ex-data (try (jws/verify "a.b.c" codec)
+                                   (catch clojure.lang.ExceptionInfo e e)))))))
+
+;; ── a real signer ────────────────────────────────────────────────────────────
+;; Everything above uses a toy signer, which tests the JWS structure but not the
+;; injection contract. This wires the actual Ed25519 primitive, which is what a
+;; caller will do and the only way to know the seam fits.
+
+(deftest a-real-ed25519-signer-round-trips
+  (let [seed (byte-array (repeat 32 (byte 42)))
+        pub (ed25519.core/pubkey-from-seed seed)
+        compact (jws/sign {"alg" "EdDSA"} payload
+                          (merge codec
+                                 {:sign (fn [input] (ed25519.core/sign seed input))}))
+        r (jws/verify compact
+                      (merge codec
+                             {:expected-alg "EdDSA"
+                              :verify (fn [input sig]
+                                        (ed25519.core/verify pub input sig))}))]
+    (is (:valid? r))
+    (is (= payload (:payload r)))
+    (testing "Ed25519 is deterministic, so the same input signs identically"
+      (is (= compact (jws/sign {"alg" "EdDSA"} payload
+                               (merge codec {:sign (fn [i] (ed25519.core/sign seed i))})))))
+    (testing "and a different key does not verify"
+      (let [other (ed25519.core/pubkey-from-seed (byte-array (repeat 32 (byte 7))))]
+        (is (= :jws/bad-signature
+               (:reason (jws/verify compact
+                                    (merge codec
+                                           {:expected-alg "EdDSA"
+                                            :verify (fn [i s]
+                                                      (ed25519.core/verify other i s))})))))))))
+
+(deftest a-real-signature-is-64-bytes-and-survives-base64url
+  (let [seed (byte-array (repeat 32 (byte 42)))
+        compact (jws/sign {"alg" "EdDSA"} payload
+                          (merge codec {:sign (fn [i] (ed25519.core/sign seed i))}))
+        sig-part (last (str/split compact #"\."))]
+    (is (= 64 (count (seq (jws/b64url->bytes sig-part)))))
+    (testing "and the encoding is url-safe and unpadded, as §2 requires"
+      (is (not (re-find #"[+/=]" sig-part))))))
+
+(def cross-host-signing-input
+  "The Signing Input for a fixed header and payload, pinned identically here and in
+   test/nbb_smoke.cljk.
+
+   §5.1 signs these exact bytes, so if :clj and :cljs ever produce different ones,
+   a token signed on one host fails on the other with :jws/bad-signature — which
+   reads as a key problem and is not one. Two copies of a literal is the cheapest
+   way to make that divergence fail something.
+
+   Measured identical on both hosts 2026-07-31."
+  "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJodHRwczovL2FjbWUuZXhhbXBsZSJ9")
+
+(deftest the-signing-input-matches-across-hosts
+  (is (= cross-host-signing-input
+         (kbytes/utf8-string (byte-array
+                   (map unchecked-byte
+                        (seq (jws/signing-input (jws/b64url "{\"alg\":\"EdDSA\"}")
+                                                (jws/b64url payload)))))))))

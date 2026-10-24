@@ -1,0 +1,204 @@
+(ns sd-jwt.core-test
+  (:require [kotoba.json :as json]
+            [kotoba.test :refer [deftest is testing]]
+            [sd-jwt.core :as sd]))
+
+(def codec {:json-encode json/write-str
+            :json-decode #(json/read-str %)})
+
+;; A deterministic salt source, so a test can assert an exact digest. Real callers
+;; inject a CSPRNG — which is why the salt source is injected at all.
+(defn- salts [] (let [n (atom 0)]
+                  (fn [] (str "salt000000000000000000" (swap! n inc)))))
+
+(defn- opts [] (merge codec {:salt-fn (salts) :shuffle-fn identity}))
+
+;; ── §4.2.3, the trap ─────────────────────────────────────────────────────────
+
+(def cross-host-fixed-disclosure
+  "A Disclosure as a base64url STRING, and the digest both hosts must produce for
+   it. Pinned identically here and in test/nbb_smoke.cljk.
+
+   §4.2.3 hashes these exact bytes, so if :clj and :cljs ever disagree, an Issuer
+   on one host emits digests a Verifier on the other cannot reproduce — and the
+   failure is SILENT, because an unmatched digest reads as a withheld claim rather
+   than an error. Two copies of one literal is the cheapest way to make that
+   divergence fail something.
+
+   Measured identical on both hosts 2026-07-31."
+  "WyJzYWx0MDAwMDAwMDAwMDAwMDAwMDAwMSIsIm5hbWUiLCJBbGljZSJd")
+
+(def cross-host-fixed-digest "Dh_aYx1cqVyIblWlVdUTvo3YJEeigpSGdeVPyn867RY")
+
+(deftest the-digest-matches-across-hosts
+  (is (= cross-host-fixed-digest (sd/digest cross-host-fixed-disclosure))))
+
+
+(deftest the-digest-is-over-the-base64url-string-not-the-json
+  (testing "§4.2.3: 'computed over the US-ASCII bytes of the base64url-encoded
+            value that is the Disclosure'. Hashing the JSON inside — the intuitive
+            reading — produces digests nobody else can reproduce."
+    (let [d (sd/object-disclosure "salt0000000000000000001" "name" "Alice" codec)
+          over-b64 (sd/digest d)
+          over-json (sd/b64url (#'sd-jwt.core/ascii-bytes
+                                (json/write-str ["salt0000000000000000001" "name" "Alice"])))]
+      (is (string? over-b64))
+      (is (not= over-b64 over-json) "the two readings differ, which is the point")
+      (testing "and it is stable: the same Disclosure string always digests the same"
+        (is (= over-b64 (sd/digest d)))))))
+
+(deftest no-canonicalization-is-needed-anywhere
+  (testing "because the Verifier re-hashes the string it RECEIVED, two Issuers
+            whose JSON differs in whitespace both verify — unlike Data Integrity,
+            SD-JWT needs no canonical form"
+    (let [tight (sd/b64url "[\"salt0000000000000000001\",\"name\",\"Alice\"]")
+          spaced (sd/b64url "[\"salt0000000000000000001\", \"name\", \"Alice\"]")]
+      (is (not= (sd/digest tight) (sd/digest spaced))
+          "different bytes, different digests")
+      (testing "and each round-trips against its own digest"
+        (doseq [d [tight spaced]]
+          (let [payload {"_sd" [(sd/digest d)] "_sd_alg" "sha-256"}]
+            (is (= {"name" "Alice"} (sd/disclose payload [d] codec)))))))))
+
+;; ── conceal / disclose round trip ────────────────────────────────────────────
+
+(deftest a-concealed-claim-round-trips
+  (let [payload {"iss" "https://acme.example" "role" "auditor" "name" "Alice"}
+        {:keys [payload disclosures]} (sd/conceal payload [["name"]] (opts))]
+    (testing "the cleartext is gone from what gets signed"
+      (is (not (contains? payload "name")))
+      (is (= "auditor" (get payload "role")) "and other claims are untouched")
+      (is (= 1 (count (get payload "_sd"))))
+      (is (= "sha-256" (get payload "_sd_alg"))))
+    (testing "presenting it puts the claim back"
+      (is (= {"iss" "https://acme.example" "role" "auditor" "name" "Alice"}
+             (sd/disclose payload disclosures codec))))
+    (testing "withholding it leaves the rest intact — the whole point"
+      (is (= {"iss" "https://acme.example" "role" "auditor"}
+             (sd/disclose payload [] codec))))))
+
+(deftest nested-claims-can-be-concealed
+  (let [{:keys [payload disclosures]}
+        (sd/conceal {"address" {"country" "JP" "street" "1-1"}}
+                    [["address" "street"]] (opts))]
+    (is (not (contains? (get payload "address") "street")))
+    (is (= "JP" (get-in payload ["address" "country"])))
+    (is (= {"address" {"country" "JP" "street" "1-1"}}
+           (sd/disclose payload disclosures codec)))
+    (is (= {"address" {"country" "JP"}} (sd/disclose payload [] codec)))))
+
+(deftest several-claims-disclose-independently
+  (let [{:keys [payload disclosures]}
+        (sd/conceal {"role" "auditor" "name" "Alice" "email" "a@example.com"}
+                    [["name"] ["email"]] (opts))]
+    (is (= 2 (count disclosures)))
+    (testing "the holder shows exactly one"
+      (let [only-name (sd/disclose payload [(first disclosures)] codec)]
+        (is (= "Alice" (get only-name "name")))
+        (is (not (contains? only-name "email")))))))
+
+;; ── §7.1 reject vs ignore ────────────────────────────────────────────────────
+
+(deftest a-digest-with-no-disclosure-is-ignored-not-rejected
+  (testing "§7.1: it is what a withheld claim looks like, so rejecting would break
+            selective disclosure entirely"
+    (let [{:keys [payload]} (sd/conceal {"name" "Alice" "role" "x"} [["name"]] (opts))]
+      (is (= {"role" "x"} (sd/disclose payload [] codec))))))
+
+(deftest an-unused-disclosure-rejects-the-whole-sd-jwt
+  (testing "§7.1 requires rejecting, not ignoring — the asymmetry with the case
+            above is deliberate"
+    (let [{:keys [payload]} (sd/conceal {"name" "Alice"} [["name"]] (opts))
+          foreign (sd/object-disclosure "salt0000000000000000099" "role" "owner" codec)]
+      (is (= :sd-jwt/unused-disclosure
+             (:sd-jwt/error
+              (ex-data (try (sd/disclose payload [foreign] codec)
+                            (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest a-duplicate-digest-rejects
+  (testing "a second copy of a digest would let one Disclosure fill two slots"
+    (let [d (sd/object-disclosure "salt0000000000000000001" "name" "Alice" codec)
+          payload {"_sd" [(sd/digest d) (sd/digest d)] "_sd_alg" "sha-256"}]
+      (is (= :sd-jwt/duplicate-digest
+             (:sd-jwt/error
+              (ex-data (try (sd/disclose payload [d] codec)
+                            (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest an-unimplemented-sd-alg-is-refused
+  (testing "silently treating it as sha-256 would make every digest mismatch for
+            a reason that has nothing to do with the digests"
+    (is (= :sd-jwt/unsupported-sd-alg
+           (:sd-jwt/error
+            (ex-data (try (sd/disclose {"_sd" [] "_sd_alg" "sha-512"} [] codec)
+                          (catch clojure.lang.ExceptionInfo e e))))))))
+
+;; ── §4.2.2 array elements ────────────────────────────────────────────────────
+
+(deftest array-elements-use-the-two-element-form-and-the-dots-key
+  (let [d (sd/array-disclosure "salt0000000000000000001" "JP" codec)
+        payload {"countries" ["US" {"..." (sd/digest d)}] "_sd_alg" "sha-256"}]
+    (testing "a disclosed element is put back in place"
+      (is (= {"countries" ["US" "JP"]} (sd/disclose payload [d] codec))))
+    (testing "a withheld one is dropped, not left as a placeholder object"
+      (is (= {"countries" ["US"]} (sd/disclose payload [] codec))))))
+
+;; ── §4 serialization ─────────────────────────────────────────────────────────
+
+(deftest the-trailing-tilde-is-required
+  (testing "without it the last Disclosure reads as a Key Binding JWT, which
+            changes what was proved"
+    (is (= "JWT~d1~d2~" (sd/present "JWT" ["d1" "d2"])))
+    (is (= "JWT~" (sd/present "JWT" [])))
+    (is (= "JWT~d1~KB" (sd/present "JWT" ["d1"] "KB")))
+    (let [parsed (sd/parse-presentation "JWT~d1~d2~")]
+      (is (= "JWT" (:jwt parsed)))
+      (is (= ["d1" "d2"] (:disclosures parsed)))
+      (is (nil? (:kb-jwt parsed))))
+    (testing "and a KB-JWT is distinguished from a Disclosure by that character"
+      (is (= "KB" (:kb-jwt (sd/parse-presentation "JWT~d1~KB")))))
+    (testing "a presentation with no separator at all is refused, not guessed"
+      (is (= :sd-jwt/missing-trailing-separator
+             (:sd-jwt/error
+              (ex-data (try (sd/parse-presentation "JWT")
+                            (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest present-and-parse-round-trip
+  (let [{:keys [payload disclosures]}
+        (sd/conceal {"name" "Alice" "role" "auditor"} [["name"]] (opts))
+        wire (sd/present "signed.jwt.here" disclosures)
+        parsed (sd/parse-presentation wire)]
+    (is (= "signed.jwt.here" (:jwt parsed)))
+    (is (= {"role" "auditor" "name" "Alice"}
+           (sd/disclose payload (:disclosures parsed) codec)))))
+
+;; ── input discipline ─────────────────────────────────────────────────────────
+
+(deftest a-weak-salt-is-refused
+  (testing "§4.1.1 wants 128 bits; a short salt makes a claim's digest guessable
+            by brute force over the value, which defeats concealment"
+    (is (= :sd-jwt/weak-salt
+           (:sd-jwt/error
+            (ex-data (try (sd/object-disclosure "short" "name" "Alice" codec)
+                          (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest concealing-an-absent-claim-is-refused
+  (is (= :sd-jwt/claim-absent
+         (:sd-jwt/error
+          (ex-data (try (sd/conceal {"role" "x"} [["name"]] (opts))
+                        (catch clojure.lang.ExceptionInfo e e)))))))
+
+(deftest decoys-hide-how-many-claims-were-withheld
+  (let [{:keys [payload disclosures]}
+        (sd/conceal {"name" "Alice"} [["name"]] (assoc (opts) :decoys 3))]
+    (is (= 1 (count disclosures)))
+    (is (= 4 (count (get payload "_sd"))) "one real digest and three decoys")
+    (testing "and the decoys are simply ignored, since nothing discloses them"
+      (is (= {"name" "Alice"} (sd/disclose payload disclosures codec))))))
+
+(deftest the-codecs-and-salt-source-must-be-supplied
+  (is (= :sd-jwt/no-salt-fn
+         (:sd-jwt/error (ex-data (try (sd/conceal {"a" 1} [["a"]] codec)
+                                      (catch clojure.lang.ExceptionInfo e e))))))
+  (is (= :sd-jwt/no-json-decode
+         (:sd-jwt/error (ex-data (try (sd/disclose {} [] {})
+                                      (catch clojure.lang.ExceptionInfo e e)))))))

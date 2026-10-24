@@ -1,0 +1,191 @@
+;; Whether a certificate may be relied on at an instant, and whether the
+;; certificate that signed it was allowed to, as a Kotoba application
+;; (ADR-2608261100) -- RFC 5280 §4.1.2.5, §4.2.1.3, §4.2.1.9 and §6.1.4.
+;;
+;;   normalised-instant? (s)                     -> bool
+;;   validity-problem    (not-before, not-after, instant) -> keyword
+;;   issuer-problem      (name-matches?, ca?, key-usage-present?,
+;;                        key-cert-sign?)        -> keyword
+;;
+;; ## Both of these are comparisons, and there is no key in either
+;;
+;;   the guest owns   whether an instant is inside a validity period, and
+;;                    whether a certificate was permitted to issue another
+;;   the host owns    the DER, the curve, the clock, and the signature
+;;
+;; ## The byte comparison is right, and the third operand is not checked
+;;
+;; `x509.core/valid-at?` compares instants with `compare`, and its docstring
+;; says why that is correct: "`asn1/time-value` normalises both to
+;; `YYYY-MM-DDTHH:MM:SSZ` and ISO 8601 in UTC sorts lexicographically". Both
+;; -- meaning `not-before` and `not-after`. The third operand is the
+;; CALLER'S, and nothing normalises it or checks that it is in that form.
+;;
+;; Measured against this repo's own OpenSSL root, whose validity ends
+;; `2036-07-27T13:12:33Z`:
+;;
+;;     (valid-at? root "2036-07-27T10:00:00-05:00")  =>  true
+;;
+;; That instant is 15:00Z, nearly two hours after the certificate expired,
+;; and `"10"` sorts before `"13"`. An expired certificate reported valid.
+;; And in the other direction:
+;;
+;;     (valid-at? root "2026-07-30T13:12:33.000Z")   =>  false
+;;
+;; which is exactly the instant validity begins, spelled the way
+;; `Date.prototype.toISOString()` spells it -- `'Z'` is 0x5A and `'.'` is
+;; 0x2E, so the fractional form sorts before the second it is inside.
+;; `"2030-01-01"` with no time at all is accepted.
+;;
+;; So the fix is not a calendar. Byte order IS the right comparison inside
+;; the normalised form; what was missing is requiring the form. This guest
+;; refuses an instant that is not exactly `YYYY-MM-DDTHH:MM:SSZ`
+;; (`:instant-not-normalised`) instead of comparing it, which needs no
+;; arithmetic and cannot be wrong about a calendar it never consults.
+;;
+;; `normalised-instant?` is therefore a SHAPE and not a calendar:
+;; `2030-13-01T00:00:00Z` satisfies it. Byte order is a total order over the
+;; shape whether or not the digits name a day, and an instant that names no
+;; day is a caller's own bug rather than a comparison this can get wrong.
+;;
+;; `:validity-inverted` is this guest's own decision: a certificate whose
+;; `not-after` precedes its `not-before` is valid at no instant, and
+;; answering `false` for every instant is the same answer as "you asked
+;; about the wrong time".
+;;
+;; ## A signature verifies; that does not make the signer a CA
+;;
+;; `x509.core/verify-signature` reasons about the chain -- "a signature that
+;; verifies under a key from a certificate whose subject is not this
+;; certificate's issuer verifies nothing about the chain" -- and checks the
+;; issuer NAME. It reads five fields of the issuer, and neither
+;; `basicConstraints` nor `keyUsage` is among them. §6.1.4 (k) and (n)
+;; require both: the issuer must assert `cA`, and if it has a `keyUsage`
+;; extension that extension must assert `keyCertSign`.
+;;
+;; Without those, an end-entity certificate is a certificate authority for
+;; anyone holding its private key -- which is the whole reason
+;; `basicConstraints` exists. The library has `ca?` and `key-usage` and does
+;; not consult them here, so the answers are present and unused.
+;;
+;; §4.2.1.3: `keyUsage` is optional, and its ABSENCE does not deny
+;; `keyCertSign`. So a missing extension is not a refusal, and a PRESENT one
+;; that omits the bit is.
+;;
+;; `.cljc` stays the oracle for the DER, the names and the extensions, and
+;; is not required from here (require-graph). It did not grow a second copy
+;; of either check (ADR-2608261100).
+
+(ns x509.validity
+  (:export [main normalised-instant? validity-problem issuer-problem]))
+
+;; --- the normalised instant ------------------------------------------------------
+;; `YYYY-MM-DDTHH:MM:SSZ`, twenty characters, the form `asn1/time-value`
+;; produces for both ends of the validity period.
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- digits? [s :string a :i64 b :i64] :bool
+  (if (>= a b) true
+      (if (>= (cp s a) 48)
+        (if (<= (cp s a) 57) (digits? s (+ a 1) b) false)
+        false)))
+
+(defn- ch? [s :string i :i64 c :i64] :bool (if (= (cp s i) c) true false))
+
+(defn normalised-instant? [s :string] :bool
+  (if (= (string-length s) 20)
+    (if (digits? s 0 4)
+      (if (ch? s 4 45)                                      ; '-'
+        (if (digits? s 5 7)
+          (if (ch? s 7 45)
+            (if (digits? s 8 10)
+              (if (ch? s 10 84)                             ; 'T'
+                (if (digits? s 11 13)
+                  (if (ch? s 13 58)                         ; ':'
+                    (if (digits? s 14 16)
+                      (if (ch? s 16 58)
+                        (if (digits? s 17 19)
+                          (if (ch? s 19 90) true false)     ; 'Z'
+                          false)
+                        false)
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+;; --- comparison, which is byte order INSIDE that form -------------------------------
+
+(defn- cmp [a :string b :string i :i64] :i64
+  (if (>= i 20) 0
+      (let [x (cp a i) y (cp b i)]
+        (if (< x y) -1 (if (> x y) 1 (cmp a b (+ i 1)))))))
+
+(defn validity-problem [not-before :string not-after :string instant :string] :keyword
+  (cond
+    ;; Answered separately from the caller's, because a certificate this
+    ;; library could not read is not the same event as a caller asking in
+    ;; the wrong spelling.
+    (if (normalised-instant? not-before) false true) :validity-unreadable
+    (if (normalised-instant? not-after) false true) :validity-unreadable
+
+    ;; The one the library never asks. Refusing costs a caller one call to
+    ;; whatever it already used to make the string.
+    (if (normalised-instant? instant) false true) :instant-not-normalised
+
+    ;; A period that contains no instant. `valid-at?` answers false for
+    ;; every instant here, which is the same answer it gives for a correct
+    ;; certificate at the wrong time.
+    (> (cmp not-before not-after 0) 0) :validity-inverted
+
+    (< (cmp instant not-before 0) 0) :not-yet-valid
+    (> (cmp instant not-after 0) 0) :expired
+    :else :none))
+
+;; --- may this certificate have issued that one? (§6.1.4) -----------------------------
+
+(defn issuer-problem [name-matches? :bool ca? :bool
+                      key-usage-present? :bool key-cert-sign? :bool] :keyword
+  (cond
+    (if name-matches? false true) :issuer-name-mismatch
+
+    ;; §6.1.4 (k). `basic-constraints` already answers `{:ca? false}` for an
+    ;; absent extension -- absence is not permission -- so there is no third
+    ;; state to carry here.
+    (if ca? false true) :issuer-not-a-ca
+
+    ;; §4.2.1.3 and §6.1.4 (n): the extension is optional, so its absence
+    ;; does not deny the bit. A present extension that omits it does.
+    (if key-usage-present? (if key-cert-sign? false true) false)
+    :issuer-may-not-sign-certificates
+
+    :else :none))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the two findings back through the decisions above and answers 0 only
+;; when each still decides the way this object was built to decide, so a
+;; COMPILED artifact can be asked whether it is itself by a host that knows
+;; nothing about X.509.
+;;
+;; Three, not ten: the native backends evaluate `main` as a compile-time
+;; oracle with a budget, and ten calls of this shape is `native artifact
+;; oracle evaluation rejected`. The wider check lives in the suite.
+
+(defn main [] :i64
+  (cond
+    (if (= (validity-problem "2026-07-30T13:12:33Z" "2036-07-27T13:12:33Z"
+                             "2036-07-27T10:00:00-05:00")
+           :instant-not-normalised) false true) 1
+    (if (= (validity-problem "2026-07-30T13:12:33Z" "2036-07-27T13:12:33Z"
+                             "2030-01-01T00:00:00Z") :none) false true) 2
+    (if (= (issuer-problem true false false false) :issuer-not-a-ca) false true) 3
+    :else 0))

@@ -1,0 +1,340 @@
+;; `kotoba/sd_jwt_vc/verify.kotoba` against `sd-jwt-vc.core/verify`.
+;;
+;; The slice is the ORDER of refusals that decides whether a presentation
+;; may be believed, plus the choice of which bytes the holder's proof must
+;; cover. The cryptography, JSON, SHA-256 and base64url stay in the host, as
+;; they already do in the oracle.
+;;
+;; So the two are handed the SAME presentation, built by `sd-jwt-vc.core`
+;; itself, and compared on the verdict and the reason for it.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). It did not grow a second copy of the order.
+;;
+;; ## The host loop
+;;
+;; `drive` is the deployment: it runs both `jws/verify` calls, decodes the
+;; JSON, and computes the `sd_hash` -- over the prefix THE GUEST produced,
+;; which is the point of exporting it. Each result reaches the guest as the
+;; smallest thing that answers a question: a bool for a signature, a string
+;; for a claim, a digest to compare against another digest.
+;;
+;; ## The negative controls
+;;
+;;   * `the-sd-hash-input-ends-with-a-tilde` — RFC 9901 §4.3.1. Omitting it
+;;     produces a digest that fails against every other implementation,
+;;     which is a bug that only appears when you talk to somebody else;
+;;   * `dropping-a-disclosure-changes-the-hashed-bytes` — the whole purpose
+;;     of `sd_hash`: a Holder who presents fewer Disclosures and reuses the
+;;     KB-JWT must not be believed;
+;;   * `the-kb-jwt-is-not-part-of-what-it-signs` — the other half of
+;;     §4.3.1, and a prefix that included it could not be computed by the
+;;     signer;
+;;   * `cnf-is-required-before-the-kb-jwt-is-looked-at` — §3.2.2. Without
+;;     `cnf` there is no key to check the KB-JWT against, and a verifier
+;;     that checks it first has already asked a question it had no standing
+;;     to ask;
+;;   * `an-untyped-token-is-not-a-credential` — RFC 8725.
+
+(ns sd-jwt-vc.verify-kotoba-parity-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.json :as json]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [jws.core :as jws]
+            [multiformats.core :as mf]
+            [sd-jwt-vc.core :as vc]
+            [sd-jwt-vc.guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir")
+           "kotoba" "sd_jwt_vc" "verify.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'sd-jwt-vc.verify (slurp guest-file)}
+                'sd-jwt-vc.verify :wasm32-kotoba-v1))))
+
+;; The reader walks every byte of a presentation, which is long. The budget
+;; is measured in both directions by `fuel-budget-is-measured-in-both-
+;; directions` at the bottom of this file.
+(def ^:private test-fuel 20000)
+
+(defn- call
+  ([f args] (call f args test-fuel))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+;; --- the host: signatures, JSON, and the digest ------------------------------
+;; A toy signer, deliberately: the subject of this file is the order of
+;; refusals, and it must not be able to pass by accident because the crypto
+;; happened to agree. `sd-jwt-vc.core`'s own suite wires real keys.
+
+(defn- toy-sign [signing-input] signing-input)
+(defn- toy-verify [signing-input sig] (= (vec (seq signing-input)) (vec (seq sig))))
+
+(defn- decode-jwt [compact]
+  (let [[h p] (str/split compact #"\." -1)]
+    {:header (json/read-str (jws/b64url->string h))
+     :payload (json/read-str (jws/b64url->string p))
+     :verified? (boolean
+                 (try (jws/verify compact {:expected-alg "EdDSA"
+                                           :verify toy-verify
+                                           :json-decode json/read-str})
+                      (catch Exception _ false)))}))
+
+(defn- verified-jws? [compact]
+  (:valid? (jws/verify compact {:expected-alg "EdDSA"
+                                :verify toy-verify
+                                :json-decode json/read-str})))
+
+(defn- drive
+  "Verify `presentation` the way a deployment does."
+  [presentation config]
+  (let [s0 (call 'init [(->doc config)])
+        s1 (call 'offer-presentation [s0 presentation])]
+    (if (not= :want-issuer (call 'phase [s1]))
+      {:state s1 :phase (call 'phase [s1]) :reason (call 'reason [s1])
+       :stage (call 'stage [s1])}
+      (let [issuer (call 'issuer-jwt [s1])
+            {:keys [header payload]} (decode-jwt issuer)
+            s2 (call 'offer-issuer
+                     [s1 (->doc {:verified? (verified-jws? issuer)
+                                 :typ (get header "typ" "")
+                                 :vct (str (get payload "vct" ""))
+                                 :has-cnf? (some? (get payload "cnf"))})])]
+        (if (not= :want-key-binding (call 'phase [s2]))
+          {:state s2 :phase (call 'phase [s2]) :reason (call 'reason [s2])
+           :stage (call 'stage [s2])}
+          (let [kb (call 'kb-jwt [s2])
+                {kbh :header kbp :payload} (decode-jwt kb)
+                ;; Hashed over the prefix THE GUEST produced.
+                computed (mf/base64url
+                          (mf/sha256 (kbytes/utf8-bytes ^String (call 'presentation-prefix [s2]))))
+                s3 (call 'offer-key-binding
+                         [s2 (->doc {:verified? (verified-jws? kb)
+                                     :typ (get kbh "typ" "")
+                                     :aud (str (get kbp "aud" ""))
+                                     :nonce (str (get kbp "nonce" ""))
+                                     :has-iat? (some? (get kbp "iat"))
+                                     :sd-hash (str (get kbp "sd_hash" ""))
+                                     :computed-sd-hash computed})])]
+            {:state s3 :phase (call 'phase [s3]) :reason (call 'reason [s3])
+             :stage (call 'stage [s3]) :computed computed}))))))
+
+;; --- fixtures ----------------------------------------------------------------
+
+(def ^:private salt-counter (atom 0))
+
+(def ^:private opts
+  {:sign toy-sign :verify toy-verify
+   :json-encode json/write-str :json-decode json/read-str
+   :expected-alg "EdDSA"
+   ;; Deterministic per call so a Disclosure is stable within one test and
+   ;; distinct between claims; the salts are not the subject here.
+   ;; The library enforces 16 bytes of entropy (22 base64url characters),
+   ;; which is right and is not this file's subject -- so these are the
+   ;; correct length and merely deterministic.
+   :salt-fn (fn [] (subs (str "AAAAAAAAAAAAAAAAAAAAAA" (swap! salt-counter inc))
+                         (count (str @salt-counter))))})
+
+(defn- issued
+  "`{:issuer-jwt :disclosures :presentation}`. `extra` merges into the
+  claims, so a `cnf` can be added for the key-binding cases."
+  ([] (issued {}))
+  ([extra]
+   (vc/issue (merge {"vct" "https://example.com/IdentityCredential"
+                     "iss" "https://issuer.example"
+                     "given_name" "Alice"
+                     "family_name" "Smith"}
+                    extra)
+             [["given_name"] ["family_name"]]
+             (assoc opts :alg "EdDSA"))))
+
+(def ^:private with-cnf {"cnf" {"jwk" {"kty" "OKP"}}})
+
+(def ^:private aud "https://verifier.example")
+(def ^:private nonce "n-0S6_WzA2Mj")
+
+(defn- presented-with-kb
+  "An SD-JWT VC presentation carrying a KB-JWT bound to `chosen`."
+  [issuer-jwt chosen]
+  (str (vc/presentation-prefix issuer-jwt chosen)
+       (vc/key-binding-jwt issuer-jwt chosen
+                           (assoc opts :alg "EdDSA" :audience aud
+                                  :nonce nonce :iat 1700000000))))
+
+;; --- the tests ---------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-presentation-without-key-binding-verifies
+  (let [{:keys [issuer-jwt disclosures]} (issued)
+        p (vc/presentation-prefix issuer-jwt disclosures)
+        g (drive p {})
+        o (vc/verify p opts)]
+    (is (= :verified (:phase g)) [(:reason g) (:stage g)])
+    (is (true? (:valid? o)) (:reason o))
+    (is (= 2 (call 'disclosure-count [(:state g)])))))
+
+(deftest the-sd-hash-input-ends-with-a-tilde
+  (testing "RFC 9901 §4.3.1: the digest is over the JWT, a tilde, and each
+            Disclosure followed by a tilde. Omitting the trailing one
+            produces a digest that fails against every other
+            implementation -- a bug that only appears when you talk to
+            somebody else."
+    (let [{:keys [issuer-jwt disclosures]} (issued)
+          s (call 'offer-presentation
+                  [(call 'init [(->doc {})])
+                   (presented-with-kb issuer-jwt disclosures)])
+          prefix (call 'presentation-prefix [s])]
+      (is (str/ends-with? prefix "~") "the tilde is IN")
+      (testing "and it is byte-identical to what the oracle hashes"
+        (is (= (vc/presentation-prefix issuer-jwt disclosures) prefix))
+        (is (= (vc/sd-hash prefix)
+               (mf/base64url (mf/sha256 (kbytes/utf8-bytes ^String prefix)))))))))
+
+(deftest the-kb-jwt-is-not-part-of-what-it-signs
+  (testing "the other half of §4.3.1 -- a prefix that included the KB-JWT
+            could not be computed by the signer, because the signer is
+            producing it"
+    (let [{:keys [issuer-jwt disclosures]} (issued)
+          p (presented-with-kb issuer-jwt disclosures)
+          s (call 'offer-presentation [(call 'init [(->doc {})]) p])
+          prefix (call 'presentation-prefix [s])
+          kb (call 'kb-jwt [s])]
+      (is (seq kb) "there IS a KB-JWT")
+      (is (not (str/includes? prefix kb)) "and it is not in the hashed bytes")
+      (is (= (str prefix kb) p) "the two halves are the whole presentation"))))
+
+(deftest a-full-key-bound-presentation-verifies
+  (let [{:keys [issuer-jwt disclosures]} (issued with-cnf)
+        p (presented-with-kb issuer-jwt disclosures)
+        cfg {:require-key-binding? true :expected-audience aud
+             :expected-nonce nonce}
+        g (drive p cfg)]
+    (is (= :verified (:phase g)) [(:reason g) (:stage g)])))
+
+(deftest dropping-a-disclosure-changes-the-hashed-bytes
+  (testing "the whole purpose of sd_hash: a Holder who presents fewer
+            Disclosures and reuses the KB-JWT must not be believed"
+    (let [{:keys [issuer-jwt disclosures]} (issued with-cnf)
+          ;; The KB-JWT is minted over ALL disclosures...
+          honest (presented-with-kb issuer-jwt disclosures)
+          kb (last (str/split honest #"~" -1))
+          ;; ...and then one is dropped, keeping the same KB-JWT.
+          tampered (str (vc/presentation-prefix issuer-jwt (butlast disclosures)) kb)
+          cfg {:require-key-binding? true :expected-audience aud
+               :expected-nonce nonce}
+          g (drive tampered cfg)]
+      (is (= :refused (:phase g)))
+      (is (= :sd-jwt-vc/bad-sd-hash (:reason g)))
+      (is (= :kb-jwt (:stage g)))
+      (testing "and the honest presentation still verifies"
+        (is (= :verified (:phase (drive honest cfg))))))))
+
+(deftest cnf-is-required-before-the-kb-jwt-is-looked-at
+  (testing "§3.2.2. Without `cnf` there is no key to check the KB-JWT
+            against, and accepting the KB-JWT's own key would let the
+            Holder nominate themselves."
+    (let [{:keys [issuer-jwt disclosures]} (issued)   ; no :holder-key -> no cnf
+          p (presented-with-kb issuer-jwt disclosures)
+          g (drive p {:require-key-binding? true :expected-audience aud
+                      :expected-nonce nonce})]
+      (is (= :refused (:phase g)))
+      (is (= :sd-jwt-vc/missing-cnf (:reason g)))
+      (is (= :key-binding (:stage g))
+          "refused at the key-binding stage, not inside the KB-JWT"))))
+
+(deftest an-untyped-token-is-not-a-credential
+  (testing "RFC 8725 explicit typing: without it a token minted for some
+            other purpose under the same key could be presented as a
+            credential"
+    (let [plain (jws/sign {"alg" "EdDSA" "typ" "JWT"}
+                          (json/write-str {"vct" "x"})
+                          {:sign toy-sign :json-encode json/write-str})
+          g (drive (str plain "~") {})]
+      (is (= :refused (:phase g)))
+      (is (= :sd-jwt-vc/bad-typ (:reason g)))
+      (is (= :issuer-jwt (:stage g))))))
+
+(deftest the-legacy-typ-is-accepted-and-never-produced
+  (let [legacy (jws/sign {"alg" "EdDSA" "typ" "vc+sd-jwt"}
+                         (json/write-str {"vct" "x"})
+                         {:sign toy-sign :json-encode json/write-str})
+        g (drive (str legacy "~") {})]
+    (is (= :verified (:phase g)) [(:reason g) (:stage g)])
+    (testing "while `issue` produces the current one"
+      (is (= "dc+sd-jwt"
+             (get (jws/decode-header (:issuer-jwt (issued))
+                                     {:json-decode json/read-str})
+                  "typ"))))))
+
+(deftest a-credential-without-vct-is-refused
+  (let [t (jws/sign {"alg" "EdDSA" "typ" "dc+sd-jwt"}
+                    (json/write-str {"iss" "x"})
+                    {:sign toy-sign :json-encode json/write-str})
+        g (drive (str t "~") {})]
+    (is (= :refused (:phase g)))
+    (is (= :sd-jwt-vc/missing-vct (:reason g)))))
+
+(deftest key-binding-required-but-absent-is-refused
+  (let [{:keys [issuer-jwt disclosures]} (issued with-cnf)
+        p (vc/presentation-prefix issuer-jwt disclosures)   ; no KB-JWT
+        g (drive p {:require-key-binding? true :expected-audience aud
+                    :expected-nonce nonce})]
+    (is (= :refused (:phase g)))
+    (is (= :sd-jwt-vc/key-binding-required (:reason g)))))
+
+(deftest the-audience-and-nonce-are-this-verifiers-own
+  (let [{:keys [issuer-jwt disclosures]} (issued with-cnf)
+        p (presented-with-kb issuer-jwt disclosures)]
+    (testing "a presentation replayed at another verifier"
+      (let [g (drive p {:require-key-binding? true
+                        :expected-audience "https://other.example"
+                        :expected-nonce nonce})]
+        (is (= :refused (:phase g)))
+        (is (= :sd-jwt-vc/bad-audience (:reason g)))))
+    (testing "a presentation replayed with a stale nonce"
+      (let [g (drive p {:require-key-binding? true :expected-audience aud
+                        :expected-nonce "a-different-nonce"})]
+        (is (= :refused (:phase g)))
+        (is (= :sd-jwt-vc/bad-nonce (:reason g)))))))
+
+(deftest something-with-no-separator-is-not-a-presentation
+  (testing "even a bare SD-JWT with no Disclosures carries the tilde"
+    (let [g (drive "not.a.presentation" {})]
+      (is (= :refused (:phase g)))
+      (is (= :sd-jwt-vc/malformed-presentation (:reason g)))
+      (is (= :presentation (:stage g))))))
+
+;; --- the budget itself -------------------------------------------------------
+
+(defn- completes-within?
+  "Does a full key-bound presentation reach a verdict inside `fuel`?"
+  [fuel]
+  (try
+    (let [{:keys [issuer-jwt disclosures]} (issued with-cnf)
+          p (presented-with-kb issuer-jwt disclosures)
+          s (call 'offer-presentation [(call 'init [(->doc {})] fuel) p] fuel)]
+      (= :want-issuer (call 'phase [s] fuel)))
+    (catch clojure.lang.ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest fuel-budget-is-measured-in-both-directions
+  (testing "the interpreter default is genuinely insufficient -- otherwise
+            `test-fuel` is superstition and should be deleted. A
+            presentation is long: the JWT, every Disclosure and the KB-JWT,
+            and `offer-presentation` walks all of it."
+    (is (false? (completes-within? 512))))
+  (testing "and the chosen budget is sufficient"
+    (is (true? (completes-within? test-fuel))))
+  (testing "the smallest sufficient budget, so the margin is visible"
+    (let [minimum (first (filter completes-within?
+                                 [1000 2000 4000 6000 8000 12000 16000 20000]))]
+      (is (some? minimum) "no budget in the search range reaches a verdict")
+      (is (<= minimum test-fuel))
+      (println (format "  [fuel] a key-bound presentation parses at %d; test-fuel is %d"
+                       minimum test-fuel)))))

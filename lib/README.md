@@ -88,6 +88,16 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `org.ietf.x509` | `org.ietf.x509/src` | `x509.core` (an external specification, publisher ietf.org) |
+| `org.ietf.cms` | `org.ietf.cms/src` | `cms.core`, `cms.jvm` (an external specification, publisher ietf.org) |
+| `org.ietf.rfc3161` | `org.ietf.rfc3161/src` | `rfc3161.core` (an external specification, publisher ietf.org) |
+| `org.ietf.argon2` | `org.ietf.argon2/src` | `argon2.compress`, `argon2.core`, `argon2.u32` (an external specification, publisher ietf.org) |
+| `org.ietf.ers` | `org.ietf.ers/src` | `ers.core` (an external specification, publisher ietf.org) |
+| `org.ietf.jws` | `org.ietf.jws/src` | `jws.core` (an external specification, publisher ietf.org) |
+| `org.ietf.oncrpc` | `org.ietf.oncrpc/src` | `oncrpc.core`, `oncrpc.record` (an external specification, publisher ietf.org) |
+| `org.ietf.nfs` | `org.ietf.nfs/src` | `nfs.memory`, `nfs.mount`, `nfs.tcp`, `nfs.v3` (an external specification, publisher ietf.org) |
+| `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
+| `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `kotoba.optimalTransport` | `kotoba.optimalTransport/src` | `optimal-transport.mesh-morph`, `optimal-transport.sinkhorn` (Kotoba project library) |
 | `kotoba.openapi` | `kotoba.openapi/src` | `openapi.execute`, `openapi.json`, `openapi.model`, `openapi.ports` (Kotoba project library) |
 | `kotoba.ooyake` | `kotoba.ooyake/src` | `ooyake.cells.reconcile.cell`, `ooyake.cells.reconcile.state-machine`, `ooyake.cells.social-post.state-machine`, `ooyake.cells.world-model.cell` (Kotoba project library) |

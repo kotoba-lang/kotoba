@@ -1,0 +1,227 @@
+(ns nfs.roundtrip-test
+  "A client of our own, over a real socket, against a real listener.
+
+  Unit tests over the codec prove the bytes are shaped right. This proves
+  the three layers compose: framing, envelope and program, through a TCP
+  connection that reassembles fragments and pipelines calls the way a
+  kernel client does."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [nfs.memory :as memory]
+            [nfs.mount :as mount]
+            [nfs.tcp :as tcp]
+            [nfs.v3 :as nfs]
+            [oncrpc.core :as rpc]
+            [oncrpc.record :as record]
+            [xdr.core :as xdr])
+  (:import [java.io ByteArrayOutputStream]
+           [java.net Socket]))
+
+(defn- cat [& parts]
+  (xdr/->bytes (mapcat (fn [p] (map #(bit-and (int %) 0xff) (seq p))) parts)))
+
+(defn- call!
+  "One RPC call over `socket`, returning the reply's result bytes and the
+  offset the program's own result starts at."
+  [socket prog vers proc args-bytes]
+  (let [xid (rand-int 1000000)
+        msg (cat (xdr/encode rpc/call-header
+                             {:xid xid :mtype rpc/CALL :rpcvers 2
+                              :prog prog :vers vers :proc proc
+                              :cred {:flavor rpc/AUTH-SYS
+                                     :body (xdr/encode rpc/auth-sys-parms
+                                                       {:stamp 0 :machinename "test"
+                                                        :uid 501 :gid 20 :gids [20]})}
+                              :verf {:flavor rpc/AUTH-NONE :body (xdr/->bytes [])}})
+                 (or args-bytes (xdr/->bytes [])))
+        out (.getOutputStream socket)
+        in (.getInputStream socket)]
+    (.write out ^bytes (record/frame msg))
+    (.flush out)
+    (let [buf (ByteArrayOutputStream.)
+          chunk (byte-array 65536)]
+      (loop []
+        (if-let [{:keys [message]} (record/parse (.toByteArray buf))]
+          (let [{:keys [value end]}
+                (xdr/decode [:struct
+                             [:xid [:uint]] [:mtype [:enum]] [:reply-stat [:enum]]
+                             [:verf [:struct [:flavor [:enum]]
+                                     [:body [:opaque* 400]]]]
+                             [:accept-stat [:enum]]]
+                            message)]
+            (is (= xid (:xid value)) "the reply is for the call we made")
+            (is (= rpc/SUCCESS (:accept-stat value))
+                (str "accept-stat for proc " proc))
+            {:bytes message :at end})
+          (let [n (.read in chunk)]
+            (when (neg? n) (throw (ex-info "closed" {})))
+            (.write buf chunk 0 n)
+            (recur)))))))
+
+(defn- with-server [f]
+  (let [state (memory/store)
+        fs (memory/filesystem state)
+        root (nfs/-root fs)
+        hello (nfs/-create fs root "hello.txt" {})
+        _ (nfs/-write fs hello 0 (xdr/->bytes "hello over nfs\n"))
+        _ (nfs/-mkdir fs root "docs" {})
+        server (tcp/start! {:fs fs :dir "/kotoba" :port 0})]
+    (try
+      (with-open [socket (Socket. "127.0.0.1" (int (:port server)))]
+        (f fs socket))
+      (finally ((:stop! server))))))
+
+(deftest the-three-layers-compose-over-a-socket
+  (with-server
+    (fn [_fs socket]
+      (testing "MOUNT NULL"
+        (call! socket mount/program 3 0 nil))
+
+      (let [{:keys [bytes at]} (call! socket mount/program 3 1
+                                      (xdr/encode mount/dirpath "/kotoba"))
+            res (xdr/decode-value mount/mount-res bytes at)
+            root (get-in res [:value :handle])]
+        (testing "MOUNT MNT hands back the root handle"
+          (is (= mount/MNT3_OK (:disc res)))
+          (is (some? root))
+          (is (= [0 1] (vec (sort (get-in res [:value :auth-flavors]))))))
+
+        (testing "FSINFO carries the transfer sizes the client sizes everything by"
+          (let [{:keys [bytes at]} (call! socket nfs/program 3 19
+                                          (xdr/encode nfs/nfs-fh3 root))
+                res (xdr/decode-value nfs/fsinfo-res bytes at)]
+            (is (= nfs/NFS3_OK (:disc res)))
+            (is (= 65536 (get-in res [:value :rtmax])))
+            (is (pos? (get-in res [:value :dtpref])))))
+
+        (testing "READDIR lists what was created"
+          (let [{:keys [bytes at]} (call! socket nfs/program 3 16
+                                          (cat (xdr/encode nfs/nfs-fh3 root)
+                                               (xdr/encode [:uhyper] 0)
+                                               (xdr/encode [:opaque 8] (repeat 8 0))
+                                               (xdr/encode [:uint] 8192)))
+                head (xdr/decode [:struct [:status [:enum]]
+                                  [:dir-attrs nfs/post-op-attr]
+                                  [:cookieverf [:opaque 8]]]
+                                 bytes at)]
+            (is (= nfs/NFS3_OK (get-in head [:value :status])))
+            (let [names (loop [pos (:end head) acc []]
+                          (let [{:keys [value end]} (xdr/decode [:bool] bytes pos)]
+                            (if value
+                              (let [{:keys [value end]} (xdr/decode nfs/entry3 bytes end)]
+                                (recur end (conj acc (:name value))))
+                              acc)))]
+              (is (= ["docs" "hello.txt"] (sort names))))))
+
+        (testing "LOOKUP then READ returns the bytes that were written"
+          (let [{:keys [bytes at]} (call! socket nfs/program 3 3
+                                          (xdr/encode nfs/diropargs3
+                                                      {:dir root :name "hello.txt"}))
+                res (xdr/decode-value nfs/lookup-res bytes at)
+                fh (get-in res [:value :object])]
+            (is (= nfs/NFS3_OK (:disc res)))
+            (let [{:keys [bytes at]} (call! socket nfs/program 3 6
+                                            (cat (xdr/encode nfs/nfs-fh3 fh)
+                                                 (xdr/encode [:uhyper] 0)
+                                                 (xdr/encode [:uint] 4096)))
+                  res (xdr/decode-value nfs/read-res bytes at)]
+              (is (= nfs/NFS3_OK (:disc res)))
+              (is (true? (get-in res [:value :eof])))
+              (is (= "hello over nfs\n"
+                     (xdr/utf8 (get-in res [:value :data])))))))
+
+        (testing "WRITE then READ, through the same connection"
+          (let [{:keys [bytes at]} (call! socket nfs/program 3 8
+                                          (cat (xdr/encode nfs/diropargs3
+                                                           {:dir root :name "new.txt"})
+                                               (xdr/encode [:enum] 0)
+                                               (xdr/encode nfs/sattr3
+                                                           {:mode nil :uid nil :gid nil
+                                                            :size nil
+                                                            :atime {:disc 0 :value nil}
+                                                            :mtime {:disc 0 :value nil}})))
+                res (xdr/decode-value nfs/create-res bytes at)
+                fh (get-in res [:value :obj])]
+            (is (= nfs/NFS3_OK (:disc res)))
+            (let [payload (xdr/->bytes "written by the test\n")
+                  {:keys [bytes at]} (call! socket nfs/program 3 7
+                                            (cat (xdr/encode nfs/nfs-fh3 fh)
+                                                 (xdr/encode [:uhyper] 0)
+                                                 (xdr/encode [:uint] (alength ^bytes payload))
+                                                 (xdr/encode [:enum] 2)
+                                                 (xdr/encode [:opaque*] payload)))
+                  res (xdr/decode-value nfs/write-res bytes at)]
+              (is (= nfs/NFS3_OK (:disc res)))
+              (is (= (alength ^bytes payload) (get-in res [:value :count])))
+              (is (= nfs/FILE-SYNC (get-in res [:value :committed]))))
+            (let [{:keys [bytes at]} (call! socket nfs/program 3 6
+                                            (cat (xdr/encode nfs/nfs-fh3 fh)
+                                                 (xdr/encode [:uhyper] 0)
+                                                 (xdr/encode [:uint] 4096)))
+                  res (xdr/decode-value nfs/read-res bytes at)]
+              (is (= "written by the test\n"
+                     (xdr/utf8 (get-in res [:value :data])))))))))))
+
+(deftest an-unknown-export-is-refused-by-name
+  (with-server
+    (fn [_fs socket]
+      (let [{:keys [bytes at]} (call! socket mount/program 3 1
+                                      (xdr/encode mount/dirpath "/nope"))
+            res (xdr/decode-value mount/mount-res bytes at)]
+        (is (= mount/MNT3ERR_NOENT (:disc res))
+            "mounting something the client did not ask for is worse than failing")))))
+
+(deftest a-missing-file-is-a-status-not-a-silence
+  (with-server
+    (fn [fs socket]
+      (let [root (nfs/-root fs)
+            {:keys [bytes at]} (call! socket nfs/program 3 3
+                                      (xdr/encode nfs/diropargs3
+                                                  {:dir root :name "absent"}))
+            res (xdr/decode-value nfs/lookup-res bytes at)]
+        (is (= nfs/NFS3ERR_NOENT (:disc res)))))))
+
+;; ── who is allowed, and as whom ───────────────────────────────────────────
+
+(deftest a-refused-peer-never-gets-a-reply
+  (testing "NFSv3 has no authentication of its own, so the decision has to be
+            made before the protocol starts — and a refusal at accept is the
+            one place where closing beats replying, because there is no call
+            yet to answer"
+    (let [server (tcp/start! {:fs (memory/filesystem)
+                              :dir "/kotoba" :port 0
+                              :authorize (constantly nil)})]
+      (try
+        (is (thrown? Exception
+                     (with-open [socket (Socket. "127.0.0.1" (int (:port server)))]
+                       (call! socket mount/program 3 0 nil))))
+        (finally ((:stop! server)))))))
+
+(deftest an-authorized-peer-is-served-its-own-filesystem
+  (testing ":filesystem-for is what makes one listener serve a per-user tree
+            without the identity being re-derived on every call"
+    (let [seen (atom [])
+          alice (memory/filesystem)
+          _ (nfs/-create alice (nfs/-root alice) "alice-only.txt" {})
+          server (tcp/start! {:filesystem-for (fn [p] (swap! seen conj p) alice)
+                              :dir "/kotoba" :port 0
+                              :authorize (fn [peer]
+                                           (when (= "127.0.0.1" (:remote-address peer))
+                                             {:principal "alice"}))})]
+      (try
+        (with-open [socket (Socket. "127.0.0.1" (int (:port server)))]
+          (let [{:keys [bytes at]} (call! socket mount/program 3 1
+                                          (xdr/encode mount/dirpath "/kotoba"))
+                res (xdr/decode-value mount/mount-res bytes at)
+                root (get-in res [:value :handle])]
+            (is (= mount/MNT3_OK (:disc res)))
+            (let [{:keys [bytes at]} (call! socket nfs/program 3 3
+                                            (xdr/encode nfs/diropargs3
+                                                        {:dir root :name "alice-only.txt"}))
+                  res (xdr/decode-value nfs/lookup-res bytes at)]
+              (is (= nfs/NFS3_OK (:disc res))))))
+        (is (= [{:principal "alice"}] @seen)
+            "the principal is decided once, at accept")
+        (finally ((:stop! server)))))))
+
+(deftest a-listener-with-no-filesystem-is-refused-at-construction
+  (is (thrown? kerror/ExceptionInfo (tcp/start! {:dir "/x" :port 0}))))

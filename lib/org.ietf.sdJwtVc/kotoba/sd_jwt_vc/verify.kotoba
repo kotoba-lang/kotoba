@@ -1,0 +1,283 @@
+;; The SD-JWT VC presentation decision, as a Kotoba application
+;; (ADR-2608261100) — draft-ietf-oauth-sd-jwt-vc, RFC 9901 §4.3.1,
+;; RFC 8725.
+;;
+;;   init             (config)              -> state
+;;   offer-presentation (state, compact)    -> state
+;;   offer-issuer     (state, result)       -> state
+;;   offer-key-binding(state, result)       -> state
+;;
+;; ## What this module is
+;;
+;; `sd-jwt-vc.core/verify` is almost entirely decision: the cryptography is
+;; injected (`:verify`, `:verify-holder`), JSON is injected
+;; (`:json-decode`), and the hashing lives in `multiformats`. What is left
+;; is an ORDER of refusals, and that order is the credential. So the order
+;; moves into the guest and the mechanisms stay outside it:
+;;
+;;   the guest owns   which bytes the holder's proof must cover, and the
+;;                    sequence of refusals that decides whether this
+;;                    presentation may be believed
+;;   the host owns    both signature checks, JSON, SHA-256, base64url, and
+;;                    resolving the holder's key from `cnf`
+;;
+;; ## The trailing tilde is a decision, not a formatting detail
+;;
+;; RFC 9901 §4.3.1: `sd_hash` is over *"the US-ASCII bytes of the encoded
+;; SD-JWT, i.e., the Issuer-signed JWT, a tilde character, and zero or more
+;; Disclosures selected for presentation, each followed by a tilde
+;; character"* — and NOT the KB-JWT.
+;;
+;; Both halves are load-bearing, and the guest owns both:
+;;
+;;   * the hashed string ENDS with `~`. Omitting it produces an `sd_hash`
+;;     that fails against every other implementation, which is a bug that
+;;     only appears when you talk to somebody else;
+;;   * the KB-JWT is excluded, because it is the thing being bound.
+;;
+;; That is what binds the proof to THIS set of disclosures: a Holder who
+;; drops one Disclosure and reuses the KB-JWT changes the hashed bytes.
+;; `dropping-a-disclosure-changes-the-hashed-bytes` is the control, and it
+;; is the reason `presentation-prefix` is computed here rather than by
+;; whoever calls the hash.
+;;
+;; ## What the guest is told, and what it is not
+;;
+;; It is told WHETHER each signature verified, never the keys or the
+;; signatures. It is told the header `typ` and the presence of `vct` and
+;; `cnf`, never the credential's claims. It is told the KB-JWT's `aud`,
+;; `nonce`, `iat` presence and `sd_hash`, and the `sd_hash` the host
+;; computed over the prefix this module produced — comparing two digests is
+;; a decision; producing one is not.
+;;
+;; Disclosed claims never enter. `sd-jwt.core/disclose` runs in the host and
+;; its output goes to the caller, not through here: a credential's claims
+;; can be arbitrarily large and a `:document` cannot hold them
+;; (`:container-items` 32, `:aggregate-utf8-bytes` 65536 —
+;; ADR-2608039970).
+;;
+;; ## `cnf` before the KB-JWT
+;;
+;; §3.2.2 makes `cnf` REQUIRED once Key Binding is supported, and the order
+;; matters: without `cnf` there is no key to check the KB-JWT against, and
+;; accepting the KB-JWT's own key would let the Holder nominate themselves.
+;; A verifier that checks the KB-JWT first has already asked a question it
+;; had no standing to ask.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph). It did not grow a second copy of this order.
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/sd_jwt_vc/verify.kotoba \
+;;     --target wasm32-browser --output verify.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6612-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns sd-jwt-vc.verify
+  (:export [init offer-presentation offer-issuer offer-key-binding
+            phase reason stage
+            issuer-jwt kb-jwt disclosure-count presentation-prefix
+            typ vct requires-key-binding?]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+;; --- byte scanning --------------------------------------------------------
+;; A presentation is US-ASCII: base64url segments separated by `~`.
+
+(defn- at-byte [s :string i :i64] :i64
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- index-of [s :string c :i64 i :i64] :i64
+  (let [x (at-byte s i)]
+    (cond (= x -1) -1
+          (= x c) i
+          :else (index-of s c (+ i 1)))))
+
+(defn- last-index-of [s :string c :i64 i :i64 best :i64] :i64
+  (let [p (index-of s c i)]
+    (if (< p 0) best (last-index-of s c (+ p 1) p))))
+
+(defn- count-char [s :string c :i64 i :i64 acc :i64] :i64
+  (let [p (index-of s c i)]
+    (if (< p 0) acc (count-char s c (+ p 1) (+ acc 1)))))
+
+;; --- the typ values (RFC 8725 explicit typing) ----------------------------
+;; Without an explicit `typ` a token minted for some other purpose under the
+;; same key could be presented as a credential.
+
+(defn- issuer-typ [] :string "dc+sd-jwt")
+
+;; Accepted on verification during the transition the draft allows, and
+;; never produced.
+(defn- legacy-typ [] :string "vc+sd-jwt")
+
+(defn- kb-typ [] :string "kb+jwt")
+
+;; --- state ----------------------------------------------------------------
+
+(defn- refuse-at [state :document why :keyword where :keyword] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc state :phase (document-keyword :refused))
+    :reason (document-keyword why))
+   :stage (document-keyword where)))
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-presentation)
+                :reason (document-keyword :none)
+                :stage (document-keyword :none)
+                :require-kb (document-bool (db config :require-key-binding?))
+                :expected-audience (document-string (ds config :expected-audience))
+                :expected-nonce (document-string (ds config :expected-nonce))
+                :issuer-jwt (document-string "")
+                :kb-jwt (document-string "")
+                :prefix (document-string "")
+                :disclosures (document-i64 0)
+                :typ (document-string "")
+                :vct (document-string "")))
+
+;; --- the presentation (RFC 9901 §4) ---------------------------------------
+;; `<JWT>~<D.1>~…~<D.N>~<KB>`. The KB-JWT follows the final tilde and may be
+;; empty; everything up to and INCLUDING that tilde is what `sd_hash` covers.
+
+(defn offer-presentation [state :document compact :string] :document
+  (if (not (= (dk state :phase) :want-presentation))
+    state
+    (let [n (string-byte-length compact)
+          first-t (index-of compact 126 0)
+          last-t (last-index-of compact 126 0 -1)]
+      (if (< first-t 0)
+        ;; Not a presentation at all: even a bare SD-JWT with no Disclosures
+        ;; carries the separator.
+        (refuse-at state :sd-jwt-vc/malformed-presentation :presentation)
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc
+            (document-assoc state :phase (document-keyword :want-issuer))
+            :issuer-jwt (document-string (string-substring compact 0 first-t)))
+           :kb-jwt (document-string (string-substring compact (+ last-t 1) n)))
+          ;; Up to and including the final tilde. The tilde is IN, the
+          ;; KB-JWT is OUT, and both halves are the point.
+          :prefix (document-string (string-substring compact 0 (+ last-t 1))))
+         :disclosures (document-i64 (- (count-char compact 126 0 0) 1)))))))
+
+;; --- the issuer-signed JWT ------------------------------------------------
+;; The host verified the signature with the issuer's key and decoded the
+;; header and payload. `result`: `:verified?`, `:typ`, `:vct`, `:has-cnf?`.
+
+(defn offer-issuer [state :document result :document] :document
+  (if (not (= (dk state :phase) :want-issuer))
+    state
+    (let [t (ds result :typ)
+          v (ds result :vct)
+          kept (document-assoc
+                (document-assoc state :typ (document-string t))
+                :vct (document-string v))]
+      (cond
+        (not (db result :verified?))
+        (refuse-at kept :sd-jwt-vc/issuer-signature :issuer-jwt)
+
+        ;; RFC 8725. Before anything is read out of the payload: a token
+        ;; that is not typed as a credential is not one, whatever it says.
+        (not (or (string=? t (issuer-typ)) (string=? t (legacy-typ))))
+        (refuse-at kept :sd-jwt-vc/bad-typ :issuer-jwt)
+
+        (string=? v "") (refuse-at kept :sd-jwt-vc/missing-vct :issuer-jwt)
+
+        (not (db state :require-kb))
+        (document-assoc kept :phase (document-keyword :verified))
+
+        (string=? (ds kept :kb-jwt) "")
+        (refuse-at kept :sd-jwt-vc/key-binding-required :key-binding)
+
+        ;; §3.2.2, and before the KB-JWT is looked at: without `cnf` there
+        ;; is no key to check it against, and accepting the KB-JWT's own key
+        ;; would let the Holder nominate themselves. A verifier that checks
+        ;; the KB-JWT first has already asked a question it had no standing
+        ;; to ask.
+        (not (db result :has-cnf?))
+        (refuse-at kept :sd-jwt-vc/missing-cnf :key-binding)
+
+        :else (document-assoc kept :phase (document-keyword :want-key-binding))))))
+
+;; --- the Key Binding JWT --------------------------------------------------
+;; The host verified it with the holder's key -- which it resolved from
+;; `cnf`, not from the KB-JWT -- and decoded it, and hashed the prefix this
+;; module produced. `result`: `:verified?`, `:typ`, `:aud`, `:nonce`,
+;; `:has-iat?`, `:sd-hash`, `:computed-sd-hash`.
+
+(defn offer-key-binding [state :document result :document] :document
+  (if (not (= (dk state :phase) :want-key-binding))
+    state
+    (cond
+      (not (db result :verified?))
+      (refuse-at state :sd-jwt-vc/holder-signature :kb-jwt)
+
+      (not (string=? (ds result :typ) (kb-typ)))
+      (refuse-at state :sd-jwt-vc/bad-kb-typ :kb-jwt)
+
+      (not (string=? (ds result :aud) (ds state :expected-audience)))
+      (refuse-at state :sd-jwt-vc/bad-audience :kb-jwt)
+
+      (not (string=? (ds result :nonce) (ds state :expected-nonce)))
+      (refuse-at state :sd-jwt-vc/bad-nonce :kb-jwt)
+
+      (not (db result :has-iat?))
+      (refuse-at state :sd-jwt-vc/missing-iat :kb-jwt)
+
+      ;; What binds the proof to THIS set of disclosures. A Holder who drops
+      ;; one and reuses the KB-JWT changes the hashed bytes, which is the
+      ;; point -- and the bytes are the ones this module chose.
+      (not (string=? (ds result :sd-hash) (ds result :computed-sd-hash)))
+      (refuse-at state :sd-jwt-vc/bad-sd-hash :kb-jwt)
+
+      :else (document-assoc state :phase (document-keyword :verified)))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; Which half refused, so a caller can log an issuer problem differently
+;; from a holder problem.
+(defn stage [state :document] :keyword (dk state :stage))
+
+(defn issuer-jwt [state :document] :string (ds state :issuer-jwt))
+
+(defn kb-jwt [state :document] :string (ds state :kb-jwt))
+
+(defn disclosure-count [state :document] :i64 (di state :disclosures))
+
+;; `<JWT>~<D.1>~…~<D.N>~` — the tilde INCLUDED, the KB-JWT excluded
+;; (RFC 9901 §4.3.1). The host hashes exactly this and hands the digest
+;; back as `:computed-sd-hash`.
+(defn presentation-prefix [state :document] :string (ds state :prefix))
+
+(defn typ [state :document] :string (ds state :typ))
+
+(defn vct [state :document] :string (ds state :vct))
+
+(defn requires-key-binding? [state :document] :bool (db state :require-kb))

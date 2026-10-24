@@ -1,0 +1,288 @@
+;; The RFC 4998 evidence-record verdict, as a Kotoba application
+;; (ADR-2608261100) — §5.2 / §5.3, and what `ers.core/verify` returns.
+;;
+;;   init         (config)         -> state
+;;   offer-shape  (state, lengths) -> state   ; how many stamps per chain
+;;   offer-stamp  (state, result)  -> state   ; the host checked one
+;;
+;; The companion to `ers/path.kotoba`, which decided whether one document is
+;; in one archive. This decides what a whole record CLAIMS.
+;;
+;;   the guest owns   what each stamp must cover, whether the record is
+;;                    verified at all, which date is the claim, and what
+;;                    "trusted" is allowed to mean
+;;   the host owns    every digest, every TSA signature, the trust anchors,
+;;                    and the clock
+;;
+;; ## Four rules, and three of them are about not overclaiming
+;;
+;; `ers.core/verify`'s own docstring states each:
+;;
+;;   1. **`:oldest` is the claim.** *"An evidence record proves the data
+;;      existed before the EARLIEST verified timestamp; later ones exist to
+;;      keep the older ones checkable, not to move the date forward."* A
+;;      verifier that reports the newest date reports the weakest possible
+;;      version of what it actually proved — and it looks like the strongest;
+;;   2. **an unverified stamp's time is not a date.** The earliest time is
+;;      taken from the VERIFIED stamps only. Letting an unverified one set
+;;      the claim would let anyone with a forged token move the date;
+;;   3. **`:trusted` is three-valued.** *"`rfc3161.core` keeps `:verified`
+;;      and `:trusted` apart for a reason and collapsing them here would undo
+;;      it."* `true` only when every TSA was vouched for; `false` when any
+;;      was explicitly rejected; `:unknown` otherwise — and `:unknown` must
+;;      not be reported as either of the others;
+;;   4. **an empty record is not verified.** `verify` guards with `(seq
+;;      flat)`. No evidence is not good evidence, and a record with no
+;;      timestamps that reported `verified` would be the most dangerous
+;;      possible answer.
+;;
+;; ## What each stamp covers is structural, so the guest says it
+;;
+;; §5.2 and §5.3 are different operations that people conflate:
+;;
+;;   * the first stamp of the first chain covers the DATA;
+;;   * every later stamp WITHIN a chain covers the previous token — a
+;;     timestamp renewal, attesting that the old token existed and was
+;;     intact before the new time;
+;;   * the first stamp of a LATER chain is a hash renewal, covering
+;;     `digest_new(data) ‖ digest_new(every previous chain)`.
+;;
+;; `covers` names which, from the shape alone, before any of them is checked.
+;; The host then computes that digest and reports whether the stamp verified
+;; against it.
+;;
+;; ## A hash renewal without the data cannot be checked, and says so
+;;
+;; *"A hash renewal computed without it would carry the new algorithm's name
+;; over the old algorithm's digests, which is the failure this operation
+;; exists to prevent."* So a record that hash-renewed is UNVERIFIED when the
+;; data is absent — reported, not skipped, and distinguishable from a
+;; signature that failed.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/ers/chain.kotoba \
+;;     --target wasm32-browser --output chain.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6442-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns ers.chain
+  (:export [init offer-shape offer-stamp
+            phase reason
+            covers needs-stamp? stamp-index chain-index within-chain-index
+            verified? trusted oldest newest
+            stamp-count verified-count]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- dv [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-vector)))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-i64 [v :document i :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (at v i)) -1))
+
+;; --- the shape --------------------------------------------------------------
+
+(defn- total-stamps [lengths :document i :i64 acc :i64] :i64
+  (if (>= i (document-count lengths))
+    acc
+    (total-stamps lengths (+ i 1) (+ acc (at-i64 lengths i)))))
+
+(defn- any-empty-chain? [lengths :document i :i64] :bool
+  (cond
+    (>= i (document-count lengths)) false
+    (< (at-i64 lengths i) 1) true
+    :else (any-empty-chain? lengths (+ i 1))))
+
+;; --- state ------------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-shape)
+                :reason (document-keyword :none)
+                :has-data (document-bool (db config :has-data?))
+                :lengths (document-vector)
+                :total (document-i64 -1)
+                :index (document-i64 0)
+                :chain (document-i64 0)
+                :within (document-i64 0)
+                :all-verified (document-bool true)
+                :verified-n (document-i64 0)
+                :any-untrusted (document-bool false)
+                :all-trusted (document-bool true)
+                :oldest (document-i64 -1)
+                :newest (document-i64 -1)))
+
+;; `lengths` is how many ArchiveTimeStamps each chain holds, in order.
+(defn offer-shape [state :document lengths :document] :document
+  (if (not (= (dk state :phase) :want-shape))
+    state
+    (cond
+      ;; No evidence is not good evidence. `verify` guards with `(seq flat)`
+      ;; for the same reason, and a record with no timestamps reporting
+      ;; verified would be the most dangerous possible answer.
+      (= (document-count lengths) 0) (refuse state :ers/empty-record)
+
+      (any-empty-chain? lengths 0) (refuse state :ers/empty-chain)
+
+      :else
+      (document-assoc
+       (document-assoc
+        (document-assoc state :phase (document-keyword :want-stamp))
+        :lengths lengths)
+       :total (document-i64 (total-stamps lengths 0 0))))))
+
+;; --- what the next stamp must cover (§5.2 / §5.3) --------------------------
+
+(defn covers [state :document] :keyword
+  (let [c (di state :chain)
+        w (di state :within)]
+    (cond
+      (not (= (dk state :phase) :want-stamp)) :none
+      ;; The first stamp of the first chain covers the data itself.
+      (and (= c 0) (= w 0)) :data
+      ;; Within a chain, each renewal attests that the previous token existed
+      ;; and was intact before the new time (§5.2).
+      (> w 0) :previous-token
+      ;; A new chain is a hash renewal (§5.3).
+      :else :hash-renewal)))
+
+(defn needs-stamp? [state :document] :bool
+  (= (dk state :phase) :want-stamp))
+
+;; --- one stamp's result -----------------------------------------------------
+;; `result`: `:verified?`, `:trusted` (`:yes` / `:no` / `:unknown`),
+;; `:gen-time` (epoch seconds; -1 when the token carried none).
+
+(defn offer-stamp [state :document result :document] :document
+  (if (not (= (dk state :phase) :want-stamp))
+    state
+    (let [kind (covers state)
+          ;; A hash renewal cannot be checked without the original data, and
+          ;; that is not the same fact as a signature that failed.
+          ;; `and` / `or` without a type annotation evaluate to i64, not
+          ;; :bool, so a `document-bool` fed one traps "value is not a
+          ;; boolean" (measured 2026-08-31; AGENTS.md records the same
+          ;; typing from the css port). Every boolean that reaches a
+          ;; document constructor in this file is therefore an `if`.
+          checkable (if (= kind :hash-renewal) (db state :has-data) true)
+          ok (if checkable (db result :verified?) false)
+          t (dk result :trusted)
+          gen (di result :gen-time)
+          old (di state :oldest)
+          newest-seen (di state :newest)
+
+          ;; The claim is taken from the VERIFIED stamps only: letting an
+          ;; unverified one set the date would let anyone with a forged token
+          ;; move it.
+          s1 (if (and ok (>= gen 0))
+               (document-assoc
+                (document-assoc state :oldest
+                                (document-i64 (if (or (< old 0) (< gen old)) gen old)))
+                :newest (document-i64 (if (> gen newest-seen) gen newest-seen)))
+               state)
+
+          s2 (document-assoc s1 :all-verified
+                             (document-bool (if (db state :all-verified) ok false)))
+          s3 (if ok
+               (document-assoc s2 :verified-n (document-i64 (+ (di state :verified-n) 1)))
+               s2)
+
+          ;; Three-valued, and the two halves are tracked separately so
+          ;; `:unknown` cannot collapse into either answer.
+          s4 (document-assoc
+              (document-assoc s3 :any-untrusted
+                              (document-bool (if (db state :any-untrusted)
+                                               true
+                                               (if (= t :no) true false))))
+              :all-trusted (document-bool (if (db state :all-trusted)
+                                            (if (= t :yes) true false)
+                                            false)))
+
+          s5 (if (and (= kind :hash-renewal) (not (db state :has-data)))
+               (document-assoc s4 :reason (document-keyword :ers/hash-renewal-needs-data))
+               s4)
+
+          ;; Advance: within the chain, or on to the next one.
+          idx (+ (di state :index) 1)
+          within (+ (di state :within) 1)
+          chain (di state :chain)
+          len (at-i64 (dv state :lengths) chain)
+          s6 (if (>= within len)
+               (document-assoc (document-assoc s5 :chain (document-i64 (+ chain 1)))
+                               :within (document-i64 0))
+               (document-assoc s5 :within (document-i64 within)))
+          s7 (document-assoc s6 :index (document-i64 idx))]
+      (if (>= idx (di state :total))
+        (document-assoc s7 :phase (document-keyword :decided))
+        s7))))
+
+;; --- projections ------------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+(defn stamp-index [state :document] :i64 (di state :index))
+
+(defn chain-index [state :document] :i64 (di state :chain))
+
+(defn within-chain-index [state :document] :i64 (di state :within))
+
+(defn stamp-count [state :document] :i64 (di state :total))
+
+(defn verified-count [state :document] :i64 (di state :verified-n))
+
+;; Every stamp verified, and there was at least one. An undecided record is
+;; not a verified one either: a verdict is only a verdict once every stamp
+;; has been seen.
+(defn verified? [state :document] :bool
+  (and (= (dk state :phase) :decided)
+       (and (db state :all-verified) (> (di state :total) 0))))
+
+;; :yes only when every TSA was vouched for, :no when any was explicitly
+;; rejected, :unknown otherwise. Collapsing :unknown into either would undo
+;; the distinction `rfc3161.core` keeps deliberately.
+(defn trusted [state :document] :keyword
+  (cond
+    (not (= (dk state :phase) :decided)) :unknown
+    (db state :all-trusted) :yes
+    (db state :any-untrusted) :no
+    :else :unknown))
+
+;; THE CLAIM: the data existed before this time. The earliest verified
+;; timestamp, not the latest -- later ones exist to keep the older ones
+;; checkable, not to move the date forward.
+(defn oldest [state :document] :i64
+  (if (= (dk state :phase) :decided) (di state :oldest) -1))
+
+;; Reported alongside, and deliberately not the claim.
+(defn newest [state :document] :i64
+  (if (= (dk state :phase) :decided) (di state :newest) -1))
