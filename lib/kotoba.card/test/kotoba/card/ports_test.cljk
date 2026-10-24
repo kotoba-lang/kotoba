@@ -1,0 +1,143 @@
+(ns kotoba.card.ports-test
+  "Contract test for the issuer-side ports: that a host can satisfy them, that
+  the protocol split is real rather than cosmetic, and that the propose-only
+  posture survives an implementation."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.card :as card]
+            [kotoba.card.lifecycle :as lc]
+            [kotoba.card.ports :as ports]))
+
+;; A fixture host. Offline, in-memory, propose-only -- the shape a governed
+;; actor's adapter takes before any scheme connection exists.
+(defrecord FixtureIssuer [state]
+  ports/ICardholderProvisioning
+  (intake-cardholder [_ application]
+    {:card/kind :cardholder-draft
+     :card/effect :propose
+     :card/application application})
+  (cardholder [_ cardholder-id]
+    (get-in @state [:cardholders cardholder-id]))
+
+  ports/ICardProgram
+  (assess-bin [_ request]
+    {:card/kind :bin-assessment :card/effect :propose :card/request request})
+  (sponsor-bin [_ request]
+    {:card/kind :bin-sponsorship-draft :card/effect :propose :card/request request})
+
+  ports/ICardIssuance
+  (issue-card [_ cardholder-id program]
+    {:card/kind :card-issuance-draft
+     :card/effect :propose
+     :card/cardholder cardholder-id
+     :card/program program
+     :card/state :issued})
+  (card [_ card-reference]
+    (get-in @state [:cards card-reference]))
+  (apply-lifecycle [this card-reference event]
+    ;; The host asks the library whether the event is even reachable before
+    ;; drafting anything -- it does not re-derive reachability itself.
+    (let [current (:card/state (ports/card this card-reference))
+          outcome (lc/apply-event current event :card-reference card-reference)]
+      (if (:card/ok? outcome)
+        (assoc outcome :card/kind :lifecycle-draft :card/effect :propose)
+        outcome)))
+
+  ports/IAuthorizationDecision
+  (decide-authorization [_ {:keys [pan amount]}]
+    (card/authorization pan amount :decline :reason "fixture declines by default"))
+
+  ports/IDisputeInitiation
+  (initiate-dispute [_ card-reference transaction reason]
+    {:card/kind :dispute-draft :card/effect :propose
+     :card/reference card-reference :card/transaction transaction
+     :card/reason reason})
+  (dispute-status [_ dispute-id]
+    (get-in @state [:disputes dispute-id])))
+
+;; A host that decides authorizations and nothing else -- the case the protocol
+;; split exists to make expressible.
+(defrecord AuthOnlyHost []
+  ports/IAuthorizationDecision
+  (decide-authorization [_ {:keys [pan amount]}]
+    (card/authorization pan amount :approve)))
+
+(def valid-pan "4111111111111111")
+
+(defn- issuer []
+  (->FixtureIssuer
+   (atom {:cards {"ref-1" {:card/state :issued}
+                  "ref-2" {:card/state :blocked}
+                  "ref-3" {:card/state :closed}}
+          :cardholders {"ch-1" {:card/name "Example"}}
+          :disputes {}})))
+
+(deftest a-host-can-satisfy-every-port
+  (let [h (issuer)]
+    (doseq [p [ports/ICardholderProvisioning ports/ICardProgram
+               ports/ICardIssuance ports/IAuthorizationDecision
+               ports/IDisputeInitiation]]
+      (is (satisfies? p h) (str "fixture should satisfy " p)))))
+
+(deftest the-protocol-split-is-real
+  (testing "a host may implement authorization decisions without gaining the
+            ability to propose issuing cards or sponsoring a BIN"
+    (let [a (->AuthOnlyHost)]
+      (is (satisfies? ports/IAuthorizationDecision a))
+      (is (not (satisfies? ports/ICardIssuance a)))
+      (is (not (satisfies? ports/ICardProgram a)))
+      (is (not (satisfies? ports/IDisputeInitiation a)))))
+  (testing "and it still decides authorizations correctly"
+    (let [auth (ports/decide-authorization (->AuthOnlyHost)
+                                           {:pan valid-pan :amount 5000})]
+      (is (card/approved? auth))
+      (is (= 5000 (card/authorized-amount auth))))))
+
+(deftest every-write-port-returns-a-proposal-not-an-actuation
+  (let [h (issuer)]
+    (doseq [[label result]
+            [[:cardholder (ports/intake-cardholder h {:name "Example"})]
+             [:bin-assess (ports/assess-bin h {:jurisdiction "JPN"})]
+             [:bin-sponsor (ports/sponsor-bin h {:jurisdiction "JPN"})]
+             [:issue (ports/issue-card h "ch-1" {:bin "411111"})]
+             [:lifecycle (ports/apply-lifecycle h "ref-1" :activate)]
+             [:dispute (ports/initiate-dispute h "ref-1" {:rrn "x"} :fraud)]]]
+      (is (= :propose (:card/effect result))
+          (str label " must be propose-only")))))
+
+(deftest lifecycle-refusals-propagate-through-the-port
+  (let [h (issuer)]
+    (testing "a reachable event drafts a transition"
+      (let [r (ports/apply-lifecycle h "ref-1" :activate)]
+        (is (:card/ok? r))
+        (is (= :active (:card/to r)))))
+    (testing "an unreachable event is refused with the library's own issue, and
+              the port does not soften it into a success"
+      (let [r (ports/apply-lifecycle h "ref-1" :block)]
+        (is (not (:card/ok? r)))
+        (is (= [:transition/unreachable] (mapv :card/issue (:card/issues r))))
+        (is (nil? (:card/effect r)))))
+    (testing "a terminal card refuses everything through the port too"
+      (is (not (:card/ok? (ports/apply-lifecycle h "ref-3" :activate)))))
+    (testing "a reissue through the port reports the new card reference it mints"
+      (let [r (ports/apply-lifecycle h "ref-2" :reissue)]
+        (is (:card/ok? r))
+        (is (= :active (:card/to r)))
+        (is (:card/mints-successor? r))))
+    (testing "and a reissue from :active is refused -- only :blocked is legal"
+      (let [h2 (->FixtureIssuer (atom {:cards {"a" {:card/state :active}}}))
+            r (ports/apply-lifecycle h2 "a" :reissue)]
+        (is (not (:card/ok? r)))
+        (is (= [:transition/unreachable] (mapv :card/issue (:card/issues r))))))))
+
+(deftest lookups-return-nil-for-unknown-subjects
+  (let [h (issuer)]
+    (is (nil? (ports/card h "no-such-ref")))
+    (is (nil? (ports/cardholder h "no-such-holder")))
+    (is (nil? (ports/dispute-status h "no-such-dispute")))
+    (is (some? (ports/cardholder h "ch-1")))))
+
+(deftest a-declining-decision-grants-nothing
+  (testing "the fixture declines, and a decline must not read as funds granted"
+    (let [auth (ports/decide-authorization (issuer) {:pan valid-pan :amount 5000})]
+      (is (not (card/approved? auth)))
+      (is (zero? (card/authorized-amount auth))))))
