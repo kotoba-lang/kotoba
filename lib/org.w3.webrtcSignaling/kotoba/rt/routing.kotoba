@@ -1,0 +1,226 @@
+;; WebRTC signaling relay routing, as a Kotoba application
+;; (ADR-2608261100) — the semantic contract of `kotoba.rt.core/route-message`.
+;;
+;;   init          (config)         -> state
+;;   offer-room    (state, room)    -> state   ; the host looked the room up
+;;   offer-message (state, message) -> state
+;;
+;; ## The guest routes; the host relays
+;;
+;; A signaling relay carries `:payload` — an SDP offer, an answer, an ICE
+;; candidate — VERBATIM. It never reads one, and neither does this guest:
+;;
+;;   the guest owns   who is allowed to send into a room, who may be
+;;                    addressed, and which clients a broadcast reaches
+;;   the host owns    the room table, the sockets, and every payload byte
+;;
+;; So `offer-message` takes ids and no payload at all, and the deliveries
+;; come back as a list of client ids. An SDP offer is unbounded and a
+;; `:document` is not; more to the point, the relay's whole promise is that
+;; it does not look.
+;;
+;; ## Four routing rules, and each is an access-control decision
+;;
+;;   1. **the sender must be in the room.** Otherwise anyone who can reach
+;;      the relay can inject signals into any room they can name — which is
+;;      not a routing bug, it is joining a call uninvited;
+;;   2. **an addressed recipient must be in the room.** Otherwise a signal
+;;      can be aimed at a client in a different call. The room is the
+;;      boundary, and `:to` must not cross it;
+;;   3. **a broadcast does not echo to the sender.** `route-message` removes
+;;      `from` from the member set; a relay that echoes makes every client
+;;      answer its own offer;
+;;   4. **an absent room is not an empty broadcast.** A room with no entry
+;;      and a room where the sender is alone produce the same empty delivery
+;;      list, and they are not the same fact: one is "nobody to tell", the
+;;      other is "no such call". The first is success and the second is an
+;;      error, and collapsing them makes a signal to a room that does not
+;;      exist look like a signal that simply had no listeners.
+;;
+;; ## The member list is bounded, so a truncated one is refused
+;;
+;; A `:document` vector holds 32 items. A room with more members than that
+;; cannot be handed over intact — and a broadcast computed from a truncated
+;; member list silently drops recipients, which looks exactly like a
+;; successful broadcast to a smaller room. So the host reports the room's
+;; TRUE size alongside the members, and a disagreement is refused rather
+;; than routed. `a-truncated-member-list-is-refused` is the control.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/rt/routing.kotoba \
+;;     --target wasm32-browser --output routing.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 5771-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns rt.routing
+  (:export [init offer-room offer-message
+            phase reason
+            delivery-count delivery-at broadcast?
+            member-count sender recipient]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- dv [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-vector)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-str [v :document i :i64] :string
+  (option-value-of [:option :string] (document-string-value (at v i)) ""))
+
+;; --- membership -------------------------------------------------------------
+
+(defn- member? [members :document who :string i :i64] :bool
+  (cond
+    (>= i (document-count members)) false
+    (string=? (at-str members i) who) true
+    :else (member? members who (+ i 1))))
+
+;; Everyone except the sender. A relay that echoes makes every client answer
+;; its own offer.
+(defn- others [members :document from :string i :i64 out :document] :document
+  (if (>= i (document-count members))
+    out
+    (others members from (+ i 1)
+            (if (string=? (at-str members i) from)
+              out
+              (document-vector-conj out (document-string (at-str members i)))))))
+
+;; --- state ------------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+(defn init [_config :document] :document
+  (document-map :phase (document-keyword :want-room)
+                :reason (document-keyword :none)
+                :members (document-vector)
+                :room-exists (document-bool false)
+                :member-count (document-i64 -1)
+                :from (document-string "")
+                :to (document-string "")
+                :broadcast (document-bool false)
+                :deliveries (document-vector)))
+
+;; The host looked the room up in its own table -- a lookup keyed by a
+;; runtime string, which is the host's job -- and reports whether it exists,
+;; who is in it, and HOW MANY are in it. The count is not redundant: see
+;; `a-truncated-member-list-is-refused`.
+(defn offer-room [state :document room :document] :document
+  (if (not (= (dk state :phase) :want-room))
+    state
+    (let [members (dv room :members)
+          claimed (di room :member-count)]
+      (cond
+        ;; A truncated list would silently drop broadcast recipients, and a
+        ;; short broadcast looks exactly like a successful one.
+        (not (= claimed (document-count members)))
+        (refuse state :rt/truncated-member-list)
+
+        :else
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc state :phase (document-keyword :want-message))
+           :members members)
+          :room-exists (document-bool (db room :exists?)))
+         :member-count (document-i64 claimed))))))
+
+;; --- the routing decision ---------------------------------------------------
+;; `message`: `:type`, `:room-id`, `:from`, `:to` (empty for a broadcast).
+;; No payload: the relay carries it and this never sees it.
+
+(defn offer-message [state :document message :document] :document
+  (if (not (= (dk state :phase) :want-message))
+    state
+    (let [from (ds message :from)
+          to (ds message :to)
+          members (dv state :members)
+          kept (document-assoc
+                (document-assoc state :from (document-string from))
+                :to (document-string to))]
+      (cond
+        (not (= (dk message :type) :signal)) (refuse kept :rt/malformed-message)
+
+        (string=? (ds message :room-id) "") (refuse kept :rt/malformed-message)
+
+        (string=? from "") (refuse kept :rt/malformed-message)
+
+        ;; "Nobody to tell" and "no such call" are not the same fact, and
+        ;; both produce an empty delivery list. Collapsing them makes a
+        ;; signal to a room that does not exist look like one that simply
+        ;; had no listeners.
+        (not (db state :room-exists)) (refuse kept :rt/room-not-found)
+
+        ;; Anyone who can reach the relay can NAME any room. Membership is
+        ;; what makes naming one different from being in it.
+        (not (member? members from 0)) (refuse kept :rt/sender-not-in-room)
+
+        ;; The room is the boundary, and `:to` must not cross it.
+        (and (not (string=? to "")) (not (member? members to 0)))
+        (refuse kept :rt/recipient-not-in-room)
+
+        (not (string=? to ""))
+        (document-assoc
+         (document-assoc
+          (document-assoc kept :phase (document-keyword :routed))
+          :broadcast (document-bool false))
+         :deliveries (document-vector-conj (document-vector) (document-string to)))
+
+        :else
+        (document-assoc
+         (document-assoc
+          (document-assoc kept :phase (document-keyword :routed))
+          :broadcast (document-bool true))
+         :deliveries (others members from 0 (document-vector)))))))
+
+;; --- projections ------------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; Only once routed. A delivery list handed back from a refusal would make
+;; the refusal decorative, and these are the sockets that get written to.
+(defn delivery-count [state :document] :i64
+  (if (= (dk state :phase) :routed) (document-count (dv state :deliveries)) -1))
+
+(defn delivery-at [state :document i :i64] :string
+  (if (= (dk state :phase) :routed) (at-str (dv state :deliveries) i) ""))
+
+;; A unicast has exactly one delivery; a broadcast has one per OTHER member,
+;; which may legitimately be none when the sender is alone.
+(defn broadcast? [state :document] :bool (db state :broadcast))
+
+(defn member-count [state :document] :i64 (di state :member-count))
+
+(defn sender [state :document] :string (ds state :from))
+
+(defn recipient [state :document] :string (ds state :to))

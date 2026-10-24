@@ -72,6 +72,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.jsonLdApi` | `org.w3.jsonLdApi/src` | `json-ld-api.core`, `json-ld-api.to-rdf` (an external specification, publisher w3.org) |
 | `org.w3.svg` | `org.w3.svg/src` | `svg.core`, `svg.css`, `svg.reader`, `svg.shapes` (an external specification, publisher w3.org) |
 | `org.w3.webaudio` | `org.w3.webaudio/src` | `w3.webaudio`, `w3.webaudio.protocol` (an external specification, publisher w3.org) |
+| `org.w3.webrtcSignaling` | `org.w3.webrtcSignaling/src` | `kotoba.rt.core` (an external specification, publisher w3.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
