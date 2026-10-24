@@ -1,0 +1,140 @@
+(ns mlkem.mlkem-test
+  "Runtime-agnostic suite: the building blocks checked against independent
+   definitions, and the behaviour of keygen / encaps / decaps, including implicit
+   rejection and the refusal of malformed inputs. The NIST ACVP vectors are in
+   `mlkem.acvp-test`."
+  (:require [mlkem.core :as mlkem]
+            [sha3.core :as sha3]
+            [mlkem.test-util :refer [seed]]
+            #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(def ^:private q 3329)
+
+(defn- poly
+  "A deterministic polynomial: 256 coefficients in [0, q)."
+  [n]
+  (mapv (fn [i] (mod (+ (* (+ i 1) 7919 (+ n 3)) (* n 104729) (* i i 31)) q)) (range 256)))
+
+;; ---------------------------------------------------------------------------
+;; Number theory
+;; ---------------------------------------------------------------------------
+
+(deftest zetas-match-appendix-a
+  ;; 17^BitRev7(i) mod 3329 for i = 0..7 (FIPS 203 Appendix A).
+  (is (= [1 1729 2580 3289 2642 630 1897 848]
+         (subvec @#'mlkem.core/zetas 0 8)))
+  (is (= 128 (count @#'mlkem.core/zetas)))
+  (is (= 17 (nth @#'mlkem.core/gammas 0))))
+
+(deftest ntt-round-trips
+  (doseq [n (range 3)]
+    (let [f (poly n)]
+      (is (= f (@#'mlkem.core/ntt-inv (@#'mlkem.core/ntt f))) (str "poly " n)))))
+
+(defn- schoolbook
+  "Product in Z_q[x]/(x^256 + 1), straight from the definition."
+  [a b]
+  (let [acc (reduce (fn [acc [i j]]
+                      (let [k (+ i j) v (* (nth a i) (nth b j))]
+                        (if (< k 256)
+                          (update acc k + v)
+                          (update acc (- k 256) - v))))
+                    (vec (repeat 256 0))
+                    (for [i (range 256) j (range 256)] [i j]))]
+    (mapv #(mod % q) acc)))
+
+(deftest ntt-multiplication-equals-schoolbook
+  ;; An independent check of the NTT, the inverse NTT and MultiplyNTTs together.
+  (doseq [[x y] [[0 1] [2 3]]]
+    (let [a (poly x) b (poly y)
+          via-ntt (@#'mlkem.core/ntt-inv
+                   (@#'mlkem.core/multiply-ntts (@#'mlkem.core/ntt a) (@#'mlkem.core/ntt b)))]
+      (is (= (schoolbook a b) via-ntt) (str "pair " x " " y)))))
+
+;; ---------------------------------------------------------------------------
+;; Encoding and compression
+;; ---------------------------------------------------------------------------
+
+(deftest byte-encode-decode-round-trip
+  (doseq [d [1 4 10 12]]
+    (let [f (mapv #(mod % (if (= d 12) q (bit-shift-left 1 d))) (poly d))
+          enc (@#'mlkem.core/byte-encode d f)]
+      (is (= (* 32 d) (count enc)) (str "length d=" d))
+      (is (every? #(<= 0 % 255) enc))
+      (is (= f (@#'mlkem.core/byte-decode d enc)) (str "d=" d)))))
+
+(deftest compress-error-is-bounded
+  ;; |Decompress(Compress(x)) - x| <= ceil(q / 2^(d+1)) in the centered sense.
+  (doseq [d [1 4 10]]
+    (let [bound (long (Math/ceil (/ q (* 2.0 (bit-shift-left 1 d)))))
+          worst (reduce max
+                        (for [x (range q)]
+                          (let [y (@#'mlkem.core/decompress d (@#'mlkem.core/compress d x))
+                                diff (mod (- y x) q)]
+                            (min diff (- q diff)))))]
+      (is (<= worst bound) (str "d=" d " worst " worst " bound " bound)))))
+
+;; ---------------------------------------------------------------------------
+;; The KEM
+;; ---------------------------------------------------------------------------
+
+(deftest sizes
+  (let [{:keys [ek dk]} (mlkem/keygen (seed 1) (seed 2))
+        {:keys [k c]} (mlkem/encaps ek (seed 3))]
+    (is (= [1184 2400 1088 32] [(count ek) (count dk) (count c) (count k)]))
+    (is (= [mlkem/ek-size mlkem/dk-size mlkem/ciphertext-size] [1184 2400 1088]))))
+
+(deftest round-trip
+  (doseq [n [1 5 9]]
+    (let [{:keys [ek dk]} (mlkem/keygen (seed n) (seed (+ n 100)))
+          {:keys [k c]} (mlkem/encaps ek (seed (+ n 200)))]
+      (is (= k (mlkem/decaps dk c)) (str "seed " n)))))
+
+(deftest keygen-and-encaps-are-deterministic
+  (is (= (mlkem/keygen (seed 1) (seed 2)) (mlkem/keygen (seed 1) (seed 2))))
+  (is (not= (:ek (mlkem/keygen (seed 1) (seed 2))) (:ek (mlkem/keygen (seed 3) (seed 2)))))
+  (let [{:keys [ek]} (mlkem/keygen (seed 1) (seed 2))]
+    (is (= (mlkem/encaps ek (seed 4)) (mlkem/encaps ek (seed 4))))
+    (is (not= (:k (mlkem/encaps ek (seed 4))) (:k (mlkem/encaps ek (seed 5)))))))
+
+(defn- flip [c i] (update (vec c) i #(bit-xor % 1)))
+
+(deftest implicit-rejection
+  (let [{:keys [ek dk]} (mlkem/keygen (seed 1) (seed 2))
+        {:keys [k c]} (mlkem/encaps ek (seed 3))
+        z (subvec dk (- (count dk) 32))]
+    (doseq [i [0 1 500 959 960 1087]]
+      (let [c' (flip c i)
+            got (mlkem/decaps dk c')]
+        (is (= 32 (count got)) (str "byte " i))
+        (is (not= k got) (str "byte " i " must not give the real key"))
+        (is (= (sha3/shake256 (into z c') 32) got) (str "byte " i " gives J(z || c')"))
+        (is (= got (mlkem/decaps dk c')) (str "byte " i " is deterministic"))))
+    (testing "the rejection key depends on the whole ciphertext"
+      (is (not= (mlkem/decaps dk (flip c 0)) (mlkem/decaps dk (flip c 1)))))))
+
+(deftest malformed-inputs-are-refused
+  (let [{:keys [ek dk]} (mlkem/keygen (seed 1) (seed 2))
+        {:keys [c]} (mlkem/encaps ek (seed 3))]
+    (testing "decaps"
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/decaps dk (butlast c))))
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/decaps dk (conj (vec c) 0))))
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/decaps (butlast dk) c)))
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/decaps (update (vec dk) (- (count dk) 40) #(bit-xor % 1)) c))
+          "a decapsulation key whose stored H(ek) was altered fails the hash check"))
+    (testing "encaps"
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/encaps (butlast ek) (seed 3))))
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/encaps ek (butlast (seed 3)))))
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/encaps (assoc (vec ek) 0 255 1 255) (seed 3)))
+          "a coefficient of 4095 is not reduced mod q: the modulus check refuses it"))
+    (testing "keygen"
+      (is (thrown? #?(:clj Exception :cljs :default) (mlkem/keygen (butlast (seed 1)) (seed 2)))))
+    (testing "out-of-range bytes are not accepted as bytes"
+      (is (not (mlkem/valid-encapsulation-key? (assoc (vec ek) 5 256))))
+      (is (not (mlkem/valid-decapsulation-key? (assoc (vec dk) 5 -1)))))))
+
+(deftest key-checks-accept-real-keys
+  (let [{:keys [ek dk]} (mlkem/keygen (seed 7) (seed 8))]
+    (is (mlkem/valid-encapsulation-key? ek))
+    (is (mlkem/valid-decapsulation-key? dk))))
