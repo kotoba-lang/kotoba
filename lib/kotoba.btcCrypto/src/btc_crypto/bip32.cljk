@@ -1,0 +1,145 @@
+(ns btc-crypto.bip32
+  "BIP-32 hierarchical deterministic key derivation. Reuses eth-crypto's
+  secp256k1 point arithmetic (`private->public`, same curve as Bitcoin) for
+  the public-key side of non-hardened derivation; adds the HMAC-SHA512
+  master-key/CKDpriv machinery BIP-32 needs on top. Private-key-path only —
+  there is no CKDpub/xpub-only (watch-only) derivation in this v1 (a wallet
+  that holds the seed never needs it); see the ADR's out-of-scope list.
+
+  (require '[btc-crypto.bip32 :as bip32])
+  (-> (bip32/seed->master seed)
+      (bip32/derive-path \"m/44'/0'/0'/0/0\"))
+  ;=> {:private-key bytes32 :chain-code bytes32 :depth n :parent-fingerprint u32
+       :child-number u32 :hardened? bool}
+
+  PORTABILITY: :clj-only (wrapped #?(:clj (do ...)) with throwing :cljs
+  stubs of the same names, matching eth-crypto.core's precedent) — needs
+  java.math.BigInteger and javax.crypto HMAC."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [btc-crypto.core :as btc]
+            [btc-crypto.base58 :as base58])
+  #?(:clj (:import (javax.crypto Mac)
+                    (javax.crypto.spec SecretKeySpec)
+                    (java.math BigInteger)
+                    (java.util Arrays))))
+
+(def hardened-offset 0x80000000)
+
+#?(:clj
+(do
+
+(def ^:private ^BigInteger SECP-N
+  (BigInteger. "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141" 16))
+
+(defn- hmac-sha512 ^bytes [^bytes key ^bytes data]
+  (let [mac (Mac/getInstance "HmacSHA512")]
+    (.init mac (SecretKeySpec. key "HmacSHA512"))
+    (.doFinal mac data)))
+
+(defn- ser32 ^bytes [^long i]
+  (byte-array [(unchecked-byte (bit-shift-right i 24)) (unchecked-byte (bit-shift-right i 16))
+               (unchecked-byte (bit-shift-right i 8)) (unchecked-byte i)]))
+
+(defn- parse32 ^long [^bytes b]
+  (reduce (fn [acc x] (bit-or (bit-shift-left acc 8) (bit-and (long x) 0xff))) 0 (seq b)))
+
+(defn- concat-bytes ^bytes [arrays]
+  (let [total (reduce (fn [^long n ^bytes a] (+ n (alength a))) 0 arrays)
+        out (byte-array total)]
+    (loop [off 0 as arrays]
+      (if (seq as)
+        (let [^bytes a (first as)]
+          (System/arraycopy a 0 out off (alength a))
+          (recur (+ off (alength a)) (rest as)))
+        out))))
+
+(defn- fingerprint ^bytes [^bytes privkey]
+  (Arrays/copyOfRange (btc/hash160 (btc/compressed-pubkey privkey)) 0 4))
+
+(defn seed->master
+  "Master key + chain code from a BIP-32 seed (typically the 64-byte output
+  of BIP-39 mnemonic->seed, but any 16-64 byte seed is valid)."
+  [^bytes seed]
+  (let [I (hmac-sha512 (kbytes/utf8-bytes "Bitcoin seed") seed)]
+    {:private-key (Arrays/copyOfRange I 0 32)
+     :chain-code (Arrays/copyOfRange I 32 64)
+     :depth 0
+     :parent-fingerprint 0
+     :child-number 0
+     :hardened? false}))
+
+(defn ckd-priv
+  "Derive child private extended key `index` (add `hardened-offset` for a
+  hardened child, or use `hardened?`) from parent `node`."
+  ([node index] (ckd-priv node index false))
+  ([{:keys [private-key chain-code depth]} index hardened?]
+   (let [index (long (if hardened? (+ index hardened-offset) index))
+         hardened? (>= index hardened-offset)
+         data (if hardened?
+                (concat-bytes [(byte-array [(byte 0)]) private-key (ser32 index)])
+                (concat-bytes [(btc/compressed-pubkey private-key) (ser32 index)]))
+         I (hmac-sha512 chain-code data)
+         IL (Arrays/copyOfRange I 0 32)
+         IR (Arrays/copyOfRange I 32 64)
+         il-int (BigInteger. 1 IL)
+         kpar-int (BigInteger. 1 ^bytes private-key)]
+     (when (or (>= (.compareTo il-int SECP-N) 0) (>= (.compareTo kpar-int SECP-N) 0))
+       (throw (ex-info "bip32: invalid IL/kpar >= n (retry with index+1)" {:index index})))
+     (let [ki (.mod (.add il-int kpar-int) SECP-N)]
+       (when (zero? (.signum ki))
+         (throw (ex-info "bip32: derived key is zero (retry with index+1)" {:index index})))
+       (let [ki-bytes (let [^bytes raw (.toByteArray ki) n (alength raw) out (byte-array 32)]
+                        (cond
+                          (= n 32) raw
+                          (< n 32) (do (System/arraycopy raw 0 out (- 32 n) n) out)
+                          :else (do (System/arraycopy raw (- n 32) out 0 32) out)))]
+         {:private-key ki-bytes
+          :chain-code IR
+          :depth (inc depth)
+          :parent-fingerprint (parse32 (fingerprint private-key))
+          :child-number index
+          :hardened? hardened?})))))
+
+(defn- parse-segment [^String seg]
+  (if (or (str/ends-with? seg "'") (str/ends-with? seg "h") (str/ends-with? seg "H"))
+    [(Long/parseLong (subs seg 0 (dec (count seg)))) true]
+    [(Long/parseLong seg) false]))
+
+(defn derive-path
+  "Derive `path` (e.g. \"m/44'/0'/0'/0/0\", apostrophe or \"h\"/\"H\" marks a
+  hardened segment) from `master` (as returned by `seed->master`)."
+  [master ^String path]
+  (if (= path "m")
+    master
+    (let [segs (rest (str/split path #"/"))]
+      (reduce (fn [node seg]
+                (let [[index hardened?] (parse-segment seg)]
+                  (ckd-priv node index hardened?)))
+              master
+              segs))))
+
+;; ─── xprv/xpub extended-key serialization (BIP-32 §Serialization format) ────
+
+(def ^:private VERSION {:mainnet {:private 0x0488ADE4 :public 0x0488B21E}
+                         :testnet {:private 0x04358394 :public 0x043587CF}})
+
+(defn serialize
+  "Base58Check-encode `node` as an extended key. `key-type` is :private
+  (xprv/tprv) or :public (xpub/tpub); `network` is :mainnet or :testnet."
+  ^String [{:keys [private-key chain-code depth parent-fingerprint child-number]} key-type network]
+  (let [version (get-in VERSION [network key-type])
+        key-data (if (= key-type :private)
+                   (concat-bytes [(byte-array [(byte 0)]) private-key])
+                   (btc/compressed-pubkey private-key))
+        payload (concat-bytes [(ser32 version) (byte-array [(unchecked-byte depth)])
+                               (ser32 parent-fingerprint) (ser32 child-number)
+                               chain-code key-data])]
+    (base58/encode-check payload)))
+
+) ;; end do
+:cljs
+(do
+  (defn seed->master [& _] (throw (ex-info "btc-crypto.bip32/seed->master is :clj-only (javax.crypto HMAC)" {})))
+  (defn ckd-priv [& _] (throw (ex-info "btc-crypto.bip32/ckd-priv is :clj-only (java.math.BigInteger)" {})))
+  (defn derive-path [& _] (throw (ex-info "btc-crypto.bip32/derive-path is :clj-only (java.math.BigInteger)" {})))
+  (defn serialize [& _] (throw (ex-info "btc-crypto.bip32/serialize is :clj-only (java.math.BigInteger)" {})))))

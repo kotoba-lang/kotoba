@@ -1,0 +1,204 @@
+#!/usr/bin/env kbb
+;; bin/lint.cljk -- clj-kondo, without a JVM.
+;;
+;; ## What this replaces
+;;
+;; This repository used to lint through a deps.edn alias:
+;;
+;;   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+;;          :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+;;                      "--fail-level" "error"]}
+;;
+;; run as `kbb -M:lint`. clj-kondo is not a JVM library here -- it is a
+;; tool, and it ships a GraalVM native image for every platform this
+;; workspace runs on. The alias was a delivery mechanism, not a dependency.
+;; AGENTS.md fixes the runtime order with the JVM demoted to last resort;
+;; `scripts/verify-jvm-dependency-surface.cljs` classifies this alias as
+;; `:jvm-lint` and calls it "the cheapest exit in the whole set".
+;;
+;; The lint itself is unchanged: same tool, same VERSION, same paths, same
+;; --fail-level, therefore the same findings. Verified before landing by
+;; running `kbb -M:lint` and this script on the same tree and diffing
+;; the finding lines.
+;;
+;; ## Why not the npm package
+;;
+;; `npm install clj-kondo` looks like the obvious answer and is not one.
+;; That package (a third-party republish, filipesilva/clj-kondo) declares
+;; native URLs for darwin-x64, linux-x64 and win32-x64 ONLY. On Apple
+;; Silicon -- every machine in this fleet -- binwrap finds no binary for the
+;; platform, falls into its fallback branch, downloads
+;; `clj-kondo-<v>-standalone.jar`, and `bin/clj-kondo` runs `java -jar`.
+;;
+;; It produces IDENTICAL findings and exits 0, so nothing in the output says
+;; a JVM ran. Measured 2026-09-07 with `java` replaced by a stub that exits
+;; 127: the native binary linted clean, the npm package printed
+;; `JVM ESCAPE: java -jar .../clj-kondo.jar`. Converting to npm would have
+;; moved the JVM from `clojure` to `java` and reported success.
+;;
+;; ## Why not `npx --yes clj-kondo@... --lint ...`
+;;
+;; Measured on this machine the same day: `npx --yes clj-kondo@2025.10.23
+;; --version` prints `10.2.2` -- npx's own version -- and exits 0. npx
+;; consumes the leading `--flag` as its own. AGENTS.md already records this
+;; breakage. A lint that never ran and exited 0 is the failure mode this
+;; whole exercise is about.
+;;
+;; ## How the binary is obtained
+;;
+;; In order: $CLJ_KONDO, then `node_modules/.bin/clj-kondo`, then PATH, then
+;; a shared per-user cache under $XDG_CACHE_HOME (or ~/.cache). If the cache
+;; is empty the pinned release archive is downloaded from the clj-kondo
+;; GitHub release and its SHA-256 checked against the digest published by
+;; upstream alongside it (`<asset>.zip.sha256`) before anything is unpacked
+;; or executed. The cache is keyed by version, so all repositories in this
+;; workspace share ONE copy rather than one node_modules each.
+;;
+;; ## What it does when it cannot answer
+;;
+;; It exits 97 and prints REFUSED. It does not exit 0. "I could not lint"
+;; and "I linted and it was clean" must not be the same value -- AGENTS.md
+;; ADR-2608136000. 97 rather than 2 because clj-kondo already uses 0/2/3 for
+;; clean/warnings/errors and 1 for its own internal failure.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs     (js/require "node:fs"))
+(def os     (js/require "node:os"))
+(def nodep  (js/require "node:path"))
+(def cp     (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+
+;; --- the pin -------------------------------------------------------------
+;; Same version the maven alias pinned. Changing it changes the findings.
+(def version "2024.11.14")
+
+;; Same paths and same fail level the alias passed. Changing either changes
+;; what is reported.
+(def lint-paths ["src" "test"])
+(def fail-level "error")
+
+;; SHA-256 of each release archive, as published by upstream in
+;; `<asset>.sha256` next to the asset itself. Fetched 2026-09-07.
+(def archives
+  {"darwin-arm64" ["macos-aarch64"  "c22fcd53639481b0829177f4332ce51f3848e0eb1b99abd4a62888c5b0d2f488"]
+   "darwin-x64"   ["macos-amd64"    "daea65614210063179671655b6a57e8d3d4be2c8d9ec52459f4dba91ff80f44f"]
+   "linux-x64"    ["linux-amd64"    "d5ed5e8ec0b9f51b5112b57a4f74719942f8e6c7edf50f75913e1538da77a3aa"]
+   "linux-arm64"  ["linux-aarch64"  "013622bb687d91c1e6954d639b2d5427660b9bebffdc0bf1c4d3a5cf5db4d039"]
+   "win32-x64"    ["windows-amd64"  "1d359388e006a3def27984fdbb5455d06a965447c1c0a1c0a5431dc53fa36b28"]})
+
+(defn refuse! [& msg]
+  (binding [*print-fn* *print-err-fn*]
+    (println (str "REFUSED\t" (str/join " " msg))))
+  (js/process.exit 97))
+
+(defn exec-ok?
+  "True when `bin` runs and reports the pinned version. Never throws."
+  [bin]
+  (try
+    (let [r (.spawnSync cp bin #js ["--version"] #js {:encoding "utf8"})]
+      (and (zero? (or (.-status r) 1))
+           (str/includes? (or (.-stdout r) "") version)))
+    (catch :default _ false)))
+
+(defn exec-runs?
+  "True when `bin` runs at all, whatever version it reports."
+  [bin]
+  (try
+    (let [r (.spawnSync cp bin #js ["--version"] #js {:encoding "utf8"})]
+      (zero? (or (.-status r) 1)))
+    (catch :default _ false)))
+
+(defn reported-version [bin]
+  (try (str/trim (or (.-stdout (.spawnSync cp bin #js ["--version"] #js {:encoding "utf8"})) ""))
+       (catch :default _ "")))
+
+(def cache-dir
+  (nodep.join (or js/process.env.XDG_CACHE_HOME (nodep.join (.homedir os) ".cache"))
+              "clj-kondo" version))
+
+(def cached-bin (nodep.join cache-dir "clj-kondo"))
+
+(defn sha256 [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+(defn unzip!
+  "Extract `zip` into `dir`. Tries unzip(1) then bsdtar. Returns true on success."
+  [zip dir]
+  (some (fn [[bin args]]
+          (try
+            (let [r (.spawnSync cp bin (clj->js args) #js {:stdio "ignore"})]
+              (and (zero? (or (.-status r) 1))
+                   (.existsSync fs (nodep.join dir "clj-kondo"))))
+            (catch :default _ false)))
+        [["unzip" ["-o" "-q" zip "-d" dir]]
+         ["tar"   ["-xf" zip "-C" dir]]]))
+
+(defn fetch-into-cache!
+  "Download the pinned archive for this platform, verify its published
+   SHA-256, unpack it into the shared cache. Returns the binary path or nil."
+  []
+  (let [key (str js/process.platform "-" js/process.arch)
+        [asset want] (get archives key)]
+    (when-not asset
+      (refuse! (str "no pinned clj-kondo " version " archive for platform " key
+                    " -- install clj-kondo " version " and put it on PATH")))
+    (let [url (str "https://github.com/clj-kondo/clj-kondo/releases/download/v"
+                   version "/clj-kondo-" version "-" asset ".zip")]
+      (println (str "bin/lint.cljk: fetching clj-kondo " version " for " key))
+      (-> (js/fetch url)
+          (.then (fn [resp]
+                   (when-not (.-ok resp)
+                     (refuse! (str "download failed: HTTP " (.-status resp) " " url)))
+                   (.arrayBuffer resp)))
+          (.then (fn [ab]
+                   (let [buf (js/Buffer.from ab)
+                         got (sha256 buf)]
+                     (when-not (= got want)
+                       (refuse! (str "checksum mismatch for " url
+                                     " -- want " want " got " got)))
+                     (.mkdirSync fs cache-dir #js {:recursive true})
+                     (let [zip (nodep.join cache-dir "archive.zip")]
+                       (.writeFileSync fs zip buf)
+                       (when-not (unzip! zip cache-dir)
+                         (refuse! (str "could not unpack " zip
+                                       " -- no working unzip or tar")))
+                       (.chmodSync fs cached-bin 0755)
+                       (.unlinkSync fs zip)
+                       cached-bin))))))))
+
+(defn run! [bin]
+  (let [args (concat ["--lint"] lint-paths ["--fail-level" fail-level])]
+    (println (str "bin/lint.cljk: " (reported-version bin) " (" bin ")"))
+    (let [r (.spawnSync cp bin (clj->js args) #js {:stdio "inherit"})]
+      (when (.-error r)
+        (refuse! (str "could not execute " bin ": " (.-message (.-error r)))))
+      (js/process.exit (or (.-status r) 1)))))
+
+(defn resolve-and-run! []
+  (let [candidates (remove nil?
+                           [js/process.env.CLJ_KONDO
+                            (nodep.join (.cwd js/process) "node_modules" ".bin" "clj-kondo")
+                            "clj-kondo"
+                            cached-bin])]
+    (if-let [exact (first (filter exec-ok? candidates))]
+      (run! exact)
+      ;; Nothing at the pinned version. Rather than lint with an unknown
+      ;; version silently, fetch the pinned one. A different version already
+      ;; on PATH is reported, not used, so a findings delta can never be
+      ;; introduced without it appearing in this output.
+      (do
+        (when-let [other (first (filter exec-runs? candidates))]
+          (binding [*print-fn* *print-err-fn*]
+            (println (str "bin/lint.cljk: ignoring " (reported-version other)
+                          " at " other " -- this repository pins " version))))
+        (-> (js/Promise.resolve (fetch-into-cache!))
+            (.then (fn [bin]
+                     (if (and bin (exec-ok? bin))
+                       (run! bin)
+                       (refuse! (str "obtained a binary that does not report " version)))))
+            (.catch (fn [e]
+                      (refuse! (str "could not obtain clj-kondo " version ": "
+                                    (or (.-message e) e))))))))))
+
+(resolve-and-run!)
