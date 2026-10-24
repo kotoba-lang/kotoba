@@ -92,6 +92,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.cms` | `org.ietf.cms/src` | `cms.core`, `cms.jvm` (an external specification, publisher ietf.org) |
 | `org.ietf.rfc3161` | `org.ietf.rfc3161/src` | `rfc3161.core` (an external specification, publisher ietf.org) |
 | `org.ietf.argon2` | `org.ietf.argon2/src` | `argon2.compress`, `argon2.core`, `argon2.u32` (an external specification, publisher ietf.org) |
+| `org.ietf.ers` | `org.ietf.ers/src` | `ers.core` (an external specification, publisher ietf.org) |
 | `kotoba.optimalTransport` | `kotoba.optimalTransport/src` | `optimal-transport.mesh-morph`, `optimal-transport.sinkhorn` (Kotoba project library) |
 | `kotoba.openapi` | `kotoba.openapi/src` | `openapi.execute`, `openapi.json`, `openapi.model`, `openapi.ports` (Kotoba project library) |
 | `kotoba.ooyake` | `kotoba.ooyake/src` | `ooyake.cells.reconcile.cell`, `ooyake.cells.reconcile.state-machine`, `ooyake.cells.social-post.state-machine`, `ooyake.cells.world-model.cell` (Kotoba project library) |
