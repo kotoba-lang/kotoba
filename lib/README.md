@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.datom` | `kotoba.datom/src` | `datom.core` (Kotoba project library) |
 | `kotoba.daichou` | `kotoba.daichou/src` | `daichou.canonical`, `daichou.chain`, `daichou.hash`, `daichou.receipt` (Kotoba project library) |
 | `kotoba.d3` | `kotoba.d3/src` | `kotoba.lang.d3.scale`, `kotoba.lang.d3.shape` (Kotoba project library) |
 | `kotoba.search` | `kotoba.search/src` | `search.model`, `search.origin`, `search.postings`, `search.validate` (Kotoba project library) |
