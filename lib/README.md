@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.byoubuUi` | `kotoba.byoubuUi/src` | `byoubu-ui.core`, `byoubu-ui.style`, `byoubu-ui.tokens` (Kotoba project library) |
 | `kotoba.css` | `kotoba.css/src` | `css.build`, `css.core`, `css.utility`, `kotoba.css` (Kotoba project library) |
 | `kotoba.byoubu` | `kotoba.byoubu/src` | `byoubu.catalog`, `byoubu.color`, `byoubu.core`, `byoubu.facts` (Kotoba project library) |
 | `kotoba.apn` | `kotoba.apn/src` | `apn.grid`, `apn.model`, `apn.provision`, `apn.runner` (Kotoba project library) |
