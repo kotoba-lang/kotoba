@@ -1,0 +1,238 @@
+(ns gateway.gateway-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [gateway.cache :as cache]
+            [gateway.request :as req]
+            [gateway.resolve :as res]))
+
+(def cid "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+(def cidv0 "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")
+(def k51 "k51qzi5uqu5dg6lcd99r9gmb963kgugjinxxggwy7o93oagk3f2eg3qcjh7127")
+
+;; ── request parsing ───────────────────────────────────────────────────────
+
+(deftest a-path-request-splits-into-namespace-id-and-path
+  (let [r (req/parse {:host "gw.example" :path (str "/ipfs/" cid "/dir/index.html")})]
+    (is (= :content (:kind r)))
+    (is (= "ipfs" (:namespace r)))
+    (is (= cid (:id r)))
+    (is (= "dir/index.html" (:path r)))
+    (is (= :path (:style r)))
+    (is (req/immutable? r))))
+
+(deftest a-subdomain-request-puts-the-cid-in-the-authority
+  (let [r (req/parse {:host (str cid ".ipfs.gw.example") :path "/dir/index.html"})]
+    (is (= :content (:kind r)))
+    (is (= cid (:id r)))
+    (is (= "dir/index.html" (:path r)))
+    (is (= :subdomain (:style r)))
+    (is (= "gw.example" (:gateway-host r)))))
+
+(deftest a-cidv0-cannot-be-a-dns-label
+  (testing "in the path it is fine — paths are case-sensitive"
+    (is (= :content (:kind (req/parse {:host "gw.example" :path (str "/ipfs/" cidv0)})))))
+  (testing "as a subdomain DNS has already lower-cased it, and that is unrecoverable"
+    (let [r (req/parse {:host (str cidv0 ".ipfs.gw.example") :path "/"})]
+      (is (= :error (:kind r)))
+      (is (= :non-subdomain-safe-cid (:reason r)))
+      (is (= 400 (:status r)))))
+  (testing "so a subdomain gateway cannot mint a redirect for it either"
+    (is (nil? (req/subdomain-redirect {:namespace "ipfs" :id cidv0 :path ""} "gw.example")))
+    (is (some? (req/subdomain-redirect {:namespace "ipfs" :id cid :path "a"} "gw.example")))))
+
+(deftest a-subdomain-redirect-preserves-the-path
+  (let [r (req/subdomain-redirect {:namespace "ipns" :id k51 :path "docs/x"} "gw.example")]
+    (is (= 301 (:status r)))
+    (is (= (str "https://" k51 ".ipns.gw.example/docs/x") (:location r)))))
+
+(deftest urls-this-gateway-does-not-own-fall-through
+  (is (= :not-gateway (:kind (req/parse {:host "gw.example" :path "/xrpc/com.atproto.x"}))))
+  (is (= :not-gateway (:kind (req/parse {:host "gw.example" :path "/"}))))
+  (is (= :not-gateway (:kind (req/parse {:host "gw.example" :path "/ipfs"})))
+      "a namespace with no identifier is not a gateway request at all"))
+
+(deftest the-response-format-comes-from-format-then-accept
+  (is (= "application/vnd.ipld.raw"
+         (:format (req/parse {:host "h" :path (str "/ipfs/" cid) :query "format=raw"}))))
+  (is (= "application/vnd.ipld.car"
+         (:format (req/parse {:host "h" :path (str "/ipfs/" cid)
+                              :accept "application/vnd.ipld.car"}))))
+  (testing "?format= wins — it is explicit and survives being pasted"
+    (is (= "application/vnd.ipld.raw"
+           (:format (req/parse {:host "h" :path (str "/ipfs/" cid)
+                                :query "format=raw"
+                                :accept "application/vnd.ipld.car"})))))
+  (testing "absent means deserialized, which the client cannot verify"
+    (is (nil? (:format (req/parse {:host "h" :path (str "/ipfs/" cid)}))))))
+
+(deftest a-repeated-query-parameter-keeps-the-first
+  (is (= "raw" (get (req/parse-query "format=raw&format=car") "format"))
+      "last-wins lets an appended parameter change what the gateway returns"))
+
+;; ── cache policy ──────────────────────────────────────────────────────────
+
+(deftest ipfs-is-immutable-and-says-so
+  (let [h (cache/cache-control {:immutable? true})]
+    (is (str/includes? h "immutable"))
+    (is (str/includes? h (str "max-age=" cache/immutable-max-age)))
+    (testing "immutable is what stops a browser revalidating on reload"
+      (is (not (str/includes? h "stale-while-revalidate"))))))
+
+(deftest ipns-max-age-comes-from-the-record-ttl-in-nanoseconds
+  (is (= 3600 (cache/ns->seconds 3600000000000)) "the TTL is nanoseconds")
+  (is (= 300 (cache/mutable-max-age (* 300 1000000000))))
+  (testing "reading it as seconds would be a billion times too long"
+    (is (not= 3600000000000 (cache/mutable-max-age 3600000000000)))))
+
+(deftest ipns-max-age-is-clamped-at-both-ends
+  (is (= cache/min-mutable-max-age (cache/mutable-max-age (* 1 1000000000)))
+      "a 1-second TTL makes every request a resolution")
+  (is (= cache/max-mutable-max-age (cache/mutable-max-age (* 30 86400 1000000000)))
+      "a 30-day TTL asks a gateway to serve a moved name for a month")
+  (is (= cache/min-mutable-max-age (cache/mutable-max-age nil))
+      "an absent TTL is not 'cache forever'"))
+
+(deftest a-mutable-response-promises-stale-while-revalidate
+  (let [h (cache/cache-control {:immutable? false :ttl-ns (* 600 1000000000)})]
+    (is (str/includes? h "max-age=600"))
+    (is (str/includes? h "stale-while-revalidate=600")
+        "without it, one request per name per TTL pays the full resolution cost")))
+
+(deftest a-deserialized-response-gets-a-weak-etag
+  (is (= (str "\"" cid "\"") (cache/etag cid {:format "application/vnd.ipld.raw"}))
+      "raw bytes are exactly the addressed content")
+  (is (= (str "\"" cid "\"") (cache/etag cid {:format "application/vnd.ipld.car"})))
+  (is (= (str "W/\"" cid "\"") (cache/etag cid {}))
+      "a deserialized response is a render of the DAG and can differ between versions"))
+
+(deftest the-resolution-cache-is-keyed-on-the-name-not-the-url
+  (let [a (req/parse {:host "h" :path (str "/ipns/" k51 "/a")})
+        b (req/parse {:host "h" :path (str "/ipns/" k51 "/b")})]
+    (is (= (cache/cache-key a) (cache/cache-key b))
+        "everything under a name shares one resolution")))
+
+(deftest headers-carry-the-path-and-roots-a-client-needs-to-verify
+  (let [r (req/parse {:host "h" :path (str "/ipfs/" cid "/a/b")})
+        h (cache/headers {:request r :cid cid :roots [cid "bafyroot2"]})]
+    (is (= (str "/ipfs/" cid "/a/b") (get h "X-Ipfs-Path")))
+    (is (= (str cid ",bafyroot2") (get h "X-Ipfs-Roots")))
+    (is (= "bytes" (get h "Accept-Ranges")))
+    (is (str/includes? (get h "Cache-Control") "immutable"))))
+
+;; ── freshness ─────────────────────────────────────────────────────────────
+
+(def t0 1000000)
+
+(defn- entry [ttl-s seq']
+  (cache/resolution-entry {:cid cid :ttl-ns (* ttl-s 1000000000)
+                           :sequence seq' :now-ms t0}))
+
+(deftest freshness-and-the-stale-window-match-the-header
+  (let [e (entry 600 1)]
+    (is (cache/fresh? e t0))
+    (is (cache/fresh? e (+ t0 599000)))
+    (is (not (cache/fresh? e (+ t0 601000))))
+    (testing "and it stays usable for the same span again, as the header promised"
+      (is (cache/usable-while-revalidating? e (+ t0 900000)))
+      (is (not (cache/usable-while-revalidating? e (+ t0 1300000)))))))
+
+(deftest a-lower-sequence-is-not-accepted
+  (let [e (entry 600 5)]
+    (is (cache/accept-resolution? e {:sequence 6}))
+    (is (cache/accept-resolution? e {:sequence 5}))
+    (is (not (cache/accept-resolution? e {:sequence 4}))
+        "a stale-but-valid record would walk the name backwards for a whole TTL")))
+
+;; ── plane routing ─────────────────────────────────────────────────────────
+
+(deftest a-key-derived-name-is-owned-by-the-dht-and-nothing-else
+  (is (= :dht (res/plane-for k51)))
+  (is (res/key-derived-name? k51))
+  (is (= :registry (res/plane-for "my-graph")))
+  (is (= :dnslink (res/plane-for "example.com")))
+  (is (not (res/key-derived-name? "my-graph"))))
+
+(deftest a-dht-miss-for-a-key-derived-name-is-a-miss-not-a-fallback
+  (let [planes {:dht (constantly nil)
+                :registry (fn [_] {:cid "bafyEVIL" :ttl-ns 0 :sequence 99})}
+        r (res/route planes k51)]
+    (is (false? (:ok? r)))
+    (is (= :no-such-name (:reason r)))
+    (is (= :dht (:plane r)))
+    (testing "the registry must never answer for a name whose authority is a key"
+      (is (nil? (:cid r))))))
+
+(deftest the-registry-keeps-answering-for-the-names-it-owns
+  (let [planes {:dht (constantly nil)
+                :registry (fn [_] {:cid "bafyGRAPH" :ttl-ns 0 :sequence 3})}
+        r (res/route planes "my-graph")]
+    (is (:ok? r))
+    (is (= "bafyGRAPH" (:cid r)))
+    (is (= :registry (:plane r)))))
+
+(deftest an-unconfigured-plane-says-so-rather-than-404ing
+  (let [r (res/route {} k51)]
+    (is (= :plane-not-configured (:reason r)))
+    (is (= :dht (:plane r)))))
+
+;; ── cached lookup ─────────────────────────────────────────────────────────
+
+(defn- store []
+  (let [m (atom {})]
+    {:get #(get @m %) :put! #(swap! m assoc %1 %2) :state m}))
+
+(deftest a-cache-hit-does-not-resolve
+  (let [s (store)
+        calls (atom 0)
+        planes {:dht (fn [_] (swap! calls inc) {:cid cid :ttl-ns (* 600 1000000000) :sequence 1})}
+        r (req/parse {:host "h" :path (str "/ipns/" k51)})
+        opts {:planes planes :cache-get (:get s) :cache-put! (:put! s) :now-ms t0}]
+    (is (= :miss (:status (res/lookup opts r))))
+    (is (= 1 @calls))
+    (is (= :hit (:status (res/lookup opts r))))
+    (is (= 1 @calls) "the second request never touches the resolution path")))
+
+(deftest a-stale-entry-is-served-while-it-refreshes
+  (let [s (store)
+        planes {:dht (fn [_] {:cid cid :ttl-ns (* 600 1000000000) :sequence 1})}
+        r (req/parse {:host "h" :path (str "/ipns/" k51)})
+        base {:planes planes :cache-get (:get s) :cache-put! (:put! s)}]
+    (res/lookup (assoc base :now-ms t0) r)
+    (let [out (res/lookup (assoc base :now-ms (+ t0 700000)) r)]
+      (is (= :refreshed (:status out)))
+      (is (= cid (:cid out)) "served immediately, not after a round trip"))))
+
+(deftest a-failed-resolution-still-serves-a-recent-answer
+  (let [s (store)
+        r (req/parse {:host "h" :path (str "/ipns/" k51)})
+        ok {:planes {:dht (fn [_] {:cid cid :ttl-ns (* 600 1000000000) :sequence 1})}
+            :cache-get (:get s) :cache-put! (:put! s)}
+        down (assoc ok :planes {:dht (constantly nil)})]
+    (res/lookup (assoc ok :now-ms t0) r)
+    (let [out (res/lookup (assoc down :now-ms (+ t0 700000)) r)]
+      (is (= :stale (:status out)))
+      (is (= cid (:cid out))
+          "the publisher's last statement beats a 502, and it is inside the promised window"))
+    (testing "but past the stale window it is an error, not an ancient answer"
+      (is (= :error (:status (res/lookup (assoc down :now-ms (+ t0 5000000)) r)))))))
+
+(deftest a-regressing-record-does-not-replace-the-cached-one
+  (let [s (store)
+        r (req/parse {:host "h" :path (str "/ipns/" k51)})
+        seq-atom (atom 5)
+        planes {:dht (fn [_] {:cid (str "bafy-seq-" @seq-atom)
+                              :ttl-ns (* 60 1000000000) :sequence @seq-atom})}
+        base {:planes planes :cache-get (:get s) :cache-put! (:put! s)}]
+    (res/lookup (assoc base :now-ms t0) r)
+    (reset! seq-atom 2)
+    (let [out (res/lookup (assoc base :now-ms (+ t0 61000)) r)]
+      (is (true? (:regression? out)))
+      (is (= "bafy-seq-5" (:cid out))
+          "accepting it would make the gateway look like it is losing updates"))))
+
+(deftest the-cache-control-a-client-sees-uses-the-same-ttl-the-cache-used
+  (let [r (req/parse {:host "h" :path (str "/ipns/" k51)})
+        out {:cid cid :ttl-ns (* 300 1000000000)}
+        h (res/response-for r out)]
+    (is (str/includes? (get h "Cache-Control") "max-age=300"))
+    (is (str/includes? (get h "Cache-Control") "stale-while-revalidate=300"))))
