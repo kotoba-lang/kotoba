@@ -1,0 +1,302 @@
+(ns adnet.entitlement-test
+  "Tests for the ad-funded service layer.
+
+  Each of the four leaks named in `adnet.entitlement`'s docstring gets a test
+  that pins the REASON, not just the refusal: a negative test that only
+  asserts `(not ok?)` passes when the code refuses for the wrong cause, and
+  four of this workspace's agents shipped exactly that shape in one day (root
+  AGENTS.md, question 6). Every comparison in the namespace also gets an input
+  exactly on its boundary, since a test suite with passing and failing cases
+  either side of a boundary still cannot see `>` flip to `>=`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [adnet.core :as adnet]
+            [adnet.billing :as billing]
+            [adnet.entitlement :as ent]))
+
+(def policy
+  {:unit-price-micros 10000      ; $0.01 — murakumo's x402 list price per request
+   :funding-share 1
+   :daily-unit-cap 5
+   :max-balance-micros 100000
+   :sponsor nil})
+
+(def cpm-campaign
+  {:id "cmp-cpm" :advertiser "did:key:zADV"
+   :creative {:type :image :image-url "u" :click-url "c"}
+   :bid {:model :cpm :usd "4.00"}
+   :targeting {:placements #{"free-tier"}}
+   :budget {:total-usd "50.00" :spent-micros 0}
+   :status :active})
+
+(def cpc-campaign
+  (assoc cpm-campaign :id "cmp-cpc" :bid {:model :cpc :usd "0.50"}))
+
+(def slot {:slot "free-tier" :now "2026-09-09T00:00:00Z"})
+
+(defn- credit
+  "One impression through the real pipeline: auction -> accrual -> entitlement.
+  Deliberately not a hand-built serve map — a test that constructs the verdict
+  it is checking cannot notice the pipeline changing underneath it."
+  [campaigns extra]
+  (let [s (adnet/serve campaigns slot)
+        acc (when (= :paid (:kind s))
+              (billing/accrue (:campaign s) {:kind :impression :at "2026-09-09T00:00:00Z"
+                                             :placement (:slot slot)}))]
+    (ent/admit-impression (merge {:serve s
+                                  :charge-micros (:charge-micros acc)
+                                  :receipt-consumed? true
+                                  :balance-micros 0
+                                  :units-today 0
+                                  ;; Supplied even for advertiser-funded views:
+                                  ;; a policy that declares a sponsor REFUSES
+                                  ;; without it, which is the point of the
+                                  ;; fleet-wide budget.
+                                  :sponsored-micros-today 0
+                                  :policy policy}
+                                 extra))))
+
+;; ── leak 1: the house backfill funds nothing ───────────────────────────────
+
+(deftest house-backfill-is-refused-and-named
+  (let [v (credit [] {})]
+    (is (false? (:ok? v)))
+    (is (= :inventory/house-backfill-funds-nothing (:reason v))
+        "the reason must distinguish 'nobody bid' from 'the bid does not pay'")
+    (is (nil? (:funding-micros v)))))
+
+(deftest house-backfill-with-declared-sponsor-is-funded-and-labelled
+  (let [v (credit [] {:policy (assoc policy :sponsor {:daily-micros 50000
+                                                      :funded-by "murakumo house"})})]
+    (is (true? (:ok? v)))
+    (is (true? (:sponsored? v)) "sponsored credit must be labelled as such")
+    (is (= "murakumo house" (:funded-by v)))
+    (is (= 10000 (:funding-micros v))
+        "a sponsored credit is capped at one unit, not the whole daily sponsorship")))
+
+;; ── leak 2: a paid serve is not evidence of revenue ────────────────────────
+
+(deftest cpc-impression-is-paid-but-unbillable
+  (let [s (adnet/serve [cpc-campaign] slot)]
+    (is (= :paid (:kind s)) "the auction does select the CPC campaign")
+    (is (zero? (billing/charge-micros (:campaign s) :impression))
+        "and its impression earns nothing — this is the trap")
+    (let [v (credit [cpc-campaign] {})]
+      (is (false? (:ok? v)))
+      (is (= :inventory/impression-not-billable (:reason v)))
+      (is (= :cpc (:bid-model v)) "the finding names the bid model to fix"))))
+
+;; ── leak 3: an unconsumed receipt is not a view ─────────────────────────────
+
+(deftest receipt-must-be-consumed-by-the-caller
+  (testing "false and nil both refuse — an unanswerable question is not a yes"
+    (doseq [v [nil false]]
+      (let [r (credit [cpm-campaign] {:receipt-consumed? v})]
+        (is (false? (:ok? r)))
+        (is (= :receipt/not-consumed (:reason r))))))
+  (testing "the receipt is checked before the auction result is even read"
+    (is (= :receipt/not-consumed
+           (:reason (ent/admit-impression {:serve {:kind :paid}
+                                           :charge-micros 999999
+                                           :receipt-consumed? false
+                                           :balance-micros 0 :units-today 0
+                                           :policy policy}))))))
+
+;; ── leak 4: sub-unit charges accumulate, they do not round up ──────────────
+
+(deftest one-impression-does-not-buy-one-unit
+  (let [v (credit [cpm-campaign] {})]
+    (is (true? (:ok? v)))
+    (is (= 4000 (:funding-micros v)) "$4.00 CPM = 4000 micros per impression")
+    (is (= 0 (:units-affordable v))
+        "4000 micros does not buy a 10000-micro unit — it must not round up")
+    (is (false? (:sponsored? v)))
+    (is (= "did:key:zADV" (:funded-by v)))))
+
+(deftest three-impressions-buy-one-unit
+  (let [after (reduce (fn [balance _]
+                        (:balance-micros (credit [cpm-campaign] {:balance-micros balance})))
+                      0 (range 3))]
+    (is (= 12000 after))
+    (is (= 1 (quot after (:unit-price-micros policy))))
+    (is (true? (:ok? (ent/admit-unit {:balance-micros after :units-today 0
+                                      :policy policy}))))))
+
+(deftest impressions-per-unit-is-derived-not-configured
+  (is (= 3 (ent/impressions-per-unit cpm-campaign policy billing/charge-micros))
+      "ceil(10000/4000) = 3")
+  (is (nil? (ent/impressions-per-unit cpc-campaign policy billing/charge-micros))
+      "nil, not 0 and not a large number: a CPC campaign cannot fund a unit at all")
+  (is (= 5 (ent/impressions-per-unit cpm-campaign (assoc policy :funding-share 0.5)
+                                     billing/charge-micros))
+      "halving the share halves the credit per impression: ceil(10000/2000) = 5.
+       Not 6 — 3 was itself a ceiling of 2.5, so the counts do not simply double."))
+
+;; ── boundaries: one input exactly on every comparison ──────────────────────
+
+(deftest unit-price-boundary
+  (testing "balance exactly equal to the price admits — the price IS the cost"
+    (is (true? (:ok? (ent/admit-unit {:balance-micros 10000 :units-today 0
+                                      :policy policy})))))
+  (testing "one micro short refuses, and says how short"
+    (let [v (ent/admit-unit {:balance-micros 9999 :units-today 0 :policy policy})]
+      (is (false? (:ok? v)))
+      (is (= :viewer/insufficient-balance (:reason v)))
+      (is (= 1 (:short-by-micros v))))))
+
+(deftest daily-cap-boundary
+  (testing "at the cap refuses, one below admits"
+    (is (= :viewer/daily-cap-reached
+           (:reason (ent/admit-unit {:balance-micros 100000 :units-today 5 :policy policy}))))
+    (is (true? (:ok? (ent/admit-unit {:balance-micros 100000 :units-today 4 :policy policy})))))
+  (testing "the same cap bounds crediting, so banked balance cannot outrun it"
+    (is (= :viewer/daily-cap-reached
+           (:reason (credit [cpm-campaign] {:units-today 5}))))))
+
+(deftest balance-ceiling-boundary
+  (testing "at the ceiling refuses further credit, one micro below admits"
+    (is (= :viewer/balance-ceiling-reached
+           (:reason (credit [cpm-campaign] {:balance-micros 100000}))))
+    (is (true? (:ok? (credit [cpm-campaign] {:balance-micros 99999})))))
+  (testing "credit is clamped to the ceiling rather than exceeding it"
+    (is (= 100000 (:balance-micros (credit [cpm-campaign] {:balance-micros 99999}))))))
+
+(deftest funding-share-truncates-down
+  (testing "a share that would credit a fraction of a micro credits the floor"
+    (is (= 1333 (ent/funding-micros 4000 (/ 1 3.0))))
+    (is (= 0 (ent/funding-micros 1 0.5)) "half a micro is zero micros, not one")))
+
+;; ── the policy itself fails closed ─────────────────────────────────────────
+
+(deftest policy-problems-are-named
+  (testing "each bad field is named, so an operator can fix the right one"
+    (is (= :policy/unit-price-not-positive-integer
+           (ent/policy-problem (assoc policy :unit-price-micros 0))))
+    (is (= :policy/funding-share-out-of-range
+           (ent/policy-problem (assoc policy :funding-share 0))))
+    (is (= :policy/funding-share-out-of-range
+           (ent/policy-problem (assoc policy :funding-share 1.5))))
+    (is (= :policy/daily-unit-cap-not-positive-integer
+           (ent/policy-problem (assoc policy :daily-unit-cap 0))))
+    (is (= :policy/max-balance-below-unit-price
+           (ent/policy-problem (assoc policy :max-balance-micros 9999))))
+    (is (= :policy/sponsor-malformed
+           (ent/policy-problem (assoc policy :sponsor {:daily-micros 100}))))
+    (is (nil? (ent/policy-problem policy))))
+  (testing "share = 1 is inside the range and share = 0 is not"
+    (is (nil? (ent/policy-problem (assoc policy :funding-share 1))))
+    (is (some? (ent/policy-problem (assoc policy :funding-share 0)))))
+  (testing "a missing policy refuses at both entry points"
+    (is (= :policy/not-a-map (:reason (ent/admit-unit {:balance-micros 10000
+                                                       :units-today 0 :policy nil}))))
+    (is (= :policy/not-a-map (:reason (ent/admit-impression {:serve {:kind :paid}
+                                                             :charge-micros 4000
+                                                             :receipt-consumed? true
+                                                             :balance-micros 0
+                                                             :units-today 0
+                                                             :policy nil}))))))
+
+;; ── unknown state is refused, not treated as zero ──────────────────────────
+
+(deftest unmeasured-viewer-state-is-not-zero
+  (is (= :viewer/balance-unknown
+         (:reason (ent/admit-unit {:balance-micros nil :units-today 0 :policy policy}))))
+  (is (= :viewer/day-state-unknown
+         (:reason (ent/admit-unit {:balance-micros 10000 :units-today nil :policy policy}))))
+  (is (= :viewer/balance-negative
+         (:reason (credit [cpm-campaign] {:balance-micros -1})))))
+
+;; ── the funding mix cannot report sponsorship as revenue ───────────────────
+
+(deftest funding-mix-separates-sponsorship-from-revenue
+  (let [adv (ent/credit-record {:viewer "did:key:zV" :receipt-id "r1"
+                                :campaign-id "cmp-cpm" :placement "free-tier"
+                                :at "2026-09-09T00:00:00Z"
+                                :verdict (credit [cpm-campaign] {})})
+        spo (ent/credit-record {:viewer "did:key:zV" :receipt-id "r2"
+                                :campaign-id nil :placement "free-tier"
+                                :at "2026-09-09T00:00:01Z"
+                                :verdict (credit [] {:policy (assoc policy :sponsor
+                                                                    {:daily-micros 50000
+                                                                     :funded-by "murakumo house"})})})
+        mix (ent/funding-mix [adv spo])]
+    (is (= 2 (:counted mix)))
+    (is (= 4000 (:advertiser-micros mix)))
+    (is (= 10000 (:sponsored-micros mix)))
+    (is (< (:advertiser-share mix) 0.3)))
+  (testing "no records is an unmeasured mix, not 0% advertiser-funded"
+    (is (nil? (:advertiser-share (ent/funding-mix []))))
+    (is (= 0 (:counted (ent/funding-mix []))))))
+
+;; ── the self-check counts ──────────────────────────────────────────────────
+
+(deftest self-check-reports-a-count
+  (let [r (ent/self-check)]
+    (is (= 0 (:count r)) (str "self-check failures: " (:failures r)))
+    (is (pos? (:checked r)) "a self-check that checked nothing must not read as clean")
+    (is (vector? (:failures r)))))
+
+;; ── the sponsorship budget is fleet-wide and daily ────────────────────────
+;;
+;; :daily-micros used to be consulted only as `(min daily-micros unit-price)`,
+;; which made it a per-VIEW cap and never a budget: the per-viewer daily cap
+;; bounded one viewer, so total house spend was bounded only by how many viewers
+;; turned up. The tests below are what make it a budget.
+
+(def sponsored-policy
+  (assoc policy :sponsor {:daily-micros 30000 :funded-by "murakumo house"}))
+
+(defn- sponsored-view [spent-today extra]
+  (ent/admit-impression (merge {:serve {:kind :house}
+                                :charge-micros 0
+                                :receipt-consumed? true
+                                :balance-micros 0
+                                :units-today 0
+                                :sponsored-micros-today spent-today
+                                :policy sponsored-policy}
+                               extra)))
+
+(deftest sponsor-budget-boundary
+  (testing "the last unit in the budget lands"
+    (let [v (sponsored-view 20000 {})]
+      (is (true? (:ok? v)))
+      (is (= 10000 (:funding-micros v)) "exactly the 30000th micro is spendable")))
+  (testing "one micro past the budget refuses, and reports both numbers"
+    (let [v (sponsored-view 20001 {})]
+      (is (false? (:ok? v)))
+      (is (= :sponsor/daily-budget-exhausted (:reason v)))
+      (is (= 20001 (:sponsored-micros-today v)))
+      (is (= 30000 (:daily-micros v)))))
+  (testing "an empty budget refuses the first view"
+    (is (= :sponsor/daily-budget-exhausted (:reason (sponsored-view 30000 {}))))))
+
+(deftest unmeasured-sponsor-spend-refuses-rather-than-reading-as-zero
+  (is (= :sponsor/spend-unknown
+         (:reason (ent/admit-impression {:serve {:kind :house} :charge-micros 0
+                                         :receipt-consumed? true :balance-micros 0
+                                         :units-today 0 :policy sponsored-policy})))
+      "nil spend today must not be treated as an empty budget -- that is how a
+       budget stops binding on exactly the day the query breaks")
+  (is (= :sponsor/spend-unknown (:reason (sponsored-view nil {})))))
+
+(deftest the-budget-only-applies-to-sponsored-credit
+  (testing "an advertiser-funded view is unaffected by the sponsor's budget"
+    (let [v (ent/admit-impression {:serve {:kind :paid
+                                           :campaign {:advertiser "did:key:zADV"
+                                                      :bid {:model :cpm :usd "4.00"}}}
+                                   :charge-micros 4000
+                                   :receipt-consumed? true
+                                   :balance-micros 0 :units-today 0
+                                   ;; budget long gone, and it does not matter
+                                   :sponsored-micros-today 999999
+                                   :policy sponsored-policy})]
+      (is (true? (:ok? v)))
+      (is (= 4000 (:funding-micros v)))
+      (is (false? (:sponsored? v)))))
+  (testing "and a policy with no sponsor never asks for the figure"
+    (is (true? (:ok? (ent/admit-impression {:serve {:kind :paid
+                                                    :campaign {:advertiser "a"
+                                                               :bid {:model :cpm :usd "4.00"}}}
+                                            :charge-micros 4000
+                                            :receipt-consumed? true
+                                            :balance-micros 0 :units-today 0
+                                            :policy policy}))))))
