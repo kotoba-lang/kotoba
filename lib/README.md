@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.standardModel` | `kotoba.standardModel/src` | `kotoba.sm.complex`, `kotoba.sm.gauge`, `kotoba.sm.gtg`, `kotoba.sm.spinor` (Kotoba project library) |
 | `kotoba.socialPublication` | `kotoba.socialPublication/src` | `etzhayyim.social.publication` (Kotoba project library) |
 | `kotoba.skeleton` | `kotoba.skeleton/src` | `skeleton`, `skeleton.math` (Kotoba project library) |
 | `kotoba.simulatedUser` | `kotoba.simulatedUser/src` | `simulated-user.eval`, `simulated-user.interaction`, `simulated-user.model`, `simulated-user.murakumo` (Kotoba project library) |
