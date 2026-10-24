@@ -1,0 +1,123 @@
+(ns pdf.core-test
+  "PDF image XObject extraction via a synthetic minimal PDF."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [kotoba.io :as io]
+            [pdf.core :as pdf]))
+
+(defn- zlib [^bytes in]
+  (let [d (java.util.zip.Deflater.) out (java.io.ByteArrayOutputStream.) buf (byte-array 4096)]
+    (.setInput d in) (.finish d)
+    (while (not (.finished d)) (let [k (.deflate d buf)] (.write out buf 0 k)))
+    (.end d) (mapv #(bit-and (int %) 0xff) (.toByteArray out))))
+
+(defn- rd-bytes [p]
+  (mapv #(bit-and (int %) 0xff) (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+
+(deftest pdf-image-xobject
+  (let [samples [10 20 30 40]                                            ; 2x2 gray, 8bpc
+        comp    (zlib (byte-array (map unchecked-byte samples)))
+        ascii*  (fn [s] (mapv #(bit-and (int %) 0xff) (.getBytes ^String s "ISO-8859-1")))
+        head (ascii* (str "%PDF-1.5\n"
+                          "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+                          "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >> endobj\n"
+                          "3 0 obj << /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 4 0 R >> >> >> endobj\n"
+                          "4 0 obj << /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 "
+                          "/ColorSpace /DeviceGray /Filter /FlateDecode /Length " (count comp) " >> stream\n"))
+        tail (ascii* "\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n")
+        bytes (vec (concat head comp tail))
+        parsed (pdf/parse bytes)
+        page (first (pdf/pages parsed))
+        imgs (pdf/page-images (:objects parsed) page)]
+    (is (= 1 (count imgs)))
+    (let [img (first imgs)]
+      (is (= "Im0" (:name img)))
+      (is (= [2 2] [(:w img) (:h img)]))
+      (let [dec (pdf/decode-image (:objects parsed) img)]
+        (is (= :raw (:fmt dec)))
+        (is (= samples (:samples dec)))))))                              ; FlateDecode → original samples
+
+(deftest objstm-expansion
+  (testing "objects packed inside a /Type /ObjStm compressed object stream
+            (ISO 32000 §7.5.7) — common in PDFs written by recent Acrobat/
+            other real-world tools; previously unsupported (R0 scope note)"
+    (let [ascii*   (fn [s] (mapv #(bit-and (int %) 0xff) (.getBytes ^String s "ISO-8859-1")))
+          obj5-txt "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+          obj6-txt "42"
+          body     (str obj5-txt " " obj6-txt)
+          off5     0
+          off6     (inc (count obj5-txt))                        ; +1 for the separating space
+          header   (str "5 " off5 " 6 " off6 " ")
+          objstm-plain (str header body)
+          comp     (zlib (byte-array (map (comp unchecked-byte int) objstm-plain)))
+          pdf-text (str "%PDF-1.5\n"
+                       "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+                       "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
+                       "3 0 obj << /Type /Page /Parent 2 0 R "
+                       "/Resources << /Font << /F1 5 0 R >> >> "
+                       "/MediaBox [0 0 100 100] >> endobj\n"
+                       "4 0 obj << /Type /ObjStm /N 2 /First " (count header)
+                       " /Length " (count comp) " /Filter /FlateDecode >> stream\n")
+          bytes    (vec (concat (ascii* pdf-text) comp
+                                (ascii* "\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n")))
+          parsed   (pdf/parse bytes)
+          objs     (:objects parsed)]
+      (testing "both compressed objects landed in the object table at generation 0"
+        (is (contains? objs [5 0]))
+        (is (contains? objs [6 0]))
+        (is (= 42 (get objs [6 0]))))
+      (testing "an indirect reference into the compressed object stream resolves transparently"
+        (let [page (first (pdf/pages parsed))
+              font-ref (get-in page [:Resources :Font :F1])
+              font (pdf/resolve-ref objs font-ref)]
+          (is (= :Font (:Type font)))
+          (is (= :Helvetica (:BaseFont font))))))))
+
+(deftest pdf-text-extraction
+  (let [ascii* (fn [s] (mapv #(bit-and (int %) 0xff) (.getBytes ^String s "ISO-8859-1")))
+        pdf-bytes (ascii* (str "%PDF-1.5\n"
+                               "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+                               "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >> endobj\n"
+                               "3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R >> endobj\n"
+                               "4 0 obj << /Length 33 >> stream\n"
+                               "BT (Hello) Tj (World) Tj ET\n"
+                               "endstream endobj\n"
+                               "trailer << /Root 1 0 R >>\n%%EOF\n"))
+        parsed (pdf/parse pdf-bytes)
+        page (first (pdf/pages parsed))]
+    (is (= [0 0 200 200] (mapv int (:MediaBox page))))
+    (is (= ["Hello" "World"] (pdf/page-text (:objects parsed) page)))))
+
+(deftest pdf-real-file-objstm
+  (testing "a real qpdf-repacked PDF (reportlab-generated content, re-saved by
+            qpdf/pikepdf with object_stream_mode=generate) — org-iso-pdf's
+            ObjStm support had only ever been exercised against a hand-built
+            synthetic PDF before this test. This fixture also has NO literal
+            'trailer' keyword at all (qpdf wrote a pure PDF 1.5+ /Type /XRef
+            cross-reference stream instead), so it additionally exercises
+            find-trailer's Catalog-scan fallback path for the first time."
+    (let [parsed (pdf/parse (rd-bytes "pdf/fixtures/qpdf_objstm.pdf"))
+          pgs    (pdf/pages parsed)]
+      (is (= :Catalog (:Type (:root parsed))))
+      (is (= 2 (count pgs)))
+      (is (= [["Hello ObjStm World" "kasane/org-iso-pdf real-file fixture"]
+              ["Second page"]]
+             (mapv #(pdf/page-text (:objects parsed) %) pgs))))))
+
+(deftest writes-valid-multipage-pdf-with-xref
+  (let [bytes (pdf/write-document
+               [{:width 420 :height 297
+                 :content (str (pdf/rect-command {:x 10 :y 10 :width 400 :height 277})
+                               (pdf/line-command {:from [10 30] :to [410 30] :width 0.5})
+                               (pdf/text-command {:x 20 :y 270 :size 14
+                                                  :text "A-101 (Issued)"}))}
+                {:width 420 :height 297
+                 :content (pdf/text-command {:x 20 :y 270 :text "Second Sheet"})}])
+        text (apply str (map char bytes))
+        parsed (pdf/parse bytes)
+        pages (pdf/pages parsed)]
+    (is (string/includes? text "xref\n0 8"))
+    (is (string/includes? text "startxref"))
+    (is (= 2 (count pages)))
+    (is (= ["A-101 (Issued)"] (pdf/page-text (:objects parsed) (first pages))))
+    (is (= ["Second Sheet"] (pdf/page-text (:objects parsed) (second pages))))))

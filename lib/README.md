@@ -62,6 +62,7 @@ The bundled standard libraries live in this repository:
 | `org.iso.aac` | `org.iso.aac/src` | `aac.adts`, `aac.bits`, `aac.decode`, `aac.dequant` (an external specification, publisher iso.org) |
 | `org.iso.jpeg` | `org.iso.jpeg/src` | `jpeg.bytes`, `jpeg.core`, `jpeg.decode` (an external specification, publisher iso.org) |
 | `org.iso.opentype` | `org.iso.opentype/src` | `opentype.bytes`, `opentype.cmap`, `opentype.core` (an external specification, publisher iso.org) |
+| `org.iso.pdf` | `org.iso.pdf/src` | `pdf.core` (an external specification, publisher iso.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
