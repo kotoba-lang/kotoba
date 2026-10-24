@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.mineAi` | `kotoba.mineAi/src` | `mine-ai` (Kotoba project library) |
 | `kotoba.mfa` | `kotoba.mfa/src` | `mfa.adapters.live-risk`, `mfa.adapters.orchestrator`, `mfa.adapters.planner`, `mfa.adapters.risk-planner` (Kotoba project library) |
 | `kotoba.mathml` | `kotoba.mathml/src` | `kotoba.mathml`, `mathml.core` (Kotoba project library) |
 | `kotoba.manimaniExperienceUi` | `kotoba.manimaniExperienceUi/src` | `manimani.build`, `manimani.ui` (Kotoba project library) |
