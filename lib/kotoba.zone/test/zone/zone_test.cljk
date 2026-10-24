@@ -1,0 +1,149 @@
+(ns zone.zone-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.io :as io]
+            [zone.model    :as m]
+            [zone.validate :as v]
+            [zone.zone     :as z]))
+
+;; ── helpers ──────────────────────────────────────────────────────────────────
+
+(defn- load-example []
+  (z/parse-str (slurp (io/resource "zone/example.com.zone"))))
+
+(defn- make-zone
+  "Build a minimal zone map directly (no parsing) for targeted unit tests."
+  [records]
+  {:zone/origin "test.example."
+   :zone/ttl    3600
+   :zone/records records})
+
+(defn- rec
+  ([name type rdata]     (rec name 3600 "IN" type rdata))
+  ([name ttl cls type rdata]
+   {:zone/name name :zone/ttl ttl :zone/class cls :zone/type type :zone/rdata rdata}))
+
+;; ── parse the bundled resource ────────────────────────────────────────────────
+
+(deftest parse-resource
+  (let [zone (load-example)]
+    (testing "zone-level directives"
+      (is (= "example.com." (:zone/origin zone)))
+      (is (= 3600           (:zone/ttl zone))))
+    (testing "SOA record"
+      (let [soa (first (m/records-of-type zone "SOA"))]
+        (is (some? soa) "SOA is present")
+        (is (= 2024010101 (get-in soa [:zone/rdata :zone/serial])))
+        (is (= "ns1.example.com." (get-in soa [:zone/rdata :zone/mname])))))
+    (testing "MX records"
+      (let [mxs (m/records-of-type zone "MX")]
+        (is (= 2 (count mxs)) "two MX records")
+        (is (= #{10 20} (into #{} (map #(get-in % [:zone/rdata :zone/pref]) mxs))))
+        (is (= "mail.example.com."
+               (get-in (first (filter #(= 10 (get-in % [:zone/rdata :zone/pref])) mxs))
+                       [:zone/rdata :zone/exchange])))))
+    (testing "A record for apex"
+      (let [a (first (filter #(= "@" (:zone/name %)) (m/records-of-type zone "A")))]
+        (is (= "93.184.216.34" (get-in a [:zone/rdata :zone/address])))))
+    (testing "CNAME record"
+      (let [cname (first (m/records-of-type zone "CNAME"))]
+        (is (= "ftp" (:zone/name cname)))
+        (is (= "www.example.com." (get-in cname [:zone/rdata :zone/target])))))))
+
+;; ── emit → parse round-trip ───────────────────────────────────────────────────
+
+(deftest round-trip
+  (let [zone   (load-example)
+        emitted (z/emit-str zone)
+        zone2  (z/parse-str emitted)]
+    (is (= (z/emit-str zone) (z/emit-str zone2))
+        "emit-str is idempotent across a parse→emit cycle")))
+
+;; ── queries ───────────────────────────────────────────────────────────────────
+
+(deftest records-of-type-query
+  (let [zone (load-example)]
+    (is (every? #(= "A" (:zone/type %)) (m/records-of-type zone "A"))
+        "records-of-type returns only the requested type")
+    (is (= 2 (count (m/records-of-type zone "NS"))) "two NS records")))
+
+(deftest by-name-query
+  (let [zone (load-example)
+        apex (m/by-name zone "@")]
+    (is (pos? (count apex)) "apex (@) records exist")
+    (is (every? #(= "@" (:zone/name %)) apex) "by-name returns only the requested name")))
+
+;; ── validation ────────────────────────────────────────────────────────────────
+
+(deftest example-zone-is-valid
+  (is (v/valid? (load-example)) "bundled example.com.zone passes validation"))
+
+(deftest cname-conflict-error
+  (let [zone (make-zone [(rec "@" "SOA"  {:zone/mname "ns1.test." :zone/rname "h.test."
+                                          :zone/serial 1 :zone/refresh 3600
+                                          :zone/retry 900 :zone/expire 604800
+                                          :zone/minimum 86400})
+                         (rec "www" "CNAME" {:zone/target "example.com."})
+                         (rec "www" "A"     {:zone/address "1.2.3.4"})])
+        errs (v/errors zone)]
+    (is (pos? (count errs)) "CNAME + A on same name is an error")
+    (is (some #(= :zone/cname-conflict (:zone/code %)) errs)
+        "error code is :zone/cname-conflict")))
+
+(deftest soa-zero-is-error
+  (let [zone (make-zone [(rec "@" "A" {:zone/address "1.2.3.4"})])
+        errs (v/errors zone)]
+    (is (some #(= :zone/no-soa (:zone/code %)) errs)
+        "zone with no SOA records an error")))
+
+(deftest soa-multiple-is-error
+  (let [soa-rec #(rec "@" "SOA"
+                      {:zone/mname "ns1." :zone/rname "h." :zone/serial %
+                       :zone/refresh 3600 :zone/retry 900
+                       :zone/expire 604800 :zone/minimum 86400})
+        zone (make-zone [(soa-rec 1) (soa-rec 2)])
+        errs (v/errors zone)]
+    (is (some #(= :zone/multiple-soa (:zone/code %)) errs)
+        "zone with two SOA records an error")))
+
+(deftest missing-trailing-dot-warning
+  (let [zone (make-zone [(rec "@" "SOA"
+                              {:zone/mname "ns1.test." :zone/rname "h.test."
+                               :zone/serial 1 :zone/refresh 3600 :zone/retry 900
+                               :zone/expire 604800 :zone/minimum 86400})
+                         (rec "@" "NS" {:zone/target "ns1.example.com"})])  ; missing dot!
+        ps (v/problems zone)]
+    (is (some #(= :zone/missing-trailing-dot (:zone/code %)) ps)
+        "FQDN-looking target without trailing dot triggers a warning")))
+
+;; ── diff ─────────────────────────────────────────────────────────────────────
+
+(def ^:private base-soa
+  {:zone/mname "ns1.test." :zone/rname "h.test."
+   :zone/serial 1 :zone/refresh 3600 :zone/retry 900
+   :zone/expire 604800 :zone/minimum 86400})
+
+(deftest diff-detects-add
+  (let [old (make-zone [(rec "@" "SOA" base-soa)])
+        new (make-zone [(rec "@" "SOA" base-soa)
+                        (rec "www" "A" {:zone/address "1.2.3.4"})])
+        d   (m/diff old new)]
+    (is (= 1 (count (:zone/added d))) "one record added")
+    (is (= "www" (:zone/name (first (:zone/added d)))) "added record is www A")))
+
+(deftest diff-detects-remove
+  (let [old (make-zone [(rec "@" "SOA" base-soa)
+                        (rec "www" "A" {:zone/address "1.2.3.4"})])
+        new (make-zone [(rec "@" "SOA" base-soa)])
+        d   (m/diff old new)]
+    (is (= 1 (count (:zone/removed d))) "one record removed")
+    (is (= "www" (:zone/name (first (:zone/removed d)))) "removed record is www A")))
+
+(deftest diff-detects-change
+  (let [old (make-zone [(rec "@" "SOA" base-soa)
+                        (rec "@" "A" {:zone/address "1.2.3.4"})])
+        new (make-zone [(rec "@" "SOA" base-soa)
+                        (rec "@" "A" {:zone/address "5.6.7.8"})])
+        d   (m/diff old new)]
+    (is (= 1 (count (:zone/changed d))) "one record changed")
+    (is (= "1.2.3.4" (get-in (first (:zone/changed d)) [:zone/from :zone/rdata :zone/address])))
+    (is (= "5.6.7.8" (get-in (first (:zone/changed d)) [:zone/to   :zone/rdata :zone/address])))))
