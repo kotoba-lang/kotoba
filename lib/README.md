@@ -61,6 +61,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.vhdl` | `org.ieee.vhdl/src` | `vhdl.architecture`, `vhdl.entity`, `vhdl.parser`, `vhdl.signal` (an external specification, publisher ieee.org) |
 | `org.iso.aac` | `org.iso.aac/src` | `aac.adts`, `aac.bits`, `aac.decode`, `aac.dequant` (an external specification, publisher iso.org) |
 | `org.iso.jpeg` | `org.iso.jpeg/src` | `jpeg.bytes`, `jpeg.core`, `jpeg.decode` (an external specification, publisher iso.org) |
+| `org.iso.opentype` | `org.iso.opentype/src` | `opentype.bytes`, `opentype.cmap`, `opentype.core` (an external specification, publisher iso.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
