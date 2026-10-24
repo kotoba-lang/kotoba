@@ -1,0 +1,147 @@
+;; The gate that was missing: does the COMPILED artifact decide the way the
+;; interpreter does?
+;;
+;; `ceremony_kotoba_test.clj` drives the guest through `kotoba.kir`, which
+;; is not what ships. Until this file existed, nothing here had asserted
+;; that `kotoba -M compile` produces something that answers the same way --
+;; the shape this workspace keeps warning about, where a check that never
+;; ran looks exactly like a check that passed.
+;;
+;; So: compile with the public CLI, instantiate the `.wasm` on real
+;; `WebAssembly` through amu's own `runtime/browser-host.mjs`, call the
+;; exports -- including the ones that take a `:document`, built host-side
+;; through the runtime's own `typedValues.document` -- and hold every answer
+;; against the interpreter's.
+;;
+;; ## Skipping is not passing
+;;
+;; The gate needs `kotoba`, `nbb` and an amu checkout. Each is measured by
+;; RUNNING it and reading the exit code, never by `which` -- a shim whose
+;; target is gone passes `which` and exits 126, which this migration has
+;; already been bitten by. When a tool is absent the probe exits 3, which is
+;; neither 0 nor 1, and this file reports the absence rather than asserting
+;; nothing.
+
+(ns webauthn.ceremony-artifact-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [webauthn.ceremony-guest-document :refer [->doc]]))
+
+(def ^:private amu-root
+  "The amu checkout that owns the CLI and the browser runtime. Overridable so
+  the gate is not pinned to one machine's layout."
+  (or (System/getenv "AMU_ROOT")
+      (str (System/getProperty "user.home")
+           "/github/com-junkawasaki/orgs/kotoba-lang/amu")))
+
+(defn- runs? [& command]
+  (try (zero? (:exit (apply shell/sh command))) (catch Exception _ false)))
+
+(def ^:private tools
+  (delay
+    {:kotoba (let [bin (str amu-root "/bin/kotoba")]
+               (when (runs? bin "--help") bin))
+     :nbb (when (runs? "nbb" "--version") "nbb")
+     :runtime (io/exists? (io/file amu-root "runtime/browser-host.mjs"))}))
+
+(def ^:private probe
+  (delay
+    (let [{:keys [kotoba nbb runtime]} @tools]
+      (if-not (and kotoba nbb runtime)
+        {:status :unavailable
+         :detail (str "kotoba=" (boolean kotoba) " nbb=" (boolean nbb)
+                      " runtime=" (boolean runtime) " AMU_ROOT=" amu-root)}
+        (let [r (shell/sh nbb "lib/org.w3.webauthn/test/webauthn/artifact_probe.cljk" kotoba amu-root)
+              parsed (try (edn/read-string (str/trim (:out r))) (catch Exception _ nil))]
+          (cond
+            (nil? parsed) {:status :probe-unreadable :detail (str (:out r) (:err r))}
+            (= 3 (:exit r)) (assoc parsed :status (or (:status parsed) :probe-refused))
+            :else parsed))))))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'webauthn.ceremony
+                 (slurp (io/file (System/getProperty "user.dir")
+                                 "kotoba" "webauthn" "ceremony.kotoba"))}
+                'webauthn.ceremony :wasm32-kotoba-v1))))
+
+(defn- interpreted
+  "The same call on the interpreter. A map argument is a `:document` and is
+  encoded exactly as the probe encodes it host-side, so both halves are
+  asked with one shape."
+  [f args]
+  (str (ir/execute @kir (symbol f)
+                   (mapv #(if (map? %) (->doc %) %) args)
+                   {:fuel 100000})))
+
+(deftest the-compiled-artifact-answers-the-way-the-interpreter-does
+  (let [p @probe]
+    (if (not= :ok (:status p))
+      ;; Not a pass. The suite says out loud that it could not measure.
+      (is false (str "artifact gate could not run: " (:status p) " -- " (:detail p)))
+      (do
+        (is (seq (:results p)) "the probe returned no calls at all")
+        (is (= "0" (:main p))
+            "the artifact's own conformance entry point answered non-zero")
+        (is (re-matches #"[0-9a-f]{64}" (:sha256 p))
+            "and the host measured the module it ran")
+        (testing "every call agrees with the interpreter"
+          (doseq [[f args-edn got] (:results p)]
+            (let [args (edn/read-string args-edn)]
+              (is (= (interpreted f args) got)
+                  (str f " " args-edn)))))
+        (testing "including the ones whose arguments are documents"
+          (is (some (fn [[f _ _]] (= "client-data-problem" f)) (:results p))
+              "the probe skipped every document call, which would make the
+               agreement above a claim about scalars only"))))))
+
+(deftest the-gate-would-notice-a-difference
+  ;; The comparison is only worth having if a wrong answer fails it.
+  (let [p @probe]
+    (when (= :ok (:status p))
+      (let [[f args-edn got] (first (:results p))]
+        (is (not= (str got "-not") (interpreted f (edn/read-string args-edn)))
+            "a fabricated answer must not match the interpreter")))))
+
+;; --- the native target ------------------------------------------------------------------
+
+(deftest the-native-backend-refuses-this-guest-and-says-why
+  ;; This guest uses `:document` values, and that is what keeps it off the
+  ;; native backends today -- not Wasm, and not anything about WebAuthn.
+  ;; Measured across the eleven guests landed on 2026-08-31: six compiled to
+  ;; `aarch64-macos` and five did not, and the five were exactly the five
+  ;; that use documents.
+  ;;
+  ;; It is the USE and not the export list. Making `client-data-problem`
+  ;; private and dropping it from `:export` leaves the refusal unchanged
+  ;; (measured), because the gate is over the whole lowered module rather
+  ;; than over its public surface -- so this cannot be worked around by
+  ;; hiding the signature, and there is no point trying.
+  ;;
+  ;; The refusal is asserted BY ITS REASON, not merely as a non-zero exit. A
+  ;; test that accepted any failure would stay green if the native backend
+  ;; started refusing this for some other cause -- and it would also stay
+  ;; green if the compiler broke. When native admits documents this test
+  ;; goes red, which is the point: it is a ratchet that notices the gap
+  ;; closing rather than a limitation nobody revisits. It is
+  ;; `:not-yet-implemented`, not a security constraint (ADR-2608650000).
+  (if-let [bin (:kotoba @tools)]
+    (let [out (str (System/getProperty "java.io.tmpdir") "/webauthn-ceremony-native.kexe")
+          r (shell/sh bin "-M" "compile"
+                      (str (io/file (System/getProperty "user.dir")
+                                    "kotoba" "webauthn" "ceremony.kotoba"))
+                      "--jvm-free" "--target" "aarch64-macos" "--output" out)
+          said (str (:out r) (:err r))]
+      (is (not (zero? (:exit r)))
+          "the native backend now admits a :document -- delete this test and
+           assert the compile instead")
+      (is (str/includes? said ":kotoba/target-rejected")
+          (str "refused, but not for the reason this test is about: " (str/trim said)))
+      (is (str/includes? said "typed values currently require")
+          (str "refused, but not for the reason this test is about: " (str/trim said))))
+    (is false (str "native gate could not run: no kotoba CLI at " amu-root))))

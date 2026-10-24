@@ -1,0 +1,182 @@
+;; `kotoba/webauthn/ceremony.kotoba` against `webauthn.core`.
+;;
+;; Parity covers the ceremonies that are simply correct or simply wrong:
+;; the RP's own encoding of its challenge coming back unchanged, and each
+;; of the three fields disagreeing on its own. Where the two part, the test
+;; drives both and shows the difference.
+;;
+;;   * `a-missing-field-throws-in-a-function-that-says-it-never-throws` --
+;;     `verify-client-data`'s docstring is "Never throws; returns
+;;     {:valid? bool :errors [...]}". clientData with no `challenge` key
+;;     raises NullPointerException out of `base64url-decode`.
+;;
+;;   * `several-strings-name-the-same-challenge` -- `base64url-decode`
+;;     reads an unknown character as zero in three positions of every four
+;;     and throws in the fourth, and strips `=` from anywhere rather than
+;;     from the end. `"A!AA"`, `"AAAA"` and `"AA=AA="` all decode to
+;;     `[0 0 0]`; `"!AAA"` throws. The guest requires the challenge to be
+;;     canonical and compares strings, which refuses the spellings instead
+;;     of accepting them as equal.
+;;
+;;   * `cross-origin-is-not-looked-at` -- §7.2 step 9. clientData with
+;;     `crossOrigin true` and everything else correct is `{:valid? true}`.
+;;
+;;   * `a-counter-that-returns-to-zero-passes` -- §6.1.3. A counter of zero
+;;     means the authenticator implements none, which is a property of the
+;;     authenticator and so is knowable from the STORED value.
+;;     `verify-signature-counter` reads it from the presented value, so a
+;;     stored 500 followed by a presented 0 passes -- the cloned-
+;;     authenticator signal the function exists to raise.
+;;
+;; `.cljc` stays the oracle for the encoder and the options builders and is
+;; not required from the guest (require-graph). It did not grow a second
+;; copy of these checks (ADR-2608261100).
+
+(ns webauthn.ceremony-kotoba-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [webauthn.ceremony-guest-document :refer [->doc]]
+            [webauthn.core :as w]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "webauthn" "ceremony.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'webauthn.ceremony (slurp guest-file)}
+                                         'webauthn.ceremony :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(def ^:private challenge-bytes [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16])
+(def ^:private challenge (w/base64url-encode challenge-bytes))
+(def ^:private origin "https://rp.example")
+
+(defn- guest [observed expected]
+  (call 'client-data-problem [(->doc observed) (->doc expected)]))
+
+(defn- oracle [observed expected]
+  (w/verify-client-data observed expected))
+
+(def ^:private expected
+  {:type "webauthn.get" :challenge challenge :origin origin
+   :accept-cross-origin? false})
+
+(def ^:private oracle-expected
+  {:expected-type "webauthn.get" :expected-challenge challenge-bytes
+   :expected-origin origin})
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+;; --- parity ---------------------------------------------------------------------
+
+(deftest the-guest-agrees-with-verify-client-data
+  (doseq [[label observed expected-problem]
+          [["bound" {:type "webauthn.get" :challenge challenge :origin origin} :none]
+           ["the wrong ceremony type"
+            {:type "webauthn.create" :challenge challenge :origin origin} :type-mismatch]
+           ["a challenge from another ceremony"
+            {:type "webauthn.get" :challenge (w/base64url-encode (range 16)) :origin origin}
+            :challenge-mismatch]
+           ["an origin the RP did not ask for"
+            {:type "webauthn.get" :challenge challenge :origin "https://evil.example"}
+            :origin-mismatch]]]
+    (testing label
+      (is (= expected-problem (guest observed expected)) "the guest")
+      (let [o (oracle observed oracle-expected)]
+        (is (= (= :none expected-problem) (:valid? o)) "and the oracle on the outcome")
+        (when-not (:valid? o)
+          (is (= [expected-problem] (:errors o)) "and on which field"))))))
+
+;; --- the findings ------------------------------------------------------------------
+
+(deftest a-missing-field-throws-in-a-function-that-says-it-never-throws
+  (let [observed {:type "webauthn.get" :origin origin}]   ; no :challenge
+    (is (thrown? NullPointerException (oracle observed oracle-expected))
+        "the docstring is \"Never throws\"")
+    (is (= :missing-challenge (guest observed expected))
+        "and a field that is absent is a different event from one that
+         disagrees, so it gets a different answer")))
+
+(deftest an-expectation-the-relying-party-did-not-supply-is-not-satisfied
+  ;; The safe direction in the library -- nil against a value is a mismatch
+  ;; -- but the answer sends the reader to the wrong place.
+  (let [observed {:type "webauthn.get" :challenge challenge :origin origin}]
+    (is (= [:type-mismatch :challenge-mismatch :origin-mismatch]
+           (:errors (oracle observed {})))
+        "the library reports three mismatches for an RP that named nothing")
+    (is (= :expectation-missing (guest observed {}))
+        "the guest says whose bug it is")
+    (is (= :expectation-missing (guest observed (dissoc expected :origin)))
+        "including when only one expectation is absent")))
+
+(deftest several-strings-name-the-same-challenge
+  (testing "the library's decoder"
+    (is (= [0 0 0] (w/base64url-decode "AAAA")))
+    (is (= [0 0 0] (w/base64url-decode "A!AA"))
+        "an unknown character in three of every four positions reads as zero")
+    (is (= [0 0 0] (w/base64url-decode "AA=AA="))
+        "and `=` is stripped from anywhere, not from the end")
+    (is (thrown? NullPointerException (w/base64url-decode "!AAA"))
+        "while the fourth position throws, so one input class fails two ways")
+    (is (= [1 2 3 0] (w/base64url-decode (str (w/base64url-encode [1 2 3]) "A")))
+        "and a leftover character becomes a byte that was never encoded"))
+  (testing "the guest refuses the spellings instead of accepting them as equal"
+    (is (true? (call 'canonical-b64url? ["AAAA"])))
+    (doseq [s ["A!AA" "!AAA" "AA=AA=" "AAAA=" "A" "AAAAA" ""]]
+      (is (false? (call 'canonical-b64url? [s])) s)))
+  (testing "and says so, rather than reporting a mismatch"
+    (is (= :challenge-not-canonical
+           (guest {:type "webauthn.get" :challenge "A!AA" :origin origin} expected)))))
+
+(deftest cross-origin-is-not-looked-at
+  (let [observed {:type "webauthn.get" :challenge challenge :origin origin
+                  :cross-origin? true}]
+    (is (= {:valid? true :errors []}
+           (oracle {:type "webauthn.get" :challenge challenge :origin origin
+                    :crossOrigin true}
+                   oracle-expected))
+        "§7.2 step 9 is not among the checks")
+    (is (= :cross-origin (guest observed expected)))
+    (testing "unless the relying party has said it accepts them"
+      (is (= :none (guest observed (assoc expected :accept-cross-origin? true)))))
+    (testing "and a same-origin ceremony is untouched by the new check"
+      (is (= :none (guest {:type "webauthn.get" :challenge challenge :origin origin}
+                          expected))))))
+
+(deftest a-counter-that-returns-to-zero-passes
+  (testing "the library"
+    (is (true? (w/verify-signature-counter 500 0))
+        "a stored 500 and a presented 0 is the cloning signal §6.1.3 exists for")
+    (is (true? (w/verify-signature-counter 500 501)))
+    (is (false? (w/verify-signature-counter 500 499))))
+  (testing "the guest reads \"no counter\" from the stored value, where it lives"
+    (is (= :possible-clone (call 'counter-problem [500 0])))
+    (is (= :none (call 'counter-problem [0 0]))
+        "both zero is an authenticator that implements no counter")
+    (is (= :none (call 'counter-problem [500 501])))
+    (is (= :possible-clone (call 'counter-problem [500 500]))
+        "equal is not greater")
+    (is (= :possible-clone (call 'counter-problem [500 499])))
+    (is (= :none (call 'counter-problem [0 1]))
+        "and an authenticator that starts counting is not a clone"))
+  (testing "an unknown counter is neither zero nor a clone"
+    (is (= :no-stored-counter (call 'counter-problem [-1 5])))
+    (is (= :no-presented-counter (call 'counter-problem [5 -1])))))
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed, on the case that
+  ;; actually walks: a 22-character challenge, character by character.
+  ;; 20000 was written throughout this file first, and the bracket said the
+  ;; interpreter default carries it. That is the sixth budget this form has
+  ;; ruled out, against one it kept (org-ietf-ers).
+  (let [observed {:type "webauthn.get" :challenge challenge :origin origin}]
+    (is (= :none (call 'client-data-problem [(->doc observed) (->doc expected)]))
+        "the default budget carries the walk")
+    (is (thrown? Exception
+                 (call 'client-data-problem [(->doc observed) (->doc expected)] 64))
+        "and sixty-four does not, so the assertion above is not vacuous")))
