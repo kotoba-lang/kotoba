@@ -1,0 +1,276 @@
+(ns kotoba.activity-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.activity :as a]))
+
+(def ^:private min-ms 60000)
+(def ^:private t0 1767225600000) ;; 2026-01-01T00:00:00Z, an arbitrary fixed epoch
+
+(defn- at [minutes] (+ t0 (* minutes min-ms)))
+
+(defn- poll
+  "A run of samples one minute apart, all in the same app/window."
+  [from-min to-min subject detail]
+  (for [m (range from-min (inc to-min))]
+    (a/observation (at m) :app subject :detail detail)))
+
+;; ---------------------------------------------------------------------------
+;; Observation
+;; ---------------------------------------------------------------------------
+
+(deftest observation-rejects-unknown-source
+  (is (nil? (a/observation (at 0) :telepathy "Emacs")))
+  (is (some? (a/observation (at 0) :app "Emacs"))))
+
+(deftest validity-requires-instant-source-and-subject
+  (is (a/valid-observation? (a/observation (at 0) :app "Emacs")))
+  (is (not (a/valid-observation? {:obs/at (at 0) :obs/source :app :obs/subject "  "})))
+  (is (not (a/valid-observation? {:obs/at nil :obs/source :app :obs/subject "Emacs"}))))
+
+(deftest redact-drops-detail-and-keeps-timing
+  (let [obs (vec (poll 0 2 "Emacs" "salary-negotiation.md"))
+        red (a/redact obs)]
+    (is (every? nil? (map :obs/detail red)))
+    (is (= (map :obs/at obs) (map :obs/at red)))
+    (is (= (map :obs/subject obs) (map :obs/subject red)))))
+
+;; ---------------------------------------------------------------------------
+;; Segmentation
+;; ---------------------------------------------------------------------------
+
+(deftest contiguous-samples-form-one-session
+  (let [[s & more] (a/segment (poll 0 10 "Emacs" "activity.cljc"))]
+    (is (empty? more))
+    (is (= (at 0) (:session/start s)))
+    (is (= (at 10) (:session/end s)))
+    (is (= (* 10 min-ms) (:session/duration-ms s)))
+    (is (= 11 (:session/samples s)))))
+
+(deftest duration-is-never-extrapolated-past-the-last-sample
+  (testing "11 samples one minute apart span 10 minutes, not 11"
+    (let [[s] (a/segment (poll 0 10 "Emacs" "activity.cljc"))]
+      (is (= (* 10 min-ms) (:session/duration-ms s)))
+      (is (not= (* 11 min-ms) (:session/duration-ms s))))))
+
+(deftest a-gap-longer-than-gap-ms-closes-the-session
+  (let [obs (concat (poll 0 5 "Emacs" "a.cljc") (poll 20 30 "Emacs" "a.cljc"))
+        sessions (a/segment obs)]
+    (is (= 2 (count sessions)))
+    (is (= (at 0) (:session/start (first sessions))))
+    (is (= (at 20) (:session/start (second sessions))))))
+
+(deftest switching-subject-closes-the-session
+  (let [obs (concat (poll 0 5 "Emacs" "a.cljc") (poll 6 12 "Slack" "#general"))
+        sessions (a/segment obs)]
+    (is (= 2 (count sessions)))
+    (is (= ["Emacs" "Slack"] (mapv :session/subject sessions)))))
+
+(deftest idle-samples-are-dropped-and-split-the-session
+  (let [obs (concat (poll 0 5 "Emacs" "a.cljc")
+                    (for [m (range 6 20)]
+                      (a/observation (at m) :app "Emacs" :detail "a.cljc" :idle? true))
+                    (poll 20 30 "Emacs" "a.cljc"))
+        sessions (a/segment obs)]
+    (testing "the idle stretch becomes a gap rather than billable time"
+      (is (= 2 (count sessions)))
+      (is (= (* 15 min-ms) (a/observed-ms sessions)))
+      (is (not= (* 30 min-ms) (a/observed-ms sessions))))))
+
+(deftest out-of-order-samples-are-sorted-before-segmenting
+  (is (= (a/segment (poll 0 10 "Emacs" "a.cljc"))
+         (a/segment (shuffle (poll 0 10 "Emacs" "a.cljc"))))))
+
+(deftest sessions-below-min-ms-are-dropped
+  (let [obs (concat (poll 0 10 "Emacs" "a.cljc") (poll 20 20 "Slack" "#general"))]
+    (is (= 1 (count (a/segment obs))))
+    (testing "min-ms 0 keeps the zero-length one"
+      (is (= 2 (count (a/segment obs {:min-ms 0})))))))
+
+(deftest invalid-observations-are-ignored
+  (is (= 1 (count (a/segment (concat (poll 0 10 "Emacs" "a.cljc")
+                                     [{:obs/at nil :obs/source :app :obs/subject "junk"}
+                                      {:garbage true}]))))))
+
+;; ---------------------------------------------------------------------------
+;; Attribution
+;; ---------------------------------------------------------------------------
+
+(def ^:private rules
+  [(a/rule :emacs-activity "kotoba-activity" :source :app :subject-is "Emacs"
+           :detail-contains "activity" :weight 0.9)
+   (a/rule :slack "internal" :source :app :subject-is "Slack" :weight 0.5)])
+
+(deftest a-matching-rule-attributes-with-its-weight
+  (let [[s] (a/segment (poll 0 10 "Emacs" "activity.cljc"))
+        att (a/attribute s rules)]
+    (is (= "kotoba-activity" (:attribution/project att)))
+    (is (= 0.9 (:attribution/confidence att)))
+    (is (= [:emacs-activity] (:attribution/evidence att)))))
+
+(deftest every-clause-must-match
+  (testing "same app, different document — the :detail-contains clause fails"
+    (let [[s] (a/segment (poll 0 10 "Emacs" "taxes.org"))
+          att (a/attribute s rules)]
+      (is (nil? (:attribution/project att)))
+      (is (zero? (:attribution/confidence att))))))
+
+(deftest a-clauseless-rule-matches-nothing
+  (let [[s] (a/segment (poll 0 10 "Emacs" "activity.cljc"))]
+    (is (not (a/matches? s (a/rule :oops "everything"))))
+    (is (nil? (:attribution/project (a/attribute s [(a/rule :oops "everything")]))))))
+
+(deftest highest-weight-wins
+  (let [[s] (a/segment (poll 0 10 "Emacs" "activity.cljc"))
+        rs  [(a/rule :low "wrong" :subject-is "Emacs" :weight 0.4)
+             (a/rule :high "right" :subject-is "Emacs" :weight 0.95)]]
+    (is (= "right" (:attribution/project (a/attribute s rs))))))
+
+(deftest a-tie-between-projects-is-ambiguous-not-first-wins
+  (let [[s] (a/segment (poll 0 10 "Emacs" "activity.cljc"))
+        rs  [(a/rule :a "project-a" :subject-is "Emacs" :weight 0.8)
+             (a/rule :b "project-b" :subject-is "Emacs" :weight 0.8)]
+        att (a/attribute s rs)]
+    (is (:attribution/ambiguous? att))
+    (is (nil? (:attribution/project att)))
+    (is (zero? (:attribution/confidence att)))
+    (is (= #{:a :b} (set (:attribution/evidence att))))))
+
+(deftest a-tie-within-one-project-is-not-ambiguous
+  (let [[s] (a/segment (poll 0 10 "Emacs" "activity.cljc"))
+        rs  [(a/rule :a "same" :subject-is "Emacs" :weight 0.8)
+             (a/rule :b "same" :subject-contains "Ema" :weight 0.8)]
+        att (a/attribute s rs)]
+    (is (not (:attribution/ambiguous? att)))
+    (is (= "same" (:attribution/project att)))))
+
+;; ---------------------------------------------------------------------------
+;; Admission
+;; ---------------------------------------------------------------------------
+
+(def ^:private observed (a/segment (poll 0 30 "Emacs" "activity.cljc")))
+
+(defn- clean-proposal []
+  {:session/start (:session/start (first observed))
+   :session/end   (:session/end (first observed))
+   :duration-ms   (:session/duration-ms (first observed))
+   :project       "kotoba-activity"
+   :confidence    0.8})
+
+(deftest a-well-formed-proposal-is-admitted
+  (is (:admit/ok? (a/admit (clean-proposal) observed #{"kotoba-activity"}))))
+
+(deftest a-proposal-for-an-unobserved-span-is-rejected
+  (let [r (a/admit (assoc (clean-proposal) :session/start (at 900) :session/end (at 960))
+                   observed #{"kotoba-activity"})]
+    (is (not (:admit/ok? r)))
+    (is (some #(= :no-session (:rule %)) (:admit/errors r)))))
+
+(deftest a-proposal-cannot-lengthen-time
+  (let [r (a/admit (assoc (clean-proposal) :duration-ms (* 8 3600000))
+                   observed #{"kotoba-activity"})]
+    (is (not (:admit/ok? r)))
+    (is (some #(= :duration-mismatch (:rule %)) (:admit/errors r)))))
+
+(deftest a-proposal-cannot-invent-a-project
+  (let [r (a/admit (assoc (clean-proposal) :project "a-client-we-do-not-have")
+                   observed #{"kotoba-activity"})]
+    (is (not (:admit/ok? r)))
+    (is (some #(= :unknown-project (:rule %)) (:admit/errors r)))))
+
+(deftest a-nil-project-asserts-nothing-and-is-not-an-unknown-project
+  (testing "'observed, nobody knows what for' is the honest answer, not a rejection"
+    (let [r (a/admit (assoc (clean-proposal) :project nil) observed #{"kotoba-activity"})]
+      (is (not (some #(= :unknown-project (:rule %)) (:admit/errors r))))
+      (is (:admit/ok? r)))))
+
+(deftest confidence-must-be-a-number-in-range
+  (doseq [bad [nil "high" -0.1 1.5]]
+    (let [r (a/admit (assoc (clean-proposal) :confidence bad) observed #{"kotoba-activity"})]
+      (is (not (:admit/ok? r)) (str "should reject confidence " (pr-str bad)))
+      (is (some #(= :bad-confidence (:rule %)) (:admit/errors r))))))
+
+(deftest confidence-below-the-floor-fails-admission
+  (let [r (a/admit (assoc (clean-proposal) :confidence 0.2) observed #{"kotoba-activity"})]
+    (is (not (:admit/ok? r)))
+    (is (some #(= :low-confidence (:rule %)) (:admit/errors r))))
+  (testing "the floor is caller-settable"
+    (is (:admit/ok? (a/admit (assoc (clean-proposal) :confidence 0.2)
+                             observed #{"kotoba-activity"} {:confidence-floor 0.1})))))
+
+;; ---------------------------------------------------------------------------
+;; Coverage
+;; ---------------------------------------------------------------------------
+
+(deftest coverage-reports-the-unattributed-remainder
+  (let [sessions (a/segment (concat (poll 0 30 "Emacs" "activity.cljc")
+                                    (poll 40 70 "Safari" "news")))
+        att (a/attribute-all sessions rules)
+        c   (a/coverage att)]
+    (is (= (* 60 min-ms) (:coverage/observed-ms c)))
+    (is (= (* 30 min-ms) (:coverage/attributed-ms c)))
+    (is (= (* 30 min-ms) (:coverage/unattributed-ms c)))
+    (is (= 0.5 (:coverage/ratio c)))))
+
+(deftest coverage-of-nothing-is-zero-not-a-division-error
+  (is (= 0.0 (:coverage/ratio (a/coverage [])))))
+
+;; ---------------------------------------------------------------------------
+;; Timesheet emission
+;; ---------------------------------------------------------------------------
+
+(defn- date-of [_ms] "2026-01-01")
+
+(deftest emission-rounds-down-to-the-billing-increment
+  (let [sessions (a/segment (poll 0 100 "Emacs" "activity.cljc"))  ;; 100 min observed
+        entries  (a/->timesheet-entries "w-1" date-of (a/attribute-all sessions rules))]
+    (is (= 1 (count entries)))
+    (testing "100 minutes floors to 90, i.e. 1.5h at a 15-minute increment"
+      (is (= 1.5 (:ts/hours (first entries)))))
+    (is (= "kotoba-activity" (:ts/project (first entries))))
+    (is (= (* 100 min-ms) (:ts/observed-ms (first entries))))))
+
+(deftest emitted-hours-never-exceed-observed-hours
+  (doseq [span [7 13 61 100 187 421]]
+    (let [sessions (a/segment (poll 0 span "Emacs" "activity.cljc"))
+          att      (a/attribute-all sessions rules)
+          entries  (a/->timesheet-entries "w-1" date-of att)]
+      (is (<= (a/total-hours entries) (/ (double (a/observed-ms sessions)) 3600000))
+          (str "floor rounding must not bill unobserved time, span " span)))))
+
+(deftest nearest-rounding-is-available-and-ceil-is-not
+  (let [sessions (a/segment (poll 0 100 "Emacs" "activity.cljc"))
+        att      (a/attribute-all sessions rules)]
+    (is (= 1.75 (:ts/hours (first (a/->timesheet-entries "w-1" date-of att {:rounding :nearest})))))
+    (testing ":ceil is not a rounding mode — an unknown mode falls back to :floor"
+      (is (= 1.5 (:ts/hours (first (a/->timesheet-entries "w-1" date-of att {:rounding :ceil}))))))))
+
+(deftest unattributed-time-is-dropped-not-bundled
+  (let [sessions (a/segment (concat (poll 0 60 "Emacs" "activity.cljc")
+                                    (poll 70 130 "Safari" "news")))
+        entries  (a/->timesheet-entries "w-1" date-of (a/attribute-all sessions rules))]
+    (is (= 1 (count entries)))
+    (is (= 1.0 (:ts/hours (first entries))))
+    (testing "the hour of unattributed browsing is absent, not folded in"
+      (is (= 1.0 (a/total-hours entries))))))
+
+(deftest entries-that-round-to-zero-are-dropped
+  (let [sessions (a/segment (poll 0 5 "Emacs" "activity.cljc"))
+        entries  (a/->timesheet-entries "w-1" date-of (a/attribute-all sessions rules))]
+    (is (empty? entries))))
+
+(deftest entries-carry-the-kotoba-labor-timesheet-shape
+  (let [sessions (a/segment (poll 0 100 "Emacs" "activity.cljc"))
+        e (first (a/->timesheet-entries "w-1" date-of (a/attribute-all sessions rules)))]
+    (is (= #{:ts/worker :ts/date :ts/hours :ts/project :ts/observed-ms} (set (keys e))))
+    (testing "the three keys kotoba.labor/wages-for reads are present and typed"
+      (is (string? (:ts/worker e)))
+      (is (string? (:ts/date e)))
+      (is (number? (:ts/hours e))))))
+
+(deftest one-worker-two-projects-two-entries
+  (let [rs (conj rules (a/rule :safari "research" :subject-is "Safari" :weight 0.7))
+        sessions (a/segment (concat (poll 0 60 "Emacs" "activity.cljc")
+                                    (poll 70 130 "Safari" "news")))
+        entries (a/->timesheet-entries "w-1" date-of (a/attribute-all sessions rs))]
+    (is (= 2 (count entries)))
+    (is (= ["kotoba-activity" "research"] (mapv :ts/project entries)))
+    (is (= 2.0 (a/total-hours entries)))))
