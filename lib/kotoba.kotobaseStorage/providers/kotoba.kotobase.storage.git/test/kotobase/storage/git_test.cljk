@@ -1,0 +1,161 @@
+(ns kotobase.storage.git-test
+  (:require [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotobase.engine :as engine]
+            [kotobase.storage.contract :as contract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.git :as git])
+  (:import [java.nio.file Files Path]
+           [java.nio.file.attribute FileAttribute]))
+
+(defn- temp-repo []
+  (.resolve (Files/createTempDirectory "kotobase-git-" (make-array FileAttribute 0))
+            "store.git"))
+
+(defn- delete-tree! [^Path path]
+  (when (Files/exists path (make-array java.nio.file.LinkOption 0))
+    (doseq [p (reverse (iterator-seq (.iterator (Files/walk path (make-array java.nio.file.FileVisitOption 0)))))]
+      (Files/deleteIfExists ^Path p))))
+
+(defn- with-repo [run!]
+  (let [path (temp-repo)]
+    (try (run! path)
+         (finally (delete-tree! (.getParent path))))))
+
+(defn- git-in [^Path repo & args]
+  (apply shell/sh "git" (concat args [:env {"GIT_DIR" (str repo)}])))
+
+(deftest shared-storage-contract
+  (with-repo
+    (fn [path]
+      (let [checks (atom [])
+            backend (git/open {:path path})
+            result (contract/verify backend (fn [truthy label]
+                                              (swap! checks conj label)
+                                              (is truthy label)))]
+        ;; Assert what ran, not how many. A count is the wrong thing to
+        ;; pin: it made adding the concurrent half look like a failure
+        ;; here, and it would have gone on reporting success if the half
+        ;; were ever skipped for this backend.
+        (is (= {:profile :linearizable-ref :concurrency :verified} result)
+            "the suite raced this backend rather than skipping it")
+        (is (some #(re-find #"concurrent writers" %) @checks)
+            "and `git update-ref` was actually put under contention")))))
+
+(deftest cid-collision-is-rejected-without-changing-stored-bytes
+  (with-repo
+    (fn [path]
+      (let [backend (git/open {:path path})]
+        (storage/put-block! backend "same-cid" (byte-array [1]))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"different bytes"
+                              (storage/put-block! backend "same-cid" (byte-array [2]))))
+        (is (= [1] (vec (storage/get-block backend "same-cid"))))))))
+
+(deftest competing-genesis-cas-has-one-winner
+  (testing "concurrent CAS is decided by git's own ref lock, not by us"
+    (with-repo
+      (fn [path]
+        (let [backend (git/open {:path path})
+              start (promise)
+              attempt (fn [cid] (future @start (storage/-compare-and-set-ref! backend "race" nil cid)))
+              left (attempt "left")
+              right (attempt "right")]
+          (deliver start true)
+          (let [results [@left @right]]
+            (is (= 1 (count (filter :published? results))))
+            (is (contains? #{"left" "right"} (:cid (storage/-read-ref backend "race"))))
+            (testing "the loser is told who won, so it can retry against reality"
+              (let [loser (first (remove :published? results))]
+                (is (= (:cid (storage/-read-ref backend "race")) (:current loser)))))))))))
+
+(deftest concurrent-block-writers-both-survive
+  (testing "a lost blocks-ref race is retried rather than dropping the blocks"
+    (with-repo
+      (fn [path]
+        (let [backend (git/open {:path path})
+              start (promise)
+              writer (fn [n] (future @start
+                                     (storage/put-block! backend (str "concurrent-" n)
+                                                         (byte-array [(byte n)]))))
+              futures (mapv writer (range 8))]
+          (deliver start true)
+          (doseq [f futures] @f)
+          (let [found (storage/-get-blocks backend (mapv #(str "concurrent-" %) (range 8)))]
+            (is (= 8 (count found)) "every concurrently written block is present")))))))
+
+(deftest blocks-survive-aggressive-gc
+  (testing "blocks are reachable objects, not loose ones a gc may prune"
+    (with-repo
+      (fn [path]
+        (let [backend (git/open {:path path})]
+          (storage/put-block! backend "durable" (byte-array [7 8 9]))
+          (storage/-compare-and-set-ref! backend "main" nil "durable")
+          ;; This is the failure mode that distinguishes "wrote a git object"
+          ;; from "stored data in git": an unreachable object does not survive.
+          (let [{:keys [exit]} (git-in path "gc" "--prune=now" "--aggressive" "--quiet")]
+            (is (zero? exit) "gc runs"))
+          (is (= [7 8 9] (vec (storage/get-block backend "durable")))
+              "block still readable after gc --prune=now")
+          (is (= "durable" (:cid (storage/-read-ref backend "main")))))))))
+
+(deftest ref-names_survive_git_ref_syntax
+  (testing "scoped-ref output is not a legal git ref name and must be encoded"
+    (with-repo
+      (fn [path]
+        (let [backend (git/open {:path path})
+              scoped (storage/scoped-ref "tenant one" "db:weird[name]")]
+          (is (:published? (storage/-compare-and-set-ref! backend scoped nil "cid-x")))
+          (is (= "cid-x" (:cid (storage/-read-ref backend scoped))))
+          (testing "and it really did land in git's ref namespace"
+            (let [{:keys [out]} (git-in path "for-each-ref" "--format=%(refname)" "refs/kotobase/db/")]
+              (is (= 1 (count (remove str/blank? (str/split-lines out))))))))))))
+
+(deftest distinct-cids-never-share-a-slot
+  (testing "the encoding is injective across the safe/unsafe boundary"
+    (with-repo
+      (fn [path]
+        (let [backend (git/open {:path path})]
+          ;; "x41" is a legal path segment; hex-encoding "A" also yields 41.
+          ;; Without distinct prefixes these two CIDs would collide.
+          (storage/put-block! backend "x41" (byte-array [1]))
+          (storage/put-block! backend "A" (byte-array [2]))
+          (is (= [1] (vec (storage/get-block backend "x41"))))
+          (is (= [2] (vec (storage/get-block backend "A")))))))))
+
+(deftest engine-data-persists-across-reopen
+  (testing "the datom plane — transact, reopen, and query with git as the only storage"
+    (with-repo
+      (fn [path]
+        (let [open-engine (fn [] (engine/open {:storage (git/open {:path path})
+                                               :encrypt-fn identity
+                                               :decrypt-fn identity
+                                               :blind-fn pr-str
+                                               :visible? (constantly true)}))
+              first-database (open-engine)
+              committed (engine/transact! first-database [["alice" "role" "admin"]
+                                                          ["bob" "role" "reader"]])
+              reopened (open-engine)]
+          (is (= committed (engine/head reopened)) "the mutable head survives reopen")
+          (is (= #{{:s "alice" :p "role" :o "admin"}}
+                 (engine/q reopened ["alice" "role" nil]))
+              "datalog-shaped query resolves through git-stored blocks")
+          (is (= #{{:s "alice" :p "role" :o "admin"}
+                   {:s "bob" :p "role" :o "reader"}}
+                 (engine/q reopened [nil "role" nil]))
+              "wildcard subject scans the index built over git objects"))))))
+
+(deftest history_is_inspectable_with_plain_git
+  (testing "every published head is an ordinary commit — the audit trail is git log"
+    (with-repo
+      (fn [path]
+        (let [backend (git/open {:path path})]
+          (storage/put-block! backend "one" (byte-array [1]))
+          (storage/put-block! backend "two" (byte-array [2]))
+          (let [{:keys [out]} (git-in path "log" "--oneline" "refs/kotobase/blocks")]
+            (is (<= 2 (count (remove str/blank? (str/split-lines out))))
+                "each block batch is a commit an operator can read")))))))
+
+(deftest invalid-open-options-fail-closed
+  (is (thrown? clojure.lang.ExceptionInfo (git/open {})))
+  (is (thrown? clojure.lang.ExceptionInfo (git/open {:path "   "}))))

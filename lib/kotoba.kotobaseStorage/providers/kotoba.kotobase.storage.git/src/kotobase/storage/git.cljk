@@ -1,0 +1,282 @@
+(ns kotobase.storage.git
+  "Git implementation of immutable blocks and linearizable refs.
+
+  Git is not being used here as a place to *keep files*. It is being used as the
+  storage engine itself, because it already is one: a content-addressed object
+  database with garbage collection, delta compression, replication, and — the
+  part that matters most for this contract — an atomic compare-and-swap on refs.
+
+  ## Why the fit is exact
+
+  `IRefStore/-compare-and-set-ref!` asks for: publish NEXT only if the current
+  value is EXPECTED, atomically, reporting the winner on loss. That is
+  `git update-ref <ref> <new> <old>` verbatim. Git performs it under a `.lock`
+  file with an fsync, and fails without mutating anything when `<old>` does not
+  match. `docs/storage-architecture.md` in kotobase notes that IPNS has no such
+  primitive and the IPFS provider therefore has to declare itself single-writer;
+  git needs no such caveat on a single filesystem.
+
+  `IBlockStore` asks for idempotent CID-keyed immutable bytes. Git objects are
+  immutable and content-keyed by construction, so a re-put is a no-op at the
+  object layer for free.
+
+  ## Blocks must be reachable, or they are garbage
+
+  The one thing git will do that a database will not is *delete your data*:
+  `git gc` prunes objects no ref reaches. So writing a block is not
+  `hash-object -w` alone — that leaves a loose object which the next gc is
+  entitled to remove. Each batch therefore also commits the blocks into a tree
+  under `refs/kotobase/blocks`, which is what makes them durable.
+
+  The tree is built with a scratch index (`GIT_INDEX_FILE`) and plumbing only,
+  so no worktree is required and a bare repository works. The commit is
+  published with the same CAS used for refs, and retried when a concurrent
+  writer wins the race — so two processes writing blocks to one repository is
+  safe, not merely usually safe.
+
+  ## What this backend is good at, and what it is not
+
+  Good: durable, replicable (`git push`/`fetch` are the replication protocol),
+  fully auditable history of every published head, works offline, needs no
+  server, and is already installed everywhere. A database whose entire storage
+  layer is inspectable with `git log` is a genuinely different operational
+  posture from one behind a JDBC URL.
+
+  Not good: throughput. Every batch rewrites a tree and writes a commit, and
+  `-get-blocks` currently spawns one `cat-file` per CID rather than using
+  `cat-file --batch` (a real optimisation left undone deliberately — correctness
+  first, and the batching is a contained change behind this same protocol).
+  Concurrency is safe within one filesystem; across NFS git's own locking
+  caveats apply and this backend inherits them rather than fixing them."
+  (:require [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotobase.storage.core :as storage])
+  (:import [java.io ByteArrayInputStream File]))
+
+(def ^:private blocks-ref "refs/kotobase/blocks")
+(def ^:private ref-prefix "refs/kotobase/db/")
+(def ^:private zero-oid "0000000000000000000000000000000000000000")
+
+(def ^:private commit-identity
+  "Committer identity is supplied explicitly rather than read from git config.
+  A bare repository created by a service may have no user.name at all, and a
+  storage backend silently adopting whoever ran it would make the audit trail
+  say something untrue."
+  {"GIT_AUTHOR_NAME" "kotobase-storage-git"
+   "GIT_AUTHOR_EMAIL" "storage@kotobase.invalid"
+   "GIT_COMMITTER_NAME" "kotobase-storage-git"
+   "GIT_COMMITTER_EMAIL" "storage@kotobase.invalid"})
+
+;; ── process plumbing ────────────────────────────────────────────────────────
+
+(defn- run
+  "Run git in REPO. Returns {:exit :out :err}. OUT is a String unless :bytes?."
+  [repo args {:keys [in bytes? index-file]}]
+  (let [env (cond-> (merge {"GIT_DIR" (str repo)} commit-identity)
+              index-file (assoc "GIT_INDEX_FILE" (str index-file)))
+        opts (cond-> [:env env]
+               in (conj :in in)
+               bytes? (conj :out-enc :bytes))]
+    (apply shell/sh "git" (concat args opts))))
+
+(defn- git!
+  "Run git and throw on failure. Storage errors must not be silently swallowed —
+  a backend that returns nil on a broken repository looks exactly like a
+  backend reporting a legitimately absent block."
+  [repo args & {:as opts}]
+  (let [{:keys [exit err] :as result} (run repo args opts)]
+    (when-not (zero? exit)
+      (throw (ex-info "git command failed"
+                      {:type :kotobase.storage.git/command-failed
+                       :args (vec args) :exit exit :err (str/trim (str err))})))
+    result))
+
+(defn- git-ok?
+  "Run git, returning nil on non-zero exit. For genuinely-absent lookups only."
+  [repo args & {:as opts}]
+  (let [{:keys [exit] :as result} (run repo args opts)]
+    (when (zero? exit) result)))
+
+;; ── name encoding ───────────────────────────────────────────────────────────
+
+(defn- hex [^bytes bs]
+  (str/join (map #(format "%02x" (bit-and % 0xff)) bs)))
+
+(defn- encode-name
+  "CIDs and ref names are opaque strings; git paths and ref names are not.
+
+  The encoding is injective on purpose: safe names take a `b` prefix and unsafe
+  ones a hex `x` form, so no CID can encode onto another's slot. Encoding only
+  the unsafe ones without a prefix would let the literal CID \"x41\" collide
+  with the hex encoding of \"A\"."
+  [s]
+  (if (re-matches #"[A-Za-z0-9][A-Za-z0-9._-]{0,250}" s)
+    (str "b" s)
+    (str "x" (hex (kbytes/utf8-bytes ^String s)))))
+
+(defn- block-path
+  "Two-character fan-out under the encoded name. Git trees are rewritten whole,
+  so a single flat directory of every block would make each write O(all blocks)."
+  [cid]
+  (let [n (encode-name cid)
+        fan (subs n 1 (min 3 (count n)))]
+    (str "blocks/" fan "/" n)))
+
+(defn- ref-path
+  "Git ref names forbid spaces, `~^:?*[`, `..`, a leading `.` in any component
+  and a `.lock` suffix. `storage/scoped-ref` produces `(pr-str [:kotobase/ref
+  tenant db])`, which trips several of those, so everything outside
+  [A-Za-z0-9_-] is percent-encoded — including `.`, which removes the leading-dot
+  and .lock hazards without needing to special-case them."
+  [ref-name]
+  (str ref-prefix
+       (str/join (for [b (kbytes/utf8-bytes ^String ref-name)
+                       :let [c (char (bit-and b 0xff))]]
+                   (if (re-matches #"[A-Za-z0-9_-]" (str c))
+                     (str c)
+                     (format "%%%02X" (bit-and b 0xff)))))))
+
+;; ── refs ────────────────────────────────────────────────────────────────────
+
+(defn- read-ref* [repo ref-name]
+  (let [path (ref-path ref-name)]
+    (when-let [{:keys [out]} (git-ok? repo ["rev-parse" "--verify" "--quiet" path])]
+      (let [oid (str/trim out)]
+        (when (seq oid)
+          {:cid (str/trim (:out (git! repo ["cat-file" "blob" oid])))
+           :version oid})))))
+
+(defn- write-cid-blob! [repo cid]
+  (str/trim (:out (git! repo ["hash-object" "-w" "-t" "blob" "--stdin"]
+                        :in (str cid)))))
+
+;; ── blocks ──────────────────────────────────────────────────────────────────
+
+(defn- blocks-tree [repo]
+  (some-> (git-ok? repo ["rev-parse" "--verify" "--quiet" (str blocks-ref "^{tree}")])
+          :out str/trim not-empty))
+
+(defn- existing-block-oid [repo path]
+  (some-> (git-ok? repo ["rev-parse" "--verify" "--quiet" (str blocks-ref ":" path)])
+          :out str/trim not-empty))
+
+(defn- commit-blocks!
+  "Stage PLACEMENTS ([path oid]) into a scratch index seeded from the current
+  blocks tree, then publish the new commit with CAS. Returns true when
+  published, false when a concurrent writer moved the ref first."
+  [repo placements]
+  (let [index (File/createTempFile "kotobase-git-index" ".idx")
+        _ (.delete index)                       ; git wants to create it itself
+        parent (some-> (git-ok? repo ["rev-parse" "--verify" "--quiet" blocks-ref])
+                       :out str/trim not-empty)]
+    (try
+      (when-let [tree (blocks-tree repo)]
+        (git! repo ["read-tree" tree] :index-file index))
+      (doseq [[path oid] placements]
+        (git! repo ["update-index" "--add" "--cacheinfo" (str "100644," oid "," path)]
+              :index-file index))
+      (let [tree (str/trim (:out (git! repo ["write-tree"] :index-file index)))]
+        (if (= tree (blocks-tree repo))
+          true                                   ; nothing changed; no empty commit
+          (let [commit (str/trim
+                        (:out (git! repo (concat ["commit-tree" tree]
+                                                 (when parent ["-p" parent])
+                                                 ["-m" (str "kotobase blocks: "
+                                                            (count placements) " placement(s)")]))))]
+            (boolean (git-ok? repo ["update-ref" blocks-ref commit (or parent zero-oid)])))))
+      (finally (.delete index)))))
+
+(defn- put-blocks!*
+  [repo blocks]
+  (when (seq blocks)
+    (let [placements
+          (doall
+           (for [{:keys [cid bytes]} blocks
+                 :let [path (block-path cid)
+                       oid (str/trim (:out (git! repo ["hash-object" "-w" "-t" "blob" "--stdin"]
+                                                 :in (ByteArrayInputStream. bytes))))
+                       prior (existing-block-oid repo path)]]
+             (do
+               ;; Immutability is the contract, so a CID arriving with different
+               ;; bytes is a caller bug and is refused rather than overwritten.
+               ;; Git makes the check cheap: identical bytes have the identical oid.
+               (when (and prior (not= prior oid))
+                 (throw (ex-info "CID already stored with different bytes"
+                                 {:type :kotobase.storage.git/cid-collision :cid cid})))
+               [path oid])))]
+      ;; Retry the publish: losing the ref race means another writer committed
+      ;; between our read of the tree and our update-ref, not that our blocks
+      ;; are unwanted.
+      (loop [attempt 0]
+        (when-not (commit-blocks! repo placements)
+          (if (< attempt 20)
+            (recur (inc attempt))
+            (throw (ex-info "blocks ref contended beyond retry budget"
+                            {:type :kotobase.storage.git/ref-contention})))))))
+  nil)
+
+(defn- get-blocks* [repo cids]
+  (reduce (fn [acc cid]
+            (if-let [{:keys [out]} (git-ok? repo ["cat-file" "blob"
+                                                  (str blocks-ref ":" (block-path cid))]
+                                            :bytes? true)]
+              (assoc acc cid out)
+              acc))
+          {}
+          cids))
+
+;; ── backend ─────────────────────────────────────────────────────────────────
+
+(defrecord GitBackend [repo]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks] (put-blocks!* repo blocks))
+  (-get-blocks [_ cids] (get-blocks* repo cids))
+
+  storage/IRefStore
+  (-read-ref [_ ref-name] (read-ref* repo ref-name))
+  (-compare-and-set-ref! [_ ref-name expected-cid next-cid]
+    (let [path (ref-path ref-name)
+          next-oid (write-cid-blob! repo next-cid)
+          expected-oid (if (nil? expected-cid) zero-oid (write-cid-blob! repo expected-cid))]
+      (if (git-ok? repo ["update-ref" path next-oid expected-oid])
+        {:published? true :current next-cid :version next-oid}
+        ;; Report the winner, which is what a CAS loser needs in order to retry.
+        (let [current (read-ref* repo ref-name)]
+          {:published? false :current (:cid current) :version (:version current)}))))
+
+  storage/IBackendCapabilities
+  (-capabilities [_]
+    (conj storage/required-capabilities
+          ;; `git update-ref <ref> <new> <old>` is the compare-and-swap:
+          ;; git takes a lock file, verifies the old value, writes and
+          ;; fsyncs. The precondition is the store's, not this provider's,
+          ;; which is exactly what `:linearizable-ref` means. (Within one
+          ;; filesystem. Over NFS git's own locking caveats apply, and this
+          ;; provider inherits them rather than pretending to fix them --
+          ;; the README says the same.)
+          :linearizable-ref
+          ;; Beyond the contract, and true rather than aspirational: every
+          ;; published head is a commit in an append-only DAG, and fetch/push
+          ;; replicate the whole store without any extra machinery.
+          :history :replication :offline)))
+
+(defn open
+  "Open (creating if absent) a bare git repository as a kotobase backend.
+
+  Fails closed on a missing :path rather than defaulting to somewhere, because
+  a storage backend that silently picks its own location is how data ends up
+  written where nobody looks for it."
+  [{:keys [path] :as options}]
+  (when (str/blank? (str path))
+    (throw (ex-info "kotobase git storage requires :path"
+                    {:type :kotobase.storage.git/invalid-options :options options})))
+  (let [dir (io/file (str path))]
+    (when-not (.exists (io/file dir "HEAD"))
+      (.mkdirs dir)
+      (let [{:keys [exit err]} (shell/sh "git" "init" "--bare" "--quiet" (str dir))]
+        (when-not (zero? exit)
+          (throw (ex-info "could not initialise git repository"
+                          {:type :kotobase.storage.git/init-failed
+                           :path (str dir) :err (str/trim (str err))})))))
+    (storage/validate-backend! (->GitBackend dir))))

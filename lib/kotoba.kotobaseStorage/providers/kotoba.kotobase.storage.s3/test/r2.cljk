@@ -1,0 +1,121 @@
+(ns r2
+  "The contract through `r2-client`, against a real R2Bucket binding.
+
+  `test/run.cljk` runs the contract against `object-store`, a mock written
+  in this repo to the shape `open` expects. That verifies `S3Storage`, and
+  nothing else: it never calls `r2-client`, so the code that actually
+  translates a CAS into `bucket.put(key, body, {onlyIf: {etagMatches}})`
+  had no coverage at all -- while being the client this adapter recommends
+  and the one a Workers deployment would use.
+
+  A mock cannot close that gap, because the question is precisely whether
+  the R2 API behaves as the adapter assumes. Miniflare's R2 is an
+  implementation of that API, and it does enforce the preconditions
+  (checked directly before writing this: `etagDoesNotMatch: \"*\"` on an
+  existing object is rejected, `etagMatches` with a wrong ETag is rejected,
+  and with the right one is accepted). So the race runs against something
+  that can actually refuse.
+
+  This is still not Cloudflare's production R2. What it establishes is that
+  `r2-client` speaks the R2 API correctly and that the profile it claims
+  survives contention against an implementation of that API. Whether the
+  production service matches its own API implementation is what
+  `probe-conditional-put!` is for, and that has not been run against the
+  real endpoint yet."
+  (:require ["miniflare" :refer [Miniflare]]
+            [kotobase.storage.async-contract :as contract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.s3 :as s3]))
+
+(def ^:private failures (atom 0))
+
+(defn- expect [ok? message]
+  (if ok?
+    (println (str "ok  - " message))
+    (do (js/console.error (str "FAIL: " message)) (swap! failures inc))))
+
+(defn- bucket-backend [bucket & {:keys [require-linearizable?]}]
+  (s3/open (cond-> {:client (s3/r2-client bucket) :prefix "kotobase"}
+             require-linearizable? (assoc :require-linearizable? true))))
+
+;; ── does the harness have teeth on THIS client? ──────────────────────────────
+
+(defn- unconditional-r2
+  "`r2-client` with the precondition stripped out of the put.
+
+   Everything else is the real R2 binding. This is what the adapter would
+   be if `onlyIf` were dropped or misspelled -- and misspelled matters:
+   `onlyIf` takes an options object, so a typo in the key name is silently
+   ignored by R2 rather than rejected, which is the failure this whole
+   exercise is about. A green race means nothing unless it can catch it."
+  [bucket]
+  (let [real (s3/r2-client bucket)]
+    (assoc real
+           :put-object!
+           (fn [{:keys [key body]}]
+             (-> (.put bucket key body)
+                 (.then (fn [result] (when result {:etag (.-etag result)}))))))))
+
+(defn- run-checks [bucket oracle-bucket]
+  (-> (contract/verify (bucket-backend bucket))
+      (.then
+       (fn [result]
+         (println (str "R2 contract: " (pr-str result)))
+         (expect (= :linearizable-ref (:profile result))
+                 "r2-client yields linearizable, from the binding rather than a flag")
+         (expect (= :verified (:concurrency result))
+                 "and the race ran against a real R2Bucket")))
+      (.then
+       (fn [_]
+         (s3/probe-conditional-put! {:client (s3/r2-client bucket)
+                                     :prefix "kotobase"})))
+      (.then
+       (fn [{:keys [enforced? checks]}]
+         (expect (true? enforced?)
+                 (str "the probe confirms R2 enforces both preconditions: "
+                      (pr-str checks)))))
+      (.then
+       (fn [_]
+         (expect (some? (bucket-backend bucket :require-linearizable? true))
+                 ":require-linearizable? opens against an R2 binding")))
+      (.then
+       (fn [_]
+         ;; The oracle, on its own bucket: the contract's ref names are
+         ;; shared state, and a second run over the same bucket would trip
+         ;; on the first run's refs before reaching the race.
+         (contract/verify
+          (s3/open {:client (assoc (unconditional-r2 oracle-bucket)
+                                   :conditional-put :native)
+                    :prefix "kotobase"}))))
+      (.then
+       (fn [result]
+         (expect false
+                 (str "an R2 client with no precondition was ACCEPTED: "
+                      (pr-str result)))))
+      (.catch
+       (fn [error]
+         (expect (some? (re-find #"concurrent writers all published"
+                                 (or (.-message error) "")))
+                 (str "an R2 client with the precondition dropped is caught "
+                      "by the race -- got: " (.-message error)))))))
+
+(defn -main [& _]
+  (let [mf (Miniflare. #js {:modules true
+                            :script "export default {};"
+                            :r2Buckets #js {:BUCKET "kotobase-contract"
+                                            :ORACLE "kotobase-contract-oracle"}})]
+    (-> (js/Promise.all #js [(.getR2Bucket mf "BUCKET") (.getR2Bucket mf "ORACLE")])
+        (.then (fn [[bucket oracle]] (run-checks bucket oracle)))
+        (.catch (fn [error]
+                  (js/console.error (str "FAIL: " (.-message error)))
+                  (swap! failures inc)))
+        (.then (fn [_]
+                 (-> (.dispose mf)
+                     (.then (fn [_]
+                              (if (zero? @failures)
+                                (println "kotobase-storage-s3 (R2): all green")
+                                (println (str "kotobase-storage-s3 (R2): " @failures
+                                              " FAILURE(S) above")))
+                              (.exit js/process (if (zero? @failures) 0 1))))))))))
+
+(-main)

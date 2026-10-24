@@ -1,0 +1,128 @@
+(ns r2-live-worker
+  "The live half of the R2 benchmark: bounded PUT/HEAD/GET samples and an
+  eight-writer ETag race, run inside a Worker against a real bucket.
+
+  The race is the point. `test/race.cljk` says why the sequential contract
+  cannot see it: read-and-compare answers correctly whether or not the provider
+  enforces `onlyIf`, so a backend that ignores preconditions entirely passes.
+  Eight writers that all read the SAME etag can tell the two apart, and only a
+  real bucket can say whether R2 does -- the question ADR-2608039000 turns on.
+
+  Every key written is unique to one run and deleted in a `finally`, so a run
+  that throws still cleans up. Disabled unless BENCH_LIVE_ENABLED is \"1\".")
+
+(defn- percentile [values p]
+  (let [sorted (vec (sort values))]
+    (nth sorted (min (dec (count sorted)) (js/Math.floor (* p (count sorted)))))))
+
+(defn- distribution [values]
+  #js {:samples (count values)
+       :min_ms (apply min values)
+       :p50_ms (percentile values 0.50)
+       :p95_ms (percentile values 0.95)
+       :max_ms (apply max values)})
+
+(defn- timed
+  "Promise<{:value v :elapsed ms}>. Wall time around one operation."
+  [operation]
+  (let [started (.now js/performance)]
+    (.then (js/Promise.resolve (operation))
+           (fn [value] {:value value :elapsed (- (.now js/performance) started)}))))
+
+(defn- json [obj status]
+  (js/Response.json obj #js {:status status}))
+
+(defn- bounded? [samples size]
+  (and (js/Number.isSafeInteger samples) (<= 5 samples 100)
+       (js/Number.isSafeInteger size) (<= 1 size 262144)))
+
+(defn- sample-seq
+  "Run `f` over keys one at a time, collecting elapsed ms. Sequential on
+  purpose: concurrency here would measure the client's parallelism, not R2."
+  [ks f]
+  (reduce (fn [p k]
+            (.then p (fn [acc] (.then (timed #(f k)) #(conj acc (:elapsed %))))))
+          (js/Promise.resolve [])
+          ks))
+
+(defn- run-bench [^js env ^js request samples size]
+  (let [run (.randomUUID js/crypto)
+        prefix (str "bench/kotobase-storage-s3/" run "/")
+        ks (mapv #(str prefix "block-" %) (range samples))
+        cas-key (str prefix "head")
+        body (js/Uint8Array. size)
+        ^js bucket (.-BENCH_BUCKET env)]
+    (.getRandomValues js/crypto (.subarray body 0 (min size 65536)))
+    (-> (sample-seq ks (fn [k] (.put bucket k body)))
+        (.then (fn [put]
+                 (.then (sample-seq ks (fn [k] (.head bucket k)))
+                        (fn [head] [put head]))))
+        (.then (fn [[put head]]
+                 (.then (sample-seq ks
+                                    (fn [k]
+                                      (.then (.get bucket k)
+                                             (fn [^js object]
+                                               (when (or (nil? object) (not= (.-size object) size))
+                                                 (throw (js/Error. "R2 GET mismatch")))
+                                               (.then (.arrayBuffer object)
+                                                      (fn [buf]
+                                                        (when (not= (.-byteLength buf) size)
+                                                          (throw (js/Error. "R2 GET body mismatch")))
+                                                        (.-byteLength buf)))))))
+                        (fn [gets] [put head gets]))))
+        (.then (fn [[put head gets]]
+                 (.then (.put bucket cas-key (js/Uint8Array. #js [0]))
+                        (fn [^js initial] [put head gets initial]))))
+        (.then (fn [[put head gets ^js initial]]
+                 (.then (js/Promise.all
+                         (clj->js
+                          (mapv (fn [i]
+                                  (timed #(.put bucket cas-key (js/Uint8Array. #js [(inc i)])
+                                                #js {:onlyIf #js {:etagMatches (.-etag initial)}})))
+                                (range 8))))
+                        (fn [racers] [put head gets racers]))))
+        (.then (fn [[put head gets racers]]
+                 (let [rs (js->clj racers)
+                       ;; a refused conditional PUT answers null; a winner does not
+                       winners (count (filter #(some? (get % "value")) rs))
+                       latency (mapv #(get % "elapsed") rs)]
+                   (.then (.get bucket cas-key)
+                          (fn [^js final]
+                            (.then (if final (.arrayBuffer final) (js/Promise.resolve nil))
+                                   (fn [buf]
+                                     (json #js {:schema "kotobase.r2-live-benchmark.v1"
+                                                :colo (some-> (.-cf request) .-colo)
+                                                :samples samples
+                                                :object_bytes size
+                                                :put (distribution put)
+                                                :head (distribution head)
+                                                :get (distribution gets)
+                                                :conditional_race
+                                                #js {:writers (count rs)
+                                                     :winners winners
+                                                     :final_byte (when buf (aget (js/Uint8Array. buf) 0))
+                                                     :latency (distribution latency)}}
+                                           200)))))))) 
+        (.finally (fn []
+                    ;; runs even when a sample threw -- no key outlives its run
+                    (js/Promise.all
+                     (clj->js (mapv #(.delete bucket %) (conj ks cas-key)))))))))
+
+(defn fetch-handler [^js request ^js env]
+  (cond
+    (not= "1" (.-BENCH_LIVE_ENABLED env))
+    (js/Promise.resolve (json #js {:error "live benchmark disabled"} 503))
+
+    (not= "POST" (.-method request))
+    (js/Promise.resolve (json #js {:error "POST required"} 405))
+
+    :else
+    (.then (.json request)
+           (fn [^js input]
+             (let [samples (js/Number (or (aget input "samples") 40))
+                   size (js/Number (or (aget input "size") 1024))]
+               (if (bounded? samples size)
+                 (run-bench env request samples size)
+                 (json #js {:error "invalid benchmark bounds"} 400)))))))
+
+(def worker #js {:fetch fetch-handler})
