@@ -39,6 +39,15 @@ deployment is a separate workflow.
 
 ## Public command execution remains open
 
+An isolated native execution slice now validates `check --kind cli-contract`
+inside the Kotoba guest. It checks the exact twelve command IDs, command and
+option uniqueness, option types and flag shapes. Mutated version/command-set
+inputs are refused, and unimplemented verbs return
+`:cli/native-execution-unavailable`. The source is
+`src/kotoba/cli_exec.kotoba`; the native ARM fixture executes it through the
+Amu selfhost compiler. This is one internal check mode. The public launcher,
+other `check` modes, and the remaining command execution paths are still open.
+
 `src/kotoba/cli.kotoba` produces validated requests. Parsing a command does
 not execute it, approve a provider operation, admit a package or qualify a
 target. The public `bin/kotoba` still has legacy dispatch and must not be used

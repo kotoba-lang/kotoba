@@ -31,7 +31,8 @@ def main(amu, contract, compiler, out):
     # All .kotoba sources retain their namespaces. No host concatenation or
     # rewriting substitutes for the compiler's project loader/checker.
     entry = ROOT / "test/kotoba/native_cli_request.kotoba"
-    sources = [entry, ROOT / "src/kotoba/cli.kotoba", *[amu / "src/kotoba" / name for name in
+    sources = [entry, ROOT / "src/kotoba/cli.kotoba", ROOT / "src/kotoba/cli_exec.kotoba",
+               *[amu / "src/kotoba" / name for name in
                ("form.kotoba", "compiler/kotoba_reader.kotoba", "compiler/decimal_bits.kotoba")]]
     roots = [ROOT / "src", amu / "src"]
     lock = out / "request.ksl"
@@ -63,7 +64,7 @@ def main(amu, contract, compiler, out):
     data = contract.read_text()
     guest = dict(PATH="/nonexistent", KEXE_ALLOW="37,38", KEXE_STACK_BYTES="8388608")
     positive = run("all12-request", [out / "request.elf", data], guest)
-    assert positive.stdout == b"PASS_NATIVE_ALL12_CLI_REQUEST_FLAGS_ALIASES_REFUSALS\n"
+    assert positive.stdout == b"PASS_NATIVE_ALL12_CLI_REQUEST_AND_CONTRACT_CHECK_EXECUTION\n"
     assert ":values [:kotoba]" in data
     changed = data.replace(":values [:kotoba]", ":values [:nbb]", 1)
     run("contract-negative-control", [out / "request.elf", changed], guest, expected=1)
@@ -72,7 +73,8 @@ def main(amu, contract, compiler, out):
     report = dict(status="PASS_NATIVE_ALL12_CLI_REQUEST", inputs=inputs, compiler=pin(compiler),
                   sources={str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else "amu/" + str(p.relative_to(amu)): pin(p) for p in sources},
                   contract=pin(contract), lock=pin(lock), image=pin(out / "request.elf"), calls=calls,
-                  nativeGuestOwnsAssertions=True, commandExecutionQualified=False, publicEntryReplaced=False,
+                  nativeGuestOwnsAssertions=True, contractCheckExecutionQualified=True,
+                  commandExecutionQualified=False, publicEntryReplaced=False,
                   wholeCLIQualified=False, legacyRuntimeFallback=False, cCompilerOrLoader=False, emulation=False)
     (out / "native-cli-request.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report["status"])
