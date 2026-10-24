@@ -29,6 +29,7 @@ The bundled standard libraries live in this repository:
 | `kotoba.lsp.rpc` | `kotoba.lsp.rpc/src` | `kotoba.lsp-rpc`, `kotoba.lang.lsp-rpc` |
 | `kotoba.lint` | `kotoba.lint/src` | `kotoba.lint`, `kotoba.lang.lint` |
 | `kotoba.lint.kotoba` | `kotoba.lint.kotoba/src` | `kotoba.lint-kotoba`, `kotoba.lang.lint-kotoba` |
+| `gov.nist.sha3` | `gov.nist.sha3/src` | `sha3.core` (FIPS 202 SHA-3 and SHAKE; an external specification, so its ID is the publisher's reverse domain, nist.gov) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
