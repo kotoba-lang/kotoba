@@ -1,0 +1,127 @@
+;; Compile `kotoba/opentype/directory.kotoba` and run the COMPILED artifact.
+;;
+;; The JVM suite drives the guest through the KIR interpreter, which is not
+;; the thing that ships. This runs the `.wasm` the public CLI produces, on
+;; real `WebAssembly`, through amu's own `runtime/browser-host.mjs`, over
+;; this repository's own `noto-lycian.ttf`, and prints what it answered so
+;; `directory_artifact_test.clj` can hold it against the interpreter.
+;;
+;; nbb rather than a `.mjs`: this workspace does not add raw JavaScript
+;; harnesses (AGENTS.md, runtime priority).
+;;
+;; This guest is a STREAM -- `init`, the header, then one directory entry at
+;; a time, each returning the next state -- so the probe hands the guest's
+;; own returned document straight back in. Bytes the host introduces go
+;; through `typedValues.document` in the tagged form the KIR value plane
+;; uses; building one any other way is refused as forged.
+;;
+;; `take` and not `subvec` for the header: a truncated file has fewer
+;; than twelve bytes, and a host that does not have them cannot offer them.
+;; `subvec` past the end throws on the JVM and does not in ClojureScript, so
+;; using it here would make the two halves of this gate disagree about the
+;; HARNESS rather than about the runtimes.
+;;
+;; A whole walk shares ONE instance, because the state has to survive the
+;; calls. That is why only the first few entries are offered: a module's
+;; fuel is a private global baked in at compile time (512 by default) and is
+;; spent over the life of an instance, so a ten-entry directory does not fit
+;; in one. The suite walks the whole file on the interpreter; what is
+;; compared here is the prefix both can do.
+
+(ns opentype.artifact-probe
+  (:require ["node:fs" :as fs]
+            ["node:child_process" :as cp]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+(defn- bytes->doc [bs]
+  #js ["vector" (clj->js (mapv (fn [x] #js ["i64" (js/BigInt x)]) bs))])
+
+(defn- ->doc [x]
+  (cond
+    (int? x) #js ["i64" (js/BigInt x)]
+    (map? x) #js ["map" (clj->js (mapv (fn [[k v]] #js [#js ["keyword" (str k)] (->doc v)])
+                                       (sort-by key x)))]
+    :else #js ["null" nil]))
+
+(def amu-bin (or (first *command-line-args*) "kotoba"))
+(def guest (path/resolve "kotoba/opentype/directory.kotoba"))
+(def host-url
+  (some-> (second *command-line-args*)
+          (as-> root (str "file://" root "/runtime/browser-host.mjs"))))
+
+(def ^:private font
+  (vec (js/Array.from (fs/readFileSync (path/resolve "resources/opentype/fixtures/noto-lycian.ttf")))))
+
+;; [label bytes entries-to-offer]
+(def cases
+  [["the fixture" font 2]
+   ["a version of 0xDEADBEEF" (into [222 173 190 239] (subvec font 4)) 0]
+   ["a collection tag" (into [0x74 0x74 0x63 0x66] (subvec font 4)) 0]
+   ["a table count that does not fit" (vec (concat (subvec font 0 4) [0x7f 0xff] (subvec font 6))) 0]
+   ["a truncated file" (subvec font 0 8) 0]])
+
+(defn- emit [m] (println (pr-str m)))
+
+(defn- walk [m bs entries]
+  (let [e (.. m -instance -exports)
+        D (.-document (.-typedValues m))
+        s0 ((aget e "offer-header")
+            ((aget e "init") (D (->doc {:file-length (count bs)})))
+            (D (bytes->doc (vec (take 12 bs)))))
+        final (loop [s s0 i 0]
+                (let [at (js/Number ((aget e "needs-at") s))
+                      n (js/Number ((aget e "needs-count") s))]
+                  (if (or (neg? at) (>= i entries)) s
+                      (recur ((aget e "offer-entry") s (D (bytes->doc (subvec bs at (+ at n)))))
+                             (inc i)))))]
+    {:phase (str ((aget e "phase") final))
+     :reason (str ((aget e "reason") final))
+     :version (str ((aget e "sfnt-version") final))
+     :tables (str ((aget e "table-count") final))
+     :seen (str ((aget e "entries-seen") final))
+     :needs-at (str ((aget e "needs-at") final))}))
+
+(defn- run []
+  (let [wasm (path/join (or (.-TMPDIR js/process.env) "/tmp") "opentype-directory-gate.wasm")
+        r (cp/spawnSync amu-bin
+                        #js ["-M" "compile" guest "--target" "wasm32-browser"
+                             "--output" wasm]
+                        #js {:encoding "utf8"})]
+    (if-not (zero? (.-status r))
+      ;; A gate that could not compile has not verified anything. Exit 3 --
+      ;; not 0 and not 1 -- so "could not measure" never reads as "measured
+      ;; and clean".
+      (do (emit {:status :compile-failed
+                 :detail (str/trim (str (.-stdout r) (.-stderr r)))})
+          (js/process.exit 3))
+      (-> (js/import host-url)
+          (.then
+           (fn [host]
+             (let [bs (js/Uint8Array. (fs/readFileSync wasm))
+                   instantiate (.-instantiateKotoba host)]
+               (-> (js/Promise.all
+                    (clj->js
+                     (for [[label file entries] cases]
+                       (-> (instantiate bs)
+                           (.then (fn [m] (clj->js [label (pr-str (walk m file entries))])))
+                           (.catch (fn [e]
+                                     (clj->js [label (pr-str {:threw (str (or (.-code e)
+                                                                             (.-message e)))})])))))))
+                   (.then (fn [results]
+                            (-> (instantiate bs)
+                                (.then (fn [m]
+                                         (emit {:status :ok
+                                                :sha256 (.-sha256 m)
+                                                :main (str ((.. m -instance -exports -main)))
+                                                :font-bytes (count font)
+                                                :results (mapv #(vec (js->clj %)) results)}))))))
+                   (.catch (fn [e]
+                             (emit {:status :host-failed
+                                    :detail (str (or (.-code e) "") " " (.-message e))})
+                             (js/process.exit 3)))))))
+          (.catch (fn [e]
+                    (emit {:status :host-import-failed :detail (str e)})
+                    (js/process.exit 3)))))))
+
+(run)

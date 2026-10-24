@@ -1,0 +1,186 @@
+;; The gate that was missing: does the COMPILED artifact decide the way the
+;; interpreter does?
+;;
+;; `directory_kotoba_test.clj` drives the guest through `kotoba.kir`, which
+;; is not what ships. Until this file existed, nothing here had asserted
+;; that `kotoba -M compile` produces something that answers the same way --
+;; the shape this workspace keeps warning about, where a check that never
+;; ran looks exactly like a check that passed.
+;;
+;; This guest is a STREAM, so the comparison is over whole WALKS: `init`,
+;; the twelve-byte header, then a directory entry at a time. The probe hands
+;; the guest's own returned state document straight back in; bytes the host
+;; introduces go through the runtime's `typedValues.document` in the tagged
+;; form the KIR value plane uses, and building one any other way is refused
+;; as forged.
+;;
+;; ## Skipping is not passing
+;;
+;; The gate needs `kotoba`, `nbb` and an amu checkout. Each is measured by
+;; RUNNING it and reading the exit code, never by `which` -- a shim whose
+;; target is gone passes `which` and exits 126, which this migration has
+;; already been bitten by. When a tool is absent the probe exits 3, which is
+;; neither 0 nor 1, and this file reports the absence rather than asserting
+;; nothing.
+
+(ns opentype.directory-artifact-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [opentype.directory-guest-document :refer [->doc]]))
+
+(def ^:private amu-root
+  (or (System/getenv "AMU_ROOT")
+      (str (System/getProperty "user.home")
+           "/github/com-junkawasaki/orgs/kotoba-lang/amu")))
+
+(defn- runs? [& command]
+  (try (zero? (:exit (apply shell/sh command))) (catch Exception _ false)))
+
+(def ^:private tools
+  (delay
+    {:kotoba (let [bin (str amu-root "/bin/kotoba")]
+               (when (runs? bin "--help") bin))
+     :nbb (when (runs? "nbb" "--version") "nbb")
+     :runtime (io/exists? (io/file amu-root "runtime/browser-host.mjs"))}))
+
+(def ^:private probe
+  (delay
+    (let [{:keys [kotoba nbb runtime]} @tools]
+      (if-not (and kotoba nbb runtime)
+        {:status :unavailable
+         :detail (str "kotoba=" (boolean kotoba) " nbb=" (boolean nbb)
+                      " runtime=" (boolean runtime) " AMU_ROOT=" amu-root)}
+        (let [r (shell/sh nbb "test/opentype/artifact_probe.cljk" kotoba amu-root)
+              parsed (try (edn/read-string (str/trim (:out r))) (catch Exception _ nil))]
+          (cond
+            (nil? parsed) {:status :probe-unreadable :detail (str (:out r) (:err r))}
+            (= 3 (:exit r)) (assoc parsed :status (or (:status parsed) :probe-refused))
+            :else parsed))))))
+
+(def ^:private guest-source
+  (delay (slurp (io/file (System/getProperty "user.dir")
+                         "kotoba" "opentype" "directory.kotoba"))))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'opentype.directory @guest-source}
+                                         'opentype.directory :wasm32-kotoba-v1))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args) {:fuel 100000}))
+
+(def ^:private font
+  (delay (with-open [in (io/input-stream
+                         (io/file "resources/opentype/fixtures/noto-lycian.ttf"))]
+           (mapv #(bit-and % 0xff) (seq (.readAllBytes in))))))
+
+;; `take` and not `subvec` for the header: a truncated file has fewer than
+;; twelve bytes. `subvec` past the end throws on the JVM and does not in
+;; ClojureScript, so using it would make the two halves of this gate
+;; disagree about the HARNESS rather than about the runtimes -- which is how
+;; this was found.
+;;
+;; The same walk the probe performs, on the interpreter. Deliberately the
+;; same shape rather than a tidier one: a comparison between two different
+;; walks would not be a comparison of the two runtimes.
+(defn- walk [bs entries]
+  (let [s0 (call 'offer-header
+                 (call 'init (->doc {:file-length (count bs)}))
+                 (->doc (vec (take 12 bs))))
+        final (loop [s s0 i 0]
+                (let [at (call 'needs-at s) n (call 'needs-count s)]
+                  (if (or (neg? at) (>= i entries)) s
+                      (recur (call 'offer-entry s (->doc (subvec bs at (+ at n))))
+                             (inc i)))))]
+    {:phase (str (call 'phase final))
+     :reason (str (call 'reason final))
+     :version (str (call 'sfnt-version final))
+     :tables (str (call 'table-count final))
+     :seen (str (call 'entries-seen final))
+     :needs-at (str (call 'needs-at final))}))
+
+(defn- cases []
+  (let [f @font]
+    {"the fixture" [f 2]
+     "a version of 0xDEADBEEF" [(into [222 173 190 239] (subvec f 4)) 0]
+     "a collection tag" [(into [0x74 0x74 0x63 0x66] (subvec f 4)) 0]
+     "a table count that does not fit"
+     [(vec (concat (subvec f 0 4) [0x7f 0xff] (subvec f 6))) 0]
+     "a truncated file" [(subvec f 0 8) 0]}))
+
+(deftest the-compiled-artifact-answers-the-way-the-interpreter-does
+  (let [p @probe]
+    (if (not= :ok (:status p))
+      ;; Not a pass. The suite says out loud that it could not measure.
+      (is false (str "artifact gate could not run: " (:status p) " -- " (:detail p)))
+      (do
+        (is (= (count @font) (:font-bytes p))
+            "the probe read a different file from this one")
+        (is (= (set (keys (cases))) (set (map first (:results p))))
+            "the probe and this file must ask the same questions")
+        (is (= "0" (:main p))
+            "the artifact's own conformance entry point answered non-zero")
+        (is (re-matches #"[0-9a-f]{64}" (:sha256 p))
+            "and the host measured the module it ran")
+        (testing "every walk agrees with the interpreter, phase and projections"
+          (doseq [[label got-edn] (:results p)]
+            (let [[bs entries] (get (cases) label)]
+              (is (= (walk bs entries) (edn/read-string got-edn)) label))))))))
+
+(deftest the-gate-would-notice-a-difference
+  ;; The comparison is only worth having if a wrong answer fails it.
+  (let [p @probe]
+    (when (= :ok (:status p))
+      (let [[label got-edn] (first (:results p))
+            [bs entries] (get (cases) label)]
+        (is (not= (assoc (edn/read-string got-edn) :phase ":something-else")
+                  (walk bs entries))
+            "a fabricated phase must not match the interpreter")))))
+
+;; --- why `main` does not offer the header --------------------------------------------
+
+;; Compile this guest with `body` appended, and say whether the CLI accepted
+;; it. Returns [ok? said].
+(defn- compiles? [body]
+  (let [bin (:kotoba @tools)
+        src (io/file (System/getProperty "java.io.tmpdir") "opentype-ice-probe.kotoba")
+        out (io/file (System/getProperty "java.io.tmpdir") "opentype-ice-probe.wasm")
+        base (str/replace @guest-source
+                          #"(?s);; --- the artifact's own conformance check.*" "")]
+    (spit src (str base body))
+    (let [r (shell/sh bin "-M" "compile" (str src) "--target" "wasm32-browser"
+                      "--output" (str out))]
+      [(zero? (:exit r)) (str (:out r) (:err r))])))
+
+(deftest offer-header-cannot-be-called-from-inside-the-module
+  ;; `main` checks what a directory reader must get right before it has read
+  ;; anything, and NOT the header refusals, because it cannot: calling
+  ;; `offer-header` from another function in this module is an internal
+  ;; compiler error.
+  ;;
+  ;; Asserted with both halves so it is a measurement and not a story:
+  ;; `offer-entry` in exactly the same position compiles. Without that
+  ;; control the test would also pass if the compiler simply stopped working.
+  ;;
+  ;; When this is fixed the test goes red, which is the point -- it is a
+  ;; ratchet that notices, and the comment in the guest stops being true at
+  ;; the same moment.
+  (if (:kotoba @tools)
+    (let [entry (str "(defn main [] :i64\n"
+                     "  (if (= (phase (offer-entry"
+                     " (init (document-map :file-length (document-i64 4556)))"
+                     " (document-vector (document-i64 0)))) :want-header) 0 1))\n")
+          header (str/replace entry "offer-entry" "offer-header")
+          [entry-ok? _] (compiles? entry)
+          [header-ok? said] (compiles? header)]
+      (is entry-ok?
+          "the control does not compile either, so this test measures nothing")
+      (is (not header-ok?)
+          "`offer-header` is callable from inside the module now -- delete
+           this test and let `main` offer the header")
+      (is (str/includes? said "internal compiler error")
+          (str "refused, but not the way this test is about: " (str/trim said))))
+    (is false (str "compiler-bug control could not run: no kotoba CLI at " amu-root))))

@@ -1,0 +1,306 @@
+;; The SFNT table directory decision, as a Kotoba application
+;; (ADR-2608261100) — ISO/IEC 14496-22 §4.
+;;
+;;   init         (config)        -> state
+;;   offer-header (state, bytes)  -> state   ; the first 12
+;;   offer-entry  (state, bytes)  -> state   ; one 16-byte directory record
+;;
+;; ## A table directory is a list of pointers a caller will dereference
+;;
+;; `opentype.core/parse` returns `:table-offsets`, and its own comment says
+;; why: *"so a caller can reach `opentype.cmap` without re-parsing the
+;; directory"*. Every one of those offsets came out of the file, and the
+;; caller will index with them.
+;;
+;;   the guest owns   whether this is an SFNT at all, whether the directory
+;;                    fits, and whether each table's range lies inside the
+;;                    file
+;;   the host owns    the bytes, which are a font and megabytes of it
+;;
+;; ## What `parse` does not check
+;;
+;; Measured on this repo at 8604a2c, against `noto-lycian.ttf`:
+;;
+;;   sfnt version overwritten with 0xDEADBEEF
+;;     -> {:sfnt-version 3735928559 :magic-ok? true :num-tables 10}
+;;   the first table's offset overwritten with 0xFFFFFFFF
+;;     -> parses, and that offset is handed out in :table-offsets
+;;   numTables set to 0x7FFF
+;;     -> IndexOutOfBoundsException
+;;
+;; The first says a file that is not a font is a valid one. The second hands
+;; a caller a pointer past the end of the file and calls it a table. The
+;; third is a raw exception where a refusal belongs — and all three come
+;; from the same place: the directory is read, not validated.
+;;
+;; ## Entries are validated one at a time, and never collected
+;;
+;; A font has ten to thirty tables and a `:document` vector holds 32, so
+;; collecting them would put a ceiling on a format that has none — and one
+;; that silently truncated would drop tables a caller then could not find.
+;; So the host feeds one 16-byte record at a time and the guest keeps a
+;; count, the previous tag, and a few booleans. Nothing accumulates.
+;;
+;; ## Tags ascend, and that is a check rather than a convention
+;;
+;; §4.2: directory entries are sorted by tag. Out-of-order entries mean
+;; either a malformed file or a second directory spliced onto the first, and
+;; a reader that ignores the order cannot tell those from a font.
+;;
+;; `.cljc` remains the oracle for the fields it extracts and is not required
+;; from here (require-graph). It did not grow a second copy of these
+;; refusals (ADR-2608261100).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/opentype/directory.kotoba \
+;;     --target wasm32-browser --output directory.wasm
+
+(ns opentype.directory
+  (:export [main init offer-header offer-entry
+            phase reason
+            needs-at needs-count
+            sfnt-version table-count entries-seen
+            saw-head? saw-maxp? saw-name? saw-cmap?]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-i64 [v :document i :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (at v i)) -1))
+
+;; --- big-endian reads (§4: SFNT is big-endian throughout) ------------------
+
+(defn- u16 [bytes :document o :i64] :i64
+  (+ (* (at-i64 bytes o) 256) (at-i64 bytes (+ o 1))))
+
+(defn- u32 [bytes :document o :i64] :i64
+  (+ (* (at-i64 bytes o) 16777216)
+     (+ (* (at-i64 bytes (+ o 1)) 65536)
+        (+ (* (at-i64 bytes (+ o 2)) 256) (at-i64 bytes (+ o 3))))))
+
+;; --- the format's constants (§4.1) -----------------------------------------
+
+(defn- header-bytes [] :i64 12)
+(defn- entry-bytes [] :i64 16)
+
+;; 0x00010000 — TrueType outlines.
+(defn- version-1-0 [] :i64 65536)
+;; 'OTTO' — CFF outlines.
+(defn- version-otto [] :i64 1330926671)
+;; 'true' — an Apple variant that is otherwise an SFNT.
+(defn- version-true [] :i64 1953658213)
+;; 'ttcf' — a COLLECTION, whose layout after the tag is not a table
+;; directory at all. Reading one as a font is not a smaller answer.
+(defn- version-ttcf [] :i64 1953784678)
+
+(defn- known-version? [v :i64] :bool
+  (if (= v (version-1-0)) true
+      (if (= v (version-otto)) true
+          (if (= v (version-true)) true false))))
+
+;; --- state ------------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc state :phase (document-keyword :refused))
+    :reason (document-keyword why))
+   :count (document-i64 0)))
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-header)
+                :reason (document-keyword :none)
+                :length (document-i64 (di config :file-length))
+                :at (document-i64 0)
+                :count (document-i64 (header-bytes))
+                :version (document-i64 -1)
+                :tables (document-i64 -1)
+                :seen (document-i64 0)
+                :prev-tag (document-i64 -1)
+                :head (document-bool false)
+                :maxp (document-bool false)
+                :name (document-bool false)
+                :cmap (document-bool false)))
+
+;; --- the header (§4.1) ------------------------------------------------------
+
+(defn offer-header [state :document bytes :document] :document
+  (if (= (dk state :phase) :want-header)
+    (let [len (di state :length)
+          v (u32 bytes 0)
+          n (u16 bytes 4)]
+      (cond
+        (< len (header-bytes)) (refuse state :opentype/truncated)
+
+        ;; A collection is a different container, not a malformed font, so
+        ;; it gets its own reason: a caller that wants one should open it as
+        ;; one rather than be told its font is broken.
+        (= v (version-ttcf)) (refuse state :opentype/is-a-collection)
+
+        (not (known-version? v)) (refuse state :opentype/bad-sfnt-version)
+
+        ;; §4.2: numTables entries of 16 bytes each follow the 12-byte
+        ;; header. A count that does not fit is a claim about a file this is
+        ;; not -- and checking it here is the difference between a refusal
+        ;; and an IndexOutOfBoundsException.
+        (> (+ (header-bytes) (* n (entry-bytes))) len)
+        (refuse state :opentype/table-count-out-of-range)
+
+        (= n 0) (refuse state :opentype/no-tables)
+
+        :else
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc
+            (document-assoc state :phase (document-keyword :want-entry))
+            :version (document-i64 v))
+           :tables (document-i64 n))
+          :at (document-i64 (header-bytes)))
+         :count (document-i64 (entry-bytes)))))
+    state))
+
+;; --- one directory entry (§4.2) ---------------------------------------------
+;; tag(4) checkSum(4) offset(4) length(4).
+
+(defn- tag-is? [bytes :document a :i64 b :i64 c :i64 d :i64] :bool
+  (if (= (at-i64 bytes 0) a)
+    (if (= (at-i64 bytes 1) b)
+      (if (= (at-i64 bytes 2) c)
+        (if (= (at-i64 bytes 3) d) true false)
+        false)
+      false)
+    false))
+
+(defn offer-entry [state :document bytes :document] :document
+  (if (= (dk state :phase) :want-entry)
+    (let [tag (u32 bytes 0)
+          off (u32 bytes 8)
+          len (u32 bytes 12)
+          file-len (di state :length)
+          seen (+ (di state :seen) 1)
+          dir-end (+ (header-bytes) (* (di state :tables) (entry-bytes)))]
+      (cond
+        ;; §4.2: entries ascend by tag. Out of order means a malformed file
+        ;; or a second directory spliced onto the first, and a reader that
+        ;; ignores the order cannot tell either from a font.
+        (<= tag (di state :prev-tag)) (refuse state :opentype/tags-out-of-order)
+
+        ;; The offset a caller will dereference. `:table-offsets` exists to
+        ;; be dereferenced, so an offset past the end is not a detail.
+        (> (+ off len) file-len) (refuse state :opentype/table-out-of-range)
+
+        ;; A table starting inside the directory overlaps the pointers that
+        ;; name it.
+        (< off dir-end) (refuse state :opentype/table-overlaps-directory)
+
+        :else
+        (let [kept (document-assoc
+                    (document-assoc
+                     (document-assoc
+                      (document-assoc
+                       (document-assoc state :seen (document-i64 seen))
+                       :prev-tag (document-i64 tag))
+                       ;; 'head' 'maxp' 'name' 'cmap' -- the tables
+                       ;; `opentype.core/parse` silently returns nil for
+                       ;; when they are absent.
+                      :head (document-bool
+                             (if (db state :head) true
+                                 (tag-is? bytes 104 101 97 100))))
+                     :maxp (document-bool
+                            (if (db state :maxp) true
+                                (tag-is? bytes 109 97 120 112))))
+                    :name (document-bool
+                           (if (db state :name) true
+                               (tag-is? bytes 110 97 109 101))))
+              kept2 (document-assoc kept :cmap
+                                    (document-bool
+                                     (if (db state :cmap) true
+                                         (tag-is? bytes 99 109 97 112))))]
+          (if (>= seen (di state :tables))
+            (document-assoc
+             (document-assoc kept2 :phase (document-keyword :done))
+             :count (document-i64 0))
+            (document-assoc
+             (document-assoc kept2 :at
+                             (document-i64 (+ (header-bytes)
+                                              (* seen (entry-bytes)))))
+             :count (document-i64 (entry-bytes)))))))
+    state))
+
+;; --- projections ------------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+(defn needs-at [state :document] :i64
+  (if (= (dk state :phase) :done) -1
+      (if (= (dk state :phase) :refused) -1 (di state :at))))
+
+(defn needs-count [state :document] :i64 (di state :count))
+
+(defn sfnt-version [state :document] :i64 (di state :version))
+
+(defn table-count [state :document] :i64 (di state :tables))
+
+(defn entries-seen [state :document] :i64 (di state :seen))
+
+;; The tables `opentype.core/parse` returns nil for when they are missing --
+;; which is a different fact from a font that has them and a caller cannot
+;; tell from the nil alone.
+(defn saw-head? [state :document] :bool (db state :head))
+(defn saw-maxp? [state :document] :bool (db state :maxp))
+(defn saw-name? [state :document] :bool (db state :name))
+(defn saw-cmap? [state :document] :bool (db state :cmap))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; checks the two things a directory reader has to get right before it has
+;; read anything: a fresh state wants the twelve-byte header, and a
+;; directory entry offered BEFORE that header is ignored rather than folded
+;; in.
+;;
+;; ## Why it does not offer the header
+;;
+;; It cannot, today. Calling `offer-header` from another function in this
+;; module is an `internal compiler error` (exit 70, no detail), measured
+;; against amu 2cb7d3f on 2026-08-31. `offer-entry` in exactly the same
+;; position compiles, and so does `init`, and the size of the byte vector
+;; does not matter -- one element fails the same way twelve do.
+;; `directory_artifact_test.clj` holds both halves of that control so the
+;; claim is executed rather than written down, and so this comment stops
+;; being true the moment the bug is fixed.
+;;
+;; The suite offers the header on the interpreter and through the compiled
+;; artifact from the HOST side, where the call is a normal export
+;; invocation and works. What is missing is only the artifact's ability to
+;; check that part of itself.
+
+(defn main [] :i64
+  (let [s (init (document-map :file-length (document-i64 4556)))]
+    (cond
+      (if (= (phase s) :want-header) false true) 1
+      (if (= (needs-count s) 12) false true) 2
+      ;; §4.1 order: nothing is a directory entry until the header says how
+      ;; many there are.
+      (if (= (phase (offer-entry s (document-vector (document-i64 0)))) :want-header)
+        false true) 3
+      :else 0)))
