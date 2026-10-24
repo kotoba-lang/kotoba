@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.phone` | `kotoba.phone/src` | `kotoba.phone`, `kotoba.phone.export`, `kotoba.phone.lifecycle`, `kotoba.phone.numbering` (Kotoba project library) |
 | `kotoba.wire` | `kotoba.wire/src` | `kotoba.wire.edn`, `kotoba.wire.framing`, `kotoba.wire.tcp` (Kotoba project library) |
 | `kotoba.techIpfsSpecsIpns` | `kotoba.techIpfsSpecsIpns/src` | `ipns.core`, `ipns.head`, `ipns.pubsub`, `ipns.record` (Kotoba project library) |
 | `kotoba.ioLibp2pSpecsTransport` | `kotoba.ioLibp2pSpecsTransport/src` | `libp2p.multistream`, `libp2p.provider.node`, `libp2p.provider.node-muxed`, `libp2p.yamux` (Kotoba project library) |

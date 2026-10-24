@@ -1,0 +1,116 @@
+(ns kotoba.phone.numbering-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.phone.numbering :as numbering]))
+
+(def ^:private blk
+  (numbering/block "JP-MOBILE-1" "+819012340000" "+819012340099" :mobile
+                   :operator "cloud-itonami"))
+
+(def ^:private premium
+  (numbering/block "JP-PREMIUM-1" "+819901230000" "+819901230009" :premium-rate))
+
+(def ^:private day (* 24 60 60 1000))
+(def ^:private now 1800000000000)
+
+(deftest block-test
+  (testing "a well-formed block carries its country code"
+    (is (= "81" (:phone/country-code blk)))
+    (is (= :mobile (:phone/kind blk))))
+  (testing "bounds that disagree are not a range"
+    (is (nil? (numbering/block "B" "+819012340000" "+81901234000" :mobile)))   ; length
+    (is (nil? (numbering/block "B" "+819012340099" "+819012340000" :mobile)))  ; inverted
+    (is (nil? (numbering/block "B" "+819012340000" "+819012340099" :nonsense)))))
+
+(deftest in-block-test
+  (is (numbering/in-block? blk "+819012340000"))
+  (is (numbering/in-block? blk "+819012340099"))
+  (is (numbering/in-block? blk "+81 90 1234 0050"))
+  (is (not (numbering/in-block? blk "+819012340100")))
+  (is (not (numbering/in-block? blk "+8190123400")))
+  (is (= blk (numbering/block-of [blk premium] "+819012340042"))))
+
+(deftest quarantine-test
+  (testing "an unknown release date leaves the FULL window -- never zero"
+    (let [r (numbering/record "+819012340001" :quarantined)]
+      (is (= (numbering/quarantine-ms) (numbering/quarantine-remaining-ms r now)))
+      (is (not (numbering/quarantine-elapsed? r now)))))
+  (testing "the window counts from the release"
+    (let [r (numbering/record "+819012340002" :quarantined
+                              :released-at-ms (- now (* 89 day)))]
+      (is (not (numbering/quarantine-elapsed? r now)))
+      (is (numbering/quarantine-elapsed? r (+ now (* 2 day)))))
+    (let [r (numbering/record "+819012340003" :quarantined
+                              :released-at-ms (- now (* 91 day)))]
+      (is (numbering/quarantine-elapsed? r now))))
+  (testing "an operator window overrides the default"
+    (let [r (numbering/record "+819012340004" :quarantined
+                              :released-at-ms (- now (* 31 day)))]
+      (is (not (numbering/quarantine-elapsed? r now)))
+      (is (numbering/quarantine-elapsed? r now 30)))))
+
+(deftest allocation-issues-test
+  (let [base {:blocks [blk premium] :records [] :subject "did:key:z6Sub" :now-ms now}]
+    (testing "a number nobody has a record for is in the pool"
+      (is (empty? (numbering/allocation-issues (assoc base :msisdn "+819012340010")))))
+    (testing "malformed is reported as malformed, not as unavailable"
+      (is (= [:number/malformed]
+             (mapv :phone/issue (numbering/allocation-issues (assoc base :msisdn "nope"))))))
+    (testing "outside every block"
+      (is (= [:number/outside-block]
+             (mapv :phone/issue (numbering/allocation-issues (assoc base :msisdn "+819099990000"))))))
+    (testing "premium-rate and short codes are not allocated by this path"
+      (is (= [:number/kind-not-allocatable]
+             (mapv :phone/issue (numbering/allocation-issues (assoc base :msisdn "+819901230005"))))))
+    (testing "a number must be assigned to somebody"
+      (is (= [:number/subject-missing]
+             (mapv :phone/issue (numbering/allocation-issues
+                                 (assoc base :msisdn "+819012340011" :subject nil))))))
+    (testing "a live number is unavailable, and the refusal names its state"
+      (let [issues (numbering/allocation-issues
+                    (assoc base :msisdn "+819012340012"
+                           :records [(numbering/record "+819012340012" :active :subject "other")]))]
+        (is (= [:number/not-available] (mapv :phone/issue issues)))
+        (is (= :active (:phone/state (first issues))))))
+    (testing "aging is reported as aging, with how much is left"
+      (let [issues (numbering/allocation-issues
+                    (assoc base :msisdn "+819012340013"
+                           :records [(numbering/record "+819012340013" :quarantined
+                                                       :released-at-ms (- now (* 80 day)))]))]
+        (is (= [:number/quarantine-incomplete] (mapv :phone/issue issues)))
+        (is (= (* 10 day) (:phone/remaining-ms (first issues))))))
+    (testing "aged out but not yet recycled is still refused -- and names the fix"
+      (is (= [:number/awaiting-recycle]
+             (mapv :phone/issue
+                   (numbering/allocation-issues
+                    (assoc base :msisdn "+819012340014"
+                           :records [(numbering/record "+819012340014" :quarantined
+                                                       :released-at-ms (- now (* 200 day)))]))))))))
+
+(deftest plan-allocation-test
+  (let [ok (numbering/plan-allocation {:blocks [blk] :records [] :subject "did:key:z6Sub"
+                                       :msisdn "+819012340020" :now-ms now})]
+    (testing "allocation is two recorded decisions, not one"
+      (is (:phone/ok? ok))
+      (is (= [:reserve :assign] (mapv first (:phone/plan ok))))
+      (is (= "did:key:z6Sub" (:phone/subject (second (second (:phone/plan ok))))))))
+  (let [refused (numbering/plan-allocation {:blocks [blk] :records [] :subject nil
+                                            :msisdn "+819012340020" :now-ms now})]
+    (is (false? (:phone/ok? refused)))
+    (is (seq (:phone/issues refused)))))
+
+(deftest available-test
+  (let [records [(numbering/record "+819012340000" :active :subject "s")
+                 (numbering/record "+819012340001" :quarantined
+                                   :released-at-ms (- now (* 200 day)))]
+        out (numbering/available {:blocks [blk premium] :records records} 5)]
+    (testing "skips live numbers, aged-out-but-unrecycled numbers, and premium blocks"
+      (is (= ["+819012340002" "+819012340003" "+819012340004"
+              "+819012340005" "+819012340006"] out)))
+    (testing "the limit is honoured and capped"
+      (is (= 3 (count (numbering/available {:blocks [blk] :records records} 3))))
+      (is (>= 1000 (count (numbering/available {:blocks [blk] :records []} 99999)))))
+    (testing "enumeration carries across a digit boundary"
+      (let [b (numbering/block "B" "+819012340008" "+819012340012" :mobile)]
+        (is (= ["+819012340008" "+819012340009" "+819012340010"
+                "+819012340011" "+819012340012"]
+               (numbering/available {:blocks [b] :records []} 10)))))))
