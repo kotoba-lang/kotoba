@@ -99,6 +99,31 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.tetsuzuki` | `kotoba.tetsuzuki/src` | `tetsuzuki.catalog`, `tetsuzuki.coverage`, `tetsuzuki.deadline`, `tetsuzuki.ooyake` (Kotoba project library) |
+| `kotoba.sekisho` | `kotoba.sekisho/src` | `sekisho.account`, `sekisho.assurance`, `sekisho.browser`, `sekisho.didkey` (Kotoba project library) |
+| `kotoba.secretResolve` | `kotoba.secretResolve/src` | `secret-resolve.core`, `secret-resolve.exec`, `secret-resolve.resolver`, `secret-resolve.sources` (Kotoba project library) |
+| `kotoba.sceneGraph` | `kotoba.sceneGraph/src` | `scene-graph` (Kotoba project library) |
+| `kotoba.scene` | `kotoba.scene/src` | `scene` (Kotoba project library) |
+| `kotoba.rtxNative` | `kotoba.rtxNative/src` | `kotoba.rtx-native` (Kotoba project library) |
+| `kotoba.retail` | `kotoba.retail/src` | `kotoba.retail`, `kotoba.retail.export`, `kotoba.retail.ui` (Kotoba project library) |
+| `kotoba.reservation` | `kotoba.reservation/src` | `kotoba.reservation`, `kotoba.reservation.export`, `kotoba.reservation.ui` (Kotoba project library) |
+| `kotoba.replicator` | `kotoba.replicator/src` | `kotoba.replicator` (Kotoba project library) |
+| `kotoba.remocon` | `kotoba.remocon/src` | `remocon.match`, `remocon.nec`, `remocon.pronto`, `remocon.raw` (Kotoba project library) |
+| `kotoba.reji` | `kotoba.reji/src` | `kotoba.reji.core`, `kotoba.reji.currency` (Kotoba project library) |
+| `kotoba.rdfCanon` | `kotoba.rdfCanon/src` | `rdf-canon.core` (Kotoba project library) |
+| `kotoba.rcs` | `kotoba.rcs/src` | `kotoba.rcs`, `kotoba.rcs.export`, `kotoba.rcs.ui` (Kotoba project library) |
+| `kotoba.raytrace` | `kotoba.raytrace/src` | `kotoba.raytrace`, `kotoba.raytrace.bvh`, `kotoba.raytrace.config`, `kotoba.raytrace.denoise` (Kotoba project library) |
+| `kotoba.quickjs` | `kotoba.quickjs/src` | `quickjs.binary` (Kotoba project library) |
+| `kotoba.quarantine` | `kotoba.quarantine/src` | `quarantine.core`, `quarantine.host` (Kotoba project library) |
+| `kotoba.psa` | `kotoba.psa/src` | `kotoba.psa` (Kotoba project library) |
+| `kotoba.providerPostgres` | `kotoba.providerPostgres/src` | `provider.postgres.pool` (Kotoba project library) |
+| `kotoba.providerIncidence` | `kotoba.providerIncidence/src` | `provider.incidence` (Kotoba project library) |
+| `kotoba.presentationml` | `kotoba.presentationml/src` | `presentationml.core`, `presentationml.parse` (Kotoba project library) |
+| `kotoba.power` | `kotoba.power/src` | `power`, `power.em`, `power.estimation`, `power.ir-drop` (Kotoba project library) |
+| `kotoba.postfx` | `kotoba.postfx/src` | `postfx` (Kotoba project library) |
+| `kotoba.policy` | `kotoba.policy/src` | `policy.execute`, `policy.model`, `policy.ports`, `policy.validate` (Kotoba project library) |
+| `kotoba.wsValuefloVocabulary` | `kotoba.wsValuefloVocabulary/src` | `valueflows.commitment`, `valueflows.conform`, `valueflows.data`, `valueflows.datom` (Kotoba project library) |
+| `kotoba.pkg` | `kotoba.pkg/src` | `kotoba.pkg`, `kotoba.pkg.bonding`, `kotoba.pkg.package`, `kotoba.pkg.registry` (Kotoba project library) |
 | `kotoba.persona` | `kotoba.persona/src` | `persona.core`, `persona.relay` (Kotoba project library) |
 | `kotoba.wordId` | `kotoba.wordId/src` | `word-id.core`, `word-id.english`, `word-id.vocabulary` (Kotoba project library) |
 | `kotoba.pedigree` | `kotoba.pedigree/src` | `kotoba.pedigree` (Kotoba project library) |

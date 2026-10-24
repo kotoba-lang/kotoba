@@ -1,0 +1,193 @@
+(ns kotoba.raytrace.denoise-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [kotoba.raytrace.denoise :as dn]))
+
+(def ^:private W 64)
+(def ^:private H 64)
+
+(defn- scene
+  "Two materials meeting at x = 32, with a vertical shading gradient and a
+  depth ramp. The albedo and normal buffers are discontinuous at the seam and
+  the colour is too — which is exactly the place a blur destroys and an
+  edge-aware filter must not."
+  []
+  (let [px (for [y (range H) x (range W)]
+             (let [left? (< x 32)
+                   base (if left? 0.75 0.25)
+                   shade (+ 0.6 (* 0.4 (/ (double y) H)))]
+               {:c [(* base shade) (* base shade 0.9) (* base shade 0.8)]
+                :a (if left? [0.75 0.7 0.65] [0.25 0.2 0.18])
+                :n (if left? [0.0 1.0 0.0] [1.0 0.0 0.0])
+                :d [(+ 1.0 (* 0.02 y))]}))]
+    {:truth (dn/image W H (mapv :c px))
+     :albedo (dn/image W H (mapv :a px))
+     :normal (dn/image W H (mapv :n px))
+     :depth (dn/image W H (mapv :d px))}))
+
+(defn- noisy
+  "Deterministic uniform noise — the test has to give the same answer on both
+  hosts and in a year, so `rand` is not usable."
+  [img seed sigma]
+  (let [state (atom seed)
+        next! (fn []
+                (let [x (swap! state
+                               (fn [v]
+                                 (let [v (bit-xor v (bit-shift-left v 13))
+                                       v (bit-xor v (unsigned-bit-shift-right v 17))]
+                                   #?(:clj (unchecked-int (bit-xor v (bit-shift-left v 5)))
+                                      :cljs (bit-or 0 (bit-xor v (bit-shift-left v 5)))))))
+                      u #?(:clj (bit-and (long x) 0xffffffff)
+                           :cljs (unsigned-bit-shift-right x 0))]
+                  (- (* 2.0 (/ u 4294967296.0)) 1.0)))]
+    (assoc img :image/pixels
+           (mapv (fn [p] (mapv (fn [v] (max 0.0 (min 1.0 (+ v (* sigma (next!)))))) p))
+                 (:image/pixels img)))))
+
+(defn- region-rmse [a b pred]
+  (let [pa (:image/pixels a) pb (:image/pixels b)
+        idx (filter pred (range (count pa)))]
+    (#?(:clj Math/sqrt :cljs js/Math.sqrt)
+     (/ (reduce + (map (fn [i] (reduce + (map (fn [p q] (* (- p q) (- p q)))
+                                              (nth pa i) (nth pb i))))
+                       idx))
+        (* 3.0 (count idx))))))
+
+(deftest it-removes-noise
+  (let [{:keys [truth albedo normal depth]} (scene)
+        input (noisy truth 12345 0.18)
+        [status out] (dn/denoise {:colour input :albedo albedo :normal normal :depth depth}
+                                 {:passes 4})]
+    (is (= :ok status))
+    (is (< (dn/rmse out truth) (* 0.25 (dn/rmse input truth)))
+        (str "RMSE went " (dn/rmse input truth) " -> " (dn/rmse out truth)))
+    (is (> (dn/psnr out truth) (+ 15.0 (dn/psnr input truth)))
+        (str "PSNR went " (dn/psnr input truth) " -> " (dn/psnr out truth)))))
+
+(deftest it-beats-a-blur-and-beats-it-hardest-at-the-edges
+  ;; The measurement that separates an edge-aware filter from a well-tuned
+  ;; blur. Both reduce noise in flat regions; only one of them still knows
+  ;; where the silhouette was. Comparing the two ADVANTAGES rather than the
+  ;; two errors is the point — a filter that simply blurs less would beat the
+  ;; Gaussian everywhere by the same factor and fail this.
+  (let [{:keys [truth albedo normal depth]} (scene)
+        input (noisy truth 12345 0.18)
+        [_ out] (dn/denoise {:colour input :albedo albedo :normal normal :depth depth} {:passes 4})
+        blur (dn/gaussian input 4)
+        edge? (fn [i] (let [x (mod i W)] (< 29 x 35)))
+        flat-gain (/ (region-rmse blur truth (complement edge?))
+                     (region-rmse out truth (complement edge?)))
+        edge-gain (/ (region-rmse blur truth edge?)
+                     (region-rmse out truth edge?))]
+    (is (< (dn/rmse out truth) (dn/rmse blur truth)))
+    (is (> edge-gain (* 2.0 flat-gain))
+        (str "advantage over the Gaussian was " edge-gain "x at the seam and only "
+             flat-gain "x in the flat regions"))))
+
+(deftest it-does-not-destroy-an-image-that-was-already-clean
+  ;; A filter can win every noise benchmark by smoothing everything, so the
+  ;; other direction has to be checked: run it on the ground truth and the
+  ;; result must still be the ground truth.
+  (let [{:keys [truth albedo normal depth]} (scene)
+        [_ out] (dn/denoise {:colour truth :albedo albedo :normal normal :depth depth} {:passes 4})]
+    (is (< (dn/rmse out truth) 0.01)
+        (str "denoising a clean image moved it by " (dn/rmse out truth)))
+    (testing "and the Gaussian does destroy it, which is why this test is here"
+      (is (> (dn/rmse (dn/gaussian truth 4) truth) (* 5.0 (dn/rmse out truth)))))))
+
+(deftest the-feature-buffers-are-what-does-the-work
+  ;; Same colour, same kernel, same passes — only the edge stops removed.
+  (let [{:keys [truth albedo normal depth]} (scene)
+        input (noisy truth 12345 0.18)
+        [_ with] (dn/denoise {:colour input :albedo albedo :normal normal :depth depth} {:passes 4})
+        [_ without] (dn/denoise {:colour input} {:passes 4 :colour-only? true})
+        edge? (fn [i] (let [x (mod i W)] (< 29 x 35)))]
+    (is (< (region-rmse with truth edge?) (region-rmse without truth edge?))
+        "colour alone cannot tell a silhouette from a bright sample")))
+
+(deftest it-is-a-pure-function
+  (let [{:keys [truth albedo normal depth]} (scene)
+        input (noisy truth 999 0.2)
+        buffers {:colour input :albedo albedo :normal normal :depth depth}
+        [_ a] (dn/denoise buffers {:passes 3})
+        [_ b] (dn/denoise buffers {:passes 3})]
+    (is (= (:image/pixels a) (:image/pixels b)))))
+
+(deftest it-refuses-buffers-it-cannot-trust
+  (let [{:keys [truth albedo normal depth]} (scene)]
+    (testing "zero passes is a denoiser that reports success and does nothing"
+      (let [[status msg] (dn/denoise {:colour truth :albedo albedo} {:passes 0})]
+        (is (= :error status))
+        (is (string/includes? msg "does nothing"))))
+
+    (testing "a feature buffer of the wrong size stops edges in the wrong places"
+      ;; It would not throw. It would produce a plausible image with the edges
+      ;; preserved somewhere else, which reads as a sigma that needs tuning.
+      (let [half (dn/image 32 H (vec (take (* 32 H) (:image/pixels albedo))))
+            [status msg] (dn/denoise {:colour truth :albedo half} {:passes 2})]
+        (is (= :error status))
+        (is (string/includes? msg "wrong places"))))
+
+    (testing "no feature buffers at all has to be asked for explicitly"
+      (let [[status msg] (dn/denoise {:colour truth} {:passes 2})]
+        (is (= :error status))
+        (is (string/includes? msg "silhouette")))
+      (is (= :ok (first (dn/denoise {:colour truth} {:passes 2 :colour-only? true})))))))
+
+(deftest each-feature-buffer-has-to-earn-its-place
+  ;; The scene above is discriminated by albedo AND depth AND normal at the
+  ;; same seam, so removing any one of them changes nothing — measured, cutting
+  ;; the normal term out of the weight left every assertion above green. A
+  ;; suite that cannot tell which buffer is doing the work is not testing the
+  ;; buffers.
+  ;;
+  ;; This is a crease in a uniformly white surface: one albedo, one depth, two
+  ;; normals. Only the normal buffer can stop this edge.
+  (let [px (for [y (range H) x (range W)]
+             (let [facing-up? (< x 32)]
+               {:c (if facing-up? [0.80 0.80 0.80] [0.35 0.35 0.35])
+                :a [0.8 0.8 0.8]
+                :n (if facing-up? [0.0 1.0 0.0] [0.7071 0.7071 0.0])
+                :d [1.0]}))
+        truth (dn/image W H (mapv :c px))
+        albedo (dn/image W H (mapv :a px))
+        normal (dn/image W H (mapv :n px))
+        depth (dn/image W H (mapv :d px))
+        input (noisy truth 4242 0.15)
+        edge? (fn [i] (let [x (mod i W)] (< 29 x 35)))
+        with-normal (second (dn/denoise {:colour input :albedo albedo :normal normal :depth depth}
+                                        {:passes 4}))
+        without-normal (second (dn/denoise {:colour input :albedo albedo :depth depth}
+                                           {:passes 4}))]
+    (is (< (region-rmse with-normal truth edge?)
+           (* 0.7 (region-rmse without-normal truth edge?)))
+        (str "at a crease with uniform albedo and depth, the normal buffer took the"
+             " edge error from " (region-rmse without-normal truth edge?) " to "
+             (region-rmse with-normal truth edge?)))))
+
+(deftest and-so-does-albedo
+  ;; Two paints on one flat wall: one normal, one depth, two albedos. The
+  ;; colour buffer is discontinuous here too, but sigma-colour is deliberately
+  ;; loose (colour is the noisy channel — a tight threshold on it would stop
+  ;; edges at bright samples), so it is the albedo term that holds this seam.
+  (let [px (for [y (range H) x (range W)]
+             (let [left? (< x 32)]
+               {:c (if left? [0.62 0.60 0.58] [0.30 0.29 0.28])
+                :a (if left? [0.85 0.82 0.80] [0.40 0.39 0.38])
+                :n [0.0 0.0 1.0]
+                :d [1.0]}))
+        truth (dn/image W H (mapv :c px))
+        albedo (dn/image W H (mapv :a px))
+        normal (dn/image W H (mapv :n px))
+        depth (dn/image W H (mapv :d px))
+        input (noisy truth 777 0.15)
+        edge? (fn [i] (let [x (mod i W)] (< 29 x 35)))
+        with-albedo (second (dn/denoise {:colour input :albedo albedo :normal normal :depth depth}
+                                        {:passes 4}))
+        without-albedo (second (dn/denoise {:colour input :normal normal :depth depth}
+                                           {:passes 4}))]
+    (is (< (region-rmse with-albedo truth edge?)
+           (* 0.8 (region-rmse without-albedo truth edge?)))
+        (str "the albedo buffer took the edge error from "
+             (region-rmse without-albedo truth edge?) " to "
+             (region-rmse with-albedo truth edge?)))))

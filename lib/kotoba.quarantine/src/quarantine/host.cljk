@@ -1,0 +1,250 @@
+(ns quarantine.host
+  "Reversible removal, the IO half. nbb.
+
+  Moves are `rename` only. A cross-device move would mean copy-then-unlink,
+  which is a delete with extra steps and a window in which neither copy is
+  authoritative — so a cross-device candidate is refused with a legible reason
+  instead of being silently downgraded.
+
+  Nothing here decides whether destruction is permitted; `quarantine.core/purge-verdict`
+  does, and `purge!` refuses on anything but `:allowed`."
+  (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [quarantine.core :as q]))
+
+;; ---------------------------------------------------------------------------
+;; layout
+;; ---------------------------------------------------------------------------
+
+(defn vault-dir [home] (path/join home "vault"))
+(defn run-dir [home rid] (path/join (vault-dir home) rid))
+(defn items-dir [home rid] (path/join (run-dir home rid) "items"))
+(defn manifest-path [home rid] (path/join (run-dir home rid) "manifest.edn"))
+(defn ledger-path [home] (path/join home "ledger.edn"))
+
+(defn ensure-dir! [d] (fs/mkdirSync d #js {:recursive true}))
+
+(defn- lstat [p] (try (fs/lstatSync p) (catch :default _ nil)))
+(defn exists? [p] (some? (lstat p)))
+
+(defn append-ledger!
+  "One EDN map per line, opened with 'a' and never read — so it cannot rewrite
+  history even by accident."
+  [home entry]
+  (ensure-dir! home)
+  (fs/appendFileSync (ledger-path home) (str (pr-str entry) "\n") "utf8")
+  entry)
+
+(defn read-manifest [home rid]
+  (let [p (manifest-path home rid)]
+    (when (exists? p)
+      (try (edn/read-string (fs/readFileSync p "utf8")) (catch :default _ nil)))))
+
+(defn- write-manifest! [home rid m]
+  (ensure-dir! (run-dir home rid))
+  (fs/writeFileSync (manifest-path home rid) (pr-str m) "utf8")
+  m)
+
+(defn- same-device? [a b]
+  (let [sa (lstat a) sb (lstat b)]
+    (boolean (and sa sb (= (.-dev sa) (.-dev sb))))))
+
+;; ---------------------------------------------------------------------------
+;; quarantine
+;; ---------------------------------------------------------------------------
+
+(defn quarantine!
+  "Move `entries` into a fresh vault run under `home`.
+
+  entries: [{:path :bytes :rule/id :rules} ...]
+
+  A failing entry is recorded and skipped; the run continues. A partial move
+  that is fully described is more useful than an all-or-nothing rollback whose
+  own rollback can also fail."
+  [home entries {:keys [now-ms policy-id plan-id]}]
+  (let [rid (q/run-id now-ms)
+        idir (items-dir home rid)]
+    (ensure-dir! idir)
+    (ensure-dir! home)
+    (let [{:keys [moves failures]}
+          (reduce
+           (fn [acc [idx entry]]
+             (let [src (:path entry)
+                   st (lstat src)
+                   dest-dir (path/join idir (str idx))
+                   dest (path/join dest-dir (path/basename src))]
+               (cond
+                 (nil? st)
+                 (update acc :failures conj {:path src :reason :vanished})
+
+                 (not (same-device? src (vault-dir home)))
+                 (update acc :failures conj
+                         {:path src :reason :cross-device
+                          :detail (str "the vault is on a different volume; moving here "
+                                       "would be a copy followed by a delete")})
+
+                 :else
+                 (try
+                   (ensure-dir! dest-dir)
+                   (fs/renameSync src dest)
+                   (update acc :moves conj
+                           (q/item {:index idx
+                                    :original-path src
+                                    :vault-path dest
+                                    :bytes (:bytes entry 0)
+                                    :mode (.-mode st)
+                                    :mtime-ms (.getTime (.-mtime st))
+                                    :rule-id (:rule/id entry)
+                                    :rules (:rules entry)}))
+                   (catch :default e
+                     (update acc :failures conj
+                             {:path src :reason :move-failed :detail (.-message e)}))))))
+           {:moves [] :failures []}
+           (map-indexed vector entries))
+          m (write-manifest! home rid
+                             (q/manifest {:run-id rid :created-ms now-ms
+                                          :policy-id policy-id :plan-id plan-id
+                                          :items moves}))]
+      {:run-id rid :vault-path (run-dir home rid)
+       :moves moves :failures failures :manifest m})))
+
+;; ---------------------------------------------------------------------------
+;; restore
+;; ---------------------------------------------------------------------------
+
+(defn restore!
+  "Put a vault run back. An item whose original path is occupied again is NOT
+  overwritten — it is reported, so restoring never destroys newer state."
+  [home rid]
+  (if-let [m (read-manifest home rid)]
+    (let [{:keys [restored failures]}
+          (reduce
+           (fn [acc {:keys [original-path vault-path mode mtime-ms] :as it}]
+             (cond
+               (not (exists? vault-path))
+               (update acc :failures conj {:path original-path :reason :missing-from-vault})
+
+               (exists? original-path)
+               (update acc :failures conj
+                       {:path original-path :reason :occupied
+                        :detail "something exists at the original path again; not overwriting"})
+
+               :else
+               (try
+                 (ensure-dir! (path/dirname original-path))
+                 (fs/renameSync vault-path original-path)
+                 (when mode (fs/chmodSync original-path mode))
+                 (when mtime-ms
+                   (let [secs (/ mtime-ms 1000)] (fs/utimesSync original-path secs secs)))
+                 (update acc :restored conj it)
+                 (catch :default e
+                   (update acc :failures conj
+                           {:path original-path :reason :restore-failed
+                            :detail (.-message e)})))))
+           {:restored [] :failures []}
+           (:vault/items m))]
+      ;; The run directory stays even when fully restored: the manifest is
+      ;; evidence, and evidence outlives the bytes it describes.
+      {:run-id rid :vault-path (run-dir home rid)
+       :restored restored :failures failures})
+    {:run-id rid :restored [] :failures [{:reason :no-such-run :run-id rid}]}))
+
+;; ---------------------------------------------------------------------------
+;; purge — the only irreversible operation
+;; ---------------------------------------------------------------------------
+
+(defn- overwrite-file!
+  "Overwrite a regular file's bytes in place before unlinking it.
+
+  Honest about what this is worth: on an SSD with wear levelling, copy-on-write
+  or snapshots (APFS is all three) overwriting a path does NOT guarantee the old
+  blocks are unreachable. It removes the data from the obvious place, and that is
+  the whole claim. `:purge/overwritten?` records that it was attempted; it does
+  not certify erasure."
+  [p passes]
+  (try
+    (let [st (fs/lstatSync p)]
+      (when (and (.isFile st) (pos? (.-size st)))
+        (dotimes [_ (max 1 passes)]
+          (fs/writeFileSync p (crypto/randomBytes (.-size st))))
+        (fs/writeFileSync p (js/Buffer.alloc 0)))
+      true)
+    (catch :default _ false)))
+
+(defn- walk-files [root]
+  (let [st (lstat root)]
+    (cond
+      (nil? st) []
+      (.isDirectory st) (mapcat #(walk-files (path/join root %))
+                                (array-seq (try (fs/readdirSync root)
+                                                (catch :default _ #js []))))
+      :else [root])))
+
+(defn purge!
+  "Destroy a vault run's bytes. Refuses unless `quarantine.core/purge-verdict`
+  says `:allowed`.
+
+  `:overwrite-passes` > 0 overwrites each regular file with random bytes before
+  unlinking (see `overwrite-file!` for what that does and does not guarantee)."
+  [home rid {:keys [now-ms retention-days acknowledged? overwrite-passes] :as opts}]
+  (let [m (read-manifest home rid)
+        verdict (q/purge-verdict m opts)]
+    (if-not (:allowed? verdict)
+      (assoc verdict :purged? false :run-id rid)
+      (let [idir (items-dir home rid)
+            passes (or overwrite-passes 0)
+            overwritten (when (pos? passes)
+                          (count (filter true? (map #(overwrite-file! % passes)
+                                                    (walk-files idir)))))]
+        (fs/rmSync idir #js {:recursive true :force true})
+        (write-manifest! home rid (q/mark-purged m now-ms))
+        (assoc verdict
+               :purged? true
+               :run-id rid
+               :overwritten? (boolean (and (pos? passes) (pos? (or overwritten 0))))
+               :overwrite-passes passes
+               :overwritten-file-count (or overwritten 0))))))
+
+;; ---------------------------------------------------------------------------
+;; listing / gc
+;; ---------------------------------------------------------------------------
+
+(defn list-runs
+  "Vault runs, newest first."
+  [home {:keys [now-ms retention-days] :as opts}]
+  (let [d (vault-dir home)]
+    (if-not (exists? d)
+      []
+      (->> (array-seq (try (fs/readdirSync d) (catch :default _ #js [])))
+           (keep (fn [rid]
+                   (when-let [m (read-manifest home rid)]
+                     {:run-id rid
+                      :at (.toISOString (js/Date. (:vault/created-ms m 0)))
+                      :created-ms (:vault/created-ms m 0)
+                      :bytes (q/total-bytes m)
+                      :item-count (count (:vault/items m))
+                      :age-days (q/run-age-days m now-ms)
+                      :purged? (q/purged? m)
+                      :purgeable? (q/purgeable? m opts)})))
+           (sort-by :created-ms)
+           reverse
+           vec))))
+
+(defn gc!
+  "Purge every run already past the retention floor. Same gates as `purge!` —
+  nothing within retention is touched and the caller must have acknowledged.
+
+  Without this the vault only ever grows, and the sole way to reclaim its space
+  was purging runs one id at a time."
+  [home {:keys [acknowledged?] :as opts}]
+  (let [candidates (filter :purgeable? (list-runs home opts))
+        results (mapv #(purge! home (:run-id %) opts) candidates)
+        purged (filter :purged? results)]
+    {:considered (count candidates)
+     :purged-runs (mapv :run-id purged)
+     :purged-count (reduce + 0 (map #(:item-count % 0) purged))
+     :purged-bytes (reduce + 0 (map #(:bytes % 0) purged))
+     :refused (mapv #(select-keys % [:run-id :reason]) (remove :purged? results))
+     :acknowledged? (boolean acknowledged?)}))

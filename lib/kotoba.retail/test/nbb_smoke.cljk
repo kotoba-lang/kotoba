@@ -1,0 +1,140 @@
+;; nbb_smoke.cljs -- run the pure namespaces on ClojureScript and check they
+;; agree with the JVM.
+;;
+;; ## Why this file exists
+;;
+;; Both the ns docstring of kotoba.retail and the README sell this library as
+;; "Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM". Until this
+;; file, the only thing that ever ran was `kbb -M:test` -- the JVM. The
+;; portability claim was asserted in prose and measured nowhere, so a
+;; :clj-only regression could land green.
+;;
+;; The risk is concrete, not hypothetical. These namespaces reach for the host
+;; in four places, and each behaves differently enough to matter:
+;;
+;;   Math/round   `line-item` rounds tax. Java's Math.round returns a long;
+;;                JS returns a Number. A `^double` hint means nothing in cljs.
+;;   int / char   `ean13-valid?` does digit arithmetic through (int %) on
+;;                characters. JVM chars are a distinct type; cljs chars are
+;;                single-character strings.
+;;   re-find      `csv-cell` and `digits-only` use regex literals. Java and
+;;                JS regex engines are not the same engine.
+;;   str/escape   `json-str` maps characters through a lookup table keyed by
+;;                \char literals -- the same JVM-char-vs-JS-string split.
+;;
+;; So this does not merely check that the namespaces LOAD. It recomputes the
+;; values the JVM suite pins and compares them, which is the only form that
+;; catches a runtime divergence rather than a syntax error.
+;;
+;; ## What this file does NOT cover, stated so it is not read as coverage
+;;
+;; kotoba.retail.ui is excluded. It requires html.core and css.core, which are
+;; :git/sha deps resolved by the JVM toolchain, and nbb has no classpath for
+;; them here. Its portability is UNMEASURED -- not verified, and not known to
+;; be broken. Extending this to ui/ means giving nbb those two sources.
+;;
+;; ## Run
+;;
+;;   kbb --backend sci --classpath src test/nbb_smoke.cljk
+;;
+;; Exits 0 only when every check ran and passed. A namespace that fails to
+;; load, or a check count below the floor, exits non-zero -- "could not
+;; measure" must not leave the same trace as "measured and fine".
+
+(ns nbb-smoke
+  (:require [kotoba.lang.text :as str]
+            [kotoba.retail :as ret]
+            [kotoba.retail.export :as ex]))
+
+(def ^:private failures (atom []))
+(def ^:private checks (atom 0))
+
+(defn- check! [label expected actual]
+  (swap! checks inc)
+  (when-not (= expected actual)
+    (swap! failures conj (str label "\n    expected: " (pr-str expected)
+                              "\n    actual:   " (pr-str actual)))))
+
+;; The same EAN-13 the JVM suite uses, so a divergence shows up as a
+;; disagreement between runtimes rather than as two independent fixtures.
+(def ean "4006381333931")
+
+;; --- kotoba.retail ---------------------------------------------------------
+
+;; ean13-valid? returns a truthy/falsey through (when ...), so compare
+;; booleans explicitly rather than relying on nil-vs-false reading the same.
+(check! "ean13-valid? accepts a valid barcode" true (boolean (ret/ean13-valid? ean)))
+(check! "ean13-valid? rejects a bad checksum" false (boolean (ret/ean13-valid? "4006381333932")))
+(check! "ean13-valid? rejects a short string" false (boolean (ret/ean13-valid? "123")))
+(check! "ean13-valid? rejects nil" false (boolean (ret/ean13-valid? nil)))
+;; int/char arithmetic over separators -- the digits-only path.
+(check! "ean13-valid? strips separators" true (boolean (ret/ean13-valid? "400-6381-333931")))
+
+(check! "validate-ean13 normalizes" ean (:retail/normalized (ret/validate-ean13 "400 6381 333931")))
+(check! "validate-ean13 :not-a-string" :not-a-string (:retail/error (ret/validate-ean13 42)))
+(check! "validate-ean13 :wrong-length" :wrong-length (:retail/error (ret/validate-ean13 "400638133393")))
+(check! "validate-ean13 :bad-checksum" :bad-checksum (:retail/error (ret/validate-ean13 "4006381333932")))
+
+(check! "needs-reorder? at threshold" true (ret/needs-reorder? (ret/inventory "S1" "L1" 5 :reorder-at 5)))
+(check! "needs-reorder? above threshold" false (ret/needs-reorder? (ret/inventory "S1" "L1" 10 :reorder-at 5)))
+(check! "needs-reorder? without a threshold" false (ret/needs-reorder? (ret/inventory "S1" "L1" 0)))
+
+;; Math/round: JVM returns a long, JS a Number. `=` across 50 and 50.0 is
+;; false in Clojure, so this check is exactly the runtime divergence guard.
+(check! "line-item rounds tax the way the JVM suite pins it"
+        50 (:li/tax (ret/line-item "S2" 500 1 :tax-rate 0.1)))
+(let [r (ret/receipt "R1" [(ret/line-item "S1" 200 2)
+                           (ret/line-item "S2" 500 1 :tax-rate 0.1)]
+                     :currency "USD")]
+  (check! "receipt net" 900 (:receipt/net r))
+  (check! "receipt tax" 50 (:receipt/tax r))
+  (check! "receipt total" 950 (:receipt/total r)))
+
+;; --- kotoba.retail.export --------------------------------------------------
+
+(let [invs [(ret/inventory "S1" "L1" 3 :reorder-at 5)
+            (ret/inventory "S2" "L1" 20 :reorder-at 5)]
+      csv (ex/inventory->csv invs)]
+  (check! "inventory CSV header" true (str/includes? csv "sku,location,quantity,reorder_at,needs_reorder"))
+  (check! "inventory CSV flags reorder" true (str/includes? csv "S1,L1,3,5,yes"))
+  (check! "inventory CSV clears the flag" true (str/includes? csv "S2,L1,20,5,no")))
+
+;; regex character class over a bare CR -- JS and Java regex engines both have
+;; to agree that \r is inside [",\n\r].
+(check! "CSV quotes a bare carriage return"
+        true (str/includes? (ex/receipts->csv [(ret/receipt (str "R" (char 13) "1") [])]) "\"R\r1\""))
+
+;; str/escape through a \char-keyed table: the C0 range and the currency field.
+(check! "JSON escapes C0 control characters"
+        true (str/includes? (ex/receipts->json [(ret/receipt (str "R" (char 9) "1" (char 1) "x") [])])
+                            "\"receipt_id\":\"R\\t1\\u0001x\""))
+(check! "JSON escapes currency"
+        true (str/includes? (ex/receipts->json [(ret/receipt "R1" [] :currency (str "US\"D" (char 10)))])
+                            "\"currency\":\"US\\\"D\\n\""))
+
+(let [j (ex/inventory->json [(ret/inventory "S\"1" "L1" 3 :reorder-at 5)])]
+  (check! "inventory JSON escapes sku" true (str/includes? j "\"sku\":\"S\\\"1\""))
+  (check! "inventory JSON carries the boolean" true (str/includes? j "\"needs_reorder\":true")))
+
+;; --- report ----------------------------------------------------------------
+
+;; Evidence floor. If a require silently resolved to an empty namespace, or a
+;; future edit deletes checks, a run with nothing to say must not print the
+;; same line as a run that verified everything.
+(def ^:private floor 24)
+
+(let [n @checks
+      fs @failures]
+  (println (str "cljs checks ran: " n " (floor " floor "), failures: " (count fs)))
+  (doseq [f fs] (println "  FAIL " f))
+  (cond
+    (< n floor)
+    (do (println (str "REFUSING to report a pass: only " n " checks ran, floor is " floor
+                      " -- this run did not measure what it claims to measure."))
+        (js/process.exit 2))
+
+    (seq fs)
+    (do (println "cljs disagrees with the JVM contract above.") (js/process.exit 1))
+
+    :else
+    (println "cljs agrees with the JVM contract on kotoba.retail + kotoba.retail.export.")))
