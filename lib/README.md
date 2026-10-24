@@ -53,6 +53,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.websocket` | `org.ietf.websocket/src` | `websocket.bytes`, `websocket.frame`, `websocket.handshake` (an external specification, publisher ietf.org) |
 | `org.ietf.asn1` | `org.ietf.asn1/src` | `asn1.core`, `asn1.oid` (an external specification, publisher ietf.org) |
 | `org.ietf.rtsp` | `org.ietf.rtsp/src` | `rtsp.bytes`, `rtsp.interleaved`, `rtsp.message`, `rtsp.session-header` (an external specification, publisher ietf.org) |
+| `org.ietf.ospf` | `org.ietf.ospf/src` | `ospf.bytes`, `ospf.checksum`, `ospf.dd`, `ospf.header` (an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
