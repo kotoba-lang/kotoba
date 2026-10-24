@@ -1,0 +1,184 @@
+(ns vllm.core-test
+  (:require [vllm.request :as req]
+            [vllm.sampling :as sampling]
+            [vllm.wire :as wire]
+            [vllm.validate :as v]
+            [vllm.ports :as ports]
+            [vllm.core :as core]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test    :refer-macros [deftest is testing]])))
+
+;; ---------------------------------------------------------------------------
+;; request: builders
+;; ---------------------------------------------------------------------------
+
+(deftest request-builders
+  (testing "chat request carries model, messages, default sampling, base-url"
+    (let [r (req/chat "m" [(req/system "s") (req/user "hi")])]
+      (is (= :chat (:vllm/endpoint r)))
+      (is (= "m" (:vllm/model r)))
+      (is (= 2 (count (:vllm/messages r))))
+      (is (= 0.7 (get-in r [:vllm/sampling :vllm/temperature])))
+      (is (= "http://localhost:8000/v1/chat/completions" (req/target-url r)))))
+  (testing "completion request uses prompt + completion path"
+    (let [r (req/completion "m" "once upon")]
+      (is (= "once upon" (:vllm/prompt r)))
+      (is (= "/v1/completions" (req/endpoint-path r)))))
+  (testing "threadable modifiers"
+    (let [r (-> (req/chat "m" [(req/user "hi")])
+                (req/with-sampling {:vllm/temperature 0.0 :vllm/max-tokens 64})
+                (req/with-base-url "http://gpu:8000")
+                (req/with-stream true))]
+      (is (= 0.0 (get-in r [:vllm/sampling :vllm/temperature])))
+      (is (= 64 (get-in r [:vllm/sampling :vllm/max-tokens])))
+      (is (true? (:vllm/stream r)))
+      (is (= "http://gpu:8000/v1/chat/completions" (req/target-url r))))))
+
+;; ---------------------------------------------------------------------------
+;; sampling
+;; ---------------------------------------------------------------------------
+
+(deftest sampling-wire-and-range
+  (testing "namespaced keys map to OpenAI/vLLM wire fields; unknown dropped"
+    (is (= {"temperature" 0.7 "top_p" 0.9 "top_k" 40 "max_tokens" 128}
+           (sampling/to-wire {:vllm/temperature 0.7 :vllm/top-p 0.9
+                              :vllm/top-k 40 :vllm/max-tokens 128
+                              :vllm/bogus 1}))))
+  (testing "out-of-range temperature is an :error"
+    (is (some #(= :sampling/range (:vllm/code %))
+              (sampling/problems {:vllm/temperature 9.0}))))
+  (testing "best_of < n is an :error"
+    (is (some #(= :sampling/best-of (:vllm/code %))
+              (sampling/problems {:vllm/n 4 :vllm/best-of 2}))))
+  (testing "unknown key warns"
+    (is (some #(= :sampling/unknown (:vllm/code %))
+              (sampling/problems {:vllm/bogus 1})))))
+
+;; ---------------------------------------------------------------------------
+;; wire: render request -> string-keyed body
+;; ---------------------------------------------------------------------------
+
+(deftest wire-render-chat
+  (let [body (wire/render
+              (req/chat "llama" [(req/system "be brief") (req/user "hi")]
+                        {:vllm/sampling {:vllm/temperature 0.2 :vllm/max-tokens 32}}))]
+    (is (= "llama" (get body "model")))
+    (is (= 0.2 (get body "temperature")))
+    (is (= 32 (get body "max_tokens")))
+    (is (= [{"role" "system" "content" "be brief"}
+            {"role" "user"   "content" "hi"}]
+           (get body "messages")))))
+
+(deftest wire-render-completion-and-stream
+  (let [body (wire/render (-> (req/completion "m" "x")
+                              (req/with-stream true)))]
+    (is (= "x" (get body "prompt")))
+    (is (true? (get body "stream")))))
+
+;; ---------------------------------------------------------------------------
+;; wire: parse responses
+;; ---------------------------------------------------------------------------
+
+(def chat-resp
+  {"id" "cmpl-1" "model" "llama"
+   "choices" [{"index" 0
+               "message" {"role" "assistant" "content" "Hello!"}
+               "finish_reason" "stop"}]
+   "usage" {"prompt_tokens" 8 "completion_tokens" 2 "total_tokens" 10}})
+
+(deftest wire-parse-response
+  (let [r (wire/parse-response chat-resp)]
+    (is (= "Hello!" (:vllm/text r)))
+    (is (= :stop (:vllm/finish-reason (first (:vllm/choices r)))))
+    (is (= 10 (get-in r [:vllm/usage :vllm/total-tokens])))))
+
+(deftest wire-parse-completion-and-chunk
+  (testing "completion choices use \"text\""
+    (is (= "tok" (:vllm/text (wire/parse-response
+                              {"choices" [{"index" 0 "text" "tok"}]})))))
+  (testing "streaming delta + DONE sentinel"
+    (is (= "He" (:vllm/delta (wire/parse-chunk
+                              {"choices" [{"delta" {"content" "He"}}]}))))
+    (is (wire/done-chunk? "data: [DONE]"))
+    (is (= "{\"x\":1}" (wire/strip-sse "data: {\"x\":1}")))
+    (is (nil? (wire/strip-sse "data: [DONE]")))))
+
+;; ---------------------------------------------------------------------------
+;; validate
+;; ---------------------------------------------------------------------------
+
+(deftest validate-requests
+  (testing "a well-formed chat request is valid"
+    (is (v/valid? (req/chat "m" [(req/user "hi")]))))
+  (testing "missing model is an :error"
+    (is (some #(= :request/model (:vllm/code %))
+              (v/problems (req/chat "" [(req/user "hi")])))))
+  (testing "empty messages is an :error"
+    (is (not (v/valid? (req/chat "m" [])))))
+  (testing "invalid role is an :error"
+    (is (some #(= :message/role (:vllm/code %))
+              (v/problems (req/chat "m" [(req/message :wizard "hi")])))))
+  (testing "out-of-range sampling surfaces through request validation"
+    (is (not (v/valid? (req/chat "m" [(req/user "hi")]
+                                 {:vllm/sampling {:vllm/temperature 5.0}}))))))
+
+;; ---------------------------------------------------------------------------
+;; core: end-to-end over an injected fake transport
+;; ---------------------------------------------------------------------------
+
+(def captured (atom nil))
+
+(def fake-transport
+  "Captures the request spec and returns a canned 200 response."
+  (ports/fn-transport
+   (fn [spec]
+     (reset! captured spec)
+     {:status 200 :body chat-resp})))
+
+(deftest core-complete-happy-path
+  (reset! captured nil)
+  (let [r (core/chat fake-transport "llama" [(req/user "hi")])]
+    (is (= "Hello!" (:vllm/text r)))
+    (testing "the transport saw the rendered spec"
+      (is (= "http://localhost:8000/v1/chat/completions" (:url @captured)))
+      (is (= :post (:method @captured)))
+      (is (= "llama" (get-in @captured [:body "model"]))))))
+
+(deftest core-validation-short-circuits
+  (testing "an invalid request never reaches the transport"
+    (reset! captured nil)
+    (let [r (core/chat fake-transport "" [(req/user "hi")])]
+      (is (= :validation (:vllm/error r)))
+      (is (nil? @captured)))))
+
+(deftest core-http-error
+  (testing "a non-2xx response becomes a :http error result"
+    (let [t (ports/fn-transport (fn [_] {:status 500 :body {"error" "boom"}}))
+          r (core/chat t "m" [(req/user "hi")])]
+      (is (= :http (:vllm/error r)))
+      (is (= 500 (:vllm/status r))))))
+
+(deftest core-no-transport-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (core/chat ports/no-transport "m" [(req/user "hi")]))))
+
+;; ---------------------------------------------------------------------------
+;; streaming over an injected IStreamTransport
+;; ---------------------------------------------------------------------------
+
+(def stream-transport
+  (reify
+    ports/ITransport
+    (request! [_ _] {:status 200 :body chat-resp})
+    ports/IStreamTransport
+    (stream! [_ _ on-chunk]
+      (doseq [c [{"choices" [{"delta" {"content" "Hel"}}]}
+                 {"choices" [{"delta" {"content" "lo"}}]}
+                 {"choices" [{"delta" {} "finish_reason" "stop"}]}]]
+        (on-chunk c)))))
+
+(deftest core-stream
+  (let [acc (atom [])]
+    (core/stream stream-transport (req/chat "m" [(req/user "hi")])
+                 #(swap! acc conj %))
+    (is (= ["Hel" "lo"] @acc))))
