@@ -1,0 +1,235 @@
+(ns mailer.core-test
+  (:require [kotoba.test :refer [deftest is are testing]]
+            [mail.draft :as draft]
+            [mail.message :as msg]
+            [mailer.core :as mailer]))
+
+(defn caught
+  "Run `f` and return whatever it threw, or nil if it returned normally.
+  `catch` needs a literal class, so the reader conditional lives here once
+  instead of at every call site.
+
+  This deliberately catches everything, not only `ex-info`. Catching narrowly
+  let an incidental NullPointerException escape as a test error, which is red
+  either way -- so the assertion about *which* refusal happened never ran, and
+  the test would have counted a crash as the refusal it names."
+  [f]
+  (try (f) nil
+       (catch #?(:clj Throwable :cljs :default) ex ex)))
+
+(defn effect-for
+  "An approved mail/send effect carrying `m`. `request` accepts no other shape,
+  and `mail.draft/send-effect` refuses to build one from an unapproved draft, so
+  every case below starts from a genuinely approved draft."
+  [m]
+  (-> (draft/draft "d1" m)
+      (draft/approve {:by "did:web:jun.example"})
+      draft/send-effect))
+
+(defn effect
+  ([] (effect {:from "ops@example.com" :to ["alice@example.com"]
+               :subject "Hello" :text "Hi"}))
+  ([attrs] (effect-for (msg/message attrs))))
+
+;; ---------------------------------------------------------------- provider table
+
+(deftest every-supported-provider-has-a-capability-set
+  ;; `supported-providers` and `provider-capabilities` are two spellings of the
+  ;; same list. A provider in one and not the other yields a config whose
+  ;; required capabilities are nil, which a policy engine reads as "needs
+  ;; nothing" rather than as an error.
+  (is (= mailer/supported-providers (set (keys mailer/provider-capabilities))))
+  (doseq [p mailer/supported-providers]
+    (is (seq (mailer/provider-capabilities p)) (str p " declares no capabilities"))
+    (is (contains? (mailer/provider-capabilities p) "mail/send")
+        (str p " does not require mail/send"))))
+
+(deftest provider-config-carries-id-and-capabilities
+  (let [c (mailer/provider-config :ses {:region "ap-northeast-1"})]
+    (is (= :ses (:mailer.provider/id c)))
+    (is (= (mailer/provider-capabilities :ses)
+           (:mailer.provider/required-capabilities c)))
+    (is (= "ap-northeast-1" (:region c)) "caller attrs survive the merge")))
+
+(deftest provider-config-refuses-unknown-provider
+  (let [e (caught #(mailer/provider-config :postmark {}))]
+    (is (some? e) "an unknown provider must not produce a config")
+    (is (= :postmark (:provider (ex-data e)))
+        "the rejection must name the provider it rejected")))
+
+;; ---------------------------------------------------------------- request shape
+
+(deftest builds-resend-request
+  (let [req (mailer/request :resend (effect))]
+    (is (= :resend (:mailer.request/provider req)))
+    (is (= :post (:http/method req)))
+    (is (= "https://api.resend.com/emails" (:http/url req)))
+    (is (= :resend-api-key (:http/auth-secret req)))
+    (is (= "Hi" (get-in req [:http/json :text])))
+    (is (contains? (:mailer.request/capabilities req) "secrets/get:resend-api-key"))))
+
+(deftest builds-smtp-request
+  (let [req (mailer/request :smtp (effect))]
+    (is (= :smtp (:mailer.request/provider req)))
+    (is (= :send (:smtp/action req)))
+    (is (= :smtp-credentials (:smtp/credentials-secret req)))
+    (is (= "Hello" (get-in req [:smtp/message :subject])))))
+
+(deftest builds-ses-request
+  ;; :ses is a supported provider that no test reached, so nothing said whether
+  ;; its branch produced a request or fell through to the unsupported-provider
+  ;; throw.
+  (let [req (mailer/request :ses (effect))]
+    (is (= :ses (:mailer.request/provider req)))
+    (is (= :ses-send-email (:aws/action req)))
+    (is (= :aws-credentials (:aws/credentials-secret req)))
+    (is (= "Hello" (get-in req [:aws/payload :subject])))
+    (is (= "Hi" (get-in req [:aws/payload :text])))))
+
+(deftest every-request-declares-its-providers-capabilities
+  ;; The host grants capabilities from the request, not from the config, so the
+  ;; two must agree for all three providers -- not just the one with a test.
+  (doseq [p mailer/supported-providers]
+    (let [req (mailer/request p (effect))]
+      (is (= p (:mailer.request/provider req)))
+      (is (= (mailer/provider-capabilities p)
+             (:mailer.request/capabilities req))
+          (str p " request declares capabilities its config does not")))))
+
+(deftest refuses-unsupported-provider
+  (let [e (caught #(mailer/request :postmark (effect)))]
+    (is (some? e))
+    (is (= :postmark (:provider (ex-data e))))))
+
+(deftest rejects-non-mail-effect
+  ;; Asserting only that something was thrown does not discriminate: with the
+  ;; effect-type check removed the message is nil, and `assert-valid-message`
+  ;; throws about the message instead. The ex-data is what says the refusal
+  ;; happened for the reason this test names.
+  (let [e (caught #(mailer/request :resend {:mail.effect/type :not-mail/send}))]
+    (is (some? e))
+    (is (= :not-mail/send (get-in (ex-data e) [:effect :mail.effect/type]))
+        "the refusal must report the effect it refused, not the empty message behind it")))
+
+(deftest rejects-invalid-message
+  ;; `request` reaches `assert-valid-message`, so an effect carrying a message
+  ;; with no recipient must not become a provider request.
+  (let [bad (assoc (msg/message {:from "ops@example.com" :to ["a@example.com"]
+                                 :subject "S" :text "T"})
+                   :mail/to [])
+        e (caught #(mailer/request :resend {:mail.effect/type :mail/send
+                                            :mail.effect/message bad}))]
+    (is (some? e))
+    (is (= [:missing-to] (mapv :mail.error/code (:mail/errors (ex-data e)))))))
+
+;; ---------------------------------------------------------------- message wire
+
+(deftest carries-cc-bcc-reply-to-and-html
+  (let [req (mailer/request :resend
+                            (effect {:from "ops@example.com"
+                                     :to ["alice@example.com"]
+                                     :cc ["carol@example.com"]
+                                     :bcc ["bob@example.com"]
+                                     :reply-to "replies@example.com"
+                                     :subject "Hello"
+                                     :text "Hi"
+                                     :html "<p>Hi</p>"}))
+        json (:http/json req)]
+    (is (= ["carol@example.com"] (:cc json)))
+    (is (= ["bob@example.com"] (:bcc json)))
+    (is (= "replies@example.com" (:reply_to json)))
+    (is (= "<p>Hi</p>" (:html json)))
+    (is (= "Hi" (:text json)))))
+
+(deftest bare-address-stays-a-string
+  (is (= "alice@example.com" (first (get-in (mailer/request :resend (effect))
+                                            [:http/json :to])))))
+
+(deftest keeps-the-display-name-in-both-spellings
+  ;; `mail.message/normalize-address` accepts `:email` or `:mail.address/email`
+  ;; and passes every other key through unchanged, so the display name arrives
+  ;; under whichever key the caller wrote. Reading only the namespaced one
+  ;; dropped the name of every `{:email _ :name _}` address without complaint.
+  (are [address] (= {:email "alice@example.com" :name "Alice"}
+                    (first (get-in (mailer/request
+                                    :resend
+                                    (effect {:from "ops@example.com"
+                                             :to [address]
+                                             :subject "Hello" :text "Hi"}))
+                                   [:http/json :to])))
+    {:email "Alice@Example.com" :name "Alice"}
+    {:mail.address/email "alice@example.com" :mail.address/name "Alice"}))
+
+(deftest matches-body-parts-by-media-type-not-header-string
+  ;; A charset spelled any other way is the same media type. Matching the whole
+  ;; header meant such a part was not found -- and, because a message with parts
+  ;; is valid, the request was built anyway with no body in it.
+  (testing "content-type variants all yield the body"
+    (are [content-type] (= "Body"
+                           (get-in (mailer/request
+                                    :resend
+                                    (effect-for
+                                     (assoc (msg/message {:from "ops@example.com"
+                                                          :to ["a@example.com"]
+                                                          :subject "S" :text "seed"})
+                                            :mail/parts
+                                            [(msg/body-part content-type "Body")])))
+                                   [:http/json :text]))
+      "text/plain"
+      "text/plain; charset=utf-8"
+      "text/plain;charset=UTF-8"
+      "TEXT/PLAIN; charset=\"utf-8\""
+      "  text/plain  ; charset=iso-8859-1")))
+
+(deftest refuses-a-message-with-no-sendable-part
+  ;; `mail.message` calls a message with any part valid, so this reaches the
+  ;; wire builder. Emitting a request without :text or :html would instruct the
+  ;; host to send a blank email and report success.
+  (let [m (assoc (msg/message {:from "ops@example.com" :to ["a@example.com"]
+                               :subject "S" :text "seed"})
+                 :mail/parts [(msg/body-part "application/pdf" "%PDF-1.4")])]
+    (is (msg/valid-message? m) "precondition: mail.message calls this valid")
+    (doseq [p mailer/supported-providers]
+      (let [e (caught #(mailer/request p (effect-for m)))]
+        (is (some? e) (str p " built a request with no body"))
+        (is (= ["application/pdf"] (:mail.part/content-types (ex-data e)))
+            "the refusal must name the parts it could not send")))))
+
+;; ---------------------------------------------------------------- receipt
+
+(deftest materializes-provider-receipt
+  (let [r (mailer/materialize-receipt (effect)
+                                      {:provider :resend
+                                       :message-id "msg_123"
+                                       :status :accepted})]
+    (is (= :resend (:mail.receipt/provider r)))
+    (is (= "msg_123" (:mail.receipt/provider-message-id r)))
+    (is (= :accepted (:mail.receipt/status r)))
+    (is (= "d1" (:mail.receipt/draft-id r))
+        "the receipt must be traceable back to the draft that was approved")))
+
+(deftest receipt-defaults-status-to-accepted
+  (is (= :accepted (:mail.receipt/status
+                    (mailer/materialize-receipt (effect)
+                                                {:provider :resend
+                                                 :message-id "msg_123"})))))
+
+(deftest receipt-reports-the-status-the-provider-gave
+  ;; The default is :accepted, so a status that is dropped on the way through
+  ;; becomes an acceptance. A send the provider queued or rejected must not be
+  ;; recorded as one it accepted.
+  (are [reported] (= reported
+                     (:mail.receipt/status
+                      (mailer/materialize-receipt (effect)
+                                                  {:provider :resend
+                                                   :message-id "msg_123"
+                                                   :status reported})))
+    :queued
+    :rejected
+    :accepted))
+
+(deftest refuses-receipt-without-provider-message-id
+  ;; A receipt with no provider message-id cannot be reconciled against the
+  ;; provider later, so an unidentifiable send must not become a receipt.
+  (is (some? (caught #(mailer/materialize-receipt (effect) {:provider :resend
+                                                            :status :accepted})))))
