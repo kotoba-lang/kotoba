@@ -1,0 +1,184 @@
+(ns datom.source-test
+  (:require [kotoba.test :refer [deftest is testing #?(:cljs async)]]
+            [datom.source :as src]
+            [datom.source.conformance :as conf]))
+
+(deftest reference-source-conforms-to-itself
+  (testing "the suite is not vacuous: the reference implementation passes"
+    (is (empty? (conf/check src/of-quads)) (conf/report (conf/check src/of-quads)))))
+
+(deftest the-suite-catches-a-broken-implementation
+  (testing "a source that ignores the object position is REJECTED -- otherwise
+           conformance would prove nothing"
+    (let [broken (fn [quads]
+                   (reify src/IPatternSource
+                     (-scan [_ [s p _]]
+                       (src/scan-set (src/of-quads quads) [s p nil]))))
+          failures (conf/check broken)]
+      (is (seq failures))
+      (is (some #(= :by-object (:case %)) failures))))
+  (testing "a source that returns a BAG instead of a set is rejected"
+    (let [dup (fn [quads]
+                (reify src/IPatternSource
+                  (-scan [_ pattern]
+                    (concat (src/scan (src/of-quads quads) pattern)
+                            [{:s "ghost" :p "ghost" :o "ghost"}]))))]
+      (is (seq (conf/check dup))))))
+
+(deftest merged-is-a-source-and-partitions-round-trip
+  (let [halves (partition-all 3 conf/corpus)
+        m (src/merged (map src/of-quads halves))]
+    (testing "k partitions answer exactly as one whole"
+      (is (empty? (conf/check (fn [quads]
+                                (src/merged (map src/of-quads
+                                                 (partition-all 2 quads))))))))
+    (testing "and a merged source is itself mergeable (they nest)"
+      (is (= (src/scan-set (src/of-quads conf/corpus) [nil "knows" nil])
+             (src/scan-set (src/merged [m (src/of-quads [])]) [nil "knows" nil]))))
+    (testing "a quad duplicated across partitions appears once -- which is why
+             partitioned writers never have to coordinate"
+      (let [dupd (src/merged [(src/of-quads conf/corpus) (src/of-quads conf/corpus)])]
+        (is (= (src/scan-set (src/of-quads conf/corpus) [nil nil nil])
+               (src/scan-set dupd [nil nil nil])))))))
+
+(deftest filtered-hides-quads-from-every-pattern
+  (let [no-alice (src/filtered (src/of-quads conf/corpus) #(not= "alice" (:s %)))]
+    (is (empty? (src/scan-set no-alice ["alice" nil nil])))
+    (is (= 2 (count (src/scan-set no-alice [nil nil nil]))))))
+
+(deftest counting-records-the-shape-of-the-work
+  (let [c (src/counting (src/of-quads conf/corpus))]
+    (src/scan c [nil "knows" nil])
+    (src/scan c ["alice" nil nil])
+    (is (= 2 (:scans (src/counts c))))
+    (is (= 6 (:quads (src/counts c))))))
+
+(deftest pattern-helpers
+  (is (= #{:s :p} (src/bound-positions ["a" "b" nil])))
+  (is (= 3 (src/selectivity-hint [nil nil nil])))
+  (is (= 0 (src/selectivity-hint ["a" "b" "c"]))))
+
+;; ── brick 3: views ───────────────────────────────────────────────────
+
+(deftest a-view-over-every-pattern-conforms
+  (testing "if a view answers all the suite's patterns it must answer them
+           the same way -- otherwise it is a cache with a bug"
+    (let [mk (fn [quads]
+               (src/view (src/of-quads quads) (map second conf/cases)))]
+      (is (empty? (conf/check mk)) (conf/report (conf/check mk))))))
+
+(deftest a-partial-view-falls-through-or-refuses
+  (let [base (src/of-quads conf/corpus)
+        covered [nil "knows" nil]]
+    (testing "covered patterns are answered from the view"
+      (let [v (src/view base [covered])]
+        (is (= (src/scan-set base covered) (src/scan-set v covered)))
+        (is (= #{covered} (src/coverage v)))))
+    (testing "uncovered patterns fall through by default"
+      (let [v (src/view base [covered])]
+        (is (= (src/scan-set base ["alice" nil nil])
+               (src/scan-set v ["alice" nil nil])))))
+    (testing "and refuse loudly when the view exists to bound latency"
+      (let [v (src/view base [covered] {:fallback? false})]
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                     (src/scan v ["alice" nil nil])))))))
+
+(deftest a-view-does-not-follow-its-source-until-absorbed
+  (let [quads (atom (vec conf/corpus))
+        live (reify src/IPatternSource
+               (-scan [_ pattern] (src/scan-set (src/of-quads @quads) pattern)))
+        v (src/view live [[nil "knows" nil]])
+        newq {:s "carol" :p "knows" :o "dave"}]
+    (swap! quads conj newq)
+    (testing "the source sees the new fact"
+      (is (contains? (src/scan-set live [nil "knows" nil]) newq)))
+    (testing "the view does NOT -- this is the staleness a caller must know about"
+      (is (not (contains? (src/scan-set v [nil "knows" nil]) newq))))
+    (testing "absorb folds it in, touching only the covered patterns"
+      (let [v' (src/absorb v [newq])]
+        (is (= (src/scan-set live [nil "knows" nil])
+               (src/scan-set v' [nil "knows" nil])))))
+    (testing "and absorb ignores quads that match nothing covered"
+      (let [v' (src/absorb v [{:s "x" :p "unrelated" :o "y"}])]
+        (is (= (src/scan-set v [nil "knows" nil])
+               (src/scan-set v' [nil "knows" nil])))))))
+
+;; ── scan cache ───────────────────────────────────────────────────────
+
+(deftest cached-conforms-and-collapses-repeats
+  (testing "a cache that changes an answer is a bug, not a cache"
+    (is (empty? (conf/check #(src/cached (src/of-quads %))))))
+  (testing "a repeated pattern reaches the source once"
+    (let [calls (atom 0)
+          base (reify src/IPatternSource
+                 (-scan [_ p] (swap! calls inc)
+                   (src/scan-set (src/of-quads conf/corpus) p)))
+          c (src/cached base)]
+      (dotimes [_ 5] (src/scan c [nil "knows" nil]))
+      (is (= 1 @calls))
+      (is (= {:patterns 1 :quads 2} (src/cache-stats c)))))
+  (testing "distinct patterns are not conflated"
+    (let [c (src/cached (src/of-quads conf/corpus))]
+      (src/scan c [nil "knows" nil])
+      (src/scan c [nil "likes" nil])
+      (is (= 2 (:patterns (src/cache-stats c)))))))
+
+(deftest a-scan-cache-is-scoped-to-a-snapshot-not-to-a-source
+  (testing "the documented hazard, asserted so it is not a surprise: a pattern
+           is not a version, so a cache outliving a write answers from the past"
+    (let [quads (atom (vec conf/corpus))
+          live (reify src/IPatternSource
+                 (-scan [_ p] (src/scan-set (src/of-quads @quads) p)))
+          c (src/cached live)
+          before (src/scan-set c [nil "knows" nil])]
+      (swap! quads conj {:s "carol" :p "knows" :o "dave"})
+      (is (= before (src/scan-set c [nil "knows" nil])) "stale, by design")
+      (is (not= before (src/scan-set live [nil "knows" nil])) "the source moved on"))))
+
+(deftest in-range-is-half-open-and-mixed-types-do-not-throw
+  (is (true? (src/in-range? 5 0 10)))
+  (is (false? (src/in-range? 10 0 10)) "hi exclusive")
+  (is (true? (src/in-range? 10 0 10 {:hi-open? false})))
+  (is (false? (src/in-range? 0 0 10 {:lo-open? true})))
+  (is (true? (src/in-range? "b" "a" "c")))
+  (is (true? (src/in-range? 1 nil 2)))
+  (is (false? (src/in-range? "a" 0 10)) "mixed types compare by rank, not throw"))
+
+(deftest scan-range-on-the-reference-source
+  (let [src (src/of-quads [{:s "a" :p "age" :o 10}
+                           {:s "b" :p "age" :o 20}
+                           {:s "c" :p "age" :o 30}
+                           {:s "d" :p "name" :o "x"}])]
+    (is (= #{{:s "b" :p "age" :o 20}}
+           (src/scan-range src "age" 15 25)))
+    (testing "merged and filtered still range"
+      (let [m (src/merged [(src/of-quads [{:s "a" :p "age" :o 10}])
+                           (src/of-quads [{:s "b" :p "age" :o 20}])])]
+        (is (= #{{:s "b" :p "age" :o 20}} (src/scan-range m "age" 15 25))))
+      (is (= #{} (src/scan-range (src/filtered src #(= "a" (:s %))) "age" 15 25))))))
+
+#?(:cljs
+   (deftest async-pattern-and-range-contracts
+     (async done
+       (let [calls (atom [])
+             quads #{{:s "a" :p "age" :o 10}
+                     {:s "b" :p "age" :o 20}
+                     {:s "c" :p "name" :o "c"}}
+             source (reify src/IAsyncPatternSource
+                      (-scan-async [_ pattern]
+                        (swap! calls conj pattern)
+                        (js/Promise.resolve
+                         (src/scan-set (src/of-quads quads) pattern))))]
+         (-> (src/scan-async source [nil "age" nil])
+             (.then (fn [rows]
+                      (is (= #{{:s "a" :p "age" :o 10}
+                               {:s "b" :p "age" :o 20}}
+                             rows))
+                      (src/scan-range-async source "age" 15 25)))
+             (.then (fn [rows]
+                      (is (= #{{:s "b" :p "age" :o 20}} rows))
+                      (is (= [[nil "age" nil] [nil "age" nil]] @calls))
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "async source threw: " e))
+                       (done))))))))
