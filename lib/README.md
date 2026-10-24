@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.remocon` | `kotoba.remocon/src` | `remocon.match`, `remocon.nec`, `remocon.pronto`, `remocon.raw` (Kotoba project library) |
 | `kotoba.reji` | `kotoba.reji/src` | `kotoba.reji.core`, `kotoba.reji.currency` (Kotoba project library) |
 | `kotoba.rdfCanon` | `kotoba.rdfCanon/src` | `rdf-canon.core` (Kotoba project library) |
 | `kotoba.rcs` | `kotoba.rcs/src` | `kotoba.rcs`, `kotoba.rcs.export`, `kotoba.rcs.ui` (Kotoba project library) |
