@@ -96,6 +96,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.jws` | `org.ietf.jws/src` | `jws.core` (an external specification, publisher ietf.org) |
 | `org.ietf.oncrpc` | `org.ietf.oncrpc/src` | `oncrpc.core`, `oncrpc.record` (an external specification, publisher ietf.org) |
 | `org.ietf.nfs` | `org.ietf.nfs/src` | `nfs.memory`, `nfs.mount`, `nfs.tcp`, `nfs.v3` (an external specification, publisher ietf.org) |
+| `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `kotoba.optimalTransport` | `kotoba.optimalTransport/src` | `optimal-transport.mesh-morph`, `optimal-transport.sinkhorn` (Kotoba project library) |
 | `kotoba.openapi` | `kotoba.openapi/src` | `openapi.execute`, `openapi.json`, `openapi.model`, `openapi.ports` (Kotoba project library) |
 | `kotoba.ooyake` | `kotoba.ooyake/src` | `ooyake.cells.reconcile.cell`, `ooyake.cells.reconcile.state-machine`, `ooyake.cells.social-post.state-machine`, `ooyake.cells.world-model.cell` (Kotoba project library) |
