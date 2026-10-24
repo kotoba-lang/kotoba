@@ -1,0 +1,109 @@
+(ns kotoba.issue.gate-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.issue.store :as store]
+            [kotoba.issue.gate :as gate]))
+
+(def default-autonomy {:read-only :auto :external-send :approve
+                        :financial :approve :destructive :approve})
+
+(defn- fresh-store [] (store/mem-store))
+
+(defn- sample-issue [s]
+  (gate/open-issue! s {:id "issue-1" :kind :inbox/mail :title "hello"
+                        :source "gmail" :source-id "gm-1"}))
+
+(deftest issue-open-and-close
+  (let [s (fresh-store)]
+    (sample-issue s)
+    (is (= :open (:kotoba.issue/state (store/get-entity s :issue "issue-1"))))
+    (gate/close-issue! s "issue-1")
+    (is (= :closed (:kotoba.issue/state (store/get-entity s :issue "issue-1"))))
+    (is (= [:issue/opened :issue/closed] (mapv :kotoba.issue.audit/type (store/audit-log s))))))
+
+(deftest propose-approve-merge-happy-path
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        p (gate/propose! s {:id "prop-1" :issue "issue-1" :kind :gmail/draft
+                             :risk :external-send :rationale "draft a reply"})]
+    (is (= :proposed (:kotoba.issue.proposal/status p)))
+    (is (= :awaiting-review (gate/route default-autonomy p)))
+
+    (gate/approve! s "prop-1" {:decider "jun" :note "looks good"})
+    (is (= :approved (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-1"))))
+
+    (let [results (gate/merge! s {:gmail/draft (fn [_p] {:drafted true})})]
+      (is (= [{:proposal-id "prop-1" :status :merged}] results))
+      (is (= :merged (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-1")))))))
+
+(deftest merge-with-proposal-id-only-touches-that-one
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-1a" :issue "issue-1" :kind :gmail/archive :risk :read-only})
+        _ (gate/propose! s {:id "prop-1b" :issue "issue-1" :kind :gmail/archive :risk :read-only})
+        _ (gate/approve! s "prop-1a" {:decider "jun"})
+        _ (gate/approve! s "prop-1b" {:decider "jun"})
+        results (gate/merge! s {:gmail/archive (fn [_] {:archived true})} {:proposal-id "prop-1a"})]
+    (is (= [{:proposal-id "prop-1a" :status :merged}] results))
+    (is (= :merged (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-1a"))))
+    (is (= :approved (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-1b")))
+        "an unrelated approved proposal must not be swept in by a scoped merge!")))
+
+(deftest reject-is-terminal
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-2" :issue "issue-1" :kind :gmail/archive :risk :read-only})]
+    (gate/reject! s "prop-2" {:decider "jun" :note "not needed"})
+    (is (= :rejected (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-2"))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (gate/approve! s "prop-2" {:decider "jun"})))))
+
+(deftest request-changes-is-not-terminal
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-3" :issue "issue-1" :kind :gmail/draft :risk :external-send})]
+    (gate/request-changes! s "prop-3" {:decider "jun" :note "wrong tone"})
+    (is (= :changes-requested (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-3"))))
+    ;; not terminal -- a fresh review can still land
+    (gate/approve! s "prop-3" {:decider "jun" :note "fixed"})
+    (is (= :approved (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-3"))))))
+
+(deftest merge-missing-handler-fails
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-4" :issue "issue-1" :kind :unknown/kind :risk :read-only})]
+    (gate/approve! s "prop-4" {:decider "jun"})
+    (let [results (gate/merge! s {})]
+      (is (= [{:proposal-id "prop-4" :status :failed :reason :missing-handler}] results))
+      (is (= :failed (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-4")))))))
+
+(deftest merge-handler-exception-fails
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-5" :issue "issue-1" :kind :boom/kind :risk :read-only})]
+    (gate/approve! s "prop-5" {:decider "jun"})
+    (let [results (gate/merge! s {:boom/kind (fn [_] (throw (ex-info "boom" {})))})]
+      (is (= :failed (:status (first results))))
+      (is (= :failed (:kotoba.issue.proposal/status (store/get-entity s :proposal "prop-5")))))))
+
+(deftest route-auto-mergeable-for-read-only
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        p (gate/propose! s {:id "prop-6" :issue "issue-1" :kind :gmail/archive :risk :read-only})]
+    (is (= :auto-mergeable (gate/route default-autonomy p)))))
+
+(deftest dry-run-propose-approve-merge
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-7" :issue "issue-1" :kind :gmail/archive :risk :read-only})
+        result (gate/dry-run! s {:gmail/archive (fn [_] {:archived true})})]
+    (is (= ["prop-7"] (:approved result)))
+    (is (= [{:proposal-id "prop-7" :status :merged}] (:merged result)))))
+
+(deftest audit-trail-records-every-transition
+  (let [s (fresh-store)
+        _ (sample-issue s)
+        _ (gate/propose! s {:id "prop-8" :issue "issue-1" :kind :gmail/archive :risk :read-only})
+        _ (gate/approve! s "prop-8" {:decider "jun"})
+        _ (gate/merge! s {:gmail/archive (fn [_] {})})
+        types (mapv :kotoba.issue.audit/type (store/audit-log s))]
+    (is (= [:issue/opened :proposal/proposed :review/approved :merge/merged] types))))

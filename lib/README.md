@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.kotobaIssue` | `kotoba.kotobaIssue/src` | `kotoba.issue.bcf`, `kotoba.issue.bcf.xml`, `kotoba.issue.gate`, `kotoba.issue.opencde` (Kotoba project library) |
 | `kotoba.ioStripeIssuing` | `kotoba.ioStripeIssuing/src` | `io.stripe.issuing.core`, `io.stripe.issuing.exercise`, `io.stripe.issuing.state` (Kotoba project library) |
 | `kotoba.ctf` | `kotoba.ctf/src` | `ctf.adapters.auth-client`, `ctf.adapters.etzhayyim`, `ctf.adapters.evidence-ledger`, `ctf.adapters.retry` (Kotoba project library) |
 | `kotoba.atprotoClient` | `kotoba.atprotoClient/src` | `kotoba.lang.atproto-client.atproto`, `kotoba.lang.atproto-client.http-jdk`, `kotoba.lang.atproto-client.pds` (Kotoba project library) |
