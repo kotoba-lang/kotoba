@@ -1,0 +1,207 @@
+;; Where a message stops being headers, and what counts as a line, as a
+;; Kotoba application (ADR-2608261100) -- RFC 5322 §2.1 and §2.2, RFC 2046
+;; §5.1.1.
+;;
+;;   header-block-length (raw)             -> i64
+;;   body-start          (raw)             -> i64
+;;   field-problem       (line)            -> keyword
+;;   delimiter-kind      (line, boundary)  -> keyword
+;;
+;; ## Framing is the decision, and it is upstream of every other one
+;;
+;; A mail parser's first act is to say where the headers end. Everything
+;; after that -- which fields exist, what the Content-Type is, which parts a
+;; multipart has -- is read off that one answer, so a parser that puts the
+;; line somewhere else is reading a different message from every other
+;; parser that touches the same bytes. There is nothing cryptographic in it.
+;;
+;;   the guest owns   where the header block ends, whether a line is a
+;;                    header field, and whether a line is a boundary
+;;   the host owns    the bytes, the transfer decoding, the charsets
+;;
+;; ## Three things measured on this library
+;;
+;; **The header block ends at the wrong blank line.** §2.1 puts the body
+;; after the FIRST empty line. `mime.parse/split-message` is
+;;
+;;     (some (fn [sep] (when-let [j (str/index-of raw sep)] [j (count sep)]))
+;;           ["\r\n\r\n" "\n\n"])
+;;
+;; `some` returns the first separator that is FOUND, not the one that occurs
+;; earliest. A message whose headers end in a bare LF, and whose body later
+;; contains a CRLF CRLF, splits at the later one. Measured: a message with
+;;
+;;     From: alice@example.com \n Subject: hello \n \n
+;;     X-Injected: yes \r\n To: victim@example.com \r\n \r\n real body
+;;
+;; parses as FOUR headers -- `x-injected` and `to` among them -- and a body
+;; of "real body". Those two lines are body bytes. Anyone who can put text
+;; in a body can put headers in the message.
+;;
+;; **Transport padding hides a part.** §5.1.1 spells the delimiter as
+;; `--boundary` followed by *transport-padding* (LWSP) and then CRLF.
+;; `split-multipart` compares the line with `=`, so `--b ` with one trailing
+;; space is not a delimiter to it. Measured: a two-part message where the
+;; first delimiter carries a space parses as ONE part, and the first part is
+;; gone. A scanner that honours the padding sees the part the recipient's
+;; client does not.
+;;
+;; **A field name may not contain a space.** §2.2: a field name is printable
+;; US-ASCII excluding space and colon, and the colon follows it
+;; immediately. `parse-headers` takes everything before the first `:` and
+;; trims it, so `X-Evil : yes` becomes the header `x-evil`. A line with no
+;; colon at all is dropped rather than ending the block or being refused,
+;; so unparseable bytes disappear instead of stopping the parse.
+;;
+;; ## Both line endings are read, and that is deliberate
+;;
+;; A bare LF is not legal in a message on the wire, but real mail arrives
+;; with it and refusing the whole message would be worse than reading it.
+;; What matters is that whatever this counts as a line ending, it counts
+;; the same one everywhere -- the defect above is not that the library
+;; accepts LF, it is that it looks for one separator and settles for the
+;; other.
+;;
+;; `.cljc` stays the oracle for the codecs, the parameters and the part
+;; tree, and is not required from here (require-graph). It did not grow a
+;; second copy of the framing (ADR-2608261100).
+
+(ns mime.framing
+  (:export [main header-block-length body-start field-problem delimiter-kind]))
+
+;; --- bytes ----------------------------------------------------------------------
+;; A Kotoba string is UTF-8 and a message body is arbitrary bytes, so the
+;; walk steps by the width of whatever it is standing on. CR and LF are
+;; ASCII and cannot appear inside a multi-byte sequence, which is what makes
+;; stepping over one safe.
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- cr [] :i64 13)
+(defn- lf [] :i64 10)
+(defn- sp [] :i64 32)
+(defn- tab [] :i64 9)
+(defn- colon [] :i64 58)
+(defn- dash [] :i64 45)
+
+;; --- lines ------------------------------------------------------------------------
+
+(defn- line-end [s :string i :i64] :i64
+  (if (>= i (string-length s)) i
+      (let [c (cp s i)]
+        (if (= c (cr)) i (if (= c (lf)) i (line-end s (+ i (width c))))))))
+
+(defn- next-line [s :string i :i64] :i64
+  (let [e (line-end s i)
+        n (string-length s)]
+    (if (>= e n) n
+        (if (= (cp s e) (cr))
+          (if (>= (+ e 1) n) n (if (= (cp s (+ e 1)) (lf)) (+ e 2) (+ e 1)))
+          (+ e 1)))))
+
+;; The FIRST empty line, which is the only one §2.1 names. Not the first
+;; occurrence of some particular pair of bytes.
+(defn- first-empty-line [s :string i :i64] :i64
+  (if (>= i (string-length s)) (string-length s)
+      (if (= (line-end s i) i) i (first-empty-line s (next-line s i)))))
+
+(defn header-block-length [raw :string] :i64 (first-empty-line raw 0))
+
+(defn body-start [raw :string] :i64
+  (let [e (first-empty-line raw 0)]
+    (if (>= e (string-length raw)) (string-length raw) (next-line raw e))))
+
+;; --- one header field line (§2.2) ---------------------------------------------------
+
+(defn- colon-at [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1
+      (let [c (cp s i)]
+        (if (= c (colon)) i (colon-at s (+ i (width c)))))))
+
+;; §2.2: printable US-ASCII, 33 through 126, excluding the colon -- so a
+;; space is not a name character and neither is a control byte.
+(defn- name-ok? [s :string i :i64 end :i64] :bool
+  (if (>= i end) true
+      (let [c (cp s i)]
+        (if (< c 33) false
+            (if (> c 126) false
+                (if (= c (colon)) false (name-ok? s (+ i (width c)) end)))))))
+
+(defn field-problem [line :string] :keyword
+  (let [n (string-length line)]
+    (cond
+      (= n 0) :empty-line
+
+      ;; §2.2.3: a line beginning with whitespace continues the one before
+      ;; it. It is not a field of its own and is not an error.
+      (= (cp line 0) (sp)) :continuation
+      (= (cp line 0) (tab)) :continuation
+
+      :else
+      (let [c (colon-at line 0)]
+        (cond
+          ;; Not a field and not a continuation. The library drops it, which
+          ;; means bytes it could not read leave no trace.
+          (< c 0) :no-colon
+          (= c 0) :empty-name
+          (if (name-ok? line 0 c) false true) :bad-name-character
+          :else :none)))))
+
+;; --- a multipart delimiter line (RFC 2046 §5.1.1) --------------------------------------
+
+(defn- matches-at? [s :string i :i64 t :string j :i64] :bool
+  (if (>= j (string-length t)) true
+      (if (>= i (string-length s)) false
+          (if (= (cp s i) (cp t j))
+            (matches-at? s (+ i (width (cp s i))) t (+ j (width (cp t j))))
+            false))))
+
+;; transport-padding: any run of SP and HTAB, and nothing else, to the end
+;; of the line.
+(defn- padding-only? [s :string i :i64] :bool
+  (if (>= i (string-length s)) true
+      (let [c (cp s i)]
+        (if (= c (sp)) (padding-only? s (+ i 1))
+            (if (= c (tab)) (padding-only? s (+ i 1)) false)))))
+
+(defn delimiter-kind [line :string boundary :string] :keyword
+  (if (< (string-length line) 2) :not-a-delimiter
+      (if (= (cp line 0) (dash))
+        (if (= (cp line 1) (dash))
+          (if (matches-at? line 2 boundary 0)
+            (let [after (+ 2 (string-length boundary))
+                  n (string-length line)]
+              (if (>= (+ after 1) n)
+                (if (padding-only? line after) :delimiter :not-a-delimiter)
+                (if (= (cp line after) (dash))
+                  (if (= (cp line (+ after 1)) (dash))
+                    (if (padding-only? line (+ after 2)) :close-delimiter :not-a-delimiter)
+                    (if (padding-only? line after) :delimiter :not-a-delimiter))
+                  (if (padding-only? line after) :delimiter :not-a-delimiter))))
+            :not-a-delimiter)
+          :not-a-delimiter)
+        :not-a-delimiter)))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the three findings through the decisions above and answers 0 only
+;; when each still decides the way this object was built to decide, so a
+;; COMPILED artifact can be asked whether it is itself by a host that knows
+;; nothing about mail.
+;;
+;; Three, not ten, and that is measured: the native backends evaluate `main`
+;; as a compile-time oracle with a budget, and ten calls of this shape is
+;; `native artifact oracle evaluation rejected`. The wider check lives in
+;; the suite, which can afford it.
+
+(defn main [] :i64
+  (cond
+    (if (= (field-problem "X-Evil : yes") :bad-name-character) false true) 1
+    (if (= (delimiter-kind "--b " "b") :delimiter) false true) 2
+    (if (= (header-block-length "a: b\n\ntail") 5) false true) 3
+    :else 0))

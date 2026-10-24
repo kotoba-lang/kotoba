@@ -1,0 +1,160 @@
+;; `kotoba/mime/framing.kotoba` against `mime.parse` and `mime.header`.
+;;
+;; Framing is the first thing a mail parser decides and everything else is
+;; read off it, so a parser that puts the line somewhere else is reading a
+;; different message from every other parser that touches the same bytes.
+;;
+;;   * `the-header-block-ends-at-the-wrong-blank-line` -- RFC 5322 §2.1 puts
+;;     the body after the FIRST empty line. `split-message` searches for
+;;     `"\r\n\r\n"` and then for `"\n\n"`, and `some` returns the first
+;;     separator FOUND rather than the one occurring earliest. A message
+;;     whose headers end in a bare LF and whose body later contains a CRLF
+;;     CRLF splits at the later one, and two lines of body become two
+;;     headers.
+;;
+;;   * `transport-padding-hides-a-part` -- RFC 2046 §5.1.1 spells the
+;;     delimiter as `--boundary` followed by transport-padding and CRLF.
+;;     `split-multipart` compares with `=`, so one trailing space makes the
+;;     line invisible and the part it opened disappears.
+;;
+;;   * `a-field-name-may-not-contain-a-space` -- §2.2. `parse-headers`
+;;     takes everything before the first colon and trims it, so
+;;     `X-Evil : yes` is the header `x-evil`; and a line with no colon is
+;;     dropped rather than refused, so bytes the parser could not read
+;;     leave no trace.
+;;
+;; Parity is over the cases the library gets right -- an ordinary CRLF
+;; message, an ordinary LF message, a message with no body -- so the
+;; disagreements above are not the only thing being measured.
+
+(ns mime.framing-kotoba-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [mime.header :as h]
+            [mime.parse :as p]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "mime" "framing.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'mime.framing (slurp guest-file)}
+                                         'mime.framing :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(defn- header-block [raw] (subs raw 0 (call 'header-block-length [raw])))
+(defn- body [raw] (subs raw (call 'body-start [raw])))
+(defn- field [line] (call 'field-problem [line]))
+(defn- delim [line b] (call 'delimiter-kind [line b]))
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+;; --- parity, where the library is right ----------------------------------------------
+
+(deftest the-guest-and-split-message-agree-on-ordinary-mail
+  (doseq [[label raw]
+          [["CRLF throughout" "From: a@b\r\nSubject: hi\r\n\r\nbody\r\n"]
+           ["LF throughout" "From: a@b\nSubject: hi\n\nbody\n"]
+           ["no body at all" "From: a@b\r\nSubject: hi\r\n\r\n"]
+           ["headers and nothing else" "From: a@b\r\nSubject: hi"]
+           ["a folded field" "Subject: one\r\n  two\r\n\r\nbody"]
+           ["a body containing a lone CRLF" "From: a@b\r\n\r\nline\r\nline"]]]
+    (testing label
+      (is (= (:body (p/split-message raw)) (body raw)) "the body")
+      (is (= (count (:headers (p/split-message raw)))
+             (count (h/parse-headers (header-block raw))))
+          "and the same number of header fields"))))
+
+;; --- finding one: the blank line ---------------------------------------------------------
+
+(def ^:private injected
+  (str "From: alice@example.com\n"
+       "Subject: hello\n"
+       "\n"                                   ; §2.1 -- the headers end HERE
+       "X-Injected: yes\r\n"
+       "To: victim@example.com\r\n"
+       "\r\n"
+       "real body"))
+
+(deftest the-header-block-ends-at-the-wrong-blank-line
+  (testing "the library reads two lines of body as two headers"
+    (let [{:keys [headers body]} (p/split-message injected)]
+      (is (= [["from" "alice@example.com"] ["subject" "hello"]
+              ["x-injected" "yes"] ["to" "victim@example.com"]]
+             headers)
+          "`some` returns the first separator FOUND, not the earliest one")
+      (is (= "real body" body))))
+  (testing "the guest stops at the first empty line"
+    (is (= "From: alice@example.com\nSubject: hello\n" (header-block injected)))
+    (is (= [["from" "alice@example.com"] ["subject" "hello"]]
+           (h/parse-headers (header-block injected))))
+    (is (str/starts-with? (body injected) "X-Injected: yes")
+        "and everything after it is body, which is what it was sent as")))
+
+(deftest the-two-orderings-are-only-distinguishable-when-both-appear
+  ;; A control: with one kind of separator the library and the guest agree,
+  ;; so the test above is measuring the ordering and not the split.
+  (doseq [raw [(str/replace injected "\r\n" "\n") (str/replace injected "\n" "\r\n")]]
+    (is (= (:body (p/split-message raw)) (body raw)))))
+
+;; --- finding two: transport padding --------------------------------------------------------
+
+(def ^:private padded
+  (str "Content-Type: multipart/mixed; boundary=b\r\n\r\n"
+       "--b \r\nContent-Type: text/plain\r\n\r\nhidden\r\n"
+       "--b\r\nContent-Type: text/plain\r\n\r\nvisible\r\n--b--\r\n"))
+
+(deftest transport-padding-hides-a-part
+  (testing "the library sees one part where the message has two"
+    (is (= ["visible"] (mapv :body (:parts (p/parse padded))))
+        "the part opened by `--b ` is gone, and nothing says so"))
+  (testing "the guest reads the padding the way §5.1.1 spells it"
+    (is (= :delimiter (delim "--b " "b")))
+    (is (= :delimiter (delim "--b\t " "b")))
+    (is (= :delimiter (delim "--b" "b")))
+    (is (= :close-delimiter (delim "--b--" "b")))
+    (is (= :close-delimiter (delim "--b--  " "b"))))
+  (testing "and does not widen the delimiter into a prefix match"
+    (is (= :not-a-delimiter (delim "--bb" "b")) "a longer boundary is not this one")
+    (is (= :not-a-delimiter (delim "--b x" "b")) "padding is SP and HTAB, nothing else")
+    (is (= :not-a-delimiter (delim "-b" "b")))
+    (is (= :not-a-delimiter (delim "--" "b")))
+    (is (= :not-a-delimiter (delim "text" "b")))))
+
+;; --- finding three: the field name -----------------------------------------------------------
+
+(deftest a-field-name-may-not-contain-a-space
+  (testing "the library accepts a space before the colon"
+    (is (= [["x-evil" "yes"] ["from" "a@b"]]
+           (h/parse-headers "X-Evil : yes\r\nFrom: a@b"))
+        "§2.2 says the colon follows the name immediately"))
+  (testing "and drops a line it cannot read"
+    (is (= [["from" "a@b"]] (h/parse-headers "garbage line\r\nFrom: a@b"))
+        "the unparseable line leaves no trace at all"))
+  (testing "the guest answers each of them separately"
+    (is (= :bad-name-character (field "X-Evil : yes")))
+    (is (= :no-colon (field "garbage line")))
+    (is (= :empty-name (field ": yes")))
+    (is (= :continuation (field "  two")) "§2.2.3, which is not an error")
+    (is (= :continuation (field "\ttwo")))
+    (is (= :empty-line (field "")))
+    (is (= :none (field "X-Ok: yes")))
+    (is (= :none (field "Subject:")) "an empty value is a field")))
+
+;; --- the fuel budget --------------------------------------------------------------------------
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed. The walk is one byte
+  ;; at a time, so 8000 was written here first on the assumption that a
+  ;; whole message would need it; the interpreter default carries every
+  ;; message in this file.
+  (is (str/starts-with? (body injected) "X-Injected: yes")
+      "the default budget carries the walk over the message")
+  (is (thrown? Exception (call 'body-start [injected] 32))
+      "and thirty-two does not, so the assertion above is not vacuous"))
