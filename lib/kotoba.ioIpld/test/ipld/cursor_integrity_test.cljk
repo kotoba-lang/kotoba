@@ -1,0 +1,86 @@
+(ns ipld.cursor-integrity-test
+  "P2-3 of ADR-2608170400: disconnect -> checkpoint -> resume, and a cursor
+  state that refuses tampering.
+
+  A checkpoint is resumed work, and it travels -- handed to a peer, parked in
+  storage, handed back. Both halves matter and they fail differently: a resume
+  that returns a different result is a bug you can see, while a resume that
+  returns a confident result for a graph nobody asked for is not."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [ipld.core :as ipld]
+            [ipld.graph :as graph]
+            [ipld.link :as link]
+            [ipld.value :as value]))
+
+(defn- fixture []
+  (let [blocks (atom {})
+        put! (fn [node]
+               (let [{:keys [cid bytes]} (ipld/node->block node)]
+                 (swap! blocks assoc cid bytes)
+                 cid))
+        leaf (put! {"v" 1})
+        root (put! {"a" (link/link leaf) "b" 2})]
+    {:root root :store (fn [cid] (get @blocks cid))}))
+
+(def ^:private selector
+  {:selector :explore-all :next {:selector :explore-all :next {:selector :matcher}}})
+
+(def ^:private limits
+  {:max-blocks 16 :max-bytes 4096 :max-depth 8 :max-matches 16})
+
+(defn- run-all [cursor store]
+  (loop [cursor cursor]
+    (let [{:keys [cursor done?]} (graph/advance-cursor cursor store 64)]
+      (if done? cursor (recur cursor)))))
+
+(deftest resuming-from-a-checkpoint-returns-the-same-result
+  (let [{:keys [root store]} (fixture)
+        straight (run-all (graph/selection-cursor root selector limits) store)
+        partial (:cursor (graph/advance-cursor
+                          (graph/selection-cursor root selector limits) store 1))
+        resumed (run-all (graph/restore-cursor (graph/checkpoint-cursor partial)) store)]
+    (is (seq (:matches (graph/cursor-result straight))))
+    (is (= (graph/cursor-result straight) (graph/cursor-result resumed)))))
+
+(deftest an-edited-checkpoint-is-refused
+  (let [{:keys [root store]} (fixture)
+        partial (:cursor (graph/advance-cursor
+                          (graph/selection-cursor root selector limits) store 1))
+        bytes (graph/checkpoint-cursor partial)
+        envelope (value/decode-value bytes)
+        edit (fn [path v]
+               (try (do (graph/restore-cursor
+                         (value/encode-value (assoc-in envelope path v)))
+                        nil)
+                    (catch kerror/ExceptionInfo e (:problem (ex-data e)))))]
+    (testing "an unedited checkpoint still restores"
+      (is (some? (graph/restore-cursor bytes))))
+    (testing "swapping the root would resume against a graph nobody asked for"
+      ;; Every block read afterwards still verifies -- against the wrong root.
+      ;; Shape validation cannot see this; a content address can.
+      (is (= :checkpoint-content-address-mismatch
+             (edit [:checkpoint/cursor :root] "bafkqaaa"))))
+    (testing "widening the resource limits is also tampering"
+      (is (= :checkpoint-content-address-mismatch
+             (edit [:checkpoint/cursor :limits :max-blocks] 1000000))))
+    (testing "so is fabricating a match that never happened"
+      ;; Clearing :matches would be a no-op here -- nothing has matched yet at
+      ;; one unit of work -- and would have passed while testing nothing. The
+      ;; forgery has to add something.
+      (is (= :checkpoint-content-address-mismatch
+             (edit [:checkpoint/cursor :matches]
+                   [{:path [] :value (ipld/encode {"forged" true})}]))))))
+
+(deftest a-checkpoint-from-the-previous-format-is-told-it-is-old
+  ;; Not "corrupt". The version field exists so an old token gets an accurate
+  ;; answer rather than one that sends its holder looking for tampering.
+  (let [{:keys [root store]} (fixture)
+        partial (:cursor (graph/advance-cursor
+                          (graph/selection-cursor root selector limits) store 1))
+        envelope (value/decode-value (graph/checkpoint-cursor partial))
+        v1 (value/encode-value (-> envelope
+                                   (dissoc :checkpoint/cid)
+                                   (assoc :checkpoint/version 1)))]
+    (is (= :ipld/invalid-checkpoint
+           (try (do (graph/restore-cursor v1) nil)
+                (catch kerror/ExceptionInfo e (:type (ex-data e))))))))
