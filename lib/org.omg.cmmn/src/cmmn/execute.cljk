@@ -1,0 +1,132 @@
+(ns cmmn.execute
+  "A pure, sentry-driven interpreter for a CMMN-as-EDN case model. State is plain
+  data — inspectable, replayable, testable offline with fixture ports.
+
+  A case starts with `start`; external events are applied with `raise`. After each
+  `raise`, sentries are re-evaluated to a fixpoint, automatically activating items
+  whose entry-criteria are all satisfied. Milestones auto-complete on activation
+  (:active is immediately promoted to :completed, signifying occurrence). Done when
+  all plan-items have reached a terminal state (:completed or :terminated)."
+  (:require [cmmn.model :as m]
+            [cmmn.ports :as p]))
+
+(defn- milestone? [it] (= :milestone (:cmmn/type it)))
+(defn- task-item? [it] (contains? #{:human-task :process-task} (:cmmn/type it)))
+
+(defn- criterion-sat?
+  "True when sentry criterion `c` is satisfied given current item `states` and `items` map."
+  [c states items]
+  (let [on-id    (:cmmn/on c)
+        event    (:cmmn/event c)
+        on-state (get states on-id)]
+    (case event
+      :complete  (= :completed on-state)
+      :occur     (and (some-> (get items on-id) milestone?) (= :completed on-state))
+      :terminate (= :terminated on-state)
+      false)))
+
+(defn- entry-satisfied?
+  "True when ALL entry-criteria of `item` are satisfied and all guards pass."
+  [ports item states ctx items]
+  (let [criteria (:cmmn/entry-criteria item)]
+    (if (empty? criteria)
+      false   ; items with no criteria are auto-activated at start, not by fixpoint
+      (every? (fn [c]
+                (and (criterion-sat? c states items)
+                     (p/allow? (:guard ports) (:cmmn/if c) ctx)))
+              criteria))))
+
+(defn- exit-satisfied?
+  "True when ALL exit-criteria of `item` are satisfied and all guards pass."
+  [ports item states ctx items]
+  (let [criteria (:cmmn/exit-criteria item)]
+    (if (empty? criteria)
+      false
+      (every? (fn [c]
+                (and (criterion-sat? c states items)
+                     (p/allow? (:guard ports) (:cmmn/if c) ctx)))
+              criteria))))
+
+(defn- fixpoint
+  "Repeatedly activate available items whose entry-criteria are all satisfied,
+  and terminate active items whose exit-criteria are all satisfied. Milestones
+  are immediately promoted :active → :completed (occurred). Loops until no more
+  items change state."
+  [ports case-map state]
+  (let [items (:cmmn/items case-map)]
+    (loop [st state]
+      (let [states  (:cmmn/states st)
+            ctx     (:cmmn/ctx st)
+            entered (filterv (fn [it]
+                               (and (= :available (get states (:cmmn/id it)))
+                                    (entry-satisfied? ports it states ctx items)))
+                             (vals items))
+            exited  (filterv (fn [it]
+                               (and (= :active (get states (:cmmn/id it)))
+                                    (exit-satisfied? ports it states ctx items)))
+                             (vals items))]
+        (if (and (empty? entered) (empty? exited))
+          st
+          (recur
+           (as-> st s
+             (reduce (fn [s it]
+                       (let [iid (:cmmn/id it)
+                             s'  (assoc-in s [:cmmn/states iid] :active)]
+                         (if (milestone? it)
+                           (assoc-in s' [:cmmn/states iid] :completed)
+                           s')))
+                     s entered)
+             (reduce (fn [s it]
+                       (assoc-in s [:cmmn/states (:cmmn/id it)] :terminated))
+                     s exited))))))))
+
+(defn- compute-done?
+  "True when all item states are terminal (:completed or :terminated)."
+  [states]
+  (every? (fn [s] (contains? #{:completed :terminated} s)) (vals states)))
+
+(defn start
+  "Build the initial case state from `ports`, `case-map`, and context `ctx`.
+  Items with no entry-criteria are :active immediately (milestones → :completed).
+  Items with entry-criteria start as :available.
+  Runs a fixpoint pass in case any available items are already satisfiable.
+  Returns {:cmmn/states {id state} :cmmn/ctx ctx :cmmn/done? bool}."
+  ([ports case-map] (start ports case-map {}))
+  ([ports case-map ctx]
+   (let [items  (:cmmn/items case-map)
+         states (into {}
+                      (map (fn [it]
+                             (let [iid      (:cmmn/id it)
+                                   no-entry (empty? (:cmmn/entry-criteria it))]
+                               [iid (cond
+                                      (and no-entry (milestone? it)) :completed
+                                      no-entry                       :active
+                                      :else                          :available)]))
+                           (vals items)))
+         init   {:cmmn/states states :cmmn/ctx ctx :cmmn/done? false}
+         st     (fixpoint ports case-map init)]
+     (assoc st :cmmn/done? (compute-done? (:cmmn/states st))))))
+
+(defn raise
+  "Apply an external event `{:cmmn/item item-id :cmmn/event event}` to `state`.
+  Marks the named item :completed (or :terminated for a :terminate event),
+  running ITask for task items, then re-evaluates all available items'
+  entry-criteria and active items' exit-criteria to a fixpoint. Returns the
+  new state."
+  [ports case-map state {:cmmn/keys [item event]}]
+  (let [items     (:cmmn/items case-map)
+        it        (get items item)
+        ctx'      (if (task-item? it)
+                    (p/run (:task ports) it (:cmmn/ctx state))
+                    (:cmmn/ctx state))
+        new-state (if (= :terminate event) :terminated :completed)
+        state'    (-> state
+                      (assoc :cmmn/ctx ctx')
+                      (assoc-in [:cmmn/states item] new-state))
+        state'    (fixpoint ports case-map state')]
+    (assoc state' :cmmn/done? (compute-done? (:cmmn/states state')))))
+
+(defn done?
+  "True when all plan-items in `state` have reached a terminal state."
+  [state]
+  (:cmmn/done? state))
