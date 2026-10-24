@@ -58,6 +58,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.systemverilog` | `org.ieee.systemverilog/src` | `systemverilog.assertion`, `systemverilog.class`, `systemverilog.datatype`, `systemverilog.interface` (an external specification, publisher ieee.org) |
 | `org.ieee.tar` | `org.ieee.tar/src` | `tar.bytes`, `tar.core` (an external specification, publisher ieee.org) |
 | `org.ieee.upf` | `org.ieee.upf/src` | `upf.domain`, `upf.parser`, `upf.power-state`, `upf.strategy` (an external specification, publisher ieee.org) |
+| `org.ieee.vhdl` | `org.ieee.vhdl/src` | `vhdl.architecture`, `vhdl.entity`, `vhdl.parser`, `vhdl.signal` (an external specification, publisher ieee.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
