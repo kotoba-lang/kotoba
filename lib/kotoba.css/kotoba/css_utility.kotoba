@@ -1,0 +1,466 @@
+(ns css-utility
+  ;; No :export: the parity harness appends zero-arg case defns and executes
+  ;; them via KIR, exactly as css_core.kotoba / css_document.kotoba do.
+  ;; Schemas alone enable record-new/record-get.
+  ;;
+  ;; T5.2 convention: multi-argument pure functions are folded into a single
+  ;; guest record.
+  (:schemas {:util/prefix   [:record :util/prefix   [[:s :string] [:p :string]]]
+             :util/pfx-scan [:record :util/pfx-scan [[:s :string] [:p :string]
+                                                     [:index :i64]]]
+             :util/pos      [:record :util/pos      [[:s :string] [:index :i64]]]
+             :util/scan     [:record :util/scan     [[:s :string] [:index :i64]
+                                                     [:acc :string]]]
+             :util/decl     [:record :util/decl     [[:prop :string]
+                                                     [:value :string]]]
+             :util/decl2    [:record :util/decl2    [[:prop-a :string]
+                                                     [:prop-b :string]
+                                                     [:value :string]]]}))
+
+;; A `.kotoba` port of the string-producing decisions in `css.utility`
+;; (ADR-2607270100 §10, form A: pure functions that return :string, no
+;; capabilities, so the whole module sits in the kotoba/pure profile).
+;;
+;; WHAT CROSSED, AND WHAT DID NOT
+;;
+;;   crossed  escape-class, the class selector it builds, the sm/md/dark
+;;            variant split, the variant -> media-query lookup, the spacing
+;;            scale lookup, and the *regex-driven* families of the private
+;;            `base-utility-rule`: gap/p/px/py/pt/pb/mt/mb/mx-N, w/h-N,
+;;            grid-cols-N, max-w-[V], grid-cols-[V], text-[Npx].
+;;
+;;   host     `static-utilities`. It is a 90-entry table and a Kotoba typed
+;;            map holds at most 31 entries (compiler `max-typed-map-entries`
+;;            = 31, measured, not guessed); its values are also heterogeneous
+;;            (keyword / string / long / double), while `[:map K V]` is
+;;            homogeneous. Transcribing it is data entry, not a decision, so
+;;            it stays where it is.
+;;
+;;   host     `opacity-N`. The .cljc divides by 100 into a double and lets the
+;;            host print it (`0.5`, `1.0`). There is a `string-from-i64` head
+;;            but no f64 printer, so reproducing Java's Double/toString
+;;            byte-for-byte would be a numeric-formatting project, not a CSS
+;;            one. `utility-declarations` reports it as :err "unsupported",
+;;            and the parity test pins that boundary as a fixture.
+;;
+;;   host     `rules` / `media-rules` / `unsupported`. They build maps keyed by
+;;            selector (media-rules a map of maps); their per-token string
+;;            decisions are exactly what this module provides.
+;;
+;; NO REGEX. There is no regex head in Kotoba, so every pattern here is a
+;; hand-written scan. Every scan advances by whole code points, because
+;; `string-code-point-at` and `string-substring` both TRAP on an index that
+;; splits a UTF-8 code point (kotoba-kir `utf8-code-point-at!` /
+;; `utf8-substring!`) -- byte-at-a-time walking is a trap waiting for the
+;; first non-ASCII token.
+;;
+;; ERRORS ARE VALUES. `css.core` throws on a value that could break out of the
+;; rule; a Kotoba guest has no throw, so the breakout guard returns
+;; [:result :string :string].
+
+;; --- UTF-8 walking --------------------------------------------------------
+
+(defn utf8-len [cp :i64] :i64
+  ;; Byte width of CP's UTF-8 encoding; the documented way to advance a
+  ;; string cursor with a single string-code-point-at per step.
+  (if (< cp 128) 1
+      (if (< cp 2048) 2
+          (if (< cp 65536) 3 4))))
+
+(defn prefix-match-from [x [:ref :util/pfx-scan]] :bool
+  ;; Code-point-wise "does S start with P". INDEX is a code-point boundary in
+  ;; both strings whenever every earlier byte matched, which is the only
+  ;; reason string-code-point-at is safe to call here.
+  (let [s (record-get x :s)
+        p (record-get x :p)
+        i (record-get x :index)]
+    (if (>= i (string-byte-length p)) true
+        (if (>= i (string-byte-length s)) false
+            (let [cs (string-code-point-at s i)
+                  cp (string-code-point-at p i)]
+              (if (= cs cp)
+                (prefix-match-from (record-new [:ref :util/pfx-scan]
+                                               s p (+ i (utf8-len cp))))
+                false))))))
+
+(defn starts-with? [x [:ref :util/prefix]] :bool
+  (prefix-match-from (record-new [:ref :util/pfx-scan]
+                                 (record-get x :s) (record-get x :p) 0)))
+
+(defn drop-prefix [x [:ref :util/prefix]] :string
+  ;; Only call after starts-with?: the prefix length is then a code-point
+  ;; boundary, which string-substring requires.
+  (let [s (record-get x :s)]
+    (string-substring s (string-byte-length (record-get x :p))
+                      (string-byte-length s))))
+
+;; --- escape-class ---------------------------------------------------------
+;; The .cljc is `(str/replace token #"[^a-zA-Z0-9_-]" #(str "\\" %))`. Java's
+;; regex engine matches a character class per CODE POINT (Character.codePointAt
+;; internally), so a supplementary character gets one backslash, not one per
+;; UTF-16 unit -- this walk agrees with that.
+
+(defn class-safe-cp? [cp :i64] :bool
+  ;; [a-zA-Z0-9_-]. Written as nested `if` rather than `or`, because `or`
+  ;; yields an i64 in this profile and folding bools through it is a type
+  ;; error, not a shorthand.
+  (if (= cp 45) true                    ; -
+      (if (= cp 95) true                ; _
+          (if (< cp 48) false
+              (if (<= cp 57) true       ; 0-9
+                  (if (< cp 65) false
+                      (if (<= cp 90) true   ; A-Z
+                          (if (< cp 97) false
+                              (if (<= cp 122) true  ; a-z
+                                  false)))))))))
+
+(defn escape-from [x [:ref :util/scan]] :string
+  (let [s (record-get x :s)
+        i (record-get x :index)
+        acc (record-get x :acc)]
+    (if (>= i (string-byte-length s)) acc
+        (let [cp (string-code-point-at s i)
+              n (utf8-len cp)
+              ch (string-substring s i (+ i n))]
+          (escape-from (record-new [:ref :util/scan] s (+ i n)
+                                   (string-concat
+                                    acc
+                                    (if (class-safe-cp? cp)
+                                      ch
+                                      (string-concat "\\" ch)))))))))
+
+(defn escape-class [token :string] :string
+  (escape-from (record-new [:ref :util/scan] token 0 "")))
+
+(defn class-selector [token :string] :string
+  ;; The `(str "." (escape-class token))` that `rules` and `media-rules` build.
+  (string-concat "." (escape-class token)))
+
+;; --- variant-token --------------------------------------------------------
+;; The .cljc is `(re-matches #"(sm|md|dark):(.+)" token)`. `.` in a Java
+;; pattern matches any character EXCEPT a line terminator, and re-matches
+;; anchors both ends, so the base matches exactly when it is non-empty and
+;; contains none of \n \r U+0085 U+2028 U+2029.
+;;
+;; (Measured divergence in the ORIGINAL, not in this port: a JS regex, i.e.
+;; the :cljs branch of the same .cljc, excludes only \n \r U+2028 U+2029 from
+;; `.`, so `"sm:ab"` is a variant token on ClojureScript and is not on
+;; the JVM. This port follows the JVM, which is what the parity gate runs.)
+
+(defn line-terminator-cp? [cp :i64] :bool
+  (if (= cp 10) true
+      (if (= cp 13) true
+          (if (= cp 133) true
+              (if (= cp 8232) true
+                  (if (= cp 8233) true false))))))
+
+(defn has-line-terminator? [x [:ref :util/pos]] :bool
+  (let [s (record-get x :s)
+        i (record-get x :index)]
+    (if (>= i (string-byte-length s)) false
+        (let [cp (string-code-point-at s i)]
+          (if (line-terminator-cp? cp) true
+              (has-line-terminator?
+               (record-new [:ref :util/pos] s (+ i (utf8-len cp)))))))))
+
+(defn variant-base-for [x [:ref :util/prefix]] :string
+  ;; "" when this prefix does not apply, or when what follows is not a legal
+  ;; `.+` match. A legal base is never "", so "" is an unambiguous "no".
+  (if (starts-with? x)
+    (let [base (drop-prefix x)]
+      (if (= (string-byte-length base) 0) ""
+          (if (has-line-terminator? (record-new [:ref :util/pos] base 0)) ""
+              base)))
+    ""))
+
+(defn variant-base [token :string] :string
+  ;; Second element of the .cljc's [variant base], or "" when there is none.
+  (let [sm (variant-base-for (record-new [:ref :util/prefix] token "sm:"))]
+    (if (> (string-byte-length sm) 0) sm
+        (let [md (variant-base-for (record-new [:ref :util/prefix] token "md:"))]
+          (if (> (string-byte-length md) 0) md
+              (variant-base-for (record-new [:ref :util/prefix] token "dark:")))))))
+
+(defn variant-of [token :string] :string
+  ;; First element of the .cljc's [variant base], or "" when there is none.
+  (if (> (string-byte-length
+          (variant-base-for (record-new [:ref :util/prefix] token "sm:"))) 0)
+    "sm"
+    (if (> (string-byte-length
+            (variant-base-for (record-new [:ref :util/prefix] token "md:"))) 0)
+      "md"
+      (if (> (string-byte-length
+              (variant-base-for (record-new [:ref :util/prefix] token "dark:"))) 0)
+        "dark"
+        ""))))
+
+(defn media-query [variant :string] :string
+  ;; `variant-media`. Three entries, well inside the 31-entry typed-map limit.
+  (option-value-of
+   [:option :string]
+   (typed-map-get [:map :string :string]
+                  (typed-map-new [:map :string :string]
+                                 "sm" "(min-width: 40rem)"
+                                 "md" "(min-width: 48rem)"
+                                 "dark" "(prefers-color-scheme: dark)")
+                  variant)
+   ""))
+
+;; --- numbers --------------------------------------------------------------
+;; `\d` in a Java pattern without UNICODE_CHARACTER_CLASS is ASCII 0-9 only.
+
+(defn digit-run [x [:ref :util/pos]] :i64
+  ;; Byte index of the first non-digit at or after INDEX. Advancing by 1 is
+  ;; safe because every byte it steps over is a one-byte ASCII digit, so the
+  ;; cursor stays on a code-point boundary.
+  (let [s (record-get x :s)
+        i (record-get x :index)]
+    (if (>= i (string-byte-length s)) i
+        (let [cp (string-code-point-at s i)]
+          (if (< cp 48) i
+              (if (> cp 57) i
+                  (digit-run (record-new [:ref :util/pos] s (+ i 1)))))))))
+
+(defn int-token? [s :string] :bool
+  ;; \d+
+  (let [len (string-byte-length s)]
+    (if (= len 0) false
+        (if (= (digit-run (record-new [:ref :util/pos] s 0)) len) true false))))
+
+(defn number-token? [s :string] :bool
+  ;; \d+(?:\.\d+)?
+  (let [len (string-byte-length s)
+        a (digit-run (record-new [:ref :util/pos] s 0))]
+    (if (= a 0) false
+        (if (= a len) true
+            (if (= (string-code-point-at s a) 46)   ; '.'
+              (let [b (digit-run (record-new [:ref :util/pos] s (+ a 1)))]
+                (if (= b (+ a 1)) false
+                    (if (= b len) true false)))
+              false)))))
+
+(defn spacing-value [n :string] :string
+  ;; `spacing-scale`. 16 entries, inside the 31-entry typed-map limit.
+  ;; "" means "not on the scale", which is the .cljc's inner when-let failing.
+  (option-value-of
+   [:option :string]
+   (typed-map-get [:map :string :string]
+                  (typed-map-new [:map :string :string]
+                                 "0" "0" "0.5" "0.125rem" "1" "0.25rem"
+                                 "1.5" "0.375rem" "2" "0.5rem" "2.5" "0.625rem"
+                                 "3" "0.75rem" "4" "1rem" "8" "2rem"
+                                 "12" "3rem" "14" "3.5rem" "16" "4rem"
+                                 "20" "5rem" "24" "6rem" "28" "7rem"
+                                 "80" "20rem")
+                  n)
+   ""))
+
+;; --- declaration text -----------------------------------------------------
+;; `css.core/declarations` renders "prop: value;" and joins with a space, in
+;; the map's own order. A two-property utility is compared against a key-sorted
+;; run of css.core, so the two names below are in ascending key order --
+;; see the ORDERING note in the parity test.
+
+(defn decl1 [x [:ref :util/decl]] :string
+  (string-concat (record-get x :prop)
+                 (string-concat ": " (string-concat (record-get x :value) ";"))))
+
+(defn decl2 [x [:ref :util/decl2]] :string
+  (let [v (record-get x :value)]
+    (string-concat
+     (decl1 (record-new [:ref :util/decl] (record-get x :prop-a) v))
+     (string-concat
+      " "
+      (decl1 (record-new [:ref :util/decl] (record-get x :prop-b) v))))))
+
+;; --- breakout guard (the same four sequences as css.core / css_core) -------
+
+(defn safe? [s :string] :bool
+  (if (string-contains? s "{") false
+      (if (string-contains? s "}") false
+          (if (string-contains? s ";") false
+              (if (string-contains? s "/*") false true)))))
+
+;; --- spacing family -------------------------------------------------------
+;; (gap|p|px|py|pt|pb|mt|mb|mx)-(\d+(?:\.\d+)?) then a spacing-scale lookup.
+;;
+;; The regex alternation looks order-sensitive ("p" precedes "px") but is not:
+;; the "-" separator makes the nine prefixes mutually exclusive, since no
+;; "<prefix>-" is a prefix of another "<prefix>-".
+
+(defn scale-for [x [:ref :util/prefix]] :string
+  (if (starts-with? x)
+    (let [n (drop-prefix x)]
+      (if (number-token? n) (spacing-value n) ""))
+    ""))
+
+(defn int-scale-for [x [:ref :util/prefix]] :string
+  ;; (w|h)-(\d+): integers only, no decimal form.
+  (if (starts-with? x)
+    (let [n (drop-prefix x)]
+      (if (int-token? n) (spacing-value n) ""))
+    ""))
+
+(defn spacing-decls [token :string] :string
+  (let [gap (scale-for (record-new [:ref :util/prefix] token "gap-"))]
+    (if (> (string-byte-length gap) 0)
+      (decl1 (record-new [:ref :util/decl] "gap" gap))
+      (let [p (scale-for (record-new [:ref :util/prefix] token "p-"))]
+        (if (> (string-byte-length p) 0)
+          (decl1 (record-new [:ref :util/decl] "padding" p))
+          (let [px (scale-for (record-new [:ref :util/prefix] token "px-"))]
+            (if (> (string-byte-length px) 0)
+              (decl2 (record-new [:ref :util/decl2]
+                                 "padding-left" "padding-right" px))
+              (let [py (scale-for (record-new [:ref :util/prefix] token "py-"))]
+                (if (> (string-byte-length py) 0)
+                  (decl2 (record-new [:ref :util/decl2]
+                                     "padding-bottom" "padding-top" py))
+                  (let [pt (scale-for (record-new [:ref :util/prefix] token "pt-"))]
+                    (if (> (string-byte-length pt) 0)
+                      (decl1 (record-new [:ref :util/decl] "padding-top" pt))
+                      (let [pb (scale-for (record-new [:ref :util/prefix] token "pb-"))]
+                        (if (> (string-byte-length pb) 0)
+                          (decl1 (record-new [:ref :util/decl] "padding-bottom" pb))
+                          (let [mt (scale-for (record-new [:ref :util/prefix] token "mt-"))]
+                            (if (> (string-byte-length mt) 0)
+                              (decl1 (record-new [:ref :util/decl] "margin-top" mt))
+                              (let [mb (scale-for (record-new [:ref :util/prefix] token "mb-"))]
+                                (if (> (string-byte-length mb) 0)
+                                  (decl1 (record-new [:ref :util/decl] "margin-bottom" mb))
+                                  (let [mx (scale-for (record-new [:ref :util/prefix] token "mx-"))]
+                                    (if (> (string-byte-length mx) 0)
+                                      (decl2 (record-new [:ref :util/decl2]
+                                                         "margin-left" "margin-right" mx))
+                                      "")))))))))))))))))))
+
+(defn size-decls [token :string] :string
+  (let [w (int-scale-for (record-new [:ref :util/prefix] token "w-"))]
+    (if (> (string-byte-length w) 0)
+      (decl1 (record-new [:ref :util/decl] "width" w))
+      (let [h (int-scale-for (record-new [:ref :util/prefix] token "h-"))]
+        (if (> (string-byte-length h) 0)
+          (decl1 (record-new [:ref :util/decl] "height" h))
+          "")))))
+
+(defn grid-cols-n-decls [token :string] :string
+  ;; grid-cols-(\d+) -> repeat(N,minmax(0,1fr)). N is spliced verbatim, digits
+  ;; only, so it cannot carry a breakout sequence.
+  (let [x (record-new [:ref :util/prefix] token "grid-cols-")]
+    (if (starts-with? x)
+      (let [n (drop-prefix x)]
+        (if (int-token? n)
+          (decl1 (record-new [:ref :util/decl] "grid-template-columns"
+                             (string-concat "repeat("
+                                            (string-concat n ",minmax(0,1fr))"))))
+          ""))
+      "")))
+
+;; --- bracketed families ---------------------------------------------------
+;; max-w-\[([^]]+)\] and grid-cols-\[([^]]+)\]. `[^]]+` is a character class,
+;; so unlike `.` it does match line terminators; the only constraints are
+;; non-empty and no "]" inside, which is exactly "the first ']' after the
+;; prefix is the last byte of the token".
+
+(defn first-bracket [x [:ref :util/pos]] :i64
+  (let [s (record-get x :s)
+        i (record-get x :index)]
+    (if (>= i (string-byte-length s)) (- 0 1)
+        (let [cp (string-code-point-at s i)]
+          (if (= cp 93) i
+              (first-bracket (record-new [:ref :util/pos] s
+                                         (+ i (utf8-len cp)))))))))
+
+(defn bracket-body [x [:ref :util/prefix]] :string
+  (if (starts-with? x)
+    (let [s (record-get x :s)
+          pl (string-byte-length (record-get x :p))
+          j (first-bracket (record-new [:ref :util/pos] s pl))]
+      (if (= j (- (string-byte-length s) 1))
+        (if (> j pl) (string-substring s pl j) "")
+        ""))
+    ""))
+
+(defn text-px-decls [token :string] :string
+  ;; text-\[(\d+)px\] -> font-size: Npx.
+  (let [body (bracket-body (record-new [:ref :util/prefix] token "text-["))
+        bl (string-byte-length body)
+        a (digit-run (record-new [:ref :util/pos] body 0))]
+    (if (= a 0) ""
+        (if (= (- bl a) 2)
+          (if (= (string-code-point-at body a) 112)          ; 'p'
+            (if (= (string-code-point-at body (+ a 1)) 120)  ; 'x'
+              (decl1 (record-new [:ref :util/decl] "font-size" body))
+              "")
+            "")
+          ""))))
+
+;; --- the dispatcher -------------------------------------------------------
+;; The .cljc's `base-utility-rule` is an `or` chain. Everything above produces
+;; values that are constant or digits-only, so it cannot fail the breakout
+;; guard; the two bracketed families carry author-supplied text and can, so
+;; they are handled after, where an :err is available.
+
+(defn constant-decls [token :string] :string
+  (let [a (spacing-decls token)]
+    (if (> (string-byte-length a) 0) a
+        (let [b (size-decls token)]
+          (if (> (string-byte-length b) 0) b
+              (let [c (grid-cols-n-decls token)]
+                (if (> (string-byte-length c) 0) c
+                    (text-px-decls token))))))))
+
+(defn utility-declarations [token :string] [:result :string :string]
+  (let [plain (constant-decls token)]
+    (if (> (string-byte-length plain) 0)
+      (result-ok-of [:result :string :string] plain)
+      (let [mw (bracket-body (record-new [:ref :util/prefix] token "max-w-["))]
+        (if (> (string-byte-length mw) 0)
+          (if (safe? mw)
+            (result-ok-of [:result :string :string]
+                          (decl1 (record-new [:ref :util/decl] "max-width" mw)))
+            (result-err-of [:result :string :string]
+                           "unsafe value for max-width"))
+          (let [gc (bracket-body (record-new [:ref :util/prefix]
+                                             token "grid-cols-["))]
+            (if (> (string-byte-length gc) 0)
+              (let [v (string-replace-all gc "_" " ")]
+                (if (safe? v)
+                  (result-ok-of [:result :string :string]
+                                (decl1 (record-new [:ref :util/decl]
+                                                   "grid-template-columns" v)))
+                  (result-err-of [:result :string :string]
+                                 "unsafe value for grid-template-columns")))
+              (result-err-of [:result :string :string] "unsupported"))))))))
+
+(defn utility-token-base [token :string] :string
+  ;; `utility-rule` looks the *base* up when the token carries a variant, and
+  ;; the token itself otherwise.
+  (let [b (variant-base token)]
+    (if (> (string-byte-length b) 0) b token)))
+
+(defn rule-declarations [token :string] [:result :string :string]
+  ;; The public `utility-rule`, rendered. `utility-declarations` above is the
+  ;; private `base-utility-rule`; this is the variant-stripping wrapper.
+  (utility-declarations (utility-token-base token)))
+
+(defn utility-rule-text [token :string] [:result :string :string]
+  ;; What `rules` and `media-rules` hand to css.core/rule for one token:
+  ;; ".<escaped-full-token> { <declarations of its base> }".
+  (let [sel (class-selector token)]
+    (if (safe? sel)
+      (match-result (rule-declarations token) [:result :string :string]
+                    (ok body
+                        (result-ok-of [:result :string :string]
+                                      (string-concat
+                                       sel
+                                       (string-concat
+                                        " { " (string-concat body " }")))))
+                    (err message
+                         (result-err-of [:result :string :string] message)))
+      (result-err-of [:result :string :string] "unsafe selector"))))
+
+(defn main []
+  ;; Self-check: a rule css.utility + css.core produce identically.
+  (string-byte-length
+   (result-value-of [:result :string :string] (utility-rule-text "px-4") "")))

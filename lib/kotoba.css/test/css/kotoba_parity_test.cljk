@@ -1,0 +1,127 @@
+(ns css.kotoba-parity-test
+  "Byte-equality gate between css.core and its `.kotoba` port
+  (kotoba/css_core.kotoba), the first step of the design-system migration in
+  ADR-2607270100 section 10.
+
+  The port is compiled here and executed through the KIR interpreter in this
+  same JVM, so nothing crosses a runtime boundary and no typed value has to be
+  marshalled from Clojure: each case is generated as a zero-argument `.kotoba`
+  function whose whole body is the call under test, and the interpreter hands
+  back the resulting string directly.
+
+  ORDERING. `css.core/declarations` walks a Clojure map, whose order is
+  insertion-defined only up to 8 entries and hash-defined above it, so its
+  output order is unspecified for a larger rule. The port walks a
+  `[:map :keyword :string]` with `typed-map-entry-at`, which is sorted by key
+  and therefore deterministic. Parity is asserted against a key-sorted run of
+  css.core -- that is the honest comparison, and the difference is a finding
+  about the original, not about the port.
+
+  T5.2: multi-arg pure folded into guest records; cases call via record-new."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [css.core :as css]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def port-source (slurp "lib/kotoba.css/kotoba/css_core.kotoba"))
+
+(defn- kotoba-literal
+  "A `.kotoba` string literal for S. Only the two escapes the reader needs."
+  [s]
+  (str \" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) \"))
+
+(defn- compile-cases
+  "Compile the port plus one zero-arg function per case. Returns a map of
+  case-name -> the string that function evaluates to."
+  [cases]
+  (let [defs (for [[name body] cases]
+               (str "(defn " name " [] :string " body ")"))
+        kir (:kir (compiler/compile-source
+                   (str port-source "\n" (str/join "\n" defs)) :wasm32-kotoba-v1 {}))]
+    (into {} (map (fn [[name _]] [name (ir/execute kir (symbol name) [])])) cases)))
+
+(defn- typed-map-literal [decls]
+  (str "(typed-map-new [:map :keyword :string] "
+       (str/join " " (mapcat (fn [[k v]] [(pr-str k) (kotoba-literal v)])
+                             (sort-by (comp str key) decls)))
+       ")"))
+
+(defn- unwrap [expr]
+  (str "(result-value-of [:result :string :string] " expr " \"\")"))
+
+(defn- rule-call [selector decls]
+  (str "(rule (record-new [:ref :css/rule] "
+       (kotoba-literal selector) " " (typed-map-literal decls) "))"))
+
+(defn- declaration-call [prop value]
+  (str "(declaration (record-new [:ref :css/declaration] "
+       (pr-str prop) " " (kotoba-literal value) "))"))
+
+(defn- number-value-call [prop n]
+  (str "(number-value (record-new [:ref :css/number-value] "
+       (pr-str prop) " " n "))"))
+
+;; --- the corpus -----------------------------------------------------------
+;; Real rules taken from css.core/operator-theme, with the numeric values
+;; already reduced to text by value-str so both sides render the same input.
+;; The numeric path itself is covered separately by number-value-matches-value-str.
+
+(def rule-corpus
+  {".card"    {:background "#fff" :border "1px solid #e5e5e5"
+               :border-radius "8px" :padding "16px" :margin-bottom "16px"}
+   "body"     {:font-family "system-ui,-apple-system,sans-serif"
+               :margin "0" :color "#1a1a1a" :background "#fafafa"}
+   "th"       {:font-weight "600" :color "#555" :font-size "12px"
+               :text-transform "uppercase" :letter-spacing "0.04em"}
+   "td.amt"   {:font-variant-numeric "tabular-nums" :text-align "right"}
+   ".muted"   {:color "#888"}
+   "main"     {:max-width "980px" :margin "24px auto" :padding "0 20px"}})
+
+(deftest rule-output-is-byte-identical-to-css-core
+  (let [cases (into {} (map-indexed (fn [i [selector decls]]
+                                      [(str "case_" i)
+                                       (unwrap (rule-call selector decls))])
+                                    rule-corpus))
+        actual (compile-cases cases)]
+    (doseq [[i [selector decls]] (map-indexed vector rule-corpus)]
+      (testing selector
+        ;; sorted-map so css.core walks the same order the port does
+        (is (= (css/rule selector (into (sorted-map) decls))
+               (get actual (str "case_" i))))))))
+
+(deftest number-value-matches-value-str
+  (let [props [:padding :margin :font-size :width          ; unit-bearing
+               :opacity :z-index :line-height :font-weight ; unitless
+               :flex-grow :order :columns]
+        numbers [0 1 2 8 12 16 24 100 980 65535]
+        cases (into {} (for [p props n numbers]
+                         [(str "n_" (str/replace (name p) "-" "_") "_" n)
+                          (number-value-call p n)]))
+        actual (compile-cases cases)]
+    (doseq [p props n numbers]
+      (testing (str p " " n)
+        (is (= (css/value-str p n)
+               (get actual (str "n_" (str/replace (name p) "-" "_") "_" n))))))))
+
+(deftest the-breakout-guard-rejects-what-css-core-throws-on
+  (let [hostile ["red; } .evil { background: url(x)"
+                 "red } .evil {"
+                 "red; color: blue"
+                 "red /* swallow"]
+        cases (into {} (map-indexed
+                        (fn [i v] [(str "guard_" i)
+                                   (str "(match-result " (declaration-call :color v)
+                                        " [:result :string :string]"
+                                        " (ok text text) (err message \"REJECTED\"))")])
+                        hostile))
+        actual (compile-cases cases)]
+    (doseq [[i v] (map-indexed vector hostile)]
+      (testing v
+        ;; css.core throws; the port returns the failure as an :err value.
+        ;; Both refuse to emit the text -- neither silently produces it.
+        (is (thrown? kerror/ExceptionInfo (css/style {:color v})))
+        (is (= "REJECTED" (get actual (str "guard_" i))))))
+    (testing "a safe value still renders"
+      (is (= {"safe" "color: red;"}
+             (compile-cases {"safe" (unwrap (declaration-call :color "red"))}))))))
