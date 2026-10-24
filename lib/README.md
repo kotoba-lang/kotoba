@@ -88,6 +88,26 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kamiUsdNative` | `kotoba.kamiUsdNative/src` | `usd-native` (Kotoba project library) |
+| `kotoba.kamiStudio` | `kotoba.kamiStudio/src` | `kami.studio.ui` (Kotoba project library) |
+| `kotoba.kamiOngakuSampler` | `kotoba.kamiOngakuSampler/src` | `kami.ongaku.sampler` (Kotoba project library) |
+| `kotoba.kamiOngakuSequencer` | `kotoba.kamiOngakuSequencer/src` | `kami.ongaku.sequencer`, `kami.ongaku.sequencer.smf` (Kotoba project library) |
+| `kotoba.kamiOngakuPluginHost` | `kotoba.kamiOngakuPluginHost/src` | `kami.ongaku.plugin-host`, `kami.ongaku.plugin-host.graph` (Kotoba project library) |
+| `kotoba.kamiMangakaText` | `kotoba.kamiMangakaText/src` | `kami.mangaka.hiccup`, `kami.mangaka.text` (Kotoba project library) |
+| `kotoba.kamiMangakaSceneAuthor` | `kotoba.kamiMangakaSceneAuthor/src` | `kami.mangaka.scene` (Kotoba project library) |
+| `kotoba.kamiMangakaScene` | `kotoba.kamiMangakaScene/src` | `mangaka-scene`, `mangaka-scene.camera`, `mangaka-scene.lexicon`, `mangaka-scene.pose` (Kotoba project library) |
+| `kotoba.kamiMangakaRender` | `kotoba.kamiMangakaRender/src` | `kami.mangaka.render` (Kotoba project library) |
+| `kotoba.kamiMangakaQa` | `kotoba.kamiMangakaQa/src` | `kami.mangaka.qa.axes`, `kami.mangaka.qa.geometry`, `kami.mangaka.qa.overlay`, `kami.mangaka.qa.perception` (Kotoba project library) |
+| `kotoba.kamiIsekaiAssets` | `kotoba.kamiIsekaiAssets/src` | `kami.isekai.catalog`, `kami.isekai.chargen`, `kami.isekai.classes`, `kami.isekai.equipment` (Kotoba project library) |
+| `kotoba.kamiGenSdfAgent` | `kotoba.kamiGenSdfAgent/src` | `kami.gen.sdf-agent`, `kami.gen.sdf-agent.critique`, `kami.gen.sdf-agent.propose`, `kami.gen.sdf-agent.render` (Kotoba project library) |
+| `kotoba.scad` | `kotoba.scad/src` | `scad`, `scad.csg`, `scad.evaluator`, `scad.parser` (Kotoba project library) |
+| `kotoba.vegetation` | `kotoba.vegetation/src` | `vegetation`, `vegetation.cull`, `vegetation.instance`, `vegetation.lod` (Kotoba project library) |
+| `kotoba.mesher` | `kotoba.mesher/src` | `mesher`, `mesher.mc-tables` (Kotoba project library) |
+| `kotoba.kamiEngineSculpt` | `kotoba.kamiEngineSculpt/src` | `kami.paint`, `kami.sculpt` (Kotoba project library) |
+| `kotoba.kamiEngineInputMap` | `kotoba.kamiEngineInputMap/src` | `input-map` (Kotoba project library) |
+| `kotoba.kamiEngineHudGpu` | `kotoba.kamiEngineHudGpu/src` | `ui_gpu` (Kotoba project library) |
+| `kotoba.kamiEngineGuest` | `kotoba.kamiEngineGuest/src` | `kotoba.engine-clj`, `kotoba.engine-clj.ast`, `kotoba.engine-clj.codegen`, `kotoba.engine-clj.component` (Kotoba project library) |
+| `kotoba.kamiEngWeb` | `kotoba.kamiEngWeb/src` | `eng-web`, `eng-web.cam`, `eng-web.coverage`, `eng-web.dft` (Kotoba project library) |
 | `kotoba.kamiArticulated` | `kotoba.kamiArticulated/src` | `kami_articulated`, `kami_articulated.urdf` (Kotoba project library) |
 | `kotoba.kamiAppQuarryWalk` | `kotoba.kamiAppQuarryWalk/src` | `kami-app-quarry-walk` (Kotoba project library) |
 | `kotoba.nagare` | `kotoba.nagare/src` | `nagare.demo`, `nagare.diagnostics`, `nagare.field`, `nagare.fvm` (Kotoba project library) |

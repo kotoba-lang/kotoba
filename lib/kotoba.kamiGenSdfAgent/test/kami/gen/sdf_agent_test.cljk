@@ -1,0 +1,182 @@
+(ns kami.gen.sdf-agent-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.io :as io]
+            [kami.gen.sdf-agent :as agent]
+            [kami.gen.sdf-agent.sdf :as sdf]
+            [kami.gen.sdf-agent.render :as render]
+            [kami.gen.sdf-agent.critique :as critique]
+            [kami.gen.sdf-agent.propose :as propose]))
+
+(defn- tmp-dir [tag]
+  (str (io/file (System/getProperty "java.io.tmpdir")
+                (str "kga-test-" tag "-" (System/nanoTime)))))
+
+;; ---------------------------------------------------------------------------
+;; SDF primitive math sanity (exact-formula checks, not fixtures)
+;; ---------------------------------------------------------------------------
+
+(deftest sphere-sdf
+  (is (< (Math/abs (- (sdf/sd-sphere [0 0 0] 1.0) -1.0)) 1e-9))
+  (is (< (Math/abs (sdf/sd-sphere [1 0 0] 1.0)) 1e-9))
+  (is (< (Math/abs (- (sdf/sd-sphere [2 0 0] 1.0) 1.0)) 1e-9)))
+
+(deftest round-box-sdf
+  (testing "center of a unit half-extent box is 1 unit inside"
+    (is (< (Math/abs (- (sdf/sd-round-box [0 0 0] [1 1 1] 0.0) -1.0)) 1e-9)))
+  (testing "point straight out from a face is exactly that far outside"
+    (is (< (Math/abs (- (sdf/sd-round-box [2 0 0] [1 1 1] 0.0) 1.0)) 1e-9))))
+
+(deftest capped-cylinder-sdf
+  (is (< (Math/abs (- (sdf/sd-capped-cylinder [0 0 0] 1.0 2.0) -1.0)) 1e-9))
+  (is (< (Math/abs (- (sdf/sd-capped-cylinder [2 0 0] 1.0 2.0) 1.0)) 1e-9)))
+
+(deftest capped-cone-sdf
+  (testing "apex (r2=0) is an exact surface point"
+    (is (< (Math/abs (sdf/sd-capped-cone [0 0 1] 1.0 0.0 2.0)) 1e-6)))
+  (testing "a point on the cone's axis at mid-height is inside (negative)"
+    (is (neg? (sdf/sd-capped-cone [0 0 0] 1.0 0.0 2.0))))
+  (testing "a point far off-axis is well outside (large positive)"
+    (is (> (sdf/sd-capped-cone [5 0 0] 1.0 0.0 2.0) 3.0))))
+
+;; ---------------------------------------------------------------------------
+;; CSG combinators + compiler
+;; ---------------------------------------------------------------------------
+
+(deftest union-picks-nearer-child
+  (let [sample (sdf/compile-program
+                [:union
+                 [:sphere {:r 1 :center [0 0 0] :color [1 0 0 1]}]
+                 [:sphere {:r 1 :center [5 0 0] :color [0 1 0 1]}]])
+        [d c] (sample 0 0 0)]
+    (is (< (Math/abs (- d -1.0)) 1e-9))
+    (is (= c [1 0 0 1]))))
+
+(deftest difference-hollows-out-center
+  (let [sample (sdf/compile-program
+                [:difference
+                 [:sphere {:r 1.0 :center [0 0 0]}]
+                 [:sphere {:r 0.5 :center [0 0 0]}]])
+        [d-center _] (sample 0 0 0)
+        [d-shell _] (sample 0.75 0 0)]
+    (testing "the hollowed-out center is now OUTSIDE the resulting solid"
+      (is (pos? d-center)))
+    (testing "a point in the remaining shell is still inside"
+      (is (neg? d-shell)))))
+
+(deftest program-bounds-cover-all-children
+  (let [b (sdf/program->bounds
+           [:union
+            [:sphere {:r 1.0 :center [0 0 0]}]
+            [:sphere {:r 0.5 :center [0 0 3.0]}]])]
+    ;; must cover the farthest child (center 3.0 + r 0.5 = 3.5) plus margin
+    (is (>= b 3.5))))
+
+;; ---------------------------------------------------------------------------
+;; compile-program -> real mesher.sdf-to-colored-mesh Marching Cubes
+;; ---------------------------------------------------------------------------
+
+(deftest compile-program-produces-real-mesh
+  (let [{:keys [mesh vertex-colors]} (agent/compile-program
+                                       [:sphere {:r 1.0 :center [0 0 0]}]
+                                       {:resolution 24})]
+    (is (pos? (:vertex-count mesh)))
+    (is (pos? (:index-count mesh)))
+    (is (zero? (mod (:index-count mesh) 3)))
+    (is (= (:vertex-count mesh) (count vertex-colors)))))
+
+;; ---------------------------------------------------------------------------
+;; render + default critique on a real rendered PNG
+;; ---------------------------------------------------------------------------
+
+(deftest render-and-critique-real-png
+  (let [{:keys [mesh vertex-colors]} (agent/compile-program
+                                       [:sphere {:r 1.0 :center [0 0 0] :color [0.9 0.8 0.1 1.0]}]
+                                       {:resolution 24})
+        path (str (io/file (tmp-dir "render") "sphere.png"))
+        stats (render/render-preview! mesh vertex-colors path {:width 120 :height 120})
+        f (io/file path)]
+    (is (io/exists? f))
+    (is (pos? (io/length f)))
+    (is (pos? (:triangle-count stats)))
+    (is (pos? (:non-background-pixel-count stats)))
+    (let [result (critique/default-critique path "a plain yellow ball")]
+      (is (<= 0.0 (:score result) 1.0))
+      (is (pos? (get-in result [:details :foreground-pixels])))
+      (testing "yellow sphere brief mentioning yellow finds yellow pixels"
+        (is (> (get-in result [:details :yellow-fraction]) 0.0))))))
+
+;; ---------------------------------------------------------------------------
+;; Full round-trip with FIXTURE propose/critique (no heuristics, no LLM)
+;; ---------------------------------------------------------------------------
+
+(deftest full-round-trip-with-fixture-functions
+  (let [fixture-propose (fn [_brief _history]
+                           [:sphere {:r 1.0 :center [0 0 0] :color [0.5 0.5 0.9 1.0]}])
+        fixture-critique (fn [_render-path _brief]
+                            {:score 1.0 :accept? true :edit-suggestion nil})
+        result (agent/generate {:brief "a simple ball"
+                                 :propose fixture-propose
+                                 :critique fixture-critique
+                                 :resolution 22
+                                 :out-dir (tmp-dir "roundtrip")})]
+    (testing "accepted on round 1, mesh is real and sane"
+      (is (= 1 (:rounds result)))
+      (is (true? (:accepted? result)))
+      (is (pos? (get-in result [:mesh :vertex-count])))
+      (is (pos? (get-in result [:mesh :index-count])))
+      (is (= 1 (count (:history result))))
+      (is (io/exists? (io/file (:render result)))))))
+
+;; ---------------------------------------------------------------------------
+;; max-rounds bound is respected AND surfaced (never a silent cap)
+;; ---------------------------------------------------------------------------
+
+(deftest max-rounds-cap-is-respected-and-logged
+  (let [fixture-propose (fn [_brief _history]
+                          [:sphere {:r 1.0 :center [0 0 0]}])
+        never-accept (fn [_render-path _brief]
+                       {:score 0.2 :accept? false :edit-suggestion {:op :noop}})
+        result (agent/generate {:brief "never good enough"
+                                 :max-rounds 2
+                                 :propose fixture-propose
+                                 :critique never-accept
+                                 :resolution 22
+                                 :out-dir (tmp-dir "cap")})]
+    (testing "loop stops exactly at max-rounds, not before or after"
+      (is (= 2 (:rounds result)))
+      (is (= 2 (count (:history result)))))
+    (testing "cap is surfaced, not silent"
+      (is (false? (:accepted? result)))
+      (is (seq (:log result)))
+      (is (some #(re-find #"(?i)max-rounds|cap" %) (:log result))))
+    (testing "still returns a usable best-scoring program/mesh, not nil"
+      (is (some? (:program result)))
+      (is (pos? (get-in result [:mesh :vertex-count]))))))
+
+;; ---------------------------------------------------------------------------
+;; End-to-end with the REAL default (heuristic, non-LLM) propose + critique,
+;; on the ADR's penguin-kigurumi-hood brief -- demonstrates round-over-round
+;; convergence driven by actual rendered-pixel feedback, not fixtures.
+;; ---------------------------------------------------------------------------
+
+(deftest end-to-end-default-heuristics-penguin-brief
+  (let [result (agent/generate {:brief "penguin kigurumi hood, rounded chibi body, yellow beak"
+                                 :resolution 30
+                                 :out-dir (tmp-dir "penguin")})]
+    (testing "runs within the bound, never past it"
+      (is (<= (:rounds result) agent/default-max-rounds))
+      (is (= (:rounds result) (count (:history result)))))
+    (testing "produces a real, non-degenerate mesh"
+      (is (pos? (get-in result [:mesh :vertex-count])))
+      (is (pos? (get-in result [:mesh :index-count]))))
+    (testing "history is a replayable, scored trace"
+      (is (every? #(contains? % :program) (:history result)))
+      (is (every? #(contains? % :score) (:history result)))
+      (is (every? #(contains? % :critique) (:history result))))
+    (testing "program uses only the documented primitive/combinator vocabulary"
+      (letfn [(tags [node]
+                (let [tag (first node)]
+                  (cons tag (mapcat (fn [child] (when (vector? child) (tags child)))
+                                     (rest node)))))]
+        (is (every? #{:union :intersect :difference :sphere :box :cylinder :cone}
+                    (tags (:program result))))))))

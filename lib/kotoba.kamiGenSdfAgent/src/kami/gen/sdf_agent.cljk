@@ -1,0 +1,137 @@
+(ns kami.gen.sdf-agent
+  "kotoba-lang/kami-gen-sdf-agent -- LLM-authored (v0: heuristic-authored)
+  SDF/CSG mesh pipeline. See ADR-2607051110 in `com-junkawasaki/root`
+  (`90-docs/adr/2607051110-kami-gen-sdf-agent-procedural-mesh-pipeline.md`).
+
+  `generate` runs a bounded propose -> compile -> render -> critique loop
+  (max `:max-rounds`, default 4, never unbounded -- see `generate`'s
+  docstring for the org's \"no silent caps\" convention this follows):
+
+    - propose:  brief + history -> a CSG EDN program (see
+                `kami.gen.sdf-agent.sdf` for the grammar). Injected as
+                `:propose`; default is `kami.gen.sdf-agent.propose/default-propose`,
+                a deterministic heuristic -- NOT an LLM call in v0.
+    - compile:  CSG program -> signed-distance sampler
+                (`kami.gen.sdf-agent.sdf/compile-program`) -> mesh via
+                `kotoba-lang/mesher`'s real Marching Cubes
+                (`mesher/sdf-to-colored-mesh`). Always real; never mocked.
+    - render:   mesh -> an offscreen PNG preview from a fixed camera angle
+                (`kami.gen.sdf-agent.render/render-preview!`), a real (if
+                simple) software rasterizer -- no wgpu, but real pixels
+                from the real mesh.
+    - critique: render path + brief -> `{:score :accept? :edit-suggestion}`.
+                Injected as `:critique`; default is
+                `kami.gen.sdf-agent.critique/default-critique`, a heuristic
+                pixel-analysis of the actual PNG -- NOT a vision-LLM call
+                in v0.
+
+  Every round's CSG program is plain EDN, so a full run's `:history` is
+  diffable and replayable, not just the final mesh."
+  (:require [kami.gen.sdf-agent.sdf :as sdf]
+            [kami.gen.sdf-agent.render :as render]
+            [kami.gen.sdf-agent.propose :as propose]
+            [kami.gen.sdf-agent.critique :as critique]
+            [mesher :as mesher]
+            [kotoba.io :as io]))
+
+(def default-max-rounds 4)
+(def default-resolution 40)
+
+(defn compile-program
+  "Compiles a CSG EDN `program` (see `kami.gen.sdf-agent.sdf` grammar) into
+  a mesh, via the real SDF primitive/combinator math in
+  `kami.gen.sdf-agent.sdf` and `kotoba-lang/mesher`'s real Marching Cubes.
+  This step is never mocked: it always actually samples the SDF on a
+  `resolution`^3 grid and extracts real geometry.
+
+  Returns `{:mesh :vertex-colors :bounds :resolution}`. `:mesh` matches
+  `kotoba-lang/mesher`'s shape: `{:vertex-count :index-count :vertices
+  :indices}`."
+  [program {:keys [resolution] :or {resolution default-resolution}}]
+  (let [sampler (sdf/compile-program program)
+        bounds (sdf/program->bounds program)
+        [mesh vertex-colors] (mesher/sdf-to-colored-mesh sampler resolution bounds)]
+    {:mesh mesh :vertex-colors vertex-colors :bounds bounds :resolution resolution}))
+
+(defn- round-render-path [out-dir round]
+  (str (io/file out-dir (format "round-%02d.png" round))))
+
+(defn generate
+  "Runs the bounded propose/compile/render/critique loop for `brief` (a
+  text string) and returns:
+
+    {:program <accepted-or-best CSG EDN tree>
+     :history [{:round :program :score :critique :render :render-stats} ...]
+     :mesh    <kotoba-lang/mesher mesh for :program>
+     :render  <path to that round's offscreen PNG preview>
+     :rounds  <how many rounds actually ran>
+     :accepted? <bool -- did some round's critique accept, or did max-rounds cap?>
+     :log     [<strings -- always non-empty when the max-rounds cap is hit,
+                per this org's \"no silent caps\" convention: a capped run
+                is reported, never silently truncated>]}
+
+  Options (all optional):
+    :max-rounds  int, default 4. Hard bound -- generate NEVER loops past
+                 this even if no round's critique ever accepts.
+    :propose     (fn [brief history] -> program). Default: heuristic
+                 `kami.gen.sdf-agent.propose/default-propose` (NOT an LLM
+                 call in v0 -- see its docstring for the seam a real LLM
+                 plugs into).
+    :critique    (fn [render-path brief] -> {:score :accept? :edit-suggestion}).
+                 Default: heuristic `kami.gen.sdf-agent.critique/default-critique`
+                 (NOT a vision-LLM call in v0 -- see its docstring).
+    :resolution  Marching Cubes per-axis grid resolution, default 40.
+    :out-dir     Directory for per-round PNG renders, default a fresh temp dir.
+    :render-opts Passed through to `kami.gen.sdf-agent.render/render-preview!`
+                 (e.g. `{:width 300 :height 300}`).
+
+  If no round's critique ever sets `:accept? true` by the time `:max-rounds`
+  is reached, `generate` still returns a usable result -- the BEST-scoring
+  round's `:program`/`:mesh`, not necessarily the last round's -- and always
+  logs (via `println` and the returned `:log`) that the cap was hit, which
+  round won, and its score. This never fails silently."
+  [{:keys [brief max-rounds propose critique render-opts out-dir resolution]
+    :or {max-rounds default-max-rounds
+         propose propose/default-propose
+         critique critique/default-critique
+         resolution default-resolution}
+    :as opts}]
+  (when (< max-rounds 1)
+    (throw (ex-info "kami.gen.sdf-agent/generate: :max-rounds must be >= 1"
+                     {:max-rounds max-rounds})))
+  (let [out-dir (or out-dir
+                     (str (io/file (System/getProperty "java.io.tmpdir")
+                                   (str "kami-gen-sdf-agent-" (System/currentTimeMillis)))))]
+    (io/make-parents (io/file out-dir "._sentinel"))
+    (loop [round 1 history [] best nil]
+      (let [program (propose brief history)
+            {:keys [mesh vertex-colors]} (compile-program program {:resolution resolution})
+            render-path (round-render-path out-dir round)
+            render-stats (render/render-preview! mesh vertex-colors render-path (or render-opts {}))
+            critique-result (critique render-path brief)
+            score (:score critique-result)
+            entry {:round round :program program :score score :critique critique-result
+                   :render render-path :render-stats render-stats}
+            history' (conj history entry)
+            candidate {:entry entry :mesh mesh}
+            best' (if (or (nil? best) (> score (:score (:entry best)))) candidate best)
+            accepted? (boolean (:accept? critique-result))]
+        (cond
+          accepted?
+          {:program program :history history' :mesh mesh :render render-path
+           :rounds round :accepted? true
+           :log [(format "kami.gen.sdf-agent: accepted at round %d/%d (score %.3f)"
+                          round max-rounds score)]}
+
+          (>= round max-rounds)
+          (let [{:keys [entry mesh]} best'
+                log-line (format (str "kami.gen.sdf-agent: max-rounds cap (%d) hit -- no round's "
+                                       "critique accepted. Returning the BEST-scoring round (round "
+                                       "%d/%d, score %.3f), not silently the last round.")
+                                  max-rounds (:round entry) max-rounds (:score entry))]
+            (println log-line)
+            {:program (:program entry) :history history' :mesh mesh :render (:render entry)
+             :rounds round :accepted? false :log [log-line]})
+
+          :else
+          (recur (inc round) history' best'))))))

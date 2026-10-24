@@ -1,0 +1,214 @@
+(ns kami.mangaka.render
+  "Work-agnostic 2D manga panel render commons (ADR-2606282100, Tier-1 mangaka).
+
+  This is the generic half extracted from `sip.render`: prompt composition and
+  the image-gen HTTP client. It hard-codes NO story, character, world, emotion
+  vocabulary, or location — those are injected by the calling work via `:mappers`.
+
+  Two render facts (verified 2026-06-18) are baked in, not just documented:
+
+    1. CLIP 77-token truncation. We drive image-gen's `/generate` directly (no
+       server-side prefix/suffix), so we own the whole window and compose
+       STYLE-FIRST under a hard word budget — style/colour never get cut.
+
+    2. IP-Adapter on the diffusers app (AnimagineXL 4.0 + MPS float32) returns
+       noise. We render tag-only; `:refs` are carried as metadata for a future
+       ComfyUI IP-Adapter path."
+  (:require [clojure.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [json.data-json :as json])
+  (:import [java.net URI]
+           [java.util Base64]
+           [java.net.http HttpClient HttpClient$Version HttpRequest HttpRequest$BodyPublishers
+                          HttpResponse$BodyHandlers]))
+
+;; ---------------------------------------------------------------------------
+;; Anchors — generic defaults (this crate) merged UNDER the work's anchors
+;; ---------------------------------------------------------------------------
+
+(def default-anchors-resource
+  "Bundled work-agnostic defaults: model / quality-tail / word-budget /
+  base-negative / aspect-by-layout."
+  "mangaka_default_anchors.edn")
+
+(defn- unblob
+  "Undo scripts/edn-datomize.bb's pr-str blob encoding for non-scalar values."
+  [v]
+  (if (string? v)
+    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+         (catch Exception _ v))
+    v))
+
+(defn- reconstitute-entity
+  "Turn a Datomic/Datascript tx-data vector `[{:db/id -1 :ns/key val ...}]`
+  (as produced by scripts/edn-datomize.bb) back into the bare flat map the
+  loader expects: strip :db/id, drop the file-level namespace off each key,
+  and un-pr-str any blobbed non-scalar values."
+  [tx-data]
+  (into {} (map (fn [[k v]] [(keyword (name k)) (unblob v)]))
+        (dissoc (first tx-data) :db/id)))
+
+(defn- read-edn-reader [rdr]
+  (let [data (with-open [r rdr] (edn/read (java.io.PushbackReader. r)))]
+    (if (and (vector? data) (map? (first data)) (contains? (first data) :db/id))
+      (reconstitute-entity data)
+      data)))
+
+(defn merge-anchors
+  "Merge generic mangaka defaults UNDER a work's anchors. Work wins at the top
+  level; :base-negative is the de-duped union (a work extends, not replaces, the
+  universal negatives)."
+  [defaults work]
+  (assoc (merge defaults work)
+         :base-negative
+         (vec (distinct (concat (:base-negative defaults) (:base-negative work))))))
+
+(defn load-anchors
+  "Load a work's anchor bible from the classpath, merged over the mangaka
+  defaults. Pass a second resource name to override the defaults source."
+  ([work-resource] (load-anchors default-anchors-resource work-resource))
+  ([defaults-resource work-resource]
+   (merge-anchors (read-edn-reader (io/reader (io/resource defaults-resource)))
+                  (read-edn-reader (io/reader (io/resource work-resource))))))
+
+(defn read-anchors
+  "Load a work's anchor bible from a filesystem path, merged over the mangaka
+  defaults (read from the classpath)."
+  [work-path]
+  (merge-anchors (read-edn-reader (io/reader (io/resource default-anchors-resource)))
+                 (read-edn-reader (io/reader (io/file work-path)))))
+
+;; ---------------------------------------------------------------------------
+;; Composition (pure)
+;; ---------------------------------------------------------------------------
+
+(def dims
+  "Aspect keyword → [w h], multiples of 8 (mirrors image-gen config ASPECT_RATIOS)."
+  {:16x9 [1216 688] :9x16 [688 1216] :1x1 [1024 1024]
+   :4x3 [1152 864] :3x4 [864 1152] :3x2 [1152 768] :2x3 [768 1152]})
+
+(defn aspect->dims [aspect] (get dims aspect (dims :2x3)))
+
+(defn framing
+  "camera string → 1-2 booru framing tags. Generic film grammar (no world)."
+  [camera]
+  (let [c (str/lower (str camera))
+        seg (str/trim (first (str/split c #"/")))
+        shot (cond
+               (str/includes? seg "extreme close") "extreme close-up"
+               (str/includes? seg "close")         "close-up"
+               (str/includes? seg "extreme wide")  "extreme wide shot"
+               (str/includes? seg "wide")          "wide shot"
+               (str/includes? seg "medium")        "medium shot"
+               (str/includes? seg "over")          "over the shoulder"
+               (str/includes? seg "two")           "two shot"
+               :else "cinematic shot")
+        angle (cond
+                (str/includes? c "bird")  "from above"
+                (str/includes? c "low")   "from below"
+                (re-find #"over" c)       nil
+                :else nil)]
+    (filterv some? [shot angle])))
+
+(defn subject-count
+  "Combine present character subjects into a booru subject phrase (1girl/2girls…)."
+  [present chars-anchors]
+  (let [subs (keep #(get-in chars-anchors [% :subject]) present)
+        g (count (filter #{"1girl"} subs))
+        b (count (filter #{"1boy"} subs))]
+    (->> [(case g 0 nil 1 "1girl" 2 "2girls" (str g "girls"))
+          (case b 0 nil 1 "1boy" (str b "boys"))]
+         (filterv some?))))
+
+(defn word-count [tags] (count (str/split (str/join " " tags) #"\s+")))
+
+(defn take-budget
+  "Greedily concat tag groups, never exceeding `budget` words. Earlier groups win."
+  [budget groups]
+  (reduce (fn [acc tag]
+            (let [acc' (conj acc tag)]
+              (if (> (word-count acc') budget) (reduced acc) acc')))
+          [] (distinct (apply concat groups))))
+
+(defn compose
+  "Panel + anchors → render spec {:tags :prompt :neg :refs :aspect :dims}.
+  STYLE-FIRST + word-budgeted so it survives CLIP 77 tokens.
+
+  Work-specific semantics are injected via `:mappers`:
+    :focal-character (fn [panel]) → anchor key for the one focal character (or nil)
+    :location->env   (fn [location]) → environment anchor key (or nil)
+    :emotion->tags   (fn [emotion]) → vector of booru mood tags
+  All three default to the generic no-op (first character / no env / no mood)."
+  [{:keys [anchors panel mappers]}]
+  (let [{:keys [style-lead quality-tail word-budget base-negative
+                volume-color characters environments aspect-by-layout]} anchors
+        {:keys [focal-character location->env emotion->tags]
+         :or   {focal-character (fn [p] (first (:characters p)))
+                location->env   (constantly nil)
+                emotion->tags   (constantly [])}} mappers
+        present  (if-let [f (focal-character panel)] [f] []) ; one character per panel
+        char-an  characters
+        col      (get volume-color (:area panel) [])
+        env      (get-in environments [(location->env (:location panel)) :tags] [])
+        subj     (subject-count present char-an)
+        ;; cap identity tags per character so a two/three-shot keeps each
+        ;; character's most-distinguishing tags (else the first eats the budget).
+        per-char (if (> (count present) 1) 4 7)
+        id-tags  (vec (mapcat #(take per-char (get-in char-an [% :tags] [])) present))
+        ;; priority groups (high → low); style & colour lead, env trails.
+        body     (take-budget word-budget
+                              [style-lead (vec (take 2 col)) (framing (:camera panel))
+                               subj id-tags (vec (emotion->tags (:emotion panel)))
+                               (vec (take 3 env)) quality-tail])
+        neg      (->> (concat base-negative (mapcat #(get-in char-an [% :negative] []) present))
+                      distinct vec)
+        refs     (->> present (keep #(get-in char-an [% :ref])) vec)
+        aspect   (get aspect-by-layout (:layout panel) :2x3)]
+    {:tags body
+     :prompt (str/join ", " body)
+     :neg neg
+     :refs refs
+     :aspect aspect
+     :dims (aspect->dims aspect)}))
+
+;; ---------------------------------------------------------------------------
+;; image-gen HTTP client — /generate (we own the full prompt, tag-only)
+;; ---------------------------------------------------------------------------
+
+(def ^:private b64 (Base64/getDecoder))
+
+(defn- post-json [^HttpClient client url body]
+  (let [req (-> (HttpRequest/newBuilder (URI/create url))
+                (.header "content-type" "application/json")
+                (.timeout (java.time.Duration/ofMinutes 40))
+                (.POST (HttpRequest$BodyPublishers/ofString (json/write-str body)))
+                (.build))
+        resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+    (if (<= 200 (.statusCode resp) 299)
+      (json/read-str (.body resp) :key-fn keyword)
+      (throw (ex-info "image-gen error" {:status (.statusCode resp) :body (.body resp)})))))
+
+(defn render!
+  "Render `spec` via image-gen /generate and write the PNG to `out-path`.
+  Returns {:path :seed :ms}. `base` defaults to $IMAGEGEN_URL or :8100.
+  Work-agnostic: `spec` is just {:prompt :neg :dims} — it does not know the story."
+  [spec out-path & {:keys [base seed steps]
+                    :or {base (or (System/getenv "IMAGEGEN_URL") "http://localhost:8100")
+                         steps 28}}]
+  (let [[w h] (:dims spec)
+        ;; force HTTP/1.1 — uvicorn rejects the JDK client's default h2c upgrade
+        client (-> (HttpClient/newBuilder) (.version HttpClient$Version/HTTP_1_1) (.build))
+        res (post-json client (str base "/generate")
+                       {:prompt (:prompt spec)
+                        :negative_prompt (str/join ", " (:neg spec))
+                        :width w :height h
+                        :num_inference_steps steps
+                        :seed seed})
+        ;; /generate returns a data-URL ("data:image/png;base64,XXXX"); strip the prefix
+        raw   (:image_base64 res)
+        b64s  (if-let [i (str/index-of raw ",")] (subs raw (inc i)) raw)
+        bytes (.decode b64 ^String b64s)]
+    (io/make-parents (io/file out-path))
+    (with-open [o (io/output-stream out-path)] (.write o bytes))
+    {:path out-path :seed (:seed res) :ms (:generation_time_ms res)}))
