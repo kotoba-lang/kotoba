@@ -1,0 +1,176 @@
+#!/usr/bin/env kbb
+;; verify-turn-loop-parity — agent.turn-loop must agree with the loop it was
+;; transcribed from.
+;;
+;;   kbb --backend sci scripts/verify-turn-loop-parity.cljk
+;;
+;; exit 0 = parity holds, 1 = a case disagrees, 2 = could not measure.
+;;
+;; ## What it compares
+;;
+;; `src/agent/turn_loop.kotoba` is a transcription of
+;; `NousResearch/hermes-agent` `agent/conversation_loop.py:2074..2115` plus the
+;; whole of `agent/iteration_budget.py`. The golden vectors in
+;; `migration/hermes-turn-loop-golden.edn` were produced by
+;; `migration/hermes_turn_loop_oracle.py`, which IMPORTS the upstream
+;; `IterationBudget` rather than reimplementing it, so the budget half of the
+;; contract is the upstream's own code. The admission half is transcribed, and
+;; this gate is what checks the transcription.
+;;
+;; ## Both artifacts, for different reasons
+;;
+;;   js-browser       exports take real JS strings, so the whole case crosses
+;;                    the boundary and every vector can be compared
+;;   wasm32-browser   strings would have to be marshalled into linear memory,
+;;                    so this one asserts the in-module self-check `main() = 42`
+;;
+;; Neither is optional. Compiling one and reporting on the other would let a
+;; backend regress unseen.
+;;
+;; ## Three things that will bite whoever edits this
+;;
+;;   fuel        is spent for the life of an INSTANCE. Four queries per case
+;;               across ten cases exhausted one instance at case eight
+;;               (`fuel-exhausted`), so each query instantiates its own.
+;;   i64         arguments must be BigInt. A JS number raises `invalid-i64`.
+;;   exports     keep their kebab names, so they are read with `aget`, not
+;;               property access.
+
+(ns verify-turn-loop-parity
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def root (.cwd js/process))
+(def src (path/join root "src" "agent" "turn_loop.kotoba"))
+(def golden-path (path/join root "migration" "hermes-turn-loop-golden.edn"))
+(def oracle-path (path/join root "migration" "hermes_turn_loop_oracle.py"))
+
+;; The compiler lives in a sibling west project. Availability is measured by
+;; RUNNING it: a shim whose target is gone passes `which` and exits 126, and a
+;; check that skipped on that would look exactly like a check that passed.
+(def amu-root
+  (first (filter (fn [d]
+                   (let [bin (path/join d "bin" "kotoba")]
+                     (and (fs/existsSync bin)
+                          (fs/existsSync (path/join d "runtime" "browser-host.mjs"))
+                          (zero? (or (.-status (cp/spawnSync bin #js ["--help"]
+                                                 #js {:stdio "ignore"})) 1)))))
+                 (remove nil?
+                   [(aget (.-env js/process) "AMU_ROOT")
+                    (path/join root ".." "amu")
+                    (path/join root ".." ".." "kotoba-lang" "amu")]))))
+
+(def kotoba-bin (when amu-root (path/join amu-root "bin" "kotoba")))
+(def browser-host (when amu-root (path/join amu-root "runtime" "browser-host.mjs")))
+
+(defn- die [code msg] (.error js/console msg) (set! (.-exitCode js/process) code))
+
+(def ev-digit {:tick "0" :interrupt "1" :review-budget-exhausted "2"
+               :refund "3" :grace-grant "4"})
+(def reason-code {:running 0 :max-iterations-reached 1 :budget-exhausted 2
+                  :interrupted-by-user 3 :review-input-budget-exhausted 4})
+
+(defn- compile! [target out]
+  (let [r (cp/spawnSync kotoba-bin
+            #js ["-M" "compile" src "--target" target "--output" out]
+            #js {:encoding "utf8"})]
+    (when-not (zero? (or (.-status r) 1))
+      (throw (js/Error. (str target " compile failed: "
+                             (subs (str (.-stdout r) (.-stderr r)) 0 400)))))))
+
+(defn- drift-check!
+  "Regenerate the vectors from upstream when the checkout is here. A committed
+   vector that no longer matches the source it claims to come from is worse
+   than no vector, and nothing else would notice."
+  [cases]
+  (let [r (cp/spawnSync "python3" #js [oracle-path] #js {:encoding "utf8"})]
+    (if-not (zero? (or (.-status r) 1))
+      (do (println "DRIFT\tunchecked — the upstream checkout is not readable here;"
+                   " the committed vectors were used as-is")
+          nil)
+      (let [fresh (js->clj (js/JSON.parse (.-stdout r)) :keywordize-keys true)
+            same? (= (count fresh) (count cases))
+            bad (when same?
+                  (remove nil?
+                    (map (fn [f c]
+                           (when-not (and (= (:api_call_count f) (:api-call-count c))
+                                          (= (:budget_used f) (:budget-used c))
+                                          (= (keyword (str/replace (:exit_reason f) "_" "-"))
+                                             (:exit-reason c)))
+                             (:name f)))
+                         fresh cases)))]
+        (if (and same? (empty? bad))
+          (println "DRIFT\tnone — the committed vectors still match the upstream")
+          (do (println "DRIFT\tthe committed vectors no longer match the upstream:"
+                       (pr-str (or bad "case count changed")))
+              :drift))))))
+
+(defn- run []
+  (cond
+    (not amu-root)
+    (die 2 (str "CANNOT ANSWER — no runnable amu checkout (bin/kotoba + runtime/browser-host.mjs)."
+                " Looked at $AMU_ROOT, ../amu, ../../kotoba-lang/amu."
+                " Refusing to report parity from a build that did not happen."))
+    (not (fs/existsSync golden-path))
+    (die 2 (str "CANNOT ANSWER — " golden-path " is missing."))
+    :else
+    (let [tmp (fs/mkdtempSync (path/join (os/tmpdir) "turn-loop-"))
+          mjs (path/join tmp "turn_loop.mjs")
+          wasm (path/join tmp "turn_loop.wasm")
+          {:keys [cases]} (edn/read-string (fs/readFileSync golden-path "utf8"))]
+      (try
+        (compile! "js-browser" mjs)
+        (compile! "wasm32-browser" wasm)
+        (catch :default e (die 2 (str "CANNOT ANSWER — " (.-message e)))))
+      (when-not (= 2 (.-exitCode js/process))
+        (let [drifted (drift-check! cases)]
+          (-> (js/import (str "file://" mjs))
+              (.then
+                (fn [m]
+                  (let [inst (.-instantiateKotoba m)
+                        fails (atom [])]
+                    (if (some? (aget (inst) "run-budget-remaining"))
+                      (doseq [c cases]
+                        (let [evs (apply str (map ev-digit (:events c)))
+                              mx (js/BigInt (:max-iterations c))
+                              bm (js/BigInt (:budget-max c))
+                              got [(js/Number ((aget (inst) "run-exit-code") mx bm evs))
+                                   (js/Number ((aget (inst) "run-api-calls") mx bm evs))
+                                   (js/Number ((aget (inst) "run-budget-used") mx bm evs))
+                                   (js/Number ((aget (inst) "run-budget-remaining") mx bm evs))]
+                              remaining (- (:budget-max c) (:budget-used c))
+                              exp [(reason-code (:exit-reason c))
+                                   (:api-call-count c) (:budget-used c)
+                                   (if (< remaining 0) 0 remaining)]]
+                          (if (= exp got)
+                            (println (str "  ok    " (name (:name c)) "  evs=" evs))
+                            (do (swap! fails conj (:name c))
+                                (println (str "  FAIL  " (name (:name c))
+                                              "  expected=" exp " got=" got))))))
+                      (do (swap! fails conj :missing-run-budget-remaining)
+                          (println "  FAIL  missing export run-budget-remaining")))
+                    (js/Promise.resolve
+                      {:fails @fails
+                       :js-main (str ((aget (inst) "main")))}))))
+              (.then
+                (fn [{:keys [fails js-main]}]
+                  (-> (js/import (str "file://" browser-host))
+                      (.then (fn [host]
+                        (-> ((.-instantiateKotoba host) (fs/readFileSync wasm))
+                            (.then (fn [w]
+                              (let [wm (str ((.. w -instance -exports -main)))]
+                                (println (str "CASES\t" (count cases)))
+                                (println (str "SELFCHECK\tjs=" js-main "\twasm=" wm))
+                                (cond
+                                  drifted (die 1 "FAILED — committed vectors drifted from upstream")
+                                  (seq fails) (die 1 (str "FAILED " (count fails) "/" (count cases)))
+                                  (not= "42" js-main) (die 1 (str "js self-check returned " js-main ", not 42"))
+                                  (not= "42" wm) (die 1 (str "wasm self-check returned " wm ", not 42"))
+                                  :else (println "parity holds against the upstream oracle")))))))))))
+              (.catch (fn [e] (die 2 (str "CANNOT ANSWER — " (.-message e)))))))))))
+
+(run)
