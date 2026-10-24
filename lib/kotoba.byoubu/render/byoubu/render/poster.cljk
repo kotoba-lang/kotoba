@@ -1,0 +1,249 @@
+(ns byoubu.render.poster
+  "Tier 1: render a `:byoubu/scene` to a deterministic SVG poster.
+
+  Why SVG and not a bitmap. The workspace 3D rule (AGENTS.md) makes WebGPU /
+  WebGL 2.0 the authoritative renderer and permits DOM/SVG only for
+  \"非3D overlay、diagram、thumbnail、明示された degraded fallback\". A T1
+  poster is exactly a thumbnail/fallback, so SVG is in bounds — and it buys
+  three things a PNG would not: the output is text (diffable, reviewable in a
+  PR, no binary in git and therefore no B2/DataLad dataset needed at this
+  tier), it is resolution-independent, and it is byte-reproducible from the
+  seed. T2 — the live scene — stays WebGPU through the kami stack.
+
+  Why this lives under `render/` and not `src/`. It requires
+  `kotoba-lang/terrain`, which pulls `kotoba-lang/compiler`. Nothing a browser
+  loads may inherit that, so this path is on the `:render` alias only. The
+  posters it writes land in `resources/`, which `src/` may read about through
+  the generated `byoubu.poster` manifest.
+
+  The ridge and dune silhouettes come from `terrain.noise/fbm-noise` — the
+  real library the scene spec names, not a second noise implementation. That
+  is the whole point of describing scenes in the kami stack's vocabulary."
+  (:require [byoubu.core :as byoubu]
+            [byoubu.color :as color]
+            [terrain.noise :as noise]
+            [kotoba.lang.text :as str]))
+
+(def width 1600)
+(def height 900)
+
+;; ---------------------------------------------------------------------------
+;; deterministic helpers
+
+(defn- seeded
+  "A stable [0,1) value for (seed, stream, index). Derived from the same value
+  noise the terrain uses, sampled on a lattice keyed by the stream, so star
+  placement is reproducible from `:byoubu/seed` alone and independent of any
+  host RNG."
+  [seed stream i]
+  (let [v (noise/value-noise (+ (* 0.7391 (inc i)) (* 13.0 stream))
+                             (+ (* 0.3129 (inc i)) (* 7.0 (mod seed 997))))]
+    (- v (Math/floor v))))
+
+(defn- fmt
+  "Number -> SVG coordinate string with at most two decimals, formatted
+  identically on both runtimes (`(/ (Math/round (* 100 x)) 100.0)` prints
+  `12.0` on the JVM and `12` in ClojureScript, so build the string by hand)."
+  [x]
+  (let [n (Math/round (* 100.0 (double x)))
+        neg (neg? n)
+        n (if neg (- n) n)
+        i (quot n 100)
+        f (rem n 100)]
+    (str (when neg "-") i
+         (cond
+           (zero? f) ""
+           (zero? (rem f 10)) (str "." (quot f 10))
+           (< f 10) (str ".0" f)
+           :else (str "." f)))))
+
+;; ---------------------------------------------------------------------------
+;; scene geometry
+
+(defn horizon-y
+  "Pixel row of the horizon. Same derivation as `byoubu.plate/horizon-pct`
+  (62% at a level camera, pushed down 2.6% per degree of downward pitch), so
+  the poster and the tier-0 gradient put the skyline in the same place and
+  content does not shift when the poster loads."
+  [backdrop]
+  (let [pitch (or (get-in backdrop [:byoubu/scene :camera :pitch-deg]) 0.0)]
+    (* height (/ (max 40.0 (min 80.0 (- 62.0 (* 2.6 pitch)))) 100.0))))
+
+(def view-width
+  "World units the frame spans. Converts `:terrain :dune-wavelength` (world
+  units per crest) into crests per frame, which is the number that actually
+  has to be right — sampling FBM in raw world units gives one noise period
+  every few pixels and renders as a sawtooth, not a dune field."
+  2400.0)
+
+(defn- ridge-points
+  "Polyline for one ridge line: FBM sampled across the width, with `depth`
+  (0 = furthest) lowering amplitude and raising the base, which is what makes
+  a far ridge read as far.
+
+  Plain FBM, not the ridged |2n-1| fold: a dune crest is smooth. The fold is
+  what you want for rock, and using it here produced spikes."
+  [backdrop depth ridge-count]
+  (let [seed   (:byoubu/seed backdrop)
+        scene  (:byoubu/scene backdrop)
+        wl     (or (get-in scene [:terrain :dune-wavelength]) 200.0)
+        amp    (or (get-in scene [:terrain :dune-amplitude]) 0.4)
+        hz     (horizon-y backdrop)
+        ;; Further ridges show fewer, broader forms — perspective compresses
+        ;; them horizontally as well as vertically.
+        cycles (* (/ view-width wl) (- 1.0 (* 0.45 (/ (double depth)
+                                                      (max 1.0 (double ridge-count))))))
+        t      (/ (double depth) (max 1.0 (double (dec ridge-count))))
+        rise   (* height 0.075 amp (+ 0.30 (* 1.30 t)))
+        base   (+ hz (* height 0.020 t))
+        step   8.0]
+    (for [x (range 0 (+ width step) step)]
+      (let [u (* cycles (/ (double x) width))
+            n (noise/fbm-noise (+ u (* 3.7 (inc depth)))
+                               (+ (* 0.5 (mod seed 211)) (* 11.0 depth))
+                               3 2.0 0.45)]
+        [x (- base (* rise (- (* 2.0 n) 1.0)))]))))
+
+(defn- path-of
+  "Closed path under a polyline, down to the bottom of the frame."
+  [points]
+  (str "M " (str/join " L " (for [[x y] points] (str (fmt x) " " (fmt y))))
+       " L " (fmt width) " " height " L 0 " height " Z"))
+
+;; ---------------------------------------------------------------------------
+;; svg pieces
+
+(defn- defs [backdrop]
+  (let [p    (fn [k] (get-in backdrop [:byoubu/palette k]))
+        hz   (horizon-y backdrop)
+        hzp  (* 100.0 (/ hz height))
+        haze (or (get-in backdrop [:byoubu/scene :atmosphere :haze-density]) 0.3)
+        vig  (or (get-in backdrop [:byoubu/scene :grade :vignette]) 0.25)]
+    (str
+     "<defs>"
+     "<linearGradient id=\"sky\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">"
+     "<stop offset=\"0%\" stop-color=\"" (p :sky-zenith) "\"/>"
+     "<stop offset=\"" (fmt (* 0.62 hzp)) "%\" stop-color=\"" (p :sky-mid) "\"/>"
+     "<stop offset=\"" (fmt hzp) "%\" stop-color=\"" (p :sky-horizon) "\"/>"
+     "</linearGradient>"
+
+     "<radialGradient id=\"glow\" cx=\"0.5\" cy=\"" (fmt (/ hzp 100.0))
+     "\" r=\"0.55\">"
+     "<stop offset=\"0%\" stop-color=\"" (color/rgba (p :sky-horizon) "0.9") "\"/>"
+     "<stop offset=\"45%\" stop-color=\"" (color/rgba (p :haze) (fmt haze)) "\"/>"
+     "<stop offset=\"100%\" stop-color=\"" (color/rgba (p :haze) "0") "\"/>"
+     "</radialGradient>"
+
+     "<linearGradient id=\"ground\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">"
+     "<stop offset=\"0%\" stop-color=\"" (p :dune-lit) "\"/>"
+     "<stop offset=\"100%\" stop-color=\"" (p :dune-shadow) "\"/>"
+     "</linearGradient>"
+
+     ;; Haze pools at the horizon. Drawn over the ridges and under the near
+     ;; dune, so distance fogs and the foreground stays clear — and, as a side
+     ;; effect, the seam where the sky rect meets the ground stops reading as
+     ;; a drawn line.
+     "<linearGradient id=\"haze\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">"
+     "<stop offset=\"0%\" stop-color=\"" (color/rgba (p :haze) "0") "\"/>"
+     "<stop offset=\"58%\" stop-color=\""
+     (color/rgba (p :haze) (fmt (* 0.55 haze))) "\"/>"
+     "<stop offset=\"100%\" stop-color=\"" (color/rgba (p :haze) "0") "\"/>"
+     "</linearGradient>"
+
+     "<radialGradient id=\"vignette\" cx=\"0.5\" cy=\"0.45\" r=\"0.78\">"
+     "<stop offset=\"45%\" stop-color=\"rgba(0,0,0,0)\"/>"
+     "<stop offset=\"100%\" stop-color=\""
+     (color/rgba (p :dune-shadow) (fmt vig)) "\"/>"
+     "</radialGradient>"
+     "</defs>")))
+
+(defn- stars [backdrop]
+  (let [scene   (:byoubu/scene backdrop)
+        density (or (get-in scene [:sky :stars :density]) 0.0)
+        seed    (:byoubu/seed backdrop)
+        hz      (horizon-y backdrop)
+        n       (int (* 420 density))]
+    (when (pos? n)
+      (str "<g fill=\"" (get-in backdrop [:byoubu/palette :star]) "\">"
+           (str/join
+            ""
+            (for [i (range n)
+                  :let [x (* width (seeded seed 1 i))
+                        ;; Stars only above the skyline, thinning toward it —
+                        ;; the squared distribution is what keeps the horizon
+                        ;; from looking sprinkled.
+                        v (seeded seed 2 i)
+                        y (* hz (* v v))
+                        r (+ 0.5 (* 1.4 (seeded seed 3 i)))
+                        o (+ 0.18 (* 0.72 (seeded seed 4 i)))]]
+              (str "<circle cx=\"" (fmt x) "\" cy=\"" (fmt y)
+                   "\" r=\"" (fmt r) "\" opacity=\"" (fmt o) "\"/>")))
+           "</g>"))))
+
+(defn- ridges
+  "Ridge silhouettes back to front. The furthest is mixed toward the haze
+  colour by the scene's own `:haze-density` — atmospheric perspective is what
+  separates three dark bands into three distances."
+  [backdrop]
+  (let [n    (or (get-in backdrop [:byoubu/scene :terrain :ridge-count]) 3)
+        haze (or (get-in backdrop [:byoubu/scene :atmosphere :haze-density]) 0.3)
+        far  (get-in backdrop [:byoubu/palette :ridge-far])
+        near (get-in backdrop [:byoubu/palette :ridge-near])
+        hazec (get-in backdrop [:byoubu/palette :haze])]
+    (str/join
+     ""
+     (for [d (range n)
+           :let [t    (/ (double d) (max 1.0 (double (dec n))))
+                 base (color/mix [[far (- 1.0 t)] [near t]])
+                 ;; the further back, the more haze bleeds into the silhouette
+                 lift (* haze 0.55 (- 1.0 t))
+                 fill (color/mix [[base (- 1.0 lift)] [hazec lift]])]]
+       (str "<path d=\"" (path-of (ridge-points backdrop d n))
+            "\" fill=\"" fill "\"/>")))))
+
+(defn- foreground
+  "The near dune the camera sits on: one long sweep across the lower frame,
+  filled with the ground gradient so the eye reads depth."
+  [backdrop]
+  (let [seed  (:byoubu/seed backdrop)
+        scene (:byoubu/scene backdrop)
+        wl    (or (get-in scene [:terrain :dune-wavelength]) 200.0)
+        amp   (or (get-in scene [:terrain :dune-amplitude]) 0.4)
+        hz    (horizon-y backdrop)
+        base  (+ hz (* (- height hz) 0.38))
+        rise  (* (- height hz) 0.34 (+ 0.4 amp))
+        ;; The near dune is one or two broad forms, not a field: halve the
+        ;; crest count the far ridges use, because it is closer to the camera.
+        cycles (* 0.5 (/ view-width wl))
+        pts   (for [x (range 0 (+ width 8.0) 8.0)]
+                (let [u (* cycles (/ (double x) width))
+                      n (noise/fbm-noise (+ u 91.0) (* 0.25 (mod seed 173)) 3 2.0 0.5)]
+                  [x (- base (* rise (- (* 2.0 n) 1.0)))]))]
+    (str "<path d=\"" (path-of pts) "\" fill=\"url(#ground)\"/>")))
+
+;; ---------------------------------------------------------------------------
+
+(defn svg
+  "The complete poster for a backdrop (id or map), as an SVG string."
+  [id-or-backdrop]
+  (let [b  (if (map? id-or-backdrop) id-or-backdrop (byoubu/fetch id-or-backdrop))
+        hz (horizon-y b)]
+    (str "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 "
+         width " " height "\" width=\"" width "\" height=\"" height
+         "\" preserveAspectRatio=\"xMidYMid slice\" role=\"img\""
+         " aria-label=\"" (:byoubu/title b) "\">"
+         (defs b)
+         ;; base fill first: an SVG that fails to paint a layer still shows
+         ;; the backdrop's own dark, never white
+         "<rect width=\"" width "\" height=\"" height "\" fill=\""
+         (get-in b [:byoubu/palette :dune-shadow]) "\"/>"
+         "<rect width=\"" width "\" height=\"" (fmt hz) "\" fill=\"url(#sky)\"/>"
+         (stars b)
+         "<rect width=\"" width "\" height=\"" height "\" fill=\"url(#glow)\"/>"
+         (ridges b)
+         ;; band centred just below the skyline
+         "<rect x=\"0\" y=\"" (fmt (- hz (* height 0.13))) "\" width=\"" width
+         "\" height=\"" (fmt (* height 0.22)) "\" fill=\"url(#haze)\"/>"
+         (foreground b)
+         "<rect width=\"" width "\" height=\"" height "\" fill=\"url(#vignette)\"/>"
+         "</svg>")))
