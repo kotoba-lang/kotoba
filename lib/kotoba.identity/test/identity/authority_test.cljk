@@ -1,0 +1,70 @@
+(ns identity.authority-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [identity.authority :as authority]))
+
+(def op {:schema authority/schema :operation-id "link-1"
+         :principal-id "urn:kotoba:principal:one" :genesis-cid "genesis"
+         :previous-head-cid "head" :previous-version 1
+         :account-id "eip155:314:0x1234" :purposes [:login :payout]
+         :audience "https://murakumo.cloud" :nonce "single-use" :expires-at 1200})
+(def state {:principal-id (:principal-id op) :genesis-cid "genesis"
+            :head-cid "head" :version 1 :used-nonces #{} :accounts {}
+            :controllers {"pc" {:status :active :permissions #{:link-account}}}})
+(def payload (authority/operation-payload op))
+(def proofs {:controller-id "pc" :controller-proof payload :account-proof payload})
+(def ports {:now 1000 :audience (:audience op) :max-ttl-ms 300
+            :verify-head! (fn [_ _] true)
+            :verify-controller! (fn [_ bytes proof] (= bytes proof))
+            :verify-account! (fn [_ bytes proof] (= bytes proof))})
+
+(deftest link-requires-both-bound-proofs
+  (let [result (authority/admit-link state op proofs ports)]
+    (is (:ok? result))
+    (is (= :pending-commit (get-in result [:next-state :accounts (:account-id op) :status])))
+    (is (nil? (get-in result [:next-state :head-cid])))
+    (is (= #{"single-use"} (get-in result [:next-state :used-nonces])))
+    (is (= (:controllers state) (get-in result [:next-state :controllers]))))
+  (doseq [part [:controller-proof :account-proof]]
+    (is (false? (:ok? (authority/admit-link state op (assoc proofs part "forged") ports))))))
+
+(deftest replay-stale-and-revoked-refuse
+  (is (= :replay (:reason (authority/admit-link (assoc state :used-nonces #{"single-use"}) op proofs ports))))
+  (is (= :head-mismatch (:reason (authority/admit-link (assoc state :version 2) op proofs ports))))
+  (is (= :head-not-current-and-final (:reason (authority/admit-link state op proofs (assoc ports :verify-head! (fn [_ _] false))))))
+  (is (= :controller-not-authorized (:reason (authority/admit-link (assoc-in state [:controllers "pc" :status] :revoked) op proofs ports))))
+  (is (= :already-linked (:reason (authority/admit-link (assoc-in state [:accounts (:account-id op)] {}) op proofs ports)))))
+
+(deftest no-ambient-verifier-or-recovery-authority
+  (is (= :verifier-unavailable (:reason (authority/admit-link state op proofs (dissoc ports :verify-account!)))))
+  (is (false? (:ok? (authority/admit-link state (assoc op :purposes [:recovery]) proofs ports))))
+  (is (false? (:ok? (authority/admit-link state op proofs (assoc ports :verify-account! (fn [& _] {:verified true})))))))
+
+(deftest signatures-bind-every-field
+  (doseq [[field value] [[:account-id "eip155:1:0x1234"] [:nonce "other"]
+                       [:operation-id "other"] [:purposes [:login]]
+                       [:audience "https://evil.example"] [:expires-at 1100]]]
+    (is (false? (:ok? (authority/admit-link state (assoc op field value) proofs ports)))))
+  (doseq [bad [(assoc op :extra "not-signed") (dissoc op :nonce)
+               (assoc op :previous-version "1") (assoc op :expires-at 1000)
+               (assoc op :expires-at 1301) (assoc op :purposes [:payout :login])]]
+    (is (false? (:ok? (authority/admit-link state bad proofs ports))))))
+
+(deftest framing-distinguishes-delimiters-and-types
+  (is (not= (authority/operation-payload (assoc op :nonce "a:b" :operation-id "c"))
+            (authority/operation-payload (assoc op :nonce "b" :operation-id "c:a")))))
+
+#?(:cljs
+   (deftest real-signatures-cannot-be-substituted-or-replayed-across-chains
+     (let [crypto (js/require "node:crypto")
+           owner (.generateKeyPairSync crypto "ed25519")
+           wallet (.generateKeyPairSync crypto "ed25519")
+           sign (fn [pair text] (.sign crypto nil (js/Buffer.from text "utf8") (.-privateKey pair)))
+           verify (fn [pair text signature] (.verify crypto nil (js/Buffer.from text "utf8") (.-publicKey pair) signature))
+           signed {:controller-id "pc" :controller-proof (sign owner payload)
+                   :account-proof (sign wallet payload)}
+           live (assoc ports :verify-controller! (fn [_ text signature] (verify owner text signature))
+                             :verify-account! (fn [_ text signature] (verify wallet text signature)))]
+       ;; This qualifies the native-key port, not SIWE or a real WebAuthn ceremony.
+       (is (:ok? (authority/admit-link state op signed live)))
+       (is (false? (:ok? (authority/admit-link state op (assoc signed :controller-proof (sign wallet payload)) live))))
+       (is (false? (:ok? (authority/admit-link state (assoc op :account-id "eip155:1:0x1234") signed live)))))))
