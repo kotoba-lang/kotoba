@@ -1,0 +1,472 @@
+(ns aac.encode-test
+  "Tests for `aac.encode` — this repo's AAC-LC ENCODER.
+
+   ## The golden-vector methodology, run backwards
+
+   `aac.decode-test` validates decoding by feeding this repo a real
+   ffmpeg-encoded stream and comparing against ffmpeg's own PCM. There is no
+   equivalent way to validate an encoder against a reference encoder: two
+   conformant AAC encoders produce completely different bitstreams (different
+   quantizers, different codebooks, different bit allocation) and neither is
+   wrong. What IS checkable, and is the only claim worth making, is that a real
+   independent decoder reads THIS encoder's output and recovers the audio.
+
+   So the direction flips: this repo encodes, and real ffmpeg decodes. The
+   committed fixtures (regenerate with `kbb -M:fixtures`, see
+   `aac.dev.fixtures`) are
+
+     encode-tone-{mono,stereo}.src.pcm      the encoder's exact input (s16le)
+     encode-tone-{mono,stereo}.aac          this encoder's output
+     encode-tone-{mono,stereo}.ffmpeg.pcm   `ffmpeg -i <that> -f s16le` output
+
+   and `ffmpeg-decodes-our-*-stream` asserts that ffmpeg's decode of that
+   bitstream agrees with this repo's own decode of it to within 2 LSB — the same
+   tolerance, for the same floating-point reason, as the decode-side tests. That
+   is the conformance evidence, and it stays valid in CI without ffmpeg
+   installed because ffmpeg's answer is committed.
+
+   ## Why byte-exactness against the fixture is deliberately NOT asserted
+
+   `fresh-encode-matches-the-validated-stream` re-encodes the committed source
+   and compares frame count, size and reconstruction quality — not bytes.
+   `Math/pow` and `Math/cos` are permitted 1 ulp of error and are not required
+   to be identical across platforms or JDK versions (only `StrictMath` is), and
+   a last-bit difference can flip a coefficient that sits exactly on a quantizer
+   decision boundary. A byte comparison would therefore be a portability trap
+   that fails on a different architecture while nothing is wrong, so it is not
+   made; the durable correctness evidence is the ffmpeg comparison above, which
+   tolerates exactly that kind of difference.
+
+   ## What the numeric floors mean
+
+   The SNR floors below are set from measured values with margin, and they are
+   floors on SQUARED ERROR, not on perceived quality. This encoder has no
+   psychoacoustic model, so its SNR at a given bitrate is expected to be HIGHER
+   than a perceptual encoder's while sounding no better — see `aac.encode`'s
+   namespace docstring. A regression that made the audio worse would show up
+   here; an SNR number here is not evidence of quality parity with ffmpeg."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotoba.io :as io]
+            [aac.adts :as adts]
+            [aac.bits :as bits]
+            [aac.decode :as decode]
+            [aac.dequant :as dequant]
+            [aac.encode :as encode]
+            [aac.huffman :as huffman]
+            [aac.ics :as ics]
+            [aac.huffman-tables :as tabs]
+            [aac.mdct :as mdct]
+            [aac.quant :as quant]
+            [aac.stereo :as stereo]
+            [aac.tables :as tables]))
+
+(def ^:private sample-rate 44100)
+
+(defn- rd-bytes [p]
+  (mapv #(bit-and (int %) 0xff)
+        (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+
+(defn- rd-pcm-s16le [p]
+  (let [bs (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+        n (quot (count bs) 2)]
+    (mapv (fn [i]
+            (short (bit-or (bit-and (int (aget bs (* 2 i))) 0xff)
+                           (bit-shift-left (aget bs (inc (* 2 i))) 8))))
+          (range n))))
+
+(defn- deinterleave [xs]
+  {:left (mapv #(nth xs (* 2 %)) (range (quot (count xs) 2)))
+   :right (mapv #(nth xs (inc (* 2 %))) (range (quot (count xs) 2)))})
+
+(defn- snr-db
+  "Signal-to-noise ratio of `test-signal` against `reference` over the first `n`
+   samples, with `test-signal` shifted by `offset` (the encoder delay — a
+   decoder's first frame is the filterbank's zero-padded lead-in, see
+   `aac.encode/encoder-delay`)."
+  [reference test-signal n offset]
+  (let [sig (reduce (fn [a i] (+ a (let [v (double (nth reference i))] (* v v)))) 0.0 (range n))
+        err (reduce (fn [a i] (+ a (let [d (- (double (nth reference i))
+                                              (double (nth test-signal (+ i offset))))]
+                                     (* d d))))
+                    0.0 (range n))]
+    (if (zero? err) ##Inf (* 10.0 (Math/log10 (/ sig err))))))
+
+(defn- max-abs-diff [a b n]
+  (apply max (map (fn [i] (Math/abs (- (int (nth a i)) (int (nth b i))))) (range n))))
+
+(defn- realised-bitrate [adts frames]
+  (long (/ (* 8.0 (count adts) sample-rate) (* frames 1024.0))))
+
+(defn- dequantized-snr
+  "Coefficient-domain SNR of quantizing `spec` at a single scalefactor `sf` and
+   dequantizing again — the error the filterbank then carries into the PCM."
+  [spec sf]
+  (let [q (mapv #(quant/quantize-coeff % sf) spec)
+        back (mapv #(dequant/dequantize-coeff % sf) q)
+        sig (reduce + 0.0 (map #(* % %) spec))
+        err (reduce + 0.0 (map (fn [a b] (let [d (- a b)] (* d d))) spec back))]
+    (if (zero? err) ##Inf (* 10.0 (Math/log10 (/ sig err))))))
+
+(def ^:private spectral-table
+  {1 tabs/cb1-huffman-table 2 tabs/cb2-huffman-table 3 tabs/cb3-huffman-table
+   4 tabs/cb4-huffman-table 5 tabs/cb5-huffman-table 6 tabs/cb6-huffman-table
+   7 tabs/cb7-huffman-table 8 tabs/cb8-huffman-table 9 tabs/cb9-huffman-table
+   10 tabs/cb10-huffman-table 11 tabs/cb11-huffman-table})
+
+;; --- the conformance evidence: real ffmpeg decodes what we wrote ---------
+
+(deftest ffmpeg-decodes-our-mono-stream
+  (let [stream (rd-bytes "aac/fixtures/encode-tone-mono.aac")
+        src (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm")
+        ff (rd-pcm-s16le "aac/fixtures/encode-tone-mono.ffmpeg.pcm")
+        frames (adts/frames stream)
+        ours (mapv decode/pcm->int16 (decode/decode-frames frames))]
+    (testing "the ADTS framing this encoder wrote parses back to the parameters it was asked for"
+      (is (= 9 (count frames)))
+      (let [h (first frames)]
+        (is (= 44100 (:sample-rate h)))
+        (is (= 1 (:channel-configuration h)))
+        (is (= 2 (:profile h)))                            ; AAC-LC
+        (is (= 0 (:mpeg-version h)))                       ; MPEG-4
+        (is (true? (:protection-absent? h)))))
+    (testing "ffmpeg emitted one PCM frame per ADTS frame, delay included"
+      (is (= (* 9 1024) (count ff))))
+    (testing "REAL ffmpeg's decode and this repo's decode of the same bitstream agree to 2 LSB"
+      (is (<= (max-abs-diff ff ours (count ff)) 2)))
+    (testing "ffmpeg recovers the source audio (so the bitstream carries the signal, not merely valid syntax)"
+      (is (> (snr-db src ff (count src) encode/encoder-delay) 30.0)
+          (str "SNR " (snr-db src ff (count src) encode/encoder-delay))))))
+
+(deftest ffmpeg-decodes-our-stereo-stream
+  (let [stream (rd-bytes "aac/fixtures/encode-tone-stereo.aac")
+        src (deinterleave (rd-pcm-s16le "aac/fixtures/encode-tone-stereo.src.pcm"))
+        ff (deinterleave (rd-pcm-s16le "aac/fixtures/encode-tone-stereo.ffmpeg.pcm"))
+        frames (adts/frames stream)
+        decoded (decode/decode-frames-stereo frames)
+        ours {:left (mapv decode/pcm->int16 (:left decoded))
+              :right (mapv decode/pcm->int16 (:right decoded))}]
+    (testing "stereo framing"
+      (is (= 9 (count frames)))
+      (is (= 2 (:channel-configuration (first frames)))))
+    (testing "REAL ffmpeg's decode agrees with this repo's, per channel, to 2 LSB"
+      (is (<= (max-abs-diff (:left ff) (:left ours) (count (:left ff))) 2))
+      (is (<= (max-abs-diff (:right ff) (:right ours) (count (:right ff))) 2)))
+    (testing "ffmpeg recovers both channels"
+      (is (> (snr-db (:left src) (:left ff) (count (:left src)) encode/encoder-delay) 30.0))
+      (is (> (snr-db (:right src) (:right ff) (count (:right src)) encode/encoder-delay) 30.0)))
+    (testing "the channels are not swapped or mixed: each source channel matches ITS OWN output far better than the other's"
+      (let [n (count (:left src))
+            same (snr-db (:left src) (:left ff) n encode/encoder-delay)
+            crossed (snr-db (:left src) (:right ff) n encode/encoder-delay)]
+        (is (> same (+ crossed 20.0))
+            (str "same-channel SNR " same " vs crossed " crossed))))))
+
+(deftest fresh-encode-matches-the-validated-stream
+  (testing "re-encoding the committed source now reproduces the stream ffmpeg validated (see namespace docstring on why not byte-for-byte)"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))
+          committed (rd-bytes "aac/fixtures/encode-tone-mono.aac")
+          ff (rd-pcm-s16le "aac/fixtures/encode-tone-mono.ffmpeg.pcm")
+          out (encode/encode-mono src {:sample-rate sample-rate :bitrate 128000})]
+      (is (= 9 (:frames out)))
+      (is (zero? (:clipped-lines out)))
+      (testing "same size to within 0.5%"
+        (let [ratio (/ (double (count (:adts out))) (count committed))]
+          (is (< 0.995 ratio 1.005) (str "size ratio " ratio))))
+      (testing "and decodes to the same audio ffmpeg saw, to a few LSB"
+        (let [ours (mapv decode/pcm->int16 (decode/decode-frames (adts/frames (:adts out))))]
+          (is (<= (max-abs-diff ff ours (count ff)) 2)))))))
+
+;; --- rate control -------------------------------------------------------
+
+(deftest rate-control-tracks-the-target
+  (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))]
+    (doseq [target [96000 128000 192000]]
+      (let [out (encode/encode-mono src {:sample-rate sample-rate :bitrate target})
+            actual (realised-bitrate (:adts out) (:frames out))]
+        (testing (str "target " target " is approached from below, never exceeded")
+          (is (<= actual target) (str "actual " actual))
+          (is (> actual (* 0.93 target)) (str "actual " actual " undershoots target " target)))))
+    (testing "quality rises monotonically with the bit budget"
+      (let [snrs (mapv (fn [target]
+                         (let [out (encode/encode-mono src {:sample-rate sample-rate :bitrate target})
+                               pcm (decode/decode-frames (adts/frames (:adts out)))]
+                           (snr-db src pcm (count src) encode/encoder-delay)))
+                       [64000 96000 128000 192000])]
+        (is (apply < snrs) (str "SNR by bitrate: " snrs))))))
+
+(deftest bit-prediction-equals-bits-written
+  (testing "every frame's predicted size is what the writer actually produced — asserted inside encode-frame-sce/-cpe, so reaching here at all is the check"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))
+          out (encode/encode-mono src {:sample-rate sample-rate :bitrate 128000})
+          payload-bits (* 8 (reduce + 0 (map count (:access-units out))))]
+      ;; :bits counts real payload bits; the byte-aligned payload rounds each
+      ;; frame up to at most 7 further bits.
+      (is (<= (:bits out) payload-bits (+ (:bits out) (* 7 (:frames out))))))))
+
+;; --- the clipping floor (regression test for a measured failure) ---------
+
+(deftest scalefactor-floor-prevents-clipping
+  (testing "asking for a quantizer far finer than the spectrum can represent must not clip: aac.quant/band-scalefactors floors each band"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))]
+      (doseq [base-sf [80 100 110 120]]
+        (let [out (encode/encode-mono src {:sample-rate sample-rate :base-sf base-sf})
+              pcm (decode/decode-frames (adts/frames (:adts out)))
+              snr (snr-db src pcm (count src) encode/encoder-delay)]
+          (is (zero? (:clipped-lines out)) (str "base-sf " base-sf " clipped " (:clipped-lines out)))
+          (is (> snr 55.0) (str "base-sf " base-sf " SNR " snr)))))))
+
+(deftest the-floor-is-what-prevents-it
+  (testing "without the floor the same spectrum DOES overflow — so the test above is evidence about min-scalefactor, not about the signal being harmless"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))
+          spec (mdct/analyze-frame (nth (mdct/frame-blocks src) 2) 0 0)
+          floor-sf (quant/min-scalefactor spec 0 1024)
+          clipped-at (fn [sf] (count (filter #(= quant/max-quant (Math/abs (long %)))
+                                             (mapv #(quant/quantize-coeff % sf) spec))))]
+      (is (pos? floor-sf))
+      (testing "at the floor nothing clips"
+        (is (zero? (clipped-at floor-sf))))
+      (testing "one step below it, something does"
+        (is (pos? (clipped-at (dec floor-sf)))))
+      (testing "and a SINGLE clipped line costs tens of dB, which is why the floor matters"
+        ;; Measured on this fixture: 67.6 dB at the floor, 26.0 dB one
+        ;; scalefactor step below it, where exactly one line overflows. The
+        ;; assertion is on the SIZE OF THE COLLAPSE rather than an absolute
+        ;; number, because how far a clipped peak drags a frame down depends on
+        ;; how much of the frame's energy that one line carried — going further
+        ;; below the floor reaches ~0 dB. The claim being pinned is that
+        ;; overflowing at all is catastrophic, not that it lands anywhere in
+        ;; particular.
+        (let [ok (dequantized-snr spec floor-sf)
+              bad (dequantized-snr spec (dec floor-sf))]
+          (is (> ok 60.0) (str "SNR at the floor " ok))
+          (is (> (- ok bad) 30.0) (str "SNR at the floor " ok " vs one step below " bad)))))))
+
+;; --- Huffman encode direction, exhaustively -----------------------------
+
+(defn- tuple-round-trip
+  "Write `tuple` under codebook `cb`, read it back, and return
+   {:decoded :written-bits :predicted-bits}."
+  [cb tuple]
+  (let [w (bits/writer)]
+    (huffman/write-spectral-tuple! w cb tuple)
+    (let [written (bits/bits-written w)
+          bs (bits/bytes! w)
+          r (bits/reader bs)]
+      {:decoded (huffman/decode-spectral-tuple! r cb)
+       :written-bits written
+       :predicted-bits (huffman/tuple-bits cb tuple)})))
+
+(deftest every-huffman-table-entry-round-trips
+  (testing "for all eleven spectral codebooks, EVERY one of the ~1240 table indices' n-tuples survives write -> read, and tuple-bits predicts the exact cost"
+    (doseq [cb (range 1 12)]
+      (let [size (count (get spectral-table cb))
+            failures (for [idx (range size)
+                           :let [tuple (huffman/idx->tuple cb idx)
+                                 {:keys [decoded written-bits predicted-bits]} (tuple-round-trip cb tuple)]
+                           :when (or (not= tuple decoded) (not= written-bits predicted-bits))]
+                       {:cb cb :idx idx :tuple tuple :decoded decoded
+                        :written written-bits :predicted predicted-bits})]
+        (is (empty? failures) (str "codebook " cb ": " (pr-str (take 5 failures))))
+        (testing "and tuple->idx is the exact inverse of idx->tuple over the whole table"
+          (is (= (range size)
+                 (map (fn [idx] (huffman/tuple->idx cb (huffman/idx->tuple cb idx))) (range size)))))))))
+
+(deftest escape-coding-round-trips
+  (testing "ESC_HCB magnitudes above the table's 16 survive the escape sequence, including the boundaries of every escape word length"
+    (let [magnitudes (concat (range 16 40)
+                             (mapcat (fn [n] [(bit-shift-left 1 (+ n 4))
+                                              (dec (bit-shift-left 1 (+ n 5)))])
+                                     (range 0 9))
+                             [8191])]
+      (doseq [mag magnitudes
+              signs [[1 1] [-1 1] [1 -1] [-1 -1]]]
+        (let [tuple [(* (first signs) mag) (* (second signs) 3)]
+              {:keys [decoded written-bits predicted-bits]} (tuple-round-trip 11 tuple)]
+          (is (= tuple decoded) (str "magnitude " mag " signs " signs))
+          (is (= written-bits predicted-bits)))))))
+
+(deftest scalefactor-dpcm-round-trips
+  (testing "every differential scalefactor the codebook can express survives write -> read, and its cost is predicted exactly"
+    (doseq [delta (range -60 61)]
+      (let [w (bits/writer)]
+        (huffman/write-scalefactor-dpcm! w delta)
+        (let [written (bits/bits-written w)
+              r (bits/reader (bits/bytes! w))]
+          (is (= delta (huffman/decode-scalefactor-dpcm! r)))
+          (is (= written (huffman/scalefactor-delta-bits delta)))))))
+  (testing "and a delta outside it throws rather than emitting a stream no decoder can read"
+    (is (thrown? kerror/ExceptionInfo (huffman/write-scalefactor-dpcm! (bits/writer) 61)))
+    (is (thrown? kerror/ExceptionInfo (huffman/scalefactor-delta-bits -61)))))
+
+(deftest codebook-range-is-enforced-not-clamped
+  (testing "a value a codebook cannot represent throws — silently clamping would emit audio that is not what was quantized"
+    (is (thrown? kerror/ExceptionInfo (huffman/tuple->idx 1 [2 0 0 0])))     ; cb1 lav 1
+    (is (thrown? kerror/ExceptionInfo (huffman/tuple->idx 7 [8 0])))         ; cb7 lav 7
+    (is (false? (huffman/codebook-fits? 1 [2 0 0 0])))
+    (is (true? (huffman/codebook-fits? 5 [-4 4])))
+    (is (true? (huffman/codebook-fits? 11 [8191 -16])))))
+
+;; --- quantizer ----------------------------------------------------------
+
+(deftest quantizer-inverts-dequantizer
+  (testing "quantize-coeff picks the level aac.dequant reconstructs closest to the input — no neighbouring level is closer"
+    (doseq [sf [60 100 137 200]
+            x [0.0 1.0 -1.0 12.5 -3333.0 1.0e6 -7.7e5]]
+      (let [q (quant/quantize-coeff x sf)
+            back (dequant/dequantize-coeff q sf)
+            err (Math/abs (- (double x) (double back)))]
+        (testing (str "x " x " sf " sf " q " q)
+          (is (or (zero? q) (= (neg? q) (neg? x))) "sign preserved")
+          (doseq [nudge [-1 1]]
+            (let [alt-q (+ q nudge)]
+              (when (<= (Math/abs (long alt-q)) quant/max-quant)
+                (is (<= err (+ 1e-9 (Math/abs (- (double x)
+                                                 (double (dequant/dequantize-coeff alt-q sf)))))))))))))))
+
+(deftest biased-offset-is-the-derived-boundary
+  (testing "the conventional 0.4054 is exactly 1 - (1/2)^(3/4), the q=0 -> q=1 decision boundary in the compressed domain"
+    (is (< (Math/abs (- quant/biased-round-offset 0.4054)) 0.0001))))
+
+(deftest rounding-mode-comparison
+  (testing "MEASURED, not assumed: at equal bit budget the exact nearest-level rule beats the conventional biased 0.4054 offset on squared error (the promise aac.quant's docstring makes)"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))
+          run (fn [rounding]
+                (let [out (encode/encode-mono src {:sample-rate sample-rate :bitrate 128000
+                                                   :rounding rounding})
+                      pcm (decode/decode-frames (adts/frames (:adts out)))]
+                  {:bitrate (realised-bitrate (:adts out) (:frames out))
+                   :snr (snr-db src pcm (count src) encode/encoder-delay)}))
+          nearest (run :nearest)
+          biased (run quant/biased-round-offset)]
+      (testing "both stay inside the budget"
+        (is (<= (:bitrate nearest) 128000))
+        (is (<= (:bitrate biased) 128000)))
+      (testing "and nearest is not worse"
+        (is (>= (:snr nearest) (:snr biased))
+            (str "nearest " nearest " biased " biased))))))
+
+;; --- structure ----------------------------------------------------------
+
+(deftest silence-encodes-to-silence
+  (testing "an all-zero input needs no scalefactor bands at all (max_sfb 0) and decodes back to exact zero"
+    (let [out (encode/encode-mono (vec (repeat 4096 0.0)) {:sample-rate sample-rate :bitrate 96000})
+          frames (adts/frames (:adts out))
+          pcm (decode/decode-frames frames)]
+      (is (= 5 (:frames out)))
+      (is (every? #(= 4 (count (:payload %))) frames)
+          "4 payload bytes: SCE + tag + global_gain + ics_info + three presence flags + END, byte-aligned")
+      (is (every? zero? pcm)))))
+
+(deftest section-optimiser-never-loses-to-per-band-sections
+  (testing "the dynamic program is at least as good as giving every band its own section"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))
+          spec (mdct/analyze-frame (nth (mdct/frame-blocks src) 2) 0 0)
+          swb (tables/swb-offsets 4)
+          opts (assoc encode/default-options :sample-rate sample-rate
+                      :budget-bits (encode/frame-budget-bits 128000 sample-rate))
+          plan (encode/plan-channel spec swb 49 130 opts)
+          max-sfb (:max-sfb plan)
+          sf-cost (encode/scalefactor-costs (:scale-factors plan) (:coded? plan) max-sfb)
+          per-band (reduce (fn [acc sfb]
+                             (let [start (nth swb sfb) end (nth swb (inc sfb))
+                                   cb (nth (:sfb-cb plan) sfb)
+                                   spectral (encode/band-spectral-bits (:q plan) start end cb)]
+                               (+ acc (encode/section-length-bits 1) spectral
+                                  (if (zero? cb) 0 (nth sf-cost sfb)))))
+                           0 (range max-sfb))]
+      (is (pos? max-sfb))
+      (is (<= (:section-bits plan) per-band)
+          (str "optimised " (:section-bits plan) " vs per-band " per-band))
+      (testing "and it does merge: this frame's section count is below its band count"
+        (is (< (count (partition-by identity (:sfb-cb plan))) max-sfb))))))
+
+(deftest supports-48-khz
+  (testing "the other sample rate aac.tables has a scalefactor-band table for"
+    (let [src (mapv double (rd-pcm-s16le "aac/fixtures/encode-tone-mono.src.pcm"))
+          out (encode/encode-mono src {:sample-rate 48000 :bitrate 128000})
+          frames (adts/frames (:adts out))]
+      (is (= 3 (:sampling-frequency-index (first frames))))
+      (is (= 48000 (:sample-rate (first frames))))
+      (is (zero? (:clipped-lines out)))
+      (is (> (snr-db src (decode/decode-frames frames) (count src) encode/encoder-delay) 30.0)))))
+
+(deftest rejects-unsupported-configuration
+  (testing "a sample rate with no scalefactor-band table fails loudly rather than producing a mislabelled stream (22050 Hz HAS an ADTS index, so it is aac.tables that refuses)"
+    (is (thrown? kerror/ExceptionInfo (encode/encode-mono [0.0] {:sample-rate 22050}))))
+  (testing "and one with no ADTS index at all fails too"
+    (is (thrown? kerror/ExceptionInfo (encode/encode-mono [0.0] {:sample-rate 44101})))))
+
+;; --- ADTS / AudioSpecificConfig write direction --------------------------
+
+(deftest adts-header-round-trips
+  (testing "write-header is the inverse of parse-header over every field it sets"
+    (doseq [sfi [3 4]
+            channels [1 2]
+            len [7 100 8191]]
+      (let [b (adts/write-header {:sampling-frequency-index sfi
+                                  :channel-configuration channels
+                                  :frame-length len})
+            h (adts/parse-header (into b (repeat 7 0)) 0)]
+        (is (= 7 (count b)))
+        (is (= sfi (:sampling-frequency-index h)))
+        (is (= channels (:channel-configuration h)))
+        (is (= len (:frame-length h)))
+        (is (= 2 (:profile h)))
+        (is (= 0 (:mpeg-version h)))
+        (is (true? (:protection-absent? h)))
+        (is (= 7 (:header-length h))))))
+  (testing "a frame length the 13-bit field cannot hold is refused"
+    (is (thrown? kerror/ExceptionInfo
+                 (adts/write-header {:sampling-frequency-index 4 :channel-configuration 1
+                                     :frame-length 8192}))))
+  (testing "sampling-frequency-index is the inverse of the rate table"
+    (is (= 4 (adts/sampling-frequency-index 44100)))
+    (is (= 3 (adts/sampling-frequency-index 48000)))
+    (is (thrown? kerror/ExceptionInfo (adts/sampling-frequency-index 44101)))))
+
+(deftest audio-specific-config-bytes
+  (testing "the 2-byte AudioSpecificConfig an MP4 esds needs: AOT 2 (AAC-LC), then sfi, then channel config"
+    ;; 00010 0100 0001 000  = 0x12 0x08  (AOT 2, sfi 4 = 44100, 1 channel)
+    (is (= [0x12 0x08] (adts/audio-specific-config {:sampling-frequency-index 4
+                                                    :channel-configuration 1})))
+    ;; 00010 0100 0010 000  = 0x12 0x10  (same, 2 channels)
+    (is (= [0x12 0x10] (adts/audio-specific-config {:sampling-frequency-index 4
+                                                    :channel-configuration 2})))
+    (is (= [0x11 0x88] (adts/audio-specific-config {:sampling-frequency-index 3
+                                                    :channel-configuration 1}))))
+  (testing "and encode-* hands it back alongside the ADTS stream, from the same parameters"
+    (let [out (encode/encode-mono (vec (repeat 1024 0.0)) {:sample-rate 44100})]
+      (is (= [0x12 0x08] (:audio-specific-config out)))
+      (is (= 1024 (:encoder-delay out))))))
+
+;; --- mid/side -----------------------------------------------------------
+
+(deftest mid-side-is-exercised-and-invertible
+  (let [src (deinterleave (rd-pcm-s16le "aac/fixtures/encode-tone-stereo.src.pcm"))
+        swb (tables/swb-offsets 4)
+        bl (nth (mdct/frame-blocks (mapv double (:left src))) 2)
+        br (nth (mdct/frame-blocks (mapv double (:right src))) 2)
+        spec-l (mdct/analyze-frame bl 0 0)
+        spec-r (mdct/analyze-frame br 0 0)
+        ms-used (encode/ms-decision spec-l spec-r swb 49)]
+    (testing "the fixture really does have a MIX of mid/side and plain L/R bands, so both branches run"
+      (is (some true? ms-used))
+      (is (some false? ms-used)))
+    (testing "apply-ms-forward is exactly inverted by the decoder's aac.stereo/apply-ms"
+      (let [[ch0 ch1] (encode/apply-ms-forward spec-l spec-r ms-used swb)
+            ;; the decoder addresses bands by [start end) range rather than by
+            ;; swb_offset index (so the same code serves EIGHT_SHORT's per-group
+            ;; bands) — for a long window_sequence that is exactly `swb`'s pairs.
+            [back-l back-r] (stereo/apply-ms ch0 ch1 (vec ms-used)
+                                             (ics/band-ranges 4 0 49 [1]))
+            worst (apply max (map (fn [i] (max (Math/abs (- (nth spec-l i) (nth back-l i)))
+                                               (Math/abs (- (nth spec-r i) (nth back-r i)))))
+                                  (range 1024)))]
+        (is (< worst 1e-6) (str "worst spectral round-trip error " worst))))
+    (testing "and the frame this encoder writes signals ms_mask_present = 1 (a genuine per-band mask, not the all-on shorthand)"
+      (let [frame (encode/encode-frame-cpe spec-l spec-r swb 49
+                                           (assoc encode/default-options
+                                                  :sample-rate sample-rate
+                                                  :budget-bits (encode/frame-budget-bits 192000 sample-rate)))]
+        (is (= 1 (:ms-mask-mode frame)))
+        (is (zero? (:clipped-lines frame)))))))

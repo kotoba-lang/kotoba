@@ -1,0 +1,128 @@
+(ns aac.dev.fixtures
+  "Regenerates the ENCODE-side test fixtures under `resources/aac/fixtures/`:
+
+     kbb -M:fixtures
+
+   Not part of `src` and not on the library's classpath — it exists so the
+   fixtures are reproducible rather than mystery bytes, which matters more here
+   than for the decode-side fixtures: those came from ffmpeg and can be
+   regenerated from the one-line commands in their docstrings, whereas these
+   come from THIS repo's encoder, so the recipe has to live somewhere.
+
+   Per source signal it writes three files:
+
+     <name>.src.pcm      the encoder's input, signed 16-bit little-endian
+     <name>.aac          this repo's encoder output (ADTS)
+     <name>.ffmpeg.pcm   real ffmpeg's decode of that ADTS
+
+   The source is written out rather than only generated in code so the test's
+   input is exact: `Math/sin` is not required to be bit-identical across
+   platforms, so a signal regenerated on another machine would not necessarily
+   be the same signal.
+
+   The third file is the load-bearing one. It is the evidence that a real,
+   independent AAC decoder reads this encoder's bitstream and recovers the
+   audio — the same golden-vector methodology `aac.decode-test` uses, run in the
+   other direction. Requires `ffmpeg` on PATH; without it the first two files
+   are still written and the command to finish the job is printed."
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [aac.decode :as decode]
+            [aac.encode :as encode]))
+
+(def ^:private sample-rate 44100)
+(def ^:private sample-count 8192)
+(def ^:private fixture-dir "resources/aac/fixtures")
+
+(defn- tone [n freq amp]
+  (mapv (fn [i] (* amp (Math/sin (* 2.0 Math/PI freq (/ (double i) (double sample-rate))))))
+        (range n)))
+
+(defn- dither
+  "Seeded pseudo-random low-level noise. `java.util.Random` is specified down to
+   its exact algorithm, so unlike `Math/sin` this part IS bit-reproducible; the
+   point of including it is to give the high bands non-tonal content, so the
+   encoder's codebook choice and section merging are exercised on something
+   other than isolated spectral spikes."
+  [n amp seed]
+  (let [r (java.util.Random. seed)]
+    (mapv (fn [_] (* amp (- (.nextDouble r) 0.5))) (range n))))
+
+(defn mono-source []
+  (mapv #(double (decode/pcm->int16 %))
+        (mapv + (tone sample-count 440.0 5000.0)
+              (tone sample-count 1867.0 2000.0)
+              (tone sample-count 5300.0 900.0)
+              (dither sample-count 600.0 20260730))))
+
+(defn stereo-source
+  "Left and right share a strong low-frequency component — so `ms-decision`
+   has correlated bands to find — and each carries a tone the other does not, so
+   a channel swap or cross-channel mixup shows up as the wrong frequency rather
+   than merely the wrong numbers."
+  []
+  (let [common (mapv + (tone sample-count 440.0 5000.0) (tone sample-count 1867.0 2000.0))
+        round (fn [xs] (mapv #(double (decode/pcm->int16 %)) xs))]
+    {:left (round (mapv + common (tone sample-count 3100.0 800.0)
+                        (dither sample-count 400.0 20260731)))
+     :right (round (mapv + common (tone sample-count 6700.0 800.0)
+                         (dither sample-count 400.0 20260732)))}))
+
+(defn- write-bytes! [path bs]
+  (io/make-parents path)
+  (with-open [o (io/output-stream path)]
+    (.write o (byte-array (map unchecked-byte bs)))))
+
+(defn- s16le [samples]
+  (mapcat (fn [x]
+            (let [v (decode/pcm->int16 x)]
+              [(bit-and v 0xff) (bit-and (bit-shift-right v 8) 0xff)]))
+          samples))
+
+(defn- interleaved-s16le [left right]
+  (mapcat (fn [l r] (concat (s16le [l]) (s16le [r]))) left right))
+
+(defn- ffmpeg-decode!
+  "Decode `aac-path` with real ffmpeg into raw s16le at `channels` channels."
+  [aac-path pcm-path channels]
+  (let [cmd ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error"
+             "-i" aac-path "-f" "s16le" "-ar" (str sample-rate) "-ac" (str channels)
+             pcm-path]]
+    (println "  $" (str/join " " cmd))
+    (try
+      (let [p (.start (doto (ProcessBuilder. ^java.util.List cmd) (.redirectErrorStream true)))
+            out (slurp (.getInputStream p))
+            code (.waitFor p)]
+        (when-not (str/blank? out) (println "   " (str/trim out)))
+        (when-not (zero? code)
+          (println "    ffmpeg exited" code "- reference PCM NOT regenerated"))
+        (zero? code))
+      (catch java.io.IOException _
+        (println "    ffmpeg not found on PATH - run the command above by hand")
+        false))))
+
+(defn -main [& _]
+  (let [mono (mono-source)
+        {:keys [left right]} (stereo-source)]
+    (println "mono:" (count mono) "samples @" sample-rate "Hz")
+    (let [out (encode/encode-mono mono {:sample-rate sample-rate :bitrate 128000})
+          base (str fixture-dir "/encode-tone-mono")]
+      (println "  frames" (:frames out) " bytes" (count (:adts out))
+               " clipped lines" (:clipped-lines out)
+               " bitrate" (long (/ (* 8.0 (count (:adts out)) sample-rate)
+                                   (* (:frames out) 1024.0))))
+      (write-bytes! (str base ".src.pcm") (s16le mono))
+      (write-bytes! (str base ".aac") (:adts out))
+      (ffmpeg-decode! (str base ".aac") (str base ".ffmpeg.pcm") 1))
+
+    (println "stereo:" (count left) "samples x2")
+    (let [out (encode/encode-stereo left right {:sample-rate sample-rate :bitrate 192000})
+          base (str fixture-dir "/encode-tone-stereo")]
+      (println "  frames" (:frames out) " bytes" (count (:adts out))
+               " clipped lines" (:clipped-lines out)
+               " bitrate" (long (/ (* 8.0 (count (:adts out)) sample-rate)
+                                   (* (:frames out) 1024.0))))
+      (write-bytes! (str base ".src.pcm") (interleaved-s16le left right))
+      (write-bytes! (str base ".aac") (:adts out))
+      (ffmpeg-decode! (str base ".aac") (str base ".ffmpeg.pcm") 2))
+    (println "done")))

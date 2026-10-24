@@ -1,0 +1,153 @@
+(ns aac.mdct
+  "AAC-LC long-window (1024-line) FORWARD MDCT + analysis windowing — the
+   exact TDAC inverse of `aac.imdct/decode-frame` (ISO/IEC 14496-3:2005
+   §4.6.11 filterbank, read in the encode direction). Scope:
+   `ONLY_LONG_SEQUENCE` only — NO block switching, unlike the DECODER, which
+   reads all four window sequences (`aac.imdct`). The asymmetry is
+   deliberate: deciding WHEN to switch is a psychoacoustic question (a
+   transient detector, which this encoder has no basis for — see the
+   `aac.encode` namespace docstring's 'no psychoacoustic model' item),
+   whereas reading a switch the encoder already made is not. The short and
+   transition windows and the window grouping an encoder-side switch would
+   need already exist in `aac.imdct`/`aac.ics`; what is missing is the
+   decision, not the filterbank. See `aac.encode` for what the gap costs on
+   transients.
+
+   ## Why the forward transform carries a factor of 2
+
+   The spec writes the decoder's IMDCT (§4.6.11.3.1) with an explicit `2/N`
+   and leaves the encoder informative, so the forward scale has to be
+   DERIVED from the requirement that the round trip reconstruct. Writing
+   `c(n,k) = cos((2*pi/N)*(n+n0)*(k+1/2))` with N=2048, n0=(N/2+1)/2, and
+   taking the forward transform as `X[k] = s * sum_n z[n] c(n,k)`, the
+   decoder's `y[n] = (2/N) sum_k X[k] c(n,k)` gives
+
+     sum_{k=0}^{N/2-1} c(m,k) c(n,k) = (N/4) * ( delta[m,n] + (-1)^j [p = jN] )
+
+   where `p = m + n + N/2 + 1` (the difference term collapses because
+   `sin(pi*(m-n)) = 0` for integer m-n; the sum term survives only where the
+   denominator vanishes too, i.e. `p` a multiple of N). Substituting:
+
+     y[n] = (s/2) * ( z[n] - z[N/2-1-n]   )   for n <  N/2   (j=1)
+     y[n] = (s/2) * ( z[n] + z[3N/2-1-n]  )   for n >= N/2   (j=2)
+
+   i.e. the classic `signal minus its time-domain alias`. The 50%-overlap-add
+   of two consecutively windowed blocks cancels those alias terms and sums
+   `w[i]^2 + w[N/2+i]^2 = 1` (the Princen-Bradley condition, which both the
+   sine and the KBD window satisfy) — but only if the leading factor is 1,
+   so `s = 2`.
+
+   That derivation is not taken on faith: `test/aac/mdct_test.cljk` feeds real
+   signal through `analyze-frame` -> `aac.imdct/decode-frame` and asserts
+   perfect reconstruction to ~1e-9 for BOTH window shapes, and asserts it
+   FAILS at s=1 (so the test would catch a silently-wrong scale rather than
+   passing on a self-consistent-but-wrong pair).
+
+   ## Analysis window halves follow the decoder's convention exactly
+
+   `window_shape` in a frame's `ics_info()` describes that frame's window's
+   SECOND half; the first half uses the PREVIOUS frame's shape
+   (§4.6.11.3.2). `aac.imdct/decode-frame` applies `prev-window-shape` to
+   the first 1024 samples and `window-shape` REVERSED to the second 1024;
+   `analyze-frame` below applies the identical pair to the identical halves,
+   which is what makes the two exact inverses rather than merely similar.
+
+   ## Cosine table
+
+   The kernel argument reduces to an exact integer index: with theta = pi/1024,
+   `theta*(n+512.5)*(k+0.5) = pi*j/4096` where `j = 4nk + 2n + 2050k + 1025`,
+   and cos(pi*j/4096) has period 8192 in j — so an 8192-entry table indexed by
+   `j mod 8192` (advanced by the recurrence `j(n+1,k) = j(n,k) + 4k + 2`)
+   evaluates the whole O(N^2) transform with no trigonometry in the inner
+   loop and no floating-point argument accumulation. `aac.imdct`'s decode-side
+   IMDCT is deliberately NOT changed to match: its output is validated
+   bit-exactly (<=2 LSB) against real ffmpeg PCM, and the two forms differ in
+   the last bits, so touching it would put that golden-vector tolerance at
+   risk for no decode-side benefit."
+  (:require [aac.imdct :as imdct]))
+
+(def ^:private pi #?(:clj Math/PI :cljs js/Math.PI))
+(defn- cos- [x] #?(:clj (Math/cos x) :cljs (js/Math.cos x)))
+
+(def ^:private transform-length 2048)
+(def ^:private half-length 1024)
+(def ^:private cos-period 8192)
+
+(def ^:private cos-table
+  "cos(pi*j/4096) for j = 0..8191 — see namespace docstring (`j` is the exact
+   integer index the MDCT kernel argument reduces to)."
+  (delay
+    (let [values (map (fn [j] (cos- (* pi (/ (double j) 4096.0)))) (range cos-period))]
+      #?(:clj (double-array values)
+         :cljs (into-array values)))))
+
+(defn- cos-at [^long j]
+  #?(:clj (aget ^doubles @cos-table j)
+     :cljs (aget @cos-table j)))
+
+(defn mdct-long
+  "Forward MDCT of `z` (2048 ALREADY-WINDOWED time samples) -> a 1024-length
+   vector of spectral coefficients:
+
+     X[k] = 2 * sum_{n=0}^{2047} z[n] * cos((2*pi/N)*(n+n0)*(k+0.5))
+
+   The factor 2 is derived (and tested) in the namespace docstring — it is
+   what makes `aac.imdct/imdct-long` this function's exact inverse up to the
+   time-domain aliasing that overlap-add cancels."
+  [z]
+  (let [zs #?(:clj (double-array (map double z)) :cljs (into-array (map double z)))]
+    (mapv (fn [k]
+            (let [step (mod (+ (* 4 k) 2) cos-period)]
+              (loop [n 0
+                     j (mod (+ (* 2050 k) 1025) cos-period)
+                     acc 0.0]
+                (if (>= n transform-length)
+                  (* 2.0 acc)
+                  (recur (inc n)
+                         (let [j' (+ j step)] (if (>= j' cos-period) (- j' cos-period) j'))
+                         (+ acc (* (double (aget zs n)) (cos-at j))))))))
+          (range half-length))))
+
+(defn window-block
+  "Apply the §4.6.11.3.2 analysis window to a 2048-sample `block`: the first
+   1024 samples with `prev-window-shape`'s half-window ascending, the second
+   1024 with `window-shape`'s half-window reversed (descending) — the exact
+   pair `aac.imdct/decode-frame` applies on the way out. Returns the 2048
+   windowed samples."
+  [block window-shape prev-window-shape]
+  (let [win-prev (imdct/half-window prev-window-shape)
+        win-cur (imdct/half-window window-shape)]
+    (mapv (fn [i]
+            (if (< i half-length)
+              (* (double (nth block i)) (double (nth win-prev i)))
+              (* (double (nth block i)) (double (nth win-cur (- transform-length 1 i))))))
+          (range transform-length))))
+
+(defn analyze-frame
+  "One ONLY_LONG_SEQUENCE analysis step: window `block` (2048 raw PCM samples,
+   the 50%-overlapping slice `frame-blocks` produces) and forward-MDCT it into
+   1024 spectral coefficients ready for `aac.quant`. Inverse of
+   `aac.imdct/decode-frame` (which windows and overlap-adds on the way back);
+   `window-shape`/`prev-window-shape` mean exactly what they mean there."
+  [block window-shape prev-window-shape]
+  (mdct-long (window-block block window-shape prev-window-shape)))
+
+(defn frame-blocks
+  "Slice mono float PCM `samples` into the 2048-sample, 50%-overlapping
+   analysis blocks the filterbank consumes: block f is
+   `samples[(f-1)*1024 .. (f+1)*1024-1]`, out-of-range indices zero.
+
+   Returns `ceil(count/1024) + 1` blocks — ONE MORE than the number of
+   1024-sample PCM frames, because the decoder's overlap-add reconstructs
+   block f's FIRST half, so the first decoded frame carries only the
+   zero-padded lead-in. That extra frame is the standard 1024-sample AAC-LC
+   encoder delay: a decoder must discard its first 1024 output samples to
+   line up with the input (`aac.encode/encoder-delay`)."
+  [samples]
+  (let [n (count samples)
+        frames (max 1 (quot (+ n (dec half-length)) half-length))
+        sample-at (fn [i] (if (and (>= i 0) (< i n)) (double (nth samples i)) 0.0))]
+    (mapv (fn [f]
+            (let [base (* (dec f) half-length)]
+              (mapv (fn [i] (sample-at (+ base i))) (range transform-length))))
+          (range (inc frames)))))
