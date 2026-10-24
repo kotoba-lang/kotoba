@@ -1,0 +1,100 @@
+(ns ucan.core-test
+  (:require [kotoba.test :refer [deftest is]]
+            [cbor.core :as cbor]
+            [ed25519.core :as ed]
+            [ucan.core :as ucan]))
+
+(defn seed [offset]
+  (byte-array (map unchecked-byte (range offset (+ offset 32)))))
+
+(def root-seed (seed 0))
+(def middle-seed (seed 32))
+(def leaf-seed (seed 64))
+(def root-did (ed/did-key-from-seed root-seed))
+(def middle-did (ed/did-key-from-seed middle-seed))
+(def leaf-did (ed/did-key-from-seed leaf-seed))
+(def holder-did (ed/did-key-from-seed (seed 96)))
+(def resource "kotoba://cap/host/ledger-append/dataspace:rooms/a")
+
+(defn payload [iss aud command nonce exp]
+  {"iss" iss "aud" aud "sub" root-did
+   "cmd" command
+   "pol" [["==" ".resource" resource]]
+   "nonce" (byte-array (repeat 12 (unchecked-byte nonce)))
+   "exp" exp})
+
+(defn signed-chain []
+  [(ucan/sign-delegation root-seed
+                         (payload root-did middle-did "/kotoba" 1 2000))
+   (ucan/sign-delegation middle-seed
+                         (payload middle-did leaf-did "/kotoba/host" 2 1900))
+   (ucan/sign-delegation leaf-seed
+                         (payload leaf-did holder-did
+                                  "/kotoba/host/ledger-append" 3 1800))])
+
+(defn problem [f]
+  (try (f) nil
+       (catch clojure.lang.ExceptionInfo e (:ucan/problem (ex-data e)))))
+
+(deftest signs-verifies-and-normalizes-a-real-chain
+  (let [chain (signed-chain)
+        result (ucan/verify-chain chain
+                                  {:now 1700
+                                   :revoked? (constantly false)
+                                   :resource! ucan/exact-resource})]
+    (is (= true (:ucan/valid? result)))
+    (is (= root-did (:ucan/root-iss result)))
+    (is (= holder-did (:ucan/audience result)))
+    (is (= #{resource} (:ucan/resources result)))
+    (is (= 1800 (:ucan/expires result)))
+    (is (= 2 (:ucan/depth result)))
+    (is (every? #(re-matches #"zdpu.*" (ucan/token-cid %)) chain))))
+
+(deftest signature-and-canonical-bytes-fail-closed
+  (let [token (first (signed-chain))
+        decoded (cbor/decode token)
+        bad-sig (byte-array (repeat 64 (unchecked-byte 0)))
+        tampered (cbor/encode [bad-sig (second decoded)])
+        trailing (byte-array (concat (seq token) [(unchecked-byte 0)]))]
+    (is (= :ucan/bad-signature
+           (problem #(ucan/verify-delegation tampered))))
+    (is (= :ucan/non-canonical
+           (problem #(ucan/verify-delegation trailing))))))
+
+(deftest chain-rejects-misalignment-amplification-time-and-revocation
+  (let [[root middle leaf] (signed-chain)
+        wrong-aud (ucan/sign-delegation
+                   root-seed (payload root-did holder-did "/kotoba" 4 2000))
+        broad-leaf (ucan/sign-delegation
+                    leaf-seed (payload leaf-did holder-did "/" 5 1800))
+        verify #(ucan/verify-chain %1
+                                  (merge {:now 1700
+                                          :revoked? (constantly false)
+                                          :resource! ucan/exact-resource}
+                                         %2))]
+    (is (= :ucan/principal-misalignment
+           (problem #(verify [wrong-aud middle leaf] {}))))
+    (is (= :ucan/command-amplification
+           (problem #(verify [root middle broad-leaf] {}))))
+    (is (= :ucan/expired
+           (problem #(verify [root middle leaf] {:now 1801}))))
+    (let [revoked-cid (ucan/token-cid middle)]
+      (is (= :ucan/revoked
+             (problem #(verify [root middle leaf]
+                               {:revoked? (fn [cid] (= cid revoked-cid))})))))))
+
+(deftest profile-refuses-unknown-policy-and-powerline-root
+  (let [bad-policy (assoc (payload root-did middle-did "/kotoba" 6 2000)
+                          "pol" [])
+        powerline (assoc (payload root-did middle-did "/kotoba" 7 2000)
+                         "sub" nil)]
+    (is (= :ucan/unsupported-policy
+           (problem #(ucan/verify-chain
+                      [(ucan/sign-delegation root-seed bad-policy)]
+                      {:now 1700 :revoked? (constantly false)
+                       :resource! ucan/exact-resource}))))
+    (is (= :ucan/powerline-root
+           (problem #(ucan/verify-chain
+                      [(ucan/sign-delegation root-seed powerline)]
+                      {:now 1700 :revoked? (constantly false)
+                       :resource! ucan/exact-resource}))))))
