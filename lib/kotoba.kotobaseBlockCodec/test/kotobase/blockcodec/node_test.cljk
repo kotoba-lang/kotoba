@@ -1,0 +1,136 @@
+(ns kotobase.blockcodec.node-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipld.core :as ipld]
+            [kotobase.blockcodec.core :as bc]
+            [kotobase.blockcodec.node :as bcn]))
+
+;; Shaped like a Merkle-LSM run block: length-framed canonical keys that sort
+;; together and therefore share long prefixes, which is the whole reason this
+;; layer pays. `merkle-lsm.core/canonical-key` builds the real thing; this
+;; reproduces its shape without taking a dependency on it.
+(defn- pad16
+  "`format` is JVM-only; this suite has to run on both runtimes or the
+  cross-runtime claim is untested."
+  [n]
+  (let [t (str n)] (str (subs "0000000000000000" (count t)) t)))
+
+(defn- run-block [n value-fn]
+  {"format" "kotobase/merkle-run-block"
+   "version" 1
+   "index" "eavt"
+   "tenant" "tenant-alpha"
+   "ordinal" 0
+   "count" n
+   "rows" (vec (for [i (range n)]
+                 {"key" (str "eavt|12:tenant-alpha|"
+                             "38:did:web:kotobase.net:entity:" (mod i 200)
+                             "|4:kind|" (pad16 (- 1000000 i)))
+                  "value" (value-fn i)}))})
+
+(defn- fake-cid
+  "A REAL CIDv1 — `ipld/link` round-trips through base32, so a hand-written
+  string with a `0` in it throws rather than standing in for one."
+  [i]
+  (ipld/cid (ipld/encode {"n" i})))
+
+(defn- manifest [n]
+  {"format" "kotobase/merkle-manifest"
+   "version" 1
+   "runs" (vec (for [i (range n)]
+                 {"ordinal" i "cid" (ipld/link (fake-cid i))}))})
+
+(defn- same-bytes?
+  "`=` on two JVM `byte[]` is identity, which is always false and would make
+  every byte-identity assertion below pass vacuously in the wrong direction."
+  [a b]
+  (= (bc/ubytes a) (bc/ubytes b)))
+
+(deftest round-trips
+  (doseq [[label node] [["run block, plain values" (run-block 200 #(str "value-" % "-lorem"))]
+                        ["run block, tiny" (run-block 2 #(str %))]
+                        ["manifest (linked)" (manifest 20)]
+                        ["empty map" {}]]]
+    (is (= node (bcn/decode-node (bcn/encode-node node))) label)))
+
+(deftest compresses-run-blocks
+  (let [node (run-block 200 #(str "value-" % "-lorem-ipsum"))
+        plain (bc/byte-length (ipld/encode node))
+        out (bc/byte-length (bcn/encode-node node))]
+    (is (bcn/envelope? (ipld/decode (bcn/encode-node node))))
+    (is (< out (quot plain 4))
+        (str "canonical keys are highly redundant; got " out " from " plain))))
+
+(deftest links-are-never-hidden
+  (testing "a node with links keeps its plain encoding, so a walker that does
+            not decompress still sees every child — the property GC depends on"
+    (let [m (manifest 30)]
+      (is (= 30 (count (ipld/links m))))
+      (is (false? (bcn/envelope? (ipld/decode (bcn/encode-node m)))))
+      (is (same-bytes? (ipld/encode m) (bcn/encode-node m))
+          "byte-identical to today: a linked node's CID does not move")
+      (is (bcn/links-preserved? m))))
+  (testing "and the invariant holds for the compressed shape too, trivially"
+    (let [b (run-block 200 #(str "value-" %))]
+      (is (empty? (ipld/links b)))
+      (is (bcn/links-preserved? b))))
+  (testing "one link is enough to disqualify a node"
+    (let [b (assoc (run-block 200 #(str "value-" %)) "prev" (ipld/link (fake-cid 99)))]
+      (is (same-bytes? (ipld/encode b) (bcn/encode-node b)))
+      (is (bcn/links-preserved? b)))))
+
+(defn- noise
+  "Structureless bytes: a full-period LCG, high byte. An earlier draft used
+  `(mod ... 251)`, whose short cycle deflated to 0.13 — the fixture, not the
+  code, was what that assertion measured."
+  [n seed]
+  (bc/platform-bytes
+   (loop [k 0 st (+ 999 (* seed 7919)) acc []]
+     (if (= k n) acc
+         (let [st' (mod (+ (* st 1103515245) 12345) 2147483648)]
+           (recur (inc k) st' (conj acc (mod (quot st' 65536) 256))))))))
+
+(deftest never-grows-a-block
+  (doseq [[label node] [["run block" (run-block 200 #(str "value-" %))]
+                        ["manifest" (manifest 20)]
+                        ["noise rows" {"format" "kotobase/opaque"
+                                       "rows" (vec (for [i (range 40)] {"v" (noise 48 i)}))}]
+                        ["one noise blob" {"v" (noise 4096 1)}]
+                        ["tiny" {"a" 1}]
+                        ["empty" {}]]]
+    (is (<= (bc/byte-length (bcn/encode-node node)) (bc/byte-length (ipld/encode node))) label)))
+
+(deftest unshrinkable-nodes-keep-the-address-they-already-had
+  (testing "one big noise blob has no framing left to recover, so the encoding
+            declines and the block is byte-identical to today's"
+    (let [node {"v" (noise 4096 1)}
+          plain (ipld/encode node)]
+      (is (same-bytes? plain (bcn/encode-node node)))
+      (is (= (ipld/cid plain) (ipld/cid (bcn/encode-node node))))))
+  (testing "rows of noise still shrink a little, and that is not a bug: the
+            per-row CBOR framing repeats even when the payload does not"
+    (let [node {"format" "kotobase/opaque"
+                "rows" (vec (for [i (range 40)] {"v" (noise 48 i)}))}]
+      (is (< (bc/byte-length (bcn/encode-node node)) (bc/byte-length (ipld/encode node))))
+      (is (> (bc/byte-length (bcn/encode-node node)) (quot (bc/byte-length (ipld/encode node)) 2))
+          "but only a little — the payload itself is incompressible"))))
+
+(deftest decode-is-the-identity-on-legacy-blocks
+  (testing "which is what lets every reader be deployed before any writer
+            starts producing envelopes"
+    (doseq [node [(run-block 200 #(str "value-" %)) (manifest 5) {"a" 1}]]
+      (is (= node (bcn/decode-node (ipld/encode node)))))))
+
+(deftest envelope-detection-is-not-fooled
+  (testing "application data that merely resembles the envelope is not one"
+    (is (false? (bcn/envelope? {"z" (bc/platform-bytes [1 2 3])})) "one key")
+    (is (false? (bcn/envelope? {"kbc" 2 "z" (bc/platform-bytes [1 2 3])})) "wrong version")
+    (is (false? (bcn/envelope? {"kbc" 1 "z" (bc/platform-bytes [1 2 3]) "extra" 0})) "extra key")
+    (is (false? (bcn/envelope? {"kbc" 1 "y" (bc/platform-bytes [1 2 3])})) "wrong payload key")))
+
+(deftest measure-separates-the-two-reasons-a-node-stays-plain
+  (let [m (bcn/measure (concat (repeat 5 (run-block 200 #(str "value-" %)))
+                               (repeat 3 (manifest 20))))]
+    (is (= 8 (:nodes m)))
+    (is (= 5 (:compressed m)))
+    (is (= 3 (:linked-so-left-plain m)))
+    (is (< 0.0 (:ratio m) 1.0))))
