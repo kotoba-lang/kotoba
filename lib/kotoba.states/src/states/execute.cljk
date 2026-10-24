@@ -1,0 +1,209 @@
+(ns states.execute
+  "A pure interpreter for an ASL (Amazon States Language) state machine in EDN
+  form. State is plain data — inspectable, replayable, testable offline with
+  fixture ports.
+
+  `run` takes a machine (model), input data, and an optional ITask ports map.
+  It returns:
+    {:states/output <final-data>
+     :states/path   [visited-state-name-strings]
+     :states/status :succeeded | :failed}
+
+  Path getter: \"$.field\" extracts (get data \"field\"); \"$.a.b\" does nested
+  get-in. Ops: :numeric-equals :numeric-greater-than :numeric-less-than
+              :string-equals :boolean-equals — plus compound :and/:or/:not."
+  (:require [kotoba.lang.text] [states.model :as m]
+            [states.ports :as p]))
+
+;; ---------------------------------------------------------------------------
+;; JSONPath-lite path getter
+;; ---------------------------------------------------------------------------
+
+(defn- path-get
+  "Extract a value from `data` using a simple \"$.a.b.c\" path reference.
+  Returns nil if the path cannot be resolved."
+  [data path]
+  (if (or (nil? path) (= "$" path))
+    data
+    ;; strip leading "$." then split on "."
+    (let [stripped (if (.startsWith ^String path "$.") (subs path 2) path)
+          parts    (kotoba.lang.text/split stripped #"\." -1)]
+      (reduce (fn [cur segment]
+                (cond
+                  (nil? cur)        nil
+                  (map? cur)        (get cur segment)
+                  :else             nil))
+              data
+              parts))))
+
+;; ---------------------------------------------------------------------------
+;; Choice rule evaluator
+;; ---------------------------------------------------------------------------
+
+(declare eval-rule)
+
+(defn- compare-op [op actual expected]
+  (case op
+    :numeric-equals       (and (number? actual) (number? expected) (== actual expected))
+    :numeric-greater-than (and (number? actual) (number? expected) (> actual expected))
+    :numeric-less-than    (and (number? actual) (number? expected) (< actual expected))
+    :string-equals        (= (str actual) (str expected))
+    :boolean-equals       (= (boolean actual) (boolean expected))
+    false))
+
+(defn- eval-rule
+  "Evaluate a single choice rule against `input`. Returns boolean."
+  [rule input]
+  (cond
+    ;; compound
+    (:states/and rule) (every? #(eval-rule % input) (:states/and rule))
+    (:states/or  rule) (boolean (some #(eval-rule % input) (:states/or rule)))
+    (:states/not rule) (not (eval-rule (:states/not rule) input))
+    ;; comparison
+    (:states/op rule)
+    (let [actual   (path-get input (:states/variable rule))
+          expected (:states/value rule)]
+      (compare-op (:states/op rule) actual expected))
+    ;; bare Next-only rule (default-like) — always matches
+    :else true))
+
+;; ---------------------------------------------------------------------------
+;; Default ports — identity task (returns input unchanged)
+;; ---------------------------------------------------------------------------
+
+(defn default-ports
+  "An ITask implementation that returns input data unchanged. Sufficient to
+  exercise control flow and routing without any host; replace for real work."
+  []
+  (reify p/ITask
+    (run [_ _state input-data] input-data)))
+
+;; ---------------------------------------------------------------------------
+;; Sub-machine interpreter (used by :parallel and :map)
+;; ---------------------------------------------------------------------------
+
+(declare interpret)
+
+;; ---------------------------------------------------------------------------
+;; State executor
+;; ---------------------------------------------------------------------------
+
+(defn- exec-state
+  "Execute a single state. Returns {:data <output> :next <state-name|nil> :status nil|:succeeded|:failed}."
+  [ports machine state-name data]
+  (let [smap (m/state machine state-name)
+        t    (:states/type smap)]
+    (case t
+      :task
+      (let [out (p/run ports smap data)
+            nxt (when-not (:states/end smap) (:states/next smap))]
+        {:data out :next nxt :status (when (:states/end smap) :succeeded)})
+
+      :pass
+      (let [out (if (:states/result smap)
+                  (merge data (:states/result smap))
+                  data)
+            nxt (when-not (:states/end smap) (:states/next smap))]
+        {:data out :next nxt :status (when (:states/end smap) :succeeded)})
+
+      :wait
+      {:data data
+       :next (when-not (:states/end smap) (:states/next smap))
+       :status (when (:states/end smap) :succeeded)}
+
+      :succeed
+      {:data data :next nil :status :succeeded}
+
+      :fail
+      {:data (cond-> data
+               (:states/error smap) (assoc "Error" (:states/error smap))
+               (:states/cause smap) (assoc "Cause" (:states/cause smap)))
+       :next nil :status :failed}
+
+      :choice
+      (let [choices  (:states/choices smap [])
+            default  (:states/default smap)
+            chosen   (some (fn [rule]
+                             (when (eval-rule rule data)
+                               (:states/next rule)))
+                           choices)
+            nxt      (or chosen default)]
+        {:data data :next nxt :status nil})
+
+      :parallel
+      (let [branches (:states/branches smap [])
+            results  (mapv #(interpret ports % data) branches)
+            out      (mapv :states/output results)
+            ;; ASL semantics: a Parallel state fails if ANY branch fails,
+            ;; regardless of :states/end -- interpret's own :states/status
+            ;; per branch must not be dropped along with the rest of that
+            ;; branch's result when only :states/output is extracted above.
+            failed?  (some #(= :failed (:states/status %)) results)
+            nxt      (when-not (:states/end smap) (:states/next smap))]
+        {:data out
+         :next (when-not failed? nxt)
+         :status (cond failed? :failed (:states/end smap) :succeeded :else nil)})
+
+      :map
+      (let [items    (path-get data (or (:states/items-path smap) "$"))
+            iterator (:states/iterator smap)
+            results  (mapv #(interpret ports iterator %) (if (sequential? items) items []))
+            out      (mapv :states/output results)
+            ;; Same ASL semantics as :parallel above: a Map state fails if
+            ;; ANY iteration fails.
+            failed?  (some #(= :failed (:states/status %)) results)
+            nxt      (when-not (:states/end smap) (:states/next smap))]
+        {:data out
+         :next (when-not failed? nxt)
+         :status (cond failed? :failed (:states/end smap) :succeeded :else nil)})
+
+      ;; unknown type — treat as pass
+      {:data data :next (:states/next smap) :status nil})))
+
+;; ---------------------------------------------------------------------------
+;; Main interpreter loop
+;; ---------------------------------------------------------------------------
+
+(defn interpret
+  "Run `machine` from its StartAt state with `input-data` using `ports` (defaults
+  to `default-ports`). Returns:
+    {:states/output <final-data>
+     :states/path   [visited-state-names]
+     :states/status :succeeded | :failed}"
+  ([ports machine input-data]
+   (loop [cur-name (m/start-at machine)
+          data     input-data
+          path     []
+          steps    0]
+     (if (or (nil? cur-name) (>= steps 10000))
+       {:states/output data
+        :states/path   path
+        :states/status (if (nil? cur-name) :succeeded :failed)}
+       (let [result   (exec-state ports machine cur-name data)
+             path'    (conj path cur-name)
+             status   (:status result)
+             nxt      (:next result)
+             data'    (:data result)]
+         (cond
+           ;; terminal status set explicitly
+           (= status :succeeded)
+           {:states/output data' :states/path path' :states/status :succeeded}
+
+           (= status :failed)
+           {:states/output data' :states/path path' :states/status :failed}
+
+           ;; no next → implicit end
+           (nil? nxt)
+           {:states/output data' :states/path path' :states/status :succeeded}
+
+           :else
+           (recur nxt data' path' (inc steps)))))))
+  ([machine input-data]
+   (interpret (default-ports) machine input-data)))
+
+(defn run
+  "Alias for `interpret`. Takes machine, input-data, and optional ports."
+  ([machine input-data]
+   (interpret (default-ports) machine input-data))
+  ([machine input-data ports]
+   (interpret ports machine input-data)))

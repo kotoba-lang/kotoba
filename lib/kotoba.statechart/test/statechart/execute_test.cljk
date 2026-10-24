@@ -1,0 +1,214 @@
+(ns statechart.execute-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [statechart.model    :as m]
+            [statechart.ports    :as p]
+            [statechart.validate :as v]
+            [statechart.execute  :as e]))
+
+;; ---- fixture: recording action port ----
+
+(defrecord RecordingAction [log]
+  p/IAction
+  (run [_ action-name ctx]
+    (swap! log conj action-name)
+    (update ctx :visited (fnil conj []) action-name)))
+
+(defn- recording-ports
+  "Ports where IAction records every action name in atom `log` and into ctx :visited.
+   IGuard reads (get ctx (keyword cond)), nil cond → true."
+  [log]
+  {:action (->RecordingAction log)
+   :guard  (reify p/IGuard
+             (allow? [_ cond ctx]
+               (if (nil? cond)
+                 true
+                 (boolean (get ctx (keyword cond))))))})
+
+;; ---- 1. simple flat event transition ----
+
+(def door-chart
+  (-> (m/chart "door" "closed")
+      (m/add-state (-> (m/state "closed" {:sc/entry ["enterClosed"]
+                                          :sc/exit  ["exitClosed"]})
+                       (m/on "OPEN"  {:sc/target "open"})
+                       (m/on "KNOCK" {:sc/target "closed"})))   ; self-transition
+      (m/add-state (-> (m/state "open" {:sc/entry ["enterOpen"]
+                                         :sc/exit  ["exitOpen"]})
+                       (m/on "CLOSE" {:sc/target "closed"})))))
+
+(deftest simple-event-transition
+  (let [ports (e/default-ports)
+        ms0   (e/start ports door-chart)
+        ms1   (e/send  ports door-chart ms0 "OPEN")
+        ms2   (e/send  ports door-chart ms1 "CLOSE")]
+    (is (= #{"closed"} (:sc/config ms0)) "initial config is closed")
+    (is (= #{"open"}   (:sc/config ms1)) "OPEN transitions to open")
+    (is (= #{"closed"} (:sc/config ms2)) "CLOSE transitions back to closed")
+    (is (not (e/done? ms1))              "not done in open")))
+
+;; ---- 2. guard blocks transition ----
+
+(def lock-chart
+  (-> (m/chart "lock" "locked")
+      (m/add-state (-> (m/state "locked")
+                       (m/on "OPEN" {:sc/target "unlocked" :sc/cond "key"})))
+      (m/add-state (m/state "unlocked"))))
+
+(deftest guard-blocks-and-passes
+  (let [ports (e/default-ports)
+        ms    (e/start ports lock-chart)
+        ;; no key in ctx → guard fails → stays locked
+        ms-blocked  (e/send ports lock-chart ms "OPEN")
+        ;; inject key=true → guard passes → unlocked
+        ms-unlocked (e/send ports lock-chart (assoc ms :sc/ctx {:key true}) "OPEN")]
+    (is (= #{"locked"}   (:sc/config ms-blocked))  "guard false: stays in locked")
+    (is (= #{"unlocked"} (:sc/config ms-unlocked)) "guard true: transitions to unlocked")))
+
+;; ---- 3. compound entry lands on initial child ----
+
+(def compound-chart
+  (-> (m/chart "machine" "active")
+      (m/add-state (-> (m/compound "active" "idle"
+                                   {:sc/entry ["enterActive"]})
+                       (m/add-state (-> (m/state "idle"    {:sc/entry ["enterIdle"]
+                                                          :sc/exit  ["exitIdle"]})
+                                        (m/on "ADVANCE" {:sc/target "running"
+                                                         :sc/actions ["doWork"]})))
+                       (m/add-state (m/state "running" {:sc/entry ["enterRunning"]}))))
+      (m/add-state (-> (m/state "done") (assoc :sc/type :final)))))
+
+(deftest compound-entry-recurses-to-initial
+  (let [ms (e/start (e/default-ports) compound-chart)]
+    (is (contains? (:sc/config ms) "active") "compound ancestor active in config")
+    (is (contains? (:sc/config ms) "idle")   "initial child idle is in config")))
+
+;; ---- 4. hierarchical bubbling (child has no handler, parent fires) ----
+
+(def bubble-chart
+  (-> (m/chart "machine" "active")
+      (m/add-state (-> (m/compound "active" "idle"
+                                   {:sc/entry ["enterActive"] :sc/exit ["exitActive"]})
+                       ;; parent has QUIT handler; idle does not
+                       (m/on "QUIT" {:sc/target "done"})
+                       (m/add-state (m/state "idle"    {:sc/exit ["exitIdle"]}))
+                       (m/add-state (m/state "running" {}))))
+      (m/add-state (-> (m/state "done") (assoc :sc/type :final)))))
+
+(deftest hierarchical-bubbling
+  (let [ms  (e/start (e/default-ports) bubble-chart)
+        ms2 (e/send  (e/default-ports) bubble-chart ms "QUIT")]
+    (is (contains? (:sc/config ms) "idle")  "starts in idle (inside active)")
+    (is (= #{"done"} (:sc/config ms2))      "QUIT bubbles from idle → active → done")
+    (is (e/done? ms2)                        "done? true when final is active")))
+
+;; ---- 5. parallel state — both regions activated and advanced ----
+
+(def parallel-chart
+  (-> (m/chart "machine" "par")
+      (m/add-state
+        (-> (m/parallel "par")
+            (m/add-state
+              (-> (m/compound "ra" "ra1")
+                  (m/add-state (-> (m/state "ra1") (m/on "NEXT" {:sc/target "ra2"})))
+                  (m/add-state (m/state "ra2"))))
+            (m/add-state
+              (-> (m/compound "rb" "rb1")
+                  (m/add-state (-> (m/state "rb1") (m/on "NEXT" {:sc/target "rb2"})))
+                  (m/add-state (m/state "rb2"))))))))
+
+(deftest parallel-regions-activate-and-advance
+  (let [ports (e/default-ports)
+        ms0   (e/start ports parallel-chart)
+        ms1   (e/send  ports parallel-chart ms0 "NEXT")]
+    (testing "start: both regions active"
+      (is (contains? (:sc/config ms0) "ra1") "region A initial state ra1 active")
+      (is (contains? (:sc/config ms0) "rb1") "region B initial state rb1 active"))
+    (testing "NEXT: both regions advance"
+      (is (contains? (:sc/config ms1) "ra2") "region A advanced to ra2")
+      (is (contains? (:sc/config ms1) "rb2") "region B advanced to rb2"))))
+
+;; ---- 6. entry / exit / transition action order ----
+
+(deftest action-order-is-correct
+  (let [log  (atom [])
+        ports (recording-ports log)
+        ;; start door: enterClosed should run
+        ms0  (e/start ports door-chart)]
+    (is (= ["enterClosed"] @log) "start runs entry action of initial state")
+    (reset! log [])
+    (let [ms1 (e/send ports door-chart ms0 "OPEN")]
+      ;; exit closed, no transition actions, enter open
+      (is (= ["exitClosed" "enterOpen"] @log)
+          "OPEN: exitClosed then enterOpen in order")
+      (reset! log [])
+      (let [ms2 (e/send ports door-chart ms1 "CLOSE")]
+        (is (= ["exitOpen" "enterClosed"] @log)
+            "CLOSE: exitOpen then enterClosed in order"))))
+  ;; also verify transition :sc/actions fire between exit and entry
+  (let [log   (atom [])
+        ports (recording-ports log)
+        ms0   (e/start ports compound-chart)
+        _     (reset! log [])
+        ms1   (e/send ports compound-chart ms0 "ADVANCE")]
+    (is (= ["exitIdle" "doWork" "enterRunning"] (filter #{"exitIdle" "doWork" "enterRunning"} @log))
+        "ADVANCE: exit idle → transition action → enter running")))
+
+;; ---- 7. reaching :final sets done? ----
+
+(def final-chart
+  (-> (m/chart "machine" "active")
+      (m/add-state (-> (m/state "active")
+                       (m/on "FINISH" {:sc/target "end"})))
+      (m/add-state (-> (m/state "end") (assoc :sc/type :final)))))
+
+(deftest final-state-sets-done
+  (let [ports (e/default-ports)
+        ms0   (e/start ports final-chart)
+        ms1   (e/send  ports final-chart ms0 "FINISH")]
+    (is (not (e/done? ms0)) "not done initially")
+    (is (e/done? ms1)       "done after reaching :final state")
+    (is (contains? (:sc/config ms1) "end") "end state in config")))
+
+;; ---- 8. internal / actions-only transition (no :sc/target) ----
+
+(def internal-chart
+  (-> (m/chart "door2" "closed")
+      (m/add-state (-> (m/state "closed" {:sc/entry ["enterClosed"] :sc/exit ["exitClosed"]})
+                       (m/on "PING" {:sc/actions ["doPing"]})
+                       (m/on "OPEN" {:sc/target "open"})))
+      (m/add-state (m/state "open"))))
+
+(deftest internal-transition-leaves-config-unchanged
+  ;; A transition with no :sc/target (SCXML-style internal transition) must
+  ;; run its actions without touching the active configuration -- neither
+  ;; :sc/exit nor :sc/entry of the current state should fire. Regression for
+  ;; a bug where a nil :sc/target computed lca as nil, exited the entire
+  ;; config, and entered #{nil}, permanently corrupting :sc/config.
+  (let [log   (atom [])
+        ports (recording-ports log)
+        ms0   (e/start ports internal-chart)
+        _     (reset! log [])
+        ms1   (e/send ports internal-chart ms0 "PING")]
+    (is (= #{"closed"} (:sc/config ms1)) "config unchanged by an internal transition")
+    (is (= ["doPing"] @log) "only the transition's own action ran, no exit/entry")
+    ;; the machine must still function normally afterward
+    (let [ms2 (e/send ports internal-chart ms1 "OPEN")]
+      (is (= #{"open"} (:sc/config ms2)) "a subsequent targeted transition still works"))))
+
+;; ---- 9. validate ----
+
+(deftest validate-catches-errors
+  (testing "valid chart passes"
+    (is (v/valid? door-chart)            "door-chart is structurally valid"))
+  (testing "missing :sc/initial reference"
+    (let [bad (m/chart "x" "nonexistent")]
+      (is (not (v/valid? bad))           "chart with nonexistent :sc/initial is invalid")
+      (is (some #(= :chart/bad-initial (:sc/code %)) (v/problems bad))
+          "reports :chart/bad-initial error")))
+  (testing "dangling transition target"
+    (let [bad (-> (m/chart "x" "s1")
+                  (m/add-state (-> (m/state "s1")
+                                   (m/on "GO" {:sc/target "ghost"}))))]
+      (is (not (v/valid? bad))           "dangling target is invalid")
+      (is (some #(= :transition/dangling-target (:sc/code %)) (v/problems bad))
+          "reports :transition/dangling-target error"))))

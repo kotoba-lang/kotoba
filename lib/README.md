@@ -99,6 +99,30 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.toshokanPatents` | `kotoba.toshokanPatents/src` | `toshokan-patents.quad`, `toshokan-patents.quad.fs`, `toshokan-patents.sources.google-patents` (Kotoba project library) |
+| `kotoba.torihikiChart` | `kotoba.torihikiChart/src` | `torihiki-chart.axis`, `torihiki-chart.candle`, `torihiki-chart.depth`, `torihiki-chart.view` (Kotoba project library) |
+| `kotoba.tilemap` | `kotoba.tilemap/src` | `tilemap` (Kotoba project library) |
+| `kotoba.tex` | `kotoba.tex/src` | `kotoba.lang.tex.core` (Kotoba project library) |
+| `kotoba.terrain` | `kotoba.terrain/src` | `terrain`, `terrain.biome`, `terrain.chunk`, `terrain.heightmap` (Kotoba project library) |
+| `kotoba.tedai` | `kotoba.tedai/src` | `tedai.cells.actuate-invoke.state-machine`, `tedai.cells.app-resolve.state-machine`, `tedai.cells.evidence-audit.state-machine`, `tedai.cells.intent-plan.state-machine` (Kotoba project library) |
+| `kotoba.taxlaw` | `kotoba.taxlaw/src` | `kotoba.taxlaw` (Kotoba project library) |
+| `kotoba.swift` | `kotoba.swift/src` | `kotoba.swift`, `kotoba.swift.export`, `kotoba.swift.iso20022`, `kotoba.swift.ui` (Kotoba project library) |
+| `kotoba.treasury` | `kotoba.treasury/src` | `treasury.core` (Kotoba project library) |
+| `kotoba.states` | `kotoba.states/src` | `states.execute`, `states.json`, `states.model`, `states.ports` (Kotoba project library) |
+| `kotoba.statechart` | `kotoba.statechart/src` | `statechart.execute`, `statechart.model`, `statechart.ports`, `statechart.validate` (Kotoba project library) |
+| `kotoba.standardModel` | `kotoba.standardModel/src` | `kotoba.sm.complex`, `kotoba.sm.gauge`, `kotoba.sm.gtg`, `kotoba.sm.spinor` (Kotoba project library) |
+| `kotoba.socialPublication` | `kotoba.socialPublication/src` | `etzhayyim.social.publication` (Kotoba project library) |
+| `kotoba.skeleton` | `kotoba.skeleton/src` | `skeleton`, `skeleton.math` (Kotoba project library) |
+| `kotoba.simulatedUser` | `kotoba.simulatedUser/src` | `simulated-user.eval`, `simulated-user.interaction`, `simulated-user.model`, `simulated-user.murakumo` (Kotoba project library) |
+| `kotoba.sigma` | `kotoba.sigma/src` | `sigma.execute`, `sigma.model`, `sigma.ports`, `sigma.validate` (Kotoba project library) |
+| `kotoba.si` | `kotoba.si/src` | `kotoba.si`, `kotoba.si.constants`, `kotoba.si.crosstalk`, `kotoba.si.eye-diagram` (Kotoba project library) |
+| `kotoba.shousetsu` | `kotoba.shousetsu/src` | `shousetsu.serialization` (Kotoba project library) |
+| `kotoba.shomen` | `kotoba.shomen/src` | `shomen.catalog`, `shomen.classify`, `shomen.coverage`, `shomen.requirement` (Kotoba project library) |
+| `kotoba.shokyaku` | `kotoba.shokyaku/src` | `kotoba.shokyaku`, `kotoba.shokyaku.embedded` (Kotoba project library) |
+| `kotoba.shift` | `kotoba.shift/src` | `kotoba.shift` (Kotoba project library) |
+| `kotoba.sheets` | `kotoba.sheets/src` | `sheets.chart`, `sheets.csv`, `sheets.edit`, `sheets.formula` (Kotoba project library) |
+| `kotoba.session` | `kotoba.session/src` | `session.adapters.datomic-kotoba`, `session.adapters.datomic-kotoba-cluster`, `session.adapters.edn-file`, `session.adapters.store` (Kotoba project library) |
+| `kotoba.senkyo` | `kotoba.senkyo/src` | `senkyo.authority`, `senkyo.datoms`, `senkyo.facts`, `senkyo.medium` (Kotoba project library) |
 | `kotoba.tetsuzuki` | `kotoba.tetsuzuki/src` | `tetsuzuki.catalog`, `tetsuzuki.coverage`, `tetsuzuki.deadline`, `tetsuzuki.ooyake` (Kotoba project library) |
 | `kotoba.sekisho` | `kotoba.sekisho/src` | `sekisho.account`, `sekisho.assurance`, `sekisho.browser`, `sekisho.didkey` (Kotoba project library) |
 | `kotoba.secretResolve` | `kotoba.secretResolve/src` | `secret-resolve.core`, `secret-resolve.exec`, `secret-resolve.resolver`, `secret-resolve.sources` (Kotoba project library) |

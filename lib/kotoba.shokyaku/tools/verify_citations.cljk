@@ -1,0 +1,160 @@
+#!/usr/bin/env kbb
+;; Check every statute cited by `kotoba.shokyaku` against the e-Gov corpus.
+;;
+;;   kbb --backend sci tools/verify_citations.cljk [path/to/jp.go.e-gov.elaws]
+;;
+;; Default corpus path assumes the kotoba-lang workspace layout
+;; (`../jp.go.e-gov.elaws`), the same convention taxlaw/worklaw use.
+;;
+;; ## Why not just fetch the URLs
+;;
+;; Fetching each citation and accepting HTTP 200 proves the URL resolves. It
+;; does not prove the law exists under that id, does not compare the title,
+;; and — the one that matters — cannot see that a law has been REPEALED. A
+;; repealed statute serves its page with a 200 like any other.
+;;
+;; The corpus index states all three. It also distinguishes
+;; `:law.status/superseded-revision` (the snapshot predates a later revision
+;; of a law still in force — fine, and reported separately) from
+;; `:law.status/repealed` / `:lapsed` / `:expired`, which are not fine.
+;;
+;; ## Exit codes are three-valued on purpose
+;;
+;;   0  every cited statute exists, is in force, and its title matches
+;;   1  a citation is bad: absent, repealed/lapsed/expired, or retitled
+;;   2  THE RUN COULD NOT ANSWER — the corpus is not on disk, the index
+;;      parsed to nothing, or no citation was found in the source. This is
+;;      the case that must never be reported as clean. A checker whose
+;;      corpus is missing has learned nothing about the citations, and
+;;      saying "0 problems" would make that indistinguishable from having
+;;      checked. Fourteen instances of exactly that shape were found in this
+;;      workspace on 2026-08-13.
+
+(ns verify-citations
+  (:require [kotoba.lang.edn :as edn]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def ^:private default-corpus "../jp.go.e-gov.elaws")
+(def ^:private src "src/kotoba/shokyaku.cljk")
+
+(defn- law-ids-from-source
+  "Read the cited law ids out of the .cljc rather than requiring the
+  namespace: nbb would have to load the whole library to get at a list of
+  strings, and this script must be runnable when that library is mid-edit."
+  []
+  (if-not (fs/existsSync src)
+    []
+    (->> (fs/readFileSync src "utf8")
+         (re-seq #":law/id\s+\"([0-9A-Za-z]+)\"")
+         (map second)
+         distinct sort vec)))
+
+(defn- titles-from-source []
+  (if-not (fs/existsSync src)
+    {}
+    (into {}
+          (map (fn [[_ title id]] [id title]))
+          ;; :source/title "..." … :law/id "..." — same map, title first
+          (re-seq #":source/title\s+\"([^\"]+)\"[\s\S]{0,300}?:law/id\s+\"([0-9A-Za-z]+)\""
+                  (fs/readFileSync src "utf8")))))
+
+(defn- tables-not-read
+  "Ordinance tables the catalog declares as fetched-but-unread.
+
+  They are COUNTED and NAMED, not skipped. The corpus check reads `:law/id`,
+  and a 別表 has none, so without this they vanish from the run entirely and
+  the summary reads `3 / 3 in force` — true of the three laws it looked at,
+  and read as true of what the library actually relies on."
+  []
+  (if-not (fs/existsSync src)
+    []
+    (->> (fs/readFileSync src "utf8")
+         (re-seq #"\{:table \"(別表[^\"]+)\" :rows (\d+) :ambiguous-rows (\d+)")
+         (map (fn [[_ t r a]] {:table t :rows r :ambiguous a}))
+         vec)))
+
+(defn- die [code & msg]
+  (apply println msg)
+  (js/process.exit code))
+
+(defn -main [& args]
+  (let [corpus (or (first args) default-corpus)
+        index-file (path/join corpus "index" "laws.edn")
+        ids (law-ids-from-source)
+        titles (titles-from-source)]
+
+    (when-not (fs/existsSync src)
+      (println "SCANNED\t0")
+      (die 2 (str "Refusing to report a verdict: " src " not found. "
+                  "Run this from the repo root.")))
+
+    (when (empty? ids)
+      ;; evidence floor: zero citations scanned is not zero citations broken.
+      (println "SCANNED\t0")
+      (die 2 (str "Refusing to report a pass: no :law/id found in " src)))
+
+    (when-not (fs/existsSync index-file)
+      (println "SCANNED\t0")
+      (die 2 (str "Refusing to report a verdict: corpus index not found at " index-file)
+           "\nGet it with:  west update --fetch smart jp.go.e-gov.elaws"
+           "\n(or pass the corpus path as the first argument)"))
+
+    (let [idx (edn/read-string (fs/readFileSync index-file "utf8"))
+          laws (:laws idx)]
+      (when (empty? laws)
+        (println "SCANNED\t0")
+        (die 2 (str "Refusing to report a verdict: " index-file " parsed to 0 laws")))
+
+      (let [by-id (into {} (map (juxt :law/local-id identity)) laws)
+            bad-status #{:law.status/repealed :law.status/lapsed :law.status/expired}
+            results
+            (for [id ids :let [l (get by-id id)]]
+              (cond
+                (nil? l) {:id id :verdict :FAIL :why "not in corpus"}
+                (bad-status (:law/status l))
+                {:id id :verdict :FAIL :why (str "no longer in force: " (:law/status l))
+                 :title (:law/title l)}
+                (and (titles id) (not= (titles id) (:law/title l)))
+                {:id id :verdict :FAIL
+                 :why (str "title differs — corpus says " (pr-str (:law/title l))
+                           ", catalog says " (pr-str (titles id)))}
+                :else {:id id :verdict :ok :status (:law/status l) :title (:law/title l)}))
+            bad (filter #(= :FAIL (:verdict %)) results)
+            superseded (filter #(= :law.status/superseded-revision (:status %)) results)
+            unread (tables-not-read)]
+
+        (println "CORPUS\t" index-file "\t" (count laws) "laws")
+        (println "SCANNED\t" (count results))
+        (doseq [{:keys [id verdict why status title]} results]
+          (println (if (= :ok verdict) "  ok  " "  FAIL")
+                   id "\t" (or status "") "\t" (or title why)))
+        (println)
+        (println (- (count results) (count bad)) "/" (count results)
+                 "e-Gov-corpus statutes in force with matching titles")
+
+        ;; Everything below is what the summary above does NOT cover.
+        ;; Printing it unconditionally — including the zero case — keeps
+        ;; `nothing outside the corpus` distinguishable from `nobody looked`.
+        (println "TABLES-NOT-READ\t" (count unread)
+                 "ordinance table(s) fetched and deliberately NOT read")
+        (doseq [{:keys [table rows ambiguous]} unread]
+          (println "  UNREAD  " table "\t" rows "rows,"
+                   ambiguous "with no 耐用年数 of their own"))
+        (when (seq unread)
+          (println "   The corpus check above says these tables' ORDINANCE is in force."
+                   "\n   It says nothing about whether this library read them. It did not,"
+                   "\n   and `useful-life` answers :none for anything that lives in them."))
+
+        (when (seq superseded)
+          (println (count superseded)
+                   "of those are :superseded-revision — the corpus snapshot predates a"
+                   "\n   later revision of a law still in force. Not a bad citation."))
+        (doseq [{:keys [id why]} bad]
+          (println "FAIL" id "-" why))
+        (js/process.exit (if (seq bad) 1 0))))))
+
+;; `*command-line-args*` rather than slicing `process.argv`: the slice index
+;; depends on how nbb was invoked, and getting it wrong made taxlaw's version
+;; of this script read its own path as the corpus directory.
+(apply -main *command-line-args*)
