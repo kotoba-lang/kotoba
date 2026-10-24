@@ -1,0 +1,667 @@
+(ns aac.encode
+  "AAC-LC encode: PCM samples -> ADTS AAC bitstream (ISO/IEC 14496-3:2005
+   §4.4-4.6, read in the write direction). The mirror of `aac.decode`, tying
+   together `aac.mdct` (forward filterbank), `aac.quant` (forward
+   quantization + per-band scalefactors), `aac.huffman`'s encode side
+   (noiseless coding), and `aac.adts`' `write-header`/`audio-specific-config`
+   (framing).
+
+   ## What this is for
+
+   `com-junkawasaki/root` ADR-2800002800 recorded that the pure-cljc codec
+   path could not produce an MP4 audio track at all: `org-iso-aac` decoded but
+   did not encode, so `ffmpeg` could not be dropped from the pipeline no
+   matter how fast the video path got. This namespace closes that gap. The
+   proof that it is closed is not that it runs — it is that REAL ffmpeg
+   decodes its output and gets the signal back (`test/aac/encode_test.cljk`,
+   which runs the repo's golden-vector methodology in reverse).
+
+   ## Scope, stated as limitations rather than as features
+
+   - **`ONLY_LONG_SEQUENCE` only — NO block switching.** Real encoders switch
+     to `EIGHT_SHORT_SEQUENCE` on transients precisely because a 2048-sample
+     window smears a sharp attack backwards in time (pre-echo). This encoder
+     cannot, so percussive material will sound worse than ffmpeg's at the same
+     bitrate in a way that is audible, not merely measurable. Steady material
+     (speech, sustained tones, synthesised narration/BGM — what
+     ADR-2800002800's consumer actually feeds it) is where it is fine.
+     Note this is now an ENCODER-only limit: the decoder reads all four
+     window sequences (`aac.imdct`/`aac.ics`), so the short/transition
+     windows and window grouping already exist. Closing it here needs a
+     transient detector and a switching decision — i.e. the psychoacoustic
+     model listed next — not more filterbank.
+   - **No psychoacoustic model.** Bits are allocated by the power law's own
+     mild shaping (`aac.quant`'s alpha = 1/4 default) and a rate loop, not by
+     masking thresholds. At equal bitrate ffmpeg will usually sound better
+     while scoring WORSE on plain SNR, because it deliberately puts noise
+     where it is masked. Do not read this encoder's higher SNR as higher
+     quality.
+   - **No TNS, no PNS, no intensity stereo, no LTP, no pulse coding, no
+     SBR/PS.** Mid/side stereo IS implemented (`ms_used` per band).
+   - **Mono (SCE) and stereo (CPE)** at 44100 or 48000 Hz — the sample rates
+     `aac.tables` has scalefactor-band tables for.
+   - **O(N^2) forward MDCT.** See `aac.mdct`; adequate here, and measured in
+     `test/aac/encode_test.cljk` rather than assumed.
+
+   Everything in that list is a thing this encoder does not do, not a thing
+   the format cannot do; each is a separate follow-on, and none of them is
+   needed for the bitstream to be conformant.
+
+   ## Bit accounting is exact, and asserted to be
+
+   `frame-bits` predicts a frame's size to the bit, and `encode-frame-sce`/
+   `-cpe` assert the writer wrote exactly that many. This is not decoration:
+   the rate-control loop chooses the quantizer by that prediction, so a
+   prediction that drifted from reality would silently produce frames of the
+   wrong size — the kind of bug that shows up as a bitrate that is 8% off and
+   nothing else. Making the two check each other means the section/scalefactor/
+   spectral cost model has to stay honest.
+
+   ## Scalefactors of all-zero bands are free, and that is load-bearing
+
+   The section-boundary optimiser may put an all-zero band inside a section
+   coded with a real codebook (merging two runs is often cheaper than the
+   9-14 bits a section header costs). Such a band must then carry a
+   scalefactor. It is written as differential 0 — 1 bit, and legal by
+   construction — because every scalefactor reconstructs an all-zero band
+   identically (`aac.dequant` maps quantized 0 to 0.0 at any scalefactor). The
+   band's nominal scalefactor is discarded. That is what keeps the DPCM chain
+   over the genuinely-coded bands exactly as `aac.quant/clamp-dpcm-chain` left
+   it, so no delta can escape the codebook's +/-60 range."
+  (:require [aac.adts :as adts]
+            [aac.bits :as bits]
+            [aac.huffman :as huffman]
+            [aac.mdct :as mdct]
+            [aac.quant :as quant]
+            [aac.tables :as tables]))
+
+(def frame-length
+  "Spectral lines / PCM samples per AAC-LC frame (`ONLY_LONG_SEQUENCE`)."
+  1024)
+
+(def encoder-delay
+  "Samples a decoder must discard from the front of its output to line up with
+   this encoder's input — one frame, because the filterbank's first block is
+   the zero-padded lead-in (`aac.mdct/frame-blocks`). Standard for AAC-LC; the
+   number every muxer wants for an `edts`/priming offset."
+  1024)
+
+(def ^:private id-sce 0)
+(def ^:private id-cpe 1)
+(def ^:private id-end 7)
+(def ^:private zero-hcb 0)
+(def ^:private sect-esc-val 31)
+(def ^:private spectral-codebooks [1 2 3 4 5 6 7 8 9 10 11])
+
+(def default-options
+  {:sample-rate 44100
+   :bitrate 128000
+   :window-shape 0                                  ; sine (§4.6.11.3.2)
+   :noise-shaping-alpha quant/default-noise-shaping-alpha
+   :rounding :nearest})
+
+;; --- band / section cost model ------------------------------------------
+
+(defn- band-dim-ok!
+  [start end dim cb]
+  (when-not (zero? (mod (- end start) dim))
+    (throw (ex-info "aac.encode: scalefactor band width is not a multiple of the codebook dimension"
+                     {:start start :end end :dim dim :cb cb}))))
+
+(defn band-spectral-bits
+  "Exact bit cost of coding `q`'s band `[start, end)` with spectral codebook
+   `cb`, or nil if `cb` cannot represent it. `cb` 0 (ZERO_HCB) costs nothing
+   and is only available for an all-zero band."
+  [q start end cb]
+  (if (= cb zero-hcb)
+    (when (every? zero? (subvec q start end)) 0)
+    (let [{:keys [dim]} (get huffman/codebook-params cb)]
+      (when (huffman/codebook-fits? cb (subvec q start end))
+        (band-dim-ok! start end dim cb)
+        (reduce (fn [acc b] (+ acc (huffman/tuple-bits cb (subvec q b (+ b dim)))))
+                0 (range start end dim))))))
+
+(defn section-length-bits
+  "Bits `section_data()` spends on one section's `sect_cb` + length (Table
+   4.46, long window): 4 bits of codebook plus 5 bits per length increment,
+   where a length of 31 or more needs escape increments — inverse of
+   `aac.ics/section-data!`'s escape loop."
+  [len]
+  (+ 4 (* 5 (inc (quot len sect-esc-val)))))
+
+(defn- band-costs
+  "For each band `0..max-sfb-1`, a map of feasible codebook -> total bits for
+   that band under that codebook (spectral bits + the scalefactor bits the band
+   costs if it is coded at all — `sf-cost`, exact, see the namespace
+   docstring)."
+  [q swb-offsets max-sfb sf-cost]
+  (mapv (fn [sfb]
+          (let [start (nth swb-offsets sfb)
+                end (nth swb-offsets (inc sfb))]
+            (persistent!
+              (reduce (fn [m cb]
+                        (if-let [c (band-spectral-bits q start end cb)]
+                          (assoc! m cb (+ c (if (= cb zero-hcb) 0 (nth sf-cost sfb))))
+                          m))
+                      (transient {})
+                      (cons zero-hcb spectral-codebooks)))))
+        (range max-sfb)))
+
+(defn- best-section-from
+  "Cheapest first section starting at band `i`: try every end `j` and every
+   codebook that can code the whole run `i..j-1`, add the already-solved cost
+   of `j` onward. Returns {:bits :cb :end}."
+  [i max-sfb costs dp]
+  (loop [j (inc i)
+         sums (nth costs i)                        ; cb -> cost of bands i..j-1
+         best nil]
+    (let [header (section-length-bits (- j i))
+          tail (:bits (get dp j))
+          best' (reduce (fn [acc [cb s]]
+                          (let [total (+ header s tail)]
+                            (if (or (nil? acc) (< total (:bits acc)))
+                              {:bits total :cb cb :end j}
+                              acc)))
+                        best sums)]
+      (if (>= j max-sfb)
+        best'
+        (let [next-costs (nth costs j)
+              sums' (persistent!
+                      (reduce (fn [m [cb s]]
+                                (if-let [c (get next-costs cb)] (assoc! m cb (+ s c)) m))
+                              (transient {}) sums))]
+          (if (empty? sums')
+            best'
+            (recur (inc j) sums' best')))))))
+
+(defn choose-sections
+  "Assign a spectral codebook to every band `0..max-sfb-1`, minimising the
+   frame's total bits (spectral + `section_data()` headers + scalefactors) by
+   exact dynamic programming over section boundaries.
+
+   Not a greedy run-length pass: merging two neighbouring runs that want
+   different codebooks into one section coded with a codebook that suits
+   neither is often cheaper than a second 9-14 bit section header, and only
+   solving the whole partition sees that. Returns {:sfb-cb :bits} where
+   `:bits` is the exact total of everything `choose-sections` accounted for."
+  [q swb-offsets max-sfb sf-cost]
+  (if (zero? max-sfb)
+    {:sfb-cb [] :bits 0}
+    (let [costs (band-costs q swb-offsets max-sfb sf-cost)
+          dp (loop [i (dec max-sfb) dp {max-sfb {:bits 0}}]
+               (if (neg? i)
+                 dp
+                 (recur (dec i) (assoc dp i (best-section-from i max-sfb costs dp)))))
+          sfb-cb (loop [i 0 out []]
+                   (if (>= i max-sfb)
+                     out
+                     (let [{:keys [cb end]} (get dp i)]
+                       (recur end (into out (repeat (- end i) cb))))))]
+      {:sfb-cb sfb-cb :bits (:bits (get dp 0))})))
+
+;; --- quantization of one channel ----------------------------------------
+
+(def ^:private max-clamp-iterations
+  "`aac.quant/clamp-dpcm-chain` can change a band's scalefactor, which can
+   change whether that band quantizes to all zeros, which changes the chain.
+   Three passes settle it in practice; the loop stops either way and the final
+   scalefactor deltas are verified when written, so a non-converging input
+   produces a legal (if slightly sub-optimal) frame rather than a corrupt one."
+  3)
+
+(defn quantize-channel
+  "Quantize one channel's spectrum at quantizer position `base-sf`. Returns
+   {:q :scale-factors :coded? :max-sfb :clipped-lines} where `:coded?` marks
+   bands with at least one non-zero quantized line, `:max-sfb` is one past the
+   highest such band (§4.6.3.3: everything at or above `max_sfb` is implicitly
+   zero), and `:clipped-lines` counts lines that hit `aac.quant/max-quant` —
+   which should be zero, since `aac.quant/band-scalefactors` floors every
+   band's scalefactor at the level that makes its peak representable. It is
+   returned rather than asserted because the DPCM chain clamp below can in
+   principle pull a scalefactor back under that floor; reporting it keeps such
+   a frame visible instead of quietly damaged."
+  [spec swb-offsets num-swb base-sf {:keys [noise-shaping-alpha rounding]}]
+  (let [nominal (quant/band-scalefactors spec swb-offsets num-swb base-sf noise-shaping-alpha rounding)
+        quantize (fn [sfs]
+                   (reduce (fn [q sfb]
+                             (let [start (nth swb-offsets sfb)
+                                   end (nth swb-offsets (inc sfb))
+                                   sf (nth sfs sfb)]
+                               (reduce (fn [q i]
+                                         (assoc q i (quant/quantize-coeff (nth spec i) sf rounding)))
+                                       q (range start end))))
+                           (vec (repeat frame-length 0))
+                           (range num-swb)))
+        finish (fn [sfs q]
+                 (let [coded? (mapv (fn [sfb]
+                                      (not (every? zero? (subvec q (nth swb-offsets sfb)
+                                                                 (nth swb-offsets (inc sfb))))))
+                                    (range num-swb))
+                       highest (reduce (fn [acc sfb] (if (nth coded? sfb) sfb acc)) -1 (range num-swb))
+                       max-sfb (inc highest)]
+                   {:q (if (< max-sfb num-swb)
+                         ;; Zero everything at/above max_sfb: those lines are
+                         ;; not coded, so anything left there would be a lie
+                         ;; the bit accounting could not see.
+                         (reduce (fn [q i] (assoc q i 0))
+                                 q (range (nth swb-offsets max-sfb) frame-length))
+                         q)
+                    :scale-factors sfs
+                    :coded? coded?
+                    :max-sfb max-sfb
+                    :clipped-lines (count (filter #(= quant/max-quant (if (neg? %) (- %) %)) q))}))]
+    (loop [sfs nominal iteration 0]
+      (let [q (quantize sfs)
+            coded? (mapv (fn [sfb]
+                           (not (every? zero? (subvec q (nth swb-offsets sfb)
+                                                      (nth swb-offsets (inc sfb))))))
+                         (range num-swb))
+            clamped (quant/clamp-dpcm-chain sfs coded?)]
+        (cond
+          (= clamped sfs) (finish sfs q)
+          ;; Out of iterations: quantize once more with the clamped
+          ;; scalefactors so the returned `:q` and `:scale-factors` are the
+          ;; SAME pair. Returning a `q` quantized at one scalefactor next to a
+          ;; different scalefactor to write would be a power-of-two error in
+          ;; every line of that band.
+          (>= iteration max-clamp-iterations) (finish clamped (quantize clamped))
+          :else (recur clamped (inc iteration)))))))
+
+(defn scalefactor-costs
+  "Per-band scalefactor bit cost, exact and independent of the section choice
+   (see the namespace docstring): a coded band costs the DPCM code for its
+   delta from the previous CODED band (the first one costs the code for 0,
+   since `global_gain` is set to it); an all-zero band, if a section drags it
+   in under a real codebook, costs the code for 0."
+  [scale-factors coded? max-sfb]
+  (let [zero-cost (huffman/scalefactor-delta-bits 0)]
+    (first
+      (reduce (fn [[out running] sfb]
+                (if (nth coded? sfb)
+                  (let [sf (nth scale-factors sfb)
+                        delta (if (nil? running) 0 (- sf running))]
+                    [(conj out (huffman/scalefactor-delta-bits delta)) sf])
+                  [(conj out zero-cost) running]))
+              [[] nil]
+              (range max-sfb)))))
+
+(defn- global-gain
+  "`global_gain`: the first coded band's scalefactor, so its differential is 0.
+   With no coded band at all (a silent frame, `max_sfb` 0) nothing reads it, so
+   any legal value does; 100 is the scalefactor at which `aac.dequant`'s
+   power-of-two term is exactly 1."
+  [scale-factors coded? max-sfb]
+  (or (first (keep (fn [sfb] (when (nth coded? sfb) (nth scale-factors sfb))) (range max-sfb)))
+      100))
+
+;; --- individual_channel_stream(), write direction -----------------------
+
+(def ^:private ics-info-bits 11)   ; reserved 1 + window_sequence 2 + shape 1 + max_sfb 6 + predictor 1
+(def ^:private ics-fixed-bits 11)  ; global_gain 8 + pulse/tns/gain-control presence 3
+
+(defn channel-bits
+  "Exact bit cost of one `individual_channel_stream()`, excluding the
+   `ics_info()` a CPE shares (add `ics-info-bits` when this channel writes its
+   own)."
+  [{:keys [section-bits]}]
+  (+ ics-fixed-bits section-bits))
+
+(defn plan-channel
+  "Everything needed to write one channel, with its exact bit cost:
+   quantization, scalefactors, section/codebook assignment. `forced-max-sfb`
+   (a CPE's shared `max_sfb`) widens `max_sfb` beyond what this channel needs,
+   since `common_window` makes it a single shared field."
+  ([spec swb-offsets num-swb base-sf opts] (plan-channel spec swb-offsets num-swb base-sf opts nil))
+  ([spec swb-offsets num-swb base-sf opts forced-max-sfb]
+   (let [{:keys [q scale-factors coded? max-sfb clipped-lines]}
+         (quantize-channel spec swb-offsets num-swb base-sf opts)
+         max-sfb (if forced-max-sfb (max forced-max-sfb max-sfb) max-sfb)
+         sf-cost (scalefactor-costs scale-factors coded? max-sfb)
+         {:keys [sfb-cb bits]} (choose-sections q swb-offsets max-sfb sf-cost)]
+     {:q q
+      :scale-factors scale-factors
+      :coded? coded?
+      :max-sfb max-sfb
+      :sfb-cb sfb-cb
+      :section-bits bits
+      :clipped-lines clipped-lines
+      :global-gain (global-gain scale-factors coded? max-sfb)})))
+
+(defn- write-ics-info! [w window-shape max-sfb]
+  (bits/write-bit! w 0)                     ; ics_reserved_bit
+  (bits/write-bits! w 2 0)                  ; window_sequence = ONLY_LONG_SEQUENCE
+  (bits/write-bit! w window-shape)
+  (bits/write-bits! w 6 max-sfb)
+  (bits/write-bit! w 0))                    ; predictor_data_present
+
+(defn- write-section-data! [w sfb-cb]
+  (let [max-sfb (count sfb-cb)]
+    (loop [k 0]
+      (when (< k max-sfb)
+        (let [cb (nth sfb-cb k)
+              len (count (take-while #(= cb %) (subvec sfb-cb k)))]
+          (bits/write-bits! w 4 cb)
+          (loop [remaining len]
+            (if (>= remaining sect-esc-val)
+              (do (bits/write-bits! w 5 sect-esc-val)
+                  (recur (- remaining sect-esc-val)))
+              (bits/write-bits! w 5 remaining)))
+          (recur (+ k len)))))))
+
+(defn- write-scale-factor-data! [w sfb-cb scale-factors coded? gg]
+  (loop [sfb 0 running gg]
+    (when (< sfb (count sfb-cb))
+      (if (= zero-hcb (nth sfb-cb sfb))
+        (recur (inc sfb) running)
+        (if (nth coded? sfb)
+          (let [sf (nth scale-factors sfb)]
+            (huffman/write-scalefactor-dpcm! w (- sf running))
+            (recur (inc sfb) sf))
+          ;; all-zero band pulled into a coded section: differential 0, and
+          ;; `running` deliberately unchanged (namespace docstring).
+          (do (huffman/write-scalefactor-dpcm! w 0)
+              (recur (inc sfb) running)))))))
+
+(defn- write-spectral-data! [w q sfb-cb swb-offsets]
+  (dotimes [sfb (count sfb-cb)]
+    (let [cb (nth sfb-cb sfb)]
+      (when-not (= zero-hcb cb)
+        (let [{:keys [dim]} (get huffman/codebook-params cb)
+              start (nth swb-offsets sfb)
+              end (nth swb-offsets (inc sfb))]
+          (doseq [b (range start end dim)]
+            (huffman/write-spectral-tuple! w cb (subvec q b (+ b dim)))))))))
+
+(defn write-channel!
+  "Write one `individual_channel_stream()` (Table 4.44) from `plan-channel`'s
+   output. `window-shape` is written only when this channel owns its
+   `ics_info()` (`write-ics-info?` — false for a CPE under `common_window`)."
+  [w {:keys [q scale-factors coded? sfb-cb global-gain]} swb-offsets window-shape write-ics-info?]
+  (bits/write-bits! w 8 global-gain)
+  (when write-ics-info?
+    (write-ics-info! w window-shape (count sfb-cb)))
+  (write-section-data! w sfb-cb)
+  (write-scale-factor-data! w sfb-cb scale-factors coded? global-gain)
+  (bits/write-bits! w 3 0)                  ; pulse / tns / gain_control absent
+  (write-spectral-data! w q sfb-cb swb-offsets))
+
+;; --- rate control -------------------------------------------------------
+
+(defn frame-budget-bits
+  "Payload bits one frame may use to hit `bitrate` at `sample-rate`, after the
+   7-byte ADTS header AND after the up-to-7 bits `byte_alignment()` adds when
+   rounding the payload up to whole bytes. Charging for both, and rounding the
+   frame's bit allowance down, is what makes `<= bitrate` a guarantee rather
+   than an approximation: without the alignment allowance a frame that exactly
+   filled its budget would still grow by a byte on the way out."
+  [bitrate sample-rate]
+  (max 8 (- (long (/ (* (double bitrate) frame-length) (double sample-rate)))
+            (* 8 adts/header-length)
+            7)))
+
+(defn- bisect-base-sf
+  "Smallest (finest) quantizer position whose cost fits `budget`. Bits fall
+   monotonically as the scalefactor rises — every band's effective scalefactor
+   is `max(base_sf, its own floor)`, which is itself monotone, so coarser can
+   never cost more — and the bisection needs nothing else. Returning the
+   smallest fitting value spends the whole budget rather than leaving quality on
+   the table.
+
+   `cost-fn` is the EXACT cost (a full `plan-channel`, section optimiser
+   included), not an upper bound. An earlier version bisected on a cheap
+   per-band upper bound instead; it undershot the target by 12% (measured:
+   112 kbps for a 128 kbps request) because the bound ignored exactly the
+   section merging the optimiser then performed. The exact form costs one extra
+   dynamic-programming pass per probe over work already being done, which is
+   not where the time goes (the forward MDCT is).
+
+   If even 255 does not fit, 255 is returned and the frame overruns the target —
+   an honest overrun (ADTS frames may be up to 8191 bytes) instead of a
+   silently mangled one."
+  [budget cost-fn]
+  (loop [lo 0 hi 255 best 255]
+    (if (> lo hi)
+      best
+      (let [mid (quot (+ lo hi) 2)]
+        (if (<= (cost-fn mid) budget)
+          (recur lo (dec mid) mid)
+          (recur (inc mid) hi best))))))
+
+;; --- frames -------------------------------------------------------------
+
+(defn- assert-bits! [w before predicted where]
+  (let [actual (- (bits/bits-written w) before)]
+    (when-not (= actual predicted)
+      (throw (ex-info "aac.encode: predicted bit count disagrees with what was written"
+                       {:where where :predicted predicted :actual actual})))))
+
+(defn encode-frame-sce
+  "Encode one mono frame's spectrum as a `raw_data_block()` holding a single
+   `single_channel_element()`. Returns {:payload <byte vector> :bits :base-sf}."
+  [spec swb-offsets num-swb {:keys [window-shape budget-bits base-sf] :as opts}]
+  (let [element-bits (+ 3 4)                        ; id_syn_ele + element_instance_tag
+        overhead (+ element-bits ics-info-bits 3)   ; + ID_END
+        plan-at (fn [sf] (plan-channel spec swb-offsets num-swb sf opts))
+        chosen (or base-sf
+                   (bisect-base-sf (- budget-bits overhead)
+                                   (fn [sf] (channel-bits (plan-at sf)))))
+        plan (plan-at chosen)
+        predicted (+ overhead (channel-bits plan))
+        w (bits/writer)
+        before (bits/bits-written w)]
+    (bits/write-bits! w 3 id-sce)
+    (bits/write-bits! w 4 0)                        ; element_instance_tag
+    (write-channel! w plan swb-offsets window-shape true)
+    (bits/write-bits! w 3 id-end)
+    (assert-bits! w before predicted "single_channel_element")
+    {:payload (bits/bytes! w) :bits predicted :base-sf chosen :plan plan
+     :clipped-lines (:clipped-lines plan)}))
+
+;; --- mid/side decision --------------------------------------------------
+
+(defn ms-decision
+  "Per-band `ms_used`: code mid/side rather than L/R where doing so is
+   predicted to cost fewer bits.
+
+   The criterion is derived rather than tuned. Under the usual
+   rate-vs-distortion result that a band of `n` lines with variance `v` needs
+   about `(n/2) log2(v / noise)` bits, coding two channels costs
+   `(n/2) log2(v1 v2 / noise^2)` — so, at a fixed noise floor, whichever pair
+   has the smaller PRODUCT of band energies is cheaper. `mid = (L+R)/2` and
+   `side = (L-R)/2` always sum to half the L/R energy
+   (`E_m + E_s = (E_L + E_R)/2`), so comparing SUMS says nothing at all; it is
+   the product that collapses when the channels are correlated (`side -> 0`),
+   which is exactly when mid/side is supposed to win.
+
+   Note what this does NOT model: quantization noise in `mid` reappears
+   correlated in both output channels and noise in `side` anti-correlated, so
+   mid/side changes the SPATIAL distribution of noise, not just its amount.
+   Judging that needs a binaural masking model this repo does not have (see the
+   namespace docstring); the rule above is a bit-count argument only."
+  [spec-l spec-r swb-offsets num-swb]
+  (mapv (fn [sfb]
+          (let [start (nth swb-offsets sfb)
+                end (nth swb-offsets (inc sfb))
+                [el er em es]
+                (reduce (fn [[el er em es] i]
+                          (let [l (double (nth spec-l i))
+                                r (double (nth spec-r i))
+                                m (/ (+ l r) 2.0)
+                                s (/ (- l r) 2.0)]
+                            [(+ el (* l l)) (+ er (* r r)) (+ em (* m m)) (+ es (* s s))]))
+                        [0.0 0.0 0.0 0.0] (range start end))]
+            (< (* em es) (* el er))))
+        (range num-swb)))
+
+(defn apply-ms-forward
+  "Turn L/R spectra into the mid/side pair the decoder will invert: for bands
+   where `ms-used` is set, `mid = (L+R)/2` and `side = (L-R)/2`, which
+   `aac.stereo/apply-ms`'s `L = mid + side` / `R = mid - side` reverses
+   exactly. Other bands pass through as plain L/R."
+  [spec-l spec-r ms-used swb-offsets]
+  (reduce (fn [[ch0 ch1] sfb]
+            (if-not (nth ms-used sfb)
+              [ch0 ch1]
+              (let [start (nth swb-offsets sfb)
+                    end (nth swb-offsets (inc sfb))]
+                (reduce (fn [[a b] i]
+                          (let [l (double (nth spec-l i))
+                                r (double (nth spec-r i))]
+                            [(assoc a i (/ (+ l r) 2.0)) (assoc b i (/ (- l r) 2.0))]))
+                        [ch0 ch1] (range start end)))))
+          [(vec spec-l) (vec spec-r)]
+          (range (count ms-used))))
+
+(defn- ms-mask-mode
+  "`ms_mask_present` (Table 4.4): 0 when no band uses mid/side, 2 when every
+   band below `max_sfb` does (the spec's shorthand, which writes no per-band
+   bits), 1 otherwise."
+  [ms-used max-sfb]
+  (let [used (take max-sfb ms-used)]
+    (cond
+      (zero? max-sfb) 0
+      (every? false? used) 0
+      (every? true? used) 2
+      :else 1)))
+
+(defn encode-frame-cpe
+  "Encode one stereo frame's two spectra as a `raw_data_block()` holding a
+   `channel_pair_element()` with `common_window` = 1 (required for mid/side,
+   §4.6.8.1) and a shared `max_sfb`."
+  [spec-l spec-r swb-offsets num-swb {:keys [window-shape budget-bits base-sf] :as opts}]
+  (let [ms-used (ms-decision spec-l spec-r swb-offsets num-swb)
+        [ch0-spec ch1-spec] (apply-ms-forward spec-l spec-r ms-used swb-offsets)
+        element-bits (+ 3 4 1)                      ; id_syn_ele + tag + common_window
+        cost-fn (fn [sf] (+ (channel-bits (plan-channel ch0-spec swb-offsets num-swb sf opts))
+                            (channel-bits (plan-channel ch1-spec swb-offsets num-swb sf opts))))
+        ;; Two things the per-channel cost cannot see are charged up front, so
+        ;; the bisection cannot pick a scalefactor that only fits without them:
+        ;; the mask's own bits (bounded by one per band) and the extra section
+        ;; header a channel pays when the SHARED max_sfb is wider than its own
+        ;; (bounded by one section spanning every band, per channel).
+        overhead (+ element-bits ics-info-bits 2 num-swb 3
+                    (* 2 (section-length-bits num-swb)))
+        chosen (or base-sf (bisect-base-sf (- budget-bits overhead) cost-fn))
+        plan0 (plan-channel ch0-spec swb-offsets num-swb chosen opts)
+        plan1 (plan-channel ch1-spec swb-offsets num-swb chosen opts (:max-sfb plan0))
+        max-sfb (max (:max-sfb plan0) (:max-sfb plan1))
+        ;; Re-plan channel 0 if channel 1 needed a wider max_sfb: the field is
+        ;; shared, so both channels' section data must span the same bands.
+        plan0 (if (= max-sfb (:max-sfb plan0))
+                plan0
+                (plan-channel ch0-spec swb-offsets num-swb chosen opts max-sfb))
+        mask-mode (ms-mask-mode ms-used max-sfb)
+        mask-bits (+ 2 (if (= mask-mode 1) max-sfb 0))
+        predicted (+ element-bits ics-info-bits mask-bits
+                     (channel-bits plan0) (channel-bits plan1) 3)
+        w (bits/writer)
+        before (bits/bits-written w)]
+    (bits/write-bits! w 3 id-cpe)
+    (bits/write-bits! w 4 0)                        ; element_instance_tag
+    (bits/write-bit! w 1)                           ; common_window
+    (write-ics-info! w window-shape max-sfb)
+    (bits/write-bits! w 2 mask-mode)
+    (when (= mask-mode 1)
+      (dotimes [sfb max-sfb] (bits/write-bit! w (if (nth ms-used sfb) 1 0))))
+    (write-channel! w plan0 swb-offsets window-shape false)
+    (write-channel! w plan1 swb-offsets window-shape false)
+    (bits/write-bits! w 3 id-end)
+    (assert-bits! w before predicted "channel_pair_element")
+    {:payload (bits/bytes! w) :bits predicted :base-sf chosen
+     :ms-mask-mode mask-mode :plans [plan0 plan1]
+     :clipped-lines (+ (:clipped-lines plan0) (:clipped-lines plan1))}))
+
+;; --- stream assembly ----------------------------------------------------
+
+(defn- adts-frame
+  [payload sfi channel-configuration]
+  (let [len (+ adts/header-length (count payload))]
+    (into (adts/write-header {:sampling-frequency-index sfi
+                              :channel-configuration channel-configuration
+                              :frame-length len})
+          payload)))
+
+(defn- resolve-options [opts]
+  (let [{:keys [sample-rate bitrate] :as o} (merge default-options opts)
+        sfi (adts/sampling-frequency-index sample-rate)]
+    (assoc o
+           :sampling-frequency-index sfi
+           :num-swb (tables/num-swb sfi)
+           :swb-offsets (tables/swb-offsets sfi)
+           :budget-bits (frame-budget-bits bitrate sample-rate))))
+
+(defn encode-mono
+  "Encode mono float PCM `samples` (same full-scale convention as
+   `aac.decode`'s output — roughly +/-32768) as an ADTS AAC-LC stream.
+
+   Options: `:sample-rate` (44100 or 48000), `:bitrate` (bits/s, the rate loop
+   target), `:window-shape` (0 sine / 1 KBD), `:noise-shaping-alpha` and
+   `:rounding` (see `aac.quant`), `:base-sf` (fix the quantizer and ignore
+   `:bitrate` — constant-quality rather than constant-rate).
+
+   Returns {:adts :audio-specific-config :frames :bits :sample-rate
+   :channels :encoder-delay}. `:audio-specific-config` is what an MP4 `esds`
+   needs, since MP4 carries these same access units WITHOUT the ADTS headers;
+   `:encoder-delay` is the priming the decoder must drop."
+  ([samples] (encode-mono samples {}))
+  ([samples opts]
+   (let [{:keys [swb-offsets num-swb sampling-frequency-index window-shape sample-rate] :as o}
+         (resolve-options opts)
+         blocks (mdct/frame-blocks samples)
+         ;; Every frame carries the same `window_shape`, so each window's two
+         ;; halves agree by construction (§4.6.11.3.2's prev/current pairing);
+         ;; a future block-switching encoder is what would need to thread the
+         ;; previous frame's shape through here.
+         frames (mapv (fn [block]
+                        (encode-frame-sce (mdct/analyze-frame block window-shape window-shape)
+                                          swb-offsets num-swb o))
+                      blocks)]
+     {:adts (into [] (mapcat #(adts-frame (:payload %) sampling-frequency-index 1) frames))
+      :audio-specific-config (adts/audio-specific-config
+                               {:sampling-frequency-index sampling-frequency-index
+                                :channel-configuration 1})
+      :access-units (mapv :payload frames)
+      :frames (count frames)
+      :bits (reduce + 0 (map :bits frames))
+      :clipped-lines (reduce + 0 (map :clipped-lines frames))
+      :sample-rate sample-rate
+      :channels 1
+      :encoder-delay encoder-delay})))
+
+(defn encode-stereo
+  "Encode stereo float PCM (`left`/`right`, same convention as `encode-mono`)
+   as an ADTS AAC-LC stream of `channel_pair_element()` frames with per-band
+   mid/side (`ms-decision`). Same options and return shape as `encode-mono`,
+   with `:channels` 2."
+  ([left right] (encode-stereo left right {}))
+  ([left right opts]
+   (let [{:keys [swb-offsets num-swb sampling-frequency-index window-shape sample-rate] :as o}
+         (resolve-options opts)
+         blocks-l (mdct/frame-blocks left)
+         blocks-r (mdct/frame-blocks right)
+         _ (when-not (= (count blocks-l) (count blocks-r))
+             (throw (ex-info "aac.encode: stereo channels must be the same length"
+                              {:left (count left) :right (count right)})))
+         frames (mapv (fn [bl br]
+                        (encode-frame-cpe (mdct/analyze-frame bl window-shape window-shape)
+                                          (mdct/analyze-frame br window-shape window-shape)
+                                          swb-offsets num-swb o))
+                      blocks-l blocks-r)]
+     {:adts (into [] (mapcat #(adts-frame (:payload %) sampling-frequency-index 2) frames))
+      :audio-specific-config (adts/audio-specific-config
+                               {:sampling-frequency-index sampling-frequency-index
+                                :channel-configuration 2})
+      :access-units (mapv :payload frames)
+      :frames (count frames)
+      :bits (reduce + 0 (map :bits frames))
+      :clipped-lines (reduce + 0 (map :clipped-lines frames))
+      :sample-rate sample-rate
+      :channels 2
+      :encoder-delay encoder-delay})))
+
+(defn from-int16
+  "Widen signed 16-bit PCM to the float scale this encoder and `aac.decode`
+   share. Present so the convention is stated in code rather than assumed:
+   full scale is +/-32768, NOT +/-1.0."
+  [samples]
+  (mapv double samples))

@@ -1,0 +1,258 @@
+(ns aac.quant
+  "AAC-LC forward quantization — the inverse of `aac.dequant`. That namespace
+   reconstructs
+
+     x = sign(q) * |q|^(4/3) * 2^((scale_factor - 100) / 4)
+
+   so the forward direction is, with `v = |x| * 2^(-(scale_factor-100)/4)`,
+   picking the integer `q` whose reconstruction `q^(4/3)` is closest to `v`.
+
+   ## Rounding: derived, not a magic number
+
+   Encoders conventionally compute `q = (int)(pow(v, 0.75) + 0.4054)`. That
+   constant is not arbitrary and it is not exact: in the compressed domain
+   `u = v^(3/4)`, the boundary between reconstructing to 0 and to 1 sits at
+   `((0^(4/3) + 1^(4/3)) / 2)^(3/4) = (1/2)^(3/4) = 0.5946`, i.e. at
+   `1 - 0.4054` below the next integer — so 0.4054 is the EXACT
+   nearest-reconstruction-level boundary for q=0 only, reused as a constant
+   for every q. The exact boundary drifts upward with q (0.4054 at q=0,
+   0.470 at q=1, 0.484 at q=2, ~0.486 at q=10, -> 0.5 asymptotically), so the
+   constant biases larger coefficients DOWNWARD — which costs distortion and
+   saves bits.
+
+   This namespace therefore implements both and lets the caller choose:
+
+   - `:nearest` (default) — evaluate the true boundary
+     `(q^(4/3) + (q+1)^(4/3)) / 2` for the one candidate pair that matters.
+     No constant, minimal squared error at a given scalefactor.
+   - a number — the biased `floor(v^(3/4) + offset)` form
+     (`biased-round-offset` is the conventional 0.4054).
+
+   Because `aac.encode` closes a rate-control loop around the scalefactor, the
+   bits the biased form saves are not free quality: the loop simply spends them
+   on a finer scalefactor. Which one wins at EQUAL BITRATE is an empirical
+   question, and it is measured rather than assumed —
+   `test/aac/encode_test.cljk`'s `rounding-mode-comparison` encodes the same
+   input both ways at the same bit budget and compares reconstruction SNR.
+
+   ## Per-band scalefactors and noise shaping
+
+   `band-scalefactors` derives one absolute scalefactor per scalefactor band
+   from a single frame-wide `base-sf` (what `aac.encode`'s rate loop bisects)
+   plus an explicit noise-shaping exponent `alpha`, defined so that
+   quantization noise power in a band is proportional to `band_rms^(2*alpha)`.
+
+   The exponent-to-scalefactor mapping is derived from the power law itself:
+   reconstruction spacing near a coefficient of magnitude `x` is
+   `dx/dq = (4/3) q^(1/3) 2^s` with `s = (sf-100)/4`, and `q^(1/3) =
+   (x 2^-s)^(1/4)`, so noise power per line goes as `x^(1/2) 2^(3s/2)`.
+   Setting that proportional to `X^(2*alpha)` for band rms `X` gives
+
+     sf_b = base_sf + (16*alpha/3 - 4/3) * log2(X_b / X_ref)
+
+   Two consequences worth stating plainly, because they are easy to get
+   backwards:
+
+   1. **alpha = 1/4 means a CONSTANT scalefactor across bands** (the bracket
+      is zero). The power law already shapes noise mildly toward louder bands
+      on its own; a flat scalefactor is not a flat noise floor.
+   2. **alpha = 0 (a genuinely flat noise floor, MSE-optimal) requires
+      LOWERING the scalefactor on loud bands**, not raising it.
+
+   The default is `alpha = 1/4` — not because it is perceptually best, but
+   because it is the only value this repo can defend: choosing between the
+   others needs a psychoacoustic masking model, and this repo has none (see
+   `aac.encode`'s namespace docstring). It is exposed so that a caller who
+   HAS a metric can measure instead of guess."
+  )
+
+(def ^:private ln2 #?(:clj (Math/log 2.0) :cljs (js/Math.log 2.0)))
+(defn- pow- [x y] #?(:clj (Math/pow x y) :cljs (js/Math.pow x y)))
+(defn- log- [x] #?(:clj (Math/log x) :cljs (js/Math.log x)))
+(defn- sqrt- [x] #?(:clj (Math/sqrt x) :cljs (js/Math.sqrt x)))
+(defn- floor- [x] #?(:clj (long (Math/floor (double x))) :cljs (js/Math.floor x)))
+(defn- round- [x] #?(:clj (Math/round (double x)) :cljs (js/Math.round x)))
+(defn- abs- [x] (if (neg? x) (- x) x))
+(defn- log2 [x] (/ (log- x) ln2))
+(defn- pow4-3 [q] (pow- (double q) (/ 4.0 3.0)))
+(defn- pow2 [x] (pow- 2.0 (double x)))
+
+(def max-quant
+  "Largest quantized magnitude a conformant AAC-LC bitstream may carry
+   (§4.6.3.3: the ESC_HCB escape word is bounded so |x_quant| <= 8191). The
+   encoder clamps to this rather than emitting an unrepresentable value —
+   `aac.encode`'s rate loop is what keeps real frames far away from it."
+  8191)
+
+(def biased-round-offset
+  "The conventional `floor(v^(3/4) + 0.4054)` rounding offset, stated exactly
+   as what it is: `1 - (1/2)^(3/4)`, the q=0 -> q=1 decision boundary in the
+   compressed domain (see namespace docstring)."
+  (- 1.0 (pow- 0.5 0.75)))
+
+(defn scale-multiplier
+  "`2^(-(sf-100)/4)` — the factor that maps a spectral coefficient into the
+   quantizer's domain (the reciprocal of `aac.dequant`'s scaling)."
+  [sf]
+  (pow2 (- (/ (- (double sf) 100.0) 4.0))))
+
+(defn quantize-magnitude
+  "Quantized level for a NON-NEGATIVE quantizer-domain value `v`, WITHOUT the
+   `max-quant` clamp. Separate from `quantize-coeff` because the unclamped
+   value is what decides whether a scalefactor is usable at all
+   (`min-scalefactor`); asking the clamped function would just return the
+   clamp and hide the overflow."
+  [v rounding]
+  (if-not (pos? v)
+    0
+    (if (number? rounding)
+      (floor- (+ (pow- v 0.75) (double rounding)))
+      (let [q0 (floor- (pow- v 0.75))
+            q0 (if (neg? q0) 0 q0)]
+        ;; `q0` from the compressed domain can land one level low or (with
+        ;; round-off) one high; the true boundary between q and q+1 is the
+        ;; midpoint of their RECONSTRUCTIONS.
+        (cond
+          (> v (/ (+ (pow4-3 q0) (pow4-3 (inc q0))) 2.0)) (inc q0)
+          (and (pos? q0)
+               (< v (/ (+ (pow4-3 (dec q0)) (pow4-3 q0)) 2.0))) (dec q0)
+          :else q0)))))
+
+(defn quantize-coeff
+  "Quantize one spectral coefficient `x` at absolute scalefactor `sf`.
+   `rounding` is `:nearest` (default — the exact nearest-reconstruction-level
+   choice) or a number (the biased `floor(v^(3/4) + offset)` form). Returns a
+   signed integer, magnitude clamped to `max-quant`.
+
+   That clamp is a floor under catastrophe, not a normal operating point: a
+   clamped coefficient is silently replaced by a much smaller one, which on a
+   spectral peak destroys the frame (measured: ONE clamped line in a frame
+   dropped a 75 dB reconstruction to ~0 dB, and alternating frames clipping
+   dropped a whole stream to 14 dB). Keeping it away from here is
+   `min-scalefactor`'s job, and `aac.encode` reports any line that still hits
+   it rather than letting it pass unseen."
+  ([x sf] (quantize-coeff x sf :nearest))
+  ([x sf rounding]
+   (let [q (min (long (quantize-magnitude (* (abs- (double x)) (scale-multiplier sf)) rounding))
+                max-quant)]
+     (if (neg? x) (- q) q))))
+
+(defn min-scalefactor
+  "Smallest scalefactor at which every coefficient of `spec` in `[start, end)`
+   quantizes to a REPRESENTABLE level (magnitude <= `max-quant`) — the
+   inner-loop constraint of the classic two-loop AAC encoder, and the reason
+   `band-scalefactors` cannot simply hand every band the rate loop's
+   scalefactor.
+
+   Solving `(X * 2^(-(sf-100)/4))^(3/4) <= max_quant` for the band's peak `X`
+   gives `sf >= 100 + 4*log2(X / max_quant^(4/3))`; because the rounding rule
+   can add one level on top of that, the analytic answer is only a starting
+   point and the loop below confirms it against the real quantizer instead of
+   trusting the algebra."
+  ([spec start end] (min-scalefactor spec start end :nearest))
+  ([spec start end rounding]
+   (let [peak (reduce (fn [m i] (let [a (abs- (double (nth spec i)))] (if (> a m) a m)))
+                      0.0 (range start end))]
+     (if-not (pos? peak)
+       0
+       (let [analytic (+ 100.0 (* 4.0 (log2 (/ peak (pow- (double max-quant) (/ 4.0 3.0))))))
+             ;; start safely below the analytic answer and walk up, so a
+             ;; one-level rounding difference cannot leave a clipped band
+             from (max 0 (min 255 (- (long (round- analytic)) 2)))]
+         (loop [sf from]
+           (cond
+             (>= sf 255) 255
+             (<= (quantize-magnitude (* peak (scale-multiplier sf)) rounding) max-quant) sf
+             :else (recur (inc sf)))))))))
+
+(defn quantize-band
+  "Quantize spectral coefficients `[start, end)` of `spec` at scalefactor `sf`,
+   returning just that band's integer vector."
+  ([spec start end sf] (quantize-band spec start end sf :nearest))
+  ([spec start end sf rounding]
+   (mapv (fn [i] (quantize-coeff (nth spec i) sf rounding)) (range start end))))
+
+(defn band-rms
+  "Root-mean-square magnitude of `spec` over `[start, end)`."
+  [spec start end]
+  (let [n (- end start)]
+    (if (zero? n)
+      0.0
+      (sqrt- (/ (reduce (fn [acc i] (let [v (double (nth spec i))] (+ acc (* v v))))
+                        0.0 (range start end))
+                (double n))))))
+
+(def default-noise-shaping-alpha
+  "See namespace docstring: 1/4 is the exponent at which the scalefactor is
+   constant across bands, i.e. the only allocation this repo can justify
+   without a masking model it does not have."
+  0.25)
+
+(defn shaping-coefficient
+  "`16*alpha/3 - 4/3` — the scalefactor-per-log2-rms slope for noise-shaping
+   exponent `alpha` (derived in the namespace docstring). Zero at alpha=1/4."
+  [alpha]
+  (- (/ (* 16.0 (double alpha)) 3.0) (/ 4.0 3.0)))
+
+(defn band-scalefactors
+  "One absolute scalefactor per scalefactor band `0..max-sfb-1`, from frame-wide
+   `base-sf` and noise-shaping exponent `alpha` (see namespace docstring), then
+   raised per band to `min-scalefactor` so nothing clips.
+
+   That floor is why the result is not simply `base-sf` everywhere even at
+   `alpha` = 1/4: the rate loop is free to ask for a quantizer finer than a
+   loud band can represent, and the band — not the frame — is where that has to
+   be caught. Results are clamped to the representable `[0, 255]` range; the
+   ADDITIONAL constraint that consecutive CODED bands differ by at most 60 (the
+   DPCM codebook's range) is applied later by `clamp-dpcm-chain`, once
+   `aac.encode` knows which bands are actually coded."
+  ([spec swb-offsets max-sfb base-sf alpha] (band-scalefactors spec swb-offsets max-sfb base-sf alpha :nearest))
+  ([spec swb-offsets max-sfb base-sf alpha rounding]
+   (let [k (shaping-coefficient alpha)
+         rms (mapv (fn [sfb] (band-rms spec (nth swb-offsets sfb) (nth swb-offsets (inc sfb))))
+                   (range max-sfb))
+         positive (filterv pos? rms)
+         ref (if (seq positive)
+               (/ (reduce + 0.0 positive) (double (count positive)))
+               1.0)]
+     (mapv (fn [sfb]
+             (let [r (nth rms sfb)
+                   desired (if (or (zero? k) (not (pos? r)))
+                             (long (round- base-sf))
+                             (long (round- (+ (double base-sf) (* k (log2 (/ r ref)))))))
+                   floor-sf (min-scalefactor spec (nth swb-offsets sfb) (nth swb-offsets (inc sfb)) rounding)]
+               (max 0 (min 255 (max desired floor-sf)))))
+           (range max-sfb)))))
+
+(def sf-delta-limit
+  "Widest differential scalefactor the Table 4.A.1 DPCM codebook can carry
+   (index_offset -60, 121 entries -> deltas -60..60)."
+  60)
+
+(defn clamp-dpcm-chain
+  "Force `scale-factors` to be encodable: every CODED band (`coded?` true —
+   i.e. not ZERO_HCB, since ZERO_HCB bands code no scalefactor at all and the
+   DPCM chain skips straight over them) must be within `sf-delta-limit` of the
+   PREVIOUS coded band, and all values stay in `[0, 255]`. Uncoded bands keep
+   their nominal value (never written, kept only so callers can re-quantize
+   against a full-length vector).
+
+   Necessary rather than defensive: a band whose neighbours are 60+
+   scalefactors away is not a corner case (a near-silent band next to a loud
+   one is ordinary), and emitting its true scalefactor would produce a
+   bitstream no decoder can read. Clamping changes the quantizer for that
+   band, which is why `aac.encode` re-quantizes after this and iterates."
+  [scale-factors coded?]
+  (let [n (count scale-factors)]
+    (loop [sfb 0 prev nil out []]
+      (if (>= sfb n)
+        out
+        (let [nominal (max 0 (min 255 (long (nth scale-factors sfb))))]
+          (if-not (nth coded? sfb)
+            (recur (inc sfb) prev (conj out nominal))
+            (let [clamped (if (nil? prev)
+                            nominal
+                            (max (- prev sf-delta-limit)
+                                 (min (+ prev sf-delta-limit) nominal)))
+                  clamped (max 0 (min 255 clamped))]
+              (recur (inc sfb) clamped (conj out clamped)))))))))
