@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.presentationml` | `kotoba.presentationml/src` | `presentationml.core`, `presentationml.parse` (Kotoba project library) |
 | `kotoba.power` | `kotoba.power/src` | `power`, `power.em`, `power.estimation`, `power.ir-drop` (Kotoba project library) |
 | `kotoba.postfx` | `kotoba.postfx/src` | `postfx` (Kotoba project library) |
 | `kotoba.policy` | `kotoba.policy/src` | `policy.execute`, `policy.model`, `policy.ports`, `policy.validate` (Kotoba project library) |
