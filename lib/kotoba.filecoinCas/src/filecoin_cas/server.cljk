@@ -1,0 +1,189 @@
+(ns filecoin-cas.server
+  "Loopback HTTP front for the Filecoin tier, so other runtimes (murakumo's
+  artifact store) use it across a process boundary and never load the Synapse
+  SDK or hold the wallet key.
+
+    PUT /obj/<cid>     verify bytes against the CID, spool, queue. 202 queued,
+                       200 already stored, 400 malformed CID, 413 too large,
+                       422 bytes do not match the CID
+    GET /obj/<cid>     the bytes, re-verified. 404 unknown, 502 the tier could
+                       not produce verified bytes
+    GET /status/<cid>  EDN entry (state, attempts, piece-cid...) or 404
+    GET /health        EDN {:ok true :stats {...}}
+
+  Both directions stream through the disk (spool / temp files), hashing on the
+  way, so memory stays flat whatever the object size. A PUT for a CID the tier
+  already holds is answered without reading the body: the object is identified
+  by its CID, and what is stored was verified when it arrived.
+
+  Binds 127.0.0.1 unless a token is configured; a token, when configured, is
+  required as `Authorization: Bearer <token>` on every request."
+  (:require ["node:http" :as http]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:stream" :as stream]
+            ["node:stream/promises" :as stream-promises]
+            [promesa.core :as p]
+            [filecoin-cas.cid :as cid]
+            [filecoin-cas.engine :as eng]
+            [filecoin-cas.index :as index]
+            [filecoin-cas.state :as state]))
+
+(def default-max-object-bytes (* 512 1024 1024))
+
+(def loopback-hosts #{"127.0.0.1" "::1" "localhost"})
+
+(defn- respond
+  ([res status] (respond res status nil))
+  ([res status body]
+   (.writeHead res status
+               #js {"content-type" (if (string? body)
+                                     "application/edn"
+                                     "application/octet-stream")})
+   (.end res (if (nil? body) "" body))))
+
+(defn- edn-response [res status m] (respond res status (pr-str m)))
+
+(defn- authorized? [token req]
+  (or (nil? token)
+      (let [given (or (aget (.-headers req) "authorization") "")
+            want (str "Bearer " token)
+            a (js/Buffer.from given) b (js/Buffer.from want)]
+        (and (= (.-length a) (.-length b))
+             (.timingSafeEqual crypto a b)))))
+
+(defn- receive-to-file!
+  "Stream the request body into a fresh temp file in the spool, hashing as it
+  passes and refusing more than `limit` bytes, then fsync. Promise of {:tmp
+  :size :digest}; on any failure the temp file is removed and the promise
+  rejects (:reason :too-large when the limit was hit)."
+  [req dir limit]
+  (let [tmp (state/spool-tmp-path dir)
+        h (.createHash crypto "sha256")
+        n (atom 0)
+        meter (stream/Transform.
+                #js {:transform
+                     (fn [chunk _enc done]
+                       (swap! n + (.-length chunk))
+                       (if (> @n limit)
+                         (done (ex-info "too large" {:reason :too-large}))
+                         (do (.update h chunk) (done nil chunk))))})]
+    (-> (.pipeline stream-promises req meter
+                   (.createWriteStream fs tmp #js {:mode 0600 :flags "wx"}))
+        (.then (fn [_] (.open (.-promises fs) tmp "r+")))
+        (.then (fn [fh] (-> (.sync fh) (.finally (fn [] (.close fh))))))
+        (.then (fn [_] {:tmp tmp :size @n :digest (js/Uint8Array. (.digest h))}))
+        (.catch (fn [e] (state/remove-file! tmp) (throw e))))))
+
+(defn- route [url]
+  (when-let [[_ kind arg] (re-matches #"/(obj|status)/([^/?#]+)" (or url ""))]
+    [(keyword kind) arg]))
+
+(defn- known? [cas c]
+  (some? (eng/status cas c)))
+
+(defn- put-object! [cas max-bytes on-queued req res c]
+  (let [declared (js/Number (or (aget (.-headers req) "content-length") 0))
+        respond-error (fn [status reason]
+                        (when-not (.-headersSent res)
+                          (edn-response res status {:ok false :reason reason})))]
+    (cond
+      (not (cid/valid-cid? c)) (do (.resume req) (respond-error 400 :invalid-cid))
+      (> declared max-bytes) (do (.resume req) (respond-error 413 :too-large))
+      (known? cas c) (do (.resume req)
+                         (edn-response res (if (= :stored (:state (eng/status cas c))) 200 202)
+                                       {:ok true :state (:state (eng/status cas c))}))
+      :else
+      (-> (receive-to-file! req (:dir cas) max-bytes)
+          (.then (fn [{:keys [tmp size digest]}]
+                   (if-not (cid/matches-digest? c digest)
+                     (do (state/remove-file! tmp) (respond-error 422 :cid-mismatch))
+                     (let [entry (eng/enqueue-file! cas c tmp size)]
+                       (when on-queued (on-queued))
+                       (edn-response res 202 {:ok true :state (:state entry)})))))
+          (.catch (fn [e]
+                    (case (cid/error-reason e)
+                      :too-large (respond-error 413 :too-large)
+                      (respond-error 500 :internal))))))))
+
+(defn- get-object [cas res c]
+  (if-not (cid/valid-cid? c)
+    (edn-response res 400 {:ok false :reason :invalid-cid})
+    (-> (eng/fetch-to-file! cas c)
+        (.then (fn [r]
+                 (if (nil? r)
+                   (edn-response res 404 {:ok false :reason :unknown-cid})
+                   (let [{:keys [path size cleanup!]} r]
+                     (.writeHead res 200 #js {"content-type" "application/octet-stream"
+                                              "content-length" (str size)})
+                     (-> (.pipeline stream-promises (.createReadStream fs path) res)
+                         (.catch (fn [_] nil))     ; client went away
+                         (.finally cleanup!))))))
+        (.catch (fn [e]
+                  (when-not (.-headersSent res)
+                    (edn-response res 502 {:ok false
+                                           :reason (or (cid/error-reason e) :fetch-failed)})))))))
+
+(defn handler
+  "Node request listener over `cas`. `on-queued` (optional) fires after an
+  object is queued so a drainer can wake early."
+  [cas {:keys [token max-object-bytes on-queued]
+        :or {max-object-bytes default-max-object-bytes}}]
+  (fn [req res]
+    (let [method (.-method req)
+          url (.-url req)]
+      (cond
+        (not (authorized? token req)) (edn-response res 401 {:ok false :reason :unauthorized})
+        (and (= "GET" method) (= "/health" url))
+        (edn-response res 200 {:ok true :stats (index/stats @(:idx cas))})
+        :else
+        (if-let [[kind c] (route url)]
+          (case [kind method]
+            [:obj "PUT"] (put-object! cas max-object-bytes on-queued req res c)
+            [:obj "GET"] (get-object cas res c)
+            [:status "GET"] (if-let [e (eng/status cas c)]
+                              (edn-response res 200 (dissoc e :copies))
+                              (edn-response res 404 {:ok false :reason :unknown-cid}))
+            (edn-response res 405 {:ok false :reason :method-not-allowed}))
+          (edn-response res 404 {:ok false :reason :not-found}))))))
+
+(defn start!
+  "Listen and resolve to the node server. Refuses a non-loopback `host` when no
+  `token` is set. `port` 0 picks a free port (see `(.-port (.address server))`)."
+  [cas {:keys [host port token] :or {host "127.0.0.1" port 8788} :as opts}]
+  (when-not (or token (contains? loopback-hosts host))
+    (throw (ex-info "filecoin-cas: a non-loopback bind requires a token"
+                    {:reason :insecure-bind :host host})))
+  (js/Promise.
+    (fn [resolve reject]
+      (let [server (.createServer http (handler cas opts))]
+        ;; Node's default 300 s request timeout would cut off a large upload.
+        (aset server "requestTimeout" 0)
+        (.once server "error" reject)
+        (.listen server port host #(resolve server))))))
+
+(defn start-drainer!
+  "Drain the queue every `interval-ms` and, via the returned :wake fn, soon
+  after new work arrives. `before-drain` (fn [queued-sizes]) -> promise runs
+  first so the wallet can be funded for what is about to upload. Returns
+  {:stop fn :wake fn}. Errors are reported through `log`, never thrown."
+  [cas {:keys [interval-ms before-drain log] :or {interval-ms 15000 log println}}]
+  (let [running (atom false)
+        tick (fn tick []
+               (when (compare-and-set! running false true)
+                 (-> (p/let [idx @(:idx cas)
+                             sizes (->> (vals (:objects idx))
+                                        (filter #(= :queued (:state %)))
+                                        (mapv :size))
+                             _ (when (and before-drain (seq sizes)) (before-drain sizes))
+                             res (eng/drain! cas)]
+                       (doseq [r res :when (not (:ok r))]
+                         (log (pr-str {:drain-failed (:cid r) :error (:error r)}))))
+                     (p/catch (fn [e] (log (pr-str {:drain-error (or (.-message e) (str e))}))))
+                     (p/finally (fn [_ _] (reset! running false))))))
+        timer (js/setInterval tick interval-ms)
+        wake-timer (atom nil)]
+    {:stop (fn [] (js/clearInterval timer) (some-> @wake-timer js/clearTimeout))
+     :wake (fn [] (when-not @wake-timer
+                    (reset! wake-timer
+                            (js/setTimeout (fn [] (reset! wake-timer nil) (tick)) 1000))))}))

@@ -1,0 +1,195 @@
+(ns filecoin-cas.engine
+  "The Filecoin cold tier: enqueue verified objects, drain the queue to
+  Filecoin, fetch them back by CID.
+
+  Objects live on disk, not in memory: a PUT is streamed into the spool and
+  hashed on the way in (`enqueue-file!`), an upload streams the spool file out,
+  and a GET streams a verified temp file back (`fetch-to-file!`). Memory stays
+  flat whatever the object size. The byte-array entry points (`enqueue!`,
+  `fetch`) remain for small callers and tests.
+
+  Transport is injected so the whole thing is testable without a network:
+
+    :upload!        (fn [bytes metadata]) -> promise of {:piece-cid :size
+                    :complete? :copies}
+    :upload-file!   optional (fn [path size metadata]) -> same; streams a file.
+                    Without it the file is read whole and given to :upload!.
+    :download       (fn [piece-cid]) -> promise of Uint8Array
+    :download-file! optional (fn [entry dest-path]) -> promise; streams the
+                    object into `dest-path`. Without it :download is used.
+
+  Every byte in or out is checked against its CID (filecoin-cas.cid)."
+  (:require ["node:fs" :as fs]
+            [promesa.core :as p]
+            [filecoin-cas.cid :as cid]
+            [filecoin-cas.index :as index]
+            [filecoin-cas.state :as state]))
+
+(defn- now [cas] ((:now-fn cas)))
+
+(defn- attempt
+  "Run `f` (a thunk that may throw synchronously or return a promise) and
+  always answer with a promise. A synchronous throw inside a promesa `p/let`
+  body can escape before any `p/catch` is attached; routing through here turns
+  every failure into a rejection."
+  [f]
+  (js/Promise. (fn [resolve reject]
+                 (try (resolve (f))
+                      (catch :default e (reject e))))))
+
+(defn- commit!
+  "Apply `f` to the index and persist the result."
+  [cas f & args]
+  (let [idx (apply swap! (:idx cas) f args)]
+    (state/save-index! (:dir cas) idx)
+    idx))
+
+(defn open
+  "Open the tier rooted at `dir`. Interrupted PUT/GET temp files are swept. Spool
+  files with no index entry (a crash between writing the spool and saving the
+  index) are verified and queued, and a corrupt one is dropped rather than
+  retried forever. Recovery hashes each orphan in 1 MiB reads (blocking, at
+  startup only)."
+  [{:keys [dir upload! upload-file! download download-file! now-fn]}]
+  (let [cas {:dir dir :upload! upload! :upload-file! upload-file!
+             :download download :download-file! download-file!
+             :now-fn (or now-fn #(js/Date.now))
+             :idx (atom (state/load-index dir))
+             :draining (atom false)}]
+    (state/sweep-temp! dir)
+    (doseq [c (state/spooled-cids dir)
+            :when (nil? (index/lookup @(:idx cas) c))]
+      (let [file (state/spool-file dir c)
+            {:keys [digest bytes]} (cid/hash-file-sync file)]
+        (if (cid/matches-digest? c digest)
+          (commit! cas index/enqueue c bytes (now cas))
+          (state/spool-delete! dir c))))
+    cas))
+
+(defn- keep-spool? [cas c]
+  (let [entry (index/lookup @(:idx cas) c)]
+    (and entry (or (= :stored (:state entry)) (state/spool-file (:dir cas) c)))))
+
+(defn enqueue-file!
+  "Queue an object whose bytes are already in `tmp` (a path from
+  `state/spool-tmp-path`) and ALREADY verified against `c` by the caller (the
+  server hashes while receiving). Adopts the file as the spool file, or deletes
+  it when the object is already known. Synchronous and cheap. Returns the entry."
+  [cas c tmp size]
+  (if (keep-spool? cas c)
+    (when tmp (state/remove-file! tmp))
+    (when tmp (state/spool-adopt! (:dir cas) c tmp)))
+  (commit! cas index/enqueue c size (now cas))
+  (index/lookup @(:idx cas) c))
+
+(defn enqueue!
+  "Verify `bytes` (Uint8Array) against `cid`, spool them, and queue the upload.
+  For callers that already hold the bytes; large objects go through
+  `enqueue-file!`. Returns the entry."
+  [cas c bytes]
+  (cid/verify! c bytes :cid-mismatch)
+  (if (keep-spool? cas c)
+    (enqueue-file! cas c nil (.-length bytes))
+    (let [tmp (state/spool-tmp-path (:dir cas))]
+      (.writeFileSync fs tmp bytes #js {:mode 0600})
+      (enqueue-file! cas c tmp (.-length bytes)))))
+
+(defn status [cas c] (index/lookup @(:idx cas) c))
+
+(defn- upload-spool! [cas c file size]
+  (let [meta {"cid" c "kind" "cas"}]
+    (js/Promise.resolve
+      (if-let [up (:upload-file! cas)]
+        (up file size meta)
+        ((:upload! cas) (js/Uint8Array. (.readFileSync fs file)) meta)))))
+
+(defn- upload-one! [cas c]
+  (let [file (state/spool-file (:dir cas) c)]
+    (if (nil? file)
+      (do (commit! cas index/mark-failed c "spool-missing" (now cas))
+          (p/resolved {:cid c :ok false :error "spool-missing"}))
+      (-> (attempt
+            (fn []
+              (-> (cid/verify-file! c file :spool-corrupt)
+                  (.then (fn [size] (upload-spool! cas c file size)))
+                  (.then (fn [res]
+                           (when-not (seq (:copies res))
+                             (throw (ex-info "filecoin-cas: upload returned no copies"
+                                             {:reason :no-copies})))
+                           (commit! cas index/mark-stored c res (now cas))
+                           (state/spool-delete! (:dir cas) c)
+                           {:cid c :ok true :piece-cid (:piece-cid res)})))))
+          (p/catch (fn [e]
+                     (let [msg (or (.-shortMessage e) (.-message e) (str e))]
+                       (commit! cas index/mark-failed c msg (now cas))
+                       {:cid c :ok false :error msg})))))))
+
+(defn drain!
+  "Upload due objects one at a time (`limit` per call, default 10). Resolves to
+  a vector of per-object results. A second concurrent call returns [] rather
+  than uploading the same object twice."
+  ([cas] (drain! cas 10))
+  ([cas limit]
+   (if-not (compare-and-set! (:draining cas) false true)
+     (p/resolved [])
+     (-> (p/loop [todo (index/due @(:idx cas) (now cas) limit)
+                  out []]
+           (if (empty? todo)
+             out
+             (p/let [r (upload-one! cas (first todo))]
+               (p/recur (rest todo) (conj out r)))))
+         (p/finally (fn [_ _] (reset! (:draining cas) false)))))))
+
+(defn- download-into! [cas entry dest]
+  (js/Promise.resolve
+    (if-let [dl (:download-file! cas)]
+      (dl entry dest)
+      (.then (js/Promise.resolve ((:download cas) (:piece-cid entry)))
+             (fn [bytes] (.writeFileSync fs dest bytes #js {:mode 0600}))))))
+
+(defn fetch-to-file!
+  "Promise of {:path :size :cleanup!} for a file holding the verified bytes of
+  `cid`, or nil when the tier has never seen it. The bytes come from the local
+  spool when still there, else they are downloaded into a temp file. Either way
+  the file is hashed against the CID BEFORE this resolves, so a caller streaming
+  it out never sends unverified bytes. Call `(cleanup!)` when done (a no-op for
+  the spool file). Rejects :spool-corrupt / :fetched-bytes-cid-mismatch."
+  [cas c]
+  (attempt
+    (fn []
+      (let [dir (:dir cas)
+            file (state/spool-file dir c)
+            entry (index/lookup @(:idx cas) c)]
+        (cond
+          file
+          (.then (cid/verify-file! c file :spool-corrupt)
+                 (fn [size] {:path file :size size :cleanup! (fn [] nil)}))
+
+          (and entry (= :stored (:state entry)))
+          (let [tmp (state/fetch-tmp-path dir)
+                cleanup! (fn [] (state/remove-file! tmp))]
+            (-> (download-into! cas entry tmp)
+                (.then (fn [_] (cid/verify-file! c tmp :fetched-bytes-cid-mismatch)))
+                (.then (fn [size] {:path tmp :size size :cleanup! cleanup!}))
+                (.catch (fn [e] (cleanup!) (throw e)))))
+
+          :else nil)))))
+
+(defn fetch
+  "Bytes for `cid` (a Uint8Array held in memory: for small objects; large ones
+  use `fetch-to-file!`), or nil when the tier has never seen it. Prefers the
+  local spool; otherwise downloads the stored piece. Whatever comes back is
+  verified against the CID before it is returned. Always a promise; failures
+  reject with an ex-info whose :reason is :spool-corrupt or
+  :fetched-bytes-cid-mismatch."
+  [cas c]
+  (attempt
+    (fn []
+      (let [spooled (state/spool-get (:dir cas) c)
+            entry (index/lookup @(:idx cas) c)]
+        (cond
+          spooled (cid/verify! c spooled :spool-corrupt)
+          (and entry (= :stored (:state entry)))
+          (p/then ((:download cas) (:piece-cid entry))
+                  #(cid/verify! c % :fetched-bytes-cid-mismatch))
+          :else nil)))))

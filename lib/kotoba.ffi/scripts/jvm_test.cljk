@@ -1,0 +1,106 @@
+(ns jvm-test
+  "JVM oracle runner for a `.cljk` repository.
+
+    kbb --backend sci scripts/jvm_test.cljk <test-ns> [<test-ns> ..] [--jar <path>].. [--jvm-opt <opt>].. [--java <bin>]
+
+  The JDK is the ORACLE here, not a runtime this repository targets: the
+  tests it runs compare this library's answers with what the JDK class it
+  replaces answers, on a real JDK.
+
+  The JVM cannot `require` a `.cljk` (clojure.lang.RT/load knows .class,
+  .clj and .cljc), and only a `.cljc` is read with reader conditionals. So
+  every classpath entry `kbb -Spath -A:test` names is mirrored into a temp
+  tree with each `.cljk` renamed `.cljc` (first entry wins, as on a
+  classpath), and `clojure.main` runs `clojure.test/run-tests` over the
+  given namespaces with the :clj branches. Extra jars (a JDBC driver, ..)
+  come in with --jar.
+
+  Exit: 0 every test passed and at least one ran | 1 a failure or error |
+  2 ZERO tests ran (nothing was measured, never green) | 3 could not run
+  (no java, no Clojure jar, no classpath)."
+  (:require [clojure.string :as str]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def os (js/require "node:os"))
+
+(defn die! [code msg] (binding [*print-fn* *print-err-fn*] (println (str "jvm-test: " msg))) (js/process.exit code))
+
+(def argv (vec *command-line-args*))
+(defn- flag-values [flag] (vec (keep (fn [[a b]] (when (= a flag) b)) (partition 2 1 argv))))
+(def jars (flag-values "--jar"))
+;; --jvm-opt <opt> (repeatable) and --java <path>: added in kotoba-lang/ffi, whose
+;; JVM tests need a JDK 22+ (java.lang.foreign final) and
+;; --enable-native-access=ALL-UNNAMED.
+(def jvm-opts (flag-values "--jvm-opt"))
+(def java-bin (or (last (flag-values "--java")) "java"))
+(def test-nses
+  (loop [as argv out []]
+    (cond (empty? as) out
+          (#{"--jar" "--jvm-opt" "--java"} (first as)) (recur (drop 2 as) out)
+          :else (recur (rest as) (conj out (first as))))))
+
+(defn newest-jar
+  "The newest version directory's jar under ~/.m2/repository/<group>/<artifact>."
+  [group artifact]
+  (let [d (.join path (.homedir os) ".m2" "repository" group artifact)
+        vs (try (vec (.readdirSync fs d)) (catch :default _ []))
+        v (last (sort-by (fn [s] (mapv #(js/parseInt % 10) (re-seq #"\d+" s))) vs))
+        j (when v (.join path d v (str artifact "-" v ".jar")))]
+    (when (and j (.existsSync fs j)) j)))
+
+(defn walk [dir f]
+  (doseq [e (try (.readdirSync fs dir #js {:withFileTypes true}) (catch :default _ []))]
+    (let [p (.join path dir (.-name e))]
+      (cond (.isDirectory e) (walk p f)
+            (.isFile e) (f p)))))
+
+(defn quote-export-map
+  "KNOWN JVM BREAK, worked around here and nowhere else: since 2026-09-11
+  (kotoba-lang/text 3b57274 \"ns: {:kotoba/export [...]}\") some stdlib ns
+  forms carry an attr-map whose vector names the namespace's own vars. JVM
+  Clojure EVALUATES an ns attr-map (clojure.core/ns emits it unquoted into
+  .resetMeta), so `(ns x {:kotoba/export [f]})` dies with `Unable to resolve
+  symbol: f` and the namespace never loads on the JVM. The mirror quotes
+  that one vector so the oracle can run; the source is not touched."
+  [src]
+  (str/replace src #"\{:kotoba/export \[" "{:kotoba/export '["))
+
+(defn -main []
+  (when (empty? test-nses) (die! 3 "no test namespace given"))
+  (let [cwd (js/process.cwd)
+        spath (try (str/trim (str (.execFileSync cp "kbb" #js ["-Spath" "-A:test"] #js {:cwd cwd :encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]})))
+                   (catch :default e (die! 3 (str "kbb -Spath failed: " (.-message e)))))
+        entries (remove str/blank? (str/split spath #":"))
+        mirror (.mkdtempSync fs (.join path (.tmpdir os) "jvm-test-"))
+        seen (atom #{})
+        clj-jars (keep identity [(newest-jar "org/clojure" "clojure")
+                                 (newest-jar "org/clojure" "spec.alpha")
+                                 (newest-jar "org/clojure" "core.specs.alpha")])]
+    (when (< (count clj-jars) 3) (die! 3 "Clojure / spec.alpha / core.specs.alpha jar not found under ~/.m2"))
+    (when (empty? entries) (die! 3 "empty classpath"))
+    (doseq [e entries
+            :let [root (.resolve path cwd e)]
+            :when (and (.existsSync fs root) (.isDirectory (.statSync fs root)))]
+      (walk root (fn [p]
+                   (let [rel (.relative path root p)
+                         rel' (str/replace rel #"\.cljk$" ".cljc")]
+                     (when-not (or (str/ends-with? rel ".cljs") (@seen rel'))
+                       (swap! seen conj rel')
+                       (let [out (.join path mirror rel')]
+                         (.mkdirSync fs (.dirname path out) #js {:recursive true})
+                         (if (str/ends-with? rel ".cljk")
+                           (.writeFileSync fs out (quote-export-map (.readFileSync fs p "utf8")) "utf8")
+                           (.copyFileSync fs p out))))))))
+    (let [expr (str "(require 'clojure.test)"
+                    "(doseq [n '[" (str/join " " test-nses) "]] (require n))"
+                    "(let [r (apply clojure.test/run-tests '[" (str/join " " test-nses) "])]"
+                    "  (System/exit (cond (zero? (:test r)) 2 (clojure.test/successful? r) 0 :else 1)))")
+          cpath (str/join ":" (concat [mirror] jars clj-jars))
+          r (.spawnSync cp java-bin (clj->js (concat jvm-opts ["-cp" cpath "clojure.main" "-e" expr])) #js {:stdio "inherit" :cwd cwd})]
+      (.rmSync fs mirror #js {:recursive true :force true})
+      (when (.-error r) (die! 3 (str "java did not run: " (.-message (.-error r)))))
+      (js/process.exit (or (.-status r) 3)))))
+
+(-main)
