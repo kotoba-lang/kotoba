@@ -1,0 +1,153 @@
+;; Generic native CBOR over the explicit cbor.value domain. Failures use the
+;; typed :keyword abort channel and can be inspected through checked APIs.
+(ns cbor.codec (:export [encode encode-ordered decode encode-checked decode-checked])
+ (:require [cbor.fragment :as f] [cbor.value :as v])
+ (:schemas {:cbor/read [:record :cbor/read [[:value [:ref :cbor/value]] [:next :i64]]]}))
+(defn- child [xs [:list [:ref :cbor/value]] i :i64] [:ref :cbor/value]
+ (typed-list-nth [:list [:ref :cbor/value]] xs i))
+(defn- encode-at [value [:ref :cbor/value] depth :i64] :vector-i64
+ (if (> depth 512) (throw :cbor/depth)
+  (let [kind (v/kind value) n (v/number value) kids (v/children value) count (vector-count kids)]
+   (cond (= kind :null) (f/encode-null)
+    (= kind :bool) (if (or (= n 0) (= n 1)) (f/encode-bool (= n 1)) (throw :cbor/bool))
+    (= kind :int) (f/encode-int n)
+    (= kind :uint) (f/encode-u64-bits n)
+    (= kind :negative) (f/encode-negative-bits n)
+    (= kind :f64) (f/encode-f64 (f64-from-bits n))
+    (= kind :text) (f/encode-text (v/text value))
+    (= kind :bytes) (f/encode-bytes (v/data value))
+    (= kind :array) (loop [i 0 out (f/array-items)]
+      (if (= i count) (f/encode-array out)
+       (let [r (encode-checked-at (child kids i) (+ depth 1))]
+        (if (result-ok?-of [:result :vector-i64 :keyword] r)
+         (let [item (result-value-of [:result :vector-i64 :keyword] r []) next (f/array-item out item)]
+          (recur (+ i 1) next))
+         (throw (result-error-of [:result :vector-i64 :keyword] r :cbor/value))))))
+    (or (= kind :map) (= kind :ordered))
+     (if (not= (bit-and count 1) 0) (throw :cbor/map-arity)
+      (loop [i 0 out (f/map-entries)]
+       (if (= i count) (if (= kind :ordered) (f/encode-map-ordered out) (f/encode-map out))
+        (let [kr (encode-checked-at (child kids i) (+ depth 1))]
+         (if (result-ok?-of [:result :vector-i64 :keyword] kr)
+          (let [vr (encode-checked-at (child kids (+ i 1)) (+ depth 1))]
+           (if (result-ok?-of [:result :vector-i64 :keyword] vr)
+            (let [key (result-value-of [:result :vector-i64 :keyword] kr [])
+                  val (result-value-of [:result :vector-i64 :keyword] vr [])]
+             (recur (+ i 2) (f/generic-map-entry out key val)))
+            (throw (result-error-of [:result :vector-i64 :keyword] vr :cbor/value))))
+          (throw (result-error-of [:result :vector-i64 :keyword] kr :cbor/value)))))))
+    (= kind :tag) (if (not= count 1) (throw :cbor/tag-arity)
+      (f/encode-tag-bits n (encode-at (child kids 0) (+ depth 1))))
+    :else (throw :cbor/value)))))
+(defn encode [value [:ref :cbor/value]] :vector-i64 (encode-at value 0))
+(defn- encode-checked-at [value [:ref :cbor/value] depth :i64] [:result :vector-i64 :keyword]
+ (try (result-ok-of [:result :vector-i64 :keyword] (encode-at value depth))
+  (catch :keyword error (result-err-of [:result :vector-i64 :keyword] error))))
+(defn encode-ordered [pairs [:list [:ref :cbor/value]]] :vector-i64 (encode (v/ordered pairs)))
+(defn- same-bytes? [a :vector-i64 b :vector-i64] :bool
+ (and (= (vector-count a) (vector-count b))
+  (loop [i 0] (cond (= i (vector-count a)) true
+   (not= (vector-at a i) (vector-at b i)) false :else (recur (+ i 1))))))
+(defn- map-put [pairs [:list [:ref :cbor/value]] key [:ref :cbor/value] value [:ref :cbor/value]] [:list [:ref :cbor/value]]
+ (let [encoded (encode key)]
+  (loop [i 0 replaced false out (typed-list-new [:list [:ref :cbor/value]])]
+   (if (= i (vector-count pairs))
+    (if replaced out (typed-list-conj [:list [:ref :cbor/value]] (typed-list-conj [:list [:ref :cbor/value]] out key) value))
+    (let [old (child pairs i) r (encode-checked-at old 0)]
+     (if (result-ok?-of [:result :vector-i64 :keyword] r)
+      (let [matches (same-bytes? encoded (result-value-of [:result :vector-i64 :keyword] r []))]
+       (recur (+ i 2) (or replaced matches)
+        (typed-list-conj [:list [:ref :cbor/value]] (typed-list-conj [:list [:ref :cbor/value]] out old)
+         (if matches value (child pairs (+ i 1))))))
+      (throw (result-error-of [:result :vector-i64 :keyword] r :cbor/value))))))))
+(defn- map-put-checked [pairs [:list [:ref :cbor/value]] key [:ref :cbor/value] value [:ref :cbor/value]] [:result [:list [:ref :cbor/value]] :keyword]
+ (try (result-ok-of [:result [:list [:ref :cbor/value]] :keyword] (map-put pairs key value))
+  (catch :keyword error (result-err-of [:result [:list [:ref :cbor/value]] :keyword] error))))
+(defn- read-n [bytes :vector-i64 pos :i64 count :i64] :i64
+ (if (or (< pos 0) (> count (- (vector-count bytes) pos))) (throw :cbor/eof)
+  (loop [i 0 value 0] (if (= i count) value
+   (recur (+ i 1) (bit-or (i64-shift-left value 8) (vector-at bytes (+ pos i))))))))
+(defn- arg-width [info :i64] :i64
+ (cond (< info 24) 0 (= info 24) 1 (= info 25) 2 (= info 26) 4 (= info 27) 8 :else (throw :cbor/indefinite)))
+(defn- slice [bytes :vector-i64 pos :i64 count :i64] :vector-i64
+ (if (or (< count 0) (> count (- (vector-count bytes) pos))) (throw :cbor/eof)
+  (loop [i 0 out (vector-alloc 0)]
+   (if (= i count) out (recur (+ i 1) (vector-conj out (vector-at bytes (+ pos i))))))))
+(defn- utf8? [bytes :vector-i64] :bool
+ (let [n (vector-count bytes)]
+  (loop [i 0]
+   (if (= i n) true
+    (let [b (vector-at bytes i) width (cond (< b 128) 1 (and (>= b 194) (< b 224)) 2
+                                         (and (>= b 224) (< b 240)) 3 (and (>= b 240) (<= b 244)) 4 :else 0)]
+     (cond (= width 0) false (> width (- n i)) false (= width 1) (recur (+ i 1))
+      :else (let [next (vector-at bytes (+ i 1))
+                  valid (loop [j 1] (cond (= j width) true
+                    (or (< (vector-at bytes (+ i j)) 128) (> (vector-at bytes (+ i j)) 191)) false :else (recur (+ j 1))))]
+       (if (and valid (not (and (= b 224) (< next 160))) (not (and (= b 237) (>= next 160)))
+                      (not (and (= b 240) (< next 144))) (not (and (= b 244) (> next 143))))
+        (recur (+ i width)) false))))))))
+(defn- parsed [value [:ref :cbor/value] next :i64] [:ref :cbor/read]
+ (record-new [:ref :cbor/read] value next))
+(defn- read-at [bytes :vector-i64 offset :i64 depth :i64] [:ref :cbor/read]
+ (cond (> depth 512) (throw :cbor/depth) (>= offset (vector-count bytes)) (throw :cbor/eof)
+  :else (let [first (vector-at bytes offset) major (quot first 32) info (bit-and first 31) pos (+ offset 1)]
+   (if (= major 7)
+    (cond (= info 20) (parsed (v/bool-value false) pos) (= info 21) (parsed (v/bool-value true) pos)
+          (= info 22) (parsed (v/null-value) pos)
+          (= info 27) (let [bits (read-n bytes pos 8)]
+            (if (= (bit-and (u64-shift-right bits 52) 2047) 2047) (throw :cbor/non-finite)
+             (parsed (v/f64-bits bits) (+ pos 8))))
+          :else (throw :cbor/simple))
+    (let [width (arg-width info) n (if (= width 0) info (read-n bytes pos width)) at (+ pos width)]
+     (cond
+      (= major 0) (parsed (if (< n 0) (v/uint-bits n) (v/int-value n)) at)
+      (= major 1) (parsed (if (< n 0) (v/negative-bits n) (v/int-value (- -1 n))) at)
+      (or (= major 2) (= major 3))
+       (if (< n 0) (throw :cbor/length)
+        (let [body (slice bytes at n)]
+         (if (= major 2) (parsed (v/bytes-value body) (+ at n))
+          (cond (> n 8388608) (throw :cbor/text-budget) (not (utf8? body)) (throw :cbor/utf8)
+           :else (parsed (v/text-value (string-from-utf8 (bytes-from-vector-i64 body))) (+ at n))))))
+      (= major 4) (if (or (< n 0) (> n (- (vector-count bytes) at))) (throw :cbor/eof)
+       (loop [i 0 at at out (typed-list-new [:list [:ref :cbor/value]])]
+        (if (= i n) (parsed (v/array-value out) at)
+         (let [r (read-checked-at bytes at (+ depth 1))]
+          (if (result-ok?-of [:result [:ref :cbor/read] :keyword] r)
+           (let [one (result-value-of [:result [:ref :cbor/read] :keyword] r (parsed (v/null-value) 0))]
+            (recur (+ i 1) (record-get [:ref :cbor/read] one :next)
+             (typed-list-conj [:list [:ref :cbor/value]] out (record-get [:ref :cbor/read] one :value))))
+           (throw (result-error-of [:result [:ref :cbor/read] :keyword] r :cbor/value)))))))
+      (= major 5) (if (or (< n 0) (> n (quot (- (vector-count bytes) at) 2))) (throw :cbor/eof)
+       (loop [i 0 at at out (typed-list-new [:list [:ref :cbor/value]])]
+        (if (= i n) (parsed (v/map-value out) at)
+         (let [kr (read-checked-at bytes at (+ depth 1))]
+          (if (result-ok?-of [:result [:ref :cbor/read] :keyword] kr)
+           (let [key (result-value-of [:result [:ref :cbor/read] :keyword] kr (parsed (v/null-value) 0))
+                 vr (read-checked-at bytes (record-get [:ref :cbor/read] key :next) (+ depth 1))]
+            (if (result-ok?-of [:result [:ref :cbor/read] :keyword] vr)
+             (let [val (result-value-of [:result [:ref :cbor/read] :keyword] vr (parsed (v/null-value) 0))
+                   pr (map-put-checked out (record-get [:ref :cbor/read] key :value) (record-get [:ref :cbor/read] val :value))]
+              (if (result-ok?-of [:result [:list [:ref :cbor/value]] :keyword] pr)
+               (recur (+ i 1) (record-get [:ref :cbor/read] val :next)
+                (result-value-of [:result [:list [:ref :cbor/value]] :keyword] pr (typed-list-new [:list [:ref :cbor/value]])))
+               (throw (result-error-of [:result [:list [:ref :cbor/value]] :keyword] pr :cbor/value))))
+             (throw (result-error-of [:result [:ref :cbor/read] :keyword] vr :cbor/value))))
+           (throw (result-error-of [:result [:ref :cbor/read] :keyword] kr :cbor/value)))))))
+      (= major 6) (let [value (read-at bytes at (+ depth 1))]
+       (parsed (v/tagged n (record-get [:ref :cbor/read] value :value)) (record-get [:ref :cbor/read] value :next)))
+      :else (throw :cbor/major)))))))
+(defn- read-checked-at [bytes :vector-i64 offset :i64 depth :i64] [:result [:ref :cbor/read] :keyword]
+ (try (result-ok-of [:result [:ref :cbor/read] :keyword] (read-at bytes offset depth))
+  (catch :keyword error (result-err-of [:result [:ref :cbor/read] :keyword] error))))
+(defn decode [bytes :vector-i64] [:ref :cbor/value]
+ (if (not (loop [i 0] (cond (= i (vector-count bytes)) true
+           (or (< (vector-at bytes i) 0) (> (vector-at bytes i) 255)) false :else (recur (+ i 1))))) (throw :cbor/byte)
+  (let [one (read-at bytes 0 0)]
+   (if (not= (record-get [:ref :cbor/read] one :next) (vector-count bytes)) (throw :cbor/trailing)
+    (record-get [:ref :cbor/read] one :value)))))
+(defn encode-checked [value [:ref :cbor/value]] [:result :vector-i64 :keyword]
+ (try (result-ok-of [:result :vector-i64 :keyword] (encode value))
+  (catch :keyword error (result-err-of [:result :vector-i64 :keyword] error))))
+(defn decode-checked [bytes :vector-i64] [:result [:ref :cbor/value] :keyword]
+ (try (result-ok-of [:result [:ref :cbor/value] :keyword] (decode bytes))
+  (catch :keyword error (result-err-of [:result [:ref :cbor/value] :keyword] error))))

@@ -1,0 +1,120 @@
+(ns cbor.core-typed-test
+  "The typed encoder (adr-2609242330 S1c) against the dynamic host `encode`.
+
+  Every typed function must write the bytes `encode` writes for the
+  equivalent Clojure value: CIDs are computed over these bytes, so a typed
+  caller and a dynamic caller of the same shape must name the same block.
+  Values come from a fixed Park-Miller sequence, so a failure reproduces.
+  (scripts/verify-pure-leaves.cljk runs the same shapes through the Kotoba
+  reading of these functions as well.)"
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
+               :cljs [cljs.test :refer [deftest is] :include-macros true])
+            [cbor.core :as cbor]))
+
+(def ^:private seed (atom 20260925))
+(defn- rnd [n] (swap! seed #(mod (* % 48271) 2147483647)) (mod @seed n))
+
+(defn- ints [b] (mapv #(bit-and % 0xff) (seq b)))
+(defn- enc [x] (ints (cbor/encode x)))
+(defn- typed [fragment] (ints (cbor/fragment-bytes fragment)))
+
+(defn- bytes-of [v]
+  #?(:clj (byte-array (map unchecked-byte v))
+     :cljs (js/Uint8Array. (clj->js v))))
+
+(defn- rand-str []
+  (apply str (repeatedly (rnd 10)
+                         #(let [c (case (rnd 3) 0 (rnd 0x80) 1 (+ 0x80 (rnd 0xF780)) 2 (+ 0x10000 (rnd 0x100000)))
+                                c (if (<= 0xD800 c 0xDFFF) 0x41 c)]
+                            #?(:clj (String. (Character/toChars c))
+                               :cljs (js/String.fromCodePoint c))))))
+
+(defn- rand-uint []
+  (case (rnd 5) 0 (rnd 24) 1 (rnd 256) 2 (rnd 65536) 3 (* (rnd 65536) (rnd 65536))
+    4 (+ (* (rnd 2097152) 4294967296) (rnd 2147483647))))
+
+(def ^:private boundaries [0 23 24 255 256 65535 65536 4294967295 4294967296 9007199254740991])
+
+(deftest scalars-match-dynamic-encode
+  (let [uints (concat boundaries (repeatedly 500 rand-uint))
+        bad (remove (fn [n] (and (= (typed (cbor/encode-uint n)) (enc n))
+                                 (= (typed (cbor/encode-int n)) (enc n))
+                                 (= (typed (cbor/encode-nint (- -1 n))) (enc (- -1 n)))
+                                 (= (typed (cbor/encode-int (- -1 n))) (enc (- -1 n)))))
+                    uints)]
+    (is (empty? bad) (str "ints differing: " (vec (take 3 bad)))))
+  (let [strs (concat ["" "a" "été" (apply str (repeat 300 "e"))] (repeatedly 500 rand-str))
+        bad (remove #(= (typed (cbor/encode-text %)) (enc %)) strs)]
+    (is (empty? bad) (str "text differing: " (vec (take 3 bad)))))
+  (let [bstrs (concat [[] [0] (vec (range 24)) (vec (map #(mod % 256) (range 300)))]
+                      (repeatedly 200 #(vec (repeatedly (rnd 100) (fn [] (rnd 256))))))
+        bad (remove #(and (= (typed (cbor/encode-bytes %)) (enc (bytes-of %)))
+                          ;; the host byte container is accepted too
+                          (= (typed (cbor/encode-bytes (bytes-of %))) (enc (bytes-of %))))
+                    bstrs)]
+    (is (empty? bad) (str "bytes differing: " (vec (take 3 bad)))))
+  (is (= (typed (cbor/encode-null)) (enc nil)))
+  (is (= (typed (cbor/encode-bool true)) (enc true)))
+  (is (= (typed (cbor/encode-bool false)) (enc false)))
+  (doseq [x [0.5 -2.5 1.1 1e300 -1e-300 5e-324 3.141592653589793]]
+    (is (= (typed (cbor/encode-f64 x)) (enc x)) (str "f64 " x))))
+
+(deftest f64-is-always-a-float
+  ;; the typed encoder never guesses: 1.0 is a float64 on every host (the
+  ;; dynamic encode writes an integral JS number as an int on :cljs)
+  (is (= [0xfb 0x3f 0xf0 0 0 0 0 0 0] (typed (cbor/encode-f64 1.0)))))
+
+(deftest non-finite-f64-is-refused
+  (is (= "cbor: non-finite float unsupported"
+         (try (cbor/encode-f64 #?(:clj Double/NaN :cljs js/NaN)) nil
+              (catch #?(:clj Exception :cljs :default) e (ex-message e))))))
+
+(defn- record-fragment [m]
+  (cbor/encode-map
+   (reduce (fn [es [k v]]
+             (cbor/map-entry es k (if (string? v) (cbor/encode-text v) (cbor/encode-uint v))))
+           (cbor/map-entries) (seq m))))
+
+(deftest records-sort-canonically
+  (is (= (typed (record-fragment {"b" 1 "a" 2 "aa" 3 "" 4})) (enc {"b" 1 "a" 2 "aa" 3 "" 4})))
+  (let [records (repeatedly 300 (fn [] (into {} (repeatedly (rnd 12) (fn [] [(rand-str) (if (zero? (rnd 2)) (rand-uint) (rand-str))])))))
+        bad (remove #(= (typed (record-fragment %)) (enc %)) records)]
+    (is (empty? bad) (str "records differing: " (count bad)))))
+
+(deftest ordered-maps-keep-insertion-order
+  (let [rows (repeatedly 200 (fn [] (vec (repeatedly (rnd 8) (fn [] [(rand-str) (rand-uint)])))))
+        typed-ordered (fn [ps] (cbor/encode-map-ordered
+                                (reduce (fn [es [k v]] (cbor/map-entry es k (cbor/encode-uint v))) (cbor/map-entries) ps)))
+        bad (remove #(= (typed (typed-ordered %)) (ints (cbor/encode-ordered %))) rows)]
+    (is (empty? bad) (str "ordered differing: " (count bad))))
+  (is (= [0xa2 0x61 0x62 0x01 0x61 0x61 0x02]
+         (typed (cbor/encode-map-ordered (-> (cbor/map-entries)
+                                             (cbor/map-entry "b" (cbor/encode-uint 1))
+                                             (cbor/map-entry "a" (cbor/encode-uint 2))))))))
+
+(deftest heterogeneous-arrays-and-tags
+  (let [rows (repeatedly 300 (fn [] [(rand-uint) (rand-str) (vec (repeatedly (rnd 40) #(rnd 256)))]))
+        typed-row (fn [[u s b]]
+                    (cbor/encode-array
+                     (-> (cbor/array-items)
+                         (cbor/array-item (cbor/encode-uint u))
+                         (cbor/array-item (cbor/encode-text s))
+                         (cbor/array-item (cbor/encode-bytes b))
+                         (cbor/array-item (cbor/encode-tag 42 (cbor/encode-bytes b)))
+                         (cbor/array-item (cbor/encode-array (cbor/array-item (cbor/array-items) (cbor/encode-null)))))))
+        dyn-row (fn [[u s b]] (enc [u s (bytes-of b) (cbor/tagged 42 (bytes-of b)) [nil]]))
+        bad (remove #(= (typed (typed-row %)) (dyn-row %)) rows)]
+    (is (empty? bad) (str "rows differing: " (count bad))))
+  (is (= [0x80] (typed (cbor/encode-array (cbor/array-items)))))
+  (is (= [0xa0] (typed (cbor/encode-map (cbor/map-entries))))))
+
+(deftest fragments-decode-to-the-shape-they-were-typed-as
+  (is (= {"a" [1 "x" nil true]}
+         (cbor/decode (cbor/fragment-bytes
+                       (cbor/encode-map
+                        (cbor/map-entry (cbor/map-entries) "a"
+                                        (cbor/encode-array (-> (cbor/array-items)
+                                                               (cbor/array-item (cbor/encode-uint 1))
+                                                               (cbor/array-item (cbor/encode-text "x"))
+                                                               (cbor/array-item (cbor/encode-null))
+                                                               (cbor/array-item (cbor/encode-bool true)))))))))))

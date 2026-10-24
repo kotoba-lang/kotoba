@@ -36,6 +36,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.ed25519` | `org.ietf.ed25519/src` | `ed25519.core`, `ed25519.sign`, `ed25519.edwards`, `ed25519.scalar` (RFC 8032 Ed25519 keys, signing and verification; an external specification, publisher ietf.org) |
 | `org.ietf.chacha20Poly1305` | `org.ietf.chacha20Poly1305/src` | `chacha20.core`, `chacha20.poly1305`, `chacha20.aead`, `chacha20.xchacha` (RFC 8439 ChaCha20-Poly1305 and XChaCha20; an external specification, publisher ietf.org) |
 | `org.ietf.jcs` | `org.ietf.jcs/src` | `jcs.core` (RFC 8785 JSON Canonicalization Scheme; an external specification, publisher ietf.org) |
+| `org.ietf.cbor` | `org.ietf.cbor/src` | `cbor.core` (RFC 8949 CBOR encode and decode, with a typed encoder; an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package

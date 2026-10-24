@@ -1,0 +1,350 @@
+;; Canonical native definite-length CBOR fragments, adopted from the reviewed
+;; typed source projection. Generic values/decoding live in cbor.codec.
+(ns cbor.fragment (:export [encode-null encode-bool encode-uint encode-nint encode-int
+ encode-f64 encode-text encode-bytes encode-tag array-items array-item encode-array
+ map-entries map-entry encode-map encode-map-ordered fragment-bytes
+ encode-u64-bits encode-negative-bits encode-tag-bits generic-map-entry]))
+
+(defn- push
+  "OUT with X appended."
+  [out :vector-i64 x] :vector-i64
+  (vector-conj out x))
+
+(defn- append-all
+  "OUT with every byte of V appended."
+  [out :vector-i64 v :vector-i64] :vector-i64
+  (into out v))
+
+(defn- out->bytes
+  "The encoded native byte vector."
+  [v :vector-i64] :vector-i64
+  v)
+
+(defn- in-count [data :vector-i64] :i64
+  (count data))
+
+(defn- in-byte
+  "The unsigned byte at POS."
+  [data :vector-i64 pos] :i64
+  (bit-and (nth data pos) 0xff))
+
+(defn- in-slice
+  "Bytes [FROM, TO) of DATA as a fresh container of DATA's own kind."
+  [data :vector-i64 from to] :vector-i64
+  (vector-take (vector-drop data from) (- to from)))
+
+(defn- utf8-code-point
+  "OUT with the UTF-8 encoding of code point CP appended (CP is a scalar
+  value: never a surrogate half)."
+  [out :vector-i64 cp] :vector-i64
+  (cond
+    (< cp 0x80) (push out cp)
+    (< cp 0x800) (push (push out (+ 0xC0 (quot cp 64))) (+ 0x80 (bit-and cp 0x3F)))
+    (< cp 0x10000) (push (push (push out (+ 0xE0 (quot cp 4096)))
+                               (+ 0x80 (bit-and (quot cp 64) 0x3F)))
+                         (+ 0x80 (bit-and cp 0x3F)))
+    :else (push (push (push (push out (+ 0xF0 (quot cp 262144)))
+                            (+ 0x80 (bit-and (quot cp 4096) 0x3F)))
+                      (+ 0x80 (bit-and (quot cp 64) 0x3F)))
+                (+ 0x80 (bit-and cp 0x3F)))))
+
+(defn- utf8-width
+  "Bytes of the UTF-8 sequence that starts with a code point CP."
+  [cp]
+  (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4))
+
+(defn- str->bytes
+  "Canonical UTF-8 bytes. Native strings cannot contain lone surrogates."
+  [s :string] :vector-i64
+  (let [n (string-byte-length s)]
+                (loop [i 0 out []]
+                  (if (< i n)
+                    (let [cp (string-code-point-at s i)]
+                      (recur (+ i (utf8-width cp)) (utf8-code-point out cp)))
+                    out))))
+
+(defn- bytes->str [b :vector-i64] :string
+  (string-from-utf8 (bytes-from-vector-i64 b)))
+
+(defn- finite-number?
+  "Whether the typed f64 has a finite exponent."
+  [x :f64] :bool
+  (not= 2047 (bit-and (u64-shift-right (f64-to-bits x) 52) 2047)))
+
+(defn- float64-bytes
+  "The 8 big-endian bytes of the binary64 X, as a vector of ints."
+  [x :f64] :vector-i64
+  (let [bits (f64-to-bits x)]
+                (loop [s 56 out []]
+                  (if (< s 0)
+                    out
+                    (recur (- s 8) (push out (bit-and (u64-shift-right bits s) 255)))))))
+
+(defn- bytes->float64
+  "The binary64 whose big-endian bytes are the 8-byte container B."
+  [b :vector-i64] :f64
+  (f64-from-bits
+               (loop [i 0 acc 0]
+                 (if (< i 8)
+                   (recur (inc i) (bit-or (i64-shift-left acc 8) (in-byte b i)))
+                   acc))))
+
+;; Extract an exact byte from a native 64-bit argument.
+(defn- byte-at [n s]
+  (bit-and (u64-shift-right n s) 255))
+
+;; ── the typed writers ────────────────────────────────────────────────────────
+;; Public fragment functions start with an empty byte vector; the generic
+;; codec invokes the same typed writers.
+
+(defn- write-head [out :vector-i64 major n] :vector-i64
+  (let [mt (* major 32)]
+    (cond
+      ;; Public callers validate unsigned arguments before this helper.
+      (< n 24)          (push out (bit-and (bit-or mt n) 0xff))
+      (< n 0x100)       (push (push out (+ mt 24)) (bit-and n 0xff))
+      (< n 0x10000)     (push (push (push out (+ mt 25)) (byte-at n 8)) (byte-at n 0))
+      (< n 0x100000000) (push (push (push (push (push out (+ mt 26)) (byte-at n 24)) (byte-at n 16))
+                                    (byte-at n 8))
+                              (byte-at n 0))
+      :else             (push (push (push (push (push (push (push (push (push out (+ mt 27))
+                                                                            (byte-at n 56))
+                                                                      (byte-at n 48))
+                                                                (byte-at n 40))
+                                                          (byte-at n 32))
+                                                    (byte-at n 24))
+                                              (byte-at n 16))
+                                        (byte-at n 8))
+                              (byte-at n 0)))))
+
+(defn- write-null [out :vector-i64] :vector-i64
+  (push out 0xf6))
+
+(defn- write-bool [out :vector-i64 b :bool] :vector-i64
+  (push out (if b 0xf5 0xf4)))
+
+(defn- write-int
+  "Major type 0 for N >= 0, major type 1 (-1 - N) below zero."
+  [out :vector-i64 n] :vector-i64
+  (if (neg? n) (write-head out 1 (- -1 n)) (write-head out 0 n)))
+
+(defn- write-f64
+  "Finite binary64 (major type 7, info 27), or typed :cbor/non-finite abort."
+  [out :vector-i64 x :f64] :vector-i64
+  (if (finite-number? x) (append-all (push out 0xfb) (float64-bytes x))
+    (throw :cbor/non-finite)))
+
+(defn- write-text [out :vector-i64 s :string] :vector-i64
+  (let [b (str->bytes s)]
+                (append-all (write-head out 3 (count b)) b)))
+
+(defn- byte-items
+  "The native byte vector."
+  [b :vector-i64] :vector-i64
+  b)
+
+(defn- write-byte-string
+  "Major type 2 over a vector of ints B."
+  [out :vector-i64 b :vector-i64] :vector-i64
+  (append-all (write-head out 2 (count b)) b))
+
+;; ── accumulators: array items and map entries ───────────────────────────────
+
+(defn- vec-slice
+  "Items [FROM, TO) of the vector V."
+  [v :vector-i64 from to] :vector-i64
+  (vector-take (vector-drop v from) (- to from)))
+
+(defn- vec-set [v :vector-i64 i x] :vector-i64
+  (vector-assoc v i x))
+
+(defn- add-entry
+  "ENTRIES with one entry appended: SORT-KEY (the bytes the canonical order
+  compares) and FRAGMENT (the encoded key followed by the encoded value).
+  FRAGMENT contains native byte values."
+  [entries :vector-i64 sort-key :vector-i64 fragment :vector-i64] :vector-i64
+  (append-all (push (append-all (push entries (count sort-key)) sort-key) (count fragment)) fragment))
+
+(defn- entry-fragment-start
+  "Index of the first fragment item of the entry at offset O."
+  [entries :vector-i64 o] :i64
+  (+ o 2 (nth entries o)))
+
+(defn- entry-end [entries :vector-i64 o] :i64
+  (let [f (entry-fragment-start entries o)]
+    (+ f (nth entries (- f 1)))))
+
+(defn- entry-offsets
+  "The offset of every entry, in the order they were added."
+  [entries :vector-i64] :vector-i64
+  (let [n (count entries)]
+    (loop [o 0 out []]
+      (if (< o n) (recur (entry-end entries o) (push out o)) out))))
+
+(defn- key-less?
+  "dag-cbor key order over the sort keys of the entries at offsets A and B:
+  shorter first, then bytewise."
+  [entries :vector-i64 a b] :bool
+  (let [la (nth entries a) lb (nth entries b)]
+    (if (not= la lb)
+      (< la lb)
+      (loop [i 1]
+        (cond (> i la) false
+              (not= (nth entries (+ a i)) (nth entries (+ b i)))
+              (< (nth entries (+ a i)) (nth entries (+ b i)))
+              :else (recur (+ i 1)))))))
+
+(defn- merge-runs
+  "OUT with the runs SRC[lo,mid) and SRC[mid,hi) (each already in key order)
+  merged onto its end. Ties take the left run first: the sort is stable, as
+  the host `sort-by` it replaces was."
+  [entries :vector-i64 src :vector-i64 lo mid hi out :vector-i64] :vector-i64
+  (loop [i lo j mid out out]
+    (cond
+      (and (< i mid) (< j hi))
+      (if (key-less? entries (nth src j) (nth src i))
+        (recur i (+ j 1) (push out (nth src j)))
+        (recur (+ i 1) j (push out (nth src i))))
+      (< i mid) (recur (+ i 1) j (push out (nth src i)))
+      (< j hi) (recur i (+ j 1) (push out (nth src j)))
+      :else out)))
+
+(defn- merge-pass
+  "One bottom-up merge sort pass over SRC with runs of WIDTH."
+  [entries :vector-i64 src :vector-i64 width] :vector-i64
+  (let [n (count src)]
+    (loop [lo 0 out []]
+      (if (< lo n)
+        (let [mid (min n (+ lo width))
+              hi (min n (+ lo width width))]
+          (recur hi (merge-runs entries src lo mid hi out)))
+        out))))
+
+(defn- sorted-offsets
+  "The entry offsets in dag-cbor key order (stable)."
+  [entries :vector-i64] :vector-i64
+  (let [offsets (entry-offsets entries)
+        n (count offsets)]
+    ;; Stable native merge sort over the strict byte-key order.
+    (loop [width 1 src offsets]
+                  (if (< width n) (recur (* 2 width) (merge-pass entries src width)) src))))
+
+(defn- write-entries
+  "OUT with a map head for the entries at OFFSETS and their fragments, in
+  that order."
+  [out :vector-i64 entries :vector-i64 offsets :vector-i64] :vector-i64
+  (let [n (count offsets)]
+    (loop [k 0 out (write-head out 5 n)]
+      (if (< k n)
+        (let [o (nth offsets k)]
+          (recur (+ k 1) (append-all out (vec-slice entries (entry-fragment-start entries o) (entry-end entries o)))))
+        out))))
+
+;; ── the typed encoder (public) ───────────────────────────────────────────────
+
+(defn encode-null
+  "CBOR null (major type 7, simple 22)."
+  [] :vector-i64
+  (write-null []))
+
+(defn encode-bool
+  "CBOR true / false."
+  [b :bool] :vector-i64
+  (write-bool [] b))
+
+(defn encode-uint
+  "An unsigned integer N >= 0 (major type 0)."
+  [n] :vector-i64
+  (if (< n 0) (throw :cbor/negative-uint) (write-head [] 0 n)))
+
+(defn encode-nint
+  "A negative integer N < 0 (major type 1, argument -1 - N)."
+  [n] :vector-i64
+  (if (>= n 0) (throw :cbor/nonnegative-nint) (write-head [] 1 (- -1 n))))
+
+(defn encode-int
+  "An integer of either sign: `encode-uint` for N >= 0, else `encode-nint`."
+  [n] :vector-i64
+  (write-int [] n))
+
+(defn encode-f64
+  "A finite binary64 X (always 8 bytes: DAG-CBOR's one float width). Every X
+  is written as a float, including integral values and negative zero."
+  [x :f64] :vector-i64
+  (write-f64 [] x))
+
+(defn encode-text
+  "A UTF-8 text string (major type 3)."
+  [s :string] :vector-i64
+  (let [b (str->bytes s)]
+    (append-all (write-head [] 3 (count b)) b)))
+
+(defn encode-bytes
+  "A byte string (major type 2) from exact byte values 0..255."
+  [b :vector-i64] :vector-i64
+  (if (loop [i 0]
+        (cond (= i (vector-count b)) true
+          (or (< (vector-at b i) 0) (> (vector-at b i) 255)) false :else (recur (+ i 1))))
+    (write-byte-string [] (byte-items b)) (throw :cbor/byte)))
+
+(defn encode-tag
+  "Tag N (major type 6) around the already-encoded item FRAGMENT."
+  [n fragment :vector-i64] :vector-i64
+  (if (< n 0) (throw :cbor/negative-tag) (append-all (write-head [] 6 n) fragment)))
+
+(defn- head-bits [major :i64 bits :i64] :vector-i64
+  (if (>= bits 0) (write-head [] major bits)
+    (loop [shift 56 out [(+ (* major 32) 27)]]
+      (if (< shift 0) out (recur (- shift 8) (vector-conj out (bit-and (u64-shift-right bits shift) 255)))))))
+(defn encode-u64-bits [bits :i64] :vector-i64 (head-bits 0 bits))
+(defn encode-negative-bits [bits :i64] :vector-i64 (head-bits 1 bits))
+(defn encode-tag-bits [bits :i64 fragment :vector-i64] :vector-i64
+  (append-all (head-bits 6 bits) fragment))
+
+(defn array-items
+  "An empty array accumulator."
+  [] :vector-i64
+  [0])
+
+(defn array-item
+  "ITEMS with the encoded item FRAGMENT appended."
+  [items :vector-i64 fragment :vector-i64] :vector-i64
+  (append-all (vec-set items 0 (+ 1 (nth items 0))) fragment))
+
+(defn encode-array
+  "An array (major type 4) of the items in ITEMS, in the order added."
+  [items :vector-i64] :vector-i64
+  (append-all (write-head [] 4 (nth items 0)) (vec-slice items 1 (count items))))
+
+(defn map-entries
+  "An empty map accumulator."
+  [] :vector-i64
+  [])
+
+(defn map-entry
+  "ENTRIES with the entry KEY (a string: DAG-CBOR's only key type) -> the
+  encoded value FRAGMENT appended."
+  [entries :vector-i64 key :string fragment :vector-i64]
+  :vector-i64
+  (add-entry entries (str->bytes key) (append-all (encode-text key) fragment)))
+
+(defn generic-map-entry [entries :vector-i64 key :vector-i64 value :vector-i64] :vector-i64
+  (add-entry entries key (append-all key value)))
+
+(defn encode-map
+  "A map (major type 5) of ENTRIES in canonical DAG-CBOR key order: shorter
+  UTF-8 key first, then bytewise; entries with equal keys keep the order
+  they were added in."
+  [entries :vector-i64] :vector-i64
+  (write-entries [] entries (sorted-offsets entries)))
+
+(defn encode-map-ordered
+  "A map (major type 5) of ENTRIES in the order they were added (CAIP-122
+  CACAO and other order-sensitive formats)."
+  [entries :vector-i64] :vector-i64
+  (write-entries [] entries (entry-offsets entries)))
+
+(defn fragment-bytes
+  "FRAGMENT as a native byte vector."
+  [fragment :vector-i64] :vector-i64
+  (out->bytes fragment))
