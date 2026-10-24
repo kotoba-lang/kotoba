@@ -1,0 +1,222 @@
+(ns snappy.core
+  "Snappy, raw format — compression and decompression in portable `.cljc`.
+
+  Raw and not framed: Parquet compresses each page body on its own and records
+  both sizes in the page header, so the stream framing that carries checksums
+  and chunk boundaries has no job there. Avro's snappy is the framed variant
+  with a trailing CRC-32C and is a different question this namespace does not
+  answer.
+
+  ## The compressor actually compresses
+
+  A snappy stream made only of literals is valid and decodes correctly, and it
+  is the shape a first attempt takes. It is also worthless: the output is
+  larger than the input by the size of the tags. `org-ietf-zstd` says the same
+  thing about itself in its own docstring -- a conformant frame of raw blocks
+  is not a compressor -- and the point of this namespace is to not be that.
+
+  So there is a match finder: a hash table over 4-byte sequences, the same
+  shape the reference implementation uses. It is not tuned, and it does not
+  need to be to earn its keep -- the columnar data this compresses is highly
+  repetitive, and finding any matches at all is most of the win.
+
+  ## Copies may reference bytes they are producing
+
+  A copy element can name an offset smaller than its length, which is how
+  snappy writes a repeating run. The decoder must therefore copy a byte at a
+  time from the output as it grows; slicing the source range up front is the
+  natural-looking implementation and it silently truncates every run longer
+  than its own period."
+  (:refer-clojure :exclude [bytes]))
+
+;; ---------------------------------------------------------------------------
+;; Shared.
+;; ---------------------------------------------------------------------------
+
+(defn- u8 [bs i] (bit-and (nth bs i) 0xff))
+
+(def ^:private max-copy-len 64)
+
+;; ---------------------------------------------------------------------------
+;; Decompression.
+;; ---------------------------------------------------------------------------
+
+(defn- read-varint [bs i]
+  (loop [i i shift 0 acc 0]
+    (let [b (u8 bs i)
+          acc (+ acc (* (bit-and b 0x7f) (Math/pow 2 shift)))]
+      (if (zero? (bit-and b 0x80))
+        [(long acc) (inc i)]
+        (recur (inc i) (+ shift 7) acc)))))
+
+(defn- le [bs i n]
+  (loop [k 0 acc 0]
+    (if (= k n) acc (recur (inc k) (bit-or acc (bit-shift-left (u8 bs (+ i k)) (* 8 k)))))))
+
+(defn- copy-back [out off len]
+  (let [n (count out)]
+    (when (or (<= off 0) (> off n))
+      (throw (ex-info "snappy copy offset is outside the output"
+                      {:type :snappy/bad-offset :offset off :produced n})))
+    (loop [k 0 o out]
+      (if (= k len) o (recur (inc k) (conj o (nth o (- (count o) off))))))))
+
+(defn- literal-out [out bs at len]
+  (loop [k 0 o out]
+    (if (= k len) o (recur (inc k) (conj o (u8 bs (+ at k)))))))
+
+(defn decompress
+  "Raw snappy in `bs[start,end)` -> a vector of unsigned ints.
+
+  `expected` is the uncompressed size the caller was promised elsewhere (a
+  Parquet page header, say). Checked rather than ignored: a disagreement means
+  the stream and the metadata describe different things, and continuing hands
+  the caller a buffer whose contents merely look like data."
+  ([bs] (decompress bs 0 (count bs) nil))
+  ([bs start end expected]
+   (let [[declared i0] (read-varint bs start)]
+     (when (and expected (not= (long expected) declared))
+       (throw (ex-info "snappy preamble disagrees with the declared length"
+                       {:type :snappy/length-mismatch :expected expected :stream declared})))
+     (loop [i i0 out []]
+       (if (>= i end)
+         (do (when (not= declared (count out))
+               (throw (ex-info "snappy output is not the declared length"
+                               {:type :snappy/truncated
+                                :declared declared :actual (count out)})))
+             out)
+         (let [tag (u8 bs i)]
+           (case (bit-and tag 3)
+             0 (let [n (bit-shift-right tag 2)]
+                 (if (< n 60)
+                   (let [len (inc n) s (inc i)]
+                     (recur (+ s len) (literal-out out bs s len)))
+                   (let [extra (- n 59)
+                         len (inc (le bs (inc i) extra))
+                         s (+ i 1 extra)]
+                     (recur (+ s len) (literal-out out bs s len)))))
+             1 (let [len (+ 4 (bit-and (bit-shift-right tag 2) 7))
+                     off (bit-or (bit-shift-left (bit-and (bit-shift-right tag 5) 7) 8)
+                                 (u8 bs (inc i)))]
+                 (recur (+ i 2) (copy-back out off len)))
+             2 (let [len (inc (bit-shift-right tag 2))
+                     off (le bs (inc i) 2)]
+                 (recur (+ i 3) (copy-back out off len)))
+             3 (let [len (inc (bit-shift-right tag 2))
+                     off (le bs (inc i) 4)]
+                 (recur (+ i 5) (copy-back out off len))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Compression.
+;; ---------------------------------------------------------------------------
+
+(defn- varint-of [n]
+  (loop [n n out []]
+    (if (< n 0x80)
+      (conj out n)
+      (recur (quot n 128) (conj out (bit-or 0x80 (bit-and n 0x7f)))))))
+
+(defn- emit-literal
+  "Tag plus the bytes themselves. Lengths up to 60 ride in the tag; longer
+  ones spill into 1-4 following little-endian bytes."
+  [out bs at len]
+  (let [n (dec len)
+        out (if (< n 60)
+              (conj! out (bit-shift-left n 2))
+              (let [width (cond (< n 0x100) 1 (< n 0x10000) 2 (< n 0x1000000) 3 :else 4)]
+                (loop [o (conj! out (bit-shift-left (+ 59 width) 2)) k 0]
+                  (if (= k width)
+                    o
+                    (recur (conj! o (bit-and (bit-shift-right n (* 8 k)) 0xff)) (inc k))))))]
+    (loop [o out k 0]
+      (if (= k len) o (recur (conj! o (u8 bs (+ at k))) (inc k))))))
+
+(defn- emit-copy-1
+  "One copy element. `len` is at most 64 and `off` at most 2^32-1."
+  [out off len]
+  (cond
+    ;; 3-bit length (4..11) and 11-bit offset share one tag byte plus one more.
+    (and (<= 4 len 11) (< off 2048))
+    (-> out
+        (conj! (bit-or 1
+                       (bit-shift-left (- len 4) 2)
+                       (bit-shift-left (bit-shift-right off 8) 5)))
+        (conj! (bit-and off 0xff)))
+    (< off 65536)
+    (-> out
+        (conj! (bit-or 2 (bit-shift-left (dec len) 2)))
+        (conj! (bit-and off 0xff))
+        (conj! (bit-and (bit-shift-right off 8) 0xff)))
+    :else
+    (-> out
+        (conj! (bit-or 3 (bit-shift-left (dec len) 2)))
+        (conj! (bit-and off 0xff))
+        (conj! (bit-and (bit-shift-right off 8) 0xff))
+        (conj! (bit-and (bit-shift-right off 16) 0xff))
+        (conj! (bit-and (bit-shift-right off 24) 0xff)))))
+
+(defn- emit-copy
+  "A match of any length, split into elements of at most 64 bytes."
+  [out off len]
+  (loop [o out remaining len]
+    (if (zero? remaining)
+      o
+      (let [take-n (min max-copy-len remaining)]
+        (recur (emit-copy-1 o off take-n) (- remaining take-n))))))
+
+(def ^:private hash-bits 14)
+(def ^:private hash-size (bit-shift-left 1 hash-bits))
+
+(defn- hash4
+  "A 4-byte sequence to a table slot.
+
+  The products stay under 2^53, so this is exact on a JavaScript double as
+  well as a JVM long -- which is why it is written with these constants
+  rather than the reference implementation's 32-bit multiply, whose overflow
+  is defined in C and lossy in JS."
+  [bs i]
+  (let [v (+ (u8 bs i)
+             (* 251 (u8 bs (+ i 1)))
+             (* 65521 (u8 bs (+ i 2)))
+             (* 16777213 (u8 bs (+ i 3))))]
+    (bit-and (bit-xor v (bit-shift-right v 13)) (dec hash-size))))
+
+(defn- match-length
+  "How far `a` and `b` agree, stopping at `limit`."
+  [bs a b limit]
+  (loop [n 0]
+    (if (or (>= (+ b n) limit) (not= (u8 bs (+ a n)) (u8 bs (+ b n))))
+      n
+      (recur (inc n)))))
+
+(defn compress
+  "`bs` -> raw snappy, as a vector of unsigned ints.
+
+  The output begins with the uncompressed length as a varint, which is what
+  `decompress` checks against the length its caller was promised."
+  [bs]
+  (let [n (count bs)]
+    (if (zero? n)
+      (varint-of 0)
+      (let [table (int-array hash-size -1)]
+        (loop [i 0
+               pending 0                    ; start of literals not yet emitted
+               out (transient (vec (varint-of n)))]
+          (if (> (+ i 4) n)
+            ;; Fewer than 4 bytes left: nothing can be hashed, so the rest is
+            ;; literal by construction.
+            (persistent! (if (< pending n) (emit-literal out bs pending (- n pending)) out))
+            (let [h (hash4 bs i)
+                  cand (aget table h)]
+              (aset table h i)
+              (if (and (>= cand 0)
+                       (< (- i cand) 65536)
+                       (= (u8 bs cand) (u8 bs i))
+                       (= (u8 bs (+ cand 1)) (u8 bs (+ i 1)))
+                       (= (u8 bs (+ cand 2)) (u8 bs (+ i 2)))
+                       (= (u8 bs (+ cand 3)) (u8 bs (+ i 3))))
+                (let [len (match-length bs cand i n)
+                      out (if (< pending i) (emit-literal out bs pending (- i pending)) out)
+                      out (emit-copy out (- i cand) len)]
+                  (recur (+ i len) (+ i len) out))
+                (recur (inc i) pending out)))))))))
