@@ -1,0 +1,101 @@
+(ns identity.authority
+  "Proof admission for account links against a pinned Principal head.
+
+  Host ports verify signatures and finality; this core binds both proofs to
+  one operation and consumes its nonce in the same state transition as the
+  link. Persist the result through CAS/consensus, never read-then-put.
+  A description carrying :verified or an evidence URI is not a proof."
+  (:require [identity.principal :as principal]))
+
+(def schema "kotoba.identity.account-link.v1")
+(def purposes #{:login :payout :payment})
+(def fields [:schema :operation-id :principal-id :genesis-cid :previous-head-cid
+             :previous-version :account-id :purposes :audience :nonce :expires-at])
+
+(defn- text? [x]
+  (and (string? x) (<= 1 (count x) 2048)))
+
+(defn- safe-int? [x]
+  (and (integer? x) (<= 0 x 9007199254740991)))
+
+(defn- frame [tag value]
+  ;; Length counts Unicode scalar-independent UTF-16 code units on both
+  ;; supported hosts. Crypto ports UTF-8 encode the complete framed string.
+  (str tag (count value) ":" value))
+
+(defn- value-bytes [x]
+  (cond
+    (string? x) (frame "s" x)
+    (safe-int? x) (frame "i" (str x))
+    (keyword? x) (frame "k" (str x))
+    (vector? x) (frame "v" (apply str (map value-bytes x)))
+    :else (throw (ex-info "unsupported authority field" {}))))
+
+(defn operation-payload
+  "Canonical signed text. Unknown fields, coercions and missing fields refuse."
+  [op]
+  (when-not (and (= (set fields) (set (keys op)))
+                 (= schema (:schema op))
+                 (every? text? (map op [:operation-id :principal-id :genesis-cid
+                                       :previous-head-cid :account-id :audience :nonce]))
+                 (principal/principal-id? (:principal-id op))
+                 (principal/account-id? (:account-id op))
+                 (safe-int? (:previous-version op))
+                 (safe-int? (:expires-at op))
+                 (vector? (:purposes op))
+                 (seq (:purposes op))
+                 (= (:purposes op) (vec (sort (set (:purposes op)))))
+                 (every? purposes (:purposes op)))
+    (throw (ex-info "malformed account link" {})))
+  (str schema "\n" (apply str (map #(value-bytes (get op %)) fields))))
+
+(defn admit-link
+  "Returns {:ok? true :next-state ...} or a closed refusal.
+
+  verify-controller! receives the prior admitted controller, signed payload
+  and proof. verify-account! receives chain-qualified account, same payload
+  and proof. verify-head! must establish BOTH finality and freshness of this
+  exact head at `now`; a QC over an unrelated/stale block is insufficient.
+  Ports must return boolean true, not user-provided evidence maps.
+  This operation cannot add controllers or recovery authority."
+  [state op {:keys [controller-id controller-proof account-proof]}
+   {:keys [now audience max-ttl-ms verify-controller! verify-account! verify-head!]}]
+  (try
+    (let [payload (operation-payload op)
+          controller (get-in state [:controllers controller-id])
+          refuse (fn [reason] {:ok? false :reason reason})]
+      (cond
+        (not (and (safe-int? now) (pos-int? max-ttl-ms)
+                  (ifn? verify-controller!) (ifn? verify-account!) (ifn? verify-head!)))
+        (refuse :verifier-unavailable)
+        (not= audience (:audience op)) (refuse :wrong-audience)
+        (or (<= (:expires-at op) now) (> (- (:expires-at op) now) max-ttl-ms))
+        (refuse :expired-or-excessive-ttl)
+        (not= [(:principal-id state) (:genesis-cid state) (:head-cid state) (:version state)]
+              [(:principal-id op) (:genesis-cid op) (:previous-head-cid op) (:previous-version op)])
+        (refuse :head-mismatch)
+        (contains? (:used-nonces state) (:nonce op)) (refuse :replay)
+        (contains? (:accounts state) (:account-id op)) (refuse :already-linked)
+        (not (and controller (= :active (:status controller))
+                  (contains? (:permissions controller) :link-account)))
+        (refuse :controller-not-authorized)
+        (not (true? (verify-head! state now))) (refuse :head-not-current-and-final)
+        (not (true? (verify-controller! controller payload controller-proof)))
+        (refuse :invalid-controller-proof)
+        (not (true? (verify-account! (:account-id op) payload account-proof)))
+        (refuse :invalid-account-proof)
+        :else
+        {:ok? true
+         ;; This is proposed state; caller MUST certify/persist before exposing
+         ;; it as active. No head CID or finality proof is fabricated here.
+         :previous-head-cid (:head-cid state)
+         :next-state (-> state
+                         (update :version inc)
+                         (assoc :head-cid nil)
+                         (update :used-nonces (fnil conj #{}) (:nonce op))
+                         (assoc-in [:accounts (:account-id op)]
+                                   {:purposes (set (:purposes op))
+                                    :operation-id (:operation-id op)
+                                    :status :pending-commit}))}))
+    (catch #?(:clj Exception :cljs :default) _
+      {:ok? false :reason :malformed-or-verifier-failed})))

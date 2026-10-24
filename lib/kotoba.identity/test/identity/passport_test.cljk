@@ -1,0 +1,212 @@
+(ns identity.passport-test
+  "Kotoba Passport end to end with real Ed25519 keys (node:crypto) and real
+  SHA-256: issue stamps, claim nullifiers in ledger order, score, certify by a
+  witness quorum, and refuse each way a Sybil would try to pass.
+
+  ClojureScript only (`kbb -M:test`): the host crypto is node's."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [identity.passport :as p]
+            [identity.causal :as causal]))
+
+#?(:cljs
+   (do
+     (def nc (js/require "node:crypto"))
+
+     (def env
+       {:sha256-hex (fn [s] (-> (.createHash nc "sha256") (.update s "utf8") (.digest "hex")))
+        :ed25519-verify
+        (fn [pk msg sig]
+          (let [key (.createPublicKey nc #js {:key #js {:kty "OKP" :crv "Ed25519"
+                                                        :x (.toString (js/Buffer.from (clj->js pk)) "base64url")}
+                                              :format "jwk"})]
+            (.verify nc nil (js/Buffer.from msg "utf8") key (js/Buffer.from (clj->js sig)))))
+        :chain-verify (fn [stamp] (= "0xabc" (get-in stamp ["evidence" "account"])))})
+
+     (defn keypair []
+       (let [kp (.generateKeyPairSync nc "ed25519")
+             x (.-x (.export (.-publicKey kp) #js {:format "jwk"}))]
+         {:did (p/did-key (vec (js/Buffer.from x "base64url"))) :priv (.-privateKey kp)}))
+
+     (defn sign [{:keys [did priv]} msg]
+       {"signer" did "sig" (.toString (.sign nc nil (js/Buffer.from msg "utf8") priv) "hex")})
+
+     (defn sha [s] ((:sha256-hex env) s))
+
+     (def now 1790000000)
+     (def day 86400)
+
+     (def github-issuer (keypair))
+     (def ceremony (vec (repeatedly 4 keypair)))
+     (def witnesses (vec (repeatedly 5 keypair)))
+     (def alice (keypair))
+     (def bob (keypair))
+     (def carol (keypair))
+     (def dave (keypair))
+
+     (def policy
+       (let [pol {:version 1
+                  :threshold 20
+                  :max-age-seconds (* 90 day)
+                  :vouch-budget 1
+                  :class-caps {:vouch 8}
+                  :providers {"github" {:class :issuer :weight 5 :issuers #{(:did github-issuer)}}
+                              "ceremony" {:class :quorum :weight 15 :quorum 3
+                                          :issuers (set (map :did ceremony))}
+                              "vouch" {:class :vouch :weight 4}
+                              "eth-account-age" {:class :chain :weight 6}}
+                  :witnesses (set (map :did witnesses))
+                  :witness-quorum 3}]
+         (assoc pol :id (p/policy-id env pol))))
+
+     (defn stamp [provider class subject issuer nullifier & {:keys [issued expires evidence]}]
+       {"v" 1 "provider" provider "class" class "subject" subject "issuer" issuer
+        "nullifier" nullifier "issued_at" (or issued (- now day)) "expires_at" (or expires (+ now (* 30 day)))
+        "evidence" (or evidence {})})
+
+     (defn sign-hex [kp] (fn [msg] (get (sign kp msg) "sig")))
+
+     (defn signed [s signers] (reduce (fn [st kp] (p/add-proof st (:did kp) (sign-hex kp))) s signers))
+
+     (def alice-github
+       (signed (stamp "github" "issuer" (:did alice) (:did github-issuer) (sha "github:1001")) [github-issuer]))
+     (def alice-ceremony
+       (signed (stamp "ceremony" "quorum" (:did alice) nil (sha "ceremony:alice-session")) (take 3 ceremony)))
+
+     (defn stamp-body-of [s] (p/stamp-body s))
+
+     (defn certify [rec signers] (mapv #(p/witness-proof rec (:did %) (sign-hex %)) signers))))
+
+#?(:cljs
+   (do
+     (deftest canonical-is-jcs
+       (is (= "{\"a\":[1,true,null],\"b\":\"x\\\"y\\n\",\"c\":{\"d\":\"日本\"}}"
+              (p/canonical {"c" {:d "日本"} "b" "x\"y\n" :a [1 true nil]})))
+       (is (thrown? js/Error (p/canonical {"f" 1.5}))))
+
+     (deftest did-key-round-trip
+       (let [d "did:key:z6MkumESUE5s47NKpjjNJMeLnWU7knXk4RnjH5a2qZM8NyHz"]
+         (is (= 32 (count (p/did-key->pubkey d))))
+         (is (= d (p/did-key (p/did-key->pubkey d)))))
+       (is (nil? (p/did-key->pubkey "did:key:zQ3sh"))))
+
+     (deftest policy-is-sound
+       (is (= [] (p/policy-problems env policy)))
+       (testing "a policy where accounts can vouch and chain-stamp themselves past the threshold is refused"
+         (let [bad (-> policy (assoc-in [:class-caps :vouch] 15) (dissoc :id))
+               bad (assoc bad :id (p/policy-id env bad))]
+           (is (= [:policy/self-mintable-classes-reach-threshold] (p/policy-problems env bad)))))
+       (testing "a minority witness quorum is refused"
+         (let [bad (-> policy (assoc :witness-quorum 2) (dissoc :id))
+               bad (assoc bad :id (p/policy-id env bad))]
+           (is (= [:policy/witness-quorum] (p/policy-problems env bad)))))
+       (is (= [:policy/id-mismatch] (p/policy-problems env (assoc policy :threshold 21)))))
+
+     (deftest alice-passes-and-is-certified
+       (let [{:keys [registry results]} (p/registry-replay policy [(p/claim-entry env alice-github)
+                                                                   (p/claim-entry env alice-ceremony)])
+             s (p/score env policy registry (:did alice) now [alice-github alice-ceremony] {})
+             rec (p/record policy s {(p/stamp-id env alice-github) alice-github
+                                     (p/stamp-id env alice-ceremony) alice-ceremony} now)]
+         (is (every? :accepted results))
+         (is (= 20 (:score s)))
+         (is (:passing s))
+         (is (= [] (:rejected s)))
+         (is (= (+ now (* 30 day)) (get rec "valid_until")) "earliest stamp expiry bounds the record")
+         (testing "three of five witnesses certify"
+           (let [v (p/verify-record env policy rec (certify rec (take 3 witnesses)) now)]
+             (is (:passing v))
+             (is (= 3 (count (:witnesses v))))
+             (let [out (p/->identity policy rec v "2026-10-07T00:00:00Z")
+                   claim (first (:identity/trust-claims out))]
+               (is (= :kotoba-passport/passed (:trust.claim/predicate claim)))
+               (is (= [:identity :sybil-resistance] (:trust.claim/scope claim)))
+               (is (causal/valid? claim)))))
+         (testing "two witnesses, or a stranger's signature, are not a certificate"
+           (is (= [:record/quorum-not-met]
+                  (:problems (p/verify-record env policy rec (certify rec (take 2 witnesses)) now))))
+           (is (= [:record/quorum-not-met]
+                  (:problems (p/verify-record env policy rec (certify rec [(first witnesses) bob carol]) now)))))
+         (testing "a record altered after signing is not certified"
+           (is (= [:record/quorum-not-met]
+                  (:problems (p/verify-record env policy (assoc rec "score" 99)
+                                              (certify rec (take 3 witnesses)) now)))))
+         (testing "an expired record does not pass"
+           (is (some #{:record/expired}
+                     (:problems (p/verify-record env policy rec (certify rec (take 3 witnesses))
+                                                 (+ now (* 31 day)))))))))
+
+     (deftest one-credential-backs-one-human
+       (let [bob-github (signed (stamp "github" "issuer" (:did bob) (:did github-issuer) (sha "github:1001"))
+                                [github-issuer])
+             {:keys [registry results]} (p/registry-replay policy [(p/claim-entry env alice-github)
+                                                                   (p/claim-entry env bob-github)])]
+         (is (= [{:accepted :nullifier/claimed} {:rejected :nullifier/claimed-by-other}] results))
+         (is (= [{:stamp-id (p/stamp-id env bob-github) :provider "github" :problems [:nullifier/claimed-by-other]}]
+                (:rejected (p/score env policy registry (:did bob) now [bob-github] {}))))
+         (testing "an unclaimed nullifier does not count either"
+           (is (= [:nullifier/unclaimed]
+                  (:problems (first (:rejected (p/score env policy p/empty-registry (:did alice) now
+                                                        [alice-github] {}))))))))
+       (testing "a second stamp for the same nullifier and subject does not count twice"
+         (let [again (signed (assoc (stamp-body-of alice-github) "issued_at" (- now 10)) [github-issuer])
+               {:keys [registry]} (p/registry-replay policy [(p/claim-entry env alice-github)
+                                                             (p/claim-entry env again)])]
+           (is (= [:nullifier/held-by-another-stamp]
+                  (:problems (first (:rejected (p/score env policy registry (:did alice) now [again] {})))))))))
+
+     (deftest stamps-must-be-signed-by-whom-the-policy-names
+       (let [forged (signed (stamp "github" "issuer" (:did bob) (:did github-issuer) (sha "github:2002")) [bob])
+             two (signed (stamp "ceremony" "quorum" (:did bob) nil (sha "ceremony:bob")) (take 2 ceremony))
+             outsiders (signed (stamp "ceremony" "quorum" (:did bob) nil (sha "ceremony:bob2"))
+                               (concat (take 2 ceremony) [alice carol]))
+             tampered (assoc alice-github "evidence" {"login" "someone-else"})
+             expired (signed (stamp "github" "issuer" (:did alice) (:did github-issuer) (sha "github:3003")
+                                    :issued (- now (* 10 day)) :expires (- now 1))
+                             [github-issuer])]
+         (is (= [:stamp/bad-signature] (p/stamp-problems env policy (:did bob) now forged {})))
+         (is (= [:stamp/quorum-not-met] (p/stamp-problems env policy (:did bob) now two {})))
+         (is (= [:stamp/quorum-not-met] (p/stamp-problems env policy (:did bob) now outsiders {})))
+         (is (= [:stamp/bad-signature] (p/stamp-problems env policy (:did alice) now tampered {})))
+         (is (= [:stamp/expired] (p/stamp-problems env policy (:did alice) now expired {})))
+         (is (= [:stamp/subject-mismatch] (p/stamp-problems env policy (:did bob) now alice-github {})))))
+
+     (deftest vouches-are-budgeted-and-capped
+       (let [alice-verified {:passing true}
+             vouch (fn [voucher subject]
+                     (signed (stamp "vouch" "vouch" (:did subject) (:did voucher)
+                                    (p/vouch-nullifier env (:did voucher) (:did subject)))
+                             [voucher]))
+             to-carol (vouch alice carol)
+             to-dave (vouch alice dave)
+             carol-chain (signed (stamp "eth-account-age" "chain" (:did carol) nil (sha "eip155:1:0xabc")
+                                        :evidence {"account" "0xabc"})
+                                 [])
+             carol-github (signed (stamp "github" "issuer" (:did carol) (:did github-issuer) (sha "github:4004"))
+                                  [github-issuer])
+             {:keys [registry results]}
+             (p/registry-replay policy (map #(p/claim-entry env %) [to-carol to-dave carol-chain carol-github]))
+             s (p/score env policy registry (:did carol) now [to-carol carol-chain carol-github]
+                        {(:did alice) alice-verified})]
+         (is (= {:rejected :vouch/budget-spent} (second results)) "alice's budget is one vouch")
+         (is (= 15 (:score s)) "vouch 4 + chain 6 + github 5")
+         (is (not (:passing s)))
+         (testing "a voucher who does not pass cannot vouch"
+           (is (= [:stamp/voucher-not-passing]
+                  (p/stamp-problems env policy (:did carol) now to-carol {(:did alice) {:passing false}}))))
+         (testing "nobody vouches for themselves"
+           (is (some #{:stamp/self-vouch}
+                     (p/stamp-problems env policy (:did alice) now (vouch alice alice) {(:did alice) alice-verified}))))
+         (testing "a chain stamp the host cannot re-derive does not count"
+           (is (= [:stamp/chain-fact-unverified]
+                  (p/stamp-problems env policy (:did carol) now (assoc carol-chain "evidence" {"account" "0xdef"}) {}))))))
+
+     (deftest issuers-can-revoke-what-they-signed
+       (let [entries [(p/claim-entry env alice-github) (p/claim-entry env alice-ceremony)
+                      {:op :revoke :stamp-id (p/stamp-id env alice-github) :by (:did bob)}
+                      {:op :revoke :stamp-id (p/stamp-id env alice-github) :by (:did github-issuer)}]
+             {:keys [registry results]} (p/registry-replay policy entries)
+             s (p/score env policy registry (:did alice) now [alice-github alice-ceremony] {})]
+         (is (= [{:rejected :revoke/not-issuer} {:accepted :stamp/revoked}] (drop 2 results)))
+         (is (= 15 (:score s)))
+         (is (not (:passing s)))
+         (is (= [:stamp/revoked] (:problems (first (:rejected s)))))))))

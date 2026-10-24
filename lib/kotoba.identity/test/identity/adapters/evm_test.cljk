@@ -1,0 +1,210 @@
+(ns identity.adapters.evm-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [kotoba.test :refer [deftest is testing]]
+            [identity.adapters.eas :as eas]
+            [identity.adapters.evm :as evm]
+            [identity.adapters.erc8004 :as erc8004]
+            [identity.adapters.human-passport :as passport])
+  (:import (java.math BigInteger)))
+
+(defn- word [n]
+  (format "%064x" (biginteger n)))
+
+(defn- hex-text [s]
+  (apply str (map #(format "%02x" (bit-and 0xff %))
+                  (kbytes/utf8-bytes s))))
+
+(defn- dynamic-bytes [raw]
+  (str (word (quot (count raw) 2))
+       raw
+       (apply str (repeat (mod (- 64 (mod (count raw) 64)) 64) "0"))))
+
+(defn- abi-string [s] (dynamic-bytes (hex-text s)))
+(defn- bytes32 [ch] (apply str (repeat 64 ch)))
+(defn- address-word [ch] (str (apply str (repeat 24 "0"))
+                               (apply str (repeat 40 ch))))
+
+(defn- signed-word [n]
+  (let [modulus (.shiftLeft BigInteger/ONE 256)
+        value (BigInteger. (str n))]
+    (format "%064x" (if (neg? n) (.add modulus value) value))))
+
+(def schema-text passport/score-schema)
+(def uid (str "0x" (bytes32 "1")))
+(def schema-uid (str "0x" (bytes32 "2")))
+(def recipient (str "0x" (apply str (repeat 40 "3"))))
+(def attester (str "0x" (apply str (repeat 40 "a"))))
+
+(def passport-data
+  (let [stamp (fn [provider score]
+                (str (word 64) (word score) (abi-string provider)))
+        first-stamp (stamp "GitHub" 250000)
+        second-stamp (stamp "ENS" 50000)
+        array (str (word 2)
+                   (word 64)
+                   (word (+ 64 (quot (count first-stamp) 2)))
+                   first-stamp second-stamp)]
+    (str "0x"
+         (word 1) (word 4) (word 335) (word 300000) (word 200000)
+         (word 192) array)))
+
+(def eas-attestation-result
+  (let [raw (subs passport-data 2)
+        tuple (str (bytes32 "1") (bytes32 "2")
+                   (word 1743452667) (word 1751228654) (word 0)
+                   (bytes32 "0") (address-word "3") (address-word "a")
+                   (word 1) (word 320)
+                   (dynamic-bytes raw))]
+    (str "0x" (word 32) tuple)))
+
+(def eas-schema-result
+  (str "0x" (word 32)
+       (bytes32 "2") (address-word "b") (word 1) (word 128)
+       (abi-string schema-text)))
+
+(def coordinate
+  {:namespace "eip155" :chain-id 10
+   :eas-address "0x4200000000000000000000000000000000000021"
+   :schema-registry-address "0x4200000000000000000000000000000000000020"})
+
+(defn- rpc-response [id result]
+  {:status 200 :body (json/write-str {:jsonrpc "2.0" :id id :result result})})
+
+(defn- fixture-post [calls]
+  (fn [_ body]
+    (let [{:keys [id method params] :as request} (json/read-str body :key-fn keyword)]
+      (swap! calls conj request)
+      (case method
+        "eth_chainId" (rpc-response id "0xa")
+        "eth_call"
+        (let [data (get-in params [0 :data])]
+          (cond
+            (.startsWith data "0xa3112a64") (rpc-response id eas-attestation-result)
+            (.startsWith data "0xa2ea7c6e") (rpc-response id eas-schema-result)
+            :else {:status 200
+                   :body (json/write-str {:jsonrpc "2.0" :id id
+                                          :error {:code -32601}})}))))))
+
+(defn- problem [f]
+  (try (f) nil (catch kerror/ExceptionInfo e
+                 (:identity.evm/problem (ex-data e)))))
+
+(deftest decodes-eas-and-current-human-passport-payload
+  (let [record (evm/decode-eas-attestation-result eas-attestation-result)
+        schema (evm/decode-eas-schema-result eas-schema-result)
+        score (evm/decode-human-passport-data (:data record))]
+    (is (= uid (:uid record)))
+    (is (= schema-uid (:schema-uid record)))
+    (is (= recipient (:recipient record)))
+    (is (= attester (:attester record)))
+    (is (= schema-text (:schema schema)))
+    (is (= {:passing-score true :score-decimals 4
+            :scorer-id (BigInteger/valueOf 335)
+            :score 300000 :threshold 200000
+            :stamps [{:provider "GitHub" :score (BigInteger/valueOf 250000)}
+                     {:provider "ENS" :score (BigInteger/valueOf 50000)}]}
+           score))))
+
+(deftest reader-pins-chain-and-contract-calls
+  (let [calls (atom [])
+        reader (evm/eas-reader {:rpc-url "https://rpc.example"
+                                :post-fn (fixture-post calls)})]
+    (is (= uid (:uid (eas/read-attestation! reader coordinate uid))))
+    (is (= schema-text
+           (:schema (eas/read-schema! reader coordinate schema-uid))))
+    (is (= ["eth_chainId" "eth_call" "eth_chainId" "eth_call"]
+           (mapv :method @calls)))
+    (is (= (:eas-address coordinate) (get-in @calls [1 :params 0 :to])))
+    (is (= (:schema-registry-address coordinate) (get-in @calls [3 :params 0 :to])))))
+
+(deftest chain-mismatch-and-malformed-abi-fail-closed
+  (testing "remote chain differs from the pinned coordinate"
+    (let [post (fn [_ body]
+                 (let [id (:id (json/read-str body :key-fn keyword))]
+                   (rpc-response id "0x1")))
+          reader (evm/eas-reader {:rpc-url "https://rpc.example" :post-fn post})]
+      (is (= :rpc/chain-mismatch
+             (problem #(eas/read-attestation! reader coordinate uid))))))
+  (testing "dynamic offsets cannot escape the response"
+    (is (= :abi/out-of-bounds
+           (problem #(evm/decode-eas-schema-result
+                      (str "0x" (word 4096))))))))
+
+(deftest registration-document-hosts-are-explicitly-allowlisted
+  (is (= :document/host-not-allowed
+         (problem #(#'evm/resolve-document-url
+                    {} "https://metadata.example/agent.json"))))
+  (is (= "https://metadata.example/agent.json"
+         (#'evm/resolve-document-url
+          {:allowed-https-hosts #{"metadata.example"}}
+          "https://metadata.example/agent.json"))))
+
+(deftest decodes-erc8004-summaries-with-fixed-point-sign
+  (is (= {:count 3 :score -25/2 :value (BigInteger/valueOf -125)
+          :value-decimals 1}
+         (evm/decode-reputation-summary-result
+          (str "0x" (word 3) (signed-word -125) (word 1)))))
+  (is (= {:count 4 :score 92}
+         (evm/decode-validation-summary-result
+          (str "0x" (word 4) (word 92))))))
+
+(deftest coordinate-driven-erc8004-reader-verifies-registration-and-summaries
+  (let [identity-address (str "0x" (apply str (repeat 40 "1")))
+        reputation-address (str "0x" (apply str (repeat 40 "2")))
+        validation-address (str "0x" (apply str (repeat 40 "3")))
+        owner-address (str "0x" (apply str (repeat 40 "4")))
+        wallet-address (str "0x" (apply str (repeat 40 "5")))
+        client-address (str "0x" (apply str (repeat 40 "6")))
+        validator-address (str "0x" (apply str (repeat 40 "7")))
+        registration {:type erc8004/registration-type
+                      :name "Kotoba test agent"
+                      :description "Fixture"
+                      :image "https://example.test/agent.png"
+                      :services [{:name "MCP" :endpoint "https://example.test/mcp"}]
+                      :x402Support false :active true
+                      :registrations [{:agentId 7
+                                       :agentRegistry (str "eip155:10:" identity-address)}]
+                      :supportedTrust ["reputation" "validation"]}
+        encoded (kbytes/base64-encode
+                                 (kbytes/utf8-bytes (json/write-str registration)))
+        agent-uri (str "data:application/json;base64," encoded)
+        address-result (fn [address]
+                         (str "0x" (apply str (repeat 24 "0")) (subs address 2)))
+        string-result (fn [s] (str "0x" (word 32) (abi-string s)))
+        post (fn [_ body]
+               (let [{:keys [id method params]} (json/read-str body :key-fn keyword)
+                     data (get-in params [0 :data])]
+                 (if (= method "eth_chainId")
+                   (rpc-response id "0xa")
+                   (cond
+                     (= data "0xbc4d861b") (rpc-response id (address-result identity-address))
+                     (.startsWith data "0x6352211e") (rpc-response id (address-result owner-address))
+                     (.startsWith data "0xc87b56dd") (rpc-response id (string-result agent-uri))
+                     (.startsWith data "0x00339509") (rpc-response id (address-result wallet-address))
+                     (.startsWith data "0x81bbba58")
+                     (rpc-response id (str "0x" (word 5) (signed-word 875) (word 1)))
+                     (.startsWith data "0x1b7cabd6")
+                     (rpc-response id (str "0x" (word 4) (word 92)))
+                     :else {:status 200
+                            :body (json/write-str {:jsonrpc "2.0" :id id
+                                                   :error {:code -32601}})}))))
+        coordinate {:namespace "eip155" :chain-id 10
+                    :identity-registry identity-address
+                    :reputation-registry reputation-address
+                    :validation-registry validation-address}
+        reader (evm/erc8004-reader {:rpc-url "https://rpc.example" :post-fn post})
+        result (erc8004/verify!
+                reader coordinate 7
+                {:policy-cid "urn:policy:erc8004:test"
+                 :issued-at "2026-08-27T00:00:00Z"
+                 :observed-at 1787788800
+                 :reputation {:allowed-clients [client-address]
+                              :minimum-count 2 :minimum-score 80}
+                 :validation {:allowed-validators [validator-address]
+                              :minimum-count 2 :minimum-score 80}})]
+    (is (= "Kotoba test agent"
+           (get-in result [:identity.erc8004/registration :name])))
+    (is (= 2 (count (:identity/trust-claims result))))
+    (is (empty? (:identity/refusals result)))
+    (is (= wallet-address
+           (second (get-in result [:identity/subject :identity.subject/aliases]))))))
