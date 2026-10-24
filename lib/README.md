@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.retail` | `kotoba.retail/src` | `kotoba.retail`, `kotoba.retail.export`, `kotoba.retail.ui` (Kotoba project library) |
 | `kotoba.reservation` | `kotoba.reservation/src` | `kotoba.reservation`, `kotoba.reservation.export`, `kotoba.reservation.ui` (Kotoba project library) |
 | `kotoba.replicator` | `kotoba.replicator/src` | `kotoba.replicator` (Kotoba project library) |
 | `kotoba.remocon` | `kotoba.remocon/src` | `remocon.match`, `remocon.nec`, `remocon.pronto`, `remocon.raw` (Kotoba project library) |
