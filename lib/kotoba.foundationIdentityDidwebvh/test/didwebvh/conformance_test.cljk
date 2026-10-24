@@ -1,0 +1,381 @@
+(ns didwebvh.conformance-test
+  "Every negative here breaks exactly the thing it claims to break, and the
+   positive alongside it is re-run unbroken. A test that reaches the right
+   `:error` for the wrong reason -- a malformed document, a reader that threw
+   -- is the failure mode this suite is written against."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [didwebvh.did :as did]
+            [didwebvh.entry :as entry]
+            [didwebvh.hash :as h]
+            [didwebvh.log :as log]
+            [didwebvh.signer :as signer]
+            [didwebvh.time :as t]
+            [didwebvh.witness :as witness]))
+
+;; ── fixtures ─────────────────────────────────────────────────────────────────
+
+(defn- seed [n]
+  #?(:clj (byte-array (map unchecked-byte (repeat 32 n)))
+     :cljs (js/Uint8Array.from (clj->js (repeat 32 n)))))
+
+(defn- threw?
+  "A thrown-exception assertion that reads the same on both runtimes. The
+   `thrown?` form does not, and a test that only compiles on one runtime is a
+   test that only runs on one."
+  [f]
+  (try (f) false (catch #?(:clj Exception :cljs :default) _ true)))
+
+(def update-1 (signer/from-seed (seed 1)))
+(def update-2 (signer/from-seed (seed 2)))
+(def update-3 (signer/from-seed (seed 3)))
+(def attacker (signer/from-seed (seed 9)))
+
+(def witnesses
+  (mapv (fn [[role n]] (assoc (signer/from-seed (seed n)) :role role))
+        [[:security 11] [:legal 12] [:operations 13] [:auditor 14] [:recovery 15]]))
+
+(def witness-param
+  {"threshold" 3
+   "witnesses" (mapv (fn [w] {"id" (:did-key w)}) witnesses)})
+
+(def t0 "2026-08-20T00:00:00Z")
+(def t1 "2026-08-21T00:00:00Z")
+(def now (+ (t/parse t1) 3600))
+
+(def domain "did.example.com")
+
+(defn- genesis-params [& {:keys [portable witness pre-rotate-to]
+                          :or {portable true witness witness-param
+                               pre-rotate-to update-2}}]
+  (cond-> {"method" h/method-1-0
+           "scid" h/scid-placeholder
+           "updateKeys" [(:multikey update-1)]
+           "portable" portable
+           "witness" witness}
+    pre-rotate-to (assoc "nextKeyHashes" [(h/key-hash (:multikey pre-rotate-to))])))
+
+(defn- state-for [domain* path]
+  {"@context" ["https://www.w3.org/ns/did/v1"]
+   "id" (str "did:webvh:" h/scid-placeholder ":" domain*
+             (when (seq path) (str ":" (str/join ":" path))))})
+
+(defn- witness-file-for [version-id ws]
+  [{"versionId" version-id
+    "proof" (mapv #(entry/witness-proof version-id %) ws)}])
+
+(defn- genesis-entry [& {:keys [params state] :or {params (genesis-params)
+                                                   state (state-for domain nil)}}]
+  (-> (entry/genesis {:version-time t0 :parameters params :state state})
+      (entry/sign update-1)))
+
+;; ── SCID and the DID string ──────────────────────────────────────────────────
+
+(deftest scid-is-46-base58btc-characters
+  (let [e (genesis-entry)
+        scid (get-in e ["parameters" "scid"])]
+    (is (= 46 (count scid)))
+    (is (h/sha256-multihash? scid))
+    (is (not (str/includes? (pr-str e) h/scid-placeholder))
+        "no placeholder survives into the published entry")))
+
+(deftest did-to-https-transformation
+  (let [scid (get-in (genesis-entry) ["parameters" "scid"])]
+    (testing "a bare domain publishes under .well-known"
+      (is (= (str "https://" domain "/.well-known/did.jsonl")
+             (did/log-url (str "did:webvh:" scid ":" domain))))
+      (is (= (str "https://" domain "/.well-known/did-witness.json")
+             (did/witness-url (str "did:webvh:" scid ":" domain)))))
+    (testing "path segments become path segments"
+      (is (= "https://identity.example.com/orgs/acme/did.jsonl"
+             (did/log-url (str "did:webvh:" scid ":identity.example.com:orgs:acme")))))
+    (testing "a port is %3A in the DID and a colon in the URL"
+      (is (= "https://example.com:3000/path/did.jsonl"
+             (did/log-url (str "did:webvh:" scid ":example.com%3A3000:path"))))
+      (is (= (str "did:webvh:" scid ":example.com%3A3000:path")
+             (did/build {:scid scid :domain "example.com" :port 3000 :path ["path"]}))))
+    (testing "what it refuses"
+      (is (threw? #(did/parse (str "did:webvh:" scid ":192.0.2.1"))))
+      (is (threw? #(did/parse (str "did:webvh:" scid ":example.com:..")))))))
+
+(deftest a-non-ascii-domain-is-refused-rather-than-punycoded
+  ;; This is the assertion that was missing when the ClojureScript run first
+  ;; happened, and its absence is why the bug it now covers was invisible:
+  ;; `ascii?` compared `(int c)`, which is a code point on the JVM and a
+  ;; numeric coercion in JS, so under cljs EVERY domain looked ASCII and this
+  ;; guard never fired. A refusal that cannot fire is indistinguishable from a
+  ;; domain that passed.
+  (let [scid (get-in (genesis-entry) ["parameters" "scid"])]
+    (is (threw? #(did/parse (str "did:webvh:" scid ":例え.jp"))))
+    (is (map? (did/parse (str "did:webvh:" scid ":xn--r8jz45g.jp")))
+        "the A-label form is what a caller is expected to hold, and it passes")))
+
+(deftest percent-decoding-happens-once-and-gets-the-bytes-right
+  ;; The other half of the same defect: `hex-value` read its digits through
+  ;; `(int c)` too, so under cljs `%3A` decoded to nonsense instead of a colon
+  ;; and every ported DID with a port was mis-parsed.
+  (is (= "example.com:3000" (did/percent-decode "example.com%3A3000")))
+  (is (= "acme" (did/percent-decode "acme")))
+  (is (= "%2F" (did/percent-decode "%252F"))
+      "decoding runs ONCE -- twice is how a path segment smuggles a separator")
+  (is (= "%E4%BE%8B" (did/percent-encode "例")) "multi-byte, uppercase hex")
+  (is (= "例" (did/percent-decode (did/percent-encode "例")))))
+
+;; ── the happy path ───────────────────────────────────────────────────────────
+
+(deftest genesis-with-three-of-five-witnesses-verifies
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        result (log/verify [e] {:witness-file (witness-file-for v (take 3 witnesses))
+                                :now now})]
+    (is (:ok? result) (pr-str (dissoc result :versions)))
+    (is (= 3 (get-in result [:versions 0 :witness :weight])))
+    (is (true? (:portable? result)))
+    (is (false? (:deactivated? result)))
+    (is (true? (:checked-future-dating? result)))
+    (is (= [(:multikey update-1)] (get-in result [:versions 0 :signed-by])))))
+
+;; ── the threshold is a method rule, not a promise ────────────────────────────
+
+(deftest two-of-five-is-refused
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        two (log/verify [e] {:witness-file (witness-file-for v (take 2 witnesses)) :now now})
+        three (log/verify [e] {:witness-file (witness-file-for v (take 3 witnesses)) :now now})]
+    (is (= :didwebvh/witness-threshold-unmet (:error two)))
+    (is (= 2 (get-in two [:witness :weight])))
+    (is (:ok? three) "the same entry with one more witness passes")))
+
+(deftest a-witness-file-that-is-absent-is-not-an-approval
+  (let [e (genesis-entry)]
+    (is (= :didwebvh/witness-threshold-unmet
+           (:error (log/verify [e] {:now now})))
+        "no file must fail the threshold, not skip the check")))
+
+(deftest a-proof-from-a-key-that-is-not-a-witness-does-not-count
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        forged (witness-file-for v [(first witnesses) (second witnesses) attacker])
+        genuine (witness-file-for v (take 3 witnesses))]
+    (is (= :didwebvh/witness-threshold-unmet (:error (log/verify [e] {:witness-file forged :now now}))))
+    (is (:ok? (log/verify [e] {:witness-file genuine :now now})))))
+
+(deftest one-witness-signing-twice-is-still-one-witness
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        doubled [{"versionId" v
+                  "proof" [(entry/witness-proof v (first witnesses))
+                           (entry/witness-proof v (assoc (first witnesses) :created t1))
+                           (entry/witness-proof v (second witnesses))]}]]
+    (is (= :didwebvh/witness-threshold-unmet
+           (:error (log/verify [e] {:witness-file doubled :now now})))
+        "three proofs, two witnesses, threshold three")))
+
+(deftest a-witness-proof-cannot-be-replayed-onto-another-version
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        other-version (str "2-" (h/hash-json {"x" 1}))
+        replayed [{"versionId" v
+                   "proof" (mapv #(entry/witness-proof other-version %) (take 3 witnesses))}]]
+    (is (= :didwebvh/witness-threshold-unmet
+           (:error (log/verify [e] {:witness-file replayed :now now}))))))
+
+;; ── updateKeys alone is NOT m-of-n, and the library says so ──────────────────
+
+(deftest any-single-update-key-signs-a-valid-entry
+  (let [params (assoc (genesis-params :pre-rotate-to nil)
+                      "updateKeys" [(:multikey update-1) (:multikey update-2)])
+        signed-by-second (-> (entry/genesis {:version-time t0 :parameters params
+                                             :state (state-for domain nil)})
+                             (entry/sign update-2))
+        v (get signed-by-second "versionId")]
+    (is (:ok? (log/verify [signed-by-second]
+                          {:witness-file (witness-file-for v (take 3 witnesses)) :now now}))
+        "two updateKeys and one signature is a valid entry -- the reason the witness threshold exists")))
+
+;; ── pre-rotation ─────────────────────────────────────────────────────────────
+
+(defn- update-entry [previous signer* & {:keys [next-key state]
+                                         :or {next-key update-3}}]
+  (-> (entry/next-entry previous
+                        {:version-time t1
+                         :parameters {"updateKeys" [(:multikey signer*)]
+                                      "nextKeyHashes" [(h/key-hash (:multikey next-key))]}
+                         :state (or state (get previous "state"))})
+      (entry/sign signer*)))
+
+(deftest a-pre-committed-key-may-rotate-in
+  (let [e1 (genesis-entry)
+        e2 (update-entry e1 update-2)
+        wf (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                 (witness-file-for (get e2 "versionId") (take 3 witnesses)))
+        result (log/verify [e1 e2] {:witness-file wf :now now})]
+    (is (:ok? result) (pr-str (dissoc result :versions)))
+    (is (= 2 (count (:versions result))))))
+
+(deftest a-key-nobody-pre-committed-cannot-rotate-in
+  (let [e1 (genesis-entry)
+        stolen (update-entry e1 attacker)
+        honest (update-entry e1 update-2)
+        wf-for (fn [e] (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                             (witness-file-for (get e "versionId") (take 3 witnesses))))]
+    (is (= :didwebvh/uncommitted-update-key
+           (:error (log/verify [e1 stolen] {:witness-file (wf-for stolen) :now now})))
+        "the current update key was compromised and still cannot name its own successor")
+    (is (:ok? (log/verify [e1 honest] {:witness-file (wf-for honest) :now now})))))
+
+(deftest pre-rotation-forbids-inheriting-update-keys
+  (let [e1 (genesis-entry)
+        lazy (-> (entry/next-entry e1 {:version-time t1
+                                       :parameters {}
+                                       :state (get e1 "state")})
+                 (entry/sign update-2))
+        wf (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                 (witness-file-for (get lazy "versionId") (take 3 witnesses)))]
+    (is (= :didwebvh/pre-rotation-inheritance
+           (:error (log/verify [e1 lazy] {:witness-file wf :now now}))))))
+
+;; ── portability ──────────────────────────────────────────────────────────────
+
+(deftest a-portable-did-may-move-and-keeps-its-scid
+  (let [e1 (genesis-entry)
+        scid (get-in e1 ["parameters" "scid"])
+        moved-id (str "did:webvh:" scid ":did.new-example.com")
+        e2 (update-entry e1 update-2
+                         :state {"@context" ["https://www.w3.org/ns/did/v1"]
+                                 "id" moved-id
+                                 "alsoKnownAs" [(get-in e1 ["state" "id"])]})
+        wf (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                 (witness-file-for (get e2 "versionId") (take 3 witnesses)))
+        result (log/verify [e1 e2] {:witness-file wf :now now :expect-did moved-id})]
+    (is (:ok? result) (pr-str (dissoc result :versions)))
+    (is (= moved-id (:did result)))
+    (is (= scid (:scid result)) "the SCID survives the move -- that is what portability means")
+    (is (= "https://did.new-example.com/.well-known/did.jsonl" (:log-url result)))))
+
+(deftest a-non-portable-did-may-not-move
+  (let [e1 (genesis-entry :params (genesis-params :portable false))
+        scid (get-in e1 ["parameters" "scid"])
+        e2 (update-entry e1 update-2
+                         :state {"@context" ["https://www.w3.org/ns/did/v1"]
+                                 "id" (str "did:webvh:" scid ":did.new-example.com")})
+        stay (update-entry e1 update-2)
+        wf-for (fn [e] (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                             (witness-file-for (get e "versionId") (take 3 witnesses))))]
+    (is (= :didwebvh/not-portable (:error (log/verify [e1 e2] {:witness-file (wf-for e2) :now now}))))
+    (is (:ok? (log/verify [e1 stay] {:witness-file (wf-for stay) :now now})))))
+
+(deftest portability-cannot-be-switched-on-later
+  (let [e1 (genesis-entry :params (genesis-params :portable false))
+        e2 (-> (entry/next-entry e1 {:version-time t1
+                                     :parameters {"updateKeys" [(:multikey update-2)]
+                                                  "nextKeyHashes" [(h/key-hash (:multikey update-3))]
+                                                  "portable" true}
+                                     :state (get e1 "state")})
+               (entry/sign update-2))
+        wf (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                 (witness-file-for (get e2 "versionId") (take 3 witnesses)))]
+    (is (= :didwebvh/portable-enabled-late
+           (:error (log/verify [e1 e2] {:witness-file wf :now now}))))))
+
+;; ── tampering ────────────────────────────────────────────────────────────────
+
+(deftest an-edited-state-breaks-the-entry-hash
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        tampered (assoc-in e ["state" "service"] [{"id" "#x" "type" "Evil"}])
+        wf (witness-file-for v (take 3 witnesses))]
+    (is (= :didwebvh/entry-hash-mismatch (:error (log/verify [tampered] {:witness-file wf :now now}))))
+    (is (:ok? (log/verify [e] {:witness-file wf :now now})))))
+
+(deftest an-entry-signed-by-a-key-outside-updateKeys-is-refused
+  (let [params (genesis-params)
+        forged (-> (entry/genesis {:version-time t0 :parameters params
+                                   :state (state-for domain nil)})
+                   (entry/sign attacker))
+        v (get forged "versionId")
+        wf (witness-file-for v (take 3 witnesses))]
+    (is (= :didwebvh/unauthorized-entry (:error (log/verify [forged] {:witness-file wf :now now}))))))
+
+(deftest a-log-that-skips-a-version-is-refused
+  (let [e1 (genesis-entry)
+        e2 (update-entry e1 update-2)
+        wf (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                 (witness-file-for (get e2 "versionId") (take 3 witnesses)))]
+    (is (= :didwebvh/bad-version-number (:error (log/verify [e2] {:witness-file wf :now now})))
+        "entry 2 presented as the whole log is not entry 1")))
+
+(deftest version-time-must-move-forward
+  (let [e1 (genesis-entry)
+        backwards (-> (entry/next-entry e1 {:version-time t0
+                                            :parameters {"updateKeys" [(:multikey update-2)]
+                                                         "nextKeyHashes" [(h/key-hash (:multikey update-3))]}
+                                            :state (get e1 "state")})
+                      (entry/sign update-2))
+        wf (into (witness-file-for (get e1 "versionId") (take 3 witnesses))
+                 (witness-file-for (get backwards "versionId") (take 3 witnesses)))]
+    (is (= :didwebvh/non-monotonic-version-time
+           (:error (log/verify [e1 backwards] {:witness-file wf :now now}))))))
+
+(deftest a-future-dated-entry-is-refused-only-when-now-is-known
+  (let [e (genesis-entry)
+        v (get e "versionId")
+        wf (witness-file-for v (take 3 witnesses))
+        long-ago (- (t/parse t0) 86400)
+        without-now (log/verify [e] {:witness-file wf})]
+    (is (= :didwebvh/future-version-time (:error (log/verify [e] {:witness-file wf :now long-ago}))))
+    (is (:ok? without-now))
+    (is (false? (:checked-future-dating? without-now))
+        "a check that could not run must say it did not run")))
+
+;; ── units ────────────────────────────────────────────────────────────────────
+
+(deftest key-hash-is-over-the-multikey-string
+  (is (= (h/digest (h/utf8 (:multikey update-2)))
+         (h/key-hash (:multikey update-2)))))
+
+(deftest witness-validation-refuses-an-unreachable-threshold
+  (is (threw? #(witness/validate! {"threshold" 6 "witnesses" (get witness-param "witnesses")})))
+  (is (nil? (witness/validate! witness-param)))
+  (is (nil? (witness/validate! {})) "declaring no witnesses is legal"))
+
+(deftest version-time-round-trips
+  (is (= t0 (t/->iso8601 (t/parse t0))))
+  (is (= (t/parse "2026-08-20T00:00:00Z") (t/parse "2026-08-20T00:00:00.500Z")))
+  (is (nil? (t/parse "2026-08-20T00:00:00+09:00")) "the method requires UTC"))
+
+;; ── the signature check as a seam ────────────────────────────────────────────
+;;
+;; These use injected verifiers and never touch Ed25519, which is why they are
+;; cheap enough to state both directions. That the DEFAULT verifier is correct
+;; is what every other test in this file measures.
+
+(deftest the-signature-check-is-a-seam-and-the-seam-is-load-bearing
+  (let [e (genesis-entry)
+        wf (witness-file-for (get e "versionId") witnesses)
+        base {:witness-file wf :now now}
+        ;; A real 64-byte signature by a witness over a different document:
+        ;; well-formed, decodes, and does not verify here.
+        forged (assoc-in e ["proof" 0 "proofValue"] (get-in wf [0 "proof" 1 "proofValue"]))]
+    (testing "a verifier that refuses every signature refuses the log"
+      (is (= :didwebvh/unauthorized-entry
+             (:error (log/verify [e] (assoc base :verify-signature (constantly false)))))))
+    (testing "a verifier that accepts every signature accepts a log with a forged proof"
+      (is (:ok? (log/verify [forged] (assoc base :verify-signature (constantly true))))
+          "so the seam is what decided it, not some other check"))
+    (testing "the seam is asked once for the entry proof and once per witness"
+      (let [asked (atom [])
+            counting (fn [pub hash-data sig]
+                       (swap! asked conj [(count (vec pub)) (count (vec hash-data)) (count (vec sig))])
+                       true)]
+        (is (:ok? (log/verify [e] (assoc base :verify-signature counting))))
+        (is (= 6 (count @asked)) "one entry proof plus five witness proofs")
+        (is (every? #(= [32 64 64] %) @asked)
+            "public key, hashData and signature reach the seam at their real lengths")))
+    (testing "witness proofs go through the same seam"
+      (let [ubytes (fn [x] (mapv #(bit-and (int %) 0xff) (seq x)))
+            ;; true for the entry proof's key, false for every witness's
+            only-entry (fn [pub _ _] (= (ubytes pub) (ubytes (:public-key update-1))))]
+        (is (= :didwebvh/witness-threshold-unmet
+               (:error (log/verify [e] (assoc base :verify-signature only-entry)))))))))
+

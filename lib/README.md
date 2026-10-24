@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.foundationIdentityDidwebvh` | `kotoba.foundationIdentityDidwebvh/src` | `didwebvh.did`, `didwebvh.entry`, `didwebvh.hash`, `didwebvh.log` (Kotoba project library) |
 | `kotoba.forms` | `kotoba.forms/src` | `forms.model`, `forms.responses`, `forms.validate`, `forms.wire` (Kotoba project library) |
 | `kotoba.transit` | `kotoba.transit/src` | `transit.core` (Kotoba project library) |
 | `kotoba.force3d` | `kotoba.force3d/src` | `kotoba.lang.force3d.core` (Kotoba project library) |
