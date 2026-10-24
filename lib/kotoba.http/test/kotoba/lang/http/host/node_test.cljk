@@ -1,0 +1,120 @@
+(ns kotoba.lang.http.host.node-test
+  "The Node client host, against a real server. `node:http` is in the runtime,
+  so a round trip costs no dependency here either."
+  (:require [kotoba.test :refer [deftest is testing async]]
+            [kotoba.lang.http.host.node :as node]
+            ["node:http" :as http]))
+
+(defn- start-server
+  "An echo server that records what it was actually sent. `handler` may add
+   response headers or take over the reply; it is given the exchange and the
+   body already read."
+  [handler]
+  (js/Promise.
+   (fn [resolve _]
+     (let [seen (atom [])
+           srv (.createServer
+                http
+                (fn [req res]
+                  (let [chunks (atom "")]
+                    (.setEncoding req "utf8")
+                    (.on req "data" #(swap! chunks str %))
+                    (.on req "end"
+                         (fn []
+                           (swap! seen conj {:method (.-method req)
+                                             :path (.-url req)
+                                             :body @chunks
+                                             :headers (js->clj (.-headers req))})
+                           (handler req res @chunks))))))]
+       (.listen srv 0 "127.0.0.1"
+                (fn [] (resolve {:base (str "http://127.0.0.1:" (.-port (.address srv)))
+                                 :seen seen
+                                 :stop #(.close srv)})))))))
+
+(defn- echo [_req res body]
+  (.setHeader res "X-Multi" #js ["first" "second"])
+  (.setHeader res "Replay-Nonce" "nonce-abc")
+  (.writeHead res 201)
+  (.end res (str "echo:" body)))
+
+(deftest performs-a-real-request-and-returns-host-jvms-shape
+  (async done
+    (-> (start-server echo)
+        (.then (fn [{:keys [base seen stop]}]
+                 (-> ((node/http-transport {:timeout-seconds 10})
+                      {:url (str base "/thing") :method :post
+                       :headers {"X-A" "1" :x-b "2"} :body "hello"})
+                     (.then (fn [resp]
+                              (testing "the server saw what this sent"
+                                (is (= "POST" (:method (first @seen))))
+                                (is (= "/thing" (:path (first @seen))))
+                                (is (= "hello" (:body (first @seen))))
+                                (is (= "1" (get-in (first @seen) [:headers "x-a"])))
+                                (is (= "2" (get-in (first @seen) [:headers "x-b"]))
+                                    "a keyword header name is sent under its name"))
+                              (testing "the response is host/jvm's shape, to the letter"
+                                (is (= 201 (:status resp)))
+                                (is (= "echo:hello" (:body resp)))
+                                (is (= "first" (get-in resp [:headers "x-multi"]))
+                                    "rawHeaders keeps each occurrence; fetch would have said \"first, second\"")
+                                (is (= "nonce-abc" (get-in resp [:headers "replay-nonce"]))))
+                              (stop) (done)))
+                     (.catch (fn [e] (is false (str "threw: " e)) (stop) (done)))))))))
+
+(deftest a-body-less-method-sends-no-body
+  (async done
+    (-> (start-server echo)
+        (.then (fn [{:keys [base seen stop]}]
+                 (-> ((node/http-transport {:timeout-seconds 10}) {:url (str base "/g") :method :get})
+                     (.then (fn [_]
+                              (is (= "GET" (:method (first @seen))))
+                              (is (= "" (:body (first @seen))))
+                              (stop) (done)))))))))
+
+(deftest an-unknown-method-is-refused-before-anything-is-sent
+  ;; Synchronously, like host/jvm: a rejected promise the caller is not
+  ;; awaiting is a refusal nobody hears. And the mutant to fear is not a throw
+  ;; that goes missing -- it is a fallback to GET, which would turn a write
+  ;; into a read that succeeds.
+  (async done
+    (-> (start-server echo)
+        (.then (fn [{:keys [base seen stop]}]
+                 (let [thrown (atom nil)]
+                   (try ((node/http-transport {:timeout-seconds 10})
+                         {:url (str base "/x") :method :teleport})
+                        (catch :default e (reset! thrown e)))
+                   (is (some? @thrown) "the refusal is synchronous, not a rejected promise")
+                   (is (= :teleport (:method (ex-data @thrown)))
+                       "the refusal names the method it refused")
+                   (is (empty? @seen)
+                       "nothing reached the server: refused before it was sent")
+                   (stop) (done)))))))
+
+(deftest a-redirect-is-followed-because-host-jvm-follows-one
+  (async done
+    (let [hits (atom 0)]
+      (-> (start-server (fn [req res body]
+                          (if (= "/from" (.-url req))
+                            (do (swap! hits inc)
+                                (.writeHead res 302 #js {"Location" "/to"})
+                                (.end res ""))
+                            (echo req res body))))
+          (.then (fn [{:keys [base stop]}]
+                   (-> ((node/http-transport {:timeout-seconds 10}) {:url (str base "/from") :method :get})
+                       (.then (fn [resp]
+                                (is (= 1 @hits) "the redirect was actually served once")
+                                (is (= 201 (:status resp)) "the caller sees the destination, not the 302")
+                                (stop) (done))))))))))
+
+(deftest a-redirect-loop-is-refused-rather-than-followed-forever
+  (async done
+    (-> (start-server (fn [_req res _body]
+                        (.writeHead res 302 #js {"Location" "/again"})
+                        (.end res "")))
+        (.then (fn [{:keys [base stop]}]
+                 (-> ((node/http-transport {:timeout-seconds 10}) {:url (str base "/again") :method :get})
+                     (.then (fn [_] (is false "a loop must not resolve") (stop) (done)))
+                     (.catch (fn [e]
+                               (is (= 5 (:max-redirects (ex-data e)))
+                                   "the refusal names the bound it hit")
+                               (stop) (done)))))))))
