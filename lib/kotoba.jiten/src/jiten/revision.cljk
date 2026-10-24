@@ -1,0 +1,144 @@
+(ns jiten.revision
+  "What a revision RECORD is, and how two versions of an entry differ.
+
+   This namespace deliberately does not store history. Kotobase already keeps
+   every transaction and answers `:as-of` / `:since` / `:history true` against
+   any ref (ADR-2607265000), so an entry's past versions are a query, not a data
+   structure this library has to maintain. Reimplementing them here would create
+   a second, worse history that could disagree with the real one.
+
+   What is left is the part kotobase cannot supply, because it is editorial
+   rather than storage:
+
+     * WHO changed it and WHY. `:jiten.rev/author` is a DID -- the same identity
+       the request was authenticated with -- and `:jiten.rev/reason` may not be
+       blank. An edit summary nobody wrote is the thing every wiki's history page
+       is mostly made of, and it is what makes review impossible years later.
+
+     * WHAT changed, at statement granularity. `diff` compares by
+       `:jiten.statement/id`, not by text position, so a reviewer sees 'this
+       claim was added, that one's source changed' instead of a line diff of
+       reflowed prose. This is the whole reason the body is a vector of
+       statements rather than a string: a text diff can tell you a paragraph
+       moved, but only a statement diff can tell you a citation quietly
+       disappeared from a claim that stayed."
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]))
+
+(def ^:private did-re #"did:[a-z0-9]+:[A-Za-z0-9._%:-]+")
+
+(defn- problem [severity code msg data]
+  (merge {:jiten/severity severity :jiten/code code :jiten/message msg} data))
+
+(defn- blank? [s] (or (nil? s) (and (string? s) (str/blank? s))))
+
+(defn revision-problems
+  "Admissibility of a revision record.
+
+   `:jiten.rev/basis` is the kotobase basis the edit was made against -- the
+   `:basis-cid` from `GET /v1/basis`. Recording it is what lets a later reader
+   reconstruct exactly which version the author was looking at, which is not the
+   same as the version immediately before theirs when two people edit at once."
+  [{:jiten.rev/keys [entry author at reason basis] :as r}]
+  (cond-> []
+    (not (keyword? entry))
+    (conj (problem :error :rev/entry-not-keyword "revision :jiten.rev/entry must be an entry-id keyword" {:jiten/revision r}))
+
+    (blank? author)
+    (conj (problem :error :rev/no-author "revision needs :jiten.rev/author (a DID)" {:jiten/revision r}))
+
+    (and (string? author) (not (str/blank? author)) (not (re-matches did-re author)))
+    (conj (problem :error :rev/author-not-did
+                   (str "revision :jiten.rev/author must be a DID, got " (pr-str author))
+                   {:jiten/revision r}))
+
+    (blank? at)
+    (conj (problem :error :rev/no-timestamp "revision needs :jiten.rev/at (ISO-8601)" {:jiten/revision r}))
+
+    (blank? reason)
+    (conj (problem :error :rev/no-reason
+                   "revision needs a non-blank :jiten.rev/reason; an unexplained edit cannot be reviewed once the author has forgotten it"
+                   {:jiten/revision r}))
+
+    (blank? basis)
+    (conj (problem :warn :rev/no-basis
+                   "revision has no :jiten.rev/basis (kotobase :basis-cid the edit was made against); without it a concurrent edit cannot be told from a sequential one"
+                   {:jiten/revision r}))))
+
+(defn statements
+  "`{statement-id {:statement s :section section-id :index n}}` for one entry.
+   Position is kept so `diff` can report a move without treating it as a change
+   to the claim."
+  [{:jiten.entry/keys [body]}]
+  (into {}
+        (for [sec (filter map? body)
+              [i s] (map-indexed vector (:jiten.section/statements sec))
+              :when (keyword? (:jiten.statement/id s))]
+          [(:jiten.statement/id s)
+           {:statement s :section (:jiten.section/id sec) :index i}])))
+
+(defn diff
+  "Statement-granular difference between two versions of one entry.
+
+   Returns `{:added [] :removed [] :changed [] :moved [] :sections {...}}`.
+   `:changed` entries name the attributes that differ, so a review can be
+   filtered to the ones that matter -- a change to
+   `:jiten.statement/source` is a different kind of event from a change to
+   `:jiten.statement/text`, and conflating them is how sourcing quietly decays."
+  [old new]
+  (let [a (statements old)
+        b (statements new)
+        ids-a (set (keys a))
+        ids-b (set (keys b))
+        both (set/intersection ids-a ids-b)
+        changed (for [id (sort-by str both)
+                      :let [sa (:statement (get a id))
+                            sb (:statement (get b id))
+                            ks (->> (into (set (keys sa)) (keys sb))
+                                    (remove #(= (get sa %) (get sb %)))
+                                    (sort-by str)
+                                    vec)]
+                      :when (seq ks)]
+                  {:jiten.statement/id id :jiten/attrs ks :jiten/before sa :jiten/after sb})
+        moved (for [id (sort-by str both)
+                    :let [pa (get a id) pb (get b id)]
+                    :when (or (not= (:section pa) (:section pb))
+                              (not= (:index pa) (:index pb)))]
+                {:jiten.statement/id id
+                 :jiten/from {:section (:section pa) :index (:index pa)}
+                 :jiten/to {:section (:section pb) :index (:index pb)}})
+        secs-a (set (map :jiten.section/id (filter map? (:jiten.entry/body old))))
+        secs-b (set (map :jiten.section/id (filter map? (:jiten.entry/body new))))]
+    {:added    (vec (sort-by str (set/difference ids-b ids-a)))
+     :removed  (vec (sort-by str (set/difference ids-a ids-b)))
+     :changed  (vec changed)
+     :moved    (vec moved)
+     :sections {:added   (vec (sort-by str (set/difference secs-b secs-a)))
+                :removed (vec (sort-by str (set/difference secs-a secs-b)))}}))
+
+(defn unsourced-after?
+  "True when the diff removes sourcing from a claim that survives -- a statement
+   present in both versions whose `:jiten.statement/source` changed to blank.
+
+   `jiten.schema` already refuses to admit such a statement, so this can only
+   fire on a corpus built with `corpus*`. It exists because this is the specific
+   decay an encyclopedia suffers from: nobody deletes the citation and the claim
+   together; they edit the claim and the citation stops matching it."
+  [d]
+  (boolean (some (fn [{:jiten/keys [attrs after]}]
+                   (and (some #{:jiten.statement/source} attrs)
+                        (blank? (:jiten.statement/source after))))
+                 (:changed d))))
+
+(defn summarize
+  "One-line human summary of a diff. For an edit log, not for review."
+  [d]
+  (let [{:keys [added removed changed moved]} d]
+    (str/join ", "
+              (cond-> []
+                (seq added)   (conj (str "+" (count added) " statement(s)"))
+                (seq removed) (conj (str "-" (count removed) " statement(s)"))
+                (seq changed) (conj (str "~" (count changed) " changed"))
+                (seq moved)   (conj (str (count moved) " moved"))
+                (and (empty? added) (empty? removed) (empty? changed) (empty? moved))
+                (conj "no statement-level change")))))

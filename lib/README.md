@@ -87,6 +87,25 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kamiArticulated` | `kotoba.kamiArticulated/src` | `kami_articulated`, `kami_articulated.urdf` (Kotoba project library) |
+| `kotoba.kamiAppQuarryWalk` | `kotoba.kamiAppQuarryWalk/src` | `kami-app-quarry-walk` (Kotoba project library) |
+| `kotoba.nagare` | `kotoba.nagare/src` | `nagare.demo`, `nagare.diagnostics`, `nagare.field`, `nagare.fvm` (Kotoba project library) |
+| `kotoba.kamiAppGiemonFactory` | `kotoba.kamiAppGiemonFactory/src` | `kami-app-giemon-factory`, `kami-app-giemon-factory.clashes`, `kami-app-giemon-factory.construction-order`, `kami-app-giemon-factory.factory` (Kotoba project library) |
+| `kotoba.kamiAppGiemon` | `kotoba.kamiAppGiemon/src` | `kami-app-giemon`, `kami-app-giemon.armcrawler`, `kami-app-giemon.caterpillar`, `kami-app-giemon.geom` (Kotoba project library) |
+| `kotoba.kamiAppCarSim` | `kotoba.kamiAppCarSim/src` | `kotoba.car-sim`, `kotoba.car-sim.color`, `kotoba.car-sim.controls`, `kotoba.car-sim.garage` (Kotoba project library) |
+| `kotoba.kaiyu` | `kotoba.kaiyu/src` | `kaiyu.core`, `kaiyu.diagnose`, `kaiyu.session` (Kotoba project library) |
+| `kotoba.kaisha` | `kotoba.kaisha/src` | `kaisha.model`, `kaisha.validate` (Kotoba project library) |
+| `kotoba.jsonlogic` | `kotoba.jsonlogic/src` | `jsonlogic.core`, `jsonlogic.ports`, `jsonlogic.validate` (Kotoba project library) |
+| `kotoba.jsonLd` | `kotoba.jsonLd/src` | `json-ld.core` (Kotoba project library) |
+| `kotoba.jpHiroshibaVoicevox` | `kotoba.jpHiroshibaVoicevox/src` | `voicevox.client`, `voicevox.speakers`, `voicevox.synthesize` (Kotoba project library) |
+| `kotoba.jiten` | `kotoba.jiten/src` | `jiten.core`, `jiten.link`, `jiten.revision`, `jiten.schema` (Kotoba project library) |
+| `kotoba.itinerary` | `kotoba.itinerary/src` | `kotoba.itinerary` (Kotoba project library) |
+| `kotoba.ipXact` | `kotoba.ipXact/src` | `ip-xact`, `ip-xact.bus-protocol`, `ip-xact.cdc`, `ip-xact.component` (Kotoba project library) |
+| `kotoba.ip` | `kotoba.ip/src` | `kotoba.ip.bus-protocol`, `kotoba.ip.cdc`, `kotoba.ip.ip-xact`, `kotoba.ip.noc` (Kotoba project library) |
+| `kotoba.sigv4` | `kotoba.sigv4/src` | `sigv4.core`, `sigv4.crypto`, `sigv4.protocols`, `sigv4.request` (Kotoba project library) |
+| `kotoba.ioIpniSpecs` | `kotoba.ioIpniSpecs/src` | `ipni.ad`, `ipni.advertise`, `ipni.announce`, `ipni.find` (Kotoba project library) |
+| `kotoba.ioIpfs` | `kotoba.ioIpfs/src` | `kotoba.lang.ipfs` (Kotoba project library) |
 | `kotoba.intWhoIcd10` | `kotoba.intWhoIcd10/src` | `icd10.chapters`, `icd10.claml`, `icd10.code`, `icd10.compare` (Kotoba project library) |
 | `kotoba.insurance` | `kotoba.insurance/src` | `kotoba.insurance`, `kotoba.insurance.eu`, `kotoba.insurance.export`, `kotoba.insurance.jp` (Kotoba project library) |
 | `kotoba.input` | `kotoba.input/src` | `input` (Kotoba project library) |

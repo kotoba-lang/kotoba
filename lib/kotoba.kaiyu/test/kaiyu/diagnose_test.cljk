@@ -1,0 +1,492 @@
+(ns kaiyu.diagnose-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [kaiyu.core :as kaiyu]
+            [kaiyu.diagnose :as dx]))
+
+(def win (kaiyu/window "2026-08-08" {:days 7}))
+
+(defn- report
+  [{:keys [visits dwell transitions since vocabulary live-since uninstrumented]
+    :or {since "2026-06-01"}}]
+  {:site "example.test"
+   :window win
+   :vocabulary (or vocabulary #{"home" "video" "pricing" "signup"})
+   :site-live-since live-since
+   :uninstrumented (or uninstrumented #{})
+   :sections {:visits (kaiyu/section win (or visits []) since)
+              :dwell (kaiyu/section win (or dwell []) since)
+              :transitions (kaiyu/section win (or transitions []) since)}})
+
+(deftest a-broken-instrument-outranks-everything-else
+  (testing "an unmeasured section on a site that was live suppresses the site
+            findings entirely — reporting both invites acting on the ones that
+            are easier to act on, which are exactly the possible artefacts"
+    (let [d (dx/diagnose (assoc-in (report {:live-since "2026-01-01"
+                                            :dwell [{:route "video" :bucket "lt10" :count 50}]})
+                                   [:sections :transitions]
+                                   (kaiyu/section win [] nil)))]
+      (is (:blocked? d))
+      (is (= :blocked (:severity (dx/top-finding d))))
+      (is (every? #(= "kaiyu.measurement" (namespace (:id %))) (:findings d))
+          "no site finding is reported while the instrument is in doubt"))))
+
+(deftest a-measured-empty-section-is-a-question-not-a-silence
+  (let [d (dx/diagnose (report {:visits [] :since "2026-06-01"}))
+        ids (set (map :id (:findings d)))]
+    (is (contains? ids :kaiyu.measurement/visits-empty-while-measured))
+    (is (not (:blocked? d)) "measured-but-empty is answerable, so the rest still runs")))
+
+(deftest a-partial-section-empty-beside-a-live-sibling-is-a-question
+  (testing "kotobase.net 2026-08-13: transitions held 0 rows since 08-07 while
+            visits — switched on the same day — counted 575. Nothing said so,
+            because the empty-row rule only looked at :measured sections"
+    (let [d (dx/diagnose (-> (report {})
+                             (assoc-in [:sections :visits]
+                                       (kaiyu/section win [{:source "direct" :count 569}
+                                                           {:source "search" :count 6}]
+                                                      "2026-08-05"))
+                             (assoc-in [:sections :dwell]
+                                       (kaiyu/section win [{:route "video" :bucket "60_179" :count 30}]
+                                                      "2026-08-05"))
+                             (assoc-in [:sections :transitions]
+                                       (kaiyu/section win [] "2026-08-05"))))
+          f (first (filter #(= :kaiyu.measurement/transitions-empty-while-collecting (:id %))
+                           (:findings d)))]
+      (is (some? f))
+      (is (= :high (:severity f)))
+      (is (= :dwell (get-in f [:evidence :witness]))
+          "the witness is chosen by name, so the same one is cited on every platform")
+      (is (= 1 (get-in f [:evidence :witness-rows])))
+      (is (not (:blocked? d))
+          "counts cannot separate 「誰も回遊していない」 from 「辺が emit されていない」,
+           so this asks rather than suppressing the site findings")
+      (is (= (:id f) (:id (dx/top-finding d)))
+          "a section two site rules silently draw on outranks a medium about the site"))))
+
+(deftest a-young-collector-is-still-allowed-to-be-empty
+  (testing "no sibling holds rows, so nothing rules out 'switched on an hour ago'"
+    (let [d (dx/diagnose (-> (report {})
+                             (assoc-in [:sections :visits] (kaiyu/section win [] "2026-08-05"))
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] "2026-08-05"))
+                             (assoc-in [:sections :transitions] (kaiyu/section win [] "2026-08-05"))))]
+      (is (empty? (filter #(str/ends-with? (name (:id %)) "-empty-while-collecting")
+                          (:findings d)))))))
+
+(deftest a-sibling-that-started-earlier-witnesses-nothing
+  (testing "every row it holds may predate the day this section was switched on"
+    (let [d (dx/diagnose (-> (report {})
+                             (assoc-in [:sections :visits]
+                                       (kaiyu/section win [{:source "direct" :count 400}]
+                                                      "2026-08-02"))
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))
+                             (assoc-in [:sections :transitions]
+                                       (kaiyu/section win [] "2026-08-05"))))]
+      (is (nil? (first (filter #(= :kaiyu.measurement/transitions-empty-while-collecting (:id %))
+                               (:findings d))))))))
+
+(deftest a-section-that-was-never-collected-is-not-this-finding
+  (testing "kotobase.net has no client beacon, so its dwell reports :not-measured
+            by construction — that is the :blocked rule's business, not this one"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-20"})
+                             (assoc-in [:sections :visits]
+                                       (kaiyu/section win [{:source "direct" :count 400}]
+                                                      "2026-08-05"))
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))
+                             (assoc-in [:sections :transitions]
+                                       (kaiyu/section win [] "2026-08-05"))))]
+      (is (empty? (filter #(= :dwell (get-in % [:evidence :section]))
+                          (filter #(str/ends-with? (name (:id %)) "-empty-while-collecting")
+                                  (:findings d))))))))
+
+(deftest a-site-that-was-not-live-yet-is-not-a-broken-instrument
+  (testing "no rows before the site existed is the correct answer, not a fault"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-20"})
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))
+                             (assoc-in [:sections :visits] (kaiyu/section win [] nil))
+                             (assoc-in [:sections :transitions] (kaiyu/section win [] nil))))]
+      (is (not (:blocked? d))))))
+
+(deftest a-declared-uninstrumented-section-is-not-a-broken-instrument
+  (testing "kotobase.net has no client beacon at all — its store returns
+            (section win [] nil) as a literal constant. Beacon stopped / read
+            threw / nobody came are all wrong, so nobody can close the issue;
+            and because :blocked short-circuits, leaving it standing silences
+            every site rule for that site permanently"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"
+                                      :uninstrumented #{:dwell}
+                                      :visits [{:source "direct" :count 679}
+                                               {:source "search" :count 7}]
+                                      :transitions [{:from "home" :to "support" :count 2}]})
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))))]
+      (is (not (:blocked? d)))
+      (is (empty? (filter #(= :kaiyu.measurement/dwell-not-measured (:id %)) (:findings d))))
+      (is (some? (first (filter #(= :kaiyu.acquisition/single-channel-direct (:id %))
+                                (:findings d))))
+          "the site rules the block was suppressing are evaluated again"))))
+
+(deftest a-declaration-is-reported-rather-than-dropped
+  (testing "a suppression the reader cannot see is indistinguishable from a pass"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01" :uninstrumented #{:dwell}})
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))))]
+      (is (= :uninstrumented (get-in d [:coverage :dwell :declared])))
+      (is (nil? (get-in d [:coverage :visits :declared]))
+          "only the declared section carries it"))))
+
+(deftest a-declaration-contradicted-by-its-own-data-is-blocked
+  (testing "the declaration must not become a mute switch: a site that starts
+            collecting the section, or a declaration copied onto the wrong site,
+            has to surface on the next tick instead of muting it"
+    (let [d (dx/diagnose (report {:live-since "2026-08-01"
+                                  :uninstrumented #{:dwell}
+                                  :dwell [{:route "video" :bucket "lt10" :count 50}]}))
+          f (dx/top-finding d)]
+      (is (:blocked? d))
+      (is (= :kaiyu.measurement/dwell-declared-uninstrumented-but-collecting (:id f)))
+      (is (= :blocked (:severity f)))
+      (is (= 1 (get-in f [:evidence :rows]))))))
+
+(deftest an-undeclared-empty-section-is-still-a-broken-instrument
+  (testing "shinshi.club 2026-08-14: transitions read collected-since nil while
+            dwell — client-observed, same beacon, same response — held ten rows.
+            That is the case this rule exists to catch. Only a declaration may
+            quiet a section, and declaring this one would delete the finding
+            rather than answer it"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-06-11"
+                                      :visits [{:source "direct" :count 17}]
+                                      :dwell [{:route "video" :bucket "lt10" :count 8}]})
+                             (assoc-in [:sections :transitions] (kaiyu/section win [] nil))))]
+      (is (:blocked? d))
+      (is (= :kaiyu.measurement/transitions-not-measured (:id (dx/top-finding d)))))))
+
+(deftest an-issue-drawn-partly-on-an-uninstrumented-section-says-so
+  (testing "『収集開始日が記録されていない』 is the wrong reason for a declared
+            section: the date is not missing, the collection does not exist"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"
+                                      :uninstrumented #{:dwell}
+                                      :transitions [{:from "home" :to "video" :count 3}]})
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))))
+          unreached (first (filter #(= :kaiyu.reach/unreached-signup (:id %)) (:findings d)))]
+      (is (some? unreached) "reach draws on [:transitions :dwell]")
+      (is (re-find #"この site は dwell を\*\*計測していない\*\*（宣言済み）"
+                   (:body (dx/->issue d unreached)))))))
+
+(deftest bounce-is-reported-per-route-with-its-numbers
+  (let [d (dx/diagnose (report {:dwell [{:route "pricing" :bucket "lt10" :count 45}
+                                        {:route "pricing" :bucket "30_59" :count 5}
+                                        {:route "video" :bucket "60_179" :count 30}]}))
+        f (first (filter #(= :kaiyu.attention/bounce-pricing (:id %)) (:findings d)))]
+    (is (some? f))
+    (is (= :high (:severity f)))
+    (is (= 50 (get-in f [:evidence :samples])))
+    (is (= 45 (get-in f [:evidence :under-10s])))
+    (is (re-find #"90%" (:title f)))
+    (testing "a route that holds attention is not reported"
+      (is (nil? (first (filter #(= :kaiyu.attention/bounce-video (:id %)) (:findings d))))))))
+
+(deftest a-thin-sample-does-not-become-a-finding
+  (testing "three visits is not a bounce rate, it is three visits"
+    (let [d (dx/diagnose (report {:dwell [{:route "pricing" :bucket "lt10" :count 3}]}))]
+      (is (empty? (filter #(= "kaiyu.attention" (namespace (:id %))) (:findings d)))))))
+
+(deftest a-dead-end-is-named-and-asked-about-not-asserted
+  (let [d (dx/diagnose (report {:transitions [{:from "home" :to "pricing" :count 12}
+                                              {:from "home" :to "video" :count 8}
+                                              {:from "video" :to "home" :count 4}]}))
+        f (first (filter #(= :kaiyu.journey/dead-end-pricing (:id %)) (:findings d)))]
+    (is (some? f))
+    (is (= 12 (get-in f [:evidence :inbound])))
+    (is (re-find #"終わってよい面か" (:question f))
+        "it asks whether ending here is correct rather than declaring a defect")
+    (testing "a route with an outbound edge is not a dead end"
+      (is (nil? (first (filter #(= :kaiyu.journey/dead-end-video (:id %)) (:findings d))))))))
+
+(deftest other-is-never-a-dead-end
+  (testing "`other` is the overflow bucket, not a page — a dead end there says
+            nothing anyone can act on"
+    (let [d (dx/diagnose (report {:transitions [{:from "home" :to "other" :count 99}]}))]
+      (is (empty? (filter #(= :kaiyu.journey/dead-end-other (:id %)) (:findings d)))))))
+
+(deftest an-unreached-page-is-low-severity
+  (let [d (dx/diagnose (report {:transitions [{:from "home" :to "video" :count 9}]
+                                :vocabulary #{"home" "video" "signup"}}))
+        f (first (filter #(= :kaiyu.reach/unreached-signup (:id %)) (:findings d)))]
+    (is (some? f))
+    (is (= :low (:severity f)) "a page with no traffic may be perfectly deliberate")))
+
+(deftest one-channel-carrying-everything-is-worth-knowing
+  (let [d (dx/diagnose (report {:visits [{:source "search" :count 95} {:source "direct" :count 3}]}))
+        f (first (filter #(= "kaiyu.acquisition" (namespace (:id %))) (:findings d)))]
+    (is (some? f))
+    (is (re-find #"止まったとき" (:question f)))
+    (testing "a mixed entry profile is not a finding"
+      (is (empty? (filter #(= "kaiyu.acquisition" (namespace (:id %)))
+                          (:findings (dx/diagnose (report {:visits [{:source "search" :count 40}
+                                                                    {:source "direct" :count 35}
+                                                                    {:source "social" :count 30}]})))))))))
+
+(deftest a-title-never-rounds-the-tail-away
+  (testing "itonami.cloud 2026-08-05〜08-11: 4756 of 4775 is 99.6%, and the 19
+            visits a rounded title erases are exactly the ones the question is
+            asking about"
+    (let [d (dx/diagnose (report {:visits [{:source "direct" :count 4756}
+                                           {:source "search" :count 10}
+                                           {:source "referral" :count 8}
+                                           {:source "campaign" :count 1}]}))
+          f (first (filter #(= "kaiyu.acquisition" (namespace (:id %))) (:findings d)))]
+      (is (some? f))
+      (is (= "到達の 99% が「direct」" (:title f)))))
+  (testing "100% is kept for a share that really is everything"
+    (let [d (dx/diagnose (report {:visits [{:source "direct" :count 40}]}))
+          f (first (filter #(= "kaiyu.acquisition" (namespace (:id %))) (:findings d)))]
+      (is (= "到達の 100% が「direct」" (:title f))))))
+
+(deftest findings-are-ranked-so-a-loop-can-take-the-first
+  (let [d (dx/diagnose (report {:dwell [{:route "pricing" :bucket "lt10" :count 40}]
+                                :transitions [{:from "home" :to "pricing" :count 12}]
+                                :visits [{:source "search" :count 99} {:source "direct" :count 1}]
+                                :vocabulary #{"home" "video" "pricing" "signup"}}))
+        sev (mapv :severity (:findings d))]
+    (is (= sev (vec (sort-by #(.indexOf [:blocked :high :medium :low] %) sev)))
+        "severity order, so `top-finding` really is the one to work on")
+    (is (= :high (:severity (dx/top-finding d))))))
+
+(deftest nothing-to-say-is-a-valid-round
+  (testing "a loop that must file an issue every round files noise on the
+            rounds when the site is fine, and noise is what makes a queue unread"
+    (let [d (dx/diagnose (report {:dwell [{:route "video" :bucket "60_179" :count 30}]
+                                  :transitions [{:from "home" :to "video" :count 20}
+                                                {:from "video" :to "home" :count 15}]
+                                  :visits [{:source "search" :count 20} {:source "direct" :count 18}]
+                                  :vocabulary #{"home" "video"}}))]
+      (is (empty? (:findings d)))
+      (is (nil? (dx/top-finding d))))))
+
+(deftest an-issue-states-what-was-measured-and-refuses-to-guess-why
+  (let [d (dx/diagnose (report {:dwell [{:route "pricing" :bucket "lt10" :count 40}]}))
+        issue (dx/->issue d (dx/top-finding d))]
+    (is (= :kaizen/open-issue (:kind issue)))
+    (is (re-find #"^\[example\.test\]" (:title issue)))
+    (is (re-find #"2026-08-02 〜 2026-08-08" (:body issue)) "the window is in the body, both ends")
+    (is (re-find #"\*\*なぜ\*\*は分からない" (:body issue))
+        "the issue says out loud which question the measurement cannot answer")
+    (is (re-find #"kaizen:example\.test:" (:id issue)))
+    (is (re-find #"根拠の範囲: この window 全体" (:body issue))
+        "a fully measured section says so, so the caveated case reads as different")
+    (testing "the id is stable for the same finding in the same window, so a
+              loop re-running does not open a second issue for one thing"
+      (is (= (:id issue) (:id (dx/->issue d (dx/top-finding d))))))))
+
+(deftest a-finding-off-a-partial-section-says-how-little-it-covers
+  (testing "babiniku.net 2026-08-11: eight home→chat edges, every one of them
+            recorded on the last day of the window, because that was the first
+            day the beacon produced a row. The numbers are real; a body that
+            calls them a week is not."
+    (let [d (dx/diagnose (-> (report {:dwell [{:route "video" :bucket "60_179" :count 30}]
+                                      :visits [{:source "search" :count 20}
+                                               {:source "direct" :count 18}]})
+                             (assoc-in [:sections :transitions]
+                                       (kaiyu/section win [{:from "home" :to "chat" :count 8}]
+                                                      "2026-08-08"))))
+          top (dx/top-finding d)
+          issue (dx/->issue d top)]
+      (is (= :kaiyu.journey/dead-end-chat (:id top))
+          "the rule still fires — gating it on :measured is a product decision, not this test's")
+      (is (= [:transitions] (:sections top)) "the finding carries where it came from")
+      (is (= {:state :partial :collected-since "2026-08-08"}
+             (get-in d [:coverage :transitions])))
+      (is (re-find #"2026-08-08 以降のみ" (:body issue))
+          "the body names the day the evidence actually starts")
+      (is (re-find #"window 全体の話として読まないこと" (:body issue))
+          "and says plainly not to read it as the whole window"))))
+
+(deftest a-suppressed-blocked-finding-does-not-silently-become-a-measured-one
+  (testing "a site that went live inside the window has its :not-measured
+            section suppressed as a fault — correctly — but the site rules keep
+            reading its rows, so the issue must not claim a known span"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-06"
+                                      :dwell [{:route "video" :bucket "60_179" :count 30}]
+                                      :visits [{:source "search" :count 20}
+                                               {:source "direct" :count 18}]})
+                             (assoc-in [:sections :transitions]
+                                       (kaiyu/section win [{:from "home" :to "chat" :count 8}] nil))))
+          dead-end (first (filter #(= :kaiyu.journey/dead-end-chat (:id %)) (:findings d)))]
+      (is (not (:blocked? d)))
+      (is (some? dead-end) "the site rule reads rows from a :not-measured section")
+      (is (re-find #"根拠の範囲: \*\*不明\*\*" (:body (dx/->issue d dead-end)))
+          "an unknown boundary is stated as unknown, never as the window"))))
+
+;; ── staleness: rows that are real and no longer arriving ──────────────
+;;
+;; `win` is 2026-08-02〜2026-08-08, so its trailing 3 days are 08-06〜08-08.
+
+(defn- with-recent [section days rows]
+  (assoc section :recent {:days days :rows rows}))
+
+(deftest a-section-that-stopped-beside-a-collecting-sibling-is-a-question
+  (testing "babiniku.net 2026-08-15: visits/dwell/transitions had been
+            byte-identical since 08-11 while the tick reported ok, because
+            measurement-state knows where collection began and nothing about
+            where it stopped"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                             (assoc-in [:sections :visits]
+                                       (with-recent (kaiyu/section win [{:source "direct" :count 9}]
+                                                                   "2026-08-03")
+                                                    3 4))
+                             (assoc-in [:sections :dwell]
+                                       (with-recent (kaiyu/section win [{:route "chat" :bucket "10_29" :count 2}]
+                                                                   "2026-08-04")
+                                                    3 0))
+                             (assoc-in [:sections :transitions]
+                                       (with-recent (kaiyu/section win [{:from "home" :to "chat" :count 8}]
+                                                                   "2026-08-04")
+                                                    3 0))))
+          f (first (filter #(= :kaiyu.measurement/transitions-stopped-while-sibling-collects (:id %))
+                           (:findings d)))]
+      (is (some? f))
+      (is (= :high (:severity f)))
+      (is (= :visits (get-in f [:evidence :witness]))
+          "the sibling with recent rows proves the instrument is still writing")
+      (is (= "2026-08-06" (get-in f [:evidence :trailing :from])))
+      (is (not (:blocked? d))
+          "never :blocked — a quiet site has this shape, and blocking would
+           silence every site finding for it permanently"))))
+
+(deftest a-whole-instrument-that-went-quiet-is-one-question-not-three
+  (let [stale (fn [rows since] (with-recent (kaiyu/section win rows since) 3 0))
+        d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                           (assoc-in [:sections :visits] (stale [{:source "direct" :count 9}] "2026-08-03"))
+                           (assoc-in [:sections :dwell] (stale [{:route "chat" :bucket "10_29" :count 2}] "2026-08-04"))
+                           (assoc-in [:sections :transitions] (stale [{:from "home" :to "chat" :count 8}] "2026-08-04"))))
+        stopped (filter #(= :kaiyu.measurement/collection-stopped (:id %)) (:findings d))]
+    (is (= 1 (count stopped)) "one event, not one finding per section")
+    (is (= [:dwell :transitions :visits] (get-in (first stopped) [:evidence :sections])))
+    (is (empty? (filter #(str/ends-with? (name (:id %)) "-stopped-while-sibling-collects")
+                        (:findings d)))
+        "with nothing fresh there is no witness, so the weaker reading is the honest one")
+    (is (not (:blocked? d)))
+    (is (some? (first (filter #(= :kaiyu.journey/dead-end-chat (:id %)) (:findings d))))
+        "the site findings are still reported — this suppresses nothing")))
+
+(deftest a-section-too-quiet-to-go-quiet-detectably-is-not-a-finding
+  (testing "shinshi.club 2026-08-29: dwell held ONE row in seven days, so its
+            own rate predicts 0.43 in three and zero is the EXPECTED
+            observation. It was reported :high 『stopped』 against a witness
+            whose ratio to it had not changed — one dwell per five visits over
+            the window, zero per four over the span — and would have gone on
+            being reported every day, because one old row can never re-enter
+            the trailing span"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                             (assoc-in [:sections :visits]
+                                       (with-recent (kaiyu/section win [{:source "direct" :count 5}]
+                                                                   "2026-08-03")
+                                                    3 4))
+                             (assoc-in [:sections :dwell]
+                                       (with-recent (kaiyu/section win [{:route "home" :bucket "lt10" :count 1}]
+                                                                   "2026-08-03")
+                                                    3 0))))]
+      (is (empty? (filter #(str/includes? (name (:id %)) "stopped") (:findings d)))
+          "one event in the window is not evidence of having stopped"))))
+
+(deftest a-section-with-volume-to-lose-still-reports-stopping
+  (testing "the floor guards the inference, not the finding: the same shape,
+            differing only in the quantity under test, still fires"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                             (assoc-in [:sections :visits]
+                                       (with-recent (kaiyu/section win [{:source "direct" :count 5}]
+                                                                   "2026-08-03")
+                                                    3 4))
+                             (assoc-in [:sections :dwell]
+                                       (with-recent (kaiyu/section win [{:route "home" :bucket "lt10" :count 40}]
+                                                                   "2026-08-03")
+                                                    3 0))))
+          f (first (filter #(= :kaiyu.measurement/dwell-stopped-while-sibling-collects (:id %))
+                           (:findings d)))]
+      (is (some? f) "forty events over seven days predict seventeen in three")
+      (is (= :high (:severity f))))))
+
+(deftest volume-is-counted-in-events-not-in-groups
+  (testing "one row standing for eight events and one standing for one are not
+            the same evidence; counting rows would call them equal"
+    (let [quiet (fn [n] (-> (report {:live-since "2026-08-01"})
+                            (assoc-in [:sections :visits]
+                                      (with-recent (kaiyu/section win [{:source "direct" :count 5}]
+                                                                  "2026-08-03")
+                                                   3 4))
+                            (assoc-in [:sections :transitions]
+                                      (with-recent (kaiyu/section win [{:from "home" :to "chat" :count n}]
+                                                                  "2026-08-03")
+                                                   3 0))
+                            dx/diagnose
+                            :findings
+                            (->> (filter #(str/includes? (name (:id %)) "stopped")))))]
+      (is (empty? (quiet 2)) "a single row of two events cannot show silence")
+      (is (seq (quiet 8)) "a single row of eight events can"))))
+
+(deftest rows-still-arriving-are-not-a-staleness-finding
+  (let [fresh (fn [rows since] (with-recent (kaiyu/section win rows since) 3 2))
+        d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                           (assoc-in [:sections :visits] (fresh [{:source "direct" :count 9}] "2026-08-03"))
+                           (assoc-in [:sections :dwell] (fresh [{:route "chat" :bucket "10_29" :count 2}] "2026-08-04"))
+                           (assoc-in [:sections :transitions] (fresh [{:from "home" :to "chat" :count 8}] "2026-08-04"))))]
+    (is (empty? (filter #(str/includes? (name (:id %)) "stopped") (:findings d))))
+    (is (empty? (filter #(= :kaiyu.measurement/collection-stopped (:id %)) (:findings d))))))
+
+(deftest a-caller-that-cannot-probe-behaves-exactly-as-before
+  (testing "only a caller that can re-query can produce :recent, and one that
+            cannot must not be made to guess"
+    (let [d (dx/diagnose (report {:live-since "2026-08-01"
+                                  :transitions [{:from "home" :to "chat" :count 8}]}))]
+      (is (empty? (filter #(str/includes? (name (:id %)) "stopped") (:findings d))))
+      (is (= {:state :measured :collected-since "2026-06-01"}
+             (get-in d [:coverage :transitions]))
+          "coverage gains nothing when there is nothing to add"))))
+
+(deftest a-collector-switched-on-inside-the-trailing-span-is-not-stale
+  (testing "a section that started collecting yesterday cannot have been silent
+            for the last three days; reading it as stale reports its youth as a
+            fault — the shape :partial was added to prevent"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                             (assoc-in [:sections :transitions]
+                                       (with-recent (kaiyu/section win [{:from "home" :to "chat" :count 8}]
+                                                                   "2026-08-07")
+                                                    3 0))))]
+      (is (empty? (filter #(str/includes? (name (:id %)) "stopped") (:findings d)))))))
+
+(deftest a-declared-uninstrumented-section-is-never-stale
+  (testing "a section nobody collects has no rows to stop arriving"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01" :uninstrumented #{:dwell}})
+                             (assoc-in [:sections :dwell] (kaiyu/section win [] nil))
+                             (assoc-in [:sections :visits]
+                                       (with-recent (kaiyu/section win [{:source "direct" :count 9}]
+                                                                   "2026-08-03")
+                                                    3 0))
+                             (assoc-in [:sections :transitions]
+                                       (with-recent (kaiyu/section win [{:from "home" :to "chat" :count 8}]
+                                                                   "2026-08-03")
+                                                    3 0))))
+          stopped (first (filter #(= :kaiyu.measurement/collection-stopped (:id %)) (:findings d)))]
+      (is (some? stopped))
+      (is (= [:transitions :visits] (get-in stopped [:evidence :sections]))
+          "the uninstrumented section is not counted among those that went quiet"))))
+
+(deftest the-issue-body-states-both-ends-of-the-span
+  (testing "「2026-08-11 以降のみ」 names the near end and a reader completes the
+            far one as 『今日まで』; on babiniku.net that sentence was printed for
+            four days about rows that all fell on 08-10 and 08-11"
+    (let [d (dx/diagnose (-> (report {:live-since "2026-08-01"})
+                             (assoc-in [:sections :visits]
+                                       (with-recent (kaiyu/section win [{:source "direct" :count 9}]
+                                                                   "2026-08-03")
+                                                    3 1))
+                             (assoc-in [:sections :transitions]
+                                       (with-recent (kaiyu/section win [{:from "home" :to "chat" :count 8}]
+                                                                   "2026-08-04")
+                                                    3 0))))
+          dead-end (first (filter #(= :kaiyu.journey/dead-end-chat (:id %)) (:findings d)))
+          body (:body (dx/->issue d dead-end))]
+      (is (some? dead-end))
+      (is (re-find #"2026-08-04 以降のみ" body) "the near end is still named")
+      (is (re-find #"直近 3 日（2026-08-06〜2026-08-08）は transitions とも 0 行" body)
+          "and so is the far one")
+      (is (re-find #"window の終わりまで続いた話ではない" body)))))

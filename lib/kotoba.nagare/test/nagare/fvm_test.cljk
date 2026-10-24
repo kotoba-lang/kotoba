@@ -1,0 +1,205 @@
+(ns nagare.fvm-test
+  "Method-of-manufactured-solutions verification of the Laplacian operator: a
+  Poisson problem with a known analytic field, checking both accuracy and
+  second-order mesh convergence."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [nagare.mesh :as mesh]
+            [nagare.field :as field]
+            [nagare.fvm :as fvm]
+            [nagare.linsolve :as ls]))
+
+(defn- poisson-l2-error
+  "Solve nabla^2 phi = f on an n x n unit square with phi=sin(pi x)sin(pi y)
+  (zero Dirichlet), f = -2 pi^2 phi, and return the discrete L2 error at cell
+  centres. Recall the operator is the positive-definite negative-Laplacian, so the
+  Poisson RHS is `-f V + (Dirichlet source)`."
+  [n]
+  (let [m (mesh/block-mesh {:nx n :ny n :lx 1.0 :ly 1.0})
+        bc {:left {:type :fixed-value :value 0.0} :right {:type :fixed-value :value 0.0}
+            :bottom {:type :fixed-value :value 0.0} :top {:type :fixed-value :value 0.0}}
+        pf (field/vol-scalar m 0.0 bc)
+        L (fvm/laplacian m 1.0 pf)
+        centres (:cell-centres m)
+        nc (:n-cells m)
+        ^doubles vol (:volumes m)
+        ^doubles src (:source L)
+        f (mapv (fn [[x y]] (* -2.0 Math/PI Math/PI
+                              (Math/sin (* Math/PI x)) (Math/sin (* Math/PI y)))) centres)
+        b (double-array nc)
+        _ (dotimes [c nc] (aset b c (+ (- (* (nth f c) (aget vol c))) (aget src c))))
+        {:keys [x]} (ls/pcg L b {:tol 1e-12 :max-iter 4000})
+        exact (mapv (fn [[x y]] (* (Math/sin (* Math/PI x)) (Math/sin (* Math/PI y)))) centres)]
+    (Math/sqrt (/ (reduce + (map (fn [xi e] (let [d (- xi e)] (* d d))) x exact)) nc))))
+
+(deftest laplacian-poisson-mms
+  (let [e16 (poisson-l2-error 16)
+        e32 (poisson-l2-error 32)]
+    (testing "discrete solution matches the analytic field"
+      (is (< e16 5e-3) (str "L2 error too large: " e16)))
+    (testing "refining the mesh reduces the error (≈ 2nd order)"
+      (is (< e32 e16))
+      (is (> (/ e16 e32) 3.0) (str "convergence ratio only " (/ e16 e32))))))
+
+(deftest green-gauss-gradient-is-exact-for-a-linear-field
+  (testing "Green-Gauss recovers the exact constant gradient of φ=a·x+b·y in interior cells"
+    (let [a 2.0 b -3.0
+          nx 6 ny 6
+          m (mesh/block-mesh {:nx nx :ny ny :lx 1.0 :ly 1.0})
+          centres (:cell-centres m)
+          ^doubles vol (:volumes m)
+          ;; zeroGradient boundaries: irrelevant for interior cells (all faces internal)
+          zg {:left {:type :zero-gradient} :right {:type :zero-gradient}
+              :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+          fld (field/vol-scalar m (fn [c] (let [[x y] (nth centres c)] (+ (* a x) (* b y)))) zg)
+          [^doubles gx ^doubles gy] (fvm/grad-sf m fld)
+          ;; interior cells = those not touching a domain boundary (1..nx-2, 1..ny-2)
+          interior (for [j (range 1 (dec ny)) i (range 1 (dec nx))] (+ (* j nx) i))]
+      (is (seq interior))
+      (doseq [c interior]
+        (is (< (Math/abs (- (/ (aget gx c) (aget vol c)) a)) 1e-9)
+            (str "∂φ/∂x wrong in cell " c))
+        (is (< (Math/abs (- (/ (aget gy c) (aget vol c)) b)) 1e-9)
+            (str "∂φ/∂y wrong in cell " c))))))
+
+(deftest laplacian-operator-properties
+  (let [m (mesh/block-mesh {:nx 5 :ny 4})
+        n (:n-cells m)]
+    (testing "pure-Neumann Laplacian annihilates a constant field (discrete consistency)"
+      (let [zg {:left {:type :zero-gradient} :right {:type :zero-gradient}
+                :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+            L (fvm/laplacian m 1.0 (field/vol-scalar m 0.0 zg))
+            Lc (ls/mat-vec L (double-array n 7.0))]
+        (dotimes [i n]
+          (is (< (Math/abs (aget ^doubles Lc i)) 1e-9)
+              (str "constant not annihilated at cell " i)))))
+    (testing "the operator is symmetric (upper == lower) and has a positive diagonal"
+      (let [bc {:left {:type :fixed-value :value 1.0} :right {:type :zero-gradient}
+                :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+            L (fvm/laplacian m 1.0 (field/vol-scalar m 0.0 bc))
+            ^doubles up (:upper L) ^doubles lo (:lower L) ^doubles dg (:diag L)]
+        (dotimes [f (count up)] (is (== (aget up f) (aget lo f))))
+        (dotimes [i n] (is (pos? (aget dg i)) (str "non-positive diagonal at " i)))))
+    (testing "a fixedValue patch makes boundary-adjacent rows strictly diagonally dominant"
+      (let [bc {:left {:type :fixed-value :value 1.0} :right {:type :zero-gradient}
+                :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+            L (fvm/laplacian m 1.0 (field/vol-scalar m 0.0 bc))
+            ^doubles dg (:diag L) ^ints own (:owner L) ^ints nei (:neighbour L)
+            ^doubles up (:upper L)
+            offsum (double-array n)]
+        ;; accumulate |off-diagonal| per row from the face list
+        (dotimes [f (count up)]
+          (let [o (aget own f) p (aget nei f) w (Math/abs (aget up f))]
+            (aset offsum o (+ (aget offsum o) w))
+            (aset offsum p (+ (aget offsum p) w))))
+        ;; the left-column cells (i=0) border the fixedValue patch ⇒ strict dominance
+        (doseq [j (range 4)]
+          (let [c (* j 5)]                       ; i=0 column, nx=5
+            (is (> (aget dg c) (aget offsum c))
+                (str "row " c " should be strictly diagonally dominant"))))))))
+
+(deftest scalar-transport-obeys-maximum-principle
+  (testing "upwind convection-diffusion of a passive scalar from φ=1 (left) to φ=0
+            (right) in a uniform rightward flux stays bounded in [0,1] and monotone"
+    (let [nx 20 ny 4 dx 0.05 dy 0.05 u 1.0 gamma 0.02
+          m (mesh/block-mesh {:nx nx :ny ny :lx (* nx dx) :ly (* ny dy)})
+          nv (* (dec nx) ny)
+          ;; uniform rightward flux: +x internal faces carry u·dy, horizontals 0;
+          ;; left patch is inflow (−u·dy), right is outflow (+u·dy), top/bottom 0
+          phi {:internal (let [a (double-array (:n-internal m))]
+                           (dotimes [f nv] (aset a f (* u dy))) a)
+               :patches {:left   (double-array ny (- (* u dy)))
+                         :right  (double-array ny (* u dy))
+                         :bottom (double-array nx 0.0)
+                         :top    (double-array nx 0.0)}}
+          bc {:left {:type :fixed-value :value 1.0} :right {:type :fixed-value :value 0.0}
+              :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+          fld (field/vol-scalar m 0.5 bc)
+          A (fvm/convection-diffusion m gamma phi fld)
+          {:keys [x]} (ls/bicgstab A (:source A) {:tol 1e-11 :max-iter 1000})
+          n (:n-cells m)]
+      (testing "no over/undershoot — every cell value lies within the boundary values"
+        (dotimes [c n]
+          (is (<= -1e-9 (aget ^doubles x c) (+ 1.0 1e-9))
+              (str "cell " c " = " (aget ^doubles x c) " violates the maximum principle"))))
+      (testing "the profile decreases monotonically from inlet to outlet along a row"
+        (let [row (mapv (fn [i] (aget ^doubles x (+ (* 1 nx) i))) (range nx))]
+          (is (apply > row) (str "row not strictly decreasing: " row)))))))
+
+(deftest momentum-boundary-inflow
+  (testing "the momentum operator's boundary INFLOW branch (F<0 at a fixedValue inlet)
+            adds the convected wall momentum to the source — untested by the cavity,
+            whose walls all carry zero flux"
+    (let [m (mesh/block-mesh {:nx 3 :ny 3})
+          U (field/vol-vector m [0.0 0.0]
+                              {:left {:type :fixed-value :value [2.0 0.0]}   ; inlet
+                               :right {:type :zero-gradient}
+                               :bottom {:type :zero-gradient} :top {:type :zero-gradient}})
+          ;; left patch carries inflow (F<0); everything else zero flux
+          phi {:internal (double-array (:n-internal m))
+               :patches {:left (double-array 3 -1.0) :right (double-array 3 0.0)
+                         :bottom (double-array 3 0.0) :top (double-array 3 0.0)}}
+          M (fvm/momentum m {:nu 1.0e-4 :dt 1.0e12} U phi U)  ; huge dt ⇒ ddt≈0, isolate inflow
+          ^doubles sx (:sx M)]
+      (testing "inlet-column cells (i=0) get a positive x-momentum source"
+        (doseq [c [0 3 6]] (is (pos? (aget sx c)) (str "inlet cell " c " sx>0"))))
+      (testing "outlet-column cells (i=2, no inflow, ddt≈0) have ~zero source"
+        (doseq [c [2 5 8]] (is (< (Math/abs (aget sx c)) 1e-6) (str "cell " c)))))))
+
+(deftest scalar-transport-reverse-flow-bounded
+  (testing "leftward flux (F<0) exercises the inflow/outflow convection branches; the
+            scalar stays bounded in [0,1] and rises monotonically toward the right inlet"
+    (let [nx 20 ny 4 u -1.0 gamma 0.05 dy (/ 0.2 ny)     ; u<0 ⇒ flow toward −x
+          m (mesh/block-mesh {:nx nx :ny ny :lx 1.0 :ly 0.2})
+          nv (* (dec nx) ny)
+          phi {:internal (let [a (double-array (:n-internal m))]
+                           (dotimes [f nv] (aset a f (* u dy))) a)   ; negative flux
+               :patches {:left   (double-array ny (- (* u dy)))      ; +|u|dy ⇒ outflow
+                         :right  (double-array ny (* u dy))          ; −|u|dy ⇒ inflow
+                         :bottom (double-array nx 0.0)
+                         :top    (double-array nx 0.0)}}
+          bc {:left {:type :fixed-value :value 0.0} :right {:type :fixed-value :value 1.0}
+              :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+          A (fvm/convection-diffusion m gamma phi (field/vol-scalar m 0.0 bc))
+          {:keys [x]} (ls/bicgstab A (:source A) {:tol 1e-11 :max-iter 2000})
+          n (:n-cells m)]
+      (testing "no over/undershoot under reverse flow"
+        (dotimes [c n] (is (<= -1e-9 (aget ^doubles x c) (+ 1.0 1e-9)))))
+      (testing "the profile rises monotonically toward the right (the inlet)"
+        (let [row (mapv (fn [i] (aget ^doubles x (+ (* 1 nx) i))) (range nx))]
+          (is (apply < row) (str "row not strictly increasing: " row)))))))
+
+(defn- transport-l2-error
+  "Solve steady 1-D convection-diffusion φ(0)=0, φ(1)=1 at uniform velocity u and
+  diffusivity Γ on an nx×4 mesh, and return the L2 error against the analytic
+  exponential φ(x)=(e^{Pe x}−1)/(e^{Pe}−1), Pe=uL/Γ."
+  [nx]
+  (let [ny 4 lx 1.0 ly 0.2 u 1.0 gamma 0.2
+        dy (/ ly ny)
+        m (mesh/block-mesh {:nx nx :ny ny :lx lx :ly ly})
+        nv (* (dec nx) ny)
+        phi {:internal (let [a (double-array (:n-internal m))]
+                         (dotimes [f nv] (aset a f (* u dy))) a)
+             :patches {:left   (double-array ny (- (* u dy)))
+                       :right  (double-array ny (* u dy))
+                       :bottom (double-array nx 0.0)
+                       :top    (double-array nx 0.0)}}
+        bc {:left {:type :fixed-value :value 0.0} :right {:type :fixed-value :value 1.0}
+            :bottom {:type :zero-gradient} :top {:type :zero-gradient}}
+        A (fvm/convection-diffusion m gamma phi (field/vol-scalar m 0.0 bc))
+        {:keys [x]} (ls/bicgstab A (:source A) {:tol 1e-12 :max-iter 4000})
+        Pe (/ (* u lx) gamma)
+        exact (fn [xx] (/ (- (Math/exp (* Pe xx)) 1.0) (- (Math/exp Pe) 1.0)))
+        centres (:cell-centres m) n (:n-cells m)]
+    (Math/sqrt (/ (reduce + (map (fn [c] (let [d (- (aget ^doubles x c)
+                                                    (exact (first (nth centres c))))]
+                                           (* d d)))
+                                 (range n))) n))))
+
+(deftest scalar-transport-converges-to-analytic-exponential
+  (testing "upwind convection-diffusion converges to the exact 1-D exponential profile
+            as the mesh refines (first-order — false diffusion ∝ Δx → 0)"
+    (let [e40 (transport-l2-error 40)
+          e80 (transport-l2-error 80)]
+      (is (< e40 0.05) (str "coarse error implausibly large: " e40))
+      (is (< e80 e40) "refining reduces the error toward the analytic solution")
+      (is (> (/ e40 e80) 1.5) (str "convergence ratio only " (/ e40 e80))))))
