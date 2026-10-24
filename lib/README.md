@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kamiMangakaSceneAuthor` | `kotoba.kamiMangakaSceneAuthor/src` | `kami.mangaka.scene` (Kotoba project library) |
 | `kotoba.kamiMangakaScene` | `kotoba.kamiMangakaScene/src` | `mangaka-scene`, `mangaka-scene.camera`, `mangaka-scene.lexicon`, `mangaka-scene.pose` (Kotoba project library) |
 | `kotoba.kamiMangakaRender` | `kotoba.kamiMangakaRender/src` | `kami.mangaka.render` (Kotoba project library) |
 | `kotoba.kamiMangakaQa` | `kotoba.kamiMangakaQa/src` | `kami.mangaka.qa.axes`, `kami.mangaka.qa.geometry`, `kami.mangaka.qa.overlay`, `kami.mangaka.qa.perception` (Kotoba project library) |
