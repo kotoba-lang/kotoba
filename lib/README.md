@@ -70,6 +70,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.did` | `org.w3.did/src` | `did.core` (an external specification, publisher w3.org) |
 | `org.w3.nquads` | `org.w3.nquads/src` | `nquads.core` (an external specification, publisher w3.org) |
 | `org.w3.jsonLdApi` | `org.w3.jsonLdApi/src` | `json-ld-api.core`, `json-ld-api.to-rdf` (an external specification, publisher w3.org) |
+| `org.w3.svg` | `org.w3.svg/src` | `svg.core`, `svg.css`, `svg.reader`, `svg.shapes` (an external specification, publisher w3.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
