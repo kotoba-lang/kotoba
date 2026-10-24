@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.erc20` | `kotoba.erc20/src` | `erc20.core`, `erc20.permit` (Kotoba project library) |
 | `kotoba.engineerRender` | `kotoba.engineerRender/src` | `engineer-render`, `engineer-render.color-map`, `engineer-render.draw-list`, `engineer-render.viewport` (Kotoba project library) |
 | `kotoba.engineerIo` | `kotoba.engineerIo/src` | `engineer-io`, `engineer-io.format`, `engineer-io.gerber`, `engineer-io.step` (Kotoba project library) |
 | `kotoba.engineer` | `kotoba.engineer/src` | `engineer`, `engineer.constraint`, `engineer.drc`, `engineer.grid` (Kotoba project library) |

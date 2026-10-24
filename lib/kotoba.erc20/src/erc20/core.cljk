@@ -1,0 +1,283 @@
+(ns erc20.core
+  "ERC-20 calldata construction + return-value decoding + exact decimal
+  unit conversion. Pure `.cljc`, ZERO dependencies, genuinely dual-platform
+  (:clj AND :cljs — no throwing stubs anywhere in this namespace).
+
+  WHY THE SELECTORS ARE PINNED RATHER THAN HASHED: a 4-byte function selector is
+  `keccak256(signature)[0..4]`. The selectors of the ERC-20 standard are
+  CONSTANTS, so they can be pinned here and *verified* against keccak256 in a
+  test instead of recomputed at runtime — which keeps this namespace free of any
+  runtime dependency and free of a hash implementation on both platforms.
+  `test/erc20/selector_test.cljk` does exactly that — it computes all 12
+  selectors with eth-crypto (a test-only dep) and asserts they equal the
+  constants below, so nobody has to trust a hand-typed hex string.
+
+  (eth-crypto's keccak256 has SINCE been ported to cljs, so runtime hashing is
+  no longer impossible here. Pinning stays anyway, on its own merits: this
+  namespace keeps ZERO runtime dependencies, and a constant that is verified in
+  CI is strictly better than one recomputed on every call. What changed is that
+  the pinning is now a choice rather than the only option.)
+
+  Static-type ABI encoding is also just 32-byte word padding, so no ABI
+  encoder dependency is needed either. Everything here is string arithmetic
+  plus one tiny bignum reader-conditional (`java.math.BigInteger` / `js/BigInt`
+  — both platforms have one, unlike modInverse/modPow).
+
+  NUMERIC INPUTS: pass token amounts as STRINGS (decimal `\"1000000\"` or
+  `0x`-hex), not as JS/JVM numbers. A `uint256` does not fit in a double, and
+  ClojureScript numbers lose precision above 2^53 BEFORE this namespace ever
+  sees them. `->units` (below) produces exactly such a string from a
+  human-facing decimal amount, and does it with string arithmetic so no float
+  ever touches a balance.
+
+  WHAT THIS NAMESPACE DOES NOT DO: it does not hash, sign, or send anything,
+  and it does not EIP-55 checksum a decoded address (that needs keccak256 —
+  pass the result to eth-crypto/eip55-checksum on the JVM if you need it).
+  EIP-2612 permit typed-data lives in `erc20.permit`."
+  (:require [kotoba.lang.text :as str]))
+
+;; ─── function selectors (verified against keccak256 in selector_test) ─────
+
+(def selectors
+  "ERC-20 (+ EIP-2612) 4-byte function selectors, keyed by canonical signature.
+  Every entry is asserted == keccak256(signature)[0..4] by selector_test."
+  {"transfer(address,uint256)"                                        "a9059cbb"
+   "transferFrom(address,address,uint256)"                            "23b872dd"
+   "approve(address,uint256)"                                         "095ea7b3"
+   "allowance(address,address)"                                       "dd62ed3e"
+   "balanceOf(address)"                                               "70a08231"
+   "totalSupply()"                                                    "18160ddd"
+   "decimals()"                                                       "313ce567"
+   "symbol()"                                                         "95d89b41"
+   "name()"                                                           "06fdde03"
+   "nonces(address)"                                                  "7ecebe00"
+   "DOMAIN_SEPARATOR()"                                               "3644e515"
+   "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)"     "d505accf"})
+
+(defn selector
+  "The 4-byte selector (bare lowercase hex, no 0x) for a canonical signature.
+  Throws on an unknown signature rather than guessing — this namespace cannot
+  compute keccak256 portably, so an unpinned signature is an error, not a
+  fallback."
+  [signature]
+  (or (get selectors signature)
+      (throw (ex-info (str "erc20: no pinned selector for " (pr-str signature)
+                           " — add it to erc20.core/selectors together with its"
+                           " keccak256 assertion in selector_test.cljc"
+                           " (this namespace cannot compute keccak256 portably)")
+                      {:signature signature :known (sort (keys selectors))}))))
+
+;; ─── hex / word helpers ──────────────────────────────────────────────────
+
+(def max-uint256
+  "2^256 - 1 as a decimal string — the conventional \"infinite\" ERC-20
+  allowance. Prefer an exact allowance where the UX allows it; an unlimited
+  approval to a contract is a standing withdrawal right over that token."
+  "115792089237316195423570985008687907853269984665640564039457584007913129639935")
+
+(defn strip0x [s] (if (str/starts-with? s "0x") (subs s 2) s))
+
+(defn- ->big
+  "Coerce a non-negative integer input (int, decimal string, 0x-hex string, or
+  a platform bignum) to the platform's bignum. js/BigInt already accepts all of
+  those forms, so only the JVM side needs to dispatch on them."
+  [v]
+  #?(:clj (cond
+            (instance? java.math.BigInteger v) v
+            (and (string? v) (str/starts-with? v "0x"))
+            (java.math.BigInteger. (strip0x v) 16)
+            (string? v) (java.math.BigInteger. ^String (str/trim v))
+            :else       (biginteger v))
+     :cljs (js/BigInt (if (number? v) v (str/trim (str v))))))
+
+(defn- big->hex [b]
+  #?(:clj (.toString ^java.math.BigInteger b 16)
+     :cljs (.toString b 16)))
+
+(defn- big->dec [b]
+  #?(:clj (.toString ^java.math.BigInteger b 10)
+     :cljs (.toString b 10)))
+
+(defn- pad-word
+  "Left-pad bare hex to one 32-byte (64 hex char) ABI word."
+  [hex]
+  (let [h (str/lower hex)]
+    (when (> (count h) 64)
+      (throw (ex-info "erc20: value exceeds one 32-byte ABI word" {:hex h})))
+    (str (apply str (repeat (- 64 (count h)) "0")) h)))
+
+(defn uint-word
+  "Encode a non-negative integer as one ABI word (uint8 … uint256 all share
+  this encoding)."
+  [v]
+  (pad-word (big->hex (->big v))))
+
+(defn address-word
+  "Encode a 20-byte address as one ABI word (left-padded). Validates length so
+  a truncated or mistyped address fails here rather than becoming a silent
+  transfer to a different address."
+  [address]
+  (let [h (str/lower (strip0x (str address)))]
+    (when-not (and (= 40 (count h)) (re-matches #"[0-9a-f]{40}" h))
+      (throw (ex-info "erc20: not a 20-byte hex address" {:address address})))
+    (pad-word h)))
+
+(defn bytes32-word
+  "Encode an already-32-byte value (e.g. a signature's r/s) as one ABI word."
+  [v]
+  (let [h (str/lower (strip0x (str v)))]
+    (when-not (= 64 (count h))
+      (throw (ex-info "erc20: not a 32-byte value" {:value v})))
+    (pad-word h)))
+
+(defn calldata
+  "`signature` + already-encoded words -> 0x… calldata."
+  [signature words]
+  (str "0x" (selector signature) (apply str words)))
+
+;; ─── calldata builders ───────────────────────────────────────────────────
+
+(defn transfer
+  "ERC-20 `transfer(to, amount)` calldata. `amount` is in the token's smallest
+  unit — see `->units`."
+  [to amount]
+  (calldata "transfer(address,uint256)" [(address-word to) (uint-word amount)]))
+
+(defn transfer-from
+  "ERC-20 `transferFrom(from, to, amount)` calldata."
+  [from to amount]
+  (calldata "transferFrom(address,address,uint256)"
+            [(address-word from) (address-word to) (uint-word amount)]))
+
+(defn approve
+  "ERC-20 `approve(spender, amount)` calldata. Pass `max-uint256` for an
+  unlimited allowance, but prefer an exact amount."
+  [spender amount]
+  (calldata "approve(address,uint256)" [(address-word spender) (uint-word amount)]))
+
+(defn allowance
+  "ERC-20 `allowance(owner, spender)` calldata (eth_call)."
+  [owner spender]
+  (calldata "allowance(address,address)" [(address-word owner) (address-word spender)]))
+
+(defn balance-of
+  "ERC-20 `balanceOf(owner)` calldata (eth_call)."
+  [owner]
+  (calldata "balanceOf(address)" [(address-word owner)]))
+
+(defn total-supply [] (calldata "totalSupply()" []))
+(defn decimals [] (calldata "decimals()" []))
+(defn symbol-of [] (calldata "symbol()" []))
+(defn name-of [] (calldata "name()" []))
+
+(defn nonces
+  "EIP-2612 `nonces(owner)` calldata (eth_call) — the permit nonce to sign next."
+  [owner]
+  (calldata "nonces(address)" [(address-word owner)]))
+
+(defn domain-separator-call
+  "EIP-2612 `DOMAIN_SEPARATOR()` calldata (eth_call). Useful as a cross-check
+  that a locally built EIP-712 domain matches what the token actually enforces
+  — a mismatched domain makes every permit signature silently invalid."
+  []
+  (calldata "DOMAIN_SEPARATOR()" []))
+
+(defn permit
+  "EIP-2612 `permit(owner, spender, value, deadline, v, r, s)` calldata — the
+  gasless-approval path: the owner signs `erc20.permit/typed-data` off-chain
+  and anyone submits this. Removes the separate approve transaction (and its
+  gas, and its second wallet confirmation) from a swap flow."
+  [{:keys [owner spender value deadline v r s]}]
+  (calldata "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)"
+            [(address-word owner) (address-word spender)
+             (uint-word value) (uint-word deadline)
+             (uint-word v) (bytes32-word r) (bytes32-word s)]))
+
+;; ─── return-value decoding ───────────────────────────────────────────────
+
+(defn decode-uint
+  "eth_call return data -> the uint as a DECIMAL STRING (not a number: a
+  uint256 balance does not fit in a double, and returning one would corrupt
+  large balances on both platforms)."
+  [ret]
+  (let [h (strip0x (str ret))]
+    (when (< (count h) 64)
+      (throw (ex-info "erc20: uint return data shorter than one word" {:ret ret})))
+    (big->dec (->big (str "0x" (subs h 0 64))))))
+
+(defn decode-bool [ret]
+  (not= 0 #?(:clj (compare (->big (str "0x" (subs (strip0x (str ret)) 0 64)))
+                           java.math.BigInteger/ZERO)
+             :cljs (js/Number (->big (str "0x" (subs (strip0x (str ret)) 0 64)))))))
+
+(defn decode-address
+  "eth_call return data -> lowercase 0x… address. NOT EIP-55 checksummed
+  (checksumming needs keccak256, which is :clj-only in eth-crypto — pass this
+  through eth-crypto/eip55-checksum on the JVM if you need the mixed-case form)."
+  [ret]
+  (let [h (strip0x (str ret))]
+    (str "0x" (subs h 24 64))))
+
+(defn- hex->utf8
+  "Bare hex -> string. ASCII/UTF-8 via the platform's byte decoder."
+  [hex]
+  (let [bytes (map (fn [i] (#?(:clj Long/parseLong :cljs js/parseInt)
+                            (subs hex (* 2 i) (+ (* 2 i) 2)) 16))
+                   (range (quot (count hex) 2)))]
+    #?(:clj  (String. (byte-array (map unchecked-byte bytes)) "UTF-8")
+       :cljs (.decode (js/TextDecoder.) (js/Uint8Array.from (clj->js bytes))))))
+
+(defn decode-string
+  "eth_call return data for a dynamic `string` (name()/symbol()) -> the string.
+  Reads the ABI head offset then the length-prefixed body, so a token whose
+  metadata sits at a non-standard offset still decodes correctly."
+  [ret]
+  (let [h (strip0x (str ret))
+        offset (* 2 #?(:clj (Long/parseLong (subs h 0 64) 16)
+                       :cljs (js/Number (->big (str "0x" (subs h 0 64))))))
+        len (* 2 #?(:clj (Long/parseLong (subs h offset (+ offset 64)) 16)
+                    :cljs (js/Number (->big (str "0x" (subs h offset (+ offset 64)))))))
+        body (subs h (+ offset 64) (+ offset 64 len))]
+    (hex->utf8 body)))
+
+;; ─── exact decimal <-> smallest-unit conversion (no floats, ever) ────────
+
+(defn ->units
+  "Human decimal amount (string, e.g. \"1.5\") + token decimals -> smallest-unit
+  DECIMAL STRING (\"1500000\" at 6 decimals). Pure string arithmetic: no float
+  and no bignum, so `0.1` cannot become `0.09999999999999999` on the way to a
+  transfer.
+
+  Throws if `amount` carries more fractional digits than the token has
+  decimals, instead of silently truncating — losing a user's dust quietly is
+  worse than failing loudly. Pass `:truncate? true` to opt into truncation."
+  ([amount decimals] (->units amount decimals {}))
+  ([amount decimals {:keys [truncate?]}]
+   (let [s (str/trim (str amount))
+         _ (when-not (re-matches #"\d*(\.\d*)?" s)
+             (throw (ex-info "erc20: not a non-negative decimal amount" {:amount amount})))
+         [int-part frac-part] (str/split s #"\." 2)
+         int-part (or (not-empty int-part) "0")
+         frac (or frac-part "")]
+     (when (and (> (count frac) decimals) (not truncate?))
+       (throw (ex-info (str "erc20: amount has " (count frac) " fractional digits but the"
+                            " token has " decimals " decimals — this would silently lose value")
+                       {:amount amount :decimals decimals})))
+     (let [frac (subs frac 0 (min (count frac) decimals))
+           frac (str frac (apply str (repeat (- decimals (count frac)) "0")))
+           joined (str/replace (str int-part frac) #"^0+(?=\d)" "")]
+       joined))))
+
+(defn ->display
+  "Smallest-unit amount (decimal string) + token decimals -> human decimal
+  string, trailing zeros trimmed (\"1500000\" @6 -> \"1.5\"). Pure string
+  arithmetic — the inverse of `->units`."
+  [units decimals]
+  (let [s (str/replace (str/trim (str units)) #"^0+(?=\d)" "")
+        s (if (< (count s) (inc decimals))
+            (str (apply str (repeat (- (inc decimals) (count s)) "0")) s)
+            s)
+        cut (- (count s) decimals)
+        int-part (subs s 0 cut)
+        frac (str/replace (subs s cut) #"0+$" "")]
+    (if (empty? frac) int-part (str int-part "." frac))))
