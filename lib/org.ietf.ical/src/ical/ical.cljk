@@ -1,0 +1,311 @@
+(ns ical.ical
+  "iCalendar (RFC 5545) text ⇄ EDN model, with zero third-party deps and portable .cljc.
+
+  `parse-str` / `emit-str` cover the well-formed iCalendar subset commonly produced
+  by calendaring clients:
+  - BEGIN/END block nesting for VCALENDAR, VEVENT, VTODO
+  - RFC 5545 §3.1 line *unfolding* (a line starting with SPACE or HT continues the
+    previous content line)
+  - Property syntax `PROPNAME[;PARAM=V]:value` with value unescaping (\\\\, \\;, \\,, \\n)
+  - DTSTART/DTEND/DUE as `YYYYMMDD[Thhmmss[Z]]` → {:y :m :d :hh :mm} maps
+  - RRULE as `FREQ=…;INTERVAL=…;COUNT=…;UNTIL=…;BYDAY=MO,WE` → rrule map
+
+  `emit-str` round-trips: parse-str ∘ emit-str is identity on the EDN model."
+  (:require [kotoba.lang.text :as str]))
+
+;; --- portable integer parser (no java.lang.Long/parseLong in CLJS) ---
+
+(def ^:private digit
+  ;; A ClojureScript character IS a one-character string, so `(seq "2026")`
+  ;; yields exactly the keys of this map in both runtimes. A lookup is the one
+  ;; formulation that needs no reader conditional and no code-point
+  ;; arithmetic.
+  {\0 0 \1 1 \2 2 \3 3 \4 4 \5 5 \6 6 \7 7 \8 8 \9 9})
+
+(defn- parse-int
+  "Parse a decimal string to integer. Portable across JVM and CLJS.
+
+  It previously read `(- (int c) 48)`, which is right on the JVM — `(int \2)`
+  is the code point 50 — and silently wrong in ClojureScript, where a char is
+  a string and `(int \"2\")` coerces to **2**, so every digit came out as
+  2-48 = -46. `\"2026\"` parsed as -51302 and an iCalendar date became a
+  timestamp tens of thousands of years in the past.
+
+  The suite could not see it: the tests are `.cljc` but only ever run on the
+  JVM, where the old code was correct. `script/cljs_smoke.cljk` now exercises
+  this path under nbb for that reason."
+  [s]
+  (reduce (fn [acc c] (+ (* acc 10) (digit c 0))) 0 s))
+
+;; --- date-time parsing ---
+
+(defn- parse-dt
+  "Parse `YYYYMMDD[Thhmmss[Z]]` to `{:y :m :d :hh :mm}`, plus `:utc? true` for
+  RFC 5545 FORM #2.
+
+  The `Z` used to be accepted and discarded, so `20260701T100000Z` parsed and
+  re-emitted as `20260701T100000` — the same digits meaning a different
+  instant in every timezone but UTC. That is a round-trip that silently
+  changes an appointment's time, so the flag is carried rather than dropped."
+  [s]
+  (when (and s (>= (count s) 8))
+    (let [y  (parse-int (subs s 0 4))
+          m  (parse-int (subs s 4 6))
+          d  (parse-int (subs s 6 8))
+          has-time? (and (>= (count s) 15) (= \T (nth s 8)))
+          hh (if has-time? (parse-int (subs s 9 11)) 0)
+          mm (if has-time? (parse-int (subs s 11 13)) 0)]
+      (cond-> {:y y :m m :d d :hh hh :mm mm}
+        ;; Only on a date-TIME. "Z" cannot appear on a DATE value, and a
+        ;; date carrying :utc? would emit a trailing Z that no parser accepts.
+        (and has-time? (str/ends-with? s "Z")) (assoc :utc? true)
+        ;; A DATE (VALUE=DATE, `YYYYMMDD`) is not midnight — it is a whole day.
+        ;; :hh and :mm default to 0 either way, so without this flag a caller
+        ;; cannot tell an all-day event from one at exactly 00:00, and every
+        ;; all-day entry reads as a zero-length moment at midnight.
+        (not has-time?) (assoc :date-only? true)))))
+
+;; --- RRULE parsing ---
+
+(def ^:private str->byday
+  {"MO" :mo "TU" :tu "WE" :we "TH" :th "FR" :fr "SA" :sa "SU" :su})
+
+(defn- parse-rrule
+  "Parse an RRULE value string `FREQ=WEEKLY;INTERVAL=1;…` to a rule map."
+  [s]
+  (let [pairs (map #(let [eq (str/index-of % "=")]
+                      [(subs % 0 eq) (subs % (inc eq))])
+                   (str/split s #";"))
+        m     (into {} pairs)]
+    (cond-> {}
+      (get m "FREQ")
+      (assoc :ical/freq (keyword (str/lower (get m "FREQ"))))
+
+      (get m "INTERVAL")
+      (assoc :ical/interval (parse-int (get m "INTERVAL")))
+
+      (get m "COUNT")
+      (assoc :ical/count (parse-int (get m "COUNT")))
+
+      (get m "UNTIL")
+      (assoc :ical/until (parse-dt (get m "UNTIL")))
+
+      (get m "BYDAY")
+      (assoc :ical/byday
+             (mapv #(get str->byday (str/upper (str/trim %)))
+                   (str/split (get m "BYDAY") #","))))))
+
+;; --- value unescaping (RFC 5545 §3.3.11) ---
+
+(defn- unescape
+  "Unescape iCalendar value text sequences (RFC 5545 §3.3.11) via a single
+  left-to-right scan. Sequential str/replace passes are NOT safe here:
+  `escape` turning a lone backslash into `\\\\` can leave it immediately
+  followed by an unrelated literal `n`/`N`/`;`/`,` (e.g. `C:\notes` ->
+  `C:\\notes`), and a later pass in the chain (matching `\n`) then
+  misreads part of that already-escaped backslash pair as a DIFFERENT
+  escape sequence -- corrupting the text instead of restoring it. A single
+  scan that consumes each two-character escape atomically (never letting
+  one backslash serve double duty across two different replace passes)
+  is the only order-safe inverse of `escape`."
+  [s]
+  (let [n (count s)]
+    (loop [i 0 acc []]
+      (if (>= i n)
+        (apply str acc)
+        (if (and (< (inc i) n) (= "\\" (subs s i (inc i))))
+          (case (subs s i (+ i 2))
+            "\\;" (recur (+ i 2) (conj acc ";"))
+            "\\," (recur (+ i 2) (conj acc ","))
+            "\\n" (recur (+ i 2) (conj acc "\n"))
+            "\\N" (recur (+ i 2) (conj acc "\n"))
+            "\\\\" (recur (+ i 2) (conj acc "\\"))
+            (recur (inc i) (conj acc (subs s i (inc i)))))
+          (recur (inc i) (conj acc (subs s i (inc i)))))))))
+
+;; --- value escaping (for emit) ---
+
+(defn- escape
+  "Escape special characters in a text value."
+  [s]
+  (-> (str s)
+      (str/replace "\\" "\\\\")
+      (str/replace ";" "\\;")
+      (str/replace "," "\\,")
+      (str/replace "\n" "\\n")))
+
+;; --- content line parser ---
+
+(defn- parse-prop-line
+  "Split a single unfolded content line into [PROPNAME params-map value-str].
+  Returns nil for lines with no colon (e.g., empty lines)."
+  [line]
+  (let [colon (str/index-of line ":")]
+    (when colon
+      (let [name-params (subs line 0 colon)
+            value       (unescape (subs line (inc colon)))
+            semi        (str/index-of name-params ";")
+            prop-name   (str/upper (if semi (subs name-params 0 semi) name-params))
+            params      (when semi
+                          (into {} (map (fn [p]
+                                         (let [eq (str/index-of p "=")]
+                                           (if eq
+                                             [(subs p 0 eq) (subs p (inc eq))]
+                                             [p ""])))
+                                       (str/split (subs name-params (inc semi)) #";"))))]
+        [prop-name (or params {}) value]))))
+
+;; --- main parser ---
+
+(defn parse-str
+  "iCalendar text → EDN model {:ical/prodid :ical/version :ical/events :ical/todos}.
+  Handles RFC 5545 line unfolding (continuation lines starting with SPACE or HT)."
+  [ics-text]
+  (let [;; RFC 5545 §3.1 unfolding: CRLF/LF followed by whitespace → remove
+        unfolded (->> (str/replace ics-text #"\r?\n[ \t]" "")
+                      str/split-lines
+                      (remove #(str/blank? %)))
+        state    (volatile! {:ctx [] :cur nil :cal {:ical/events [] :ical/todos []}})]
+    (doseq [line unfolded]
+      (when-let [[prop-name _params value] (parse-prop-line line)]
+        (let [{:keys [ctx cur cal]} @state]
+          (cond
+            ;; --- BEGIN ---
+            (= prop-name "BEGIN")
+            (cond
+              (= value "VCALENDAR")
+              (vswap! state assoc :ctx [:vcal])
+
+              (= value "VEVENT")
+              (vswap! state assoc :ctx [:vcal :vevent] :cur {})
+
+              (= value "VTODO")
+              (vswap! state assoc :ctx [:vcal :vtodo] :cur {}))
+
+            ;; --- END ---
+            (= prop-name "END")
+            (cond
+              (= value "VEVENT")
+              (do (vswap! state update-in [:cal :ical/events] conj cur)
+                  (vswap! state assoc :ctx [:vcal] :cur nil))
+
+              (= value "VTODO")
+              (do (vswap! state update-in [:cal :ical/todos] conj cur)
+                  (vswap! state assoc :ctx [:vcal] :cur nil))
+
+              (= value "VCALENDAR")
+              (vswap! state assoc :ctx []))
+
+            ;; --- VCALENDAR-level properties ---
+            (= (last ctx) :vcal)
+            (case prop-name
+              "PRODID"   (vswap! state assoc-in [:cal :ical/prodid]  value)
+              "VERSION"  (vswap! state assoc-in [:cal :ical/version] value)
+              nil)
+
+            ;; --- VEVENT properties ---
+            (= (last ctx) :vevent)
+            (case prop-name
+              "UID"         (vswap! state update :cur assoc :ical/uid         value)
+              "SUMMARY"     (vswap! state update :cur assoc :ical/summary     value)
+              "DESCRIPTION" (vswap! state update :cur assoc :ical/description value)
+              "LOCATION"    (vswap! state update :cur assoc :ical/location    value)
+              "DTSTART"     (vswap! state update :cur assoc :ical/dtstart     (parse-dt value))
+              "DTEND"       (vswap! state update :cur assoc :ical/dtend       (parse-dt value))
+              "RRULE"       (vswap! state update :cur assoc :ical/rrule       (parse-rrule value))
+              nil)
+
+            ;; --- VTODO properties ---
+            (= (last ctx) :vtodo)
+            (case prop-name
+              "UID"         (vswap! state update :cur assoc :ical/uid         value)
+              "SUMMARY"     (vswap! state update :cur assoc :ical/summary     value)
+              "DESCRIPTION" (vswap! state update :cur assoc :ical/description value)
+              "DTSTART"     (vswap! state update :cur assoc :ical/dtstart     (parse-dt value))
+              "DUE"         (vswap! state update :cur assoc :ical/due         (parse-dt value))
+              "STATUS"      (vswap! state update :cur assoc :ical/status
+                                    (keyword (str/lower (str/replace value "_" "-"))))
+              nil)))))
+    (:cal @state)))
+
+;; --- emit helpers ---
+
+(defn- zero-pad
+  "Left-pad integer `n` to `width` digits with zeros."
+  [n width]
+  (let [s (str n)
+        pad (- width (count s))]
+    (if (pos? pad)
+      (str (apply str (repeat pad "0")) s)
+      s)))
+
+(defn- emit-dt
+  "Emit a `{:y :m :d :hh :mm}` map as an iCalendar date-time string.
+
+  `:utc? true` appends the `Z` of RFC 5545 FORM #2. Without it the value is
+  FORM #1 (floating local time), which is the right default for a birthday and
+  the wrong one for a meeting between two timezones."
+  [dt]
+  (when dt
+    (if (:date-only? dt)
+      ;; FORM: DATE. Emitting the time back would turn a whole day into
+      ;; midnight, which is the same information loss in the other direction.
+      (str (zero-pad (:y dt) 4) (zero-pad (:m dt) 2) (zero-pad (:d dt) 2))
+      (str (zero-pad (:y dt) 4) (zero-pad (:m dt) 2) (zero-pad (:d dt) 2)
+           "T" (zero-pad (get dt :hh 0) 2) (zero-pad (get dt :mm 0) 2) "00"
+           (when (:utc? dt) "Z")))))
+
+(def ^:private byday->str
+  {:mo "MO" :tu "TU" :we "WE" :th "TH" :fr "FR" :sa "SA" :su "SU"})
+
+(defn- emit-rrule
+  "Emit a rule map as an iCalendar RRULE value string."
+  [rrule]
+  (when rrule
+    (str "FREQ=" (str/upper (name (:ical/freq rrule)))
+         (when-let [i (:ical/interval rrule)] (str ";INTERVAL=" i))
+         (when-let [c (:ical/count rrule)]    (str ";COUNT=" c))
+         (when-let [u (:ical/until rrule)]    (str ";UNTIL=" (emit-dt u)))
+         (when-let [bd (:ical/byday rrule)]
+           (str ";BYDAY=" (str/join "," (map byday->str bd)))))))
+
+(defn- prop-line
+  "Emit a single `PROPNAME:value` content line."
+  [prop-name value]
+  (when value (str prop-name ":" value)))
+
+(defn- emit-event [evt]
+  (filter some?
+          ["BEGIN:VEVENT"
+           (prop-line "UID"         (escape (:ical/uid evt)))
+           (prop-line "SUMMARY"     (some-> (:ical/summary evt) escape))
+           (prop-line "DESCRIPTION" (some-> (:ical/description evt) escape))
+           (prop-line "LOCATION"    (some-> (:ical/location evt) escape))
+           (prop-line "DTSTART"     (emit-dt (:ical/dtstart evt)))
+           (prop-line "DTEND"       (emit-dt (:ical/dtend evt)))
+           (prop-line "RRULE"       (emit-rrule (:ical/rrule evt)))
+           "END:VEVENT"]))
+
+(defn- emit-todo [td]
+  (filter some?
+          ["BEGIN:VTODO"
+           (prop-line "UID"         (escape (:ical/uid td)))
+           (prop-line "SUMMARY"     (some-> (:ical/summary td) escape))
+           (prop-line "DESCRIPTION" (some-> (:ical/description td) escape))
+           (prop-line "DTSTART"     (emit-dt (:ical/dtstart td)))
+           (prop-line "DUE"         (emit-dt (:ical/due td)))
+           (prop-line "STATUS"      (some-> (:ical/status td) name str/upper
+                                            (str/replace "-" "_")))
+           "END:VTODO"]))
+
+(defn emit-str
+  "iCalendar EDN model → iCalendar text string (RFC 5545 subset)."
+  [cal]
+  (let [lines (concat
+               ["BEGIN:VCALENDAR"]
+               (when-let [v (:ical/version cal)] [(str "VERSION:" v)])
+               (when-let [p (:ical/prodid cal)]  [(str "PRODID:" p)])
+               (mapcat emit-event (:ical/events cal))
+               (mapcat emit-todo  (:ical/todos cal))
+               ["END:VCALENDAR"])]
+    (str (str/join "\r\n" lines) "\r\n")))
