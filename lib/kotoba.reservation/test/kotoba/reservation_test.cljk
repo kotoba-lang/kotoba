@@ -1,0 +1,328 @@
+(ns kotoba.reservation-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.reservation :as res]))
+
+(def ^:private jpn-econ
+  (res/bucket "NH-6" "2026-08-01" :economy 180 :sold 100 :held 20))
+
+(def ^:private plan
+  (res/rate-plan "Y-FLEX" :economy 42000 "JPY"
+                 :refundable? true
+                 :min-units 1
+                 :advance-days 3
+                 :weekday-bp {6 12000}                    ; Saturday +20%
+                 :date-bp {"2026-08-13" 15000}            ; Obon peak +50%
+                 :fees [{:label "airport facility" :amount 2900}]
+                 :tax-bp 1000))                           ; 10%
+
+;; ---------------------------------------------------------------------------
+;; Money
+;; ---------------------------------------------------------------------------
+
+(deftest apply-bp-is-integer-and-truncates-toward-zero
+  (is (= 10000 (res/apply-bp 10000 res/bp-scale)) "100% leaves the amount alone")
+  (is (= 12000 (res/apply-bp 10000 12000)))
+  (is (= 5000 (res/apply-bp 10000 5000)))
+  (testing "a nil modifier means unmodified, not zero"
+    (is (= 10000 (res/apply-bp 10000 nil))))
+  (testing "truncation can only move an amount down, never up"
+    ;; 333 * 10001 / 10000 = 333.0333 -> 333
+    (is (= 333 (res/apply-bp 333 10001)))))
+
+;; ---------------------------------------------------------------------------
+;; Inventory
+;; ---------------------------------------------------------------------------
+
+(deftest bucket-rejects-structurally-invalid-input
+  (is (nil? (res/bucket "NH-6" "2026-08-01" :economy -1)))
+  (is (nil? (res/bucket "NH-6" "2026-08-01" :economy 180 :sold -1)))
+  (is (nil? (res/bucket nil "2026-08-01" :economy 180)))
+  (is (some? (res/bucket "NH-6" "2026-08-01" :economy 0))
+      "a zero-capacity bucket is valid — it is simply not sellable"))
+
+(deftest available-subtracts-sold-and-held-and-adds-authorized-overbooking
+  (is (= 60 (res/available jpn-econ)))
+  (is (= 65 (res/available (assoc jpn-econ :inv/overbook 5)))))
+
+(deftest sellable-refuses-to-exceed-capacity-plus-overbooking
+  (is (res/sellable? jpn-econ 60))
+  (is (not (res/sellable? jpn-econ 61)))
+  (testing "an authorized overbooking allowance extends what is sellable"
+    (is (res/sellable? (assoc jpn-econ :inv/overbook 5) 65)))
+  (testing "a negative quantity is never sellable"
+    (is (not (res/sellable? jpn-econ -1)))))
+
+(deftest oversold-reports-physical-capacity-not-the-overbooking-allowance
+  (let [b (res/bucket "NH-6" "2026-08-01" :economy 180 :sold 185 :overbook 10)]
+    (is (res/oversold? b)
+        "sold past the aircraft is oversold even while still inside the authorized allowance")
+    (is (res/sellable? b 5)
+        "and the operator may still sell into the remaining authorized allowance")))
+
+;; ---------------------------------------------------------------------------
+;; Holds
+;; ---------------------------------------------------------------------------
+
+(deftest place-hold-refuses-rather-than-overselling
+  (let [ok (res/place-hold jpn-econ (res/hold "h1" jpn-econ 60 "2026-07-27T00:00:00Z"))
+        no (res/place-hold jpn-econ (res/hold "h2" jpn-econ 61 "2026-07-27T00:00:00Z"))]
+    (is (:reservation/ok? ok))
+    (is (= 80 (:inv/held (:reservation/bucket ok))))
+    (is (not (:reservation/ok? no)))
+    (is (= :insufficient-inventory (:reservation/error no)))))
+
+(deftest place-hold-rejects-a-hold-for-a-different-bucket
+  (let [other (res/bucket "NH-7" "2026-08-01" :economy 180)
+        r (res/place-hold jpn-econ (res/hold "h1" other 1 "2026-07-27T00:00:00Z"))]
+    (is (not (:reservation/ok? r)))
+    (is (= :hold-bucket-mismatch (:reservation/error r)))))
+
+(deftest confirm-hold-is-the-only-transition-that-sells
+  (let [h (res/hold "h1" jpn-econ 10 "2026-07-27T00:00:00Z")
+        held (:reservation/bucket (res/place-hold jpn-econ h))
+        done (res/confirm-hold held h)]
+    (is (:reservation/ok? done))
+    (is (= 110 (:inv/sold (:reservation/bucket done))))
+    (is (= 20 (:inv/held (:reservation/bucket done))))
+    (is (= :confirmed (:hold/status (:reservation/hold done))))))
+
+(deftest confirm-hold-refuses-a-double-confirm
+  (let [h (res/hold "h1" jpn-econ 10 "2026-07-27T00:00:00Z")
+        held (:reservation/bucket (res/place-hold jpn-econ h))
+        once (:reservation/bucket (res/confirm-hold held h))
+        ;; the bucket's remaining 20 held units are OTHER bookings' holds;
+        ;; draining them via a re-confirm of h1 would manufacture sold seats
+        twice (res/confirm-hold (assoc once :inv/held 5) h)]
+    (is (not (:reservation/ok? twice)))
+    (is (= :hold-not-on-bucket (:reservation/error twice)))))
+
+(deftest release-never-drives-held-negative
+  (let [h (res/hold "h1" jpn-econ 100 "2026-07-27T00:00:00Z")
+        r (res/release-hold jpn-econ h)]
+    (is (:reservation/ok? r))
+    (is (zero? (:inv/held (:reservation/bucket r))))))
+
+(deftest expiry-is-evaluated-against-passed-time-not-a-clock
+  (let [h (res/hold "h1" jpn-econ 5 "2026-07-27T12:00:00Z")]
+    (is (not (res/expired? h "2026-07-27T11:59:59Z")))
+    (is (res/expired? h "2026-07-27T12:00:01Z")))
+  (testing "epoch millis work the same way"
+    (let [h (res/hold "h1" jpn-econ 5 1000)]
+      (is (not (res/expired? h 999)))
+      (is (res/expired? h 1001))))
+  (testing "mixed time representations never compare true — a hold with an
+            uncomparable expiry does not expire rather than expiring at a
+            garbage time"
+    (let [h (res/hold "h1" jpn-econ 5 "2026-07-27T12:00:00Z")]
+      (is (not (res/expired? h 1000))))))
+
+(deftest purge-expired-releases-only-expired-held-holds
+  (let [live (res/hold "live" jpn-econ 5 "2026-07-27T18:00:00Z")
+        dead (res/hold "dead" jpn-econ 7 "2026-07-27T06:00:00Z")
+        done (assoc (res/hold "done" jpn-econ 3 "2026-07-27T06:00:00Z") :hold/status :confirmed)
+        b (reduce (fn [acc h] (:reservation/bucket (res/place-hold acc h))) jpn-econ [live dead])
+        r (res/purge-expired b [live dead done] "2026-07-27T12:00:00Z")]
+    (is (= ["dead"] (mapv :hold/id (:reservation/released r))))
+    (is (= 25 (:inv/held (:reservation/bucket r)))
+        "20 pre-existing + 5 live; the expired 7 released, the confirmed one untouched")))
+
+;; ---------------------------------------------------------------------------
+;; Rate plans and restrictions
+;; ---------------------------------------------------------------------------
+
+(deftest date-modifier-wins-over-weekday-modifier
+  (is (= 12000 (res/modifier-bp plan "2026-08-01" 6)) "Saturday")
+  (is (= 15000 (res/modifier-bp plan "2026-08-13" 6))
+      "an explicit peak date overrides the weekday rule for the same date")
+  (is (= res/bp-scale (res/modifier-bp plan "2026-09-02" 3)) "no rule -> 100%"))
+
+(deftest restrictions-report-every-violation-not-only-the-first
+  (let [r (res/restrictions-satisfied? (res/rate-plan "R" :economy 1000 "JPY" :min-units 2 :advance-days 7)
+                                       {:units 1 :advance-days 0 :class :business})]
+    (is (not (:reservation/ok? r)))
+    (is (= #{:below-min-units :inside-advance-purchase-window :class-mismatch}
+           (set (:reservation/violations r))))))
+
+(deftest restrictions-pass-a-clean-request
+  (is (:reservation/ok? (res/restrictions-satisfied? plan {:units 1 :advance-days 30 :class :economy}))))
+
+;; ---------------------------------------------------------------------------
+;; Quote
+;; ---------------------------------------------------------------------------
+
+(deftest quote-prices-each-date-with-its-own-modifier
+  (let [q (res/quote-for plan {:dates [{:date "2026-08-01" :weekday 6}   ; +20%
+                                       {:date "2026-08-13" :weekday 4}]  ; peak +50%
+                               :qty 2})
+        units (filterv #(= :unit (:line/kind %)) (:quote/lines q))]
+    (is (= 2 (count units)))
+    (is (= [100800 126000] (mapv :line/amount units))
+        "42000*2*1.2 = 100800 ; 42000*2*1.5 = 126000")))
+
+(deftest quote-total-is-subtotal-plus-tax-and-includes-plan-fees
+  (let [q (res/quote-for plan {:dates ["2026-09-02"] :qty 1})]
+    ;; 42000 (no modifier) + 2900 fee = 44900 subtotal ; 10% tax = 4490
+    (is (= 44900 (:quote/subtotal q)))
+    (is (= 4490 (:quote/tax q)))
+    (is (= 49390 (:quote/total q)))
+    (is (= "JPY" (:quote/currency q)))))
+
+(deftest quote-accepts-bare-dates-and-applies-no-weekday-rule-to-them
+  (let [q (res/quote-for plan {:dates ["2026-08-01"] :qty 1})]
+    (is (= 42000 (:line/amount (first (:quote/lines q))))
+        "a bare date carries no weekday, so the Saturday rule cannot fire —
+         weekday is data this library never derives")))
+
+(deftest quote-is-reproducible
+  (let [req {:dates [{:date "2026-08-01" :weekday 6} "2026-08-13"] :qty 3}]
+    (is (= (res/quote-for plan req) (res/quote-for plan req)))))
+
+(deftest ad-hoc-request-fees-are-added-to-plan-fees
+  (let [q (res/quote-for plan {:dates ["2026-09-02"] :qty 1
+                               :fees [{:label "seat selection" :amount 1500}]})]
+    (is (= 2 (count (filterv #(= :fee (:line/kind %)) (:quote/lines q)))))
+    (is (= 46400 (:quote/subtotal q)))))
+
+(deftest zero-tax-emits-no-tax-line
+  (let [p (res/rate-plan "NOTAX" :economy 1000 "JPY")
+        q (res/quote-for p {:dates ["2026-09-02"] :qty 1})]
+    (is (empty? (filterv #(= :tax (:line/kind %)) (:quote/lines q))))
+    (is (= 1000 (:quote/total q)))))
+
+;; ---------------------------------------------------------------------------
+;; Independent verification — the governor seam
+;; ---------------------------------------------------------------------------
+
+(deftest quote-matches-claim-catches-a-wrong-total
+  (let [req {:dates ["2026-09-02"] :qty 1}]
+    (is (res/quote-matches-claim? plan req 49390))
+    (is (not (res/quote-matches-claim? plan req 49000))
+        "an advisor that states a total it did not actually compute is caught here")
+    (is (not (res/quote-matches-claim? plan req nil)))))
+
+(deftest availability-supports-is-all-or-nothing
+  (let [a (res/bucket "NH-6" "2026-08-01" :economy 10 :sold 8)
+        b (res/bucket "NH-7" "2026-08-02" :economy 10 :sold 10)]
+    (is (res/availability-supports? [[a 2]]))
+    (is (not (res/availability-supports? [[a 2] [b 1]]))
+        "one leg with no inventory sinks the whole itinerary")))
+
+(deftest validate-booking-reports-every-failure-at-once
+  (let [p (res/rate-plan "R" :economy 1000 "JPY" :min-units 2)
+        full (res/bucket "NH-6" "2026-08-01" :economy 10 :sold 10)
+        r (res/validate-booking p {:units 1 :class :economy} [[full 1]] 999)]
+    (is (not (:reservation/valid? r)))
+    (is (= #{:below-min-units :insufficient-inventory :quote-mismatch}
+           (set (:reservation/errors r))))))
+
+(deftest validate-booking-passes-a-clean-request
+  (let [seats (res/bucket "NH-6" "2026-08-01" :economy 10 :sold 2)
+        req {:dates ["2026-09-02"] :qty 1 :units 1 :advance-days 30 :class :economy}
+        total (res/quote-total (res/quote-for plan req))
+        r (res/validate-booking plan req [[seats 1]] total)]
+    (is (:reservation/valid? r))
+    (is (empty? (:reservation/errors r)))))
+
+(deftest validate-booking-skips-the-total-check-when-no-total-is-claimed
+  (let [seats (res/bucket "NH-6" "2026-08-01" :economy 10 :sold 2)
+        r (res/validate-booking plan {:dates ["2026-09-02"] :qty 1 :units 1 :advance-days 30}
+                                [[seats 1]] nil)]
+    (is (:reservation/valid? r))))
+
+;; ---------------------------------------------------------------------------
+;; Booking
+;; ---------------------------------------------------------------------------
+
+(deftest booking-sums-held-units-and-carries-the-quote-total
+  (let [h1 (res/hold "h1" jpn-econ 2 "2026-07-27T12:00:00Z")
+        h2 (res/hold "h2" jpn-econ 1 "2026-07-27T12:00:00Z")
+        q (res/quote-for plan {:dates ["2026-09-02"] :qty 3})
+        bk (res/booking "bk-1" [h1 h2] q :status :confirmed)]
+    (is (= 3 (:booking/units bk)))
+    (is (= ["h1" "h2"] (:booking/holds bk)))
+    (is (= (:quote/total q) (:booking/total bk)))
+    (is (res/confirmed? bk))))
+
+(deftest booking-rejects-an-unknown-status
+  (is (nil? (res/booking "bk-1" [] (res/quote-for plan {:dates [] :qty 1}) :status :teleported))))
+
+(deftest describe-error-covers-every-error-this-library-emits
+  (doseq [k [:below-min-units :inside-advance-purchase-window :class-mismatch
+             :insufficient-inventory :quote-mismatch :hold-bucket-mismatch
+             :hold-not-on-bucket]]
+    (is (string? (res/describe-error k)))
+    (is (not= (name k) (res/describe-error k))
+        (str k " should have a real label, not a de-kebabbed keyword")))
+  (testing "an unknown keyword still degrades to something readable"
+    (is (= "some new error" (res/describe-error :some-new-error)))))
+
+;; ---------------------------------------------------------------------------
+;; Calendar — opt-in, proleptic Gregorian
+;; ---------------------------------------------------------------------------
+
+(deftest weekday-of-matches-known-dates
+  (testing "1970-01-01 was a Thursday (=4)"
+    (is (= 4 (res/weekday-of "1970-01-01"))))
+  (testing "dates whose weekday is independently checkable"
+    (is (= 0 (res/weekday-of "2026-08-02")) "Sunday")
+    (is (= 6 (res/weekday-of "2026-08-01")) "Saturday")
+    (is (= 3 (res/weekday-of "2000-03-01")) "Wednesday")
+    (is (= 1 (res/weekday-of "2026-07-27")) "Monday"))
+  (testing "pre-epoch dates work — the era arithmetic is signed"
+    (is (= 1 (res/weekday-of "1900-01-01")) "Monday")
+    (is (= 6 (res/weekday-of "2000-01-01")) "Saturday"))
+  (testing "the Gregorian cycle is exactly 400 years = 146097 days = 20871 weeks,
+            so any date has the same weekday 400 years earlier or later"
+    (is (zero? (mod 146097 7)))
+    (doseq [d ["2000-01-01" "2026-08-01" "1970-01-01"]]
+      (let [[y m dd] (res/parse-date d)]
+        (is (= (res/weekday-of d)
+               (res/weekday-of (res/format-date [(- y 400) m dd])))
+            (str d " vs 400 years earlier")))))
+  (is (nil? (res/weekday-of "not-a-date")))
+  (is (nil? (res/weekday-of nil))))
+
+(deftest civil-round-trips-through-day-numbers
+  (doseq [d ["1970-01-01" "1969-12-31" "2000-02-29" "2026-08-01"
+             "2400-02-29" "1900-03-01" "1600-01-01"]]
+    (is (= d (res/format-date (res/civil-from-days (res/days-from-civil (res/parse-date d)))))
+        d))
+  (testing "1900 was NOT a leap year but 2000 was — the century rule"
+    (is (= 1 (- (res/days-from-civil (res/parse-date "1900-03-01"))
+                (res/days-from-civil (res/parse-date "1900-02-28")))))
+    (is (= 2 (- (res/days-from-civil (res/parse-date "2000-03-01"))
+                (res/days-from-civil (res/parse-date "2000-02-28")))))))
+
+(deftest nights-between-is-half-open
+  (testing "a 2026-08-01 -> 2026-08-05 stay is FOUR nights, not five"
+    (let [ns (res/nights-between "2026-08-01" "2026-08-05")]
+      (is (= 4 (count ns)))
+      (is (= ["2026-08-01" "2026-08-02" "2026-08-03" "2026-08-04"] (mapv :date ns)))
+      (is (= [6 0 1 2] (mapv :weekday ns)) "Sat Sun Mon Tue")))
+  (testing "a same-day or reversed range is zero nights, not a negative or a crash"
+    (is (= [] (res/nights-between "2026-08-05" "2026-08-05")))
+    (is (= [] (res/nights-between "2026-08-05" "2026-08-01"))))
+  (testing "an unparseable date yields nil — un-priceable, never free"
+    (is (nil? (res/nights-between "garbage" "2026-08-05")))
+    (is (nil? (res/nights-between "2026-08-01" nil))))
+  (testing "it spans month and year boundaries"
+    (is (= 2 (count (res/nights-between "2026-12-31" "2027-01-02"))))
+    (is (= ["2026-12-31" "2027-01-01"] (mapv :date (res/nights-between "2026-12-31" "2027-01-02"))))))
+
+(deftest nights-between-feeds-quote-for-directly
+  (let [nights (res/nights-between "2026-08-01" "2026-08-03")
+        q (res/quote-for plan {:dates nights :qty 1})]
+    ;; 2026-08-01 is a Saturday (+20%), 08-02 a Sunday (no rule)
+    (is (= [50400 42000] (mapv :line/amount (filterv #(= :unit (:line/kind %)) (:quote/lines q)))))))
+
+(deftest quote-for-is-total-and-never-throws-at-its-caller
+  (testing "this library is called BY the checks that catch bad input, so it
+            must not be the thing that crashes on it"
+    (is (nil? (res/quote-for plan {:dates ["d"] :qty "2"})) "non-numeric qty")
+    (is (nil? (res/quote-for nil {:dates ["d"] :qty 1})) "no plan")
+    (is (nil? (res/quote-for {:rate/base-amount "x"} {:dates ["d"] :qty 1})) "junk plan")
+    (is (some? (res/quote-for plan {:dates ["d"]})) "an absent qty still defaults to 1"))
+  (testing "and the downstream readers cope with the nil"
+    (is (zero? (res/quote-total (res/quote-for plan {:dates ["d"] :qty "2"}))))
+    (is (not (res/quote-matches-claim? plan {:dates ["d"] :qty "2"} 0))
+        "an un-priceable request never matches, not even a claim of zero")))
