@@ -1,0 +1,110 @@
+(ns sigv4.verify-test
+  "Verification, closed against the signing side.
+
+  The load-bearing test is `signing-and-verifying-agree`: it signs AWS's own
+  worked example and then verifies it, so a drift between the two halves fails
+  here rather than in production as an unexplained 403.
+
+  JVM-only; the async path is covered by `scripts/verify-cljs.cljs`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [sigv4.core :as v4]
+            [sigv4.crypto :as crypto]
+            [sigv4.verify :as verify]))
+
+(def c (crypto/crypto))
+(def secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+(def auth
+  (str "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, "
+       "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, "
+       "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"))
+
+(deftest parse-authorization-round-trip
+  (let [p (verify/parse-authorization auth)]
+    (is (= "AKIAIOSFODNN7EXAMPLE" (:akid p)))
+    (is (= "20130524" (:date p)))
+    (is (= "us-east-1" (:region p)))
+    (is (= "s3" (:service p)))
+    (is (= ["host" "range" "x-amz-content-sha256" "x-amz-date"] (:signed-headers p)))
+    (is (= "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41" (:signature p)))
+    (testing "scope reassembles exactly as the signer built it"
+      (is (= "20130524/us-east-1/s3/aws4_request" (verify/scope p))))))
+
+(deftest malformed-headers-are-nil-not-throws
+  (testing "untrusted input on this side — nil, never an exception"
+    (doseq [bad [nil "" "Bearer abc" "AWS4-HMAC-SHA256 "
+                 "AWS4-HMAC-SHA256 Credential=a/b/c, SignedHeaders=host, Signature=x"
+                 ;; wrong terminator
+                 "AWS4-HMAC-SHA256 Credential=a/b/c/d/nope, SignedHeaders=host, Signature=x"
+                 ;; missing Signature
+                 "AWS4-HMAC-SHA256 Credential=a/b/c/d/aws4_request, SignedHeaders=host"]]
+      (is (nil? (verify/parse-authorization bad)) (pr-str bad)))))
+
+(deftest signing-and-verifying-agree
+  (testing "recomputing AWS's worked example reproduces AWS's signature"
+    (let [parsed (verify/parse-authorization auth)
+          sig (verify/expected-signature
+               c {:secret-key secret
+                  :parsed parsed
+                  :amz-date "20130524T000000Z"
+                  :payload-hash v4/empty-payload-sha256
+                  :request {:method :get
+                            :path "/test.txt"
+                            :query nil
+                            :headers {"host" "examplebucket.s3.amazonaws.com"
+                                      "range" "bytes=0-9"
+                                      "x-amz-content-sha256" v4/empty-payload-sha256
+                                      "x-amz-date" "20130524T000000Z"}}})]
+      (is (= "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41" sig))
+      (is (verify/constant-time-eq? (:signature parsed) sig)))))
+
+(deftest a-tampered-request-does-not-verify
+  (let [parsed (verify/parse-authorization auth)
+        sig (verify/expected-signature
+             c {:secret-key secret
+                :parsed parsed
+                :amz-date "20130524T000000Z"
+                :payload-hash v4/empty-payload-sha256
+                :request {:method :get
+                          :path "/test.txt"
+                          :query nil
+                          :headers {"host" "examplebucket.s3.amazonaws.com"
+                                    ;; the client signed bytes=0-9
+                                    "range" "bytes=0-999999"
+                                    "x-amz-content-sha256" v4/empty-payload-sha256
+                                    "x-amz-date" "20130524T000000Z"}}})]
+    (is (not (verify/constant-time-eq? (:signature parsed) sig))
+        "widening the signed Range must invalidate the signature")))
+
+(deftest constant-time-eq-semantics
+  (is (verify/constant-time-eq? "abc123" "abc123"))
+  (is (not (verify/constant-time-eq? "abc123" "abc124")))
+  (testing "differs in the first character, not just the last"
+    (is (not (verify/constant-time-eq? "abc123" "zbc123"))))
+  (is (not (verify/constant-time-eq? "abc" "abcd")))
+  (is (verify/constant-time-eq? "" "")))
+
+(deftest canonical-request-is-the-signers-canonical-request
+  (testing "the two halves build the same bytes from the same inputs"
+    (let [headers {"host" "examplebucket.s3.amazonaws.com"
+                   "range" "bytes=0-9"
+                   "x-amz-content-sha256" v4/empty-payload-sha256
+                   "x-amz-date" "20130524T000000Z"}
+          signed ["host" "range" "x-amz-content-sha256" "x-amz-date"]]
+      (is (= (:canonical-request
+              (v4/canonical-request {:method :get
+                                     :path "/test.txt"
+                                     :query ""
+                                     :headers headers
+                                     :payload-hash v4/empty-payload-sha256}))
+             (verify/canonical-request {:method :get :path "/test.txt" :query nil
+                                        :headers headers}
+                                       signed
+                                       v4/empty-payload-sha256))))))
+
+(deftest non-ascii-signs-as-utf8-not-utf16
+  (testing "the defect this shared library exists to remove: a charCodeAt-based
+            encoder emits UTF-16 code units and signs differently from every
+            S3 SDK for any non-ASCII key or query value"
+    (is (= "%E6%97%A5%E6%9C%AC" (v4/uri-encode "日本")))
+    (is (= "k=%F0%9F%97%84" (v4/canonical-query {"k" "🗄"})))))

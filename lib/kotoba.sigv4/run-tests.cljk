@@ -1,0 +1,253 @@
+(ns run-tests
+  "The suite under ClojureScript, as `clojure.test`.
+
+  `kbb -M:test` proves this library on the JVM, where crypto is synchronous
+  and every `then` is plain application. That leaves the half that actually
+  ships -- browsers and Cloudflare Workers, where WebCrypto is Promise-based,
+  so the *same* source takes a completely different path. A green JVM suite
+  says nothing about it, and Workers are where most consumers run: this
+  library both signs the fleet's outbound S3 requests and verifies the inbound
+  ones those Workers accept.
+
+  This was `scripts/verify-cljs.cljs`, a hand-rolled harness that printed
+  `ok <label>` lines and set an exit code. Every assertion in it survives here
+  unchanged; what changed is the reporting. The shared fleet gate
+  (`gates/nbb-cross-runtime.cljs`) parses a `clojure.test` summary and
+  **refuses to report a pass without one** -- correctly, since a harness that
+  runs zero checks and prints nothing would otherwise be indistinguishable
+  from a clean run. So the parity check had to speak that format to be gated,
+  and printing the format without being a real suite was never an option.
+
+  Ported 2026-08-17. The values are unchanged: AWS's two published reference
+  signatures, the digests, the verification path, and the composed signer's
+  outputs cross-checked against the JVM suite and an independent Node
+  implementation.
+
+      kbb --backend sci run-tests.cljk"
+  (:require [cljs.test :as t :refer-macros [deftest is testing async]]
+            [sigv4.core :as v4]
+            [sigv4.core-test]
+            [sigv4.crypto :as crypto]
+            [sigv4.protocols :as p]
+            [sigv4.request :as req]
+            [sigv4.verify :as verify]))
+
+(def c (crypto/crypto))
+(def aws-secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+(defn- caught
+  "Report a rejected promise as a failing assertion rather than an unhandled
+  rejection. Without this an async test that throws finishes silently and the
+  summary still says zero failures."
+  [done]
+  (fn [e] (is false (str "threw: " (or (.-stack e) e))) (done)))
+
+(defn signing-key
+  "Fold the HMAC ladder over Promises — the async mirror of the JVM reduce."
+  [secret short region]
+  (let [{:keys [seed steps]} (v4/signing-key-chain secret short region)]
+    (reduce (fn [pr step] (.then pr #(p/-hmac c % step)))
+            (js/Promise.resolve seed)
+            steps)))
+
+(defn sign-string [secret short region sts]
+  (-> (signing-key secret short region)
+      (.then #(p/-hmac c % sts))
+      (.then #(p/-hex c %))))
+
+;; ── 1. the pure layer, identical across runtimes ─────────────────────────────
+
+(deftest the-pure-layer-is-unchanged-across-runtimes
+  (is (= "%21%27%28%29%2A" (v4/uri-encode "!'()*"))
+      "uri-encode does not exempt !'()*")
+  (is (= "%E6%97%A5" (v4/uri-encode "日")) "uri-encode emits UTF-8 bytes")
+  (is (= "/b/a%20b/c.txt" (v4/object-path "b" "a b/c.txt"))
+      "object-path keeps separators")
+  (is (= "20130524/us-east-1/execute-api/aws4_request"
+         (v4/credential-scope "20130524" "us-east-1" "execute-api"))
+      "credential-scope carries a non-s3 service"))
+
+;; ── 2. WebCrypto digests agree with the JVM's ────────────────────────────────
+
+(deftest webcrypto-digests-agree-with-the-jvm
+  (async done
+    (-> (js/Promise.all
+         #js [(.then (p/-sha256-hex c "")
+                     #(is (= v4/empty-payload-sha256 %) "sha256 of empty string"))
+              (.then (p/-sha256-hex c "hello")
+                     #(is (= "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" %)
+                          "sha256 of \"hello\""))
+              (.then (p/-sha256-hex c "日本語")
+                     #(is (= "77710aedc74ecfa33685e33a6c7df5cc83004da1bdcef7fb280f5c2b2e97e0a5" %)
+                          "sha256 is UTF-8, not UTF-16"))])
+        (.then (fn [_] (done)))
+        (.catch (caught done)))))
+
+;; ── 3. AWS's published header-auth signature ─────────────────────────────────
+
+(def aws-canonical
+  (str "GET\n/test.txt\n\n"
+       "host:examplebucket.s3.amazonaws.com\n"
+       "range:bytes=0-9\n"
+       "x-amz-content-sha256:" v4/empty-payload-sha256 "\n"
+       "x-amz-date:20130524T000000Z\n\n"
+       "host;range;x-amz-content-sha256;x-amz-date\n"
+       v4/empty-payload-sha256))
+
+(deftest aws-documented-header-auth-signature
+  (async done
+    (-> (p/-sha256-hex c aws-canonical)
+        (.then (fn [cr-hash]
+                 (is (= "7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972" cr-hash)
+                     "AWS canonical-request hash")
+                 (sign-string aws-secret "20130524" "us-east-1"
+                              (v4/string-to-sign "20130524T000000Z"
+                                                 (v4/credential-scope "20130524" "us-east-1")
+                                                 cr-hash))))
+        (.then #(is (= "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41" %)
+                    "AWS documented header-auth signature"))
+        (.then (fn [_] (done)))
+        (.catch (caught done)))))
+
+;; ── 4. AWS's published query-string-auth signature ───────────────────────────
+
+(deftest aws-documented-query-string-auth-signature
+  (async done
+    (let [scope (v4/credential-scope "20130524" "us-east-1")
+          qs    (v4/canonical-query
+                 (v4/presign-params {:key-id          "AKIAIOSFODNN7EXAMPLE"
+                                     :scope           scope
+                                     :long-date       "20130524T000000Z"
+                                     :expires-seconds 86400
+                                     :signed-headers  "host"}))
+          cr    (:canonical-request
+                 (v4/canonical-request {:method       :get
+                                        :path         "/test.txt"
+                                        :query        qs
+                                        :headers      {"host" "examplebucket.s3.amazonaws.com"}
+                                        :payload-hash v4/unsigned-payload}))]
+      (-> (p/-sha256-hex c cr)
+          (.then #(sign-string aws-secret "20130524" "us-east-1"
+                               (v4/string-to-sign "20130524T000000Z" scope %)))
+          (.then #(is (= "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404" %)
+                      "AWS documented query-string-auth signature"))
+          (.then (fn [_] (done)))
+          (.catch (caught done))))))
+
+;; ── 5. verification, on the async path ───────────────────────────────────────
+
+(def auth
+  (str "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, "
+       "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, "
+       "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"))
+
+(def request
+  {:method :get :path "/test.txt" :query nil
+   :headers {"host" "examplebucket.s3.amazonaws.com"
+             "range" "bytes=0-9"
+             "x-amz-content-sha256" v4/empty-payload-sha256
+             "x-amz-date" "20130524T000000Z"}})
+
+(deftest verification-reproduces-and-refuses-on-the-async-path
+  (async done
+    (let [parsed (verify/parse-authorization auth)]
+      (is (= "s3" (:service parsed)) "parse-authorization service")
+      (-> (verify/expected-signature c {:secret-key aws-secret
+                                        :parsed parsed
+                                        :amz-date "20130524T000000Z"
+                                        :payload-hash v4/empty-payload-sha256
+                                        :request request})
+          (.then (fn [sig]
+                   (is (= (:signature parsed) sig)
+                       "verification reproduces AWS's signature")
+                   (is (true? (verify/constant-time-eq? (:signature parsed) sig))
+                       "constant-time-eq? accepts it")))
+          (.then (fn [_]
+                   ;; The half that matters for a gate: a request whose Range
+                   ;; was altered after signing must NOT verify.
+                   (verify/expected-signature
+                    c {:secret-key aws-secret
+                       :parsed parsed
+                       :amz-date "20130524T000000Z"
+                       :payload-hash v4/empty-payload-sha256
+                       :request (assoc-in request [:headers "range"] "bytes=0-999999")})))
+          (.then (fn [sig]
+                   (is (false? (verify/constant-time-eq? (:signature parsed) sig))
+                       "a tampered Range does not verify")))
+          (.then (fn [_] (done)))
+          (.catch (caught done))))))
+
+;; ── 6. the composed signer — what Workers actually call ──────────────────────
+
+(def signer-base
+  {:endpoint "https://gateway.storjshare.io" :bucket "my-bucket" :region "us-east-1"
+   :access-key "jwtest" :secret-key "supersecret" :now "2026-07-25T12:00:00.000Z"})
+
+(defn- signature-of [signed]
+  (second (re-find #"Signature=([0-9a-f]+)" (get-in signed [:headers "authorization"]))))
+
+(deftest the-composed-signer-matches-the-jvm-and-an-independent-implementation
+  (async done
+    (-> (req/signed c (assoc signer-base :method :get :key "docs/readme.txt"))
+        (.then (fn [s]
+                 (is (= "https://gateway.storjshare.io/my-bucket/docs/readme.txt" (:url s))
+                     "request/signed url")
+                 (is (= "2f164e6a8b8805003436d9150ca22b2ed89f4bdcfa505bb0bcfe36d42d2ca528"
+                        (signature-of s))
+                     "request/signed signature (matches JVM + independent impl)")))
+        (.then (fn [_] (req/presigned c (assoc signer-base :key "docs/readme.txt"))))
+        (.then (fn [url]
+                 (is (= (str "https://gateway.storjshare.io/my-bucket/docs/readme.txt"
+                             "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                             "&X-Amz-Credential=jwtest%2F20260725%2Fus-east-1%2Fs3%2Faws4_request"
+                             "&X-Amz-Date=20260725T120000Z"
+                             "&X-Amz-Expires=3600"
+                             "&X-Amz-SignedHeaders=host"
+                             "&X-Amz-Signature=8890b75c4127c944b41ade4dcacb46afd437ab9ce89678bf3d9139c9e1b78fb9")
+                        url)
+                     "request/presigned")))
+        ;; a presigned PUT that binds its size — same expected signature as the
+        ;; JVM suite and the independent Node implementation, so the cljs path
+        ;; cannot quietly sign a different string
+        (.then (fn [_] (req/presigned-request c (assoc signer-base :method :put
+                                                       :key "docs/readme.txt"
+                                                       :headers {"Content-Length" 12345}))))
+        (.then (fn [r]
+                 (is (= "content-length;host" (:signed-headers r))
+                     "request/presigned-request signed-headers")
+                 (is (= {"content-length" "12345"} (:headers r))
+                     "request/presigned-request headers echoed to the client")
+                 (is (= "c676b0f6f3fa7ac36059fefc5050a3df4e6c697d56fbcd7419443de7cc69f3fa"
+                        (second (re-find #"X-Amz-Signature=([0-9a-f]+)" (:url r))))
+                     "request/presigned-request signature (matches JVM + independent impl)")))
+        (.then (fn [_] (done)))
+        (.catch (caught done)))))
+
+(deftest what-this-signs-it-also-accepts
+  ;; The property nine diverging copies could not hold.
+  (async done
+    (-> (req/signed c (assoc signer-base :method :put
+                             :key "docs/日本語 file (1).pdf" :body "payload"))
+        (.then (fn [s]
+                 (let [parsed (verify/parse-authorization (get-in s [:headers "authorization"]))]
+                   (-> (verify/expected-signature
+                        c {:secret-key (:secret-key signer-base)
+                           :parsed parsed
+                           :amz-date (get-in s [:headers "x-amz-date"])
+                           :payload-hash (get-in s [:headers "x-amz-content-sha256"])
+                           :request {:method :put
+                                     :path (v4/object-path "my-bucket" "docs/日本語 file (1).pdf")
+                                     :query nil
+                                     :headers (:headers s)}})
+                       (.then #(is (true? (verify/constant-time-eq? (:signature parsed) %))
+                                   "sign -> verify round-trip on a non-ASCII key"))))))
+        (.then (fn [_] (done)))
+        (.catch (caught done)))))
+
+;; ── run ──────────────────────────────────────────────────────────────────────
+
+(defmethod t/report [::t/default :end-run-tests] [m]
+  (when-not (t/successful? m)
+    (js/process.exit 1)))
+
+(t/run-tests 'sigv4.core-test 'run-tests)
