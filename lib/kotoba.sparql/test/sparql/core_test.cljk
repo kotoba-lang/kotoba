@@ -1,0 +1,238 @@
+(ns sparql.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [sparql.core :as sparql]))
+
+(defn- iri [v] {:rdf/type :iri :value v})
+(defn- lit [v] {:rdf/type :literal :value v})
+
+(def role (iri "role"))
+(def name-pred (iri "name"))
+(def knows (iri "knows"))
+
+(def quads
+  [{:subject (iri "alice") :predicate role :object (lit "admin")}
+   {:subject (iri "alice") :predicate name-pred :object (lit "Alice")}
+   {:subject (iri "alice") :predicate knows :object (iri "bob")}
+   {:subject (iri "bob") :predicate role :object (lit "user")}
+   {:subject (iri "bob") :predicate name-pred :object (lit "Bob")}])
+
+(deftest bgp-single-pattern-binds-var
+  (let [algebra {:sparql/op :bgp :patterns [['?s role '?r]]}
+        results (sparql/select algebra quads)]
+    (is (= 2 (count results)))
+    (is (some #(= (lit "admin") (get % '?r)) results))))
+
+(deftest bgp-multi-pattern-joins-on-shared-var
+  (let [algebra {:sparql/op :bgp
+                 :patterns [['?s role (lit "admin")]
+                            ['?s name-pred '?n]]}
+        results (sparql/select algebra quads)]
+    (is (= 1 (count results)))
+    (is (= (lit "Alice") (get (first results) '?n)))))
+
+(deftest filter-narrows-results
+  (let [algebra {:sparql/op :filter
+                 :pred (fn [b] (= (lit "admin") (get b '?r)))
+                 :pattern {:sparql/op :bgp :patterns [['?s role '?r]]}}
+        results (sparql/select algebra quads)]
+    (is (= 1 (count results)))))
+
+(deftest union-combines-both-branches
+  (let [algebra {:sparql/op :union
+                 :left {:sparql/op :bgp :patterns [['?s role (lit "admin")]]}
+                 :right {:sparql/op :bgp :patterns [['?s role (lit "user")]]}}
+        results (sparql/select algebra quads)]
+    (is (= 2 (count results)))))
+
+(deftest optional-keeps-unmatched-left-rows
+  (let [algebra {:sparql/op :optional
+                 :left {:sparql/op :bgp :patterns [['?s name-pred '?n]]}
+                 :right {:sparql/op :bgp :patterns [['?s knows '?friend]]}}
+        results (sparql/select algebra quads)
+        bob-row (some #(when (= (iri "bob") (get % '?s)) %) results)]
+    (is (= 2 (count results)))
+    (is (nil? (get bob-row '?friend)))))
+
+(deftest project-keeps-only-listed-vars
+  (let [algebra {:sparql/op :project
+                 :vars ['?n]
+                 :pattern {:sparql/op :bgp :patterns [['?s name-pred '?n]]}}
+        results (sparql/select algebra quads)]
+    (is (every? #(= #{'?n} (set (keys %))) results))))
+
+(deftest distinct-dedupes
+  (let [algebra {:sparql/op :distinct
+                 :pattern {:sparql/op :project
+                           :vars ['?r]
+                           :pattern {:sparql/op :bgp :patterns [['?s role '?r]]}}}
+        results (sparql/select algebra quads)]
+    (is (= 2 (count results)))))
+
+(deftest slice-limits-and-offsets
+  (let [algebra {:sparql/op :slice
+                 :offset 1 :limit 1
+                 :pattern {:sparql/op :bgp :patterns [['?s name-pred '?n]]}}
+        results (sparql/select algebra quads)]
+    (is (= 1 (count results)))))
+
+(deftest ask-reports-match-existence
+  (testing "matching pattern"
+    (is (true? (sparql/ask {:sparql/op :bgp :patterns [['?s role (lit "admin")]]} quads))))
+  (testing "non-matching pattern"
+    (is (false? (sparql/ask {:sparql/op :bgp :patterns [['?s role (lit "superadmin")]]} quads)))))
+
+;; --- ORDER BY direction ----------------------------------------------------
+
+(deftest order-by-descending
+  (testing "DESC used to be accepted by the parser and then silently sorted
+            ASCENDING, because the algebra could only express one direction —
+            a wrong answer, not a missing feature"
+    (let [rows [{'?n 1} {'?n 3} {'?n 2}]
+          asc (sort (sparql/row-comparator '[?n]) rows)
+          desc (sort (sparql/row-comparator '[?n] '#{?n}) rows)]
+      (is (= [1 2 3] (map '?n asc)))
+      (is (= [3 2 1] (map '?n desc))))))
+
+(deftest order-by-mixes-directions-per-var
+  (testing "each var carries its own direction, which is the whole reason
+            sort-by + juxt could not be kept"
+    (let [rows [{'?a 1 '?b "x"} {'?a 1 '?b "y"} {'?a 2 '?b "x"}]
+          out (sort (sparql/row-comparator '[?a ?b] '#{?b}) rows)]
+      (is (= [[1 "y"] [1 "x"] [2 "x"]] (map (juxt '?a '?b) out))))))
+
+(deftest order-by-tolerates-unbound-and-mixed-types
+  (testing "a solution sequence is exactly where mixed types show up — SPARQL
+            binds whatever the data holds. compare/1 throws across types, so an
+            ORDER BY over a heterogeneous column used to be an exception"
+    (let [rows [{'?v "b"} {'?v 2} {} {'?v "a"}]
+          out (sort (sparql/row-comparator '[?v]) rows)]
+      (is (= 4 (count out)))
+      (is (nil? ('?v (first out))) "unbound sorts first, per SPARQL 1.1 §15.1")
+      (is (= ["a" "b"] (filter string? (map '?v out))) "and within a type, ordered"))))
+
+(deftest order-by-is-total-so-sorting-never-throws
+  (is (some? (sort (sparql/row-comparator '[?v]) [{'?v {:a 1}} {'?v [1]} {'?v "s"}]))))
+
+;; --- CONSTRUCT / DESCRIBE --------------------------------------------------
+
+(deftest construct-instantiates-the-template-per-solution
+  (let [algebra {:sparql/op :bgp :patterns [['?s role (lit "admin")]]}
+        template [['?s (iri "isAdmin") (lit true)]]
+        g (sparql/construct template algebra quads)]
+    (is (set? g) "a graph, not a sequence — no duplicates and no order to depend on")
+    (is (every? #(= (iri "isAdmin") (:predicate %)) g))
+    (is (pos? (count g)))))
+
+(deftest construct-drops-a-triple-with-an-unbound-slot
+  (testing "SPARQL 1.1 §16.2: a template triple with an unbound slot produces
+            nothing, rather than a triple with a hole in it"
+    (let [algebra {:sparql/op :bgp :patterns [['?s role (lit "admin")]]}
+          template [['?s (iri "p") '?never]]]
+      (is (empty? (sparql/construct template algebra quads))))))
+
+(deftest construct-deduplicates
+  (let [algebra {:sparql/op :bgp :patterns [['?s '?p '?o]]}
+        template [[(iri "one") (iri "p") (lit 1)]]]
+    (is (= 1 (count (sparql/construct template algebra quads)))
+        "one variable-free template triple is one triple however many solutions")))
+
+(deftest describe-returns-the-subject-triples
+  (let [g (sparql/describe [(iri "alice")] quads)]
+    (is (set? g))
+    (is (every? #(= (iri "alice") (:subject %)) g))
+    (is (pos? (count g)))))
+
+(deftest describe-solutions-resolves-the-variable-first
+  (let [algebra {:sparql/op :bgp :patterns [['?s role (lit "admin")]]}
+        g (sparql/describe-solutions '[?s] algebra quads)]
+    (is (pos? (count g)))
+    (is (every? #(= (iri "alice") (:subject %)) g)
+        "alice is the only admin in the fixture")))
+
+;; ── GROUP BY + aggregates ───────────────────────────────────────────────────
+
+(def ^:private ages
+  [{:subject (iri "alice") :predicate (iri "team") :object (lit "red")}
+   {:subject (iri "alice") :predicate (iri "age") :object (lit "30")}
+   {:subject (iri "bob") :predicate (iri "team") :object (lit "red")}
+   {:subject (iri "bob") :predicate (iri "age") :object (lit "20")}
+   {:subject (iri "carol") :predicate (iri "team") :object (lit "blue")}
+   {:subject (iri "carol") :predicate (iri "age") :object (lit 40)}])
+
+(defn- one [rows] (first rows))
+
+(deftest count-over-everything-is-one-group
+  (let [algebra {:sparql/op :group
+                 :aggregates [{:var '?c :fn :count :arg '?s}]
+                 :pattern {:sparql/op :bgp :patterns [['?s (iri "team") '?t]]}}]
+    (is (= {'?c (lit 3)} (one (sparql/select algebra ages))))))
+
+(deftest count-of-nothing-is-a-row-saying-zero
+  (testing "not zero rows — a caller counting things gets 0, which is what
+            SPARQL says and what makes COUNT usable as an existence check"
+    (let [algebra {:sparql/op :group
+                   :aggregates [{:var '?c :fn :count :arg '?s}]
+                   :pattern {:sparql/op :bgp :patterns [['?s (iri "nope") '?t]]}}]
+      (is (= [{'?c (lit 0)}] (vec (sparql/select algebra ages)))))))
+
+(deftest grouping-by-a-var-splits-the-solutions
+  (let [algebra {:sparql/op :group
+                 :by ['?t]
+                 :aggregates [{:var '?c :fn :count :arg '?s}]
+                 :pattern {:sparql/op :bgp :patterns [['?s (iri "team") '?t]]}}]
+    (is (= #{{'?t (lit "red") '?c (lit 2)}
+             {'?t (lit "blue") '?c (lit 1)}}
+           (set (sparql/select algebra ages))))))
+
+(deftest grouping-an-empty-result-is-zero-groups
+  (testing "unlike the no-:by case: there is no group to report a count for"
+    (let [algebra {:sparql/op :group
+                   :by ['?t]
+                   :aggregates [{:var '?c :fn :count :arg '?s}]
+                   :pattern {:sparql/op :bgp :patterns [['?s (iri "nope") '?t]]}}]
+      (is (= [] (vec (sparql/select algebra ages)))))))
+
+(deftest numeric-aggregates-parse-numbers-out-of-strings
+  (testing "a datom plane that stringifies on write reports 30 as \"30\";
+            without parsing, SUM/AVG/MIN/MAX over real data would see nothing
+            numeric at all"
+    (let [algebra {:sparql/op :group
+                   :aggregates [{:var '?sum :fn :sum :arg '?a}
+                                {:var '?min :fn :min :arg '?a}
+                                {:var '?max :fn :max :arg '?a}
+                                {:var '?avg :fn :avg :arg '?a}]
+                   :pattern {:sparql/op :bgp :patterns [['?s (iri "age") '?a]]}}
+          row (one (sparql/select algebra ages))]
+      (is (= 90.0 (double (:value (get row '?sum)))))
+      (is (= 20.0 (double (:value (get row '?min)))))
+      (is (= 40.0 (double (:value (get row '?max)))))
+      (is (= 30.0 (double (:value (get row '?avg))))))))
+
+(deftest a-value-that-is-not-a-number-is-skipped-not-thrown
+  (let [algebra {:sparql/op :group
+                 :aggregates [{:var '?sum :fn :sum :arg '?t}
+                              {:var '?c :fn :count :arg '?t}]
+                 :pattern {:sparql/op :bgp :patterns [['?s (iri "team") '?t]]}}
+        row (one (sparql/select algebra ages))]
+    (is (nil? (get row '?sum))
+        "SUM of nothing numeric is absent, not 0 — SUM of nothing and SUM of
+         zeros are different facts")
+    (is (= (lit 3) (get row '?c)) "COUNT still counts them")))
+
+(deftest count-star-counts-solutions-not-bindings
+  (let [algebra {:sparql/op :group
+                 :aggregates [{:var '?c :fn :count :arg :*}]
+                 :pattern {:sparql/op :optional
+                           :left {:sparql/op :bgp :patterns [['?s (iri "team") '?t]]}
+                           :right {:sparql/op :bgp :patterns [['?s (iri "nope") '?x]]}}}]
+    (is (= {'?c (lit 3)} (one (sparql/select algebra ages)))
+        "three solutions, none of which bind ?x")))
+
+(deftest distinct-count-collapses-repeats
+  (let [algebra {:sparql/op :group
+                 :aggregates [{:var '?all :fn :count :arg '?t}
+                              {:var '?d :fn :count :arg '?t :distinct? true}]
+                 :pattern {:sparql/op :bgp :patterns [['?s (iri "team") '?t]]}}
+        row (one (sparql/select algebra ages))]
+    (is (= (lit 3) (get row '?all)))
+    (is (= (lit 2) (get row '?d)) "red and blue")))
