@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.floorplanLab` | `kotoba.floorplanLab/src` | `floorplan-lab.ble`, `floorplan-lab.fusion`, `floorplan-lab.motion`, `floorplan-lab.sensing-bridge` (Kotoba project library) |
 | `kotoba.filecoinCas` | `kotoba.filecoinCas/src` | `filecoin-cas.cid`, `filecoin-cas.engine`, `filecoin-cas.index`, `filecoin-cas.server` (Kotoba project library) |
 | `kotoba.ffi` | `kotoba.ffi/src` | `kotoba.ffi` (Kotoba project library) |
 | `kotoba.fea` | `kotoba.fea/src` | `kotoba.fea`, `kotoba.fea.boundary`, `kotoba.fea.convergence`, `kotoba.fea.fatigue` (Kotoba project library) |
