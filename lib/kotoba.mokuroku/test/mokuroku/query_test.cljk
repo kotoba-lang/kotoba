@@ -1,0 +1,122 @@
+(ns mokuroku.query-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mokuroku.item :as item]
+            [mokuroku.query :as query]
+            [mokuroku.source :as source]))
+
+(def descriptor
+  (source/descriptor
+   {:id :test/files
+    :item-kind :file
+    :label "Files"
+    :capability "fs/browse"
+    :commands #{:open}
+    :attributes [(source/attribute :size "Size" :number)
+                 (source/attribute :owner "Owner" :string)]}))
+
+(def items
+  [(item/item "b" :file "beta.txt" {:size 20 :owner "jun"})
+   (item/item "a" :file "alpha.txt" {:size 20 :owner "jun"})
+   (item/item "c" :file "gamma.txt" {:size 5 :owner "kei"})
+   (item/item "d" :directory "delta" {:owner "kei"})])
+
+(deftest sorting-is-total-and-deterministic
+  (testing "equal sort keys are broken by id, not by input order"
+    (let [q {:query/sort [[:size :asc]]}
+          forward (query/ordered-ids (query/run items q descriptor))
+          reversed (query/ordered-ids (query/run (vec (reverse items)) q descriptor))
+          shuffled (query/ordered-ids (query/run [(nth items 2) (nth items 0)
+                                                  (nth items 3) (nth items 1)]
+                                                 q descriptor))]
+      (is (= forward reversed shuffled))
+      (is (= ["c" "a" "b" "d"] forward)
+          "5 then the 20s in id order, then the sizeless directory last")))
+
+  (testing "missing values sort last ascending, not first"
+    (let [ids (query/ordered-ids (query/run items {:query/sort [[:size :asc]]} descriptor))]
+      (is (= "d" (last ids)))))
+
+  (testing "and last descending too — absent is appended, not ranked"
+    ;; Negating the whole comparison under :desc moves valueless rows to the
+    ;; top, which is the one place they must never be: "fullest volume first"
+    ;; would lead with the volume whose capacity could not be read.
+    (let [ids (query/ordered-ids (query/run items {:query/sort [[:size :desc]]} descriptor))]
+      (is (= "d" (last ids)))
+      (is (= ["a" "b" "c" "d"] ids)
+          "the 20s (id-tiebroken), then 5, then the sizeless row")))
+
+  (testing "two absent values tie and fall through to the next sort key"
+    (let [pair [(item/item "z" :file "zeta" {})
+                (item/item "y" :file "yankee" {})]]
+      (is (= ["y" "z"] (query/ordered-ids
+                        (query/run pair {:query/sort [[:size :desc] [:label :asc]]}
+                                   descriptor)))
+          "neither has a size, so the label decides")))
+
+  (testing "descending reverses the attribute; the id tiebreak stays ascending"
+    ;; Deliberate: the tiebreak exists for determinism, not to mirror the
+    ;; direction. Negating it too would mean the set of tied rows reorders
+    ;; every time the user flips a column that does not distinguish them.
+    (is (= ["a" "b"] (->> (query/run items {:query/sort [[:size :desc]]
+                                            :query/filters [[:size := 20]]}
+                                     descriptor)
+                          query/ordered-ids)))
+    (is (= ["a" "b" "c" "d"]
+           (->> (query/run items {:query/sort [[:kind :desc]]} descriptor)
+                query/ordered-ids))
+        ":file before :directory descending, then id within each")))
+
+(deftest comparison-is-total-across-types
+  (testing "a column of mixed scalars does not throw"
+    (let [mixed [(item/item "1" :file "one" {:x 1})
+                 (item/item "2" :file "two" {:x "two"})
+                 (item/item "3" :file "three" {:x :three})
+                 (item/item "4" :file "four" {:x true})
+                 (item/item "5" :file "five" {})]]
+      (is (= 5 (count (:result/items (query/run mixed {:query/sort [[:x :asc]]}))))))))
+
+(deftest filters
+  ;; No explicit sort, so the default applies: label ascending. That is why
+  ;; "delta" precedes "gamma" below.
+  (testing "operators"
+    (let [run #(query/ordered-ids (query/run items {:query/filters [%]} descriptor))]
+      (is (= ["a" "b"] (run [:size := 20])))
+      (is (= ["d" "c"] (run [:size :not= 20])))
+      (is (= ["c"] (run [:size :< 20])))
+      (is (= ["a" "b" "c"] (run [:size :exists true])))
+      (is (= ["d"] (run [:size :exists false])))
+      (is (= ["d" "c"] (run [:owner :in ["kei"]])))
+      (is (= ["a"] (run [:label :matches "ALPHA"])) "matches is case-insensitive")))
+
+  (testing "an unknown operator excludes nothing but is reported"
+    (let [r (query/run items {:query/filters [[:size :approximately 20]]} descriptor)]
+      (is (= 4 (count (:result/items r))))
+      (is (= [:unknown-operator] (mapv :query/problem (:result/problems r))))))
+
+  (testing "a filter on a column the source does not have is reported"
+    (is (= [:unknown-attribute]
+           (mapv :query/problem
+                 (:result/problems (query/run items {:query/filters [[:colour := :red]]}
+                                              descriptor)))))))
+
+(deftest text-search
+  (testing "searches label and string attributes, not numbers"
+    (is (= ["d" "c"] (query/ordered-ids (query/run items {:query/text "kei"} descriptor))))
+    (is (= 4 (count (:result/items (query/run items {:query/text "  "} descriptor))))
+        "blank search matches everything")
+    (is (empty? (:result/items (query/run items {:query/text "20"} descriptor)))
+        "a number in an attribute is not text-searchable")))
+
+(deftest limit-reports-what-it-hid
+  (let [r (query/run items {:query/limit 2 :query/sort [[:label :asc]]} descriptor)]
+    (is (= 2 (count (:result/items r))))
+    (is (= 4 (:result/matched r)) "matched is pre-limit")
+    (is (= 4 (:result/total r)))
+    (is (true? (:result/truncated? r)))))
+
+(deftest grouping
+  (let [r (query/run items {:query/group-by :owner} descriptor)
+        groups (:result/groups r)]
+    (is (= ["jun" "kei"] (mapv :group/value groups)))
+    (is (= [2 2] (mapv :group/count groups)))
+    (is (= #{"a" "b"} (set (:group/item-ids (first groups)))))))
