@@ -1,0 +1,207 @@
+(ns pay.x402-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [pay.x402 :as x402]))
+
+(def now 1783000000) ;; fixed epoch seconds for deterministic expiry tests
+
+(def reqs
+  (x402/payment-requirements
+   {:pay-to "0xTreasurySafe" :usd "0.01"
+    :resource "https://kotobase.net/api/premium/x"
+    :description "premium API call"}))
+
+(deftest requirements-shape
+  (is (= "exact" (:scheme reqs)))
+  (is (= "base" (:network reqs)))
+  (is (= "10000" (:maxAmountRequired reqs)))       ; $0.01 = 10000 micros
+  (is (= "0xTreasurySafe" (:payTo reqs)))
+  (is (= x402/usdc-base (:asset reqs))))
+
+(deftest challenge-body
+  (let [c (x402/challenge reqs)]
+    (is (= 1 (:x402Version c)))
+    (is (= 1 (count (:accepts c))))
+    (is (= "X-PAYMENT header is required" (:error c))))
+  (testing "multiple accepted options"
+    (is (= 2 (count (:accepts (x402/challenge [reqs reqs])))))))
+
+(deftest header-codec-roundtrip
+  (testing "base64 UTF-8 survives round trip (incl. multibyte)"
+    (doseq [s ["{\"x402Version\":1}" "日本語 price ¥" "0xdeadBEEF"]]
+      (is (= s (x402/decode-header (x402/encode-header s)))))))
+
+(def v2-reqs
+  (x402/v2-payment-requirements {:pay-to "0xTreasurySafe" :usd "0.01"}))
+
+(def v2-payment
+  {:x402Version 2
+   :resource {:url "https://x402.nexus/gateway/murakumo-memory/api/v1/infer-memory"
+              :description "infer+memory" :mimeType "application/json"}
+   :accepted v2-reqs
+   :payload {:signature "0xsig"
+             :authorization {:from "0xPayer" :to "0xTreasurySafe"
+                             :value "10000" :validAfter "0"
+                             :validBefore (str (+ now 60)) :nonce "0x01"}}
+   :extensions {}})
+
+(deftest v2-official-core-shape-and-validation
+  (let [required (x402/v2-payment-required
+                  {:resource (:resource v2-payment) :accepts [v2-reqs]})]
+    (is (= 2 (:x402Version required)))
+    (is (= "eip155:8453" (:network v2-reqs)))
+    (is (= "10000" (:amount v2-reqs)))
+    (is (nil? (:maxAmountRequired v2-reqs)))
+    (is (= [] (x402/v2-payload-errors v2-payment v2-reqs now))))
+  (testing "v2 exact rejects both underpayment and overpayment"
+    (doseq [amount ["9999" "10001"]]
+      (is (some #{:x402/amount-not-exact}
+                (x402/v2-payload-errors
+                 (assoc-in v2-payment [:payload :authorization :value] amount)
+                 v2-reqs now)))))
+  (testing "accepted requirements cannot be changed by the client"
+    (is (some #{:x402/accepted-requirements-mismatch}
+              (x402/v2-payload-errors
+               (assoc-in v2-payment [:accepted :payTo] "0xAttacker")
+               v2-reqs now)))))
+
+(deftest v2-agent-spend-policy
+  (let [policy {:allowed-networks #{"eip155:8453"}
+                :allowed-assets #{x402/usdc-base}
+                :allowed-pay-tos #{"0xtreasurysafe"}
+                :max-per-call-micros 10000
+                :spent-micros 20000
+                :max-total-micros 30000}
+        selected (x402/select-v2-requirement
+                  {:accepts [v2-reqs]} policy)]
+    (is (:ok? selected))
+    (is (= 30000 (:next-spent-micros selected)))
+    (is (= :x402/no-policy-compliant-requirement
+           (:reason (x402/select-v2-requirement
+                     {:accepts [v2-reqs]}
+                     (assoc policy :max-total-micros 29999)))))
+    (is (some #{:x402/pay-to-not-allowed}
+              (x402/v2-spend-policy-errors
+               v2-reqs (assoc policy :allowed-pay-tos #{"0xattacker"}))))))
+
+(deftest v2-settlement-shape
+  (is (= {:success true :transaction "0xtx" :network "eip155:8453"
+          :payer "0xpayer"}
+         (x402/v2-settlement-response
+          {:success true :transaction "0xtx" :network "eip155:8453"
+           :payer "0xpayer"}))))
+
+(def exact-payment
+  {:x402Version 1 :scheme "exact" :network "base"
+   :payload {:signature "0xsig"
+             :authorization {:from "0xPayer" :to "0xTreasurySafe"
+                             :value "10000"
+                             :validAfter "0" :validBefore (str (+ now 60))
+                             :nonce "0x01"}}})
+
+(deftest exact-scheme-validation
+  (testing "a well-formed exact payment passes"
+    (is (x402/acceptable? exact-payment reqs now)))
+  (testing "wrong recipient rejected"
+    (is (some #{:x402/wrong-recipient}
+              (x402/payload-errors
+               (assoc-in exact-payment [:payload :authorization :to] "0xElse")
+               reqs now))))
+  (testing "underpaid rejected"
+    (is (some #{:x402/underpaid}
+              (x402/payload-errors
+               (assoc-in exact-payment [:payload :authorization :value] "9999")
+               reqs now))))
+  (testing "expired authorization rejected"
+    (is (some #{:x402/authorization-expired}
+              (x402/payload-errors
+               (assoc-in exact-payment [:payload :authorization :validBefore] (str (- now 1)))
+               reqs now))))
+  (testing "not-yet-valid authorization rejected"
+    (is (some #{:x402/authorization-not-yet-valid}
+              (x402/payload-errors
+               (assoc-in exact-payment [:payload :authorization :validAfter] (str (+ now 100)))
+               reqs now))))
+  (testing "missing signature rejected"
+    (is (some #{:x402/missing-signature}
+              (x402/payload-errors (update exact-payment :payload dissoc :signature)
+                                   reqs now))))
+  (testing "scheme / network mismatch"
+    (is (some #{:x402/scheme-mismatch}
+              (x402/payload-errors (assoc exact-payment :scheme "transaction") reqs now)))
+    (is (some #{:x402/network-mismatch}
+              (x402/payload-errors (assoc exact-payment :network "ethereum") reqs now)))))
+
+(def tx-reqs (x402/payment-requirements
+              {:pay-to "0xTreasurySafe" :usd "0.01" :resource "r" :scheme "transaction"}))
+
+(def tx-payment
+  {:x402Version 1 :scheme "transaction" :network "base"
+   :payload {:txHash "0xabc" :from "0xPayer"}})
+
+(deftest transaction-scheme-validation
+  (is (x402/acceptable? tx-payment tx-reqs now))
+  (is (some #{:x402/missing-tx-hash}
+            (x402/payload-errors (update tx-payment :payload dissoc :txHash) tx-reqs now))))
+
+(deftest authorize-decision
+  (testing "authorized only when host confirms settlement"
+    (let [ok (x402/authorize exact-payment reqs
+                             {:included true :tx "0xsettled"} now)]
+      (is (:authorized? ok))
+      (is (= true (get-in ok [:settlement :success])))
+      (is (= "0xsettled" (get-in ok [:settlement :transaction])))
+      (is (= "0xPayer" (get-in ok [:settlement :payer])))))
+  (testing "unverified settlement holds at 402"
+    (let [r (x402/authorize exact-payment reqs {:included false :reason "not-anchored"} now)]
+      (is (not (:authorized? r)))
+      (is (= 402 (:status r)))
+      (is (= :x402/settlement-unverified (:reason r)))))
+  (testing "invalid payload holds at 402 before any settlement"
+    (let [r (x402/authorize (assoc-in exact-payment [:payload :authorization :value] "1")
+                            reqs {:included true} now)]
+      (is (not (:authorized? r)))
+      (is (= :x402/invalid-payment (:reason r)))
+      (is (some #{:x402/underpaid} (:errors r))))))
+
+(deftest the-asset-follows-the-network
+  (testing "amount, chain, token の 3 つは一致していなければならない。
+            base-sepolia と言いながら mainnet USDC を名指す offer は、
+            存在しないトークンを、そこに無い場所へ送れと言っている"
+    (is (= x402/usdc-base
+           (:asset (x402/payment-requirements {:pay-to "0xA" :usd "0.001" :network "base"}))))
+    (is (= "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+           (:asset (x402/payment-requirements {:pay-to "0xA" :usd "0.001" :network "base-sepolia"}))))))
+
+(deftest an-unknown-network-refuses-rather-than-naming-mainnet
+  (testing "既定に落とすと、well-formed で払えない offer ができる"
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (x402/payment-requirements {:pay-to "0xA" :usd "0.001" :network "solana"})))))
+
+(deftest an-explicit-asset-still-wins
+  (is (= "0xdead" (:asset (x402/payment-requirements
+                           {:pay-to "0xA" :usd "0.001" :network "base" :asset "0xdead"})))))
+
+(deftest eip712-domain-is-per-network-not-a-constant
+  ;; A domain that differs from the contract's own makes the buyer's signature
+  ;; recover a different address, so the payment is rejected as a bad
+  ;; signature -- blaming the buyer for a value the offer supplied. Measured
+  ;; 2026-09-01 by calling name() on both contracts.
+  (testing "base mainnet USDC declares USD Coin"
+    (is (= {:name "USD Coin" :version "2"}
+           (:extra (x402/payment-requirements
+                    {:pay-to "0xA00366234D29d4F882088048c0B2fa0dB7302D4E"
+                     :usd "0.001" :resource "/r" :network "base"})))))
+  (testing "base-sepolia USDC declares USDC, and every offer used to say USD Coin"
+    (is (= {:name "USDC" :version "2"}
+           (:extra (x402/payment-requirements
+                    {:pay-to "0xA00366234D29d4F882088048c0B2fa0dB7302D4E"
+                     :usd "0.001" :resource "/r" :network "base-sepolia"})))))
+  (testing "the CAIP-2 spellings agree with the plain ones"
+    (is (= (x402/eip712-domain-for "base") (x402/eip712-domain-for "eip155:8453")))
+    (is (= (x402/eip712-domain-for "base-sepolia") (x402/eip712-domain-for "eip155:84532"))))
+  (testing "the v2 builder carries the same domain, not the mainnet one"
+    (is (= "USDC" (:name (:extra (x402/v2-payment-requirements
+                                  {:pay-to "0xA0" :usd "0.001" :network "eip155:84532"}))))))
+  (testing "an unknown network is refused, because a wrong domain is silently unspendable"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (x402/eip712-domain-for "optimism")))))
