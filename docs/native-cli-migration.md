@@ -47,6 +47,27 @@ all12 command/provider paths, CID/lock caller integration and general FS
 fault/cleanup checks before public CLI parity can be claimed. Existing Web,
 Wasm, signature and package contracts remain acceptance criteria.
 
+The native request fixture currently exercises every command name and option,
+but has no product execution receipt for any command. The completion ledger is:
+
+| Command | Native execution acceptance still required |
+| --- | --- |
+| `id` | Create or inspect a principal with the declared identity and approval boundary. |
+| `run` | Compile and execute the selected Kotoba entry with admitted inputs and capabilities. |
+| `compile` | Produce and verify the requested Web or Wasm artifact. |
+| `check` | Validate source, package, lock and CLI contract inputs with named refusals. |
+| `graph` | Execute connect, query, transact, pull and status against an admitted graph. |
+| `git` | Execute init, status, commit and sync against a selected repository. |
+| `rad` | Execute new, build, test and export against a selected project. |
+| `build` | Build a locked project and verify its target artifact. |
+| `test` | Execute admitted project tests and report their verdict. |
+| `deploy` | Execute plan, apply, status and rollback with explicit target authority. |
+| `library` | Resolve, inspect and publish pinned library definitions. |
+| `hinshitsu` | Execute evidence, gate, coverage and visual checks. |
+
+Each row needs positive execution, refusal, resource and cleanup evidence on
+the exact Amu/Kotoba source revision before public launcher replacement.
+
 The Amu/Kotoba controller's two roles remain build infrastructure. A passing
 controller gate is distinct from complete product command execution and from
 a production route cutover. See `AGENTS.md` for uncovered checks and limits.
