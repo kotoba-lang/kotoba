@@ -1,0 +1,231 @@
+;; ONC RPC record marking (RFC 5531 §11) as a Kotoba application
+;; (ADR-2608261100) — reading one message off a byte stream that has no
+;; message boundaries of its own.
+;;
+;; The contract is the one the other guests in this workspace use, turned
+;; to face a stream rather than a line reader:
+;;
+;;   init          (config)        -> state
+;;   need-bytes    (state)         -> how many bytes to read next
+;;   offer-header  (state, word)   -> state   ; the host read 4, big-endian
+;;   fragment-read (state)         -> state   ; the host read and kept them
+;;   reset         (state)         -> state   ; next message, same stream
+;;
+;; ## Why this is the cleanest case for the guest/host line
+;;
+;; Record marking is nothing BUT the framing decision. A fragment is a
+;; four-byte header and then that many bytes: the top bit says *this is the
+;; last fragment*, the low 31 bits are the length. The bytes it names are a
+;; message — an NFS WRITE payload, say — and they are not this module's
+;; business. So the split is exact:
+;;
+;;   the guest owns   how long this fragment is, whether it is the last,
+;;                    whether the accumulation has passed the ceiling, and
+;;                    whether the stream is incomplete or invalid;
+;;   the host owns    every byte.
+;;
+;; `.cljc`'s `parse` does both, because a `.cljc` function handed a byte
+;; array may as well slice it. A guest may not: a `:document` holds 32 items
+;; per container and 65536 UTF-8 bytes in aggregate, and the whole point of
+;; record marking is the 64 KiB transfer that exceeds them
+;; (ADR-2608039970 — bytes do not go through the value plane).
+;; `record-marking-carries-no-message-bytes` is the negative control.
+;;
+;; ## The two rules `oncrpc.record`'s own docstring names
+;;
+;; Both are negative controls, because both are rules a reader loses while
+;; every small call still works:
+;;
+;;   * **accumulate until the last-fragment bit.** A reader that treats
+;;     every fragment as a message works perfectly against every small call
+;;     and then corrupts the first 64 KiB WRITE, which is the first time a
+;;     client has any reason to split one;
+;;   * **the length is not the message length.** A reader that takes the
+;;     first header's length as the total resynchronises from a multi-
+;;     fragment stream only by chance.
+;;
+;; And one the API shape names: **"not yet" is not "never".** The oracle
+;; returns nil for an incomplete stream and throws for invalid framing, and
+;; a stream reader must be able to tell them apart. Here they are different
+;; phases (`:want-header` / `:want-fragment` versus `:failed`), which is the
+;; same distinction without an exception — `throw` is not in the language
+;; (ADR-2608650000, refined by adr-2608301500 to "no untracked control
+;; effects").
+;;
+;; ## The header arrives as one word, not four bytes
+;;
+;; The host reads four bytes and passes the big-endian u32. Assembling an
+;; integer out of four octets is mechanism the host is already doing to get
+;; them off the socket; deciding what the integer MEANS is this module's
+;; job. The value is handed over as `:i64` because the guest has no
+;; unsigned type and `0x80000000` does not fit a signed 32-bit one.
+;;
+;; UDP has no record marking at all — the datagram is the boundary — so
+;; this is TCP-only, and says so rather than pretending to be general.
+;;
+;; `.cljc` remains the oracle and is not required from here (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/oncrpc/record.kotoba \
+;;     --target wasm32-browser --output record.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 5210-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns oncrpc.record
+  (:export [init reset
+            offer-header fragment-read
+            phase need-bytes error-text
+            fragment-length last-fragment? fragment-count
+            accumulated max-message]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+;; --- the header word ------------------------------------------------------
+;; RFC 5531 §11: the top bit is the last-fragment flag, the low 31 bits are
+;; this fragment's length. `0x80000000` is 2147483648 and `0x7fffffff` is
+;; 2147483647; both are written out because the guest has no hex literal.
+
+(defn- last-bit [] :i64 2147483648)
+
+(defn- length-mask [] :i64 2147483647)
+
+;; A ceiling on what ONE message may accumulate to. NFSv3 with 64 KiB
+;; transfers needs well under a megabyte; past this the peer has lost
+;; framing, and the answer is to stop rather than to keep allocating. The
+;; same default the oracle carries.
+(defn- default-max-message [] :i64 4194304)
+
+;; --- state ----------------------------------------------------------------
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-header)
+                :need (document-i64 4)
+                :length (document-i64 0)
+                :last (document-bool false)
+                :fragments (document-i64 0)
+                :accumulated (document-i64 0)
+                :max (document-i64
+                      (let [m (option-value-of [:option :i64]
+                                               (document-i64-value (dg config :max-message))
+                                               0)]
+                        (if (> m 0) m (default-max-message))))
+                :error (document-string "")))
+
+;; The next message on the same stream. The ceiling is a property of the
+;; reader, not of the message, so it survives.
+(defn reset [state :document] :document
+  (document-map :phase (document-keyword :want-header)
+                :need (document-i64 4)
+                :length (document-i64 0)
+                :last (document-bool false)
+                :fragments (document-i64 0)
+                :accumulated (document-i64 0)
+                :max (document-i64 (di state :max))
+                :error (document-string "")))
+
+(defn- fail [state :document message :string] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc state :phase (document-keyword :failed))
+    :error (document-string message))
+   :need (document-i64 0)))
+
+;; --- transitions ----------------------------------------------------------
+
+;; The host read four bytes and assembled the big-endian u32.
+(defn offer-header [state :document word :i64] :document
+  (let [p (dk state :phase)]
+    (cond
+      (not (= p :want-header)) state
+
+      (< word 0) (fail state "oncrpc: record header is not a u32")
+
+      :else
+      (let [len (bit-and word (length-mask))
+            last (not (= (bit-and word (last-bit)) 0))
+            total (+ (di state :accumulated) len)]
+        (if (> total (di state :max))
+          ;; The ceiling is checked against what this fragment WOULD bring
+          ;; the message to, before the host reads a byte of it. Checking
+          ;; afterwards means having already allocated what the check
+          ;; exists to refuse.
+          (fail state "oncrpc: message exceeds the framing ceiling")
+          (document-assoc
+           (document-assoc
+            (document-assoc
+             (document-assoc state :phase (document-keyword :want-fragment))
+             :length (document-i64 len))
+            :last (document-bool last))
+           :need (document-i64 len)))))))
+
+;; The host read `fragment-length` bytes and kept them. A zero-length
+;; fragment is legal and is not a no-op: it can be the last one.
+(defn fragment-read [state :document] :document
+  (let [p (dk state :phase)]
+    (if (not (= p :want-fragment))
+      state
+      (let [done (document-assoc
+                  (document-assoc state :accumulated
+                                  (document-i64 (+ (di state :accumulated)
+                                                   (di state :length))))
+                  :fragments (document-i64 (+ (di state :fragments) 1)))]
+        (if (db state :last)
+          (document-assoc
+           (document-assoc done :phase (document-keyword :complete))
+           :need (document-i64 0))
+          ;; Not the last: the next four bytes are another header. This is
+          ;; the branch a reader that treats every fragment as a message
+          ;; never takes.
+          (document-assoc
+           (document-assoc done :phase (document-keyword :want-header))
+           :need (document-i64 4)))))))
+
+;; --- projections ----------------------------------------------------------
+
+;; :want-header / :want-fragment -> more bytes are needed, which is the
+;; oracle's nil. :complete -> a whole message. :failed -> invalid framing,
+;; which is the oracle's throw. "Not yet" and "never" are different answers
+;; and this is where they are told apart.
+(defn phase [state :document] :keyword (dk state :phase))
+
+;; How many bytes the host must read before calling in again: 4 for a
+;; header, the fragment's own length for a fragment, 0 when there is
+;; nothing more to read.
+(defn need-bytes [state :document] :i64 (di state :need))
+
+(defn error-text [state :document] :string (ds state :error))
+
+;; This fragment's own length -- NOT the message's. A caller that writes the
+;; total here produces a stream the peer resynchronises from only by chance.
+(defn fragment-length [state :document] :i64 (di state :length))
+
+(defn last-fragment? [state :document] :bool (db state :last))
+
+(defn fragment-count [state :document] :i64 (di state :fragments))
+
+;; How many bytes the host has kept for this message. The message itself is
+;; never a guest value.
+(defn accumulated [state :document] :i64 (di state :accumulated))
+
+(defn max-message [state :document] :i64 (di state :max))

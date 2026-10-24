@@ -1,0 +1,293 @@
+;; `kotoba/oncrpc/record.kotoba` against `oncrpc.record/parse`.
+;;
+;; The slice is record marking (RFC 5531 §11): reading one RPC message off a
+;; byte stream that has no message boundaries of its own. The guest decides
+;; the framing; the host reads every byte. So the two are driven over the
+;; SAME stream and compared on the message that came out of it and on how
+;; many bytes it took.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+;;
+;; ## The host loop is the point
+;;
+;; `drive` is what a stream reader does, and it is deliberately literal
+;; about it: ask the guest how many bytes it needs, take exactly that many,
+;; and hand back either the header word or the fact that the fragment was
+;; kept. It never shows the guest a byte of payload. If the stream runs out
+;; mid-way it stops, and the guest's phase is what says whether that was
+;; "not yet" or "never" -- the distinction `parse`'s nil-versus-throw makes,
+;; without an exception.
+;;
+;; ## The negative controls
+;;
+;; Four, and the first two are the rules `oncrpc.record`'s own docstring
+;; says are the reason it is a separate namespace -- both invisible to any
+;; test that only ever sends one small fragment:
+;;
+;;   * `a-multi-fragment-message-is-one-message` — a reader that treats
+;;     every fragment as a message works perfectly against every small call
+;;     and corrupts the first 64 KiB WRITE;
+;;   * `each-fragment-carries-its-own-length` — a reader that takes the
+;;     first header's length as the total resynchronises only by chance;
+;;   * `not-yet-is-not-never` — an incomplete stream is a phase, not a
+;;     failure, and a reader that cannot tell them apart either hangs on a
+;;     broken peer or drops a slow one;
+;;   * `the-ceiling-refuses-before-the-host-allocates` — checked against
+;;     what the fragment WOULD bring the message to, before the host reads
+;;     it. Checking afterwards means having already allocated what the
+;;     check exists to refuse.
+;;
+;; And `record-marking-carries-no-message-bytes` for the design claim.
+
+(ns oncrpc.record-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [oncrpc.guest-document :refer [->doc]]
+            [oncrpc.record :as record]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "oncrpc" "record.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'oncrpc.record (slurp guest-file)}
+                                         'oncrpc.record
+                                         :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+;; --- building streams ------------------------------------------------------
+
+(defn- header-bytes
+  "RFC 5531 §11: the top bit is the last-fragment flag, the low 31 the
+  fragment's own length."
+  [len last?]
+  (let [word (bit-or (if last? 0x80000000 0) len)]
+    [(bit-and (bit-shift-right word 24) 0xff)
+     (bit-and (bit-shift-right word 16) 0xff)
+     (bit-and (bit-shift-right word 8) 0xff)
+     (bit-and word 0xff)]))
+
+(defn- fragment [payload last?]
+  (concat (header-bytes (count payload) last?) payload))
+
+(defn- stream
+  "`fragments` is a seq of payload byte-vectors; the last is marked last."
+  [fragments]
+  (let [n (count fragments)]
+    (vec (mapcat (fn [i p] (fragment p (= i (dec n))))
+                 (range n) fragments))))
+
+(defn- ->byte-array [ints]
+  (byte-array (map #(unchecked-byte %) ints)))
+
+;; --- the host loop ---------------------------------------------------------
+
+(defn- word-of
+  "Four bytes, big-endian, as the u32 the host assembles off the socket.
+  Producing an integer from four octets is mechanism; deciding what it
+  means is the guest's job."
+  [bs i]
+  (+ (* (nth bs i) 16777216)
+     (* (nth bs (+ i 1)) 65536)
+     (* (nth bs (+ i 2)) 256)
+     (nth bs (+ i 3))))
+
+(defn- drive
+  "Read `bytes` the way a stream reader does. Returns what the host ended up
+  holding, plus the guest's final answer about the framing.
+
+  The payload never reaches the guest: `fragment-read` is told only that the
+  bytes were kept."
+  [bytes]
+  (loop [state (call 'init [(->doc {})])
+         pos 0
+         kept []]
+    (let [phase (call 'phase [state])
+          need (call 'need-bytes [state])]
+      (cond
+        (contains? #{:complete :failed} phase)
+        {:phase phase
+         :state state
+         :message kept
+         :consumed pos
+         :error (call 'error-text [state])
+         :fragments (call 'fragment-count [state])
+         :accumulated (call 'accumulated [state])}
+
+        ;; The stream ran out. Not an error here -- the guest's phase says
+        ;; whether more bytes would finish it.
+        (< (count bytes) (+ pos need))
+        {:phase phase :state state :message kept :consumed pos
+         :error (call 'error-text [state])
+         :fragments (call 'fragment-count [state])
+         :accumulated (call 'accumulated [state])
+         :starved true}
+
+        (= :want-header phase)
+        (recur (call 'offer-header [state (word-of bytes pos)]) (+ pos 4) kept)
+
+        :else
+        (recur (call 'fragment-read [state])
+               (+ pos need)
+               (into kept (subvec bytes pos (+ pos need))))))))
+
+(defn- oracle
+  "`parse` over the same stream, or the exception it throws."
+  ([bytes] (oracle bytes {}))
+  ([bytes opts]
+   (try
+     (let [r (record/parse (->byte-array bytes) opts)]
+       (if (nil? r)
+         {:incomplete true}
+         {:message (vec (map #(bit-and % 0xff) (seq (:message r))))
+          :end (:end r)}))
+     (catch clojure.lang.ExceptionInfo e {:error (ex-message e)}))))
+
+;; --- the tests -------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest one-fragment-is-the-common-case
+  (let [payload (vec (range 1 33))
+        bytes (stream [payload])
+        guest (drive bytes)
+        o (oracle bytes)]
+    (is (= :complete (:phase guest)) (:error guest))
+    (is (= payload (:message guest)))
+    (is (= (:message o) (:message guest)))
+    (is (= (:end o) (:consumed guest)))
+    (is (= 1 (:fragments guest)))))
+
+(deftest a-multi-fragment-message-is-one-message
+  (testing "RFC 5531 §11. A reader that treats every fragment as a message
+            works perfectly against every small call and then corrupts the
+            first 64 KiB WRITE, which is the first time a client has any
+            reason to split one."
+    (let [a (vec (range 1 51))
+          b (vec (range 51 101))
+          c (vec (range 101 121))
+          bytes (stream [a b c])
+          guest (drive bytes)
+          o (oracle bytes)]
+      (is (= :complete (:phase guest)) (:error guest))
+      (is (= 3 (:fragments guest)) "three fragments, one message")
+      (is (= (concat a b c) (:message guest)))
+      (is (= (:message o) (:message guest)))
+      (is (= (:end o) (:consumed guest))
+          "and the whole stream was consumed, headers included"))))
+
+(deftest each-fragment-carries-its-own-length
+  (testing "the length is NOT the message length. A reader that takes the
+            first header's length as the total resynchronises from this
+            stream only by chance."
+    (let [a (vec (repeat 10 0xaa))
+          b (vec (repeat 70 0xbb))
+          bytes (stream [a b])
+          guest (drive bytes)
+          o (oracle bytes)]
+      (is (= :complete (:phase guest)) (:error guest))
+      (is (= 80 (:accumulated guest)) "10 + 70, not 10 twice and not 80 twice")
+      (is (= (:message o) (:message guest)))
+      (is (= (+ 4 10 4 70) (:consumed guest))))))
+
+(deftest not-yet-is-not-never
+  (testing "`parse` answers nil for an incomplete stream and throws for
+            invalid framing, and a stream reader must tell them apart. Here
+            they are different phases, which is the same distinction without
+            an exception."
+    (testing "a header that has not fully arrived"
+      (let [guest (drive [0x00 0x00])]
+        (is (= :want-header (:phase guest)))
+        (is (true? (:starved guest)))
+        (is (= "" (:error guest)))
+        (is (:incomplete (oracle [0x00 0x00])))))
+    (testing "a fragment whose payload has not fully arrived"
+      (let [bytes (vec (concat (header-bytes 50 true) (repeat 10 0xcc)))
+            guest (drive bytes)]
+        (is (= :want-fragment (:phase guest)))
+        (is (= 50 (call 'need-bytes [(:state guest)])) "it says how many")
+        (is (= "" (:error guest)))
+        (is (:incomplete (oracle bytes)))))
+    (testing "and a non-final fragment whose successor has not arrived"
+      (let [bytes (vec (concat (header-bytes 4 false) [1 2 3 4]))
+            guest (drive bytes)]
+        (is (= :want-header (:phase guest)) "waiting for the NEXT header")
+        (is (= 1 (:fragments guest)))
+        (is (:incomplete (oracle bytes)))))))
+
+(deftest the-ceiling-refuses-before-the-host-allocates
+  (testing "past the ceiling the peer has lost framing, and the answer is to
+            stop rather than to keep allocating -- so the check is against
+            what the fragment WOULD bring the message to, before the host
+            reads a byte of it."
+    (let [bytes (vec (concat (header-bytes 5000 true) (repeat 10 0)))
+          state (call 'offer-header [(call 'init [(->doc {:max-message 1000})])
+                                     (bit-or 0x80000000 5000)])]
+      (is (= :failed (call 'phase [state])))
+      (is (= "oncrpc: message exceeds the framing ceiling"
+             (call 'error-text [state])))
+      (is (= 0 (call 'need-bytes [state]))
+          "and it asks for nothing more, so the host allocates nothing")
+      (is (= 0 (call 'accumulated [state])))
+      (testing "the oracle refuses the same stream"
+        (is (str/includes? (:error (oracle bytes {:max-message 1000}))
+                           "framing ceiling"))))))
+
+(deftest the-ceiling-counts-the-message-not-the-fragment
+  (testing "two fragments that each fit but together do not"
+    (let [state (-> (call 'init [(->doc {:max-message 100})])
+                    (as-> s (call 'offer-header [s 60]))
+                    (as-> s (call 'fragment-read [s]))
+                    (as-> s (call 'offer-header [s (bit-or 0x80000000 60)])))]
+      (is (= :failed (call 'phase [state])))
+      (is (= 60 (call 'accumulated [state])) "the first fragment stands"))))
+
+(deftest a-zero-length-last-fragment-completes-the-message
+  (testing "legal, and not a no-op: it is how a sender ends a message whose
+            payload happened to land on a fragment boundary"
+    (let [a (vec (range 1 11))
+          bytes (vec (concat (fragment a false) (fragment [] true)))
+          guest (drive bytes)
+          o (oracle bytes)]
+      (is (= :complete (:phase guest)) (:error guest))
+      (is (= 2 (:fragments guest)))
+      (is (= a (:message guest)))
+      (is (= (:message o) (:message guest))))))
+
+(deftest record-marking-carries-no-message-bytes
+  (testing "the design claim, tested: a `:document` holds 32 items per
+            container and 65536 UTF-8 bytes in aggregate, and the whole
+            point of record marking is the 64 KiB transfer that exceeds
+            them. This finishes because the guest is never shown a payload
+            byte -- `fragment-read` takes no data at all."
+    (let [payload (vec (repeat 200000 0x5a))
+          bytes (stream [payload])
+          guest (drive bytes)]
+      (is (< 65536 (count payload)) "only meaningful past the aggregate bound")
+      (is (= :complete (:phase guest)) (:error guest))
+      (is (= 200000 (:accumulated guest)))
+      (is (= payload (:message guest)) "the host has it")
+      (testing "and the guest's own record of it is two integers"
+        (is (= 200000 (call 'accumulated [(:state guest)])))
+        (is (= 1 (call 'fragment-count [(:state guest)])))))))
+
+(deftest reset-starts-the-next-message-and-keeps-the-ceiling
+  (testing "a stream carries many messages; the ceiling is a property of the
+            reader, not of the message"
+    (let [first-msg (drive (stream [[1 2 3]]))
+          next-state (call 'reset [(:state first-msg)])]
+      (is (= :want-header (call 'phase [next-state])))
+      (is (= 4 (call 'need-bytes [next-state])))
+      (is (= 0 (call 'accumulated [next-state])))
+      (is (= 0 (call 'fragment-count [next-state])))
+      (is (= (call 'max-message [(:state first-msg)])
+             (call 'max-message [next-state]))))))
+
+(deftest the-default-ceiling-matches-the-oracle
+  (is (= record/default-max-message
+         (call 'max-message [(call 'init [(->doc {})])]))))
