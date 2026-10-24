@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kotobaLedger` | `kotoba.kotobaLedger/src` | `kotoba.ledger.core`, `kotoba.ledger.file-git`, `kotoba.ledger.kotobase` (Kotoba project library) |
 | `kotoba.kotobaHir` | `kotoba.kotobaHir/src` | `kotoba.hir` (Kotoba project library) |
 | `kotoba.kotobaFleet` | `kotoba.kotobaFleet/src` | `kotoba.fleet.agent`, `kotoba.fleet.core`, `kotoba.fleet.evolution`, `kotoba.fleet.governor` (Kotoba project library) |
 | `kotoba.kotobaDocumentContracts` | `kotoba.kotobaDocumentContracts/src` | `kotoba.document.artifact-graph`, `kotoba.document.change`, `kotoba.document.collaboration`, `kotoba.document.dom` (Kotoba project library) |
