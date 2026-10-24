@@ -68,6 +68,7 @@ The bundled standard libraries live in this repository:
 | `org.omg.dmn` | `org.omg.dmn/src` | `dmn.execute`, `dmn.model`, `dmn.ports`, `dmn.validate` (an external specification, publisher omg.org) |
 | `org.w3.aria` | `org.w3.aria/src` | `aria.core` (an external specification, publisher w3.org) |
 | `org.w3.did` | `org.w3.did/src` | `did.core` (an external specification, publisher w3.org) |
+| `org.w3.nquads` | `org.w3.nquads/src` | `nquads.core` (an external specification, publisher w3.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
