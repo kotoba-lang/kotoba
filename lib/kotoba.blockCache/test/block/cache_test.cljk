@@ -1,0 +1,144 @@
+(ns block.cache-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [block.cache :as bc]))
+
+(defn- b [n] #?(:clj (byte-array n) :cljs (js/Uint8Array. n)))
+
+(defn- counting-store [m]
+  (let [reads (atom 0)]
+    {:get-fn (fn [cid] (swap! reads inc) (get m cid))
+     :reads reads}))
+
+(deftest a-hit-does-not-reach-the-store
+  (let [{:keys [get-fn reads]} (counting-store {"a" (b 10) "c" (b 10)})
+        g (bc/wrap-get-fn (bc/memory 1000) get-fn)]
+    (is (some? (g "a")))
+    (is (some? (g "a")))
+    (is (some? (g "a")))
+    (testing "three reads, one store hit -- the point of the whole library"
+      (is (= 1 @reads)))))
+
+(deftest a-missing-block-is-not-cached
+  (testing "absence is the one thing about a CID that CAN change later, when
+           the block finally arrives -- caching nil would make that permanent"
+    (let [store (atom {})
+          reads (atom 0)
+          g (bc/wrap-get-fn (bc/memory 1000)
+                            (fn [cid] (swap! reads inc) (get @store cid)))]
+      (is (nil? (g "later")))
+      (is (nil? (g "later")))
+      (swap! store assoc "later" (b 4))
+      (is (some? (g "later")) "the block became available and the cache did not hide it")
+      (is (= 3 @reads)))))
+
+(deftest verification-happens-once-not-per-read
+  (let [{:keys [get-fn]} (counting-store {"a" (b 10)})
+        verified (atom 0)
+        g (bc/wrap-get-fn (bc/memory 1000) get-fn
+                          {:verify! (fn [_ _] (swap! verified inc))})]
+    (dotimes [_ 5] (g "a"))
+    (testing "a content-addressed block that hashed correctly on entry cannot
+             have changed in memory; re-hashing it 5 times proves nothing"
+      (is (= 1 @verified))))
+  (testing "and a bad block still throws, on the read that fetched it"
+    (let [{:keys [get-fn]} (counting-store {"bad" (b 3)})
+          g (bc/wrap-get-fn (bc/memory 1000) get-fn
+                            {:verify! (fn [_ _] (throw (ex-info "cid mismatch" {})))})]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default) (g "bad"))))))
+
+(deftest the-bound-is-bytes-not-entries
+  (let [c (bc/memory 100)]
+    (dotimes [i 20] (bc/store! c (str "k" i) (b 10)))
+    (let [{:keys [bytes entries evictions]} (bc/stats c)]
+      (testing "20 x 10 bytes against a 100-byte budget must evict"
+        (is (<= bytes 100))
+        (is (< entries 20))
+        (is (pos? evictions)))))
+  (testing "a block larger than the whole budget is refused, not stored by
+           evicting everything else for something that will not be reused"
+    (let [c (bc/memory 100)]
+      (bc/store! c "small" (b 10))
+      (bc/store! c "huge" (b 500))
+      (is (nil? (bc/lookup c "huge")))
+      (is (some? (bc/lookup c "small"))))))
+
+(deftest eviction-is-least-recently-used
+  (let [c (bc/memory 30)]
+    (bc/store! c "a" (b 10)) (bc/store! c "b" (b 10)) (bc/store! c "c" (b 10))
+    (bc/lookup c "a")                       ; a is now the most recent
+    (bc/store! c "d" (b 10))                ; forces eviction
+    (testing "the untouched one goes before the recently used one"
+      (is (some? (bc/lookup c "a"))))))
+
+(deftest stats-report-the-miss-rate
+  (let [{:keys [get-fn]} (counting-store {"a" (b 4)})
+        c (bc/memory 1000)
+        g (bc/wrap-get-fn c get-fn)]
+    (g "a") (g "a") (g "a") (g "a")
+    (is (= 1 (:misses (bc/stats c))))
+    (is (= 3 (:hits (bc/stats c))))
+    (is (= 0.75 (bc/hit-rate c))))
+  (testing "hit-rate before any lookup is nil, not a fabricated 0 or 1"
+    (is (nil? (bc/hit-rate (bc/memory 10))))))
+
+(deftest tiers-promote-on-a-hit-from-below
+  (let [fast (bc/memory 1000)
+        slow (bc/memory 1000)
+        t (bc/tiered fast slow)]
+    (bc/store! slow "x" (b 5))
+    (is (nil? (bc/lookup fast "x")))
+    (is (some? (bc/lookup t "x")))
+    (testing "the fast tier learned what is hot -- without this, tiering does
+             nothing at all"
+      (is (some? (bc/lookup fast "x"))))))
+
+(deftest null-cache-is-transparent
+  (let [{:keys [get-fn reads]} (counting-store {"a" (b 4)})
+        g (bc/wrap-get-fn (bc/null) get-fn)]
+    (dotimes [_ 3] (g "a"))
+    (testing "caching can be turned off by configuration, not by an if"
+      (is (= 3 @reads)))))
+
+;; ── segmented: the metadata cache ────────────────────────────────────
+
+(deftest a-scan-of-large-blocks-cannot-evict-hot-metadata
+  (testing "this is the whole reason Hummock keeps two caches, and the reason
+           a shared LRU is not equivalent: one wide scan is exactly the
+           access pattern that defeats recency"
+    (let [c (bc/segmented {:small-max-bytes 1000 :large-max-bytes 1000
+                           :threshold-bytes 100})]
+      (bc/store! c "meta-1" (b 50))
+      (bc/store! c "meta-2" (b 50))
+      ;; a wide scan: 40 large blocks through a 1000-byte large segment
+      (dotimes [i 40] (bc/store! c (str "block-" i) (b 500)))
+      (is (some? (bc/lookup c "meta-1")) "metadata survived the scan")
+      (is (some? (bc/lookup c "meta-2")))
+      (is (nil? (bc/lookup c "block-0")) "and the scan DID churn its own segment")))
+  (testing "a single shared cache of the same total size loses the metadata"
+    (let [c (bc/memory 2000)]
+      (bc/store! c "meta-1" (b 50))
+      (dotimes [i 40] (bc/store! c (str "block-" i) (b 500)))
+      (is (nil? (bc/lookup c "meta-1"))))))
+
+(deftest segments-report-their-hit-rates-separately
+  (let [c (bc/segmented {:threshold-bytes 100})]
+    (bc/store! c "m" (b 10))
+    (bc/lookup c "m") (bc/lookup c "m")
+    (bc/store! c "big" (b 500))
+    (bc/lookup c "big")
+    (bc/lookup c "absent")
+    (let [{:keys [small large]} (bc/segment-hit-rates c)]
+      (testing "a healthy metadata segment and a thrashing block segment must
+               not average into one number that hides both"
+        (is (some? small))
+        (is (some? large))))))
+
+(deftest segmented-routes-by-size-not-by-caller-knowledge
+  (let [c (bc/segmented {:threshold-bytes 100})]
+    (bc/store! c "small" (b 10))
+    (bc/store! c "large" (b 1000))
+    (is (some? (bc/lookup c "small")))
+    (is (some? (bc/lookup c "large")))
+    (let [{:keys [small large]} (bc/stats c)]
+      (is (= 1 (:entries small)))
+      (is (= 1 (:entries large))))))
