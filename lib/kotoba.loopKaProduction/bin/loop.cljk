@@ -1,0 +1,196 @@
+(ns loop
+  "nbb CLI for the -ka production loop: observe -> evaluate -> decide -> act ->
+  record-evidence.
+
+  Deliberately provider-neutral (the `loop-*` contract forbids binding to one
+  runner). `plan` emits a murakumo task batch and stops; the resident path is
+  `murakumo task run --tasks`, but the same batch runs under launchd or by hand.
+
+    kbb --backend sci --classpath src:resources bin/loop.cljk observe [--date YYYY-MM-DD] [--slot 0]
+    nbb ... bin/loop.cljk plan   --workspace <dir> [--out tasks.edn]
+    nbb ... bin/loop.cljk record --channel dougaka --episode <id> --legs legs.edn
+                                 [--phase 1] [--approve publish]
+    nbb ... bin/loop.cljk report [--last 20]
+
+  `observe` and `plan` never execute a producer and never publish. `record` is
+  what a producer calls when it finishes: it grades the run's own :legs report,
+  decides publish/hold/discard, and appends the evidence. The publish itself
+  stays in the channel's repo with the channel's key — this loop holds no
+  publishing key and mints no CACAO."
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [loop-ka.decide :as decide]
+            [loop-ka.evaluate :as ev]
+            [loop-ka.ledger :as ledger]
+            [loop-ka.observe :as obs]
+            [loop-ka.task :as task]))
+
+(def ledger-file
+  (or (.-LOOP_KA_LEDGER js/process.env) "state/runs.ledger.edn"))
+
+(defn- flags [argv]
+  (loop [a (seq argv) o {}]
+    (if-not a
+      o
+      (let [[k & more] a]
+        (if (str/starts-with? (str k) "--")
+          (recur (next more) (assoc o (keyword (subs k 2)) (first more)))
+          (recur more (update o :_ (fnil conj []) k)))))))
+
+(defn- channels []
+  (:channels (edn/read-string (fs/readFileSync
+                               (or (.-LOOP_KA_CHANNELS js/process.env)
+                                   "resources/channels.edn") "utf8"))))
+
+(defn- read-ledger []
+  (if-not (fs/existsSync ledger-file)
+    []
+    (->> (str/split-lines (fs/readFileSync ledger-file "utf8"))
+         (remove str/blank?)
+         (mapv edn/read-string))))
+
+(defn- append-ledger! [record]
+  (let [dir (path/dirname ledger-file)]
+    (when (seq dir) (fs/mkdirSync dir #js {:recursive true}))
+    ;; One EDN map per line, append-only — same shape as the workspace's other
+    ;; event ledgers (canvas-ledger, gen-quality). Never rewritten in place.
+    (fs/appendFileSync ledger-file (str (pr-str record) "\n"))))
+
+(defn- today [] (first (str/split (.toISOString (js/Date.)) #"T")))
+
+(defn- catalog-entries
+  "Channel -> {:readable? bool :entries [ids]}.
+
+  Readability is reported separately because `could not look` and `nothing
+  left` are opposite facts that render identically. Without --workspace,
+  or with a catalog dir that is not there, this is NOT an exhausted catalog."
+  [{:keys [repo catalog]} workspace]
+  (cond
+    (str/blank? (str catalog)) {:readable? true :entries []}
+    (str/blank? (str workspace)) {:readable? false :entries []}
+    :else
+    (let [dir (path/join workspace repo catalog)]
+      (if-not (fs/existsSync dir)
+        {:readable? false :entries []}
+        {:readable? true
+         :entries (->> (fs/readdirSync dir)
+                       (filter #(str/ends-with? % ".edn"))
+                       sort
+                       (mapv #(str/replace % #"\.edn$" "")))}))))
+
+(defn- world [chs {:keys [date slot workspace]}]
+  (let [records (read-ledger)
+        consumed-slots (ledger/consumed-slot-keys records)]
+    (into {} (for [{:keys [id] :as ch} chs
+                   :let [{:keys [readable? entries]} (catalog-entries ch workspace)]]
+                [id {:slot-consumed? (contains? consumed-slots (obs/slot-key id date slot))
+                     :catalog-readable? readable?
+                     :remaining (obs/unconsumed entries
+                                                (ledger/consumed-episodes records id))}]))))
+
+(defn- cmd-observe [o]
+  (let [chs (channels)
+        date (or (:date o) (today))
+        slot (js/parseInt (or (:slot o) "0"))
+        planned (obs/plan chs {:date date :slot slot
+                               :world (world chs {:date date :slot slot
+                                                  :workspace (:workspace o)})})]
+    (println (obs/summary planned))
+    (println "\ndue:" (count (obs/due-only planned)) "of" (count planned))))
+
+(defn- cmd-plan [o]
+  (when-not (:workspace o)
+    (println "plan needs --workspace (where the node has the checkouts)")
+    (js/process.exit 2))
+  (let [chs (channels)
+        date (or (:date o) (today))
+        slot (js/parseInt (or (:slot o) "0"))
+        planned (obs/plan chs {:date date :slot slot
+                               :world (world chs {:date date :slot slot
+                                                  :workspace (:workspace o)})})
+        b (task/batch chs (obs/due-only planned) {:workspace (:workspace o)})]
+    (println (obs/summary planned))
+    (if (empty? b)
+      (println "\nnothing due — no batch emitted")
+      (let [out (or (:out o) "tasks.edn")
+            dir (path/dirname out)]
+        (when (seq dir) (fs/mkdirSync dir #js {:recursive true}))
+        (fs/writeFileSync out (str (pr-str b) "\n"))
+        (println "\nwrote" out (str "(" (count b) " tasks)"))
+        (println "place it with:"
+                 (str/join " " (task/murakumo-argv
+                                {:tasks-file out
+                                 :murakumo-dir (or (:murakumo o) "../murakumo")
+                                 :max-inflight (:max-inflight o)})))))))
+
+(defn- cmd-record [o]
+  (let [{:keys [channel episode legs phase approve slot date node exit]} o]
+    (when-not (and channel legs)
+      (println "record needs --channel and --legs <file.edn>")
+      (js/process.exit 2))
+    (let [legs (edn/read-string (fs/readFileSync legs "utf8"))
+          v (ev/verdict legs)
+          d (decide/decide v {:phase (js/parseInt (or phase "0"))
+                              :approvals (if approve #{(keyword approve)} #{})})
+          rec (ledger/run-record
+               {:slot-key (obs/slot-key (keyword channel) (or date (today))
+                                        (js/parseInt (or slot "0")))
+                :channel (keyword channel) :episode episode
+                :at (.toISOString (js/Date.))
+                :verdict v :decision d
+                :artifacts (:artifacts legs) :job-ids (:job-ids legs)
+                :producer-exit (when exit (js/parseInt exit))
+                :node node})]
+      (println (ev/explain v))
+      (println (decide/explain d))
+      (append-ledger! rec)
+      (println "recorded ->" ledger-file)
+      ;; The exit code IS the answer for a producer that shells out: 0 publish,
+      ;; 10 hold, 11 discard. A producer must not have to parse prose to learn
+      ;; whether it may publish.
+      (js/process.exit (case (:action d) :publish 0 :hold 10 :discard 11 1)))))
+
+(defn- cmd-seed [o]
+  ;; An empty ledger means "nothing has ever been produced", which is false for
+  ;; every channel that is already publishing. Without seeding, the first real
+  ;; tick re-cuts and re-posts episodes that are already live — measured: the
+  ;; first plan against the real workspace selected amaoto-no-arcade and
+  ;; alarm-ai, both published on 2026-07-28.
+  (let [{:keys [channel episodes]} o]
+    (when-not (and channel episodes)
+      (println "seed needs --channel <id> --episodes a,b,c   (ids already published)")
+      (js/process.exit 2))
+    (doseq [ep (remove str/blank? (str/split episodes #","))]
+      (append-ledger! {:source/dataset ledger/dataset
+                       :run/slot-key (str "seed/" (name channel) "/" ep)
+                       :run/channel channel
+                       :run/episode ep
+                       :run/at (.toISOString (js/Date.))
+                       :run/grade "unknown"
+                       :run/action "seed"
+                       :run/reason "already-published-before-this-loop-existed"
+                       :run/phase 2})
+      (println "seeded" channel ep))))
+
+(defn- cmd-report [o]
+  (let [n (js/parseInt (or (:last o) "20"))
+        rs (read-ledger)]
+    (if (empty? rs)
+      (println "no runs recorded yet (" ledger-file ")")
+      (println (ledger/report (take-last n (sort-by :run/at rs)))))))
+
+(defn -main [& argv]
+  (let [o (flags argv)
+        [sub] (:_ o)]
+    (case sub
+      "observe" (cmd-observe o)
+      "plan" (cmd-plan o)
+      "record" (cmd-record o)
+      "seed" (cmd-seed o)
+      "report" (cmd-report o)
+      (do (println "usage: loop.cljs observe|plan|record|seed|report  (see ns docstring)")
+          (js/process.exit 2)))))
+
+(apply -main *command-line-args*)
