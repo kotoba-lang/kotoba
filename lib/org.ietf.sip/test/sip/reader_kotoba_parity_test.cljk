@@ -1,0 +1,344 @@
+;; `kotoba/sip/reader.kotoba` against `sip.message/decode`.
+;;
+;; The slice is the reader: start line, headers, and the point where headers
+;; stop and a body of a declared length begins. The guest is an application
+;; — state in, one line in, next state out — so the oracle and the guest are
+;; handed the SAME message and compared on what each says it is.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+;;
+;; ## What is compared, and what deliberately is not
+;;
+;; The oracle decodes a whole message into structured values — URIs parsed
+;; by `sip.uri`, Via by `sip.headers`, and so on. This guest reads the
+;; transaction identity and hands the body to the host, so the comparison is
+;; on that identity: kind, method, status, Call-ID, the topmost Via's branch,
+;; CSeq, the From/To tags, and Content-Length. Where the oracle returns a
+;; parsed structure the test projects the same field out of it; where the
+;; guest has no nil, an absent value is "" or -1 on both sides.
+;;
+;; The body is NOT compared through the guest, because the guest never sees
+;; it. It is compared through the host: the harness reads exactly
+;; `body-bytes` octets, and `reader-carries-no-body-bytes` drives a body
+;; three orders of magnitude past what a `:document` can hold.
+;;
+;; ## The negative controls
+;;
+;; Five, each for a rule that a careless reader loses while every
+;; spelled-out, unfolded message still passes:
+;;
+;;   * `compact-header-forms-are-the-same-headers` — §7.3.3. `v` IS Via;
+;;     a reader without the table sees a message with no mandatory headers;
+;;   * `a-folded-header-continues-the-line-before-it` — §7.3.1, checked on
+;;     Via, which is both the most often folded and the one that carries the
+;;     transaction key;
+;;   * `a-branch-without-the-magic-cookie-is-not-an-rfc3261-branch` —
+;;     §8.1.1.7. Reporting the branch without reporting this hands a caller
+;;     a transaction key it cannot trust;
+;;   * `a-status-line-is-not-a-request-line` — §7.1/§7.2. The version
+;;     prefix separates them, not the shape of the first token;
+;;   * `reader-carries-no-body-bytes` — the passthrough design claim.
+
+(ns sip.reader-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [sip.guest-document :refer [->doc]]
+            [sip.message :as message]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "sip" "reader.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'sip.reader (slurp guest-file)}
+                                         'sip.reader
+                                         :wasm32-kotoba-v1))))
+
+;; The interpreter default (512) is enough for this guest, unlike
+;; `org-ietf-imap`'s. That was not assumed: the first version of this file
+;; carried a `test-fuel` of 4000 and a bracket test, and the bracket test
+;; failed -- 512 completed the RFC 3261 INVITE, so the budget was
+;; superstition and is gone. `the-default-budget-still-suffices` at the
+;; bottom keeps that honest: it goes red if this guest becomes expensive
+;; enough to need one.
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+;; --- driving the guest -----------------------------------------------------
+
+(defn- guest-read
+  "Feed `lines` one at a time. When the guest announces `body-bytes`, the
+  host reads exactly that many octets off `body` -- which is what a host
+  does, and the only place the body exists.
+
+  A host cannot decline: if the guest announces octets the wire does not
+  carry, it has already consumed bytes belonging to the next message. So
+  this throws rather than shrugging."
+  ([lines] (guest-read lines nil))
+  ([lines body]
+   (loop [state (call 'init [(->doc {})])
+          remaining lines
+          read-body nil]
+     (let [n (call 'body-bytes [state])
+           _ (when (and (pos? n) (nil? body))
+               (throw (ex-info "guest announced octets the wire does not carry"
+                               {:bytes n})))
+           read-body (if (pos? n) (subs body 0 n) read-body)
+           phase (call 'phase [state])
+           done? (contains? #{:done :failed} phase)]
+       (if (or done? (empty? remaining))
+         (let [final (if done? state (call 'closed [state]))]
+           {:state final
+            :phase (call 'phase [final])
+            :error (call 'error-text [final])
+            :body read-body
+            :body-state (call 'body-state [final])
+            :identity {:kind (call 'kind [final])
+                       :method (call 'method [final])
+                       :uri (call 'request-uri [final])
+                       :status (call 'status-code [final])
+                       :reason (call 'reason-phrase [final])
+                       :call-id (call 'call-id [final])
+                       :branch (call 'via-branch [final])
+                       :rfc3261-branch? (call 'rfc3261-branch? [final])
+                       :cseq-number (call 'cseq-number [final])
+                       :cseq-method (call 'cseq-method [final])
+                       :from-tag (call 'from-tag [final])
+                       :to-tag (call 'to-tag [final])
+                       :max-forwards (call 'max-forwards [final])
+                       :content-length (call 'content-length [final])}})
+         (recur (call 'step [state (first remaining)])
+                (rest remaining)
+                read-body))))))
+
+;; --- driving the oracle ----------------------------------------------------
+
+(defn- oracle-identity
+  "`sip.message/decode`'s answer, on the guest's vocabulary: \"\" and -1
+  where the guest has no nil."
+  [m]
+  (let [via (first (:via m))
+        cseq (:cseq m)
+        branch (or (get-in via [:params "branch"]) "")]
+    {:kind (:type m)
+     :method (or (:method m) "")
+     :status (or (:status m) -1)
+     :call-id (or (:call-id m) "")
+     :branch branch
+     :rfc3261-branch? (str/starts-with? branch "z9hG4bK")
+     :cseq-number (or (:seq cseq) -1)
+     :cseq-method (or (:method cseq) "")
+     :from-tag (or (get-in m [:from :params "tag"]) "")
+     :to-tag (or (get-in m [:to :params "tag"]) "")
+     :max-forwards (or (:max-forwards m) -1)}))
+
+(defn- guest-identity
+  "The same fields out of the guest, so the two are compared on one shape."
+  [g]
+  (select-keys (:identity g)
+               [:kind :method :status :call-id :branch :rfc3261-branch?
+                :cseq-number :cseq-method :from-tag :to-tag :max-forwards]))
+
+(defn- lines-of [message] (str/split message #"\r\n" -1))
+
+;; --- fixtures --------------------------------------------------------------
+
+(def ^:private invite
+  (str "INVITE sip:bob@biloxi.com SIP/2.0\r\n"
+       "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds\r\n"
+       "To: Bob <sip:bob@biloxi.com>\r\n"
+       "From: Alice <sip:alice@atlanta.com>;tag=1928301774\r\n"
+       "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n"
+       "CSeq: 314159 INVITE\r\n"
+       "Max-Forwards: 70\r\n"
+       "Contact: <sip:alice@pc33.atlanta.com>\r\n"
+       "Content-Length: 0\r\n"
+       "\r\n"))
+
+;; --- the tests -------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest an-invite-reads-the-same-identity-as-the-oracle
+  (let [guest (guest-read (lines-of invite))
+        oracle (message/decode invite)]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (map? oracle) (str "oracle refused the fixture: " oracle))
+    (is (= (oracle-identity oracle) (guest-identity guest)))
+    (testing "and the request-URI is the one on the start line"
+      (is (= "sip:bob@biloxi.com" (:uri (:identity guest)))))
+    (testing "headers this slice does not keep are counted, not dropped silently"
+      (is (= 1 (call 'other-header-count [(:state guest)])) "Contact")
+      (is (= 8 (call 'header-count [(:state guest)]))))))
+
+(deftest compact-header-forms-are-the-same-headers
+  (testing "RFC 3261 §7.3.3: `v` IS Via, `f` From, `t` To, `i` Call-ID,
+            `l` Content-Length. A reader without the table sees a message
+            with no mandatory headers at all and cannot say why."
+    (let [compact (str "INVITE sip:bob@biloxi.com SIP/2.0\r\n"
+                       "v: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds\r\n"
+                       "t: Bob <sip:bob@biloxi.com>\r\n"
+                       "f: Alice <sip:alice@atlanta.com>;tag=1928301774\r\n"
+                       "i: a84b4c76e66710@pc33.atlanta.com\r\n"
+                       "CSeq: 314159 INVITE\r\n"
+                       "Max-Forwards: 70\r\n"
+                       "l: 0\r\n"
+                       "\r\n")
+          guest (guest-read (lines-of compact))
+          spelled (guest-read (lines-of invite))
+          oracle (message/decode compact)]
+      (is (= :done (:phase guest)) (:error guest))
+      (testing "the compact message is the same message"
+        (is (= (dissoc (guest-identity spelled) :method)
+               (dissoc (guest-identity guest) :method))))
+      (is (= (oracle-identity oracle) (guest-identity guest))))))
+
+(deftest a-folded-header-continues-the-line-before-it
+  (testing "RFC 3261 §7.3.1. Via is both the most often folded header and
+            the one carrying the transaction key, so a reader that treats a
+            continuation as a new header loses exactly the value it needs."
+    (let [folded (str "INVITE sip:bob@biloxi.com SIP/2.0\r\n"
+                      "Via: SIP/2.0/UDP pc33.atlanta.com\r\n"
+                      " ;branch=z9hG4bK776asdhds\r\n"
+                      "To: Bob <sip:bob@biloxi.com>\r\n"
+                      "From: Alice <sip:alice@atlanta.com>\r\n"
+                      "\t;tag=1928301774\r\n"
+                      "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n"
+                      "CSeq: 314159 INVITE\r\n"
+                      "\r\n")
+          guest (guest-read (lines-of folded))
+          oracle (message/decode folded)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= "z9hG4bK776asdhds" (:branch (:identity guest)))
+          "the branch is on the continuation line")
+      (is (= "1928301774" (:from-tag (:identity guest))))
+      (is (= (oracle-identity oracle) (guest-identity guest))))))
+
+(deftest a-branch-without-the-magic-cookie-is-not-an-rfc3261-branch
+  (testing "RFC 3261 §8.1.1.7: an RFC 3261 branch begins `z9hG4bK`. One that
+            does not is an RFC 2543 branch, is not globally unique, and
+            cannot be used as a transaction key. Reporting the branch
+            without reporting this hands a caller a key it cannot trust."
+    (let [old (str/replace invite "z9hG4bK776asdhds" "776asdhds")
+          guest (guest-read (lines-of old))
+          oracle (message/decode old)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= "776asdhds" (:branch (:identity guest))) "the branch is still read")
+      (is (false? (:rfc3261-branch? (:identity guest))) "but it is not trusted")
+      (is (true? (:rfc3261-branch? (:identity (guest-read (lines-of invite))))))
+      (is (= (oracle-identity oracle) (guest-identity guest))))))
+
+(deftest a-status-line-is-not-a-request-line
+  (testing "RFC 3261 §7.1/§7.2: the `SIP/` prefix separates them, not the
+            shape of the first token"
+    (let [response (str "SIP/2.0 200 OK\r\n"
+                        "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds\r\n"
+                        "To: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\n"
+                        "From: Alice <sip:alice@atlanta.com>;tag=1928301774\r\n"
+                        "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n"
+                        "CSeq: 314159 INVITE\r\n"
+                        "\r\n")
+          guest (guest-read (lines-of response))
+          oracle (message/decode response)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= :response (:kind (:identity guest))))
+      (is (= 200 (:status (:identity guest))))
+      (is (= "OK" (:reason (:identity guest))))
+      (is (= "a6c85cf" (:to-tag (:identity guest))))
+      (testing "and the response is matched to its request by branch + CSeq method"
+        (is (= "z9hG4bK776asdhds" (:branch (:identity guest))))
+        (is (= "INVITE" (:cseq-method (:identity guest)))))
+      (is (= (oracle-identity oracle) (guest-identity guest))))))
+
+(deftest a-declared-body-reaches-the-host-and-not-the-guest
+  (let [sdp "v=0\r\no=alice 2890844526 2890844526 IN IP4 pc33.atlanta.com\r\n"
+        msg (str "INVITE sip:bob@biloxi.com SIP/2.0\r\n"
+                 "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds\r\n"
+                 "To: Bob <sip:bob@biloxi.com>\r\n"
+                 "From: Alice <sip:alice@atlanta.com>;tag=1928301774\r\n"
+                 "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n"
+                 "CSeq: 314159 INVITE\r\n"
+                 "Content-Type: application/sdp\r\n"
+                 "Content-Length: " (count sdp) "\r\n"
+                 "\r\n")
+        guest (guest-read (lines-of msg) sdp)]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (= :closed (:body-state guest)))
+    (is (= (count sdp) (:content-length (:identity guest))))
+    (testing "the host received exactly the octets the header declared"
+      (is (= sdp (:body guest))))))
+
+(deftest reader-carries-no-body-bytes
+  (testing "the design claim, tested rather than asserted in a comment: a
+            `:document` holds 32 items per container and 65536 UTF-8 bytes
+            in aggregate, so a guest that accumulated the body could not
+            finish this. It finishes because the guest only reads the count."
+    (let [body (apply str (repeat 400000 "x"))
+          msg (str "INVITE sip:bob@biloxi.com SIP/2.0\r\n"
+                   "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds\r\n"
+                   "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n"
+                   "CSeq: 314159 INVITE\r\n"
+                   "Content-Length: " (count body) "\r\n"
+                   "\r\n")
+          guest (guest-read (lines-of msg) body)]
+      (is (< 65536 (count body)) "only meaningful past the aggregate bound")
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= body (:body guest)))
+      (testing "and the guest's own record of it is the count, nothing more"
+        (is (= 400000 (:content-length (:identity guest))))
+        (is (= 0 (call 'body-bytes [(:state guest)]))
+            "cleared once the step that announced it is past")))))
+
+(deftest a-message-that-ends-before-its-headers-do-is-truncated
+  (let [guest (guest-read ["INVITE sip:bob@biloxi.com SIP/2.0"
+                           "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK1"])]
+    (is (= :failed (:phase guest)))
+    (is (= "SIP message ended before its headers did" (:error guest)))))
+
+(deftest a-message-that-begins-with-an-empty-line-is-refused
+  (let [guest (guest-read ["" "INVITE sip:bob@biloxi.com SIP/2.0"])]
+    (is (= :failed (:phase guest)))
+    (is (= "SIP message began with an empty line" (:error guest)))))
+
+(deftest only-the-topmost-via-carries-the-transaction-key
+  (testing "RFC 3261 §17.1.3 reads the top Via. A proxy adds its own on the
+            way, so a reader that keeps the last one keys the transaction on
+            a hop that is not ours."
+    (let [proxied (str "SIP/2.0 200 OK\r\n"
+                       "Via: SIP/2.0/UDP proxy.biloxi.com;branch=z9hG4bKtop\r\n"
+                       "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKbottom\r\n"
+                       "Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n"
+                       "CSeq: 314159 INVITE\r\n"
+                       "\r\n")
+          guest (guest-read (lines-of proxied))]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= "z9hG4bKtop" (:branch (:identity guest))))
+      (is (= 4 (call 'header-count [(:state guest)])) "both Vias were seen"))))
+
+;; --- the budget itself -----------------------------------------------------
+
+(defn- completes-within? [fuel]
+  (try
+    (let [final (reduce (fn [st line] (call 'step [st line] fuel))
+                        (call 'init [(->doc {})] fuel)
+                        (lines-of invite))]
+      (= :done (call 'phase [final] fuel)))
+    (catch clojure.lang.ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest the-default-budget-still-suffices
+  (testing "no `:fuel` option is passed anywhere in this file, so this is
+            the assertion that keeps that honest"
+    (is (true? (completes-within? 512))))
+  (testing "and the margin is visible, so a guest that grows is noticed
+            before it trips the default rather than after"
+    (let [minimum (first (filter completes-within?
+                                 [150 200 250 300 350 400 450 512]))]
+      (is (some? minimum) "the INVITE does not complete even at the default")
+      (println (format "  [fuel] the RFC 3261 INVITE completes at %d; the default is 512"
+                       minimum)))))
