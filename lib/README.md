@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.wsValuefloVocabulary` | `kotoba.wsValuefloVocabulary/src` | `valueflows.commitment`, `valueflows.conform`, `valueflows.data`, `valueflows.datom` (Kotoba project library) |
 | `kotoba.pkg` | `kotoba.pkg/src` | `kotoba.pkg`, `kotoba.pkg.bonding`, `kotoba.pkg.package`, `kotoba.pkg.registry` (Kotoba project library) |
 | `kotoba.persona` | `kotoba.persona/src` | `persona.core`, `persona.relay` (Kotoba project library) |
 | `kotoba.wordId` | `kotoba.wordId/src` | `word-id.core`, `word-id.english`, `word-id.vocabulary` (Kotoba project library) |
