@@ -1,0 +1,173 @@
+(ns kotoba.lang.http.host.jvm-test
+  "The JVM client host, against a real server rather than a mock.
+
+  A mock would assert that this namespace calls the functions this namespace
+  calls. What is worth asserting is the part that is not visible in the
+  source: that `java.net.http` returns headers in the case and arity the call
+  sites read them in. `com.sun.net.httpserver` is in the JDK, so a real
+  round trip costs no dependency."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.http :as http]
+            [kotoba.lang.http.host.jvm :as jvm])
+  (:import [com.sun.net.httpserver HttpServer HttpHandler]
+           [java.net InetSocketAddress]))
+
+(defn- with-server
+  "Run `f` against a server that echoes what it was sent. `f` receives the
+  base URL and an atom holding the last request the server actually saw --
+  so a test can assert on the wire rather than on the client's intentions."
+  [f]
+  (let [seen (atom nil)
+        server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.createContext
+     server "/"
+     (reify HttpHandler
+       (handle [_ exchange]
+         (let [body (slurp (.getRequestBody exchange))]
+           (reset! seen {:method (.getRequestMethod exchange)
+                         :path (.getPath (.getRequestURI exchange))
+                         :body body
+                         :headers (into {} (map (fn [[k v]] [(.toLowerCase ^String k) (first v)]))
+                                        (.getRequestHeaders exchange))})
+           ;; Two values for one name, so the collapse-to-first rule is
+           ;; exercised by the server rather than asserted about it.
+           (.add (.getResponseHeaders exchange) "X-Multi" "first")
+           (.add (.getResponseHeaders exchange) "X-Multi" "second")
+           (.add (.getResponseHeaders exchange) "Replay-Nonce" "nonce-abc")
+           (let [payload (kbytes/utf8-bytes (str "echo:" body))]
+             (.sendResponseHeaders exchange 201 (alength payload))
+             (doto (.getResponseBody exchange) (.write payload) (.close))))))) 
+    (.start server)
+    (try
+      (f (str "http://127.0.0.1:" (.getPort (.getAddress server))) seen)
+      (finally (.stop server 0)))))
+
+(deftest binary-roundtrip-preserves-every-octet-sync-and-async
+  (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+        seen (atom [])
+        payload (byte-array (map unchecked-byte (range 256)))]
+    (.createContext server "/" (reify HttpHandler
+                                (handle [_ exchange]
+                                  (let [body (.readAllBytes (.getRequestBody exchange))]
+                                    (swap! seen conj (vec body))
+                                    (.sendResponseHeaders exchange 200 (alength body))
+                                    (with-open [out (.getResponseBody exchange)] (.write out body))))))
+    (.start server)
+    (try
+      (doseq [async? [false true]]
+        (let [send! ((if async? jvm/http-transport-async jvm/http-transport) {:timeout-seconds 10})
+              result (send! {:url (str "http://127.0.0.1:" (.getPort (.getAddress server)))
+                             :method :put :body-bytes payload :response-type :bytes})
+              response (if async? @result result)]
+          (is (= 200 (:status response)))
+          (is (= (vec payload) (vec (:body response))))))
+      (is (= [(vec payload) (vec payload)] @seen))
+      (doseq [bad [{:body-bytes "not bytes"}
+                   {:body-bytes payload :body "conflicting"}
+                   {:response-type :unknown}]]
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs kerror/ExceptionInfo)
+                     ((jvm/http-transport {:timeout-seconds 10})
+                      (merge {:url "http://127.0.0.1:1" :method :post} bad)))))
+      (finally (.stop server 0)))))
+
+(deftest performs-a-real-request-and-returns-the-documented-shape
+  (with-server
+    (fn [base seen]
+      (let [send! (jvm/http-transport {:timeout-seconds 10})
+            resp (send! {:url (str base "/thing")
+                         :method :post
+                         :headers {"X-A" "1" :x-b "2"}
+                         :body "hello"})]
+        (testing "the server saw the method, body and headers this sent"
+          (is (= "POST" (:method @seen)))
+          (is (= "/thing" (:path @seen)))
+          (is (= "hello" (:body @seen)))
+          (is (= "1" (get-in @seen [:headers "x-a"])))
+          (is (= "2" (get-in @seen [:headers "x-b"]))
+              "a keyword header name is sent under its name, not its printed form"))
+        (testing "the response is {:status :headers :body}"
+          (is (= 201 (:status resp)))
+          (is (= "echo:hello" (:body resp))))
+        (testing "header names come back lower-cased, multi-values collapse to the first"
+          (is (= "first" (get-in resp [:headers "x-multi"]))
+              "ACME reads [:headers \"replay-nonce\"] positionally; the arity is the contract")
+          (is (= "nonce-abc" (get-in resp [:headers "replay-nonce"]))))))))
+
+(deftest a-body-less-method-sends-no-body
+  (with-server
+    (fn [base seen]
+      (let [send! (jvm/http-transport {:timeout-seconds 10})]
+        (send! {:url (str base "/g") :method :get})
+        (is (= "GET" (:method @seen)))
+        (is (= "" (:body @seen)))))))
+
+(deftest normalize-headers-folds-case-and-keeps-the-first-value
+  ;; This is the only place the folding rule can actually be checked. Measured
+  ;; 2026-09-09: deleting the toLowerCase and running the round-trip test above
+  ;; left it GREEN, because java.net.http folds the keys before they reach this
+  ;; namespace. An assertion that passes whether or not the code under test
+  ;; does anything is not an assertion about that code.
+  (let [m (doto (java.util.LinkedHashMap.)
+            (.put "X-Multi" ["first" "second"])
+            (.put "Replay-Nonce" ["nonce-abc"])
+            (.put "already-low" ["v"]))]
+    (is (= {"x-multi" "first" "replay-nonce" "nonce-abc" "already-low" "v"}
+           (jvm/normalize-headers m)))))
+
+(deftest an-unknown-method-is-refused-rather-than-downgraded
+  ;; The point is the REASON, not that something was thrown. Run against the
+  ;; real server on purpose: a transport that quietly fell back to GET would
+  ;; get a 201 here and turn a write into a read that succeeds and changes
+  ;; nothing, so the mutant fails this test by SUCCEEDING rather than by
+  ;; erroring on an unreachable address.
+  (with-server
+    (fn [base seen]
+      (let [send! (jvm/http-transport {:timeout-seconds 10})
+            e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs kerror/ExceptionInfo)
+                           (send! {:url (str base "/x") :method :teleport})))]
+        (is (= :teleport (:method (ex-data e)))
+            "the refusal names the method it refused")
+        (is (nil? @seen)
+            "nothing reached the server: the request was refused before it was sent")))))
+
+(deftest the-transport-is-also-an-ihttp
+  (with-server
+    (fn [base _]
+      (let [resp (http/send (jvm/->http {:timeout-seconds 10})
+                            {:url (str base "/p") :method :get})]
+        (is (= 201 (:status resp)))))))
+
+;; ---------------------------------------------------------------------------
+;; the asynchronous transport
+;; ---------------------------------------------------------------------------
+
+(deftest async-returns-the-same-answer-as-sync-for-the-same-request
+  ;; The claim worth testing is not "it returns a future" -- it is that the two
+  ;; transports AGREE. An application moving to the async shape is trusting
+  ;; exactly that, and two response builders that drift is what sharing
+  ;; `response->map` and `build-request` is for.
+  (with-server
+    (fn [base _]
+      (let [req {:url (str base "/same") :method :post
+                 :headers {"X-A" "1"} :body "payload"}
+            sync-resp ((jvm/http-transport {:timeout-seconds 10}) req)
+            async-resp (deref (.toCompletableFuture
+                               ((jvm/http-transport-async {:timeout-seconds 10}) req))
+                              10000 ::timed-out)]
+        (is (not= ::timed-out async-resp) "the future completed")
+        (is (= sync-resp async-resp)
+            "the same request through the two transports must give the same map")
+        (is (= 201 (:status async-resp)))
+        (is (= "first" (get-in async-resp [:headers "x-multi"])))))))
+
+(deftest async-refuses-an-unknown-method-on-the-callers-stack
+  ;; Not inside the future. A caller that is not yet dereferencing would never
+  ;; see a refusal that only surfaced there, and would find out by getting a
+  ;; response to a request it did not make.
+  (with-server
+    (fn [base seen]
+      (let [send! (jvm/http-transport-async {:timeout-seconds 10})
+            e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs kerror/ExceptionInfo)
+                           (send! {:url (str base "/x") :method :teleport})))]
+        (is (= :teleport (:method (ex-data e))))
+        (is (nil? @seen) "nothing was sent")))))

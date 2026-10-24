@@ -1,0 +1,300 @@
+(ns haishin.core-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [haishin.adapt :as adapt]
+            [haishin.constraints :as constraints]
+            [haishin.core :as haishin]
+            [haishin.execute :as execute]
+            [haishin.plan :as plan]
+            [haishin.target :as target]))
+
+(def short-video
+  {:artifact/id "dougaka-2026-08-04-001"
+   :artifact/kind :video
+   :artifact/title "朝の商店街"
+   :artifact/body "45秒の街歩き。"
+   :artifact/tags ["machiaruki" "vlog"]
+   :artifact/language "ja"
+   :artifact/visibility :public
+   :artifact/media [{:media/url "https://aozora.app/media/001.mp4"
+                     :media/mime "video/mp4"
+                     :media/bytes 8000000
+                     :media/duration-ms 45000
+                     :media/width 720
+                     :media/height 1280}]
+   :artifact/source {:source/platform :aozora
+                     :source/url "https://aozora.app/videos/001"}})
+
+;; ---------------------------------------------------------------------------
+;; artifact
+
+(deftest normalizes-and-validates
+  (testing "defaults fill in and blank tags are dropped"
+    (let [a (haishin/normalize {:artifact/id "x" :artifact/kind :text
+                                :artifact/title "hi" :artifact/tags ["a" "" nil]})]
+      (is (= ["a"] (:artifact/tags a)))
+      (is (= :public (:artifact/visibility a)))))
+
+  (testing "a non-text artifact without media is malformed"
+    (is (some #(= :artifact/missing-media (:problem/kind %))
+              (haishin/artifact-problems
+               (haishin/normalize {:artifact/id "x" :artifact/kind :video})))))
+
+  (testing "an artifact with no id cannot be correlated to a receipt"
+    (is (some #(= :artifact/missing-id (:problem/kind %))
+              (haishin/artifact-problems (haishin/normalize {:artifact/kind :text
+                                                             :artifact/title "t"})))))
+
+  (testing "a well-formed artifact has no problems"
+    (is (haishin/valid-artifact? (haishin/normalize short-video)))))
+
+;; ---------------------------------------------------------------------------
+;; target adaptation
+
+(deftest composes-single-field-text
+  (let [text (target/compose-text (haishin/normalize short-video) {})]
+    (testing "title, body, attribution link and hashtags all appear"
+      (is (re-find #"朝の商店街" text))
+      (is (re-find #"https://aozora\.app/videos/001" text))
+      (is (re-find #"#machiaruki" text)))
+    (testing "attribution precedes hashtags so trimming the tail keeps the link"
+      (is (< (.indexOf text "https://aozora.app/videos/001")
+             (.indexOf text "#machiaruki"))))))
+
+(deftest hashtag-strips-punctuation
+  (is (= "#machiaruki" (target/hashtag "machi-aruki")))
+  (is (= "#街歩き" (target/hashtag "街歩き"))))
+
+(deftest rejects-what-a-platform-cannot-take
+  (testing "X rejects text over its limit rather than truncating silently"
+    (let [wordy (assoc short-video :artifact/body (apply str (repeat 400 "あ")))
+          ps (target/problems :x (haishin/normalize wordy) {})]
+      (is (some #(= :target/text-too-long (:problem/kind %)) ps))))
+
+  (testing "a raised tier limit is honoured"
+    (let [wordy (assoc short-video :artifact/body (apply str (repeat 400 "あ")))]
+      (is (empty? (target/problems :x (haishin/normalize wordy)
+                                   {:body-chars-override 25000})))))
+
+  (testing "YouTube does not accept an image artifact"
+    (let [img (assoc short-video :artifact/kind :image
+                     :artifact/media [{:media/url "https://a/x.png"
+                                       :media/mime "image/png"}])
+          ps (target/problems :youtube (haishin/normalize img) {})]
+      (is (some #(= :target/kind-unsupported (:problem/kind %)) ps))))
+
+  (testing "an unsupported mime is caught before anything is sent"
+    (let [webm (assoc-in short-video [:artifact/media 0 :media/mime] "video/webm")
+          ps (target/problems :youtube (haishin/normalize webm) {})]
+      (is (some #(= :target/mime-unsupported (:problem/kind %)) ps))))
+
+  (testing "Instagram's 30-hashtag cap"
+    (let [tagged (assoc short-video :artifact/tags (mapv #(str "t" %) (range 40)))
+          ps (target/problems :instagram (haishin/normalize tagged) {})]
+      (is (some #(= :target/too-many-hashtags (:problem/kind %)) ps))))
+
+  (testing "an unknown target is a problem, not an exception"
+    (is (= :target/unknown
+           (-> (target/problems :myspace (haishin/normalize short-video) {})
+               first :problem/kind)))))
+
+(deftest warns-without-blocking
+  (testing "Instagram warns that it fetches the asset itself"
+    (is (some #(= :target/pulls-from-url (:warning/kind %))
+              (target/warnings :instagram (haishin/normalize short-video)))))
+
+  (testing "a landscape video warns on vertical-first platforms"
+    (let [wide (-> short-video
+                   (assoc-in [:artifact/media 0 :media/width] 1920)
+                   (assoc-in [:artifact/media 0 :media/height] 1080))]
+      (is (some #(= :target/not-vertical (:warning/kind %))
+                (target/warnings :tiktok (haishin/normalize wide))))))
+
+  (testing "a long video still publishes to YouTube but loses Shorts placement"
+    (let [long-v (assoc-in short-video [:artifact/media 0 :media/duration-ms] 600000)
+          a (haishin/normalize long-v)]
+      (is (empty? (target/problems :youtube a {})))
+      (is (some #(= :target/over-preferred-duration (:warning/kind %))
+                (target/warnings :youtube a)))))
+
+  (testing "unverified limits are surfaced on every plan entry"
+    (is (some #(= :target/limits-unverified (:warning/kind %))
+              (target/warnings :tiktok (haishin/normalize short-video))))))
+
+;; ---------------------------------------------------------------------------
+;; request shapes
+
+(deftest youtube-request-matches-com-youtube
+  (let [r (target/request :youtube (haishin/normalize short-video) {})]
+    (testing "the body is the shape youtube.videos/video-metadata produces"
+      (is (= :youtube/videos-insert (:request/endpoint r)))
+      (is (= "朝の商店街" (get-in r [:request/body :snippet :title])))
+      (is (= ["machiaruki" "vlog"] (get-in r [:request/body :snippet :tags])))
+      (is (= "public" (get-in r [:request/body :status :privacyStatus]))))
+    (testing "the title is not duplicated into the description"
+      (is (not (re-find #"朝の商店街" (get-in r [:request/body :snippet :description])))))))
+
+(deftest instagram-request-is-two-phase
+  (let [r (target/request :instagram (haishin/normalize short-video) {})]
+    (is (= :instagram/media-create (:request/endpoint r)))
+    (is (= :instagram/media-publish (:request/follow-up r)))
+    (is (= "REELS" (get-in r [:request/body :media_type])))
+    (is (= "https://aozora.app/media/001.mp4" (get-in r [:request/body :video_url])))))
+
+(deftest visibility-maps-per-platform
+  (let [private (assoc short-video :artifact/visibility :private)
+        a (haishin/normalize private)]
+    (is (= "private" (get-in (target/request :youtube a {}) [:request/body :status :privacyStatus])))
+    (is (= "SELF_ONLY" (get-in (target/request :tiktok a {}) [:request/body :post_info :privacy_level])))
+    (is (= "nobody" (get-in (target/request :vimeo a {}) [:request/body :privacy :view])))
+    (is (= "CONNECTIONS" (get-in (target/request :linkedin a {}) [:request/body :visibility])))))
+
+;; ---------------------------------------------------------------------------
+;; planning
+
+(deftest plans-split-sendable-from-rejected
+  (let [p (haishin/plan short-video [:youtube :instagram :tiktok :x :vimeo :linkedin]
+                        {:at "2026-08-04T09:00:00Z"})]
+    (testing "every target that can take it is planned"
+      (is (contains? (haishin/targets-in p) :youtube))
+      (is (contains? (haishin/targets-in p) :instagram)))
+    (testing "X accepts it: the composed text is well under 280 chars"
+      (is (contains? (haishin/targets-in p) :x)))
+    (testing "the timestamp is the caller's, never a clock read"
+      (is (= "2026-08-04T09:00:00Z" (:plan/at p))))))
+
+(deftest plan-is-reproducible
+  (testing "planning twice gives an identical plan — nothing ambient leaks in"
+    (is (= (haishin/plan short-video [:youtube :x] {:at "2026-08-04T09:00:00Z"})
+           (haishin/plan short-video [:youtube :x] {:at "2026-08-04T09:00:00Z"})))))
+
+(deftest plan-rejects-rather-than-drops
+  (let [img (assoc short-video :artifact/kind :image
+                   :artifact/media [{:media/url "https://a/x.png" :media/mime "image/png"}])
+        p (haishin/plan img [:youtube :instagram] {})]
+    (is (= #{:instagram} (haishin/targets-in p)))
+    (is (= [:youtube] (mapv :reject/target (:plan/rejected p))))
+    (testing "the summary states what was skipped and why"
+      (is (re-find #"✗ youtube" (haishin/summary p))))))
+
+(deftest malformed-artifact-throws-once
+  (testing "a producer bug surfaces as one error, not six identical rejections"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (haishin/plan {:artifact/kind :video} [:youtube] {})))))
+
+;; ---------------------------------------------------------------------------
+;; execution
+
+(deftest execute-requires-a-grant
+  (let [p (haishin/plan short-video [:youtube] {})]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (haishin/execute! p {:senders {}})))))
+
+(deftest ungranted-targets-are-skipped-with-a-receipt
+  (let [p (haishin/plan short-video [:youtube :x] {})
+        sent (atom [])
+        r (haishin/execute! p {:grant #{:youtube}
+                               :senders {:youtube (fn [req] (swap! sent conj req)
+                                                    {:remote-id "yt123"})
+                                         :x (fn [_] (throw (ex-info "must not run" {})))}})]
+    (testing "only the granted target's sender ran"
+      (is (= 1 (count @sent))))
+    (testing "the ungranted target still produced a receipt"
+      (is (= {:sent 1 :skipped 1} (:run/tally r)))
+      (is (= :not-granted
+             (-> (filter #(= :x (:receipt/target %)) (:run/receipts r))
+                 first :receipt/error :error/kind))))))
+
+(deftest a-failing-sender-is-recorded-not-raised
+  (let [p (haishin/plan short-video [:youtube :vimeo] {})
+        r (haishin/execute! p {:grant #{:youtube :vimeo}
+                               :senders {:youtube (fn [_] {:remote-id "ok"})
+                                         :vimeo (fn [_] (throw (ex-info "429 rate limited"
+                                                                        {:status 429})))}})]
+    (testing "one failure does not lose the other target's success"
+      (is (= {:sent 1 :failed 1} (:run/tally r))))
+    (testing "the failure carries why"
+      (let [f (first (filter #(= :failed (:receipt/status %)) (:run/receipts r)))]
+        (is (re-find #"429" (get-in f [:receipt/error :error/message])))
+        (is (= 429 (get-in f [:receipt/error :error/data :status])))))))
+
+(deftest a-granted-target-with-no-sender-is-skipped
+  (let [p (haishin/plan short-video [:youtube] {})
+        r (haishin/execute! p {:grant #{:youtube} :senders {}})]
+    (is (= {:skipped 1} (:run/tally r)))
+    (is (= :no-sender (-> r :run/receipts first :receipt/error :error/kind)))))
+
+(deftest dry-run-sends-nothing
+  (let [p (haishin/plan short-video [:youtube :instagram :x] {})
+        r (execute/dry-run p)]
+    (is (= {:skipped 3} (:run/tally r)))
+    (is (every? #(= :skipped (:receipt/status %)) (:run/receipts r)))))
+
+;; ---------------------------------------------------------------------------
+;; workspace adapter
+
+(def tamaki-manifest
+  {:artifact/id :ep-001
+   :artifact/path "/out/ep-001.mp4"
+   :artifact/stage :publish-ready
+   :artifact/kind :vertical-video
+   :artifact/mime "video/mp4"
+   :artifact/title "朝の商店街"
+   :artifact/episode-id "ep-001"
+   :artifact/content-project "dougaka"
+   :artifact/verification {:width 720 :height 1280 :duration-s 45.0 :vertical? true}})
+
+(deftest adapts-a-tamaki-manifest
+  (let [a (haishin/tamaki-content->artifact
+           tamaki-manifest
+           {:public-url "https://aozora.app/media/ep-001.mp4"
+            :source-url "https://aozora.app/videos/ep-001"
+            :tags ["machiaruki"]})]
+    (is (= "ep-001" (:artifact/id a)))
+    (is (= :video (:artifact/kind a)))
+    (testing "seconds become milliseconds"
+      (is (= 45000 (get-in a [:artifact/media 0 :media/duration-ms]))))
+    (is (haishin/valid-artifact? a))))
+
+(deftest grant-follows-human-approval
+  (testing "an unapproved plan grants nothing"
+    (let [p {:channels #{:aozora :youtube} :decision :approval-required :executable? false}]
+      (is (= #{} (adapt/plan->grant p)))
+      (is (re-find #"approval" (adapt/grant-explanation p)))))
+
+  (testing "an approved plan grants its channels, minus the producer's own appview"
+    (let [p {:channels #{:aozora :youtube} :decision :approved :executable? true}]
+      (is (= #{:youtube} (adapt/plan->grant p)))))
+
+  (testing "syndicate! on an unapproved plan sends nothing but still reports why"
+    (let [ran (atom 0)
+          r (haishin/syndicate!
+             tamaki-manifest
+             {:channels #{:aozora :youtube} :decision :approval-required :executable? false}
+             {:public-url "https://aozora.app/media/ep-001.mp4"
+              :haishin/also-plan [:youtube]
+              :senders {:youtube (fn [_] (swap! ran inc) {:remote-id "nope"})}
+              :at "2026-08-04T09:00:00Z"})]
+      (is (zero? @ran))
+      (is (= {:skipped 1} (:run/tally r)))
+      (is (re-find #"approval" (:haishin/grant-note r))))))
+
+;; ---------------------------------------------------------------------------
+;; constraint provenance
+
+(deftest limits-declare-their-provenance
+  (testing "every target records when its limits were checked and how"
+    (doseq [[id c] constraints/targets]
+      (is (string? (:constraint/checked-at c)) (str id " needs :constraint/checked-at"))
+      (is (contains? #{:in-repo-corroborated :vendor-doc :unverified}
+                     (:constraint/provenance c))
+          (str id " needs a known :constraint/provenance"))))
+
+  (testing "YouTube's limits are corroborated by com-youtube's independent client"
+    (is (= :in-repo-corroborated (:constraint/provenance (constraints/constraint :youtube))))
+    (is (= 100 (:limit/title-chars (constraints/constraint :youtube))))
+    (is (= 5000 (:limit/body-chars (constraints/constraint :youtube)))))
+
+  (testing "the unverified set is reported, not hidden"
+    (is (seq (haishin/unverified-targets)))
+    (is (not (contains? (haishin/unverified-targets) :youtube)))))

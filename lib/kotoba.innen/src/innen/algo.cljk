@@ -1,0 +1,293 @@
+(ns innen.algo
+  "Pure algorithms over an 因縁 dependency graph.
+
+   All traversal here is ITERATIVE, not recursive: a dependency record over
+   human history has long chains (a 2026 fab depends on a 19th-century mining
+   concession through a dozen intermediaries) and ClojureScript stacks are
+   shallow. Nothing here mutates the graph; every function takes a graph from
+   `innen.core` and returns plain data.
+
+   The load-bearing semantic decision is in `cascade`, and it is deliberately
+   conservative:
+
+     * a `:required` dependency that fails, fails its dependent;
+     * `:substitutable` dependencies of the same kind fail their dependent only
+       when ALL of them have failed (that is what substitutable means);
+     * `:incidental` edges never propagate failure.
+
+   That means `criticality` UNDER-states fragility whenever the record is
+   incomplete -- a node with no recorded dependents scores 0 not because it is
+   unimportant but because nothing has been ingested about it yet. Every
+   returned score therefore carries `:innen/basis`, naming what it was computed
+   from, so a small number is never mistaken for a measured absence of risk."
+  (:require [kotoba.lang.coll :as set]
+            [innen.core :as c]))
+
+(defn transitive-dependencies
+  "Everything `id` depends on, directly or indirectly. Cycle-safe (a visited
+   set, not recursion). `:max-depth` bounds the walk; the result reports
+   `:innen/truncated?` when the bound actually cut the walk short, so a
+   truncated answer cannot be read as a complete one."
+  ([g id] (transitive-dependencies g id nil))
+  ([g id {:keys [max-depth] :as opts}]
+   (loop [frontier [[id 0]]
+          seen #{id}
+          out #{}
+          truncated? false]
+     (if-let [[n depth] (first frontier)]
+       (if (and max-depth (>= depth max-depth))
+         (recur (rest frontier) seen out (or truncated? (boolean (seq (c/dependencies g n opts)))))
+         (let [deps (remove seen (c/dependencies g n opts))]
+           (recur (into (vec (rest frontier)) (map (fn [d] [d (inc depth)]) deps))
+                  (into seen deps)
+                  (into out deps)
+                  truncated?)))
+       {:innen/dependencies out
+        :innen/count (count out)
+        :innen/truncated? truncated?
+        :innen/basis (str "walk from " id " over recorded dependency edges"
+                          (when max-depth (str ", max-depth " max-depth)))}))))
+
+(defn transitive-dependents
+  "Everything that depends on `id`, directly or indirectly."
+  ([g id] (transitive-dependents g id nil))
+  ([g id opts]
+   (loop [frontier [id]
+          seen #{id}
+          out #{}]
+     (if-let [n (first frontier)]
+       (let [ups (remove seen (c/dependents g n opts))]
+         (recur (into (vec (rest frontier)) ups) (into seen ups) (into out ups)))
+       {:innen/dependents out
+        :innen/count (count out)
+        :innen/basis (str "reverse walk from " id " over recorded dependency edges")}))))
+
+(defn sccs
+  "Strongly-connected components, Tarjan's algorithm, iterative. Returns a
+   vector of id-sets. Components of size > 1 are mutual dependency -- in a
+   historical record these are usually real (two states that each depend on the
+   other's currency) rather than data errors, so they are reported, not fixed."
+  [g]
+  (let [ids (vec (c/node-ids g))
+        succ (fn [n] (c/dependencies g n))]
+    (loop [roots ids
+           index 0
+           idx {}      ; node -> index
+           low {}      ; node -> lowlink
+           on-stack #{}
+           stack []
+           work []     ; [[node remaining-successors] ...]
+           out []]
+      (cond
+        (seq work)
+        (let [[n remaining] (peek work)]
+          (if-let [w (first remaining)]
+            (let [work' (conj (pop work) [n (rest remaining)])]
+              (cond
+                (not (contains? idx w))
+                (recur roots (inc index) (assoc idx w index) (assoc low w index)
+                       (conj on-stack w) (conj stack w)
+                       (conj work' [w (succ w)]) out)
+
+                (contains? on-stack w)
+                (recur roots index idx (update low n min (get idx w)) on-stack stack work' out)
+
+                :else
+                (recur roots index idx low on-stack stack work' out)))
+            ;; n is finished
+            (let [work' (pop work)
+                  root? (= (get low n) (get idx n))
+                  [comp stack' on-stack']
+                  (if root?
+                    (loop [s stack acc #{} os on-stack]
+                      (let [w (peek s)
+                            s' (pop s)
+                            acc' (conj acc w)
+                            os' (disj os w)]
+                        (if (= w n) [acc' s' os'] (recur s' acc' os'))))
+                    [nil stack on-stack])
+                  low' (if-let [[p _] (peek work')]
+                         (update low p min (get low n))
+                         low)]
+              (recur roots index idx low' on-stack' stack' work'
+                     (if comp (conj out comp) out)))))
+
+        (seq roots)
+        (let [r (first roots)]
+          (if (contains? idx r)
+            (recur (rest roots) index idx low on-stack stack work out)
+            (recur (rest roots) (inc index) (assoc idx r index) (assoc low r index)
+                   (conj on-stack r) (conj stack r) [[r (succ r)]] out)))
+
+        :else out))))
+
+(defn cycles
+  "Mutual-dependency clusters: SCCs with more than one member."
+  [g]
+  (filterv #(> (count %) 1) (sccs g)))
+
+(defn topo-order
+  "Kahn ordering of dependencies-before-dependents. Returns
+
+     {:innen/order            [...]     ; orderable nodes, dependencies first
+      :innen/in-cycle         #{...}    ; nodes that are actually inside a cycle
+      :innen/blocked-by-cycle #{...}}   ; orderable in principle, but downstream of one
+
+   The last two are kept apart deliberately. Kahn's algorithm alone can only
+   say 'these are left over', which conflates a state that genuinely depends on
+   itself through an intermediary with a state that merely sits downstream of
+   such a pair -- a distinction that matters when the cycle is the finding."
+  [g]
+  (let [ids (c/node-ids g)
+        deps (into {} (map (fn [id] [id (set (filter ids (c/dependencies g id)))])) ids)
+        in-cycle (into #{} (mapcat identity) (filter #(> (count %) 1) (sccs g)))]
+    (loop [remaining deps
+           order []]
+      (let [ready (sort (keep (fn [[id ds]] (when (empty? ds) id)) remaining))]
+        (if (empty? ready)
+          {:innen/order order
+           :innen/in-cycle (set/intersection in-cycle (set (keys remaining)))
+           :innen/blocked-by-cycle (set/difference (set (keys remaining)) in-cycle)}
+          (recur (into {} (map (fn [[id ds]] [id (set/difference ds (set ready))]))
+                       (apply dissoc remaining ready))
+                 (into order ready)))))))
+
+(defn cascade
+  "Propagate failure from `failed-ids` to fixpoint under the necessity
+   semantics in this namespace's docstring. Returns the failed set plus the
+   per-round expansion, so a report can show HOW a failure travels rather than
+   only that it does."
+  [g failed-ids]
+  (let [ids (c/node-ids g)]
+    (loop [failed (set (filter ids failed-ids))
+           rounds []]
+      (let [newly
+            (into #{}
+                  (for [id ids
+                        :when (not (contains? failed id))
+                        :let [es (c/dependency-edges g id)
+                              required-hit? (some (fn [e]
+                                                    (and (= :required (:innen.edge/necessity e))
+                                                         (contains? failed (:innen.edge/to e))))
+                                                  es)
+                              subs-by-kind (->> es
+                                                (filter #(= :substitutable (:innen.edge/necessity %)))
+                                                (group-by :innen.edge/kind))
+                              all-subs-hit? (some (fn [[_kind group]]
+                                                    (and (seq group)
+                                                         (every? #(contains? failed (:innen.edge/to %)) group)))
+                                                  subs-by-kind)]
+                        :when (or required-hit? all-subs-hit?)]
+                    id))]
+        (if (empty? newly)
+          {:innen/failed failed
+           :innen/seeded (set (filter ids failed-ids))
+           :innen/rounds rounds
+           :innen/basis "necessity semantics: :required propagates, :substitutable propagates only when every alternative of that kind failed, :incidental never propagates"}
+          (recur (into failed newly) (conj rounds newly)))))))
+
+(defn criticality
+  "For every node: how many OTHER nodes fail if it fails. O(V * (V+E)) -- fine
+   for a record of thousands of nodes, and the honest way to compute it (no
+   centrality proxy standing in for the actual cascade semantics). Returns a
+   vector sorted most-critical-first."
+  ([g] (criticality g nil))
+  ([g {:keys [only]}]
+   (->> (or only (c/node-ids g))
+        (map (fn [id]
+               (let [{:innen/keys [failed]} (cascade g #{id})
+                     others (disj failed id)]
+                 {:innen.node/id id
+                  :innen.node/label (:innen.node/label (c/node g id))
+                  :innen/dependents-lost (count others)
+                  :innen/lost others
+                  :innen/direct-dependents (count (c/dependents g id))
+                  :innen/basis "cascade from this node alone over recorded edges; understates fragility where the record is thin"})))
+        (sort-by (juxt (comp - :innen/dependents-lost) (comp str :innen.node/id)))
+        vec)))
+
+(defn concentration
+  "Single-source risk for one node, per edge kind.
+
+   With no share data the only honest weighting is equal-per-edge, and the
+   result says so in `:innen/hhi-basis`: `:edge-count-equal-weight` means the
+   HHI is a function of HOW MANY sources are recorded, not of how much each
+   actually supplies. When every edge of a kind carries `:innen.edge/share`
+   (0..1, from a real source), the true share-weighted HHI is computed instead
+   and the basis says `:stated-share`. There is no third case where shares are
+   guessed."
+  [g id]
+  (let [by-kind (group-by :innen.edge/kind (c/dependency-edges g id))]
+    {:innen.node/id id
+     :innen/per-kind
+     (into {}
+           (map (fn [[kind es]]
+                  (let [n (count es)
+                        shares (keep :innen.edge/share es)
+                        stated? (= n (count shares))
+                        total (reduce + 0 shares)
+                        hhi (if (and stated? (pos? total))
+                              (reduce + 0 (map (fn [s] (let [x (/ s total)] (* x x))) shares))
+                              (/ 1.0 n))]
+                    [kind {:innen/source-count n
+                           :innen/hhi (double hhi)
+                           :innen/hhi-basis (if stated? :stated-share :edge-count-equal-weight)
+                           :innen/single-source? (= n 1)
+                           :innen/required-count (count (filter #(= :required (:innen.edge/necessity %)) es))}])))
+           by-kind)}))
+
+(defn explain
+  "Shortest dependency path from `from` to `to`, as the edge chain with each
+   edge's citation attached. Returns nil when no recorded path exists -- which
+   is a statement about the RECORD, not about the world, and the caller should
+   say so that way.
+
+   This is the function that keeps the record honest in use: any claim a report
+   makes about `from` depending on `to` can be printed with the sources that
+   support each hop."
+  [g from to]
+  (when (and (c/node g from) (c/node g to))
+    (loop [frontier [[from []]]
+           seen #{from}]
+      (when-let [[n path] (first frontier)]
+        (if (= n to)
+          {:innen/from from
+           :innen/to to
+           :innen/hops (count path)
+           :innen/path (mapv (fn [e]
+                               {:innen.edge/from (:innen.edge/from e)
+                                :innen.edge/to (:innen.edge/to e)
+                                :innen.edge/kind (:innen.edge/kind e)
+                                :innen.edge/necessity (:innen.edge/necessity e)
+                                :innen.edge/confidence (:innen.edge/confidence e)
+                                :innen.edge/valid (:innen.edge/valid e)
+                                :innen.edge/source (:innen.edge/source e)})
+                             path)}
+          (let [next-edges (remove #(seen (:innen.edge/to %)) (c/dependency-edges g n))]
+            (recur (into (vec (rest frontier))
+                         (map (fn [e] [(:innen.edge/to e) (conj path e)]) next-edges))
+                   (into seen (map :innen.edge/to next-edges)))))))))
+
+(defn roots
+  "Nodes nothing recorded depends on (the top of the record's chains)."
+  [g]
+  (sort (filter #(empty? (c/dependents g %)) (c/node-ids g))))
+
+(defn leaves
+  "Nodes that depend on nothing recorded -- the record's current frontier.
+   These are exactly the nodes an ingest cycle should try to extend."
+  [g]
+  (sort (filter #(empty? (c/dependencies g %)) (c/node-ids g))))
+
+(defn frontier
+  "What to ingest next, ranked: leaves with the most dependents are the ones
+   whose missing upstream would change the most answers."
+  [g]
+  (->> (leaves g)
+       (map (fn [id]
+              {:innen.node/id id
+               :innen.node/label (:innen.node/label (c/node g id))
+               :innen.node/kind (:innen.node/kind (c/node g id))
+               :innen/dependents (count (:innen/dependents (transitive-dependents g id)))}))
+       (sort-by (juxt (comp - :innen/dependents) (comp str :innen.node/id)))
+       vec))

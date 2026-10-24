@@ -87,6 +87,28 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.intWhoIcd10` | `kotoba.intWhoIcd10/src` | `icd10.chapters`, `icd10.claml`, `icd10.code`, `icd10.compare` (Kotoba project library) |
+| `kotoba.insurance` | `kotoba.insurance/src` | `kotoba.insurance`, `kotoba.insurance.eu`, `kotoba.insurance.export`, `kotoba.insurance.jp` (Kotoba project library) |
+| `kotoba.input` | `kotoba.input/src` | `input` (Kotoba project library) |
+| `kotoba.innen` | `kotoba.innen/src` | `innen.algo`, `innen.core`, `innen.schema`, `innen.time` (Kotoba project library) |
+| `kotoba.identify` | `kotoba.identify/src` | `identify.adapters.edn-resolver`, `identify.adapters.production-resolvers`, `identify.adapters.resolver`, `identify.core` (Kotoba project library) |
+| `kotoba.icPackaging` | `kotoba.icPackaging/src` | `ic-packaging`, `ic-packaging.bonding`, `ic-packaging.package`, `ic-packaging.thermal` (Kotoba project library) |
+| `kotoba.kotobaseLake` | `kotoba.kotobaseLake/src` | `kotobase.lake.acquire`, `kotobase.lake.catalog`, `kotobase.lake.columnar`, `kotobase.lake.compact` (Kotoba project library) |
+| `kotoba.ioIpldCar` | `kotoba.ioIpldCar/src` | `ipld.car`, `ipld.car.bytes`, `ipld.car.index`, `ipld.car.trustless` (Kotoba project library) |
+| `kotoba.i18nActor` | `kotoba.i18nActor/src` | `i18n.murakumo` (Kotoba project library) |
+| `kotoba.http` | `kotoba.http/src` | `kotoba.http`, `kotoba.http.decode-json-body`, `kotoba.http.fold-headers`, `kotoba.http.form-urlencoded` (Kotoba project library) |
+| `kotoba.hinshitsu` | `kotoba.hinshitsu/src` | `hinshitsu.core`, `hinshitsu.mokushi` (Kotoba project library) |
+| `kotoba.haishin` | `kotoba.haishin/src` | `haishin.adapt`, `haishin.artifact`, `haishin.constraints`, `haishin.core` (Kotoba project library) |
+| `kotoba.groot` | `kotoba.groot/src` | `kotoba.groot`, `kotoba.groot.embodiment`, `kotoba.groot.episode`, `kotoba.groot.modality` (Kotoba project library) |
+| `kotoba.graphql` | `kotoba.graphql/src` | `graphql.emit`, `graphql.execute`, `graphql.model`, `graphql.ports` (Kotoba project library) |
+| `kotoba.graphml` | `kotoba.graphml/src` | `graphml.core`, `kotoba.graphml` (Kotoba project library) |
+| `kotoba.graph` | `kotoba.graph/src` | `graph`, `graph.data`, `graph.layout` (Kotoba project library) |
+| `kotoba.governor` | `kotoba.governor/src` | `governor.core` (Kotoba project library) |
+| `kotoba.govDefenseMilStd1553` | `kotoba.govDefenseMilStd1553/src` | `mil1553.command`, `mil1553.data`, `mil1553.message`, `mil1553.mode` (Kotoba project library) |
+| `kotoba.gitWorkspace` | `kotoba.gitWorkspace/src` | `kotoba.git-workspace` (Kotoba project library) |
+| `kotoba.geojson` | `kotoba.geojson/src` | `geojson.core`, `kotoba.geojson` (Kotoba project library) |
+| `kotoba.geo` | `kotoba.geo/src` | `kotoba.geo`, `kotoba.geo.billboard`, `kotoba.geo.constants`, `kotoba.geo.math` (Kotoba project library) |
+| `kotoba.gameProduction` | `kotoba.gameProduction/src` | `game-production.audio`, `game-production.balance`, `game-production.knobs`, `game-production.spec` (Kotoba project library) |
 | `kotoba.foundationIdentityDidwebvh` | `kotoba.foundationIdentityDidwebvh/src` | `didwebvh.did`, `didwebvh.entry`, `didwebvh.hash`, `didwebvh.log` (Kotoba project library) |
 | `kotoba.forms` | `kotoba.forms/src` | `forms.model`, `forms.responses`, `forms.validate`, `forms.wire` (Kotoba project library) |
 | `kotoba.transit` | `kotoba.transit/src` | `transit.core` (Kotoba project library) |
