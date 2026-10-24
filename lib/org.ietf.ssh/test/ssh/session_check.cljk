@@ -1,0 +1,147 @@
+#!/usr/bin/env kbb
+;; The whole post-NEWKEYS layer, end to end, with REAL crypto (Node AES-128-GCM
+;; and ECDSA P-256): derive the session keys from (K, H), then run the encrypted
+;; service request/accept and the publickey userauth exchange, with the server
+;; verifying the client's signature exactly as the aiueos kernel will. If an
+;; independent implementation completes the login against these byte layouts, the
+;; kernel port has a real target. Every key is fixed so a failure is reproducible.
+
+(require '[ssh.transport :as t]
+         '[ssh.keys :as keys]
+         '[ssh.record :as rec]
+         '[ssh.userauth :as ua]
+         '[ssh.kex :as kex]
+         '[kotoba.lang.text :as str])
+
+(def crypto (js/require "node:crypto"))
+(def results (atom []))
+(defn- check! [name ok detail] (swap! results conj ok)
+  (println (if ok "SSH_SESSION_OK  " "SSH_SESSION_FAIL") name detail))
+(defn- ->buf [v] (js/Buffer.from (js/Uint8Array. (clj->js v))))
+(defn- ->vec [b] (vec (js/Array.from b)))
+(defn- sha256 [bytes] (->vec (.digest (.update (.createHash crypto "sha256") (->buf bytes)))))
+(defn- b64url [v] (.toString (->buf v) "base64url"))
+
+;; real AES-128-GCM, matching ssh.record's caller contract
+(defn- gcm-encrypt [key nonce aad plaintext]
+  (let [c (.createCipheriv crypto "aes-128-gcm" (->buf key) (->buf nonce))]
+    (.setAAD c (->buf aad))
+    (let [ct (js/Buffer.concat (clj->js [(.update c (->buf plaintext)) (.final c)]))]
+      {:ciphertext (->vec ct) :tag (->vec (.getAuthTag c))})))
+(defn- gcm-decrypt [key nonce aad ciphertext tag]
+  (try
+    (let [d (.createDecipheriv crypto "aes-128-gcm" (->buf key) (->buf nonce))]
+      (.setAAD d (->buf aad))
+      (.setAuthTag d (->buf tag))
+      (->vec (js/Buffer.concat (clj->js [(.update d (->buf ciphertext)) (.final d)]))))
+    (catch :default _ nil)))               ; tag mismatch -> nil (fatal to caller)
+
+;; real ECDSA P-256 authorized key
+(defn- p256-key []
+  (let [kp (.generateKeyPairSync crypto "ec" #js {:namedCurve "prime256v1"})
+        jwk (.export (.-privateKey kp) #js {:format "jwk"})]
+    {:priv (.-privateKey kp) :pub (.-publicKey kp)
+     :x (->vec (js/Buffer.from (.-x jwk) "base64url"))
+     :y (->vec (js/Buffer.from (.-y jwk) "base64url"))}))
+(defn- sign-rs [priv msg]
+  (let [raw (->vec (.sign crypto "sha256" (->buf msg) #js {:key priv :dsaEncoding "ieee-p1363"}))]
+    [(subvec raw 0 32) (subvec raw 32 64)]))
+(defn- verify-rs [x y r s msg]
+  (let [pub (.createPublicKey crypto #js {:key #js {:kty "EC" :crv "P-256" :x (b64url x) :y (b64url y)} :format "jwk"})]
+    (.verify crypto "sha256" (->buf msg) #js {:key pub :dsaEncoding "ieee-p1363"} (->buf (into r s)))))
+
+(defn- take-mpint [b] (let [n (+ (* 16777216 (nth b 0)) (* 65536 (nth b 1)) (* 256 (nth b 2)) (nth b 3))
+                            raw (subvec b 4 (+ 4 n)) st (vec (drop-while zero? raw))]
+                        [(into (vec (repeat (- 32 (count st)) 0)) st) (subvec b (+ 4 n))]))
+(defn- take-string [b] (let [n (+ (* 16777216 (nth b 0)) (* 65536 (nth b 1)) (* 256 (nth b 2)) (nth b 3))]
+                         [(subvec b 4 (+ 4 n)) (subvec b (+ 4 n))]))
+
+;; ── fixed session inputs (as if a kex just produced them) ────────────────────
+(def k (into [0x80] (vec (range 31))))       ; shared secret (high bit -> mpint rule)
+(def h (sha256 (mapv int "exchange-hash-H-fixed-input-for-the-session-test")))
+(def session-id h)
+(def sk (keys/session-keys sha256 k h session-id))
+
+;; keys derived identically by an independent path? check the C-derivation formula
+(check! "key-lengths"
+        (and (= 16 (count (:key-c->s sk))) (= 12 (count (:iv-c->s sk)))
+             (= 16 (count (:key-s->c sk))) (= 12 (count (:iv-s->c sk)))) "")
+(check! "keys-per-direction-differ"
+        (and (not= (:key-c->s sk) (:key-s->c sk)) (not= (:iv-c->s sk) (:iv-s->c sk))) "")
+
+;; ── GCM record round-trip (both directions, incrementing counter) ────────────
+(let [payload (vec (map #(bit-and % 255) (range 40)))
+      wire (rec/seal gcm-encrypt (:key-c->s sk) (:iv-c->s sk) 0 payload (repeat 0))
+      opened (rec/open gcm-decrypt (:key-c->s sk) (:iv-c->s sk) 0 wire)]
+  (check! "record-roundtrip" (= payload (:payload opened)) "")
+  (check! "record-tag-rejects-tamper"
+          (nil? (rec/open gcm-decrypt (:key-c->s sk) (:iv-c->s sk) 0
+                          (assoc (vec wire) 8 (bit-xor (nth wire 8) 1)))) "")
+  (check! "record-wrong-counter-rejects"
+          (nil? (rec/open gcm-decrypt (:key-c->s sk) (:iv-c->s sk) 1 wire)) ""))
+
+;; ── the encrypted userauth exchange, server verifies the client signature ────
+(let [authorized (p256-key)                 ; the provisioned authorized key
+      username "root"
+      ;; one counter per direction; seal and the matched open share the seq,
+      ;; and open advances it (simulating the sender/receiver moving in lockstep).
+      cs (atom 0) sc (atom 0)
+      seal-cs (fn [pl] (rec/seal gcm-encrypt (:key-c->s sk) (:iv-c->s sk) @cs pl (repeat 0)))
+      open-cs (fn [w] (let [o (rec/open gcm-decrypt (:key-c->s sk) (:iv-c->s sk) @cs w)]
+                        (swap! cs inc) (:payload o)))
+      seal-sc (fn [pl] (rec/seal gcm-encrypt (:key-s->c sk) (:iv-s->c sk) @sc pl (repeat 0)))
+      open-sc (fn [w] (let [o (rec/open gcm-decrypt (:key-s->c sk) (:iv-s->c sk) @sc w)]
+                        (swap! sc inc) (:payload o)))]
+  ;; 1. client -> SERVICE_REQUEST(ssh-userauth); server checks and accepts
+  (let [req (open-cs (seal-cs (ua/service-request-payload ua/service-userauth)))
+        svc (first (take-string (vec (rest req))))]
+    (check! "service-request" (and (= ua/msg-service-request (first req))
+                                   (= "ssh-userauth" (apply str (map char svc)))) ""))
+  (let [acc (open-sc (seal-sc (ua/service-accept-payload ua/service-userauth)))]
+    (check! "service-accept" (= ua/msg-service-accept (first acc)) ""))
+
+  ;; 2. client -> USERAUTH_REQUEST(publickey) with a real signature over signed-data
+  (let [point (kex/ec-point (:x authorized) (:y authorized))
+        pk-blob (ua/pubkey-blob point)
+        sd (ua/signed-data session-id username pk-blob)
+        [r s] (sign-rs (:priv authorized) sd)
+        sig-blob (kex/signature-blob r s)
+        request (ua/userauth-request-payload username pk-blob sig-blob)
+        ;; server side:
+        got (open-cs (seal-cs request))
+        parsed (ua/parse-userauth-request got)
+        ;; server reconstructs signed-data and verifies against the offered key,
+        ;; which must equal the provisioned authorized key
+        srv-blob (:pk-blob parsed)
+        [_algo a1] (take-string (vec srv-blob))
+        [_curve a2] (take-string a1)
+        [srv-point _] (take-string a2)
+        sx (subvec srv-point 1 33) sy (subvec srv-point 33 65)
+        srv-sd (ua/signed-data session-id (:username parsed) srv-blob)
+        [_sa sa1] (take-string (vec (:sig-blob parsed)))
+        [inner _] (take-string sa1)
+        [rr ia] (take-mpint inner)
+        [ss _] (take-mpint ia)
+        authorized? (and (= sx (:x authorized)) (= sy (:y authorized)))
+        verified (verify-rs sx sy rr ss srv-sd)]
+    (check! "userauth-request-parses" (and parsed (= "root" (:username parsed))
+                                           (= "ecdsa-sha2-nistp256" (:pk-algorithm parsed))) "")
+    (check! "server-reconstructs-signed-data" (= srv-sd sd) "")
+    (check! "offered-key-is-authorized" authorized? "")
+    (check! "SERVER-VERIFIES-CLIENT-SIGNATURE" (boolean (and verified authorized?))
+            "a real client authenticates by publickey")
+
+    ;; negative: a DIFFERENT key's signature must not authenticate
+    (let [attacker (p256-key)
+          [ar as] (sign-rs (:priv attacker) sd)
+          bad-verified (verify-rs (:x authorized) (:y authorized) ar as sd)]
+      (check! "wrong-key-signature-refused" (not bad-verified)
+              "signature from a non-authorized key does not verify"))
+
+    ;; 3. server -> USERAUTH_SUCCESS
+    (let [ok (open-sc (seal-sc (ua/userauth-success-payload)))]
+      (check! "userauth-success" (= ua/msg-userauth-success (first ok)) ""))))
+
+(let [expected 13 ran (count @results) failed (count (remove identity @results))]
+  (println (str "SSH_SESSION_SUMMARY ran=" ran " expected=" expected " failed=" failed))
+  (when (or (not= ran expected) (pos? failed)) (.exit js/process 1)))

@@ -1,0 +1,90 @@
+#!/usr/bin/env kbb
+;; The connection protocol end to end over the encrypted record layer with REAL
+;; AES-128-GCM: the client opens a `session` channel, runs an `exec` command, and
+;; receives the server's CHANNEL_DATA output -- the last step that turns an
+;; authenticated login into a usable command session. The server side is exactly
+;; what the aiueos kernel does after USERAUTH_SUCCESS.
+
+(require '[ssh.keys :as keys] '[ssh.record :as rec] '[ssh.connection :as con]
+         '[kotoba.lang.text :as str])
+
+(def crypto (js/require "node:crypto"))
+(def results (atom []))
+(defn- check! [name ok detail] (swap! results conj ok)
+  (println (if ok "SSH_CHAN_OK  " "SSH_CHAN_FAIL") name detail))
+(defn- ->buf [v] (js/Buffer.from (js/Uint8Array. (clj->js v))))
+(defn- ->vec [b] (vec (js/Array.from b)))
+(defn- sha256 [bytes] (->vec (.digest (.update (.createHash crypto "sha256") (->buf bytes)))))
+(defn- ->str [bytes] (apply str (map char bytes)))
+(defn- s->b [s] (mapv #(.charCodeAt s %) (range (count s))))  ; (int \a) is 0 in cljs
+
+(defn- gcm-encrypt [key nonce aad pt]
+  (let [c (.createCipheriv crypto "aes-128-gcm" (->buf key) (->buf nonce))]
+    (.setAAD c (->buf aad))
+    {:ciphertext (->vec (js/Buffer.concat (clj->js [(.update c (->buf pt)) (.final c)]))) :tag (->vec (.getAuthTag c))}))
+(defn- gcm-decrypt [key nonce aad ct tag]
+  (try (let [d (.createDecipheriv crypto "aes-128-gcm" (->buf key) (->buf nonce))]
+         (.setAAD d (->buf aad)) (.setAuthTag d (->buf tag))
+         (->vec (js/Buffer.concat (clj->js [(.update d (->buf ct)) (.final d)]))))
+       (catch :default _ nil)))
+
+;; fixed session keys, as if a login just completed
+(def k (into [0x80] (vec (range 31))))
+(def h (sha256 (mapv int "exchange-hash-for-the-connection-test")))
+(def sk (keys/session-keys sha256 k h h))
+
+;; per-direction counters (would continue from userauth in a live session)
+(def cs (atom 0)) (def sc (atom 0))
+(defn- seal-cs [pl] (let [w (rec/seal gcm-encrypt (:key-c->s sk) (:iv-c->s sk) @cs pl (repeat 0))] (swap! cs inc) w))
+(defn- open-cs [w] (let [o (rec/open gcm-decrypt (:key-c->s sk) (:iv-c->s sk) (dec @cs) w)] (:payload o)))
+(defn- seal-sc [pl] (let [w (rec/seal gcm-encrypt (:key-s->c sk) (:iv-s->c sk) @sc pl (repeat 0))] (swap! sc inc) w))
+(defn- open-sc [w] (let [o (rec/open gcm-decrypt (:key-s->c sk) (:iv-s->c sk) (dec @sc) w)] (:payload o)))
+
+;; NB: seal advances the counter; the matched open uses (dec) so both sides align.
+
+(def client-chan 0)
+(def server-chan 0)
+(def window 2097152)
+(def max-packet 32768)
+(def command "uname -a")
+
+;; 1. client -> CHANNEL_OPEN "session"
+(let [got (open-cs (seal-cs (con/channel-open-payload "session" client-chan window max-packet)))
+      op (con/parse-channel-open got)]
+  (check! "channel-open" (and op (= "session" (:type op)) (= client-chan (:sender-channel op)))
+          (str "type=" (:type op))))
+
+;; 2. server -> CHANNEL_OPEN_CONFIRMATION
+(let [conf (open-sc (seal-sc (con/channel-open-confirmation-payload client-chan server-chan window max-packet)))]
+  (check! "open-confirmation" (= con/msg-channel-open-confirmation (first conf)) ""))
+
+;; 3. client -> CHANNEL_REQUEST exec
+(let [got (open-cs (seal-cs (con/channel-request-exec-payload server-chan true command)))
+      req (con/parse-channel-request got)]
+  (check! "channel-request-exec"
+          (and req (= "exec" (:request-type req)) (:want-reply req) (= command (:command req)))
+          (str "cmd=" (pr-str (:command req)))))
+
+;; 4. server -> CHANNEL_SUCCESS
+(let [succ (open-sc (seal-sc (con/channel-success-payload client-chan)))]
+  (check! "channel-success" (= con/msg-channel-success (first succ)) ""))
+
+;; 5. server -> CHANNEL_DATA (the command output the kernel produces)
+(let [output (str "aiueos: " command "\n")
+      data (open-sc (seal-sc (con/channel-data-payload client-chan (s->b output))))
+      parsed (con/parse-channel-data data)]
+  (check! "channel-data-recipient" (= client-chan (:recipient parsed)) "")
+  (check! "CLIENT-RECEIVES-COMMAND-OUTPUT" (= output (->str (:data parsed)))
+          (str "output=" (pr-str (->str (:data parsed))))))
+
+;; 6. server -> exit-status, EOF, CLOSE
+(let [es (open-sc (seal-sc (con/channel-exit-status-payload client-chan 0)))
+      eof (open-sc (seal-sc (con/channel-eof-payload client-chan)))
+      cls (open-sc (seal-sc (con/channel-close-payload client-chan)))]
+  (check! "exit-status" (= con/msg-channel-request (first es)) "")
+  (check! "channel-eof" (= con/msg-channel-eof (first eof)) "")
+  (check! "channel-close" (= con/msg-channel-close (first cls)) ""))
+
+(let [expected 9 ran (count @results) failed (count (remove identity @results))]
+  (println (str "SSH_CHAN_SUMMARY ran=" ran " expected=" expected " failed=" failed))
+  (when (or (not= ran expected) (pos? failed)) (.exit js/process 1)))

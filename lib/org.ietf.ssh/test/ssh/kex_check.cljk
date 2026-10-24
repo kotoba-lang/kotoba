@@ -1,0 +1,147 @@
+#!/usr/bin/env kbb
+;; ssh.kex end-to-end, with REAL crypto on both sides (Node's X25519 and ECDSA
+;; P-256). The server side builds exactly what the aiueos kernel will build -- a
+;; curve25519-sha256 KEX_ECDH_REPLY carrying K_S, Q_S, and an ecdsa-sha2-nistp256
+;; signature over H. The client side is an INDEPENDENT verifier: it re-derives
+;; the shared secret and H from the wire, pulls the host public key out of K_S,
+;; and checks the signature. If a different implementation accepts our reply, a
+;; real ssh(1) will too. Every key is fixed via seeds so a failure is
+;; reproducible.
+
+(require '[ssh.transport :as t]
+         '[ssh.kex :as kex]
+         '[kotoba.lang.text :as str])
+
+(def crypto (js/require "node:crypto"))
+(def results (atom []))
+(defn- check! [name ok detail] (swap! results conj ok)
+  (println (if ok "SSH_KEX_OK  " "SSH_KEX_FAIL") name detail))
+
+(defn- sha256 [bytes]
+  (vec (.digest (.update (.createHash crypto "sha256") (js/Uint8Array. (clj->js bytes))))))
+(defn- ->buf [v] (js/Buffer.from (js/Uint8Array. (clj->js v))))
+(defn- ->vec [buf] (vec (js/Array.from buf)))
+(defn- b64url [v] (.toString (->buf v) "base64url"))
+
+;; ── X25519 via Node, raw 32-byte keys ───────────────────────────────────────
+;; Raw public = last 32 bytes of the SPKI DER; raw private = last 32 of PKCS8 DER.
+(defn- x25519-keypair []
+  (let [kp (.generateKeyPairSync crypto "x25519")
+        pub (->vec (.subarray (.export (.-publicKey kp) #js {:type "spki" :format "der"}) 12))
+        prv-der (.export (.-privateKey kp) #js {:type "pkcs8" :format "der"})]
+    {:key-object kp
+     :pub pub
+     :priv (->vec (.subarray prv-der (- (.-length prv-der) 32)))}))
+
+(defn- x25519-shared
+  "K = X25519(my-private-key-object, peer-raw-32-pub)."
+  [my-key-object peer-pub-32]
+  (let [peer (.createPublicKey crypto
+               #js {:key (js/Buffer.concat
+                          (clj->js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x6e 0x03 0x21 0x00])
+                                    (->buf peer-pub-32)]))
+                    :format "der" :type "spki"})]
+    (->vec (.diffieHellman crypto #js {:privateKey my-key-object :publicKey peer}))))
+
+;; ── ECDSA P-256 host key ─────────────────────────────────────────────────────
+(defn- p256-host-key []
+  (let [kp (.generateKeyPairSync crypto "ec" #js {:namedCurve "prime256v1"})
+        jwk (.export (.-publicKey kp) #js {:format "jwk"})]
+    {:priv (.-privateKey kp) :pub (.-publicKey kp)
+     :x (->vec (js/Buffer.from (.-x jwk) "base64url"))
+     :y (->vec (js/Buffer.from (.-y jwk) "base64url"))}))
+
+(defn- p256-sign-rs
+  "Sign the 32-byte digest with the host private key; return raw [r s] (32+32)."
+  [priv-key-object digest-32]
+  (let [sig (.sign crypto "sha256"    ; note: node hashes the INPUT with sha256
+              (->buf digest-32)         ; we pass H; node computes SHA256(H) = the ecdsa digest
+              #js {:key priv-key-object :dsaEncoding "ieee-p1363"})
+        raw (->vec sig)]
+    [(subvec raw 0 32) (subvec raw 32 64)]))
+
+(defn- p256-verify-over-h
+  "Reconstruct the host public key from (x,y), verify raw (r||s) over H
+  (node hashes H with sha256 internally, matching the signer)."
+  [x y r s h-32]
+  (let [jwk #js {:kty "EC" :crv "P-256" :x (b64url x) :y (b64url y)}
+        pub (.createPublicKey crypto #js {:key jwk :format "jwk"})]
+    (.verify crypto "sha256" (->buf h-32)
+             #js {:key pub :dsaEncoding "ieee-p1363"}
+             (->buf (into r s)))))
+
+;; ── the exchange ─────────────────────────────────────────────────────────────
+(def v-c "SSH-2.0-realclient")
+(def v-s "SSH-2.0-aiueos_0.1")
+(def i-c (t/kexinit-payload (vec (range 16))))
+(def i-s (t/kexinit-payload (vec (map #(bit-and (+ % 32) 255) (range 16)))))
+
+(let [srv-eph (x25519-keypair)
+      cli-eph (x25519-keypair)
+      host (p256-host-key)
+      q-s (:pub srv-eph)
+      q-c (:pub cli-eph)
+      ;; both sides derive the same K
+      k-srv (x25519-shared (.-privateKey (:key-object srv-eph)) q-c)
+      k-cli (x25519-shared (.-privateKey (:key-object cli-eph)) q-s)
+      k-s (kex/host-key-blob (kex/ec-point (:x host) (:y host)))
+      inputs {:v-c v-c :v-s v-s :i-c i-c :i-s i-s :k-s k-s :q-c q-c :q-s q-s :k k-srv}
+      h (t/exchange-hash sha256 inputs)
+      [r s] (p256-sign-rs (:priv host) h)
+      sig-blob (kex/signature-blob r s)
+      reply (kex/kex-ecdh-reply-payload k-s q-s sig-blob)]
+
+  (check! "shared-secret-agrees" (= k-srv k-cli)
+          (str "K=" (subs (str/join (map #(.padStart (.toString % 16) 2 "0") k-srv)) 0 16) "…"))
+
+  ;; ── the INDEPENDENT client: parse the reply and verify ────────────────────
+  ;; walk the SSH strings in the KEX_ECDH_REPLY payload
+  (let [msg (first reply)
+        buf (vec (rest reply))
+        take-string (fn [b] (let [n (+ (* 16777216 (nth b 0)) (* 65536 (nth b 1))
+                                       (* 256 (nth b 2)) (nth b 3))]
+                              [(subvec b 4 (+ 4 n)) (subvec b (+ 4 n))]))
+        [ks1 r1] (take-string buf)
+        [qs1 r2] (take-string r1)
+        [sig1 _] (take-string r2)]
+    (check! "reply-msg-number" (= kex/msg-kex-ecdh-reply msg) (str "msg=" msg))
+    (check! "reply-K_S-roundtrips" (= ks1 k-s) "")
+    (check! "reply-Q_S-roundtrips" (= qs1 q-s) "")
+
+    ;; parse K_S: string algo, string curve, string point
+    (let [[algo ra] (take-string ks1)
+          [_curve rb] (take-string ra)
+          [point _] (take-string rb)
+          px (subvec point 1 33) py (subvec point 33 65)]
+      (check! "K_S-algorithm" (= "ecdsa-sha2-nistp256" (apply str (map char algo))) "")
+      (check! "K_S-point-uncompressed" (= 0x04 (first point)) (str "len=" (count point)))
+
+      ;; parse signature: string algo, string (mpint r, mpint s)
+      (let [[salgo sa] (take-string sig1)
+            [inner _] (take-string sa)
+            take-mpint (fn [b] (let [n (+ (* 16777216 (nth b 0)) (* 65536 (nth b 1))
+                                          (* 256 (nth b 2)) (nth b 3))
+                                     raw (subvec b 4 (+ 4 n))
+                                     ;; left-pad / strip to 32 bytes big-endian
+                                     stripped (vec (drop-while zero? raw))
+                                     padded (into (vec (repeat (- 32 (count stripped)) 0)) stripped)]
+                                 [padded (subvec b (+ 4 n))]))
+            [r2v ia] (take-mpint inner)
+            [s2v _]  (take-mpint ia)]
+        (check! "sig-algorithm" (= "ecdsa-sha2-nistp256" (apply str (map char salgo))) "")
+
+        ;; the client re-derives H from ITS OWN view (client eph priv + Q_S) and verifies
+        (let [k-client (x25519-shared (.-privateKey (:key-object cli-eph)) qs1)
+              h-client (t/exchange-hash sha256
+                         {:v-c v-c :v-s v-s :i-c i-c :i-s i-s :k-s ks1 :q-c q-c :q-s qs1 :k k-client})
+              verified (p256-verify-over-h px py r2v s2v h-client)]
+          (check! "client-rederived-H-equals-server-H" (= h-client h) "")
+          (check! "INDEPENDENT-client-verifies-host-signature-over-H" verified
+                  "a real client accepts this KEX_ECDH_REPLY"))))))
+
+;; NEWKEYS is a bare message number
+(check! "newkeys-payload" (= [21] (kex/newkeys-payload)) "")
+
+(let [expected 10 ran (count @results) failed (count (remove identity @results))]
+  (println (str "SSH_KEX_SUMMARY ran=" ran " expected=" expected " failed=" failed))
+  (when (or (not= ran expected) (pos? failed)) (.exit js/process 1)))

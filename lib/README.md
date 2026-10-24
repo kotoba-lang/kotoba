@@ -74,6 +74,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.webaudio` | `org.w3.webaudio/src` | `w3.webaudio`, `w3.webaudio.protocol` (an external specification, publisher w3.org) |
 | `org.w3.webrtcSignaling` | `org.w3.webrtcSignaling/src` | `kotoba.rt.core` (an external specification, publisher w3.org) |
 | `org.w3.woff` | `org.w3.woff/src` | `woff.bytes`, `woff.core`, `woff.glyf`, `woff.woff2` (an external specification, publisher w3.org) |
+| `org.ietf.ssh` | `org.ietf.ssh/src` | `ssh.connection`, `ssh.kex`, `ssh.keys`, `ssh.record` (an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package

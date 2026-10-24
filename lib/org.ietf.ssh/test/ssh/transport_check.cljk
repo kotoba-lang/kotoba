@@ -1,0 +1,92 @@
+#!/usr/bin/env kbb
+;; ssh.transport against an independent reference. The point of a transport
+;; core that computes an exchange hash is that a DIFFERENT implementation,
+;; given the same wire inputs, gets the same H -- otherwise the peer would not.
+;; So this drives ssh.transport with fixed inputs and checks:
+;;   1. the encodings (string, mpint, packet framing, KEXINIT) against
+;;      hand-computed bytes and a Node reference;
+;;   2. the exchange hash H against a Node reference that concatenates the same
+;;      RFC 5656 fields and SHA-256s them by a separate code path.
+;; A parity failure that only reproduces sometimes is not reportable, so every
+;; input here is fixed.
+
+(require '[ssh.transport :as t]
+         '[kotoba.lang.text :as str])
+
+(def crypto (js/require "node:crypto"))
+(def results (atom []))
+(defn- check! [name ok detail]
+  (swap! results conj ok)
+  (println (if ok "SSH_TRANSPORT_OK " "SSH_TRANSPORT_FAIL") name detail))
+
+(defn- sha256 [bytes]
+  (vec (.digest (.update (.createHash crypto "sha256") (js/Uint8Array. (clj->js bytes))))))
+(defn- hex [bytes] (str/join (map #(.padStart (.toString % 16) 2 "0") bytes)))
+
+;; 1. string / mpint / u32
+(check! "u32" (= [0x12 0x34 0x56 0x78] (t/u32 0x12345678)) "")
+(check! "string-empty" (= [0 0 0 0] (t/string-bytes [])) "")
+(check! "string-len" (= [0 0 0 3 1 2 3] (t/string-bytes [1 2 3])) "")
+;; mpint: high bit set -> leading zero; RFC 4251 §5 example 0x80..00 (bit 255)
+(check! "mpint-highbit" (= [0 0 0 4 0 0x80 0x00 0x00] (t/mpint [0x80 0x00 0x00])) "")
+(check! "mpint-strip-zero" (= [0 0 0 1 0x7f] (t/mpint [0x00 0x00 0x7f])) "")
+(check! "mpint-zero" (= [0 0 0 0] (t/mpint [0 0 0])) "")
+
+;; 2. packet framing round-trips and is 8-aligned
+(let [payload (vec (range 20))
+      pkt (t/packet payload)]
+  (check! "packet-aligned" (zero? (mod (count pkt) 8)) (str "len=" (count pkt)))
+  (check! "packet-roundtrip" (= payload (t/packet-payload pkt)) "")
+  (check! "packet-rejects-short" (nil? (t/packet-payload (subvec pkt 0 4))) ""))
+
+;; 3. KEXINIT payload starts with msg 20 + a 16-byte cookie, and re-parses
+(let [cookie (vec (range 16))
+      ki (t/kexinit-payload cookie)]
+  (check! "kexinit-msgnum" (= 20 (first ki)) "")
+  (check! "kexinit-cookie" (= cookie (subvec ki 1 17)) "")
+  (let [needle (t/str->bytes "curve25519-sha256")
+        found (some #(= needle (subvec ki % (min (count ki) (+ % (count needle)))))
+                    (range (- (count ki) (count needle))))]
+    (check! "kexinit-has-curve25519" (boolean found) "")))
+
+;; 4. THE exchange hash, against a Node reference over the same RFC 5656 fields.
+(let [;; fixed wire inputs
+      v-c "SSH-2.0-testclient"
+      v-s "SSH-2.0-aiueos_0.1"
+      i-c (t/kexinit-payload (vec (repeat 16 0xa1)))
+      i-s (t/kexinit-payload (vec (repeat 16 0xb2)))
+      k-s (t/string-bytes (mapv int "ecdsa-sha2-nistp256-hostkey-blob-placeholder"))
+      q-c (vec (range 32))
+      q-s (vec (map #(bit-and (+ % 100) 255) (range 32)))
+      k   (into [0x80] (vec (range 31)))   ; high bit set -> exercises the mpint rule
+      inputs {:v-c v-c :v-s v-s :i-c i-c :i-s i-s :k-s k-s :q-c q-c :q-s q-s :k k}
+      h-ours (t/exchange-hash sha256 inputs)
+      ;; independent reference: build the same concatenation in JS and hash it
+      ref-js "
+        const put=(a,b)=>{for(const x of b)a.push(x);};
+        const u32=n=>[(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255];
+        const s=b=>[...u32(b.length),...b];
+        const mpint=b=>{let v=[...b];while(v.length&&v[0]===0)v.shift();
+                        if(!v.length)return u32(0);
+                        if(v[0]&128)v.unshift(0);return s(v);};
+        const enc=x=>[...Buffer.from(x,'utf8')];
+        const t=[];
+        put(t,s(enc(process.env.VC)));put(t,s(enc(process.env.VS)));
+        put(t,s(JSON.parse(process.env.IC)));put(t,s(JSON.parse(process.env.IS)));
+        put(t,s(JSON.parse(process.env.KS)));put(t,s(JSON.parse(process.env.QC)));
+        put(t,s(JSON.parse(process.env.QS)));put(t,mpint(JSON.parse(process.env.K)));
+        const h=require('crypto').createHash('sha256').update(Buffer.from(t)).digest('hex');
+        process.stdout.write(h);"
+      cp (js/require "node:child_process")
+      env (js/Object.assign #js {} js/process.env
+            #js {:VC v-c :VS v-s
+                 :IC (.stringify js/JSON (clj->js i-c)) :IS (.stringify js/JSON (clj->js i-s))
+                 :KS (.stringify js/JSON (clj->js k-s)) :QC (.stringify js/JSON (clj->js q-c))
+                 :QS (.stringify js/JSON (clj->js q-s)) :K (.stringify js/JSON (clj->js k))})
+      ref (.-stdout (.spawnSync cp "node" #js ["-e" ref-js] #js {:encoding "utf8" :env env}))]
+  (check! "exchange-hash-matches-reference" (= (hex h-ours) ref)
+          (str "ours=" (subs (hex h-ours) 0 16) " ref=" (subs ref 0 16))))
+
+(let [expected 13 ran (count @results) failed (count (remove identity @results))]
+  (println (str "SSH_TRANSPORT_SUMMARY ran=" ran " expected=" expected " failed=" failed))
+  (when (or (not= ran expected) (pos? failed)) (.exit js/process 1)))
