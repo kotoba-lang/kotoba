@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.terrain` | `kotoba.terrain/src` | `terrain`, `terrain.biome`, `terrain.chunk`, `terrain.heightmap` (Kotoba project library) |
 | `kotoba.tedai` | `kotoba.tedai/src` | `tedai.cells.actuate-invoke.state-machine`, `tedai.cells.app-resolve.state-machine`, `tedai.cells.evidence-audit.state-machine`, `tedai.cells.intent-plan.state-machine` (Kotoba project library) |
 | `kotoba.taxlaw` | `kotoba.taxlaw/src` | `kotoba.taxlaw` (Kotoba project library) |
 | `kotoba.swift` | `kotoba.swift/src` | `kotoba.swift`, `kotoba.swift.export`, `kotoba.swift.iso20022`, `kotoba.swift.ui` (Kotoba project library) |
