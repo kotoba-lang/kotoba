@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.loopUxKaizen` | `kotoba.loopUxKaizen/src` | `loop.ux-kaizen` (Kotoba project library) |
 | `kotoba.loopMaturityAudit` | `kotoba.loopMaturityAudit/src` | `loop-maturity-audit.core` (Kotoba project library) |
 | `kotoba.loopLeiCatalog` | `kotoba.loopLeiCatalog/src` | `loop-lei-catalog.core` (Kotoba project library) |
 | `kotoba.loopKaProduction` | `kotoba.loopKaProduction/src` | `loop-ka.decide`, `loop-ka.evaluate`, `loop-ka.ledger`, `loop-ka.observe` (Kotoba project library) |
