@@ -1,0 +1,180 @@
+#!/usr/bin/env kbb
+(ns extract-rfc-tables
+  "Generates `src/brotli/data.cljk` from the text of RFC 7932.
+
+   Every table brotli needs is *in* the RFC, and every one of them is published
+   with a length and a CRC-32 check value: the 122,784-byte static dictionary
+   (Appendix A), the 121 word transformations (Appendix B), and the three
+   context-lookup tables (§7.1). So the tables are transcribed mechanically and
+   verified against those checksums rather than typed in by hand — three of the
+   bugs in this workspace's zstd work were mis-remembered constants that stayed
+   plausible when wrong (ADR-2607300500 decision item 9).
+
+   Usage:
+     curl -sL https://www.rfc-editor.org/rfc/rfc7932.txt -o /tmp/rfc7932.txt
+     kbb --backend sci --classpath ../org-ietf-deflate/src tools/extract_rfc_tables.cljk /tmp/rfc7932.txt
+
+   The CRC-32 used for verification is this workspace's own
+   `deflate.core/crc32`, which is itself checked against java.util.zip."
+  (:require [kotoba.lang.text :as str]
+            [deflate.core :as deflate]))
+
+(def fs (js/require "node:fs"))
+
+(def rfc-path (or (first *command-line-args*) "/tmp/rfc7932.txt"))
+(def text (.readFileSync fs rfc-path "utf8"))
+(def lines (str/split-lines text))
+
+(defn- page-furniture? [l]
+  (or (str/blank? l)
+      (str/starts-with? l "Alakuijala")
+      (str/starts-with? l "RFC 7932")
+      (str/includes? l "\f")))
+
+(defn- section-lines
+  "Lines between two markers, page furniture removed."
+  [from to]
+  (let [s (first (keep-indexed (fn [i l] (when (str/includes? l from) i)) lines))
+        e (first (keep-indexed (fn [i l] (when (and (> i s) (str/includes? l to)) i)) lines))]
+    (remove page-furniture? (subvec (vec lines) (inc s) e))))
+
+(defn- check! [what bytes expected-len expected-crc]
+  (let [crc (deflate/crc32 bytes)]
+    (println (str "  " what ": " (count bytes) " bytes, CRC-32 "
+                  (.toString crc 16)
+                  (if (and (= (count bytes) expected-len) (= crc expected-crc))
+                    "  OK"
+                    (str "  MISMATCH (expected " expected-len " bytes, "
+                         (.toString expected-crc 16) ")"))))
+    (when-not (and (= (count bytes) expected-len) (= crc expected-crc))
+      (throw (ex-info (str what ": extraction does not match the RFC's published check value")
+                      {:what what :len (count bytes) :crc crc})))))
+
+;; ---------------------------------------------------------------------------
+;; Appendix A — the static dictionary, as hex
+;; ---------------------------------------------------------------------------
+
+(def dict-bytes
+  (let [hex (->> (section-lines "Appendix A.  Static Dictionary Data" "Appendix B.")
+                 (map str/trim)
+                 (filter #(re-matches #"[0-9a-f]+" %))
+                 (str/join))]
+    (println (str "  dictionary hex chars: " (count hex)))
+    (vec (for [i (range 0 (count hex) 2)]
+           (js/parseInt (subs hex i (+ i 2)) 16)))))
+
+;; ---------------------------------------------------------------------------
+;; §7.1 — the three context lookup tables
+;; ---------------------------------------------------------------------------
+
+(defn- lut [name]
+  (let [ls   (drop-while #(not (str/includes? % (str name " :="))) lines)
+        ls   (rest (take-while #(not (str/includes? % "The lengths and the CRC-32")) ls))
+        nums (->> ls
+                  (remove page-furniture?)
+                  (take-while #(re-find #"^\s*\d" %))
+                  (mapcat #(re-seq #"\d+" %))
+                  (map #(js/parseInt % 10)))]
+    (vec (take 256 nums))))
+
+;; ---------------------------------------------------------------------------
+;; Appendix B — the 121 word transformations
+;; ---------------------------------------------------------------------------
+
+(def transform-ids
+  "Byte values the RFC assigns to each elementary transform, for the check value."
+  (into {"Identity" 0 "FermentFirst" 1 "FermentAll" 2}
+        (concat (for [k (range 1 10)] [(str "OmitFirst" k) (+ 2 k)])
+                (for [k (range 1 10)] [(str "OmitLast" k) (+ 11 k)]))))
+
+(defn- unescape
+  "C string literal → the bytes it denotes."
+  [s]
+  (loop [cs (seq s) out []]
+    (if-not cs
+      out
+      (let [c (first cs)]
+        (if (= c "\\")
+          (let [n (second cs)]
+            (case n
+              "n"  (recur (nnext cs) (conj out 10))
+              "t"  (recur (nnext cs) (conj out 9))
+              "r"  (recur (nnext cs) (conj out 13))
+              "\"" (recur (nnext cs) (conj out 34))
+              "\\" (recur (nnext cs) (conj out 92))
+              ;; Transform 102 is a non-breaking space, written "\xc2\xa0".
+              "x"  (recur (nthnext cs 4)
+                          (conj out (js/parseInt (str (nth cs 2) (nth cs 3)) 16)))
+              (throw (ex-info "unknown escape" {:escape n :string s}))))
+          (let [code (.charCodeAt c 0)]
+            ;; The transform strings are ASCII plus a handful of UTF-8 sequences
+            ;; that the RFC prints literally; encode them as UTF-8 bytes.
+            (recur (next cs)
+                   (into out (if (< code 0x80)
+                               [code]
+                               (vec (.from js/Array (.encode (js/TextEncoder.) c))))))))))))
+
+(def transforms
+  (let [row #"^\s*(\d+)\s+\"((?:[^\"\\]|\\.)*)\"\s+(\S+)\s+\"((?:[^\"\\]|\\.)*)\"\s*$"]
+    (->> (section-lines "Appendix B.  List of Word Transformations" "Appendix C.")
+         (keep (fn [l] (when-let [[_ id p t s] (re-matches row l)]
+                         {:id (js/parseInt id 10) :prefix p :transform t :suffix s})))
+         vec)))
+
+(def transform-check-bytes
+  ;; prefix bytes + 0, transform id byte, suffix bytes + 0 — concatenated.
+  (vec (mapcat (fn [{:keys [prefix transform suffix]}]
+                 (concat (unescape prefix) [0]
+                         [(or (get transform-ids transform)
+                              (throw (ex-info "unknown transform" {:t transform})))]
+                         (unescape suffix) [0]))
+               transforms)))
+
+;; ---------------------------------------------------------------------------
+;; Verify, then emit
+;; ---------------------------------------------------------------------------
+
+(println "Verifying against the RFC's published check values:")
+(check! "DICT" dict-bytes 122784 0x5136cb04)
+(check! "Lut0" (lut "Lut0") 256 0x8e91efb7)
+(check! "Lut1" (lut "Lut1") 256 0xd01a32f4)
+(check! "Lut2" (lut "Lut2") 256 0x0dd7a0d6)
+(println (str "  transforms parsed: " (count transforms)))
+(check! "transforms" transform-check-bytes 648 0x3d965f81)
+
+(defn- ->base64 [bytes]
+  (.toString (.from js/Buffer (clj->js bytes)) "base64"))
+
+(def out
+  (str ";; GENERATED by tools/extract_rfc_tables.cljk from the text of RFC 7932.\n"
+       ";; DO NOT EDIT BY HAND. Every table here is verified against the check\n"
+       ";; value the RFC publishes for it (dictionary 122,784 bytes CRC-32\n"
+       ";; 0x5136cb04; transforms 648 bytes 0x3d965f81; Lut0/1/2 256 bytes each,\n"
+       ";; 0x8e91efb7 / 0xd01a32f4 / 0x0dd7a0d6).\n"
+       "(ns brotli.data\n"
+       "  \"Static tables of RFC 7932: the 122,784-byte dictionary (base64), the 121\n"
+       "   word transformations, and the three context-ID lookup tables.\")\n\n"
+       ";; Appendix A. 122,784 bytes, CRC-32 0x5136cb04.\n"
+       "(def dictionary-base64\n  \"" (->base64 dict-bytes) "\")\n\n"
+       ";; §8. Bit depths per word length; NWORDS[len] = 1 << ndbits[len] for len >= 4.\n"
+       "(def ndbits [0 0 0 0 10 10 11 11 10 10 10 10 10 9 9 8 7 7 8 7 7 6 6 5 5])\n\n"
+       ";; Appendix B. 121 transformations, as [prefix-bytes elementary-transform\n"
+       ";; suffix-bytes]. The prefix/suffix are byte vectors, not strings: the RFC\n"
+       ";; prints them as C literals, and emitting them as Clojure strings would\n"
+       ";; carry the backslash escapes through verbatim (transform 22's suffix\n"
+       ";; would be the two characters \\ and n instead of one newline).\n"
+       "(def transforms\n  ["
+       (str/join "\n   "
+                 (map (fn [{:keys [prefix transform suffix]}]
+                        (str "[" (pr-str (unescape prefix)) " " (keyword transform) " "
+                             (pr-str (unescape suffix)) "]"))
+                      transforms))
+       "])\n\n"
+       ";; §7.1 context-ID lookup tables.\n"
+       "(def lut0 " (pr-str (lut "Lut0")) ")\n\n"
+       "(def lut1 " (pr-str (lut "Lut1")) ")\n\n"
+       "(def lut2 " (pr-str (lut "Lut2")) ")\n"))
+
+(.mkdirSync fs "src/brotli" #js {:recursive true})
+(.writeFileSync fs "src/brotli/data.cljk" out)
+(println (str "wrote src/brotli/data.cljk (" (count out) " bytes)"))
