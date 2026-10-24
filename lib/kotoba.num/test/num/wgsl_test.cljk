@@ -1,0 +1,140 @@
+(ns num.wgsl-test
+  "Loads the GPU backend namespaces (compile check) and asserts the shader set
+  matches the IBackend ops. The shaders' RUNTIME correctness on a GPU is verified
+  separately on Apple M4 Metal by verify/metal_contract.js (the full contract);
+  this test guards that the Clojure side is well-formed and complete on the JVM."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [num.wgsl :as w]
+            [num.wgsl-backend :as wb]))
+
+(deftest shader-set-is-complete
+  (testing "every accelerated IBackend op has a non-empty WGSL kernel"
+    (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
+                :ewise-f16 :ewise1-f16 :gemm-f16
+                :conv2d-nchw-f16 :conv2d-nchw-f16-oc4 :group-norm-nchw-f16
+                :group-norm-nchw-f16-reference
+                :upsample-nearest2d-f16 :slice-axis-f16
+                :nchw-to-rgb-image-f16 :scale-f16
+                :transpose-nd-f16 :multi-head-attention-f16
+                :add-last-axis-bias-f16
+                :conv2d-nchw :conv2d-nchw-oc4
+                :group-norm-nchw :group-norm-silu-nchw
+                :upsample-nearest2d :cat-copy
+                :slice-axis :pad-right-bottom-nchw
+                :rgb-image-to-nchw :nchw-to-rgb-image
+                :add-last-axis-bias :multi-head-attention
+                :multi-head-attention-backward :transpose-2d :bias-gradient
+                :transpose-nd
+                :batched-matmul
+                :mse-loss :mse-gradient :sgd-step :adamw-step
+                :unscale-gradient :spmv
+                :q4-k-matmul :q6-k-matmul :q8-0-matmul
+                :q4-k-embedding :q6-k-embedding :q8-0-embedding]]
+      (is (string? (get w/shaders op)) (str "missing shader: " op))
+      (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
+  (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
+    (is (re-find #"var<workgroup>" (:gemm w/shaders))))
+  (testing "fused GroupNorm applies SiLU in the normalization kernel"
+    (is (re-find #"exp\(-normalized\)" (:group-norm-silu-nchw w/shaders)))
+    (is (re-find #"d\.activation == 1u" (:group-norm-nchw-f16 w/shaders))))
+  (testing "typed GroupNorm reduces each group once in workgroup memory"
+    (is (re-find #"var<workgroup> sums" (:group-norm-nchw-f16 w/shaders)))
+    (is (re-find #"workgroupBarrier" (:group-norm-nchw-f16 w/shaders))))
+  (testing "typed kernels use packed physical halves and accumulate GEMM in f32"
+    (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
+    (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
+    (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
+
+(deftest packed-f16-convolution-reuses-input-across-four-output-channels
+  (let [shader (:conv2d-nchw-f16-oc4 w/shaders)]
+    (is (re-find #"fn convolve4" shader))
+    (is (re-find #"vec4<f32>\(x\) \* weights" shader))
+    (is (re-find #"pack2x16float" shader))))
+
+(deftest image-boundary-shaders-fuse-layout-and-range-conversion
+  (is (re-find #"let source" (:rgb-image-to-nchw w/shaders)))
+  (is (re-find #"2\.0 \* input\[source\] - 1\.0"
+               (:rgb-image-to-nchw w/shaders)))
+  (is (re-find #"clamp" (:nchw-to-rgb-image w/shaders))))
+
+(deftest quantized-matmul-parallelizes-k-with-workgroup-reduction
+  (doseq [op [:q4-k-matmul :q6-k-matmul :q8-0-matmul]
+          :let [shader (get w/shaders op)]]
+    (is (re-find #"var<workgroup> partial" shader))
+    (is (re-find #"inner = inner \+ 64u" shader))
+    (is (re-find #"tile \* 4u" shader))
+    (is (re-find #"var sums = vec4<f32>" shader))
+    (is (re-find #"workgroupBarrier" shader))))
+
+(deftest attention-backward-shader-covers-all-three-gradients
+  (let [shader (:multi-head-attention-backward w/shaders)]
+    (is (re-find #"grad_query" shader))
+    (is (re-find #"grad_key" shader))
+    (is (re-find #"grad_value" shader))
+    (is (re-find #"grad_expectation" shader))))
+
+(deftest attention-shaders-cover-batches-and-masks
+  (doseq [shader [(:multi-head-attention w/shaders)
+                  (:multi-head-attention-backward w/shaders)]]
+    (is (re-find #"key_padding_mask" shader))
+    (is (re-find #"p\.causal" shader))
+    (is (re-find #"batch \* p\.seq" shader))))
+
+(deftest backend-namespaces-load
+  (testing "the WgslBackend constructor and IGpuDevice port compile on the JVM"
+    (is (fn? wb/wgsl-backend))
+    (is (some? w/IGpuDevice))))
+
+(deftest q8-gemv-shader-decodes-packed-signed-blocks
+  (is (string? w/q8-0-gemv-wgsl))
+  (is (re-find #"signed_byte" w/q8-0-gemv-wgsl))
+  (is (re-find #"scale \* signed_byte" w/q8-0-gemv-wgsl)))
+
+(deftest q4-gemv-shader-decodes-low-and-high-nibbles
+  (is (string? w/q4-0-gemv-wgsl))
+  (is (re-find #"packed & 15u" w/q4-0-gemv-wgsl))
+  (is (re-find #"packed >> 4u" w/q4-0-gemv-wgsl)))
+
+(deftest q4-k-gemv-shader-decodes-superblock-scales-and-minima
+  (is (string? w/q4-k-gemv-wgsl))
+  (is (re-find #"unpack2x16float" w/q4-k-gemv-wgsl))
+  (is (re-find #"group_min" w/q4-k-gemv-wgsl)))
+
+(deftest q5-gemv-shaders-restore-fifth-bit
+  (is (re-find #"high_bit" w/q5-0-gemv-wgsl))
+  (is (re-find #"- 16.0" w/q5-0-gemv-wgsl))
+  (is (re-find #"row \* p.k \+ column" w/q5-0-matmul-wgsl))
+  (is (re-find #"high << 4u" w/q5-0-embedding-wgsl))
+  (is (re-find #"high_bit" w/q5-1-gemv-wgsl))
+  (is (re-find #"dm.y" w/q5-1-gemv-wgsl)))
+
+(deftest k-quant-gemv-shaders-cover-five-and-six-bit-superblocks
+  (is (re-find #"176u" w/q5-k-gemv-wgsl))
+  (is (re-find #"let high" w/q5-k-gemv-wgsl))
+  (is (re-find #"210u" w/q6-k-gemv-wgsl))
+  (is (re-find #"signed_byte" w/q6-k-gemv-wgsl)))
+
+(deftest persistent-kv-cache-and-causal-gqa-attention-shaders
+  (is (re-find #"p.layer \* p.context" w/kv-cache-write-wgsl))
+  (is (re-find #"inverseSqrt" w/causal-gqa-attention-wgsl))
+  (is (re-find #"maximum" w/causal-gqa-attention-wgsl))
+  (is (re-find #"kv_head" w/causal-gqa-attention-wgsl)))
+
+(deftest gpu-training-primitives-cover-forward-backward-and-update
+  (is (re-find #"output\[col \* dims.x \+ row\]" w/transpose-2d-wgsl))
+  (is (re-find #"prediction\[i\] - expected\[i\]" w/mse-gradient-wgsl))
+  (is (re-find #"preactivation\[i\] > 0.0" w/relu-backward-wgsl))
+  (is (re-find #"for \(var row" w/bias-gradient-wgsl))
+  (is (re-find #"learning_rate \* gradient" w/sgd-update-wgsl)))
+
+(deftest adamw-kernel-updates-all-state-out-of-place
+  (is (re-find #"next_parameter\[i\]" w/adamw-step-wgsl))
+  (is (re-find #"next_moment\[i\] = m" w/adamw-step-wgsl))
+  (is (re-find #"next_variance\[i\] = v" w/adamw-step-wgsl))
+  (is (re-find #"weight_decay \* parameter\[i\]" w/adamw-step-wgsl)))
+
+(deftest unscale-kernel-atomically-reports-nonfinite-values
+  (is (re-find #"value != value" w/unscale-gradient-wgsl))
+  (is (re-find #"abs\(value\) >" w/unscale-gradient-wgsl))
+  (is (re-find #"atomicOr\(&found_inf, 1u\)" w/unscale-gradient-wgsl))
+  (is (re-find #"value \* inverse_scale" w/unscale-gradient-wgsl)))
