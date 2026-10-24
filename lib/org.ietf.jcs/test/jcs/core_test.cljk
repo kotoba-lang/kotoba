@@ -1,0 +1,154 @@
+(ns jcs.core-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [jcs.core :as jcs]))
+
+;; ── RFC 8785 Appendix A: the specification's own worked example ───────────────
+;; This single vector exercises key sorting across "", "1", "10", "111", "A",
+;; "a", nested objects, an array of objects, and the 56.0 -> "56" number rule.
+(deftest rfc8785-appendix-a
+  (is (= (str "{\"\":\"empty\",\"1\":{\"\\n\":56,\"f\":{\"F\":5,\"f\":\"hi\"}},"
+              "\"10\":{},\"111\":[{\"E\":\"no\",\"e\":\"yes\"}],\"A\":{},\"a\":{}}")
+         (jcs/canonicalize
+          {"1" {"f" {"f" "hi" "F" 5} "\n" 56.0}
+           "10" {}
+           "" "empty"
+           "a" {}
+           "111" [{"e" "yes" "E" "no"}]
+           "A" {}}))))
+
+;; ── §3.2.3 sorting is on UTF-16 code units, NOT code points ──────────────────
+;; This is the rule an implementation gets wrong by default. A supplementary
+;; character is stored as a surrogate pair whose lead unit is in D800-DBFF, so it
+;; sorts BEFORE the Private Use Area at E000 — the opposite of code-point order.
+(deftest utf16-code-unit-sorting
+  (let [euro "\u20ac"                ; U+20AC
+        emoji "\ud83d\ude00"         ; U+1F600, lead surrogate D83D
+        pua "\ue000"]                ; U+E000
+    (testing "UTF-16 order puts the surrogate pair between U+20AC and U+E000"
+      (is (= (str "{\"" euro "\":1,\"" emoji "\":2,\"" pua "\":3}")
+             (jcs/canonicalize {pua 3 emoji 2 euro 1}))))
+    (testing "code-point order would have put the emoji last, so this is not that"
+      (is (not= (str "{\"" euro "\":1,\"" pua "\":3,\"" emoji "\":2}")
+                (jcs/canonicalize {pua 3 emoji 2 euro 1}))))))
+
+;; ── §3.2.2.3 numbers: ECMAScript Number::toString ────────────────────────────
+(deftest number-serialization
+  (testing "integers and integral doubles carry no decimal point"
+    (is (= "0" (jcs/canonicalize 0)))
+    (is (= "0" (jcs/canonicalize 0.0)))
+    (is (= "0" (jcs/canonicalize -0.0)))       ; ES step 2: -0 renders as "0"
+    (is (= "1" (jcs/canonicalize 1)))
+    (is (= "1" (jcs/canonicalize 1.0)))
+    (is (= "-1" (jcs/canonicalize -1.0)))
+    (is (= "100" (jcs/canonicalize 100.0))))
+
+  (testing "the n<=21 / n>21 boundary of ES step 6 vs step 9"
+    (is (= "100000000000000000000" (jcs/canonicalize 1e20)))
+    (is (= "1e+21" (jcs/canonicalize 1e21)))
+    (is (= "1e+23" (jcs/canonicalize 1e23))))
+
+  (testing "the -6<n boundary of ES step 8 vs step 9"
+    (is (= "0.000001" (jcs/canonicalize 1e-6)))
+    (is (= "1e-7" (jcs/canonicalize 1e-7))))
+
+  (testing "extremes: shortest round-trip, not Double/toString"
+    ;; Double/toString gives "4.9E-324" here. RFC 8785 App. B requires 5e-324.
+    (is (= "5e-324" (jcs/canonicalize Double/MIN_VALUE)))
+    (is (= "1.7976931348623157e+308" (jcs/canonicalize Double/MAX_VALUE))))
+
+  (testing "fractions keep only the digits needed to round-trip"
+    (is (= "0.1" (jcs/canonicalize 0.1)))
+    (is (= "1.5" (jcs/canonicalize 1.5)))
+    (is (= "333333333.3333333" (jcs/canonicalize 333333333.33333331))))
+
+  (testing "every double round-trips through the canonical form"
+    (doseq [d [1.0 -1.0 0.5 1e-5 1e-4 123.456 6.02e23 -7.29e-9
+               3.141592653589793 2.718281828459045 1e100 1e-100
+               9.999999999999997e22 Double/MIN_NORMAL]]
+      (is (= d (Double/parseDouble (jcs/canonicalize d)))
+          (str "round-trip failed for " d)))))
+
+(deftest non-finite-numbers-fail-closed
+  (testing "§3.2.2.3 requires termination with an error, not a placeholder"
+    (is (thrown? kerror/ExceptionInfo (jcs/canonicalize Double/NaN)))
+    (is (thrown? kerror/ExceptionInfo (jcs/canonicalize Double/POSITIVE_INFINITY)))
+    (is (thrown? kerror/ExceptionInfo (jcs/canonicalize Double/NEGATIVE_INFINITY)))
+    (is (= :jcs/non-finite
+           (:jcs/error (ex-data (try (jcs/canonicalize Double/NaN)
+                                     (catch kerror/ExceptionInfo e e))))))))
+
+(deftest integers-beyond-ieee754-exact-range-fail-closed
+  (testing "App. D: such numbers must be carried as strings by the application"
+    (is (= "9007199254740991" (jcs/canonicalize 9007199254740991)))
+    (is (thrown? kerror/ExceptionInfo (jcs/canonicalize 9007199254740992)))
+    (is (= :jcs/integer-out-of-range
+           (:jcs/error (ex-data (try (jcs/canonicalize 12345678901234567890)
+                                     (catch kerror/ExceptionInfo e e))))))))
+
+;; ── §3.2.2.2 strings ─────────────────────────────────────────────────────────
+(deftest string-escaping
+  (testing "only the five named controls take a short form"
+    (is (= "\"\\b\\t\\n\\f\\r\"" (jcs/canonicalize "\b\t\n\f\r"))))
+
+  (testing "other C0 controls take LOWERCASE \\uhhhh"
+    (is (= "\"\\u0000\"" (jcs/canonicalize "\u0000")))
+    (is (= "\"\\u001f\"" (jcs/canonicalize "\u001f")))
+    (is (= "\"\\u000b\"" (jcs/canonicalize "\u000b"))))   ; vertical tab: no short form
+
+  (testing "quote and backslash are escaped; solidus is NOT"
+    (is (= "\"\\\"\"" (jcs/canonicalize "\"")))
+    (is (= "\"\\\\\"" (jcs/canonicalize "\\")))
+    (is (= "\"/\"" (jcs/canonicalize "/"))))
+
+  (testing "the rule is U+0000..U+001F, so DEL and non-ASCII stay literal"
+    (is (= "\"\u007f\"" (jcs/canonicalize "\u007f")))
+    (is (= "\"日本語\"" (jcs/canonicalize "日本語")))
+    (is (= "\"\ud83d\ude00\"" (jcs/canonicalize "\ud83d\ude00")))))
+
+;; ── structure ────────────────────────────────────────────────────────────────
+(deftest structure
+  (testing "no whitespace, arrays keep their given order"
+    (is (= "[1,2,3]" (jcs/canonicalize [1 2 3])))
+    (is (= "[3,1,2]" (jcs/canonicalize [3 1 2])))
+    (is (= "[]" (jcs/canonicalize [])))
+    (is (= "{}" (jcs/canonicalize {}))))
+
+  (testing "literals"
+    (is (= "null" (jcs/canonicalize nil)))
+    (is (= "true" (jcs/canonicalize true)))
+    (is (= "false" (jcs/canonicalize false))))
+
+  (testing "keyword keys reduce to their JSON name, and sort as that name"
+    (is (= "{\"a\":1,\"b\":2}" (jcs/canonicalize {:b 2 :a 1})))
+    (is (= "{\"@context\":\"x\"}" (jcs/canonicalize {(keyword "@context") "x"}))))
+
+  (testing "map iteration order cannot leak into the output"
+    ;; >8 entries forces a Clojure array-map into a hash-map, changing seq order.
+    (let [ks (map #(str "k" %) (range 20))
+          m (zipmap ks (range 20))]
+      (is (= (jcs/canonicalize m) (jcs/canonicalize (into (sorted-map) m))))
+      (is (= (jcs/canonicalize m) (jcs/canonicalize (into {} (shuffle (vec m)))))))))
+
+(deftest invalid-input-fails-closed
+  (testing "a property name that is neither string nor keyword is refused"
+    (is (= :jcs/invalid-key
+           (:jcs/error (ex-data (try (jcs/canonicalize {1 "a"})
+                                     (catch kerror/ExceptionInfo e e)))))))
+
+  (testing "two keys collapsing to one JSON name would emit a duplicate member"
+    (is (= :jcs/duplicate-key
+           (:jcs/error (ex-data (try (jcs/canonicalize {:a 1 "a" 2})
+                                     (catch kerror/ExceptionInfo e e)))))))
+
+  (testing "a set has no defined order, so canonicalizing one would invent one"
+    (is (= :jcs/unsupported-type
+           (:jcs/error (ex-data (try (jcs/canonicalize #{1 2 3})
+                                     (catch kerror/ExceptionInfo e e))))))))
+
+(deftest canonicalize-bytes-is-utf8
+  (testing "§3.3: the canonical form is UTF-8 with no BOM"
+    (let [b (jcs/canonicalize-bytes {"k" "é"})]
+      (is (= "{\"k\":\"é\"}" (kbytes/utf8-string b)))
+      ;; 9 characters, but é is two bytes in UTF-8, so 10 bytes.
+      (is (= 9 (count "{\"k\":\"é\"}")))
+      (is (= 10 (alength b))))))
