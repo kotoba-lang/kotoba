@@ -1,0 +1,194 @@
+(ns avro.writer-test
+  "The writer, tested two ways that check different things.
+
+  **Round-trip** (`encode` then `decode`) proves the writer agrees with this
+  repo's reader. That is necessary and not sufficient: two halves of one
+  misunderstanding round-trip perfectly. It catches asymmetry, not
+  nonconformance.
+
+  **Rewriting a fastavro fixture** is the part that catches nonconformance.
+  `plain.avro` was written by the reference implementation; this reads it,
+  writes it back out with `avro.file/write`, reads THAT, and expects
+  `ground-truth.edn` — so the bytes this writer produces have to mean the same
+  thing the reference writer's did.
+
+  Neither of those can tell whether fastavro would ACCEPT our file, because
+  neither runs fastavro. `test/fixtures/verify_written.py` does, and is the
+  oracle this suite defers to -- see its docstring."
+  (:require [avro.binary :as b]
+            [avro.datum :as datum]
+            [avro.file :as file]
+            [avro.schema :as schema]
+            [avro.reader-test :refer [read-fixture]]
+            [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])))
+
+(defn- read-text [name]
+  #?(:clj (slurp (io/file "lib/org.apache.avro/test/fixtures" name))
+     :cljs (.readFileSync (js/require "fs") (str "lib/org.apache.avro/test/fixtures/" name) "utf8")))
+
+(def ^:private truth (delay (edn/read-string (read-text "ground-truth.edn"))))
+
+(def ^:private sale-schema
+  {"type" "record" "name" "Sale"
+   "fields" [{"name" "price" "type" "long"}
+             {"name" "region" "type" "string"}
+             {"name" "note" "type" ["null" "string"]}
+             {"name" "ratio" "type" "double"}
+             {"name" "ok" "type" "boolean"}]})
+
+;; ---------------------------------------------------------------------------
+;; The byte grammar, both directions.
+;; ---------------------------------------------------------------------------
+
+(deftest varints-round-trip
+  (testing "including the boundaries where the encoding changes width"
+    (doseq [v [0 1 -1 63 64 -64 -65 127 128 -128 300 -300
+               8191 8192 2147483647 -2147483648]]
+      (is (= [v (count (b/long-of v))] (b/long-at (b/long-of v) 0))
+          (str "long " v)))))
+
+(deftest zigzag-is-its-own-inverse
+  (doseq [v [0 1 -1 2 -2 63 -64 1000000 -1000000]]
+    (is (= v (b/zigzag (b/zigzag-of v))) (str "zigzag " v))))
+
+(deftest strings-and-bytes-round-trip
+  (testing "empty, ASCII, multi-byte, and long enough to need a 2-byte length"
+    (doseq [s ["" "a" "日本語" (apply str (repeat 200 "x"))]]
+      (is (= s (first (b/string-at (b/string-of s) 0))))))
+  (doseq [raw [[] [0] [255] [1 2 3 254 255]]]
+    (is (= raw (first (b/bytes-at (b/bytes-of raw) 0))))))
+
+(deftest floats-and-doubles-round-trip
+  (doseq [d [0.0 1.5 -2.25 1e308 -1e-308]]
+    (is (= d (first (b/double-at (b/double-of d) 0)))))
+  (doseq [f [0.0 1.5 -2.25]]
+    (is (= (float f) (float (first (b/float-at (b/float-of f) 0)))))))
+
+;; ---------------------------------------------------------------------------
+;; Schema-directed values.
+;; ---------------------------------------------------------------------------
+
+(defn- round-trip [schema-json v]
+  (let [s (schema/parse schema-json)]
+    (first (datum/decode s (datum/encode s v) 0))))
+
+(deftest every-type-round-trips
+  (is (= 42 (round-trip "\"int\"" 42)))
+  (is (= -42 (round-trip "\"long\"" -42)))
+  (is (= true (round-trip "\"boolean\"" true)))
+  (is (nil? (round-trip "\"null\"" nil)))
+  (is (= "hi" (round-trip "\"string\"" "hi")))
+  (is (= [1 2 255] (round-trip "\"bytes\"" [1 2 255])))
+  (is (= [1 -2 3] (round-trip "{\"type\":\"array\",\"items\":\"long\"}" [1 -2 3])))
+  (is (= [] (round-trip "{\"type\":\"array\",\"items\":\"long\"}" [])))
+  (is (= {"a" "b"} (round-trip "{\"type\":\"map\",\"values\":\"string\"}" {"a" "b"})))
+  (is (= {} (round-trip "{\"type\":\"map\",\"values\":\"string\"}" {})))
+  (is (= "GREEN" (round-trip "{\"type\":\"enum\",\"name\":\"C\",\"symbols\":[\"RED\",\"GREEN\"]}"
+                             "GREEN")))
+  (is (= [222 173 190 239]
+         (round-trip "{\"type\":\"fixed\",\"name\":\"M\",\"size\":4}" [222 173 190 239]))))
+
+(deftest nullable-union-picks-the-right-branch
+  (let [u "[\"null\",\"string\"]"]
+    (is (nil? (round-trip u nil)))
+    (is (= "x" (round-trip u "x")))))
+
+(deftest a-value-no-branch-accepts-is-refused
+  (testing "rather than written under branch 0, which would decode as the wrong type"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (let [s (schema/parse "[\"null\",\"string\"]")]
+                   (datum/encode s 42))))))
+
+(deftest a-fixed-of-the-wrong-length-is-refused
+  (testing "it would silently consume the next field's bytes"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (let [s (schema/parse "{\"type\":\"fixed\",\"name\":\"M\",\"size\":4}")]
+                   (datum/encode s [1 2]))))))
+
+(deftest a-missing-non-nullable-field-is-refused
+  (testing "filling it in would write a value the caller never supplied"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (let [s (schema/parse "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}")]
+                   (datum/encode s {})))))
+  (testing "but a nullable one may be omitted"
+    (let [s (schema/parse "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"x\",\"type\":[\"null\",\"long\"]}]}")]
+      (is (= {"x" nil} (first (datum/decode s (datum/encode s {}) 0)))))))
+
+;; ---------------------------------------------------------------------------
+;; The container.
+;; ---------------------------------------------------------------------------
+
+(def ^:private sales
+  [{"price" 10 "region" "east" "note" nil "ratio" 1.5 "ok" true}
+   {"price" 20 "region" "east" "note" "clearance" "ratio" 2.25 "ok" false}
+   {"price" 30 "region" "west" "note" nil "ratio" -0.5 "ok" true}])
+
+(deftest written-files-read-back
+  (doseq [codec ["null" "deflate" "zstandard"]]
+    (testing codec
+      (let [bs (file/write {:schema sale-schema :records sales :codec codec})]
+        (is (= sales (file/records bs)))
+        (is (= 3 (file/record-count bs)))))))
+
+(deftest blocks-are-honoured
+  (let [bs (file/write {:schema sale-schema :records sales :records-per-block 2})]
+    (is (= 2 (count (file/blocks bs))) "3 records at 2 per block is 2 blocks")
+    (is (= 3 (file/record-count bs)))
+    (is (= sales (file/records bs)))))
+
+(deftest sync-marker-is-written-into-every-block
+  (let [sync (vec (range 16))
+        bs (file/write {:schema sale-schema :records sales
+                        :records-per-block 1 :sync sync})]
+    (is (= 3 (count (file/blocks bs))))
+    (is (= sales (file/records bs)))
+    (testing "the same input and sync produce the same bytes"
+      (is (= bs (file/write {:schema sale-schema :records sales
+                             :records-per-block 1 :sync sync}))))))
+
+(deftest the-file-carries-the-schema-it-encoded-with
+  (testing "a reader takes the schema from the file, so this is what it will use"
+    (let [bs (file/write {:schema sale-schema :records sales})]
+      (is (= ["price" "region" "note" "ratio" "ok"]
+             (schema/record-fields (file/file-schema bs))))
+      (testing "and the text is recoverable, which is what rewriting needs"
+        (is (= (file/file-schema bs)
+               (schema/parse (file/schema-json bs))))))))
+
+(deftest a-codec-we-cannot-write-is-refused-by-name
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (file/write {:schema sale-schema :records sales :codec "snappy"}))))
+
+;; ---------------------------------------------------------------------------
+;; Against the reference writer's own bytes.
+;; ---------------------------------------------------------------------------
+
+(deftest rewriting-a-fastavro-file-preserves-its-meaning
+  (testing "read fastavro's bytes, write our own, read those, expect ground truth"
+    (let [original (read-fixture "plain.avro")
+          rows (file/records original)
+          ours (file/write {:schema (file/schema-json original) :records rows})]
+      (is (= (get @truth "rows") rows) "the fixture still means what it meant")
+      (is (= (get @truth "rows") (file/records ours))
+          "and so does our rewrite of it"))))
+
+(deftest caller-metadata-survives-the-round-trip
+  (testing "the container metadata map is part of the format, not a comment"
+    (let [bs (file/write {:schema sale-schema :records sales
+                          :meta {"schema" "{}" "format-version" "2"}})
+          m (file/metadata bs)]
+      (is (= "{}" (get m "schema")))
+      (is (= "2" (get m "format-version")))
+      (testing "alongside the derived entries, not instead of them"
+        (is (= "null" (get m "avro.codec")))
+        (is (some? (get m "avro.schema"))))
+      (is (= sales (file/records bs)) "and the records still decode"))))
+
+(deftest derived-metadata-keys-are-refused
+  (testing "a file whose declared schema and encoding schema disagree is what write exists to prevent"
+    (doseq [k ["avro.schema" "avro.codec"]]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (file/write {:schema sale-schema :records sales :meta {k "x"}}))
+          k))))
