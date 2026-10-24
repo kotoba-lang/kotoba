@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.ioIpld` | `kotoba.ioIpld/src` | `ipld.core`, `ipld.dag-json`, `ipld.dag-pb`, `ipld.data-model` (Kotoba project library) |
 | `kotoba.devProtobuf` | `kotoba.devProtobuf/src` | `protobuf.wire` (Kotoba project library) |
 | `kotoba.sparql` | `kotoba.sparql/src` | `sparql.core` (Kotoba project library) |
 | `kotoba.datalog` | `kotoba.datalog/src` | `datalog.core`, `datalog.index`, `datalog.query`, `datalog.singleton` (Kotoba project library) |

@@ -1,0 +1,141 @@
+(ns ipld.core-test
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
+               :cljs [cljs.test :refer [deftest is] :include-macros true])
+            [ipld.core :as ipld]
+            [multiformats.core :as mf]
+            [cbor.core :as cbor]))
+
+(defn- hx [b]
+  (apply str (map (fn [x]
+                    #?(:clj (format "%02x" (bit-and (int x) 0xff))
+                       :cljs (let [h (.toString (bit-and x 0xff) 16)]
+                               (if (= 1 (count h)) (str "0" h) h))))
+                  (seq b))))
+
+(def some-cid (mf/kotoba-cid "ibuki")) ; deterministic CIDv1 dag-cbor
+
+;; ── exact wire form ───────────────────────────────────────────────────────────
+(deftest link-encodes-as-tag-42-identity-prefixed-binary-cid
+  ;; d8 2a           tag(42)
+  ;; 58 25           byte string, length 37
+  ;; 00              identity multibase prefix
+  ;; 01 71 12 20 …   binary CIDv1: version=1, codec=dag-cbor, sha2-256, len 32
+  (let [cid-hex (hx (mf/cid->bytes some-cid))]
+    (is (= (str "d82a582500" cid-hex) (hx (ipld/encode (ipld/link some-cid)))))
+    (is (= "01711220" (subs cid-hex 0 8)))))
+
+(deftest non-link-data-encodes-exactly-like-dag-cbor
+  ;; without links, ipld/encode == cbor/encode byte for byte
+  (let [node {"a" 1 "b" [2 3] "s" "x"}]
+    (is (= (hx (cbor/encode node)) (hx (ipld/encode node))))))
+
+;; ── round-trip ────────────────────────────────────────────────────────────────
+(deftest link-roundtrip
+  (let [node {"name" "root"
+              "children" [{"k" "a" "cid" (ipld/link some-cid)}
+                          {"k" "b" "cid" (ipld/link some-cid)}]
+              "prev" nil}
+        decoded (ipld/decode (ipld/encode node))]
+    (is (= "root" (get decoded "name")))
+    (is (nil? (get decoded "prev")))
+    (let [l (get-in decoded ["children" 0 "cid"])]
+      (is (ipld/link? l))
+      (is (= some-cid (ipld/link-cid l))))))
+
+(deftest cid-is-stable-and-content-addressed
+  (let [n1 {"x" (ipld/link some-cid) "n" 1}
+        n2 {"n" 1 "x" (ipld/link some-cid)}          ; same map, different literal order
+        b1 (ipld/encode n1) b2 (ipld/encode n2)]
+    (is (= (hx b1) (hx b2)))                          ; canonical key sort
+    (is (= (ipld/cid b1) (ipld/cid b2)))
+    (is (not= (ipld/cid b1) (ipld/cid (ipld/encode {"n" 2}))))))
+
+;; ── spec guards ───────────────────────────────────────────────────────────────
+(deftest only-tag-42-is-accepted
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (ipld/decode (cbor/encode (cbor/tagged 43 1)))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (ipld/encode {"x" (cbor/tagged 42 "raw")}))) ; raw tags rejected too
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (ipld/link "zNotBase32")))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (ipld/encode {1 "non-string-key"}))))
+
+;; ── storage ports + generic walk ─────────────────────────────────────────────
+(deftest put-get-links-walk
+  (let [store (atom {})
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (get @store cid))
+        leaf-cid (ipld/put-node! put! {"kind" "leaf" "v" 1})
+        root-cid (ipld/put-node! put! {"kind" "internal"
+                                       "children" [["a" (ipld/link leaf-cid)]
+                                                   ["b" (ipld/link leaf-cid)]]})
+        root (ipld/get-node get-fn root-cid)]
+    (is (= [leaf-cid leaf-cid] (ipld/links root)))
+    (is (= [] (ipld/links (ipld/get-node get-fn leaf-cid))))
+    (is (nil? (ipld/get-node get-fn some-cid)))       ; absent block -> nil
+    (is (= root-cid (ipld/cid (get @store root-cid))))))
+
+(deftest verified-read-rejects-bytes-stored-under-the-wrong-cid
+  (let [good (ipld/node->block {"kind" "good"})
+        evil (:bytes (ipld/node->block {"kind" "evil"}))
+        get-fn (fn [requested] (when (= requested (:cid good)) evil))]
+    (is (= :ipld/cid-mismatch
+           (:type
+            (ex-data
+             (try (ipld/get-node get-fn (:cid good))
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e e))))))))
+
+(deftest link-equality
+  (is (= (ipld/link some-cid) (ipld/link some-cid)))
+  (is (not= (ipld/link some-cid) (ipld/link (mf/kotoba-cid "other"))))
+  (is (= (hash (ipld/link some-cid)) (hash (ipld/link some-cid)))))
+
+;; ── the canonicality check, after it stopped allocating two vectors ────────
+;;
+;; `decode` rejects bytes that are not what `encode` would have produced. The
+;; predicate behind that was rewritten on 2026-09-05 (ADR-2609051700) for
+;; cost, not for behaviour, so these pin the behaviour on both sides: the
+;; accept, and a rejection for each way the bytes can differ.
+(deftest decode-accepts-its-own-encoding
+  (let [node {"a" 1 "b" [1 2 3] "s" "x"}]
+    (is (= node (ipld/decode (ipld/encode node))))))
+
+(defn- problem-of [f]
+  (:ipld/problem
+   (ex-data (try (f) nil (catch #?(:clj Exception :cljs js/Error) e e)))))
+
+(deftest decode-rejects-out-of-order-map-keys
+  ;; DAG-CBOR orders map keys by length then bytewise, so {"b" 2 "aa" 1}
+  ;; encodes as "b" first. These bytes put "aa" first: they decode to a map,
+  ;; which is exactly why decoding alone cannot be trusted here.
+  (let [out-of-order #?(:clj (byte-array (map unchecked-byte
+                                              [0xA2 0x62 0x61 0x61 0x01 0x61 0x62 0x02]))
+                        :cljs (js/Uint8Array.from
+                               #js [0xA2 0x62 0x61 0x61 0x01 0x61 0x62 0x02]))
+        canonical #?(:clj (byte-array (map unchecked-byte
+                                           [0xA2 0x61 0x62 0x02 0x62 0x61 0x61 0x01]))
+                     :cljs (js/Uint8Array.from
+                            #js [0xA2 0x61 0x62 0x02 0x62 0x61 0x61 0x01]))]
+    ;; the control: the canonical spelling of the same map is accepted
+    (is (= {"aa" 1 "b" 2} (ipld/decode canonical)))
+    ;; and the non-canonical one is refused FOR BEING NON-CANONICAL, not for
+    ;; some other failure that happens to throw first
+    (is (= :non-canonical-dag-cbor
+           (problem-of #(ipld/decode out-of-order))))))
+
+(deftest decode-rejects-non-canonical-integer-width
+  ;; `18 05` is the integer 5 written in two bytes; canonical DAG-CBOR writes
+  ;; it as `05`. This is the exact case `decode`'s docstring names.
+  (let [wide #?(:clj (byte-array [(byte 0x18) (byte 0x05)])
+                :cljs (js/Uint8Array.from #js [0x18 0x05]))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (ipld/decode wide)))
+    (is (= :non-canonical-dag-cbor (problem-of #(ipld/decode wide))))))
+
+(deftest decode-refuses-a-truncated-block
+  (let [bytes (ipld/encode {"a" 1 "b" 2})
+        n #?(:clj (alength ^bytes bytes) :cljs (.-length bytes))
+        short #?(:clj (java.util.Arrays/copyOf ^bytes bytes (int (dec n)))
+                 :cljs (.slice bytes 0 (dec n)))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (ipld/decode short)))))

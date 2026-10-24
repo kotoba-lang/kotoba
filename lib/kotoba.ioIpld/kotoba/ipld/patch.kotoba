@@ -1,0 +1,285 @@
+(ns ipld.patch
+  ;; IPLD Patch, in Kotoba, over the `:document` plane.
+  ;;
+  ;; The six operations of the IPLD Patch spec -- add, replace, remove, copy,
+  ;; move, test -- applied linearly to one subject document. A patch is itself
+  ;; a document, so the instructions and the subject are the same kind of
+  ;; value, which is the property the spec is built on.
+  ;;
+  ;; Atomicity needs no machinery: documents are values, so a refusal returns
+  ;; an error result and the caller still holds what it passed in.
+  ;;
+  ;; Errors are `[:result :document :keyword]`, never a thrown control effect.
+  ;;
+  ;; SURFACE. This file is `.kotoba`, which is the canonical PURE S-EXPRESSION
+  ;; core, not the Clojure-shaped surface -- that one is `.cljk`
+  ;; (kotoba-lang ADR-kotoba-pure-s-expression-core-and-cljk-surface, and
+  ;; source_contract.edn, where `.kotoba` is the only kind marked
+  ;; `:canonical? true`). Every call to a definition this module defines is
+  ;; written `(app (ref f) ...)`. Calls to builtins stay plain prefix
+  ;; application, which that ADR admits as core: application is
+  ;; `(app f args...)` OR `(f args...)`.
+  ;;
+  ;; Two limits of the pure core, measured 2026-09-10 against amu b57bcdb6,
+  ;; and both are implementation state rather than design:
+  ;;
+  ;;   * `(def name (lam [params] body))` -- the definition form that ADR
+  ;;     names for the pure surface -- is REFUSED: `def` takes a "closed
+  ;;     bounded integer/string/keyword/boolean/nil" constant. So `defn` is
+  ;;     the only admitted definition form in either surface today, and its
+  ;;     presence here is not this file falling back to `.cljk`.
+  ;;   * `(ref name)` names ONLY a definition this module defines. Pointed at
+  ;;     a builtin it is refused with "Every other shape of `ref` is Clojure's
+  ;;     STM constructor, and state must not be ambient".
+  ;;
+  ;; The rewrite from the Clojure-shaped spelling was verified the way that
+  ;; ADR's section 3 says it should be: all 25 Definition CIDs are
+  ;; BYTE-IDENTICAL across the two spellings, and the control -- one changed
+  ;; digit comparison -- moves ten of them (the edited definition and its nine
+  ;; transitive dependents).
+  ;;
+  ;; TEMPORARY LIMITS, measured 2026-09-10, not design decisions. Remove these
+  ;; lines when the measurement changes; do not copy the shape they imply.
+  ;;
+  ;;   * The `:document` kinds are null, bool, i64, f64, string, keyword,
+  ;;     symbol, map, vector, list, set. There is no :bytes and no :link, so
+  ;;     this covers the EDN-shaped subset of the IPLD Data Model. The
+  ;;     `.cljc` oracle covers bytes and links and refuses a path that would
+  ;;     cross a link; here there is nothing to cross yet.
+  ;;   * `document-vector-conj` refuses at 32 items, so a list operation is
+  ;;     bounded by that, and the whole document by `document-node-limit`.
+  ;;   * A patch has no CID here. CIDv1 assembly and DAG-CBOR live in
+  ;;     `io-multiformats` / `ipld.core`; the guest has `document-sha256`,
+  ;;     which is a digest of the document and is NOT a CID. Naming it one
+  ;;     would give a value two addresses.
+  (:export [apply-ops]))
+
+;; --------------------------------------------------------------- results
+
+(defn ok [d :document] [:result :document :keyword]
+  (result-ok-of [:result :document :keyword] d))
+
+(defn err [k :keyword] [:result :document :keyword]
+  (result-err-of [:result :document :keyword] k))
+
+(defn ok? [r [:result :document :keyword]] :bool
+  (result-ok?-of [:result :document :keyword] r))
+
+(defn value [r [:result :document :keyword]] :document
+  (result-value-of [:result :document :keyword] r (document-null)))
+
+;; ----------------------------------------------------------- list indices
+
+(defn digit-at [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn index-scan [s :string i :i64 acc :i64] :i64
+  (if (>= i (string-length s))
+    acc
+    (let [d (app (ref digit-at) s i)]
+      (if (< d 0) -1 (app (ref index-scan) s (+ i 1) (+ (* acc 10) d))))))
+
+(defn parse-index [s :string] :i64
+  ;; -1 is not a number, -2 is a leading zero. RFC 6902 forbids the second
+  ;; because "01" and "1" would otherwise address one element two ways.
+  (let [n (string-length s)]
+    (if (< n 1)
+      -1
+      (if (> n 1)
+        (if (= (app (ref digit-at) s 0) 0) -2 (app (ref index-scan) s 0 0))
+        (app (ref index-scan) s 0 0)))))
+
+;; ------------------------------------------------------------------ paths
+
+(defn path-scan [s :string i :i64 start :i64 acc :document] :document
+  (if (>= i (string-length s))
+    (document-vector-conj acc (document-string (string-substring s start i)))
+    (if (= (string-code-point-at s i) 47)
+      (app (ref path-scan) s (+ i 1) (+ i 1)
+                 (document-vector-conj acc (document-string (string-substring s start i))))
+      (app (ref path-scan) s (+ i 1) start acc))))
+
+(defn parse-path [wire :string] :document
+  ;; No ~0 / ~1 unescaping: the spec does not define it, and inventing it here
+  ;; would make the same patch name a different key than an implementation
+  ;; that read the spec literally.
+  (app (ref path-scan) wire 1 1 (document-vector)))
+
+(defn absolute? [wire :string] :bool
+  (if (< (string-length wire) 1) false (= (string-code-point-at wire 0) 47)))
+
+(defn seg-at [segs :document i :i64] :string
+  (option-value-of [:option :string]
+                   (document-string-value
+                     (option-value-of [:option :document] (document-vector-at segs i) (document-null)))
+                   ""))
+
+;; -------------------------------------------------------- vector insertion
+
+(defn item-at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn vec-insert [v :document idx :i64 val :document i :i64 acc :document] :document
+  (if (>= i (document-count v))
+    (if (= i idx) (document-vector-conj acc val) acc)
+    (if (= i idx)
+      (app (ref vec-insert) v idx val (+ i 1)
+                  (document-vector-conj (document-vector-conj acc val) (app (ref item-at) v i)))
+      (app (ref vec-insert) v idx val (+ i 1) (document-vector-conj acc (app (ref item-at) v i))))))
+
+;; ------------------------------------------------------------- leaf edits
+
+(defn leaf-map [c :document key :document op :keyword val :document] [:result :document :keyword]
+  (if (= op :add)
+    (app (ref ok) (document-assoc c key val))
+    (if (= op :replace)
+      (if (document-contains c key) (app (ref ok) (document-assoc c key val)) (app (ref err) :patch/path-not-found))
+      (if (= op :remove)
+        (if (document-contains c key) (app (ref ok) (document-dissoc c key)) (app (ref err) :patch/path-not-found))
+        (app (ref err) :patch/unknown-operation)))))
+
+(defn leaf-vec [c :document seg :string op :keyword val :document] [:result :document :keyword]
+  (let [idx (app (ref parse-index) seg)
+        n (document-count c)]
+    (if (= idx -1)
+      (app (ref err) :patch/list-index-not-a-number)
+      (if (= idx -2)
+        (app (ref err) :patch/list-index-not-canonical)
+        (if (= op :add)
+          (if (> idx n)
+            (app (ref err) :patch/list-index-out-of-range)
+            (app (ref ok) (app (ref vec-insert) c idx val 0 (document-vector))))
+          (if (>= idx n)
+            (app (ref err) :patch/list-index-out-of-range)
+            (if (= op :replace)
+              (app (ref ok) (document-vector-assoc c idx val))
+              (if (= op :remove)
+                (app (ref ok) (document-vector-remove c idx))
+                (app (ref err) :patch/unknown-operation)))))))))
+
+;; --------------------------------------------------------------- descent
+
+(defn alter-at [node :document segs :document i :i64 op :keyword val :document] [:result :document :keyword]
+  (let [seg (app (ref seg-at) segs i)
+        kind (document-kind node)
+        last? (if (= (+ i 1) (document-count segs)) true false)]
+    (if (= kind :map)
+      (let [key (document-string seg)]
+        (if last?
+          (app (ref leaf-map) node key op val)
+          (if (document-contains node key)
+            (let [sub (app (ref alter-at) (option-value-of [:option :document] (document-get node key) (document-null))
+                                segs (+ i 1) op val)]
+              (if (app (ref ok?) sub) (app (ref ok) (document-assoc node key (app (ref value) sub))) sub))
+            (app (ref err) :patch/path-not-found))))
+      (if (= kind :vector)
+        (if last?
+          (app (ref leaf-vec) node seg op val)
+          (let [idx (app (ref parse-index) seg)]
+            (if (< idx 0)
+              (app (ref err) :patch/list-index-not-a-number)
+              (if (>= idx (document-count node))
+                (app (ref err) :patch/list-index-out-of-range)
+                (let [sub (app (ref alter-at) (app (ref item-at) node idx) segs (+ i 1) op val)]
+                  (if (app (ref ok?) sub) (app (ref ok) (document-vector-assoc node idx (app (ref value) sub))) sub))))))
+        (app (ref err) :patch/path-through-scalar)))))
+
+(defn value-at [node :document segs :document i :i64] [:result :document :keyword]
+  (let [seg (app (ref seg-at) segs i)
+        kind (document-kind node)
+        last? (if (= (+ i 1) (document-count segs)) true false)]
+    (if (= kind :map)
+      (let [key (document-string seg)]
+        (if (document-contains node key)
+          (let [child (option-value-of [:option :document] (document-get node key) (document-null))]
+            (if last? (app (ref ok) child) (app (ref value-at) child segs (+ i 1))))
+          (app (ref err) :patch/path-not-found)))
+      (if (= kind :vector)
+        (let [idx (app (ref parse-index) seg)]
+          (if (< idx 0)
+            (app (ref err) :patch/list-index-not-a-number)
+            (if (>= idx (document-count node))
+              (app (ref err) :patch/list-index-out-of-range)
+              (let [child (app (ref item-at) node idx)]
+                (if last? (app (ref ok) child) (app (ref value-at) child segs (+ i 1)))))))
+        (app (ref err) :patch/path-through-scalar)))))
+
+;; ----------------------------------------------------------- one operation
+
+(defn field [op :document name :string] :document
+  (option-value-of [:option :document] (document-get op (document-string name)) (document-null)))
+
+(defn field-string [op :document name :string] :string
+  (option-value-of [:option :string] (document-string-value (app (ref field) op name)) ""))
+
+(defn op-keyword [s :string] :keyword
+  (if (string=? s "add") :add
+    (if (string=? s "replace") :replace
+      (if (string=? s "remove") :remove
+        (if (string=? s "test") :test
+          (if (string=? s "copy") :copy
+            (if (string=? s "move") :move :unknown)))))))
+
+(defn prefix? [short-segs :document long-segs :document i :i64] :bool
+  (if (>= i (document-count short-segs))
+    (> (document-count long-segs) (document-count short-segs))
+    (if (document-equal? (app (ref item-at) short-segs i) (app (ref item-at) long-segs i))
+      (app (ref prefix?) short-segs long-segs (+ i 1))
+      false)))
+
+(defn apply-move [node :document from-segs :document segs :document moved :document kind :keyword] [:result :document :keyword]
+  (if (= kind :move)
+    (let [removed (app (ref alter-at) node from-segs 0 :remove (document-null))]
+      (if (app (ref ok?) removed)
+        (app (ref alter-at) (app (ref value) removed) segs 0 :add moved)
+        removed))
+    (app (ref alter-at) node segs 0 :add moved)))
+
+(defn apply-op [node :document op :document] [:result :document :keyword]
+  (if (= (document-kind op) :map)
+    (let [kind (app (ref op-keyword) (app (ref field-string) op "op"))
+          wire (app (ref field-string) op "path")]
+      (if (= kind :unknown)
+        (app (ref err) :patch/unknown-operation)
+        (if (< (string-length wire) 1)
+          (app (ref err) :patch/root-path-unsupported)
+          (if (app (ref absolute?) wire)
+            (let [segs (app (ref parse-path) wire)
+                  val (app (ref field) op "value")]
+              (if (= kind :test)
+                (let [found (app (ref value-at) node segs 0)]
+                  (if (app (ref ok?) found)
+                    (if (document-equal? (app (ref value) found) val) (app (ref ok) node) (app (ref err) :patch/test-failed))
+                    found))
+                (if (= kind :add)
+                  (app (ref alter-at) node segs 0 :add val)
+                  (if (= kind :replace)
+                    (app (ref alter-at) node segs 0 :replace val)
+                    (if (= kind :remove)
+                      (app (ref alter-at) node segs 0 :remove val)
+                      (let [from (app (ref field-string) op "from")]
+                        (if (app (ref absolute?) from)
+                          (let [from-segs (app (ref parse-path) from)]
+                            (if (app (ref prefix?) from-segs segs 0)
+                              (app (ref err) :patch/move-into-own-child)
+                              (let [moved (app (ref value-at) node from-segs 0)]
+                                (if (app (ref ok?) moved)
+                                  (app (ref apply-move) node from-segs segs (app (ref value) moved) kind)
+                                  moved))))
+                          (app (ref err) :patch/path-not-absolute))))))))
+            (app (ref err) :patch/path-not-absolute)))))
+    (app (ref err) :patch/operation-not-a-map)))
+
+;; ----------------------------------------------------------- the sequence
+
+(defn fold-ops [node :document ops :document i :i64] [:result :document :keyword]
+  (if (>= i (document-count ops))
+    (app (ref ok) node)
+    (let [step (app (ref apply-op) node (app (ref item-at) ops i))]
+      (if (app (ref ok?) step) (app (ref fold-ops) (app (ref value) step) ops (+ i 1)) step))))
+
+(defn apply-ops [node :document ops :document] [:result :document :keyword]
+  (if (= (document-kind ops) :vector)
+    (app (ref fold-ops) node ops 0)
+    (app (ref err) :patch/operations-not-a-list)))
