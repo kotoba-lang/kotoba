@@ -1,0 +1,207 @@
+(ns interop.reference-car
+  "Cross-check against the reference implementation, `@ipld/car`.
+
+  Every other test in this repository is this library agreeing with itself.
+  That is worth having and it is not interoperability: a writer and a reader
+  built from the same misreading of the spec agree perfectly. This suite is
+  the only place where something that did not read our source decides whether
+  the bytes are a CAR.
+
+  Run:  kbb --backend sci --classpath \"$(kbb -Spath)\" test/interop/reference_car.cljk
+
+  It is nbb rather than a `.mjs` harness because this workspace writes Node
+  test drivers in nbb (root AGENTS.md), and because the same `.cljc` under
+  test is what a Worker will run."
+  (:require [kotoba.lang.text] [ipld.car :as car]
+            [ipld.car.bytes :as b]
+            [ipld.car.index :as idx]
+            [ipld.car.v2 :as v2]
+            [ipld.core :as ipld]
+            ["@ipld/car" :refer [CarReader CarBufferWriter]]
+            ["multiformats/cid" :refer [CID]]
+            ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def failures (atom 0))
+(def skipped (atom []))
+
+(defn check! [label ok?]
+  (println (str (if ok? "  ok   " "  FAIL ") label))
+  (when-not ok? (swap! failures inc)))
+
+(defn skip! [label why]
+  (println (str "  SKIP " label " — " why))
+  (swap! skipped conj label))
+
+(def leaf-a (ipld/node->block {"kind" "leaf" "v" 1}))
+(def leaf-b (ipld/node->block {"kind" "leaf" "v" 2}))
+(def root (ipld/node->block {"kind" "root"
+                             "children" [(ipld/link (:cid leaf-a))
+                                         (ipld/link (:cid leaf-b))]}))
+(def blocks [root leaf-a leaf-b])
+
+(defn- ->u8 [x] (b/as-bytes x))
+
+(defn our-car-read-by-reference
+  "Direction 1: we write, the reference reads."
+  []
+  (println "\n@ipld/car reads what ipld.car.v2/pack wrote")
+  (let [{:keys [bytes entries]} (v2/pack {:roots [(:cid root)] :blocks blocks})]
+    (-> (.fromBytes CarReader (->u8 bytes))
+        (.then
+         (fn [reader]
+           (-> (.getRoots reader)
+               (.then
+                (fn [roots]
+                  (check! "roots survive the round trip"
+                          (= [(:cid root)] (mapv str roots)))
+                  (-> (js/Promise.all
+                       (clj->js
+                        (mapv (fn [{:keys [cid]}]
+                                (.then (.get reader (.parse CID cid))
+                                       (fn [blk]
+                                         (and blk (b/equal? (.-bytes blk)
+                                                            (:bytes (first (filter #(= cid (:cid %)) blocks))))))))
+                              entries)))
+                      (.then (fn [oks]
+                               (check! "every block reads back byte-identical"
+                                       (every? true? (vec oks))))))))))))))
+
+(defn reference-car-read-by-us
+  "Direction 2: the reference writes, we read — including byte identity of the
+  whole archive, which is the claim `pack` would otherwise only assert about
+  itself."
+  []
+  (println "\nipld.car/decode reads what @ipld/car wrote")
+  (let [cids (mapv #(.parse CID (:cid %)) blocks)
+        size (.headerLength CarBufferWriter #js {:roots #js [(first cids)]})
+        total (reduce + size (map (fn [c blk]
+                                    (.blockLength CarBufferWriter
+                                                  #js {:cid c :bytes (->u8 (:bytes blk))}))
+                                  cids blocks))
+        buf (js/Uint8Array. total)
+        w (.createWriter CarBufferWriter buf #js {:roots #js [(first cids)]})]
+    (doseq [[c blk] (map vector cids blocks)]
+      (.write w #js {:cid c :bytes (->u8 (:bytes blk))}))
+    (let [theirs (.close w)
+          ours (:bytes (car/encode {:roots [(:cid root)] :blocks blocks}))
+          stream-parts (atom [])
+          stream-result (car/stream-encode!
+                         {:roots [(:cid root)] :blocks blocks :max-bytes total
+                          :write! (fn [part]
+                                    (swap! stream-parts conj part)
+                                    (b/bcount part))})
+          streamed (b/concat @stream-parts)
+          parsed (car/decode theirs)]
+      (check! "we parse their roots" (= [(:cid root)] (:roots parsed)))
+      (check! "we parse their block order" (= (mapv :cid blocks) (mapv :cid (:entries parsed))))
+      (check! "we parse their block bytes"
+              (every? (fn [{:keys [cid bytes]}] (b/equal? bytes (get (:blocks parsed) cid)))
+                      blocks))
+      (check! (str "our CARv1 is byte-identical to theirs ("
+                   (b/bcount ours) " vs " (b/bcount theirs) " bytes)")
+              (b/equal? ours theirs))
+      (check! "our streamed CARv1 is byte-identical to the reference writer"
+              (and (= total (:bytes-written stream-result))
+                   (= (count blocks) (:block-count stream-result))
+                   (b/equal? streamed theirs))))))
+
+(defn- car-cli
+  "The go-car CLI, or nil. `@ipld/car` does not read a CARv2 index, so it
+  cannot judge one; go-car is the implementation that can."
+  []
+  (try
+    (let [p (.trim (str (.execSync cp "command -v car" #js {:stdio #js ["ignore" "pipe" "ignore"]})))]
+      (when (seq p) p))
+    (catch :default _ nil)))
+
+(defn- corrupt-index-offsets
+  "Return a copy of `bytes` with every index record's offset moved by one.
+
+  The negative control for the section below. Without it, `get-block`
+  succeeding proves only that go-car can scan an archive — every CAR reader
+  can. Shifting the offsets makes the index the only thing that changed, so a
+  reader that still answers correctly is a reader that never read it."
+  [bytes index-offset]
+  (let [out (b/as-bytes (b/slice bytes 0 (b/bcount bytes)))
+        shift-run! (fn [q]
+                     (let [width (b/read-u32-le out q)
+                           run (b/read-u64-le out (+ q 4))
+                           start (+ q 12)]
+                       (doseq [k (range (quot run width))]
+                         (let [r (+ start (* k width) (- width 8))
+                               shifted (b/u64-le (inc (b/read-u64-le out r)))]
+                           (dotimes [x 8] (aset out (+ r x) (b/bget shifted x)))))
+                       (+ start run)))
+        shift-code! (fn [p]
+                      (let [n-widths (b/read-u32-le out (+ p 8))]
+                        (reduce (fn [q _] (shift-run! q)) (+ p 12) (range n-widths))))
+        p0 (+ index-offset (b/bcount (b/varint idx/codec)))
+        n-codes (b/read-u32-le out p0)]
+    (reduce (fn [p _] (shift-code! p)) (+ p0 4) (range n-codes))
+    out))
+
+(defn index-read-by-go-car
+  "Direction 3: the `MultihashIndexSorted` index, judged by go-car.
+
+  This is a separate section because it is the one claim the JavaScript
+  reference cannot settle — `@ipld/car` reads a CARv2 by honouring the header
+  and skipping the index entirely — and a suite that folded it into the others
+  would report a pass for a check nobody ran."
+  []
+  (println "\ngo-car reads the CARv2 index this library writes")
+  (if-let [cli (car-cli)]
+    (let [{:keys [bytes index-offset]} (v2/pack {:roots [(:cid root)] :blocks blocks})
+          tmp (.tmpdir os)
+          good (.join path tmp (str "ipld-car-good-" (.now js/Date) ".car"))
+          bad (.join path tmp (str "ipld-car-bad-" (.now js/Date) ".car"))
+          ;; the last block: whichever record the index sorts last, so a reader
+          ;; that ignored the index and scanned would have to walk past the others
+          target (:cid (last blocks))
+          run (fn [args] (str (.execSync cp (str cli " " args)
+                                         #js {:stdio #js ["ignore" "pipe" "pipe"]
+                                              :encoding "latin1"})))]
+      (.writeFileSync fs good (->u8 bytes))
+      (.writeFileSync fs bad (->u8 (corrupt-index-offsets bytes index-offset)))
+      (try
+        (let [report (run (str "inspect --full " good))
+              got (run (str "get-block " good " " target))
+              want (:bytes (last blocks))]
+          (check! "car inspect --full accepts the archive"
+                  (boolean (re-find #"(?i)version:\s*2" report)))
+          (check! "go-car names the index type we wrote"
+                  (boolean (re-find #"car-multihash-index-sorted" report)))
+          (check! "car get-block returns that block's exact bytes"
+                  (and (= (b/bcount want) (.-length got))
+                       (every? #(= (b/bget want %) (.charCodeAt got %))
+                               (range (b/bcount want)))))
+          (println (str "        " (kotoba.lang.text/replace (.trim report) #"\n" "\n        "))))
+        (catch :default e
+          (check! (str "car inspect --full: " (.-message e)) false))
+        (finally (.unlinkSync fs good)))
+      (try
+        (run (str "get-block " bad " " target))
+        (check! "a one-byte shift in every index offset is rejected" false)
+        (catch :default _
+          (check! "a one-byte shift in every index offset is rejected — the index is what go-car read" true))
+        (finally (.unlinkSync fs bad))))
+    (skip! "go-car index verification"
+           "car not on PATH (go install github.com/ipld/go-car/cmd/car@latest)")))
+
+(defn -main []
+  (reference-car-read-by-us)
+  (index-read-by-go-car)
+  (-> (our-car-read-by-reference)
+      (.then (fn [_]
+               (println (str "\ninterop: "
+                             (if (zero? @failures)
+                               (str "all checks passed"
+                                    (when (seq @skipped)
+                                      (str "; " (count @skipped) " SKIPPED — not verified: "
+                                           (kotoba.lang.text/join ", " @skipped))))
+                               (str @failures " FAILED"))))
+               (when (pos? @failures) (set! (.-exitCode js/process) 1))))))
+
+(-main)

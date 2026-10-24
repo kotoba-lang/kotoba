@@ -1,0 +1,94 @@
+(ns ipld.car.index-limits-test
+  "What the index decoder does with counts it cannot honour.
+
+  Every count in MultihashIndexSorted is read from the archive, so a reader
+  that trusts them does work the file did not pay for. The cases below are
+  the three shapes that reach a reader over a network: a truncated fetch, a
+  count larger than the bytes that follow, and a well-formed index larger
+  than the caller will hold.
+
+  The measurement that made these necessary (2026-09-06, nbb): a truncated
+  index did not fail -- `read-u32-le` past the end returned `NaN`, `(= j NaN)`
+  was never true, and `decode` spun without yielding the event loop. It was
+  not slow; it did not finish, and a `setTimeout` racing it never fired."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipld.car.bytes :as b]
+            [ipld.car.index :as idx]
+            [ipld.car.v2 :as car2]))
+
+(defn- err [f]
+  (try (f) nil
+       (catch #?(:clj Exception :cljs :default) e (:type (ex-data e)))))
+
+(defn- header [n-codes] (b/concat [(b/varint idx/codec) (b/u32-le n-codes)]))
+
+(deftest out-of-range-fixed-reads-refuse-on-both-runtimes
+  (testing "the NaN that made a truncated index non-terminating"
+    (let [buf (b/->bytes [1 2 3 4])]
+      (is (= :car/read-out-of-range (err #(b/read-u32-le buf 100))))
+      (is (= :car/read-out-of-range (err #(b/read-u64-le buf 100))))
+      (is (= :car/read-out-of-range (err #(b/read-u32-le buf 1)))
+          "a partial read is still a read that cannot be performed")
+      (is (= :car/read-out-of-range (err #(b/read-u32-le buf -1))))))
+  (testing "reads that fit are unchanged"
+    (let [buf (b/concat [(b/u32-le 0x01020304) (b/u64-le 42)])]
+      (is (= 0x01020304 (b/read-u32-le buf 0)))
+      (is (= 42 (b/read-u64-le buf 4))))))
+
+(deftest a_truncated_index_refuses_rather_than_decoding_as_empty
+  ;; The exact bytes measured as non-terminating: a header claiming one code
+  ;; group, carrying none of it.
+  (is (= :car/index-overruns-buffer (err #(idx/decode (header 1) 0))))
+  (is (= :car/index-overruns-buffer (err #(idx/decode (header 4) 0))))
+  (is (= :car/index-overruns-buffer
+         (err #(idx/decode (header 0xffffffff) 0))))
+  (testing "an index carrying no groups and declaring none is still empty"
+    (is (= [] (idx/decode (header 0) 0)))))
+
+(deftest declared_counts_are_checked_against_the_bytes_that_follow
+  (testing "a width-run count larger than the remaining group headers"
+    (let [buf (b/concat [(header 1) (b/u64-le 0x12) (b/u32-le 9999)])]
+      (is (= :car/index-overruns-buffer (err #(idx/decode buf 0))))))
+  (testing "a record run longer than the records present"
+    (let [buf (b/concat [(header 1) (b/u64-le 0x12) (b/u32-le 1)
+                         (b/u32-le 40) (b/u64-le (* 40 1000000))])]
+      (is (= :car/index-overruns-buffer (err #(idx/decode buf 0)))))))
+
+(defn- well-formed
+  "`n` real records of width 40 under one code, all bytes present."
+  [n]
+  (let [dlen 32
+        recs (mapcat (fn [k] [(b/->bytes (repeat dlen (mod k 256)))
+                              (b/u64-le (inc k))])
+                     (range n))]
+    (b/concat (into [(header 1) (b/u64-le 0x12) (b/u32-le 1)
+                     (b/u32-le (+ dlen 8)) (b/u64-le (* (+ dlen 8) n))]
+                    recs))))
+
+(deftest a_well_formed_index_larger_than_the_caller_will_hold_is_refused
+  (let [buf (well-formed 64)]
+    (testing "the same bytes decode when the budget allows them"
+      (is (= 64 (count (idx/decode buf 0 {:max-records 64}))))
+      (is (= 1 (:payload-offset (first (idx/decode buf 0 {:max-records 64}))))))
+    (testing "and are refused when it does not -- present is not permitted"
+      (is (= :car/index-too-many-records
+             (err #(idx/decode buf 0 {:max-records 63})))))
+    (testing "the default ceiling admits an ordinary pack index"
+      (is (= 64 (count (idx/decode buf 0)))))))
+
+(deftest characteristics_are_returned_so_a_reader_can_decline
+  (testing "an ordinary archive declares nothing, and says so"
+    (let [head (b/concat [car2/pragma
+                          (car2/header {:data-offset 51 :data-size 10
+                                        :index-offset 61})])
+          parsed (car2/parse-header head)]
+      (is (= 16 (b/bcount (:characteristics parsed))))
+      (is (car2/no-characteristics? parsed))))
+  (testing "a set bit survives parsing instead of being skipped"
+    (let [head (b/concat [car2/pragma
+                          (b/->bytes (concat [0x80] (repeat 15 0)))
+                          (b/u64-le 51) (b/u64-le 10) (b/u64-le 61)])
+          parsed (car2/parse-header head)]
+      (is (not (car2/no-characteristics? parsed))
+          "ignoring a declaration and honouring it must not look the same")
+      (is (= 51 (:data-offset parsed)) "the rest of the header still parses"))))
