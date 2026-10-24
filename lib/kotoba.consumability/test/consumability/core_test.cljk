@@ -1,0 +1,155 @@
+(ns consumability.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [consumability.core :as c]))
+
+(def ^:private live-actor
+  "A cloud-itonami marketplace worker as actually measured on 2026-07-30:
+  addressed, answers /health, and 404s on every contract and discovery path."
+  {:producer "cloud-itonami-marketplace-order"
+   :endpoint "https://cloud-itonami-marketplace-order.04-feasts-minded.workers.dev"
+   :health {:path "/health" :status 200}
+   :contract {:path "/openapi.json" :status 404}
+   :discovery [{:path "/llms.txt" :status 404}
+               {:path "/.well-known/ai-plugin.json" :status 404}]
+   :agent {:path "/mcp" :status 404}})
+
+(def ^:private directory-only
+  "The other ~1,199: a blueprint and no address."
+  {:producer "cloud-itonami-isic-6492-blueprint-only"
+   :endpoint nil})
+
+(deftest the-ladder-stops-at-the-first-broken-rung
+  (let [a (c/assess live-actor)]
+    (is (= [:addressed :reachable] (:reached a)))
+    (is (= :reachable (:rung a)))
+    (is (= :describable (:gap a)) "the first rung that did not hold")
+    (is (false? (:unknown a)))))
+
+(deftest nothing-above-a-broken-rung-counts
+  ;; A producer that serves a discovery document but answers nothing must not
+  ;; score above one that is merely reachable. This is the whole reason the score
+  ;; is a ladder rather than a weighted average.
+  (let [showy (c/assess {:producer "showy" :endpoint "https://x"
+                         :health {:path "/health" :status 503}
+                         :contract {:path "/openapi.json" :status 200}
+                         :discovery [{:path "/llms.txt" :status 200}]
+                         :agent {:path "/mcp" :status 200}})]
+    (is (= [:addressed] (:reached showy)))
+    (is (= :reachable (:gap showy)))
+    (is (false? (c/consumable? showy))
+        "three rungs answered, and it is still not consumable")))
+
+(deftest an-unaddressed-producer-reaches-nothing
+  (let [a (c/assess directory-only)]
+    (is (= [] (:reached a)))
+    (is (nil? (:rung a)))
+    (is (= :addressed (:gap a)))))
+
+(deftest unknown-is-not-absent
+  (testing "an unprobed rung is unmeasured, not failed"
+    (let [a (c/assess {:producer "unprobed" :endpoint "https://x"})]
+      (is (= :reachable (:gap a)))
+      (is (true? (:unknown a)) "the ladder stopped on something nobody measured")))
+  (testing "a probe that ran but got no answer is also unmeasured"
+    (let [a (c/assess {:producer "timeout" :endpoint "https://x"
+                       :health {:path "/health" :status nil}})]
+      (is (true? (:unknown a)))))
+  (testing "and a real refusal is a gap"
+    (let [a (c/assess {:producer "refused" :endpoint "https://x"
+                       :health {:path "/health" :status 404}})]
+      (is (false? (:unknown a))))))
+
+(deftest discovery-needs-only-one-answer-but-proof-to-be-refused
+  (is (true? (c/rung-verdict :discoverable
+                             {:discovery [{:path "/llms.txt" :status 404}
+                                          {:path "/.well-known/ai-plugin.json" :status 200}]}))
+      "any answering discovery path counts")
+  (is (false? (c/rung-verdict :discoverable {:discovery [{:path "/llms.txt" :status 404}]}))
+      "a real 404 refuses the rung")
+  (is (= :unknown (c/rung-verdict :discoverable {:discovery [{:path "/llms.txt" :status nil}]}))
+      "an unanswered probe leaves it unmeasured, not refused")
+  (is (= :unknown (c/rung-verdict :discoverable {}))
+      "no probes at all is unmeasured"))
+
+(deftest unmeasured-producers-are-not-reported-as-gaps
+  ;; Acting on an unmeasured rung would "fix" something that may already work.
+  (let [as (c/assess-all [live-actor
+                          {:producer "unprobed" :endpoint "https://x"}])]
+    (is (= {:describable ["cloud-itonami-marketplace-order"]} (c/gaps as)))
+    (is (= 1 (:unmeasured (c/summary as))))))
+
+(deftest summary-counts-each-rung-reached
+  (let [as (c/assess-all [live-actor directory-only])
+        s (c/summary as)]
+    (is (= 2 (:producers s)))
+    (is (= 1 (get-in s [:reached :addressed])))
+    (is (= 1 (get-in s [:reached :reachable])))
+    (is (= 0 (get-in s [:reached :describable])))))
+
+(deftest rank-puts-the-lower-rung-first-even-when-fewer-are-stuck-there
+  ;; The measured fleet shape inverted: many producers stuck high, few stuck low.
+  ;; Ranking by population would say "add MCP to the many" and leave the few
+  ;; unaddressed — optimising a number instead of the fleet.
+  (let [as (c/assess-all
+            (concat [{:producer "no-address" :endpoint nil}]
+                    (for [i (range 5)]
+                      {:producer (str "reachable-" i) :endpoint "https://x"
+                       :health {:status 200} :contract {:status 200}
+                       :discovery [{:status 200}] :agent {:status 404}})))
+        r (c/rank as)]
+    (is (= :addressed (:rung (first r))) "the lowest rung leads")
+    (is (= 1 (:blocked (first r))))
+    (is (= :agent-callable (:rung (second r))))
+    (is (= 5 (:blocked (second r))))))
+
+(deftest consumable-is-drawn-at-describable
+  (is (false? (c/consumable? (c/assess live-actor)))
+      "reachable but undescribed: a consumer would have to read the source")
+  (is (true? (c/consumable? (c/assess (assoc live-actor
+                                             :contract {:path "/openapi.json" :status 200}))))))
+
+(deftest ladder-helpers
+  (is (= 0 (c/rung-index :addressed)))
+  (is (= 4 (c/rung-index :agent-callable)))
+  (is (nil? (c/rung-index :not-a-rung)))
+  (is (= [:addressed :reachable] (c/below :describable)))
+  (is (= [] (c/below :addressed))))
+
+(deftest html-is-never-a-contract
+  ;; Measured 2026-07-30: a Cloudflare Pages actor answers EVERY path with
+  ;; 200 text/html and its SPA index. cloud-itonami-partners.pages.dev and
+  ;; cloud-itonami-isic-6492.pages.dev both returned 200 text/html for
+  ;; /openapi.json. Scoring 2xx alone reported three producers as describable,
+  ;; discoverable and agent-callable when the true answer for all three was zero.
+  (let [pages {:producer "cloud-itonami-partners"
+               :endpoint "https://cloud-itonami-partners.pages.dev"
+               :health {:path "/" :status 200 :content-type "text/html; charset=utf-8"}
+               :contract {:path "/openapi.json" :status 200 :content-type "text/html; charset=utf-8"}
+               :discovery [{:path "/llms.txt" :status 200 :content-type "text/html; charset=utf-8"}]
+               :agent {:path "/mcp" :status 200 :content-type "text/html; charset=utf-8"}}
+        a (c/assess pages)]
+    (is (= [:addressed :reachable] (:reached a))
+        "an SPA that answers everything is reachable and nothing above it")
+    (is (= :describable (:gap a)))
+    (is (false? (c/consumable? a)))
+    (testing "reachable still holds — answering IS the question that rung asks"
+      (is (true? (c/rung-verdict :reachable pages))))))
+
+(deftest a-real-json-contract-counts
+  (is (true? (c/rung-verdict :describable
+                             {:contract {:status 200 :content-type "application/json; charset=utf-8"}})))
+  (is (true? (c/rung-verdict :describable
+                             {:contract {:status 200 :content-type "application/vnd.oai.openapi+json"}}))
+      "+json vendor types count")
+  (is (true? (c/rung-verdict :discoverable
+                             {:discovery [{:status 200 :content-type "text/plain; charset=utf-8"}]}))
+      "llms.txt is text/plain"))
+
+(deftest content-type-is-only-required-when-observed
+  ;; An observer that does not collect content types must not have every rung
+  ;; silently fail — absent instrumentation is unmeasured, not refused.
+  (is (true? (c/rung-verdict :describable {:contract {:status 200}}))
+      "status-only observation still scores")
+  (is (false? (c/machine-readable? "text/html")))
+  (is (false? (c/machine-readable? nil)))
+  (is (true? (c/machine-readable? "application/json"))))
