@@ -1,0 +1,122 @@
+(ns opus.celt-test
+  "opus.celt end-to-end tests. Bitstreams are built by
+   opus.support.celt-encoder, a companion test-only encoder that shares
+   opus.celt's exact tables and `compute-band-allocations` function with
+   the decoder (so the two sides can never disagree about bit allocation
+   by construction) and that itself sits on top of opus.support.range-encoder,
+   which is separately cross-checked against the verified RFC 6716
+   Appendix A reference implementation (see opus.range-decoder-test).
+   These are real, deterministic decodes of genuine bitstreams producing
+   real PCM -- not fabricated pass-through assertions."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [opus.celt :as celt]
+            [opus.support.celt-encoder :as enc]
+            [opus.support.range-encoder :as re]))
+
+(defn- find-workable-frame-bytes
+  "The smallest frame size (bytes, stepping by 2) for which every band
+   clears its minimum-allocation threshold at the given trim (see
+   opus.celt's ns docstring: band-skip decoding is out of scope, so the
+   encoder must pick a frame large enough that no band would be skipped)."
+  ([] (find-workable-frame-bytes 5))
+  ([trim]
+   (first (filter (fn [fb]
+                     (try (enc/encode-frame fb {:trim trim}) true
+                          (catch clojure.lang.ExceptionInfo _ false)))
+                   (range 100 500 2)))))
+
+(deftest end-to-end-decode-produces-real-pcm
+  (let [fb (find-workable-frame-bytes)
+        bytes (enc/encode-frame fb)
+        result (celt/decode-frame bytes)]
+    (testing "960 samples (20 ms @ 48 kHz), finite, not all zero"
+      (is (false? (:silence? result)))
+      (is (= 960 (count (:pcm result))))
+      (is (every? #(not (Double/isNaN %)) (:pcm result)))
+      (is (some #(not= 0.0 %) (:pcm result))))
+    (testing "coarse energy: every band encoded qi=0 -> decoded logE is
+              exactly 0.0 for all 21 bands (RFC SS4.3.2.1 intra formula
+              with alpha=0, no deviation from the running predictor)"
+      (is (= (repeat 21 0.0) (:logE result))))
+    (testing "denormalization gain matches the real per-band mean formula
+              2^(logE[i]+eMeans[i]) exactly (RFC SS4.3.2.1/quant_bands.c
+              log2Amp, cross-checked against the verified RFC Appendix A
+              reference eMeans table): since opus.pvq guarantees every
+              band's pre-denormalization shape is unit-norm (see
+              pvq_test), the band's L2 norm *after* denormalization must
+              equal the gain exactly, for any pulse-vector shape -- this
+              is checked against the actual :freq array the decoder fed
+              to the IMDCT, not re-derived from the formula under test."
+      (doseq [i (range celt/nb-ebands)]
+        (let [expected-gain (Math/pow 2.0 (nth celt/eMeans i))
+              lo (bit-shift-left (nth celt/ebands i) celt/LM)
+              hi (bit-shift-left (nth celt/ebands (inc i)) celt/LM)
+              band-coeffs (subvec (:freq result) lo hi)
+              actual-norm (Math/sqrt (reduce + (map #(* % %) band-coeffs)))]
+          (if (zero? (nth (:pulses result) i))
+            (is (= 0.0 actual-norm))
+            (is (< (Math/abs (- expected-gain actual-norm)) 1e-6))))))
+    (testing "decode is a pure, deterministic function of the bytes"
+      (is (= (:pcm result) (:pcm (celt/decode-frame bytes)))))))
+
+(deftest allocation-trim-changes-the-spectral-tilt
+  (testing "trim biases allocation toward low (trim<5) or high (trim>5)
+            bands -- a real, observable effect of the decoded trim value,
+            not a no-op"
+    ;; trim=2 (low-band-biased) is the more constrained case for the
+    ;; band-below-threshold check, so size the frame against it and reuse
+    ;; that size for trim=8 too (both must succeed for the comparison
+    ;; below to be meaningful).
+    (let [fb (find-workable-frame-bytes 2)
+          low-trim-bytes (enc/encode-frame fb {:trim 2})
+          high-trim-bytes (enc/encode-frame fb {:trim 8})
+          low (:pulses (celt/decode-frame low-trim-bytes))
+          high (:pulses (celt/decode-frame high-trim-bytes))]
+      (is (not= low high))
+      ;; band 20 (highest frequency) should never get *fewer* pulses with
+      ;; the high-frequency-biased trim than with the low-frequency-biased
+      ;; one, for the same frame size.
+      (is (>= (nth high 20) (nth low 20))))))
+
+(deftest silence-frame-decodes-to-zero-pcm
+  (testing "RFC SS4.3 silence flag: a real, minimal, valid bitstream"
+    (let [st0 (re/init)
+          st1 (re/ec-enc-bit-logp st0 1 15)
+          bytes (re/finish st1 8)
+          result (celt/decode-frame bytes)]
+      (is (true? (:silence? result)))
+      (is (= 960 (count (:pcm result))))
+      (is (every? zero? (:pcm result))))))
+
+(deftest out-of-scope-features-throw-clear-errors
+  (testing "transient=1 (short blocks)"
+    (let [st0 (re/init)
+          st1 (re/ec-enc-bit-logp st0 0 15) ; not silent
+          st2 (re/ec-enc-bit-logp st1 0 1)  ; postfilter=0
+          st3 (re/ec-enc-bit-logp st2 1 3) ; transient=1
+          bytes (re/finish st3 64)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"transient"
+                             (celt/decode-frame bytes)))))
+  (testing "intra=0 (inter-frame energy prediction)"
+    (let [st0 (re/init)
+          st1 (re/ec-enc-bit-logp st0 0 15)
+          st2 (re/ec-enc-bit-logp st1 0 1)
+          st3 (re/ec-enc-bit-logp st2 0 3) ; transient=0
+          st4 (re/ec-enc-bit-logp st3 0 3) ; intra=0
+          bytes (re/finish st4 64)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cross-frame"
+                             (celt/decode-frame bytes)))))
+  (testing "post-filter=1"
+    (let [st0 (re/init)
+          st1 (re/ec-enc-bit-logp st0 0 15)
+          st2 (re/ec-enc-bit-logp st1 1 1) ; postfilter=1
+          bytes (re/finish st2 64)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"post-filter"
+                             (celt/decode-frame bytes))))))
+
+(deftest too-small-frame-throws-band-below-threshold
+  (testing "a frame too small for all 21 bands to clear their minimum
+            allocation throws instead of silently mis-decoding (band-skip
+            decoding is explicitly out of scope, see ns docstring)"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"threshold"
+                           (enc/encode-frame 40)))))

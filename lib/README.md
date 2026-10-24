@@ -44,6 +44,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.brotli` | `org.ietf.brotli/src` | `brotli.bits`, `brotli.core`, `brotli.data`, `brotli.dictionary` (an external specification, publisher ietf.org) |
 | `org.ietf.ical` | `org.ietf.ical/src` | `ical.builder`, `ical.execute`, `ical.ical`, `ical.model` (an external specification, publisher ietf.org) |
 | `org.ietf.sip` | `org.ietf.sip/src` | `sip.grammar`, `sip.headers`, `sip.message`, `sip.uri` (an external specification, publisher ietf.org) |
+| `org.ietf.opus` | `org.ietf.opus/src` | `opus.celt`, `opus.mdct`, `opus.packet`, `opus.pvq` (an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
