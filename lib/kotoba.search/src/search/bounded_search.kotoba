@@ -1,0 +1,429 @@
+(ns search.bounded-search
+  (:export [token-count token-start token-end token-text
+            term-count term-count-checked
+            in-fold-subset? field-weight-or score-doc
+            main]))
+
+;; Bounded-profile port of search.model's SEARCH MACHINERY -- tokenize,
+;; term-count and score-doc -- the half that bounded_index.kotoba deferred.
+;;
+;; The deferral's recorded reason ("needs a per-code-point string primitive
+;; the compiler does not yet expose") was STALE: string-code-point-at is an
+;; admitted language builtin (kotoba-lang/kotoba-lang lang/pure-product-
+;; profile.edn :string-ops), and kotoba.lang.bounded-text has walked code
+;; points with it since 2026-09-04. Re-measured 2026-09-08 against amu
+;; origin/main 9092ee34: it lowers on --target web AND --target wasm32.
+;;
+;; ---- the one stated divergence: no collection return ----
+;;
+;; The .cljc tokenize returns a VECTOR of tokens. This backend admits no
+;; readable collection of strings (kotoba.lang.bounded-text measured that
+;; for join-text and left it deferred), so this module exposes the INDEXED
+;; face instead -- the same shape segment-text / segment-count-text use for
+;; split: token-count answers HOW MANY, token-start / token-end answer the
+;; nth token's byte range in the ORIGINAL text, token-text answers the nth
+;; token's folded text. Everything the .cljc builds ON tokenize (term-count,
+;; score-doc) is a count or a number, so those port with no divergence at
+;; all. Out-of-range n answers -1 (edges) / "" (text), segment-text's
+;; contract; a caller who needs to know there were fewer tokens asks
+;; token-count.
+;;
+;; ---- the character class, stated ----
+;;
+;; The .cljc tokenizer is two regexes over the LOWER-CASED input:
+;;   token run   #"[a-z0-9぀-ヿ㐀-鿿]+"
+;;   cjk run     #"[぀-ヿ㐀-鿿々]+"   (inside a token run)
+;; A token run with no CJK code point is one token. A token run WITH one is
+;; replaced by the overlapping bigrams of each of its maximal CJK sub-runs --
+;; a 1-code-point sub-run stays whole -- and the run's ASCII code points are
+;; DROPPED ("abc漢字" tokenizes to just "漢字"). U+3005 cannot occur inside a
+;; token run (it is absent from the token class), so the second regex reduces
+;; to "maximal runs of ぀-ヿ㐀-鿿" here.
+;;
+;; Every code point in the CJK class lies in [U+0800, U+FFFF], so it is
+;; exactly THREE UTF-8 bytes. That invariant is what lets a bigram be sliced
+;; arithmetically (s+3k .. s+3k+6) instead of re-walking; main pins it.
+;;
+;; ---- case folding, and the two code points that refuse ----
+;;
+;; The .cljc folds with clojure.string/lower-case (locale case mapping);
+;; this kernel folds ASCII A-Z only. Measured 2026-09-08 by enumerating all
+;; of Unicode on both hosts (JVM ja_JP and node): EXACTLY TWO non-ASCII code
+;; points lower-case INTO [a-z0-9] --
+;;   U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE -> "i" + U+0307
+;;   U+212A KELVIN SIGN                           -> "k"
+;; -- so those two, and only those two, are outside this kernel's subset.
+;; score-doc and term-count-checked REFUSE on them through the error arm of
+;; [:result :i64 :string] rather than answering: a score of 0 is a real
+;; answer ("no term matched") and must never be confused with "not measured".
+;; in-fold-subset? is the predicate on its own.
+
+;; ---------- code point classes ----------
+
+(defn- fold-cp [ch :i64] :i64
+  ;; ASCII-only case fold: A-Z -> a-z. Everything else is identity.
+  (if (>= ch 65)
+    (if (< ch 91) (+ ch 32) ch)
+    ch))
+
+(defn- ascii-class? [ch :i64] :bool
+  ;; [a-z0-9], post-fold.
+  (if (>= ch 48)
+    (if (< ch 58)
+      true
+      (if (>= ch 97)
+        (if (< ch 123) true false)
+        false))
+    false))
+
+(defn- cjk-class? [ch :i64] :bool
+  ;; [぀-ヿ] (hiragana + katakana) and [㐀-鿿] (CJK ext-A
+  ;; and unified), inclusive on both ends -- the .cljc's ranges verbatim.
+  (if (>= ch 12352)
+    (if (< ch 12544)
+      true
+      (if (>= ch 13312)
+        (if (< ch 40960) true false)
+        false))
+    false))
+
+(defn- token-class? [ch :i64] :bool
+  (if (ascii-class? ch) true (cjk-class? ch)))
+
+(defn- step-boundary [text :string i :i64] :i64
+  ;; Byte offset where the code point STARTING AT i ends. The width comes
+  ;; from the decoded CODE POINT, not the leading byte (bounded-text's
+  ;; measured rule): string-code-point-at TRAPS on a non-boundary offset,
+  ;; so every offset this module ever hands it comes from here.
+  (let [ch (string-code-point-at text i)]
+    (if (< ch 128)
+      (+ i 1)
+      (if (< ch 2048)
+        (+ i 2)
+        (if (< ch 65536) (+ i 3) (+ i 4))))))
+
+(defn- folded-cp-at [text :string i :i64] :i64
+  (fold-cp (string-code-point-at text i)))
+
+;; ---------- run boundaries ----------
+
+(defn- scan-to-class [text :string i :i64 size :i64] :i64
+  ;; First offset >= i whose code point is in the token class, else size.
+  (if (>= i size)
+    size
+    (if (token-class? (folded-cp-at text i))
+      i
+      (scan-to-class text (step-boundary text i) size))))
+
+(defn- run-end [text :string i :i64 size :i64] :i64
+  ;; End of the maximal token run that starts at i.
+  (if (>= i size)
+    size
+    (if (token-class? (folded-cp-at text i))
+      (run-end text (step-boundary text i) size)
+      i)))
+
+(defn- cjk-sub-start [text :string i :i64 limit :i64] :i64
+  (if (>= i limit)
+    limit
+    (if (cjk-class? (folded-cp-at text i))
+      i
+      (cjk-sub-start text (step-boundary text i) limit))))
+
+(defn- cjk-sub-end [text :string i :i64 limit :i64] :i64
+  (if (>= i limit)
+    limit
+    (if (cjk-class? (folded-cp-at text i))
+      (cjk-sub-end text (step-boundary text i) limit)
+      i)))
+
+(defn- run-has-cjk? [text :string i :i64 limit :i64] :bool
+  (if (>= (cjk-sub-start text i limit) limit) false true))
+
+;; ---------- how many tokens ----------
+
+(defn- cjk-tokens [text :string i :i64 limit :i64 acc :i64] :i64
+  ;; Bigram count over every maximal CJK sub-run in [i, limit): a sub-run of
+  ;; c code points yields c-1 bigrams, except c=1 which yields the lone code
+  ;; point. Byte length / 3 IS c (the three-byte invariant above).
+  (let [s (cjk-sub-start text i limit)]
+    (if (>= s limit)
+      acc
+      (let [e (cjk-sub-end text s limit)
+            cps (quot (- e s) 3)]
+        (cjk-tokens text e limit
+                    (+ acc (if (= cps 1) 1 (- cps 1))))))))
+
+(defn- run-tokens [text :string rs :i64 re :i64] :i64
+  (if (run-has-cjk? text rs re) (cjk-tokens text rs re 0) 1))
+
+(defn- count-from [text :string i :i64 size :i64 acc :i64] :i64
+  (let [rs (scan-to-class text i size)]
+    (if (>= rs size)
+      acc
+      (let [re (run-end text rs size)]
+        (count-from text re size (+ acc (run-tokens text rs re)))))))
+
+(defn token-count [text :string] :i64
+  (count-from text 0 (string-byte-length text) 0))
+
+;; ---------- where the nth token is ----------
+;;
+;; One walk answers both edges; `want-end` picks which. Two separate walks
+;; would be the same code twice, and the arity ceiling is 5 parameters
+;; (measured 2026-09-08: 6 is :kotoba.error/max-parameters), which a
+;; start/end pair plus text/index/size would blow.
+
+(defn- edge-in-cjk [s :i64 e :i64 k :i64 want-end :i64] :i64
+  ;; Edge of bigram k inside the CJK sub-run [s, e). Three bytes per code
+  ;; point, two code points per bigram.
+  (let [cps (quot (- e s) 3)]
+    (if (= cps 1)
+      (if (= want-end 1) e s)
+      (if (= want-end 1) (+ (+ s (* 3 k)) 6) (+ s (* 3 k))))))
+
+(defn- edge-in-runcjk [text :string i :i64 limit :i64 k :i64 want-end :i64] :i64
+  (let [s (cjk-sub-start text i limit)]
+    (if (>= s limit)
+      -1
+      (let [e (cjk-sub-end text s limit)
+            cps (quot (- e s) 3)
+            cnt (if (= cps 1) 1 (- cps 1))]
+        (if (< k cnt)
+          (edge-in-cjk s e k want-end)
+          (edge-in-runcjk text e limit (- k cnt) want-end))))))
+
+(defn- edge-in-run [text :string rs :i64 re :i64 k :i64 want-end :i64] :i64
+  (if (run-has-cjk? text rs re)
+    (edge-in-runcjk text rs re k want-end)
+    (if (= want-end 1) re rs)))
+
+(defn- edge-from [text :string i :i64 n :i64 want-end :i64 size :i64] :i64
+  (let [rs (scan-to-class text i size)]
+    (if (>= rs size)
+      -1
+      (let [re (run-end text rs size)
+            c (run-tokens text rs re)]
+        (if (< n c)
+          (edge-in-run text rs re n want-end)
+          (edge-from text re (- n c) want-end size))))))
+
+(defn token-start [text :string n :i64] :i64
+  (if (< n 0) -1 (edge-from text 0 n 0 (string-byte-length text))))
+
+(defn token-end [text :string n :i64] :i64
+  (if (< n 0) -1 (edge-from text 0 n 1 (string-byte-length text))))
+
+(defn token-text [text :string n :i64] :string
+  ;; The nth token, folded. The slice holds only token-class code points, so
+  ;; string-fold-case agrees with fold-cp on it by construction (it can only
+  ;; touch A-Z there; main pins that). Folding is byte-preserving on this
+  ;; class, which is why the edges above are offsets into the ORIGINAL text.
+  (let [s (token-start text n)]
+    (if (< s 0)
+      ""
+      (string-fold-case (string-substring text s (token-end text n))))))
+
+;; ---------- term-count ----------
+;;
+;; ONE pass. The indexed face above answers "where is token n", which costs a
+;; walk from offset 0 per n; asking it once per token to count matches is
+;; quadratic, and this backend charges fuel per call (default 512, measured
+;; below), so the count is taken during the same walk that finds the tokens.
+;; Nothing is materialized: the term is compared against the token's byte
+;; span in place.
+
+(defn- span-eq? [term :string ti :i64 text :string j :i64 e :i64] :bool
+  ;; term[ti..] against FOLDED text[j..e), code point by code point. Only the
+  ;; TEXT side folds -- the .cljc compares the caller's term as given, so
+  ;; (term-count "Slides" "GFTD Slides") is 0 on both sides. Comparing code
+  ;; points rather than slicing avoids string-substring's refusal on a window
+  ;; that ends mid-code-point, which is exactly what a mismatch produces.
+  (if (>= j e)
+    (if (>= ti (string-byte-length term)) true false)
+    (if (>= ti (string-byte-length term))
+      false
+      (if (= (string-code-point-at term ti) (fold-cp (string-code-point-at text j)))
+        (span-eq? term (step-boundary term ti) text (step-boundary text j) e)
+        false))))
+
+(defn- hits-in-cjk [term :string text :string s :i64 e :i64 acc :i64] :i64
+  ;; Bigrams of a multi-code-point CJK sub-run [s, e): three bytes per code
+  ;; point, so successive bigrams are [s, s+6), [s+3, s+9), ... The last one
+  ;; starts at e-6, which is what the guard says.
+  (if (> (+ s 6) e)
+    acc
+    (hits-in-cjk term text (+ s 3) e
+                 (+ acc (if (span-eq? term 0 text s (+ s 6)) 1 0)))))
+
+(defn- hits-in-run-cjk [term :string text :string i :i64 limit :i64 acc :i64] :i64
+  (let [s (cjk-sub-start text i limit)]
+    (if (>= s limit)
+      acc
+      (let [e (cjk-sub-end text s limit)]
+        (hits-in-run-cjk term text e limit
+                         (+ acc (if (= (- e s) 3)
+                                  (if (span-eq? term 0 text s e) 1 0)
+                                  (hits-in-cjk term text s e 0))))))))
+
+(defn- hits-from [term :string text :string i :i64 size :i64 acc :i64] :i64
+  (let [rs (scan-to-class text i size)]
+    (if (>= rs size)
+      acc
+      (let [re (run-end text rs size)]
+        (hits-from term text re size
+                   (+ acc (if (run-has-cjk? text rs re)
+                            (hits-in-run-cjk term text rs re 0)
+                            (if (span-eq? term 0 text rs re) 1 0))))))))
+
+(defn term-count [term :string text :string] :i64
+  ;; (count (filter #(= term %) (tokenize text))). Callers feed terms from
+  ;; token-text, which is already folded.
+  (hits-from term text 0 (string-byte-length text) 0))
+
+;; ---------- the fold subset, and refusing outside it ----------
+
+(defn- alien-fold-at? [text :string i :i64 size :i64] :bool
+  (if (>= i size)
+    false
+    (let [ch (string-code-point-at text i)]
+      (if (= ch 304)
+        true
+        (if (= ch 8490)
+          true
+          (alien-fold-at? text (step-boundary text i) size))))))
+
+(defn in-fold-subset? [text :string] :bool
+  ;; False for the two code points whose locale lower-casing lands inside
+  ;; [a-z0-9] (U+0130, U+212A) -- the only inputs on which this kernel's
+  ;; ASCII fold can disagree with the .cljc oracle.
+  (if (alien-fold-at? text 0 (string-byte-length text)) false true))
+
+(defn field-weight-or [field :keyword fallback :i64] :i64
+  ;; search.model/default-weights, the same closed table bounded_index.kotoba
+  ;; carries. Restated rather than required: this backend compiles one file.
+  (if (= field :title) 4
+    (if (= field :tags) 3
+      (if (= field :body) 1
+        fallback))))
+
+(defn- hits [q :string text :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (hits q text (+ i 1) n (+ acc (term-count (token-text q i) text)))))
+
+(defn- score-fields [q :string title :string tags :string body :string] :i64
+  ;; score-doc sums weight * term-count over terms AND fields; summation
+  ;; commutes, so the per-field hit total is taken once and weighted once.
+  ;; `tags` is the field-text the .cljc builds: the tag set joined by " ".
+  (let [n (token-count q)]
+    (+ (* (field-weight-or :title 0) (hits q title 0 n 0))
+       (+ (* (field-weight-or :tags 0) (hits q tags 0 n 0))
+          (* (field-weight-or :body 0) (hits q body 0 n 0))))))
+
+(defn score-doc [q :string title :string tags :string body :string]
+    [:result :i64 :string]
+  ;; A score of 0 means "no term matched". A refusal must not read as that,
+  ;; so out-of-subset input takes the error arm and names which field.
+  (if (in-fold-subset? q)
+    (if (in-fold-subset? title)
+      (if (in-fold-subset? tags)
+        (if (in-fold-subset? body)
+          (result-ok-of [:result :i64 :string] (score-fields q title tags body))
+          (result-err-of [:result :i64 :string] "body outside the ASCII-fold subset"))
+        (result-err-of [:result :i64 :string] "tags outside the ASCII-fold subset"))
+      (result-err-of [:result :i64 :string] "title outside the ASCII-fold subset"))
+    (result-err-of [:result :i64 :string] "query outside the ASCII-fold subset")))
+
+(defn term-count-checked [term :string text :string] [:result :i64 :string]
+  (if (in-fold-subset? text)
+    (if (in-fold-subset? term)
+      (result-ok-of [:result :i64 :string] (term-count term text))
+      (result-err-of [:result :i64 :string] "term outside the ASCII-fold subset"))
+    (result-err-of [:result :i64 :string] "text outside the ASCII-fold subset")))
+
+;; ---------- self-check ----------
+;;
+;; Returns FAILURES * 1000 + CHECKS-RUN. A boolean cannot tell one regression
+;; apart from a build that ran nothing; this can. All-pass is exactly the
+;; number of checks.
+
+(defn- tally [acc :i64 ok :bool] :i64
+  (if ok (+ acc 1) (+ acc 1001)))
+
+(defn- score-of [q :string title :string tags :string body :string] :i64
+  (result-value-of [:result :i64 :string] (score-doc q title tags body) -777))
+
+(defn main [] :i64
+  (let [c01 (tally 0 (= 2 (token-count "GFTD Slides")))
+        c02 (tally c01 (string=? "gftd" (token-text "GFTD Slides" 0)))
+        c03 (tally c02 (string=? "slides" (token-text "GFTD Slides" 1)))
+        c04 (tally c03 (= 5 (token-start "GFTD Slides" 1)))
+        c05 (tally c04 (= 11 (token-end "GFTD Slides" 1)))
+        c06 (tally c05 (= 0 (token-count "")))
+        c07 (tally c06 (= 0 (token-count "  ,.- ")))
+        c08 (tally c07 (string=? "" (token-text "abc" 9)))
+        c09 (tally c08 (= -1 (token-start "abc" 9)))
+        c10 (tally c09 (string=? "" (token-text "abc" -1)))
+        ;; three bytes per CJK class code point -- the bigram slice invariant
+        c11 (tally c10 (= 3 (string-byte-length "日")))
+        c12 (tally c11 (= 3 (string-byte-length "ヨ")))
+        ;; overlapping bigrams
+        c13 (tally c12 (= 6 (token-count "欧州連合理事会")))
+        c14 (tally c13 (string=? "欧州" (token-text "欧州連合理事会" 0)))
+        c15 (tally c14 (string=? "事会" (token-text "欧州連合理事会" 5)))
+        c16 (tally c15 (= 3 (token-count "ミツトヨ")))
+        c17 (tally c16 (string=? "ツト" (token-text "ミツトヨ" 1)))
+        ;; a lone CJK code point stays whole
+        c18 (tally c17 (= 1 (token-count "本")))
+        c19 (tally c18 (string=? "本" (token-text "本" 0)))
+        ;; a mixed run drops its ASCII half, as the .cljc does
+        c20 (tally c19 (= 1 (token-count "abc漢字def")))
+        c21 (tally c20 (string=? "漢字" (token-text "abc漢字def" 0)))
+        ;; U+3005 is outside the token class, so it separates runs
+        c22 (tally c21 (= 1 (token-count "人々")))
+        ;; folding, digits, punctuation
+        c23 (tally c22 (string=? "abc" (token-text "ABC" 0)))
+        c24 (tally c23 (= 2 (token-count "a1 2b")))
+        c25 (tally c24 (= 2 (token-count "a,b")))
+        ;; term-count
+        c26 (tally c25 (= 2 (term-count "slides" "GFTD Slides deck slides")))
+        c27 (tally c26 (= 0 (term-count "Slides" "GFTD Slides")))
+        c28 (tally c27 (= 1 (term-count "州連" "欧州連合")))
+        ;; score-doc: title 4 + tags 3 + body 1
+        c29 (tally c28 (= 8 (score-of "slides" "GFTD Slides" "slides deck" "a slides b")))
+        c30 (tally c29 (= 4 (score-of "slides" "GFTD Slides" "deck" "nothing")))
+        ;; zero is an ANSWER, not a refusal
+        c31 (tally c30 (= 0 (score-of "zzz" "GFTD Slides" "deck" "body")))
+        ;; and a refusal is NOT zero. The literal below is U+212A KELVIN SIGN,
+        ;; not ASCII K -- c32 pins that, so an editor that normalizes it away
+        ;; turns this check red instead of silently testing nothing.
+        c32 (tally c31 (= 8490 (string-code-point-at "K" 0)))
+        c33 (tally c32 (= -777 (score-of "K" "GFTD Slides" "deck" "body")))
+        c34 (tally c33 (= -777 (score-of "k" "K" "deck" "body")))
+        c35 (tally c34 (if (in-fold-subset? "K") false true))
+        c36 (tally c35 (in-fold-subset? "kotoba 検索"))
+;; Every class EDGE, on the line and one code point outside it. Without
+        ;; these, narrowing a bound (40960 -> 40000) changes no answer in the
+        ;; corpus and the self-check stays green -- measured 2026-09-08, which
+        ;; is why they are here. Two code points in class = one bigram; two
+        ;; outside = no token at all.
+        c37 (tally c36 (= 1 (token-count "぀぀")))
+        c38 (tally c37 (= 0 (token-count "〿〿")))
+        c39 (tally c38 (= 1 (token-count "ヿヿ")))
+        c40 (tally c39 (= 0 (token-count "㄀㄀")))
+        c41 (tally c40 (= 1 (token-count "㐀㐀")))
+        c42 (tally c41 (= 0 (token-count "㏿㏿")))
+        c43 (tally c42 (= 1 (token-count "鿿鿿")))
+        c44 (tally c43 (= 0 (token-count "ꀀꀀ")))
+        c45 (tally c44 (= 1 (token-count "/09:")))
+        c46 (tally c45 (= 1 (token-count "`az{")))
+        ;; the closed weight table
+        c47 (tally c46 (= 4 (field-weight-or :title 0)))
+        c48 (tally c47 (= 3 (field-weight-or :tags 0)))
+        c49 (tally c48 (= 1 (field-weight-or :body 0)))
+        c50 (tally c49 (= 0 (field-weight-or :unknown 0)))
+        ;; string-fold-case agrees with fold-cp on the token class
+        c51 (tally c50 (string=? "az09" (string-fold-case "AZ09")))
+        c52 (tally c51 (string=? "日本ヨ" (string-fold-case "日本ヨ")))]
+    c52))
