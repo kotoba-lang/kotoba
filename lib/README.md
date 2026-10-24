@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.tetsuzuki` | `kotoba.tetsuzuki/src` | `tetsuzuki.catalog`, `tetsuzuki.coverage`, `tetsuzuki.deadline`, `tetsuzuki.ooyake` (Kotoba project library) |
 | `kotoba.sekisho` | `kotoba.sekisho/src` | `sekisho.account`, `sekisho.assurance`, `sekisho.browser`, `sekisho.didkey` (Kotoba project library) |
 | `kotoba.secretResolve` | `kotoba.secretResolve/src` | `secret-resolve.core`, `secret-resolve.exec`, `secret-resolve.resolver`, `secret-resolve.sources` (Kotoba project library) |
 | `kotoba.sceneGraph` | `kotoba.sceneGraph/src` | `scene-graph` (Kotoba project library) |
