@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.shousetsu` | `kotoba.shousetsu/src` | `shousetsu.serialization` (Kotoba project library) |
 | `kotoba.shomen` | `kotoba.shomen/src` | `shomen.catalog`, `shomen.classify`, `shomen.coverage`, `shomen.requirement` (Kotoba project library) |
 | `kotoba.shokyaku` | `kotoba.shokyaku/src` | `kotoba.shokyaku`, `kotoba.shokyaku.embedded` (Kotoba project library) |
 | `kotoba.shift` | `kotoba.shift/src` | `kotoba.shift` (Kotoba project library) |
