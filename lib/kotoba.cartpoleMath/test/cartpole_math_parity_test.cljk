@@ -1,0 +1,158 @@
+(ns cartpole-math-parity-test
+  "Parity gate between `src/kotoba/cartpole_math.kotoba` (the semantic authority)
+  and the restored load path — `kami.cartpole-math` plus the
+  `kotoba.cartpole-math` facade over it.
+
+  Shape follows `kotoba-lang/css`, `kotoba-lang/dsl-core` and `kotoba-lang/async`
+  (ADR-2608130900): the `.kotoba` is compiled here and executed through the KIR
+  interpreter in this same JVM, so nothing crosses a runtime boundary.
+
+  WHAT THIS DOES NOT CLAIM.
+
+  1. AGREEMENT IS TO 1.0e-13, NOT BIT-IDENTITY. The guest computes trigonometry
+     with the language's bounded `f64-sin-bounded` / `f64-cos-bounded` rather than
+     importing host `Math.sin` / `Math.cos` (ADR 0001 says so deliberately), and it
+     associates the multiplications differently — `pml * (theta-dot * (theta-dot *
+     sin-t))` where this namespace writes `(* pml theta-dot theta-dot sin-t)`. Both
+     differences are real and neither is a defect. The tolerance is not invented
+     here: `cartpole-math-test` in this same repo already compares the guest to a
+     Clojure oracle at exactly 1.0e-13.
+
+  2. `output-bytes` and `output-hash` HAVE NO GUEST COUNTERPART AND ARE NOT
+     PARITY-TESTED. The guest has no bytes, no float-to-string formatting and no
+     SHA-256; those are host-side serialisation. They are not omitted quietly —
+     `output-hash-has-no-guest-counterpart-and-is-pinned-by-the-consumer` below
+     pins the value `kotoba-lang/webgpu`'s committed golden depends on, so a change
+     to the serialisation fails here instead of in another repo.
+
+  3. The guest's `main` is a wasm entry point, not library API, and is not
+     mirrored (same decision as `dsl-core` and `postfx`).
+
+  4. The two surfaces are shaped differently ON PURPOSE. The guest exports four
+     SCALAR functions because its typed ABI carries `:f64`; `step` here returns the
+     assembled 4-vector. The relation asserted is
+     `(step cfg state action) == [(step-x …) (step-x-dot …) (step-theta …)
+     (step-theta-dot …)]`, which is what ADR 0001 means by \"hosts assemble the four
+     scalar outputs into their preferred state representation\"."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.compiler.ir :as ir]
+            [kami.cartpole-math :as cm]
+            [kotoba.cartpole-math :as facade]))
+
+(def ^:private source (slurp "lib/kotoba.cartpoleMath/src/kotoba/cartpole_math.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source source :js-kotoba-v1))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private tolerance 1.0e-13)
+
+(defn- close? [a b]
+  (<= (Math/abs (- (double a) (double b))) tolerance))
+
+;; The guest takes cfg as a positional :vector-f64; this namespace takes a map.
+;; The ORDER is part of the guest's ABI (cfg[0]=cart-mass … cfg[5]=dt), so spell it
+;; out here rather than deriving it from a map, which would hide a reordering.
+(defn- cfg-vector [{:keys [cart-mass pole-mass pole-half-length gravity force-mag dt]}]
+  [cart-mass pole-mass pole-half-length gravity force-mag dt])
+
+;; --- the corpus -----------------------------------------------------------
+;; The canonical input the golden pins, plus inputs that exercise every branch:
+;; force clamping in both directions, negative angle, non-zero velocities, a
+;; heavier pole, and a larger timestep.
+
+(def ^:private canonical-cfg
+  {:cart-mass 1.0 :pole-mass 0.1 :pole-half-length 0.5
+   :gravity 9.8 :force-mag 10.0 :dt 0.02})
+
+(def ^:private corpus
+  [[canonical-cfg [0.0 0.0 0.2 0.0] 1.0]
+   [canonical-cfg [0.0 0.0 0.2 0.0] 0.0]
+   [canonical-cfg [0.0 0.0 0.0 0.0] 10.0]
+   [canonical-cfg [0.5 0.25 -0.3 -0.1] 99.0]     ; clamps to +force-mag
+   [canonical-cfg [-0.5 -0.25 0.3 0.1] -99.0]    ; clamps to -force-mag
+   [canonical-cfg [1.5 -0.75 0.45 0.6] -3.25]
+   [{:cart-mass 1.3 :pole-mass 0.2 :pole-half-length 0.7
+     :gravity 9.81 :force-mag 8.0 :dt 0.01} [0.4 -0.2 -0.35 0.12] 99.0]
+   [{:cart-mass 2.0 :pole-mass 1.0 :pole-half-length 1.0
+     :gravity 9.8 :force-mag 20.0 :dt 0.05} [0.0 1.0 0.6 -0.4] 7.5]])
+
+(deftest step-agrees-with-the-four-scalar-guest-exports
+  (doseq [[cfg state action] corpus]
+    (testing (pr-str [cfg state action])
+      (let [v (cfg-vector cfg)
+            host (cm/step cfg state action)
+            guest [(call 'step-x v state action)
+                   (call 'step-x-dot v state action)
+                   (call 'step-theta v state action)
+                   (call 'step-theta-dot v state action)]]
+        (is (= 4 (count host)))
+        (doseq [[i name] (map-indexed vector ["x" "x-dot" "theta" "theta-dot"])]
+          (testing name
+            (is (close? (nth host i) (nth guest i))
+                (str "host " (nth host i) " guest " (nth guest i)))))))))
+
+(deftest the-facade-forwards-to-the-same-implementation
+  ;; kotoba.cartpole-math is what sits beside the .kotoba; kami.cartpole-math is
+  ;; the SSoT it re-exports. If the facade ever drifts, the gate should say so
+  ;; rather than the consumer discovering it.
+  (doseq [[cfg state action] corpus]
+    (testing (pr-str [cfg state action])
+      (is (= (cm/step cfg state action) (facade/step cfg state action)))))
+  (is (= (cm/canonical-input) (facade/canonical-input)))
+  (is (= (cm/canonical-step) (facade/canonical-step)))
+  (is (= (cm/output-hash (cm/canonical-step))
+         (facade/output-hash (facade/canonical-step))))
+  (doseq [[x lo hi] [[5.0 -1.0 1.0] [-5.0 -1.0 1.0] [0.5 -1.0 1.0]]]
+    (is (= (cm/clamp x lo hi) (facade/clamp x lo hi)))))
+
+(deftest clamping-agrees-including-at-the-boundary
+  ;; Force clamping is the one place the guest and this namespace could disagree
+  ;; on a discontinuity rather than in the last bits, so it gets its own test.
+  (doseq [action [-1.0e6 -10.000000001 -10.0 -9.999999999 0.0
+                  9.999999999 10.0 10.000000001 1.0e6]]
+    (testing (str "action " action)
+      (let [v (cfg-vector canonical-cfg)
+            state [0.0 0.0 0.2 0.0]]
+        (is (close? (first (cm/step canonical-cfg state action))
+                    (call 'step-x v state action)))
+        (is (close? (nth (cm/step canonical-cfg state action) 3)
+                    (call 'step-theta-dot v state action)))))))
+
+(deftest canonical-values-agree
+  (let [{:keys [state action cfg]} (cm/canonical-input)
+        host (cm/step cfg state action)]
+    (testing "the canonical input this namespace pins is the one the guest hard-codes"
+      (is (= [1.0 0.1 0.5 9.8 10.0 0.02] (cfg-vector cfg)))
+      (is (= [0.0 0.0 0.2 0.0] state))
+      (is (= 1.0 action)))
+    (is (= host (cm/canonical-step)))
+    (doseq [[i f] (map-indexed vector ['canonical-x 'canonical-x-dot
+                                       'canonical-theta 'canonical-theta-dot])]
+      (testing (str f)
+        (is (close? (nth host i) (call f)))))))
+
+(deftest output-hash-has-no-guest-counterpart-and-is-pinned-by-the-consumer
+  ;; STATED DIVERGENCE. The guest has no bytes, no float formatting, no SHA-256 —
+  ;; `output-hash` is host-side serialisation and cannot be compared to anything.
+  ;; It is not therefore untested: kotoba-lang/webgpu's
+  ;; fixtures/cartpole-compute-golden.json pins this exact hex for this exact
+  ;; canonical input, so pinning it here makes a serialisation change fail in this
+  ;; repo instead of in that one.
+  (let [hash (cm/output-hash (cm/canonical-step))]
+    (is (= 64 (count hash)))
+    (is (re-matches #"[0-9a-f]{64}" hash))
+    (is (= "b26f67a139ace0c4af23c5cfd507e5db9922edb6ccd22f600d956eba4276dfc9" hash)
+        "the value kotoba-lang/webgpu's committed compute-golden pins")
+    (testing "and the bytes it hashes are the %.12g form the golden was generated from"
+      (is (= "0.000333432655698 0.0166716327849 0.200677996362 0.0338998181180"
+             (kbytes/utf8-string (cm/output-bytes (cm/canonical-step))))))
+    (testing "and the state itself is the golden's expected-output-state"
+      (is (= [3.33432655698E-4 0.0166716327849 0.200677996362 0.033899818118]
+             (mapv #(Double/parseDouble (format "%.12g" (double %)))
+                   (cm/canonical-step)))))))
+
+(deftest the-guest-still-declares-no-effects
+  (is (= #{} (set (:effects @kir)))))
