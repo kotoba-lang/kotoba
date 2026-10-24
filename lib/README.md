@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.haishin` | `kotoba.haishin/src` | `haishin.adapt`, `haishin.artifact`, `haishin.constraints`, `haishin.core` (Kotoba project library) |
 | `kotoba.groot` | `kotoba.groot/src` | `kotoba.groot`, `kotoba.groot.embodiment`, `kotoba.groot.episode`, `kotoba.groot.modality` (Kotoba project library) |
 | `kotoba.graphql` | `kotoba.graphql/src` | `graphql.emit`, `graphql.execute`, `graphql.model`, `graphql.ports` (Kotoba project library) |
 | `kotoba.graphml` | `kotoba.graphml/src` | `graphml.core`, `kotoba.graphml` (Kotoba project library) |
