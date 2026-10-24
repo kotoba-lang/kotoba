@@ -1,0 +1,126 @@
+(ns woff.woff2-oracle-test
+  "Conformance against the reference WOFF2 implementation (`woff2_compress` /
+   `woff2_decompress` from google/woff2).
+
+   The portable suite already proves the round trip for one small font. What this
+   adds is *breadth over real fonts*: thousands of glyphs, composite glyphs with
+   scaled components, hinting instructions, CFF flavours with no `glyf` at all —
+   the cases where a transform decoder quietly goes wrong.
+
+   Comparison is table-by-table byte-identical for everything except `glyf`,
+   `loca` and `head`, and outline-by-outline for `glyf`. §5.1 explicitly permits a
+   reconstruction to re-encode points, so byte equality there would be testing our
+   encoding choices rather than our decoding.
+
+   Skipped loudly when the reference tools or a usable font are missing."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [woff.sfnt-compare :as cmp]
+            [woff.woff2 :as w2])
+  (:import [java.io File]))
+
+(defn- have-tools? []
+  (try (and (some? (:out (shell/sh "woff2_compress")))
+            (some? (:out (shell/sh "woff2_decompress"))))
+       (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir "org-w3-woff-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+
+(def ^:private candidate-fonts
+  ["resources/woff/fixtures/noto-lycian.ttf"
+   ;; macOS
+   "/System/Library/Fonts/Supplemental/Arial.ttf"
+   "/System/Library/Fonts/Supplemental/Georgia.ttf"
+   "/System/Library/Fonts/LastResort.otf"
+   ;; Linux (CI)
+   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+   "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"])
+
+(defn- fonts []
+  (filter #(.exists (io/file %)) candidate-fonts))
+
+(defn- round-trip
+  "Compress `font` with the reference encoder, decode it both ways, and return
+   `{:ours ... :reference ...}` sfnt byte vectors."
+  [dir font]
+  (let [src (io/file dir (.getName (io/file font)))]
+    (io/copy (io/file font) src)
+    (let [{:keys [exit err out]} (shell/sh "woff2_compress" (.getName src) :dir dir)]
+      (when-not (zero? exit)
+        (throw (ex-info (str "woff2_compress failed: " out err) {:font font}))))
+    (let [base (subs (.getName src) 0 (- (count (.getName src)) 4))
+          w2f  (io/file dir (str base ".woff2"))
+          ours (w2/->sfnt (read-ubytes w2f))
+          refd (io/file dir "ref")]
+      (.mkdirs refd)
+      (io/copy w2f (io/file refd (.getName w2f)))
+      (let [{:keys [exit err out]} (shell/sh "woff2_decompress" (.getName w2f) :dir refd)]
+        (when-not (zero? exit)
+          (throw (ex-info (str "woff2_decompress failed: " out err) {:font font}))))
+      {:ours ours
+       :reference (read-ubytes (io/file refd (str base ".ttf")))
+       :woff2 (read-ubytes w2f)})))
+
+(deftest we-agree-with-the-reference-decoder
+  (if-not (have-tools?)
+    (println "SKIP woff.woff2-oracle-test: woff2_compress/woff2_decompress not available")
+    (let [fs (fonts)]
+      (if (empty? fs)
+        (println "SKIP woff.woff2-oracle-test: no candidate font found")
+        (doseq [font fs]
+          (let [dir (temp-dir)]
+            (try
+              (testing font
+                (let [{:keys [ours reference]} (round-trip dir font)
+                      dirs (cmp/table-directory reference)]
+                  (testing "the same tables, and the same bytes wherever the format allows"
+                    (is (= (set (keys dirs)) (set (keys (cmp/table-directory ours)))))
+                    (doseq [tag (sort (keys dirs))
+                            :when (not (contains? #{"glyf" "loca" "head"} tag))]
+                      (is (= (cmp/table reference tag) (cmp/table ours tag)) (str font " " tag))))
+                  (testing "head agrees except for the recomputed checkSumAdjustment"
+                    (let [a (cmp/table reference "head") b (cmp/table ours "head")]
+                      (is (= (subvec a 0 8) (subvec b 0 8)))
+                      (is (= (subvec a 12) (subvec b 12)))))
+                  (when (contains? dirs "glyf")
+                    (testing "every glyph outline matches"
+                      (is (= (cmp/outlines reference) (cmp/outlines ours)))))))
+              (finally (rm-rf dir)))))))))
+
+(deftest reconstructed-fonts-parse-as-opentype
+  (if-not (have-tools?)
+    (println "SKIP woff.woff2-oracle-test: reference tools not available")
+    (doseq [font (fonts)]
+      (let [dir (temp-dir)]
+        (try
+          (testing font
+            (let [{:keys [woff2]} (round-trip dir font)
+                  parsed (w2/parse woff2)]
+              (is (:woff2 parsed))
+              (is (pos? (:units-per-em parsed)))
+              (is (pos? (:num-glyphs parsed)))
+              (is (string? (:family parsed)))))
+          (finally (rm-rf dir)))))))
+
+(deftest a-large-font-with-composite-glyphs
+  (if-not (have-tools?)
+    (println "SKIP woff.woff2-oracle-test: reference tools not available")
+    (let [big (first (filter #(and (.exists (io/file %)) (> (.length (io/file %)) 200000))
+                             candidate-fonts))]
+      (if-not big
+        (println "SKIP: no font over 200 KB available")
+        (let [dir (temp-dir)]
+          (try
+            (testing big
+              (let [{:keys [ours reference]} (round-trip dir big)
+                    outs (cmp/outlines ours)
+                    composites (count (filter :composite? outs))]
+                (is (> (count outs) 500) "a font worth calling large")
+                (is (pos? composites) "and one that actually uses composite glyphs")
+                (is (= (cmp/outlines reference) outs))))
+            (finally (rm-rf dir))))))))

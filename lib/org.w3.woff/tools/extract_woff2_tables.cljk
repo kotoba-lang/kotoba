@@ -1,0 +1,148 @@
+#!/usr/bin/env kbb
+(ns extract-woff2-tables
+  "Generates `src/woff/woff2_data.cljk` from the text of the WOFF2 specification.
+
+   Two tables are needed and both are large enough that transcribing them by hand
+   invites the failure mode this workspace keeps hitting — a constant that stays
+   plausible when wrong (see ADR-2607300500 decision items 9 and 10):
+
+   - the 63 **known table tags** (§4.1), where the flags byte's low six bits index
+     into a fixed list, and tags shorter than four characters are padded with
+     trailing spaces (the HTML strips them, so the padding is restored here);
+   - the 128-row **triplet encoding** table (§5.2) that says how many bits each
+     point's x and y deltas use, what to add to them, and their signs. In the
+     published HTML this table uses `rowspan` heavily, so most rows inherit their
+     byte count and bit widths from the row above.
+
+   Unlike RFC 7932, the WOFF2 spec publishes no checksums, so verification is
+   structural instead: the tag list must have exactly 63 entries, and every
+   triplet row must satisfy `byteCount = 1 + (xBits + yBits) / 8`. A parse error in
+   the rowspan handling breaks that invariant immediately.
+
+   Usage:
+     curl -sL https://www.w3.org/TR/WOFF2/ -o /tmp/woff2.html
+     kbb --backend sci tools/extract_woff2_tables.cljk /tmp/woff2.html"
+  (:require [kotoba.lang.text :as str]))
+
+(def fs (js/require "node:fs"))
+
+(def html-path (or (first *command-line-args*) "/tmp/woff2.html"))
+(def page (.readFileSync fs html-path "utf8"))
+
+(defn- strip-tags [s]
+  (-> s
+      (str/replace #"<[^>]+>" "")
+      (str/replace #"&amp;" "&")
+      (str/replace #"&lt;" "<")
+      (str/replace #"&gt;" ">")
+      (str/replace #"&nbsp;" " ")
+      (str/replace #"&#\d+;" "")
+      str/trim))
+
+(defn- all-tables
+  "Every <table> in the document, as rows of raw cell HTML."
+  []
+  (for [m (re-seq #"(?s)<table[^>]*>(.*?)</table>" page)]
+    (vec (for [row (re-seq #"(?s)<tr[^>]*>(.*?)</tr>" (second m))]
+           (vec (re-seq #"(?s)<t[dh]([^>]*)>(.*?)</t[dh]>" (second row)))))))
+
+(defn- cell-texts [table]
+  (map (fn [[_ _ body]] (strip-tags body)) (mapcat identity table)))
+
+(defn- find-table
+  "Select a table by what it *contains* rather than by a nearby heading: the
+   phrase \"Known Table Tags\" appears in prose two tables earlier, so anchoring
+   on markers picks up the TableDirectoryEntry table instead."
+  [pred]
+  (or (first (filter pred (all-tables)))
+      (throw (ex-info "no table matched" {}))))
+
+;; ---------------------------------------------------------------------------
+;; §4.1 Known table tags
+;; ---------------------------------------------------------------------------
+
+(def known-tags
+  (let [cells (->> (find-table (fn [t] (let [c (set (cell-texts t))]
+                                          (and (contains? c "cmap") (contains? c "Sill")))))
+                   cell-texts)
+        pairs (->> cells
+                   (drop-while #(not= "0" %))               ; skip the Flag/Tag headers
+                   (partition 2))
+        by-flag (into {} (keep (fn [[f t]]
+                                 (when (re-matches #"\d+" f)
+                                   [(js/parseInt f 10) t]))
+                               pairs))]
+    (mapv (fn [i]
+            (let [tag (get by-flag i)]
+              (when (nil? tag) (throw (ex-info "missing tag" {:flag i})))
+              ;; Tags shorter than four characters are padded with trailing
+              ;; spaces ('cvt ', 'CFF ', 'SVG '); the HTML shows them trimmed.
+              (str tag (apply str (repeat (- 4 (count tag)) " ")))))
+          (range 63))))
+
+;; ---------------------------------------------------------------------------
+;; §5.2 Triplet encoding
+;; ---------------------------------------------------------------------------
+
+(defn- num-or-zero [v]
+  (if (or (str/blank? v) (= "N/A" v) (= "-" v) (= "+" v)) 0 (js/parseInt v 10)))
+
+(defn- sign-of [v]
+  (case (str/trim v) "+" 1 "-" -1 0))
+
+(def triplets
+  (let [rows (->> (find-table (fn [t] (>= (count t) 128)))
+                  (map (fn [row] (mapv (fn [[_ _ body]] (strip-tags body)) row)))
+                  (filter (fn [row] (and (seq row) (re-matches #"\d+" (first row))))))
+        ;; A rowspan means "same as the row above", so blanks are forward-filled.
+        filled (:rows (reduce (fn [{:keys [rows prev]} row]
+                                (let [row (vec (take 8 (concat row (repeat ""))))
+                                      row (if prev
+                                            (vec (map-indexed
+                                                  (fn [i v] (if (str/blank? v) (nth prev i) v))
+                                                  row))
+                                            row)]
+                                  {:rows (conj rows row) :prev row}))
+                              {:rows [] :prev nil}
+                              rows))]
+    (when-not (= 128 (count filled))
+      (throw (ex-info "triplet table is not 128 rows" {:rows (count filled)})))
+    (vec (map-indexed
+          (fn [idx [i bc xb yb dx dy xs ys]]
+            (when-not (= idx (js/parseInt i 10))
+              (throw (ex-info "triplet rows out of order" {:expected idx :got i})))
+            (let [xbits (num-or-zero xb)
+                  ybits (num-or-zero yb)]
+              ;; The invariant that makes a mis-parse obvious.
+              (when-not (= (js/parseInt bc 10) (+ 1 (quot (+ xbits ybits) 8)))
+                (throw (ex-info "triplet byte count does not match its bit widths"
+                                {:index idx :byte-count bc :x-bits xbits :y-bits ybits})))
+              [xbits ybits (num-or-zero dx) (num-or-zero dy) (sign-of xs) (sign-of ys)]))
+          filled))))
+
+;; ---------------------------------------------------------------------------
+;; Emit
+;; ---------------------------------------------------------------------------
+
+(println (str "known table tags: " (count known-tags) " (padded to four characters)"))
+(println (str "triplet rows: " (count triplets)
+              " — all satisfy byteCount = 1 + (xBits + yBits) / 8"))
+
+(def out
+  (str ";; GENERATED by tools/extract_woff2_tables.cljk from the WOFF2 specification.\n"
+       ";; DO NOT EDIT BY HAND. The generator refuses to write unless the tag list has\n"
+       ";; exactly 63 entries and every triplet row satisfies\n"
+       ";; byteCount = 1 + (xBits + yBits) / 8, which is what catches a mis-parse of\n"
+       ";; the specification's rowspan-heavy HTML.\n"
+       "(ns woff.woff2-data\n"
+       "  \"Static tables of the WOFF2 specification: the 63 known table tags (§4.1)\n"
+       "   and the 128-row triplet encoding for point coordinates (§5.2).\")\n\n"
+       ";; §4.1: the flags byte's low six bits index this list; 63 means an explicit tag.\n"
+       "(def known-tags\n  " (pr-str known-tags) ")\n\n"
+       ";; §5.2: [x-bits y-bits delta-x delta-y x-sign y-sign] per flag value 0-127.\n"
+       ";; A point's coordinate bytes are 1 + (x-bits + y-bits) / 8 minus the flag byte.\n"
+       "(def triplets\n  " (pr-str triplets) ")\n"))
+
+(.mkdirSync fs "src/woff" #js {:recursive true})
+(.writeFileSync fs "src/woff/woff2_data.cljk" out)
+(println (str "wrote src/woff/woff2_data.cljk (" (count out) " bytes)"))
