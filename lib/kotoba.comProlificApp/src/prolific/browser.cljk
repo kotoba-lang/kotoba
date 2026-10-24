@@ -1,0 +1,495 @@
+(ns prolific.browser
+  "Drive a browser form through agent-browser (CDP), verifying every write.
+
+  Why this channel and not the desktop
+  ------------------------------------
+  Choosing a DOM-level channel does not merely make failures *detectable*,
+  it makes two of them *impossible*. Measured against a fixture form on
+  2026-07-30, in the same session where synthetic keystrokes had just
+  corrupted the real one:
+
+    fill \"Research Operations\" -> read back \"Research Operations\"
+      (the keystroke channel lost the last 4 characters)
+    fill \"User Research\" over it -> read back \"User Research\"
+      (the keystroke channel had produced \"Research OperationsUser Research\")
+
+  `fill` clears then writes atomically, so `:truncated` and `:appended` from
+  `prolific.evidence` cannot occur here. `get value` supplies the read-back
+  those verdicts are computed from. That is the entire argument for this
+  namespace.
+
+  Advancing a step is a separate, named act
+  ----------------------------------------
+  `advance!` exists but refuses by default. A step whose Next button carries
+  an agreement (`signup/may-advance?` false — the Prolific email step is one:
+  there is no terms checkbox, the button IS the agreement) can only be
+  advanced by naming the exact consent being given and who gave it.
+
+  An earlier version of this namespace simply had no advance function at all.
+  That read as safe and was worse: it left the only way forward outside the
+  code, so an advance that a person did authorise happened through a raw CLI
+  call and left no record of what was agreed to. Refusing is not the goal —
+  recording is. The refusal is the default, not the ceiling.
+
+  Nothing here fills a password or answers a CAPTCHA. Those are not defaults
+  that authorisation can lift.
+
+  nbb / Node only. The decisions live in the pure namespaces."
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [prolific.channel :as channel]
+            [prolific.evidence :as ev]
+            [prolific.signup :as signup]))
+
+(def ^:private exe "agent-browser")
+
+(defn- ab
+  "Run agent-browser. Returns {:code :out :err}. Never throws — a missing
+  binary is a capability fact, not an exception."
+  [args]
+  (let [r (.spawnSync cp exe (clj->js args)
+                      #js {:encoding "utf8" :timeout 120000})]
+    {:code (or (.-status r) 1)
+     :out (or (.-stdout r) "")
+     :err (or (.-stderr r) (some-> (.-error r) .-message) "")}))
+
+(defn- ab-json
+  "Run with --json and return the parsed `data`, or nil.
+
+  nil on any parse failure rather than a guess: an unreadable response is
+  exactly the case where inventing a value would manufacture false
+  evidence."
+  [args]
+  (let [{:keys [out]} (ab (conj (vec args) "--json"))]
+    (try
+      (let [m (js->clj (js/JSON.parse out) :keywordize-keys true)]
+        (when (:success m) (:data m)))
+      (catch :default _ nil))))
+
+;; ------------------------------------------------------------- capabilities
+
+(defn probe
+  "Observed capabilities, for `prolific.channel/choose`.
+
+  Only probes what it can establish. The desktop channels are reported as
+  unavailable rather than unknown because this process has no way to check
+  them, and `channel/assess` treats an absent key as false — a capability
+  nobody probed is not a capability."
+  []
+  {:agent-browser-installed (zero? (:code (ab ["--version"])))})
+
+;; ------------------------------------------------------------------- refs
+
+(defn snapshot
+  "Ref table from the live page: {\"e3\" {:name \"Job Role\" :role \"textbox\"}}."
+  []
+  (:refs (ab-json ["snapshot"])))
+
+(defn ref-for
+  "The `@eN` selector for a field, matched on accessible name.
+
+  Exact match first, then a unique case-insensitive substring. A substring
+  matching more than one element returns nil instead of the first hit —
+  filling the wrong field is worse than reporting that the label is
+  ambiguous."
+  ([refs name] (ref-for refs name nil))
+  ([refs name role]
+   (let [candidates (cond->> (seq refs)
+                      role (filter #(= role (:role (val %)))))
+         exact (filter #(= name (:name (val %))) candidates)
+         fuzzy (filter #(str/includes? (str/lower (str (:name (val %))))
+                                       (str/lower (str name)))
+                       candidates)
+         pick (cond
+                (= 1 (count exact)) (first exact)
+                (seq exact) nil
+                (= 1 (count fuzzy)) (first fuzzy)
+                :else nil)]
+     (when pick (str "@" (clj->js (key pick)))))))
+
+(defn value
+  "Current value of a field, or nil if it cannot be read."
+  [sel]
+  (:value (ab-json ["get" "value" sel])))
+
+(defn options
+  "Visible label -> option value, for a select. This is how a sector list
+  gets reported instead of guessed: the desktop channel could not read the
+  options at all, which is why today's run stalled on Sector."
+  [refs]
+  (into {}
+        (keep (fn [[r m]]
+                (when (= "option" (:role m))
+                  (let [sel (str "@" (clj->js r))
+                        v (:value (ab-json ["get" "attr" sel "value"]))]
+                    [(:name m) v])))
+              refs)))
+
+;; ------------------------------------------------------------------ writes
+
+(defn commit-typeahead!
+  "Accept the literal text a typeahead is holding.
+
+  Prolific's Job Role renders a `Press Enter to use \"<text>\"` control when
+  the typed value is not one of its suggestions. Leaving it uncommitted is
+  not benign: on blur the widget substituted its own nearest suggestion, so
+  \"Research Operations\" silently became \"User Researcher\".
+
+  The control is CLICKED rather than Enter being pressed — Enter inside a
+  form can submit it, and on the signup form submitting is the thing that
+  must stay in a person's hands. Returns true when such a control was found."
+  [text]
+  (let [refs (snapshot)]
+    (if-let [sel (ref-for refs (str "Press Enter to use \"" text "\"") "button")]
+      (do (ab ["click" sel]) (ab ["wait" "600"]) true)
+      false)))
+
+(defn fill-verified!
+  "Write `intent` into `sel`, then prove it landed.
+
+  The repair is chosen from `evidence/verdict`, never fixed: a verdict whose
+  `:retry-same-channel?` is false ends the loop immediately, because
+  repeating a call that reported success and changed nothing is superstition
+  rather than a retry."
+  ([sel intent] (fill-verified! sel intent 2 nil))
+  ([sel intent attempts] (fill-verified! sel intent attempts nil))
+  ([sel intent attempts commit]
+   (loop [n 1]
+     (let [before (value sel)
+           _ (ab ["fill" sel intent])
+           _ (when (= :typeahead commit) (commit-typeahead! intent))
+           observed (value sel)
+           r (assoc (ev/verdict {:intent intent :before before :observed observed})
+                    :attempt n :selector sel)]
+       (cond
+         (ev/complete? r) r
+         (not (:retry-same-channel? r)) r
+         (>= n attempts) (assoc r :exhausted? true)
+         :else (recur (inc n)))))))
+
+(defn- option-refs
+  "Every `role=option` ref, by visible label. Populated only while a custom
+  listbox is open, which is why `select-verified!` opens it first."
+  [refs]
+  (into {} (keep (fn [[r m]] (when (= "option" (:role m)) [(:name m) (str "@" (clj->js r))]))
+                 refs)))
+
+(defn select-verified!
+  "Choose an option by its VISIBLE label, whichever widget this is.
+
+  Two widgets wear the same `combobox` role and need opposite drivers:
+
+    native <select>   agent-browser `select`, by the option's VALUE
+    custom listbox    click to open, click the option, read the input back
+
+  Prolific's Sector field is the second kind — an Element-UI `INPUT` with
+  `aria-haspopup=listbox` — so `select` writes nothing and reports success.
+  The native path is tried first and, when the read-back says `:unchanged`,
+  the listbox path is tried. That is not a retry: `:unchanged` asks for a
+  different technique, and repeating the same one is what `evidence` forbids.
+
+  The label is resolved from the live snapshot so a profile can name what a
+  person sees (`\"Industry\"`, not `industry`), and an unmatched label is
+  reported with the real ones — a caller told only \"it didn't work\" cannot
+  fix a typo.
+
+  `field-label` exists so the read-back can RE-RESOLVE the control instead of
+  reusing `sel`. Opening the popup renumbers the ref table, so the `sel` this
+  was called with may no longer be the combobox by the time there is
+  something to verify — which is how a correctly-set Sector came to be
+  reported `:unchanged \"\"`."
+  [refs sel field-label label]
+  (let [read-back #(value (or (ref-for (snapshot) field-label) sel))
+        native (let [opts (options refs)]
+                 (when-let [v (get opts label)]
+                   (let [before (value sel)
+                         _ (ab ["select" sel v])]
+                     (assoc (ev/verdict {:intent v :before before
+                                         :observed (read-back)})
+                            :selector sel :label label :widget :native-select))))]
+    (if (and native (:ok? native))
+      native
+      ;; Open the popup so its options enter the snapshot, then click one.
+      (let [before (value sel)
+            _ (ab ["click" sel])
+            _ (ab ["wait" "700"])
+            by-label (option-refs (snapshot))]
+        (if-let [oref (get by-label label)]
+          (let [_ (ab ["click" oref])
+                _ (ab ["wait" "700"])]
+            (assoc (ev/verdict {:intent label :before before
+                                :observed (read-back)})
+                   :label label :widget :listbox))
+          {:ok? false :verdict :absent :selector sel :label label
+           :widget :listbox
+           :available (vec (sort (keys by-label)))
+           :note "no option with that label"})))))
+
+(defn checked?
+  "Is this radio/checkbox checked? nil when it cannot be read."
+  [sel]
+  (let [{:keys [code out]} (ab ["is" "checked" sel])]
+    (when (zero? code)
+      (cond (re-find #"(?i)\btrue\b" out) true
+            (re-find #"(?i)\bfalse\b" out) false))))
+
+(defn check-verified!
+  "Select a radio option by its visible label, then prove it took.
+
+  Radios need their own path: `fill` on a radio writes nothing and reports
+  success, which is precisely the shape of failure `evidence` exists to
+  catch. The read-back here is the checked state, not a value.
+
+  `:absent` when no option carries that label, with the real labels
+  attached — the same courtesy `select-verified!` extends, for the same
+  reason: a caller given \"it didn't work\" cannot fix a typo."
+  [refs label]
+  (if-let [sel (ref-for refs label "radio")]
+    (let [before (checked? sel)
+          _ (ab ["check" sel])
+          observed (checked? sel)]
+      {:ok? (true? observed)
+       :verdict (cond (true? observed) :match
+                      (nil? observed) :absent
+                      (= before observed) :unchanged
+                      :else :mismatch)
+       :selector sel :label label
+       :before before :observed observed})
+    {:ok? false :verdict :absent :label label
+     :available (vec (sort (keep (fn [[_ m]] (when (= "radio" (:role m)) (:name m)))
+                                 refs)))
+     :note "no radio with that label"}))
+
+;; ------------------------------------------------------------------- audit
+
+(def settle-ms
+  "How long to let async widgets finish before the final audit.
+
+  A typeahead reacts to input asynchronously, so a read-back taken
+  immediately after writing samples a value that is still in flight."
+  1200)
+
+(defn audit-step
+  "Re-read every field of a step from a FRESH snapshot and compare to intent.
+
+  This is separate from the per-write verification on purpose, because a
+  per-write read-back cannot see two things:
+
+    a selector that has come unbound — writing and verifying through the same
+    stale ref reads the same wrong element twice
+    a value overwritten AFTER verification — Prolific's Job Role is a
+    typeahead, and it replaced \"Research Operations\" with its own
+    suggestion \"User Researcher\" some time after the write had already been
+    confirmed :match
+
+  Both produced a clean report over a wrong form. A step is complete when
+  this pass agrees, not when the writes did."
+  [profile step-id]
+  (ab ["wait" (str settle-ms)])
+  (let [plan (first (filter #(= step-id (:step %)) (signup/plan profile)))
+        refs (snapshot)]
+    (mapv (fn [{:keys [field label kind] intended :value}]
+            (let [sel (ref-for refs label)
+                  observed (cond
+                             (= :radio kind) (str (checked? (ref-for refs intended "radio")))
+                             (nil? sel) nil
+                             :else (value sel))
+                  intent (if (= :radio kind) "true" (str intended))]
+              {:field field :label label
+               :intent intent :observed observed
+               :ok? (= observed intent)}))
+          (:fill plan))))
+
+;; -------------------------------------------------------------------- step
+
+(defn run-step!
+  "Fill every machine-fillable field of one step, verifying each.
+
+  Re-snapshots once when a field comes back `:absent`, which is the repair
+  that verdict asks for. Returns a report; performs no navigation."
+  ([profile step-id] (run-step! profile step-id true))
+  ([profile step-id retry-absent?]
+   (let [plan (first (filter #(= step-id (:step %)) (signup/plan profile)))
+         results
+         (mapv (fn [{:keys [field label kind value commit]}]
+                 ;; Snapshot PER FIELD, not once per step.
+                 ;;
+                 ;; Taking it once produced silently shifted values on the
+                 ;; live form: opening the Sector listbox renumbered the ref
+                 ;; table, so e6/e7/e8 — captured before — then addressed the
+                 ;; NEXT field along. Organization Name received the job
+                 ;; role, Job Role received the department, Department stayed
+                 ;; empty.
+                 ;;
+                 ;; Read-back could not catch it, and that is the part worth
+                 ;; remembering: writing and verifying through the SAME stale
+                 ;; ref reads the same wrong element twice, so two of the
+                 ;; four fields reported :match while holding another
+                 ;; field's value. A selector that has come unbound is
+                 ;; invisible to a check that trusts the selector.
+                 (let [refs (snapshot)]
+                   (if (= :radio kind)
+                     ;; A radio is addressed by the OPTION's label, not the
+                     ;; field's.
+                     (assoc (check-verified! refs value) :field field)
+                     (if-let [sel (ref-for refs label)]
+                       (assoc (if (= :select kind)
+                                (select-verified! refs sel label value)
+                                (fill-verified! sel value 2 commit))
+                              :field field)
+                       {:field field :label label :ok? false :verdict :absent
+                        :note "no element with that label in the snapshot"}))))
+               (:fill plan))
+         absent? (some #(= :absent (:verdict %)) results)]
+     (if (and absent? retry-absent?)
+       (run-step! profile step-id false)
+       (let [audit (audit-step profile step-id)
+             ;; A field the writes called :match but the audit disagrees with
+             ;; was overwritten after verification — the typeahead case. It is
+             ;; reported by name rather than folded into a pass/fail, because
+             ;; "the write succeeded and the value changed afterwards" needs a
+             ;; different fix from "the write failed".
+             wrote-ok? (into {} (map (juxt :field ev/complete?) results))
+             overwritten (vec (for [a audit
+                                   :when (and (not (:ok? a))
+                                              (true? (get wrote-ok? (:field a))))]
+                                (select-keys a [:field :intent :observed])))]
+         {:step step-id
+          :heading (:heading plan)
+          :results (ev/summarize results)
+          :audit audit
+          :overwritten-after-write overwritten
+          ;; The audit is authoritative. Writes reporting :match over a wrong
+          ;; form is the exact failure this exists to stop.
+          :ok? (every? :ok? audit)
+          :blocked (:blocked plan)})))))
+
+;; ----------------------------------------------------------------- advance
+
+(defn page-text []
+  (:text (ab-json ["get" "text" "body"])))
+
+(defn advance!
+  "Press a step's Next, then prove the page actually moved.
+
+  For a step with no consent gate this needs no authorisation. For a gated
+  step — the email step, whose Next button IS the Researcher Terms agreement
+  — `opts` must carry `:consent-given` equal to the gate's `:commits` and a
+  non-blank `:authorized-by`. Naming the wrong consent is refused: an
+  authorisation for one agreement must not advance a step that commits to
+  another.
+
+  Evidence is `evidence/navigated?`, which requires BOTH a URL change and
+  text only the next screen renders. The signup advances by fragment
+  (`#country`), so location alone is weak."
+  ([step-id] (advance! step-id {}))
+  ([step-id {:keys [consent-given authorized-by]}]
+   (let [step (first (filter #(= step-id (:step/id %)) signup/steps))
+         gate (first (filter #(= step-id (:step %)) (signup/consent-gates)))]
+     (cond
+       (nil? step)
+       {:ok? false :refused :unknown-step :step step-id}
+
+       (and gate (not= consent-given (:commits gate)))
+       {:ok? false :refused :consent-not-given :step step-id
+        :requires (:commits gate) :offered consent-given
+        :note (:note gate)}
+
+       (and gate (str/blank? (str authorized-by)))
+       {:ok? false :refused :no-authorizer :step step-id
+        :note "an agreement needs somebody who made it"}
+
+       :else
+       (let [refs (snapshot)
+             sel (or (ref-for refs "Next" "button")
+                     (ref-for refs "Continue" "button"))]
+         (if-not sel
+           {:ok? false :refused :no-advance-control :step step-id}
+           (let [url-before (:url (ab-json ["get" "url"]))
+                 _ (ab ["click" sel])
+                 _ (ab ["wait" "1500"])
+                 r (ev/navigated? {:url-before url-before
+                                   :url-after (:url (ab-json ["get" "url"]))
+                                   :text-after (page-text)
+                                   :expect-marker (:step/marker step)})]
+             (cond-> (assoc r :step step-id :selector sel)
+               gate (assoc :consented (:commits gate)
+                           :authorized-by authorized-by)))))))))
+
+;; -------------------------------------------------------------------- main
+
+(defn- die [msg]
+  (js/console.error msg)
+  (.exit js/process 1))
+
+(defn- flags
+  "Parse trailing --key value pairs. Unknown flags are an error rather than
+  ignored: a mistyped --consent must not silently become no consent."
+  [args]
+  (loop [[k v & more] args acc {}]
+    (if (nil? k)
+      acc
+      (let [key (keyword (str/replace k #"^--" ""))]
+        (when-not (contains? #{:url :consent :authorized-by} key)
+          (die (str "unknown flag: " k)))
+        (recur more (assoc acc key v))))))
+
+(defn -main
+  "kbb --backend sci -m prolific.browser <profile.edn> <step-id> [--url U]
+                           [--consent GATE --authorized-by WHO]
+
+  Fills the step. With --consent it also advances it, which for a gated step
+  is an agreement — hence both flags, and hence the authoriser is printed.
+
+  Refuses to act at all when no verifiable channel is available, which is the
+  check whose absence let a half-filled form happen."
+  [& args]
+  (let [[profile-path step & rest] args
+        {:keys [url consent authorized-by]} (flags rest)]
+    (when-not (and profile-path step)
+      (die "usage: kbb --backend sci -m prolific.browser <profile.edn> <step-id> [--url U] [--consent GATE --authorized-by WHO]"))
+    (let [pick (channel/choose (probe))]
+      (when-not (:channel pick)
+        (die (channel/explain pick)))
+      (let [profile (edn/read-string (.readFileSync fs profile-path "utf8"))
+            cov (signup/coverage profile)
+            step-id (keyword step)]
+        (when url (ab ["open" url]))
+        (let [report (run-step! profile step-id)]
+          (println (str "channel: " (name (:channel pick))))
+          (println (str "coverage: " (:machine-filled cov) "/" (:fields cov)
+                        " fields fillable now"
+                        (when (seq (:closable-gaps cov))
+                          (str "; closable gaps " (pr-str (:closable-gaps cov))))))
+          (println (str "step " (name (:step report)) " — " (:heading report)))
+          (doseq [a (:audit report)]
+            (println (str "  " (if (:ok? a) "ok     " "WRONG  ") (name (:field a))
+                          "  " (pr-str (:observed a))
+                          (when-not (:ok? a) (str "   want " (pr-str (:intent a)))))))
+          (doseq [o (:overwritten-after-write report)]
+            (println (str "  ! " (name (:field o))
+                          " passed its write check and changed afterwards"
+                          " — wrote " (pr-str (:intent o))
+                          ", now " (pr-str (:observed o)))))
+          (doseq [b (:blocked report)]
+            (println (str "  BLOCKED " (name (:field b)) " — " (name (:reason b))
+                          (when (:recommend b) (str " (" (:recommend b) ")")))))
+          (let [adv (when consent
+                      (advance! step-id {:consent-given (keyword consent)
+                                         :authorized-by authorized-by}))]
+            (when adv
+              (if (:ok? adv)
+                (println (str "  ADVANCED"
+                              (when (:consented adv)
+                                (str " — consented to " (name (:consented adv))
+                                     ", authorized by " (:authorized-by adv)))
+                              "\n    " (:url-before adv) "\n -> " (:url-after adv)))
+                (println (str "  NOT ADVANCED — "
+                              (if-let [r (:refused adv)] (name r)
+                                      (str "moved? " (:moved? adv)
+                                           " marked? " (:marked? adv)))))))
+            (.exit js/process (if (and (:ok? report)
+                                       (or (nil? adv) (:ok? adv)))
+                                0 1))))))))
