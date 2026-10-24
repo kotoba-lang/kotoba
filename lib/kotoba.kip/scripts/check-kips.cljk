@@ -1,0 +1,163 @@
+#!/usr/bin/env kbb
+;; check-kips.cljs — registry integrity for kotoba-lang/kip.
+;;
+;;   npx --yes kbb --backend sci --classpath <root>/src <root>/scripts/check-kips.cljk <root> [--surfaces <authority-map.edn>]
+;;
+;; <root> must be the FIRST positional argument. Several gates in this workspace
+;; take the tree as `(first (remove #(str/starts-with? % "--") argv))`, so
+;; `check-kips.cljs --surfaces x .` would silently treat "x" as the tree. The
+;; fleet runner passes <dir> first; a human running it by hand is the one who
+;; gets this wrong (measured 2026-08-10, three gates misdiagnosed that way).
+;;
+;; ## Exit codes
+;;
+;;   0  checked, no errors
+;;   1  checked, errors found
+;;   2  COULD NOT ANSWER — inputs missing or unreadable
+;;
+;; 2 exists because 0 and 1 are both claims about the registry, and "I never saw
+;; the registry" is not one of them. Fourteen instances of a check that returns
+;; its pass value when it could not run were found in this workspace in a single
+;; day (ADR-2608136000); the distinguishing fix that worked was an evidence
+;; floor plus a third exit code, and both are here.
+;;
+;; ## Lines that are not findings
+;;
+;; SCANNED / READ-OK are the evidence floor. QUORUM-VERIFY and SURFACE-DRIFT
+;; always print, and always say `ok`, `skipped:<why>` or `FAIL`, so that a check
+;; that did not run cannot be read as one that passed.
+
+(ns kip.check
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.kip.core :as core]
+            [kotoba.kip.registry :as registry]))
+
+(def argv (vec *command-line-args*))
+(def positional (vec (remove #(str/starts-with? % "--") argv)))
+(def root (or (first positional) "."))
+
+(defn- flag-value [name]
+  (some (fn [[a b]] (when (= a name) b)) (partition 2 1 argv)))
+
+(defn- say [& xs] (println (str/join "\t" xs)))
+
+(defn- bail! [code & msg]
+  (say "RESULT" (case code 0 "pass" 1 "fail" "could-not-answer"))
+  (when (seq msg) (println (str "  " (str/join " " msg))))
+  (js/process.exit code))
+
+(defn- read-edn [p]
+  (try {:ok (edn/read-string (fs/readFileSync p "utf8"))}
+       (catch :default e {:err (.-message e)})))
+
+;; ------------------------------------------------------------------- inputs
+(def process-path (path/join root "lang" "kip-process.edn"))
+(def kips-dir (path/join root "kips"))
+
+(when-not (fs/existsSync process-path)
+  (bail! 2 "lang/kip-process.edn not found under" root
+         "— the process authority is the thing every rule is read from."))
+(when-not (fs/existsSync kips-dir)
+  (bail! 2 "kips/ not found under" root))
+
+(def process
+  (let [{:keys [ok err]} (read-edn process-path)]
+    (if err (bail! 2 "lang/kip-process.edn is unreadable:" err) ok)))
+
+(def kip-files
+  (->> (fs/readdirSync kips-dir)
+       (filter #(str/ends-with? % ".edn"))
+       sort
+       (mapv #(path/join kips-dir %))))
+
+;; An empty registry is not a clean registry. This is the floor that stops a
+;; broken checkout, a bad glob, or an :include-ext filter that dropped the
+;; documents from being reported as "no findings".
+(say "SCANNED" (count kip-files))
+(when (zero? (count kip-files))
+  (bail! 2 "kips/ holds no .edn documents. Refusing to report a pass on an"
+         "empty registry — nothing was checked."))
+
+(def entries
+  (for [p kip-files]
+    (let [{:keys [ok err]} (read-edn p)]
+      {:path (path/relative root p)
+       :tx-data (when-not err ok)
+       :read-error err})))
+
+(def unreadable (filterv :read-error entries))
+(def readable (filterv (complement :read-error) entries))
+
+(say "READ-OK" (count readable) (str "of " (count entries)))
+
+;; ------------------------------------------------------------------- checks
+(def result (registry/check process readable))
+(def errs (into (mapv (fn [{:keys [path read-error]}]
+                        {:severity :error :kind :kip/unreadable :path path :note read-error})
+                      unreadable)
+                (registry/errors result)))
+(def warns (registry/warnings result))
+
+;; --------------------------------------------------------- delegated checks
+;; Both of these are real checks this gate cannot perform from here. They print
+;; every run so that their absence is visible, rather than being an unwritten
+;; assumption a reader has to know about.
+
+(def finals-needing-quorum
+  (->> readable
+       (map #(core/read-kip (:tx-data %)))
+       (filter #(and (= :final (:kip/status %)) (= :standards (:kip/track %))))
+       count))
+
+(say "QUORUM-VERIFY"
+     (if (zero? finals-needing-quorum)
+       "n/a:no-final-standards-kip"
+       "skipped:no-verifier")
+     (str "(" finals-needing-quorum " final standards KIP(s); signature bytes are not checked here"
+          " — kotoba.kip.core/quorum-signers takes :verify-fn)"))
+
+(def surface-drift
+  (if-let [am (flag-value "--surfaces")]
+    (if-not (fs/existsSync am)
+      {:status "FAIL" :note (str "--surfaces " am " does not exist")}
+      (let [{:keys [ok err]} (read-edn am)]
+        (if err
+          {:status "FAIL" :note (str "authority-map unreadable: " err)}
+          (let [surfaces (read-edn (path/join root "lang" "normative-surfaces.edn"))]
+            (if (:err surfaces)
+              {:status "FAIL" :note (str "lang/normative-surfaces.edn unreadable: " (:err surfaces))}
+              (let [declared (->> (:authorities ok)
+                                  (filter (fn [[_ v]] (#{:machine-normative :human-normative} (:kind v))))
+                                  (map (fn [[k v]] [k (:path v)]))
+                                  (into (sorted-map)))
+                    adopted (into (sorted-map) (map (juxt :id :path)) (:adopted (:ok surfaces)))
+                    only-upstream (remove (fn [[k _]] (contains? adopted k)) declared)
+                    only-here (remove (fn [[k _]] (contains? declared k)) adopted)]
+                (if (and (empty? only-upstream) (empty? only-here))
+                  {:status "ok" :note (str (count declared) " normative authorities agree")}
+                  {:status "FAIL"
+                   :note (str "authority-map has " (mapv first only-upstream)
+                              " that :adopted lacks; :adopted has " (mapv first only-here)
+                              " that authority-map does not name")})))))))
+    {:status "skipped:no-authority-map"
+     :note "pass --surfaces <kotoba-lang/docs/authority-map.edn> to compare :adopted against upstream"}))
+
+(say "SURFACE-DRIFT" (:status surface-drift) (str "(" (:note surface-drift) ")"))
+
+;; ------------------------------------------------------------------ report
+(doseq [w warns]
+  (say "WARN" (:kind w) (or (:path w) "-") (pr-str (dissoc w :severity :kind :path))))
+(doseq [e errs]
+  (say "ERROR" (:kind e) (pr-str (:path e)) (pr-str (dissoc e :severity :kind :path))))
+
+(say "FINDINGS" (str (count errs) " error(s), " (count warns) " warning(s)"))
+
+(cond
+  (= "FAIL" (:status surface-drift))
+  (bail! 1 "surface drift against authority-map")
+
+  (seq errs) (bail! 1 (str (count errs) " registry error(s)"))
+  :else (bail! 0))
