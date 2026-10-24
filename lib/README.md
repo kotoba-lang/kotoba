@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.ipXact` | `kotoba.ipXact/src` | `ip-xact`, `ip-xact.bus-protocol`, `ip-xact.cdc`, `ip-xact.component` (Kotoba project library) |
 | `kotoba.ip` | `kotoba.ip/src` | `kotoba.ip.bus-protocol`, `kotoba.ip.cdc`, `kotoba.ip.ip-xact`, `kotoba.ip.noc` (Kotoba project library) |
 | `kotoba.sigv4` | `kotoba.sigv4/src` | `sigv4.core`, `sigv4.crypto`, `sigv4.protocols`, `sigv4.request` (Kotoba project library) |
 | `kotoba.ioIpniSpecs` | `kotoba.ioIpniSpecs/src` | `ipni.ad`, `ipni.advertise`, `ipni.announce`, `ipni.find` (Kotoba project library) |
