@@ -1,0 +1,292 @@
+;; The did:web resolution decision, as a Kotoba application
+;; (ADR-2608261100) — W3C DID Method `web`.
+;;
+;;   init        (config)      -> state
+;;   offer-did   (state, did)  -> state
+;;
+;; ## Why this one is a decision and not a formatter
+;;
+;; `did-web-url` turns a DID into an HTTPS URL that something will then
+;; FETCH. In most flows the DID came from outside — a credential, a
+;; presentation, a peer's message — so the method-specific id is
+;; attacker-controlled and the URL it produces decides what host gets
+;; contacted and with what path. That is the SSRF seam, and it is a
+;; decision.
+;;
+;; Measured on this repo at accf098, `did.core/did-web-url`:
+;;
+;;   did:web:example.com:..:..:etc:passwd
+;;     -> https://example.com/../../etc/passwd/did.json
+;;   did:web:example.com::alice
+;;     -> https://example.com//alice/did.json
+;;   did:web:example.com%3A3000
+;;     -> https://example.com%3A3000/.well-known/did.json
+;;
+;; The first climbs out of the path it was given. The second is a malformed
+;; path. The third is a malformed host: the did:web method spec says a
+;; percent-encoded colon in the method-specific id encodes a PORT, and
+;; leaving it encoded produces a hostname no resolver will reach and some
+;; clients will normalise in surprising ways.
+;;
+;; So the guest refuses the first two and decodes the third:
+;;
+;;   the guest owns   whether this DID names a fetchable document, and what
+;;                    URL that is
+;;   the host owns    the fetch, and which hosts it is willing to contact
+;;
+;; ## What this deliberately does NOT decide
+;;
+;; It does not refuse `did:web:localhost`, or link-local addresses, or
+;; anything else by policy. The method spec has no such rule, and inventing
+;; one here would put a deployment's allow-list inside a syntax check where
+;; nobody would look for it. `host` and `port` are exported precisely so the
+;; host can apply its own — which is where an allow-list belongs, next to
+;; the client that would make the request.
+;;
+;; The line is: the guest enforces what the SPEC says about the shape, and
+;; hands the host the pieces it needs to enforce what the DEPLOYMENT says
+;; about the destination.
+;;
+;; ## Percent-encoding
+;;
+;; Only `%3A` is decoded, and only in the first segment, because that is the
+;; one case the method spec gives a meaning to. Any other `%` is refused
+;; rather than passed through: a resolver that forwards an escape it does
+;; not understand is deciding, by omission, that whatever the HTTP client
+;; makes of it is fine.
+;;
+;; `.cljc` remains the oracle for the shapes it gets right, and is not
+;; required from here (require-graph). It did not grow a second copy of
+;; these refusals — a check implemented twice is a check that will diverge
+;; once (ADR-2608261100).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/did/web_url.kotoba \
+;;     --target wasm32-browser --output web_url.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6467-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns did.web-url
+  (:export [init offer-did
+            phase reason
+            url host port method method-id segment-count]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+;; --- byte scanning --------------------------------------------------------
+;; A DID is US-ASCII (the method-specific id is percent-encoded), so byte
+;; offsets are the right unit.
+
+(defn- at-byte [s :string i :i64] :i64
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- starts-with? [s :string prefix :string] :bool
+  (let [n (string-byte-length prefix)]
+    (if (> n (string-byte-length s))
+      false
+      (string=? (string-substring s 0 n) prefix))))
+
+(defn- index-of [s :string c :i64 i :i64] :i64
+  (let [x (at-byte s i)]
+    (cond (= x -1) -1
+          (= x c) i
+          :else (index-of s c (+ i 1)))))
+
+(defn- digit? [c :i64] :bool (and (>= c 48) (<= c 57)))
+
+(defn- read-i64 [s :string i :i64 acc :i64] :i64
+  (let [c (at-byte s i)]
+    (if (digit? c)
+      (read-i64 s (+ i 1) (+ (* (if (< acc 0) 0 acc) 10) (- c 48)))
+      acc)))
+
+(defn- all-digits? [s :string i :i64] :bool
+  (let [c (at-byte s i)]
+    (cond (= c -1) (> i 0)
+          (not (digit? c)) false
+          :else (all-digits? s (+ i 1)))))
+
+;; --- segments -------------------------------------------------------------
+;; The method-specific id is colon-separated; each colon becomes a `/` in
+;; the path (or the boundary before the port, in the first segment).
+
+(defn- segment-end [s :string i :i64] :i64
+  (let [c (index-of s 58 i)]
+    (if (< c 0) (string-byte-length s) c)))
+
+(defn- count-segments [s :string i :i64 acc :i64] :i64
+  (let [e (segment-end s i)]
+    (if (>= e (string-byte-length s))
+      (+ acc 1)
+      (count-segments s (+ e 1) (+ acc 1)))))
+
+;; `..` and `.` climb out of the path the DID named. A resolver that passes
+;; them on fetches a document the DID does not identify, from a place its
+;; author did not choose.
+(defn- traversal? [s :string i :i64] :bool
+  (let [e (segment-end s i)
+        seg (string-substring s i e)]
+    (cond
+      (or (string=? seg "..") (string=? seg ".")) true
+      (>= e (string-byte-length s)) false
+      :else (traversal? s (+ e 1)))))
+
+(defn- empty-segment? [s :string i :i64] :bool
+  (let [e (segment-end s i)]
+    (cond
+      (= e i) true
+      (>= e (string-byte-length s)) false
+      :else (empty-segment? s (+ e 1)))))
+
+;; Any `%` that is not the `%3A` the method spec gives a meaning to. A
+;; resolver that forwards an escape it does not understand is deciding, by
+;; omission, that whatever the HTTP client makes of it is fine.
+(defn- pct-3a-at? [s :string i :i64] :bool
+  (and (= (at-byte s i) 37)
+       (and (= (at-byte s (+ i 1)) 51)
+            (or (= (at-byte s (+ i 2)) 65) (= (at-byte s (+ i 2)) 97)))))
+
+(defn- bad-percent? [s :string i :i64] :bool
+  (let [p (index-of s 37 i)]
+    (cond
+      (< p 0) false
+      (not (pct-3a-at? s p)) true
+      :else (bad-percent? s (+ p 3)))))
+
+;; --- building the path ----------------------------------------------------
+
+(defn- join-from [s :string i :i64 acc :string] :string
+  (let [e (segment-end s i)
+        seg (string-substring s i e)]
+    (if (>= e (string-byte-length s))
+      (string-concat acc (string-concat "/" seg))
+      (join-from s (+ e 1) (string-concat acc (string-concat "/" seg))))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+(defn init [_config :document] :document
+  (document-map :phase (document-keyword :want-did)
+                :reason (document-keyword :none)
+                :url (document-string "")
+                :host (document-string "")
+                :port (document-i64 -1)
+                :method (document-string "")
+                :method-id (document-string "")
+                :segments (document-i64 0)))
+
+;; --- the decision ---------------------------------------------------------
+
+(defn offer-did [state :document did :string] :document
+  (if (not (= (dk state :phase) :want-did))
+    state
+    (if (not (starts-with? did "did:"))
+      (refuse state :did/malformed)
+      (let [m-end (index-of did 58 4)]
+        (if (< m-end 0)
+          (refuse state :did/malformed)
+          (let [m (string-substring did 4 m-end)
+                mid (string-substring did (+ m-end 1) (string-byte-length did))
+                kept (document-assoc
+                      (document-assoc state :method (document-string m))
+                      :method-id (document-string mid))]
+            (cond
+              (string=? m "") (refuse kept :did/malformed)
+
+              ;; Named, so a caller can tell "this library does not do that
+              ;; method" from "that DID is malformed".
+              (not (string=? m "web")) (refuse kept :did/unsupported-method)
+
+              (string=? mid "") (refuse kept :did/empty-method-id)
+
+              (empty-segment? mid 0) (refuse kept :did/empty-segment)
+
+              (traversal? mid 0) (refuse kept :did/path-traversal)
+
+              (bad-percent? mid 0) (refuse kept :did/unsupported-percent-encoding)
+
+              :else
+              (let [h-end (segment-end mid 0)
+                    first-seg (string-substring mid 0 h-end)
+                    pct (index-of first-seg 37 0)
+                    h (if (< pct 0) first-seg (string-substring first-seg 0 pct))
+                    port-text (if (< pct 0)
+                                ""
+                                (string-substring first-seg (+ pct 3)
+                                                  (string-byte-length first-seg)))
+                    p (if (string=? port-text "") -1 (read-i64 port-text 0 -1))
+                    authority (if (< p 0)
+                                h
+                                (string-concat h (string-concat ":" port-text)))
+                    tail (if (>= h-end (string-byte-length mid))
+                           "/.well-known/did.json"
+                           (string-concat (join-from mid (+ h-end 1) "")
+                                          "/did.json"))]
+                (cond
+                  (string=? h "") (refuse kept :did/empty-host)
+
+                  ;; A port that is not a number is not a port, and the
+                  ;; `%3A` said one was coming.
+                  (and (not (string=? port-text ""))
+                       (not (all-digits? port-text 0)))
+                  (refuse kept :did/bad-port)
+
+                  :else
+                  (document-assoc
+                   (document-assoc
+                    (document-assoc
+                     (document-assoc
+                      (document-assoc kept :phase (document-keyword :resolvable))
+                      :host (document-string h))
+                     :port (document-i64 p))
+                    :segments (document-i64 (count-segments mid 0 0)))
+                   :url (document-string
+                         (string-concat "https://"
+                                        (string-concat authority tail)))))))))))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; Only for a DID that was accepted. A URL handed back from a refusal would
+;; make the refusal decorative -- and this one gets fetched.
+(defn url [state :document] :string
+  (if (= (dk state :phase) :resolvable) (ds state :url) ""))
+
+;; Exported so the deployment can apply its own allow-list, which is where
+;; an allow-list belongs: next to the client that would make the request.
+;; This module has no opinion about which hosts are acceptable.
+(defn host [state :document] :string (ds state :host))
+
+;; -1 when the DID named none, which means the default for https.
+(defn port [state :document] :i64 (di state :port))
+
+(defn method [state :document] :string (ds state :method))
+
+(defn method-id [state :document] :string (ds state :method-id))
+
+(defn segment-count [state :document] :i64 (di state :segments))
