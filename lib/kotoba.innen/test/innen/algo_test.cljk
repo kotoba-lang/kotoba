@@ -1,0 +1,118 @@
+(ns innen.algo-test
+  "Synthetic fixtures -- see innen.schema-test's docstring for why."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [innen.algo :as a]
+            [innen.core :as c]))
+
+(defn n [id kind label]
+  {:innen.node/id id :innen.node/kind kind :innen.node/label label
+   :innen.node/source "synthetic fixture"})
+
+(defn e [from to kind necessity & [extra]]
+  (merge {:innen.edge/from from :innen.edge/to to :innen.edge/kind kind
+          :innen.edge/necessity necessity :innen.edge/confidence :documented
+          :innen.edge/as-of "2026-07-25" :innen.edge/valid {:from "1900"}
+          :innen.edge/source "synthetic fixture"}
+         extra))
+
+;; chain: app -> service -> fab -> mineral, plus a second (substitutable) supply
+(def g
+  (c/graph
+   {:nodes (mapv #(apply n %) [[:node/app :organization "App"]
+                               [:node/service :organization "Service"]
+                               [:node/fab :artifact "Fab"]
+                               [:node/mineral :resource "Mineral"]
+                               [:node/mine-a :organization "Mine A"]
+                               [:node/mine-b :organization "Mine B"]
+                               [:node/archive :document "Archive"]])
+    :edges [(e :node/app :node/service :infrastructure :required)
+            (e :node/service :node/fab :supply :required)
+            (e :node/fab :node/mineral :supply :required)
+            (e :node/mineral :node/mine-a :supply :substitutable)
+            (e :node/mineral :node/mine-b :supply :substitutable)
+            (e :node/app :node/archive :information :incidental)]}))
+
+(deftest transitive-walk-test
+  (is (= #{:node/service :node/fab :node/mineral :node/mine-a :node/mine-b :node/archive}
+         (:innen/dependencies (a/transitive-dependencies g :node/app))))
+  (testing "a depth bound reports that it truncated instead of looking complete"
+    (let [r (a/transitive-dependencies g :node/app {:max-depth 2})]
+      (is (true? (:innen/truncated? r)))
+      (is (= #{:node/service :node/archive :node/fab} (:innen/dependencies r)))))
+  (is (= #{:node/app :node/service :node/fab} (:innen/dependents (a/transitive-dependents g :node/mineral)))))
+
+(deftest cascade-necessity-semantics-test
+  (testing "one substitutable source failing does NOT fail the dependent"
+    (is (= #{:node/mine-a} (:innen/failed (a/cascade g #{:node/mine-a})))))
+  (testing "all substitutable sources failing does"
+    (is (= #{:node/mine-a :node/mine-b :node/mineral :node/fab :node/service :node/app}
+           (:innen/failed (a/cascade g #{:node/mine-a :node/mine-b})))))
+  (testing "a required link propagates the whole chain up"
+    (is (= #{:node/fab :node/service :node/app} (:innen/failed (a/cascade g #{:node/fab})))))
+  (testing "an incidental link never propagates"
+    (is (= #{:node/archive} (:innen/failed (a/cascade g #{:node/archive})))))
+  (testing "rounds show how the failure travelled"
+    (is (= [#{:node/service} #{:node/app}] (:innen/rounds (a/cascade g #{:node/fab}))))))
+
+(deftest criticality-ranking-test
+  (let [ranked (a/criticality g)
+        by-id (into {} (map (juxt :innen.node/id identity)) ranked)]
+    (is (= :node/mineral (:innen.node/id (first ranked))))
+    (is (= 3 (:innen/dependents-lost (by-id :node/mineral))))
+    (testing "a single substitutable supplier is critical for nothing on its own"
+      (is (= 0 (:innen/dependents-lost (by-id :node/mine-a)))))
+    (testing "every score says what it was computed from"
+      (is (every? :innen/basis ranked)))))
+
+(deftest concentration-basis-is-explicit-test
+  (testing "with no stated shares the HHI is an edge-count artefact and says so"
+    (let [r (get-in (a/concentration g :node/mineral) [:innen/per-kind :supply])]
+      (is (= 2 (:innen/source-count r)))
+      (is (= :edge-count-equal-weight (:innen/hhi-basis r)))
+      (is (= 0.5 (:innen/hhi r)))
+      (is (false? (:innen/single-source? r)))))
+  (testing "a single recorded source is flagged"
+    (is (true? (get-in (a/concentration g :node/fab) [:innen/per-kind :supply :innen/single-source?]))))
+  (testing "when every edge carries a stated share, the real share-weighted HHI is used"
+    (let [g2 (c/graph {:nodes (mapv #(apply n %) [[:node/x :organization "X"]
+                                                  [:node/s1 :organization "S1"]
+                                                  [:node/s2 :organization "S2"]])
+                       :edges [(e :node/x :node/s1 :supply :substitutable {:innen.edge/share 0.9})
+                               (e :node/x :node/s2 :supply :substitutable {:innen.edge/share 0.1})]})
+          r (get-in (a/concentration g2 :node/x) [:innen/per-kind :supply])]
+      (is (= :stated-share (:innen/hhi-basis r)))
+      (is (< 0.8 (:innen/hhi r) 0.83)))))
+
+(deftest explain-carries-citations-test
+  (let [x (a/explain g :node/app :node/mineral)]
+    (is (= 3 (:innen/hops x)))
+    (is (= [:node/service :node/fab :node/mineral] (mapv :innen.edge/to (:innen/path x))))
+    (testing "every hop can be checked by a human"
+      (is (every? :innen.edge/source (:innen/path x)))))
+  (testing "no recorded path returns nil -- a statement about the record, not the world"
+    (is (nil? (a/explain g :node/mineral :node/app)))))
+
+(deftest mutual-dependency-test
+  (let [g2 (c/graph {:nodes (mapv #(apply n %) [[:node/p :polity "P"] [:node/q :polity "Q"] [:node/r :polity "R"]])
+                     :edges [(e :node/p :node/q :funding :required)
+                             (e :node/q :node/p :funding :required)
+                             (e :node/r :node/p :funding :required)]})]
+    (is (= [#{:node/p :node/q}] (a/cycles g2)))
+    (testing "being IN a cycle is distinguished from sitting downstream of one"
+      (let [{:innen/keys [order in-cycle blocked-by-cycle]} (a/topo-order g2)]
+        (is (= #{:node/p :node/q} in-cycle))
+        (is (= #{:node/r} blocked-by-cycle))
+        (is (= [] order))))
+    (testing "acyclic graphs order dependencies before dependents"
+      (let [{:innen/keys [order in-cycle blocked-by-cycle]} (a/topo-order g)
+            pos (fn [id] (first (keep-indexed (fn [i x] (when (= x id) i)) order)))]
+        (is (empty? in-cycle))
+        (is (empty? blocked-by-cycle))
+        (is (< (pos :node/mineral) (pos :node/app)))))))
+
+(deftest frontier-ranks-what-to-ingest-next-test
+  (let [f (a/frontier g)]
+    (testing "leaves with the most dependents come first -- extending them changes the most answers"
+      (is (= :node/mine-a (:innen.node/id (first f))))
+      (is (= 4 (:innen/dependents (first f)))))
+    (is (= #{:node/mine-a :node/mine-b :node/archive} (set (map :innen.node/id f))))))
