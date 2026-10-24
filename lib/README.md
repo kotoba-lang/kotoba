@@ -99,6 +99,21 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.zone` | `kotoba.zone/src` | `zone.model`, `zone.validate`, `zone.zone` (Kotoba project library) |
+| `kotoba.yakuwariView` | `kotoba.yakuwariView/src` | `yakuwari-view.hiccup`, `yakuwari-view.model` (Kotoba project library) |
+| `kotoba.yakuwari` | `kotoba.yakuwari/src` | `yakuwari.policy`, `yakuwari.reconcile`, `yakuwari.spec` (Kotoba project library) |
+| `kotoba.xyzUcan` | `kotoba.xyzUcan/src` | `ucan.core` (Kotoba project library) |
+| `kotoba.x402Directory` | `kotoba.x402Directory/src` | `x402.directory` (Kotoba project library) |
+| `kotoba.worklaw` | `kotoba.worklaw/src` | `kotoba.worklaw` (Kotoba project library) |
+| `kotoba.windowSessionState` | `kotoba.windowSessionState/src` | `window-session-state`, `window-session-state.compositor`, `window-session-state.file-explorer`, `window-session-state.input-router` (Kotoba project library) |
+| `kotoba.wici` | `kotoba.wici/src` | `wici.device`, `wici.place`, `wici.protocol`, `wici.remote` (Kotoba project library) |
+| `kotoba.webrtc` | `kotoba.webrtc/src` | `kotoba.webrtc`, `kotoba.webrtc.export`, `kotoba.webrtc.room`, `kotoba.webrtc.session` (Kotoba project library) |
+| `kotoba.webModelb` | `kotoba.webModelb/src` | `kotoba.web-modelb`, `kotoba.web-modelb.config` (Kotoba project library) |
+| `kotoba.voxel` | `kotoba.voxel/src` | `voxel`, `voxel.nvdb`, `voxel.vdb`, `voxel.vdb-file` (Kotoba project library) |
+| `kotoba.vllm` | `kotoba.vllm/src` | `vllm.accelerator`, `vllm.core`, `vllm.generate`, `vllm.gguf` (Kotoba project library) |
+| `kotoba.userTest` | `kotoba.userTest/src` | `kotoba.user-test`, `kotoba.user-test.cli`, `kotoba.user-test.io`, `kotoba.user-test.mcp` (Kotoba project library) |
+| `kotoba.uptime` | `kotoba.uptime/src` | `uptime.core` (Kotoba project library) |
+| `kotoba.triage` | `kotoba.triage/src` | `triage.classify`, `triage.eval`, `triage.metrics` (Kotoba project library) |
 | `kotoba.toshokanPatents` | `kotoba.toshokanPatents/src` | `toshokan-patents.quad`, `toshokan-patents.quad.fs`, `toshokan-patents.sources.google-patents` (Kotoba project library) |
 | `kotoba.torihikiChart` | `kotoba.torihikiChart/src` | `torihiki-chart.axis`, `torihiki-chart.candle`, `torihiki-chart.depth`, `torihiki-chart.view` (Kotoba project library) |
 | `kotoba.tilemap` | `kotoba.tilemap/src` | `tilemap` (Kotoba project library) |

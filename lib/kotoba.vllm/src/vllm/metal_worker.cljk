@@ -1,0 +1,121 @@
+(ns vllm.metal-worker
+  "Synchronous JVM client for num's persistent Deno WebGPU/Metal worker."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [vllm.accelerator :as accelerator])
+  (:import [java.io BufferedReader BufferedWriter Closeable InputStreamReader OutputStreamWriter]
+           [java.nio ByteBuffer]
+           [java.util UUID]
+           [java.lang ProcessBuilder$Redirect]))
+
+(defn- fail [message data] (throw (ex-info (str "vllm.metal-worker: " message) data)))
+
+(defn- buffer-bytes ^bytes [^ByteBuffer source]
+  (let [copy (.duplicate source) result (byte-array (.remaining copy))]
+    (.get copy result)
+    result))
+
+(defn- exchange! [{:keys [^BufferedWriter writer ^BufferedReader reader]} request]
+  (.write writer (str (json/write-str request) "\n"))
+  (.flush writer)
+  (let [line (.readLine reader)]
+    (when-not line (fail "worker closed its output" {:request (:op request)}))
+    (let [response (json/read-str line :key-fn keyword)]
+      (when-not (:ok response)
+        (fail "worker rejected request" {:request (:op request) :response response}))
+      response)))
+
+(defrecord MetalWorker [^Process process ^BufferedWriter writer ^BufferedReader reader lock]
+  accelerator/IMatrixAccelerator
+  (upload-q8! [this id rows columns bytes]
+    (locking lock
+      (let [handle (str id "-" (UUID/randomUUID))
+            encoded (kbytes/base64-encode
+                                     (if (instance? ByteBuffer bytes)
+                                       (buffer-bytes bytes)
+                                       ^bytes bytes))]
+        (exchange! this {:op "upload-q8" :id handle :rows rows :cols columns
+                         :data encoded})
+        handle)))
+  (gemv! [this handle x]
+    (locking lock
+      (float-array (:y (exchange! this {:op "gemv" :id handle :x (vec x)})))))
+  (release! [this handle]
+    (locking lock (exchange! this {:op "release" :id handle}) nil))
+  accelerator/IBatchedMatrixAccelerator
+  (gemv-many! [this requests]
+    (locking lock
+      (mapv (comp float-array :y)
+            (:results
+             (exchange! this
+                        {:op "gemv-many"
+                         :requests (mapv (fn [[handle x]]
+                                           {:id handle :x (vec x)})
+                                         requests)})))))
+  accelerator/IQuantizedMatrixAccelerator
+  (upload-quantized! [this type id rows columns bytes]
+    (when-not (contains? #{:q8-0 :q4-0 :q4-k :q5-0 :q5-1 :q5-k :q6-k} type)
+      (fail "unsupported Metal quantization" {:type type}))
+    (locking lock
+      (let [handle (str id "-" (UUID/randomUUID))
+            encoded (kbytes/base64-encode
+                                     (if (instance? ByteBuffer bytes)
+                                       (buffer-bytes bytes)
+                                       ^bytes bytes))]
+        (exchange! this {:op (case type :q8-0 "upload-q8" :q4-0 "upload-q4"
+                                   :q4-k "upload-q4k" :q5-0 "upload-q5"
+                                   :q5-1 "upload-q5-1" :q5-k "upload-q5k"
+                                   :q6-k "upload-q6k")
+                         :id handle :rows rows :cols columns :data encoded})
+        handle)))
+  accelerator/IAttentionAccelerator
+  (create-kv! [this id layers context kv-heads head-dim]
+    (locking lock
+      (let [handle (str id "-" (UUID/randomUUID))]
+        (exchange! this {:op "create-kv" :id handle :layers layers :context context
+                         :kvHeads kv-heads :headDim head-dim})
+        handle)))
+  (clone-kv! [this source id]
+    (locking lock
+      (let [handle (str id "-" (UUID/randomUUID))]
+        (exchange! this {:op "clone-kv" :source source :id handle})
+        handle)))
+  (attention! [this handle layer position heads q k v]
+    (locking lock
+      (float-array
+       (:output (exchange! this {:op "attention" :id handle :layer layer
+                                 :position position :heads heads
+                                 :q (vec q) :k (vec k) :v (vec v)})))))
+  (release-kv! [this handle]
+    (locking lock (exchange! this {:op "release-kv" :id handle}) nil))
+  accelerator/IBatchedAttentionAccelerator
+  (attention-many! [this requests]
+    (locking lock
+      (mapv (comp float-array :output)
+            (:results
+             (exchange! this
+                        {:op "attention-many"
+                         :requests (mapv (fn [{:keys [handle layer position heads q k v]}]
+                                           {:id handle :layer layer :position position
+                                            :heads heads :q (vec q) :k (vec k) :v (vec v)})
+                                         requests)})))))
+  Closeable
+  (close [_]
+    (try (.close writer) (catch Exception _))
+    (try (.close reader) (catch Exception _))
+    (.destroy process)))
+
+(defn start
+  "Start a persistent Metal worker. `command` defaults to the compiled num
+  worker in a sibling checkout and may be overridden for packaging."
+  ([] (start ["deno" "run" "--allow-all" "../num/target/deno-q8-worker.cjs"]))
+  ([command]
+   (let [builder (ProcessBuilder. ^java.util.List command)
+         _ (.redirectError builder ProcessBuilder$Redirect/INHERIT)
+         process (.start builder)]
+     (->MetalWorker process
+                    (BufferedWriter. (OutputStreamWriter. (.getOutputStream process)))
+                    (BufferedReader. (InputStreamReader. (.getInputStream process)))
+                    (Object.)))))
+
+(defn stats [worker]
+  (locking (:lock worker) (exchange! worker {:op "stats"})))

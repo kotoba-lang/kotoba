@@ -1,0 +1,150 @@
+(ns vdb-file-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [voxel.vdb-file :as f]))
+
+(defn- put-u [v n] (mapv #(mod (long (/ v (Math/pow 256 %))) 256) (range n)))
+(defn- f32-bytes [x]
+  #?(:clj (put-u (bit-and (Float/floatToIntBits (float x)) 0xffffffff) 4)
+     :cljs (let [b (js/ArrayBuffer. 4) d (js/DataView. b)]
+             (.setFloat32 d 0 x true) (mapv #(.getUint8 d %) (range 4)))))
+(defn- str-bytes [s] (mapv #(#?(:clj int :cljs (fn [c] (.charCodeAt c 0))) %) s))
+(defn- abs* [x] (#?(:clj Math/abs :cljs js/Math.abs) (double x)))
+
+(def ^:private uuid "d0f2b6a1-4c3e-4a5b-9f01-2233445566aa")
+
+(defn- sample-archive [& {:keys [grids metadata version] :or {version 225}}]
+  (f/write-archive {:archive/file-version version
+                    :archive/library-version [12 0]
+                    :archive/uuid uuid
+                    :archive/metadata (or metadata [])
+                    :archive/grids (or grids [])}))
+
+(deftest it-reads-a-container-assembled-from-the-spec
+  (let [[status a] (f/read-archive (sample-archive))]
+    (is (= :ok status) (pr-str a))
+    (is (= 225 (:archive/file-version a)))
+    (is (= [12 0] (:archive/library-version a)))
+    (is (:archive/has-grid-offsets? a))
+    (is (= uuid (:archive/uuid a)))))
+
+(deftest the-uuid-is-thirty-six-ascii-bytes-not-sixteen-binary
+  ;; The upstream comment says "16-byte (128-bit) uuid" and the code then reads
+  ;; 16*2+4. A reader that believes the comment lands 20 bytes early — inside
+  ;; the metadata count — and reads a plausible number out of the tail of the
+  ;; uuid text. This is the likeliest way to write a .vdb reader that is wrong
+  ;; on every real file.
+  (is (= 36 f/uuid-bytes))
+  (let [[_ a] (f/read-archive (sample-archive :metadata
+                                              [{:meta/name "creator" :meta/type "string"
+                                                :meta/raw (str-bytes "houdini")}]))]
+    (is (= 36 (count (:archive/uuid a))))
+    (is (= uuid (:archive/uuid a)))
+    (is (= 1 (count (:archive/metadata a)))
+        "landing early would read a garbage metadata count here")))
+
+(deftest it-refuses-what-is-not-a-vdb
+  (testing "wrong magic, and the message names the format it is confused with"
+    (let [[status msg] (f/read-archive (vec (repeat 80 0)))]
+      (is (= :error status))
+      (is (string/includes? msg "NanoVDB"))))
+  (testing "a file version OpenVDB itself throws on"
+    (let [[status msg] (f/read-archive (sample-archive :version 220))]
+      (is (= :error status))
+      (is (string/includes? msg "221"))))
+  (testing "truncation is an error, not a short read"
+    (doseq [n [0 8 20 40 60]]
+      (is (= :error (first (f/read-archive (subvec (sample-archive) 0 n))))
+          (str n " bytes")))))
+
+(deftest metadata-values-decode-by-type
+  (let [[_ a] (f/read-archive
+               (sample-archive
+                :metadata [{:meta/name "creator" :meta/type "string"
+                            :meta/raw (str-bytes "Houdini/SOP_OpenVDB")}
+                           {:meta/name "file_compression" :meta/type "int32"
+                            :meta/raw (put-u 2 4)}
+                           {:meta/name "file_bbox_min" :meta/type "vec3i"
+                            :meta/raw (concat (put-u 0 4) (put-u 0 4) (put-u 0 4))}
+                           {:meta/name "file_voxel_size" :meta/type "vec3s"
+                            :meta/raw (concat (f32-bytes 0.1) (f32-bytes 0.1)
+                                              (f32-bytes 0.1))}]))
+        d (:metadata (f/describe a))]
+    (is (= "Houdini/SOP_OpenVDB" (d "creator")))
+    (is (= 2 (d "file_compression")))
+    (is (= [0 0 0] (d "file_bbox_min")))
+    (is (every? #(< (abs* (- % 0.1)) 1e-6) (d "file_voxel_size")))))
+
+(deftest an-unknown-metadata-type-is-skipped-exactly-not-guessed
+  ;; Every value is framed by its own byte count, which is why a file written
+  ;; by a newer OpenVDB — with types this has never heard of — still parses.
+  ;; Without using the count, the unknown value's bytes would be read as the
+  ;; next name and everything after it would be wrong.
+  (let [[status a] (f/read-archive
+                    (sample-archive
+                     :metadata [{:meta/name "future" :meta/type "quatd"
+                                 :meta/raw (vec (range 32))}
+                                {:meta/name "creator" :meta/type "string"
+                                 :meta/raw (str-bytes "blender")}]
+                     :grids [{:grid/name "density" :grid/type "Tree_float_5_4_3"
+                              :grid/pos 100 :grid/block-pos 140 :grid/end-pos 900}]))
+        d (:metadata (f/describe a))]
+    (is (= :ok status))
+    (is (= [:undecoded "quatd" 32] (d "future"))
+        "reported by name and size, not decoded and not dropped")
+    (is (= "blender" (d "creator"))
+        "and the entry AFTER the unknown one is still correct")
+    (is (= 1 (count (:archive/grids a)))
+        "as is everything after the metadata map")))
+
+(deftest grids-carry-their-type-and-byte-range
+  (let [[_ a] (f/read-archive
+               (sample-archive
+                :grids [{:grid/name "density" :grid/type "Tree_float_5_4_3"
+                         :grid/pos 1000 :grid/block-pos 1040 :grid/end-pos 52000}
+                        {:grid/name "vel" :grid/type "Tree_vec3s_5_4_3"
+                         :grid/pos 52000 :grid/block-pos 52040 :grid/end-pos 90000}]))
+        d (f/describe a)]
+    (is (= 2 (:grid-count d)))
+    (is (= [{:name "density" :type "Tree_float_5_4_3" :half-float? false :bytes 51000}
+            {:name "vel" :type "Tree_vec3s_5_4_3" :half-float? false :bytes 38000}]
+           (:grids d)))))
+
+(deftest the-half-float-suffix-is-a-flag-not-part-of-the-type
+  ;; A grid saved with saveFloatAsHalf has "_HalfFloat" appended to its TYPE
+  ;; name. Left on, the type never matches a registered one and the file looks
+  ;; like it holds a type nobody supports.
+  (let [[_ a] (f/read-archive
+               (sample-archive
+                :grids [{:grid/name "density" :grid/type "Tree_float_5_4_3"
+                         :grid/half-float? true :grid/pos 0 :grid/end-pos 10}]))
+        g (first (:archive/grids a))]
+    (is (= "Tree_float_5_4_3" (:grid/type g)))
+    (is (true? (:grid/half-float? g)))))
+
+(deftest instance-parents-survive-the-round-trip
+  ;; An instanced grid shares a tree with another and stores only the parent's
+  ;; name. Dropping the field shifts every offset that follows it by 4 bytes.
+  (let [[_ a] (f/read-archive
+               (sample-archive
+                :grids [{:grid/name "vel[1]" :grid/type "Tree_vec3s_5_4_3"
+                         :grid/instance-parent "vel"
+                         :grid/pos 7 :grid/block-pos 8 :grid/end-pos 9}]))
+        g (first (:archive/grids a))]
+    (is (= "vel" (:grid/instance-parent g)))
+    (is (= [7 8 9] [(:grid/pos g) (:grid/block-pos g) (:grid/end-pos g)]))))
+
+(deftest it-does-not-claim-to-have-read-the-volume
+  ;; A reader that quietly returned an empty tree for every grid would look
+  ;; like it worked. This says, in the data, that it did not.
+  (let [[_ a] (f/read-archive
+               (sample-archive
+                :grids [{:grid/name "density" :grid/type "Tree_float_5_4_3"
+                         :grid/pos 100 :grid/end-pos 900}]))
+        g (first (:archive/grids a))]
+    (is (false? (:grid/data-decoded? g)))
+    (is (false? (:grid-data-decoded? (f/describe a))))
+    (is (not (contains? g :grid/tree)))
+    (is (not (contains? g :grid/voxels)))
+    (is (not (contains? g :grid/active-count))
+        "no count either — that would read as a volume having been read")))

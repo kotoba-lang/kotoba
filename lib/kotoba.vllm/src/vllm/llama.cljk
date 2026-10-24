@@ -1,0 +1,450 @@
+(ns vllm.llama
+  "Reference Llama-family decoder with RoPE, GQA, SwiGLU, and mutable KV cache."
+  (:require [kotoba.lang.error :as kerror] [vllm.accelerator :as accelerator]
+            [vllm.gguf :as gguf])
+  (:import [java.nio ByteBuffer ByteOrder]
+           [java.util.function IntConsumer Supplier]
+           [java.util.stream IntStream]))
+
+(defn- fail [message data] (throw (ex-info (str "vllm.llama: " message) data)))
+(defn- farray [xs] (if (instance? (Class/forName "[F") xs) xs (float-array xs)))
+
+(defn- tensor [shape data] {:shape (mapv long shape) :data (farray data)})
+
+(defn- matrix-row [{:keys [shape data type buffer byte-count]} row]
+  (let [[rows columns] shape]
+    (when-not (< -1 row rows) (fail "matrix row out of range" {:shape shape :row row}))
+    (if data
+      (let [out (float-array columns)]
+        (System/arraycopy data (* row columns) out 0 columns) out)
+      (let [row-bytes (quot byte-count rows) copy (.duplicate ^ByteBuffer buffer)
+            start (* row row-bytes)]
+        (.position copy start) (.limit copy (+ start row-bytes))
+        (gguf/decode-f32 type (.slice copy) columns)))))
+
+(defn- direct-quantized-dot [type ^ByteBuffer source row-start columns ^floats x]
+  (let [buffer source]
+    (.position buffer row-start)
+    (case type
+      :q8-0
+      (loop [base 0 sum 0.0]
+        (if (= base columns) sum
+          (let [scale (gguf/decode-half (.getShort buffer))]
+            (recur (+ base 32)
+                   (loop [i 0 sum sum]
+                     (if (= i 32) sum
+                       (recur (inc i)
+                              (+ sum (* scale (.get buffer) (aget x (+ base i)))))))))))
+      :q4-0
+      (loop [base 0 sum 0.0]
+        (if (= base columns) sum
+          (let [scale (gguf/decode-half (.getShort buffer))]
+            (recur (+ base 32)
+                   (loop [i 0 sum sum]
+                     (if (= i 16) sum
+                       (let [packed (bit-and 0xff (.get buffer))]
+                         (recur (inc i)
+                                (+ sum
+                                   (* scale (- (bit-and packed 15) 8)
+                                      (aget x (+ base i)))
+                                   (* scale (- (unsigned-bit-shift-right packed 4) 8)
+                                      (aget x (+ base i 16))))))))))))
+      :q4-1
+      (loop [base 0 sum 0.0]
+        (if (= base columns) sum
+          (let [scale (gguf/decode-half (.getShort buffer))
+                minimum (gguf/decode-half (.getShort buffer))]
+            (recur (+ base 32)
+                   (loop [i 0 sum sum]
+                     (if (= i 16) sum
+                       (let [packed (bit-and 0xff (.get buffer))]
+                         (recur (inc i)
+                                (+ sum
+                                   (* (+ minimum (* scale (bit-and packed 15)))
+                                      (aget x (+ base i)))
+                                   (* (+ minimum (* scale (unsigned-bit-shift-right packed 4)))
+                                      (aget x (+ base i 16))))))))))))
+      nil)))
+
+(defn matrix-vector
+  "Multiply a dense or mmap-backed GGUF matrix by an F32 vector. Quantized
+  matrices are decoded one row at a time, never expanded persistently."
+  [{:keys [shape data type buffer byte-count accelerator accelerator-handle]} ^floats x]
+  (let [[rows columns] shape]
+    (when-not (= columns (alength x))
+      (fail "matrix/vector shape mismatch" {:matrix shape :vector (alength x)}))
+    (if accelerator-handle
+      (accelerator/gemv! accelerator accelerator-handle x)
+      (let [out (float-array rows)
+          direct? (and buffer (contains? #{:q8-0 :q4-0 :q4-1} type))
+          thread-buffer
+          (when direct?
+            (ThreadLocal/withInitial
+             (reify Supplier
+               (get [_] (doto (.duplicate ^ByteBuffer buffer)
+                          (.order ByteOrder/LITTLE_ENDIAN))))))
+          compute-row!
+          (fn [row]
+            (let [direct-buffer (when direct? (.get ^ThreadLocal thread-buffer))
+              row-data (when (and (not data) (not direct?))
+                         (matrix-row {:shape shape :type type :buffer buffer
+                                      :byte-count byte-count} row))
+              base (* row columns)
+              row-byte-start (when buffer (* row (quot byte-count rows)))]
+          (aset-float out row
+                      (float
+                       (if direct?
+                         (direct-quantized-dot type direct-buffer row-byte-start columns x)
+                         (loop [column 0 sum 0.0]
+                           (if (< column columns)
+                             (recur (inc column)
+                                    (+ sum (* (if data
+                                                (aget ^floats data (+ base column))
+                                                (aget ^floats row-data column))
+                                              (aget x column))))
+                             sum)))))))]
+      (if (>= rows 1024)
+        (.forEach (.parallel (IntStream/range 0 rows))
+                  (reify IntConsumer (accept [_ row] (compute-row! row))))
+        (dotimes [row rows] (compute-row! row)))
+        out))))
+
+(defn- matrix-vectors [matrices ^floats x]
+  (let [backend (:accelerator (first matrices))]
+    (if (and backend
+             (satisfies? accelerator/IBatchedMatrixAccelerator backend)
+             (every? #(and (:accelerator-handle %)
+                           (identical? backend (:accelerator %))) matrices))
+      (accelerator/gemv-many! backend
+                              (mapv (fn [matrix]
+                                      [(:accelerator-handle matrix) x]) matrices))
+      (mapv #(matrix-vector % x) matrices))))
+
+(defn- matrix-vector-batch [matrix inputs]
+  (let [backend (:accelerator matrix)]
+    (if (and (:accelerator-handle matrix) backend
+             (satisfies? accelerator/IBatchedMatrixAccelerator backend))
+      (accelerator/gemv-many! backend
+                              (mapv (fn [x] [(:accelerator-handle matrix) x]) inputs))
+      (mapv #(matrix-vector matrix %) inputs))))
+
+(defn- projection-batch [matrices inputs]
+  (let [backend (:accelerator (first matrices))]
+    (if (and backend (satisfies? accelerator/IBatchedMatrixAccelerator backend)
+             (every? #(and (:accelerator-handle %)
+                           (identical? backend (:accelerator %))) matrices))
+      (let [width (count matrices)
+            outputs (accelerator/gemv-many!
+                     backend
+                     (vec (for [x inputs matrix matrices]
+                            [(:accelerator-handle matrix) x])))]
+        (mapv vec (partition width outputs)))
+      (mapv (fn [x] (mapv #(matrix-vector % x) matrices)) inputs))))
+
+(defn- add! [^floats target ^floats source]
+  (dotimes [i (alength target)]
+    (aset-float target i (float (+ (aget target i) (aget source i)))))
+  target)
+
+(defn- rms-norm [^floats x {:keys [data]} epsilon]
+  (let [n (alength x)
+        mean-square (/ (loop [i 0 sum 0.0]
+                         (if (< i n)
+                           (let [v (aget x i)] (recur (inc i) (+ sum (* v v))))
+                           sum)) n)
+        scale (/ 1.0 (Math/sqrt (+ mean-square epsilon)))
+        out (float-array n)]
+    (dotimes [i n]
+      (aset-float out i (float (* (aget x i) scale (aget ^floats data i)))))
+    out))
+
+(defn- silu [x] (* x (/ 1.0 (+ 1.0 (Math/exp (- x))))))
+
+(defn- rope! [^floats vector heads head-dim position theta rope-dim]
+  (dotimes [head heads]
+    (let [base (* head head-dim)]
+      (doseq [pair (range 0 rope-dim 2)]
+        (let [frequency (/ 1.0 (Math/pow theta (/ pair rope-dim)))
+              angle (* position frequency) c (Math/cos angle) s (Math/sin angle)
+              i (+ base pair) j (inc i) a (aget vector i) b (aget vector j)]
+          (aset-float vector i (float (- (* a c) (* b s))))
+          (aset-float vector j (float (+ (* a s) (* b c))))))))
+  vector)
+
+(defn create-model
+  "Create an executable model from config and decoded tensors.
+
+  Config keys: `:vocab-size :embedding-length :block-count :head-count
+  :head-count-kv :feed-forward-length :context-length`, with optional
+  `:rope-dimension-count :rope-freq-base :rms-epsilon`.
+  Tensor keys follow GGUF names (`token_embd.weight`, `blk.N.attn_q.weight`, …)."
+  [config tensors]
+  (let [{:keys [vocab-size embedding-length block-count head-count head-count-kv
+                feed-forward-length context-length]} config
+        head-count-kv (or head-count-kv head-count)
+        head-dim (quot embedding-length head-count)
+        rope-dim (or (:rope-dimension-count config) head-dim)]
+    (when-not (and (every? pos-int? [vocab-size embedding-length block-count head-count
+                                     head-count-kv feed-forward-length context-length])
+                   (zero? (mod embedding-length head-count))
+                   (zero? (mod head-count head-count-kv))
+                   (even? rope-dim) (<= rope-dim head-dim))
+      (fail "invalid Llama configuration" {:config config}))
+    {:config (assoc config :head-count-kv head-count-kv :head-dim head-dim
+                    :rope-dimension-count rope-dim)
+     :tensors tensors}))
+
+(defn load-gguf
+  "Load a Llama GGUF into the reference executor. Tensor payloads are decoded
+  on first use and cached as unboxed F32 arrays. The GGUF file must remain open."
+  ([model-file] (load-gguf model-file {}))
+  ([model-file {:keys [accelerator]}]
+  (let [m (:metadata model-file) architecture (get m "general.architecture")]
+    (when-not (= "llama" architecture)
+      (fail "only general.architecture=llama is executable" {:architecture architecture}))
+    (let [prefix architecture
+          required (fn [suffix]
+                     (or (get m (str prefix "." suffix))
+                         (fail "required GGUF metadata is missing" {:key (str prefix "." suffix)})))
+          cache (atom {})
+          load! (fn [name]
+                  (or (get @cache name)
+                      (let [info (gguf/tensor-info model-file name)
+                            value (if (contains? #{:q4-0 :q4-1 :q5-0 :q5-1 :q8-0
+                                                   :q4-k :q5-k :q6-k} (:type info))
+                                    (let [{:keys [shape type buffer] :as view}
+                                          (gguf/tensor-view model-file name)]
+                                      (if (and accelerator
+                                               (contains? #{:q8-0 :q4-0 :q4-k :q5-0 :q5-1
+                                                            :q5-k :q6-k} type)
+                                               (satisfies? accelerator/IQuantizedMatrixAccelerator
+                                                           accelerator)
+                                               (not= name "token_embd.weight"))
+                                        (assoc view
+                                               :accelerator accelerator
+                                               :accelerator-handle
+                                               (accelerator/upload-quantized!
+                                                accelerator type name
+                                                (first shape) (second shape) buffer))
+                                        view))
+                                    (let [{:keys [shape data]}
+                                          (gguf/read-tensor-f32 model-file name)]
+                                      (tensor shape data)))]
+                        (swap! cache assoc name value) value)))
+          config {:vocab-size (count (get m "tokenizer.ggml.tokens"))
+                  :embedding-length (required "embedding_length")
+                  :block-count (required "block_count")
+                  :head-count (required "attention.head_count")
+                  :head-count-kv (get m "llama.attention.head_count_kv")
+                  :feed-forward-length (required "feed_forward_length")
+                  :context-length (required "context_length")
+                  :rope-dimension-count (get m "llama.rope.dimension_count")
+                  :rope-freq-base (get m "llama.rope.freq_base" 10000.0)
+                  :rms-epsilon (get m "llama.attention.layer_norm_rms_epsilon" 1.0e-5)}]
+      (assoc (create-model config load!) :tensor-cache cache :accelerator accelerator)))))
+
+(defn close-model!
+  "Release accelerator-resident weights owned by a loaded model."
+  [model]
+  (doseq [[_ tensor] @(:tensor-cache model)
+          :when (:accelerator-handle tensor)]
+    (accelerator/release! (:accelerator tensor) (:accelerator-handle tensor)))
+  nil)
+
+(defn new-state [model]
+  (let [{:keys [block-count context-length head-count-kv head-dim]} (:config model)
+        backend (:accelerator model) size (* context-length head-count-kv head-dim)]
+    (if (and backend (satisfies? accelerator/IAttentionAccelerator backend))
+      {:position (atom 0) :accelerator backend
+       :kv-handle (accelerator/create-kv! backend "state" block-count context-length
+                                           head-count-kv head-dim)}
+      {:position (atom 0)
+       :keys (mapv (fn [_] (float-array size)) (range block-count))
+       :values (mapv (fn [_] (float-array size)) (range block-count))})))
+
+(defn close-state! [state]
+  (when-let [handle (:kv-handle state)]
+    (accelerator/release-kv! (:accelerator state) handle))
+  nil)
+
+(defn clone-state
+  "Clone a decoder state. Metal KV contents remain device-resident and are
+  copied device-to-device, allowing independent generation branches."
+  [state]
+  (if-let [handle (:kv-handle state)]
+    {:position (atom @(:position state)) :accelerator (:accelerator state)
+     :kv-handle (accelerator/clone-kv! (:accelerator state) handle "state-clone")}
+    {:position (atom @(:position state))
+     :keys (mapv aclone (:keys state)) :values (mapv aclone (:values state))}))
+
+(defn- tensor! [model name]
+  (let [source (:tensors model)]
+    (if (fn? source) (source name)
+        (or (get source name) (fail "model tensor is missing" {:tensor name})))))
+
+(defn- embedding-row [model token-id]
+  (let [{:keys [shape] :as embedding} (tensor! model "token_embd.weight")
+        [vocab width] shape]
+    (when-not (<= 0 token-id (dec vocab)) (fail "token ID out of range" {:token token-id}))
+    (matrix-row embedding token-id)))
+
+(defn- attend-projected [model state layer position q k v]
+  (let [{:keys [head-count head-count-kv head-dim rope-dimension-count rope-freq-base]}
+        (:config model)
+        _ (rope! q head-count head-dim position (or rope-freq-base 10000.0)
+                 rope-dimension-count)
+        _ (rope! k head-count-kv head-dim position (or rope-freq-base 10000.0)
+                 rope-dimension-count)]
+    (if-let [handle (:kv-handle state)]
+      (accelerator/attention! (:accelerator state) handle layer position head-count q k v)
+      (let [^floats key-cache (nth (:keys state) layer)
+            ^floats value-cache (nth (:values state) layer)
+            cache-width (* head-count-kv head-dim) cache-base (* position cache-width)
+            _ (System/arraycopy k 0 key-cache cache-base cache-width)
+            _ (System/arraycopy v 0 value-cache cache-base cache-width)
+            grouped (quot head-count head-count-kv)
+            attended (float-array (* head-count head-dim))]
+        (dotimes [head head-count]
+          (let [kv-head (quot head grouped) q-base (* head head-dim)
+                scores (double-array (inc position))]
+            (dotimes [past (inc position)]
+              (let [k-base (+ (* past cache-width) (* kv-head head-dim))]
+                (aset-double scores past
+                             (/ (loop [i 0 sum 0.0]
+                                  (if (< i head-dim)
+                                    (recur (inc i) (+ sum (* (aget q (+ q-base i))
+                                                              (aget key-cache (+ k-base i)))))
+                                    sum))
+                                (Math/sqrt head-dim)))))
+            (let [maximum (reduce max (seq scores))
+                  denominator (loop [i 0 sum 0.0]
+                                (if (< i (alength scores))
+                                  (recur (inc i) (+ sum (Math/exp (- (aget scores i) maximum))))
+                                  sum))]
+              (dotimes [past (inc position)]
+                (let [probability (/ (Math/exp (- (aget scores past) maximum)) denominator)
+                      v-base (+ (* past cache-width) (* kv-head head-dim))]
+                  (dotimes [i head-dim]
+                    (let [index (+ q-base i)]
+                      (aset-float attended index
+                                  (float (+ (aget attended index)
+                                            (* probability
+                                               (aget value-cache (+ v-base i)))))))))))))
+        attended))))
+
+(defn- attention [model state layer position ^floats normalized]
+  (let [prefix (str "blk." layer ".")
+        [q k v] (matrix-vectors [(tensor! model (str prefix "attn_q.weight"))
+                                 (tensor! model (str prefix "attn_k.weight"))
+                                 (tensor! model (str prefix "attn_v.weight"))]
+                                normalized)]
+    (matrix-vector (tensor! model (str prefix "attn_output.weight"))
+                   (attend-projected model state layer position q k v))))
+
+(defn- attend-projected-batch [model states layer positions projections]
+  (let [{:keys [head-count head-count-kv head-dim rope-dimension-count rope-freq-base]}
+        (:config model)
+        backend (:accelerator (first states))]
+    (if (and backend (satisfies? accelerator/IBatchedAttentionAccelerator backend)
+             (every? #(and (:kv-handle %) (identical? backend (:accelerator %))) states))
+      (let [requests
+            (mapv (fn [state position [q k v]]
+                    (rope! q head-count head-dim position (or rope-freq-base 10000.0)
+                           rope-dimension-count)
+                    (rope! k head-count-kv head-dim position (or rope-freq-base 10000.0)
+                           rope-dimension-count)
+                    {:handle (:kv-handle state) :layer layer :position position
+                     :heads head-count :q q :k k :v v})
+                  states positions projections)]
+        (accelerator/attention-many! backend requests))
+      (mapv (fn [state position [q k v]]
+              (attend-projected model state layer position q k v))
+            states positions projections))))
+
+(defn step!
+  "Consume one token at the state's current position, mutate its KV cache, and
+  return `{:logits float-array :position p}`. State is single-sequence."
+  [model state token-id]
+  (let [{:keys [block-count context-length rms-epsilon]} (:config model)
+        position @(:position state)]
+    (when (>= position context-length)
+      (fail "KV cache context is full" {:position position :context-length context-length}))
+    (let [hidden
+          (loop [layer 0 hidden (embedding-row model token-id)]
+            (if (= layer block-count) hidden
+              (let [prefix (str "blk." layer ".")
+                    normalized (rms-norm hidden (tensor! model (str prefix "attn_norm.weight"))
+                                         (or rms-epsilon 1.0e-5))
+                    residual (add! hidden (attention model state layer position normalized))
+                    ffn-input (rms-norm residual (tensor! model (str prefix "ffn_norm.weight"))
+                                        (or rms-epsilon 1.0e-5))
+                    [gate up] (matrix-vectors [(tensor! model (str prefix "ffn_gate.weight"))
+                                               (tensor! model (str prefix "ffn_up.weight"))]
+                                              ffn-input)
+                    activated (float-array (alength gate))]
+                (dotimes [i (alength gate)]
+                  (aset-float activated i (float (* (silu (aget gate i)) (aget up i)))))
+                (recur (inc layer)
+                       (add! residual
+                             (matrix-vector (tensor! model (str prefix "ffn_down.weight")) activated))))))
+          final (rms-norm hidden (tensor! model "output_norm.weight")
+                          (or rms-epsilon 1.0e-5))
+          output-weight (try (tensor! model "output.weight")
+                             (catch kerror/ExceptionInfo _
+                               (tensor! model "token_embd.weight")))
+          logits (matrix-vector output-weight final)]
+      (swap! (:position state) inc)
+      {:logits logits :position position})))
+
+(defn step-batch!
+  "Consume one token for every active sequence. Projection work for all
+  sequences is submitted together when the accelerator supports batching."
+  [model states token-ids]
+  (when-not (and (seq states) (= (count states) (count token-ids)))
+    (fail "batch requires one token per state"
+          {:states (count states) :tokens (count token-ids)}))
+  (let [{:keys [block-count context-length rms-epsilon]} (:config model)
+        positions (mapv #(deref (:position %)) states)]
+    (when-let [position (some #(when (>= % context-length) %) positions)]
+      (fail "KV cache context is full" {:position position :context-length context-length}))
+    (let [hidden
+          (loop [layer 0 hidden (mapv #(embedding-row model %2) states token-ids)]
+            (if (= layer block-count) hidden
+              (let [prefix (str "blk." layer ".")
+                    attn-norm (tensor! model (str prefix "attn_norm.weight"))
+                    normalized (mapv #(rms-norm % attn-norm (or rms-epsilon 1.0e-5)) hidden)
+                    projections (projection-batch
+                                 [(tensor! model (str prefix "attn_q.weight"))
+                                  (tensor! model (str prefix "attn_k.weight"))
+                                  (tensor! model (str prefix "attn_v.weight"))]
+                                 normalized)
+                    attended (attend-projected-batch model states layer positions projections)
+                    attention-output (matrix-vector-batch
+                                      (tensor! model (str prefix "attn_output.weight"))
+                                      attended)
+                    residuals (mapv add! hidden attention-output)
+                    ffn-norm (tensor! model (str prefix "ffn_norm.weight"))
+                    ffn-inputs (mapv #(rms-norm % ffn-norm (or rms-epsilon 1.0e-5))
+                                     residuals)
+                    gate-ups (projection-batch
+                              [(tensor! model (str prefix "ffn_gate.weight"))
+                               (tensor! model (str prefix "ffn_up.weight"))]
+                              ffn-inputs)
+                    activated (mapv (fn [[gate up]]
+                                      (let [out (float-array (alength ^floats gate))]
+                                        (dotimes [i (alength ^floats gate)]
+                                          (aset-float out i
+                                                      (float (* (silu (aget ^floats gate i))
+                                                                (aget ^floats up i)))))
+                                        out)) gate-ups)
+                    down (matrix-vector-batch
+                          (tensor! model (str prefix "ffn_down.weight")) activated)]
+                (recur (inc layer) (mapv add! residuals down)))))
+          output-norm (tensor! model "output_norm.weight")
+          final (mapv #(rms-norm % output-norm (or rms-epsilon 1.0e-5)) hidden)
+          output-weight (try (tensor! model "output.weight")
+                             (catch kerror/ExceptionInfo _
+                               (tensor! model "token_embd.weight")))
+          logits (matrix-vector-batch output-weight final)]
+      (doseq [state states] (swap! (:position state) inc))
+      (mapv (fn [position values] {:logits values :position position}) positions logits))))

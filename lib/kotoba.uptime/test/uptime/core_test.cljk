@@ -1,0 +1,140 @@
+(ns uptime.core-test
+  "The failures this library exists to prevent, all of which report as good news.
+
+  A prober that dies quietly, a month with four probes in it, an outage on the
+  prober's own network — each one makes a status page look better, and each one
+  is caught here rather than by a customer during an argument."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [uptime.core :as up]))
+
+(def t0 1786000000000)
+(defn- at [n] (+ t0 (* n 60000)))          ; one probe per minute
+(def target "https://authn.kotobase.net/health")
+
+(defn- obs [n outcome & [detail]]
+  (up/observation (cond-> {:target target :at (at n) :outcome outcome}
+                    detail (assoc :detail detail))))
+
+(deftest an-observation-must-carry-a-clock-and-a-target
+  (is (empty? (up/problems (obs 0 :up))))
+  (testing "a missing timestamp is refused rather than defaulted to now"
+    ;; A defaulted clock lands the reading in whichever window happened to be
+    ;; open when it was parsed — a quiet way to move an outage into last month.
+    (is (= :no-timestamp (:uptime.problem/code
+                          (first (up/problems (up/observation {:target target :outcome :up})))))))
+  (is (= :no-target (:uptime.problem/code
+                     (first (up/problems (up/observation {:at t0 :outcome :up}))))))
+  (testing "an unrecognised outcome degrades to :inconclusive rather than to :up"
+    (is (= :inconclusive (:observation/outcome (up/observation {:target target :at t0
+                                                                :outcome :probably-fine}))))))
+
+(deftest an-unobserved-window-is-not-a-perfect-one
+  ;; The whole reason this library exists.
+  (let [s (up/statement target [] t0 (at 60))]
+    (is (= :unobserved (:availability/status s)))
+    (is (nil? (:availability/ratio s)) "no ratio at all, not 1.0")
+    (is (zero? (:availability/observed s)))
+    (is (re-find #"no availability is claimed" (up/describe s))))
+
+  (testing "and neither is one where every probe failed to conclude"
+    ;; A prober whose own DNS is broken produces silence that looks like calm.
+    (let [s (up/statement target (mapv #(obs % :inconclusive) (range 60)) t0 (at 60))]
+      (is (= :unobserved (:availability/status s)))
+      (is (nil? (:availability/ratio s)))
+      (is (= 60 (:availability/inconclusive s)))
+      (is (re-find #"could not conclude" (up/describe s))))))
+
+(deftest an-inconclusive-probe-is-not-downtime
+  ;; Counting the prober's own failure as an outage understates the service and
+  ;; teaches everyone to ignore the number. Counting it as uptime is the lie in
+  ;; the other direction. It is excluded, and reported.
+  (let [s (up/statement target (concat (mapv #(obs % :up) (range 10))
+                                       (mapv #(obs % :inconclusive) (range 10 20)))
+                        t0 (at 60))]
+    (is (= 1.0 (:availability/ratio s)))
+    (is (= 10 (:availability/observed s)))
+    (is (= 10 (:availability/inconclusive s)))
+    (is (= :available (:availability/status s)))
+    (testing "but the reader is told how much was inconclusive"
+      (is (re-find #"10 inconclusive" (up/describe s))))))
+
+(deftest the-ratio-is-over-conclusive-probes-only
+  (let [s (up/statement target (concat (mapv #(obs % :up) (range 90))
+                                       (mapv #(obs % :down) (range 90 100)))
+                        t0 (at 200))]
+    (is (= 0.9 (:availability/ratio s)))
+    (is (= :degraded (:availability/status s)) "anything below the target is degraded, not available")
+    (is (= 100 (:availability/observed s)))))
+
+(deftest consecutive-failures-are-one-incident
+  ;; Three failures at one-minute spacing is one thing a reader can act on.
+  ;; Three lines is not.
+  (let [s (up/statement target (concat (mapv #(obs % :up) (range 5))
+                                       (mapv #(obs % :down "502 from origin") (range 5 8))
+                                       (mapv #(obs % :up) (range 8 20)))
+                        t0 (at 60))
+        [i] (:availability/incidents s)]
+    (is (= 1 (count (:availability/incidents s))))
+    (is (= (at 5) (:incident/from i)))
+    (is (= (at 7) (:incident/to i)))
+    (is (= 3 (:incident/probes i)))
+    (is (= "502 from origin" (:incident/detail i)) "an outage with no reason is one nobody can act on"))
+
+  (testing "two separated outages are two incidents"
+    (let [s (up/statement target (concat [(obs 0 :down)] [(obs 1 :up)] [(obs 2 :down)])
+                          t0 (at 60))]
+      (is (= 2 (count (:availability/incidents s)))))))
+
+(deftest coverage-is-part-of-the-statement
+  (testing "four probes in a window that should have had 1440"
+    (let [s (up/statement target (mapv #(obs % :up) (range 4)) t0 (at 1440)
+                          {:expected 1440})]
+      (is (= 1.0 (:availability/ratio s)) "every probe that landed succeeded")
+      (is (< (:availability/coverage s) 0.01))
+      (testing "and the sentence says so, so 100% cannot be quoted alone"
+        (is (re-find #"of the expected schedule" (up/describe s))))))
+
+  (testing "coverage is nil when no expectation was supplied"
+    ;; Without it there is no way to know whether the probes present are all the
+    ;; probes there should have been.
+    (is (nil? (:availability/coverage (up/statement target [(obs 0 :up)] t0 (at 60)))))))
+
+(deftest the-window-is-half-open
+  (let [obs-list [(up/observation {:target target :at t0 :outcome :up})
+                  (up/observation {:target target :at (at 60) :outcome :down})]]
+    ;; The probe exactly at `to` belongs to the NEXT window, or it is counted
+    ;; twice across two adjacent months.
+    (is (= 1 (:availability/observed (up/statement target obs-list t0 (at 60)))))
+    (is (= 1.0 (:availability/ratio (up/statement target obs-list t0 (at 60)))))))
+
+(deftest observations-of-another-target-are-not-mixed-in
+  (let [other (up/observation {:target "https://example.test/" :at (at 1) :outcome :down})
+        s (up/statement target [(obs 0 :up) other] t0 (at 60))]
+    (is (= 1 (:availability/observed s)))
+    (is (= 1.0 (:availability/ratio s)))))
+
+;; ── the SLO ─────────────────────────────────────────────────────────────────
+
+(deftest an-slo-cannot-be-met-by-a-window-nobody-watched
+  ;; The exact failure: a prober quietly stops, the handful of probes that did
+  ;; land all succeeded, and the month reports as met.
+  (let [thin (up/statement target (mapv #(obs % :up) (range 4)) t0 (at 1440) {:expected 1440})]
+    (is (= :cannot-say (:slo/verdict (up/slo-verdict thin 0.999))))
+    (is (= :insufficient-coverage (:slo/reason (up/slo-verdict thin 0.999)))))
+
+  (testing "nor by a window with no probes at all"
+    (is (= :unobserved (:slo/reason (up/slo-verdict (up/statement target [] t0 (at 60)) 0.999)))))
+
+  (testing "nor when nobody said how many probes to expect"
+    (let [no-expectation (up/statement target (mapv #(obs % :up) (range 100)) t0 (at 1440))]
+      (is (= :coverage-unknown (:slo/reason (up/slo-verdict no-expectation 0.999)))))))
+
+(deftest a-well-observed-window-gets-a-real-verdict
+  (let [good (up/statement target (mapv #(obs % :up) (range 1400)) t0 (at 1440) {:expected 1440})
+        bad (up/statement target (concat (mapv #(obs % :up) (range 1300))
+                                         (mapv #(obs % :down) (range 1300 1400)))
+                          t0 (at 1440) {:expected 1440})]
+    (is (= :met (:slo/verdict (up/slo-verdict good 0.999))))
+    (is (= :missed (:slo/verdict (up/slo-verdict bad 0.999))))
+    (testing "and a missed verdict carries the number it missed by"
+      (is (< (:slo/ratio (up/slo-verdict bad 0.999)) 0.93)))))

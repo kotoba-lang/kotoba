@@ -1,0 +1,266 @@
+(ns kotoba.webrtc.whip-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [kotoba.webrtc.whip :as whip]))
+
+(def endpoint "https://ingest.example.net/live/whip/abc")
+
+;; ---------------------------------------------------------------------------
+;; URL resolution
+;; ---------------------------------------------------------------------------
+
+(deftest resolve-url-forms
+  (testing "absolute Location is used as-is"
+    (is (= "https://other.example.org/r/1"
+           (whip/resolve-url endpoint "https://other.example.org/r/1"))))
+  (testing "network-path reference inherits the base scheme"
+    (is (= "https://other.example.org/r/1"
+           (whip/resolve-url endpoint "//other.example.org/r/1"))))
+  (testing "absolute-path reference keeps the base origin"
+    (is (= "https://ingest.example.net/resource/1"
+           (whip/resolve-url endpoint "/resource/1"))))
+  (testing "relative reference resolves against the base directory, not the base itself"
+    (is (= "https://ingest.example.net/live/whip/session-1"
+           (whip/resolve-url endpoint "session-1"))))
+  (testing "base query string does not leak into a relative resolution"
+    (is (= "https://ingest.example.net/live/s2"
+           (whip/resolve-url "https://ingest.example.net/live/whip?key=1" "s2"))))
+  (testing "origin-only base"
+    (is (= "https://ingest.example.net/s"
+           (whip/resolve-url "https://ingest.example.net" "s"))))
+  (testing "blank Location leaves the base untouched"
+    (is (= endpoint (whip/resolve-url endpoint "")))
+    (is (= endpoint (whip/resolve-url endpoint nil)))))
+
+;; ---------------------------------------------------------------------------
+;; Headers
+;; ---------------------------------------------------------------------------
+
+(deftest header-lookup-is-case-insensitive
+  (is (= "/r/1" (whip/header {"Location" "/r/1"} :location)))
+  (is (= "/r/1" (whip/header {"location" "/r/1"} :location)))
+  (is (= "/r/1" (whip/header {:Location "/r/1"} "LOCATION")))
+  (is (nil? (whip/header {"x" "y"} :location)))
+  (testing "a repeated header arrives as a collection"
+    (is (= "a" (whip/header {"link" ["a" "b"]} :link)))
+    (is (= ["a" "b"] (whip/header-values {"link" ["a" "b"]} :link)))))
+
+;; ---------------------------------------------------------------------------
+;; Link headers / ICE servers
+;; ---------------------------------------------------------------------------
+
+(deftest ice-servers-from-link-headers
+  (testing "one comma-joined header with a STUN and a TURN entry"
+    (let [headers {"Link" (str "<stun:stun.example.net>; rel=\"ice-server\", "
+                               "<turn:turn.example.net?transport=udp>; rel=\"ice-server\"; "
+                               "username=\"user\"; credential=\"pass\"; credential-type=\"password\"")}]
+      (is (= [{:urls "stun:stun.example.net"}
+              {:urls "turn:turn.example.net?transport=udp"
+               :username "user"
+               :credential "pass"
+               :credential-type "password"}]
+             (whip/ice-servers headers)))))
+  (testing "a comma inside a quoted credential does not split the link-value"
+    (let [headers {"Link" "<turn:t.example.net>; rel=\"ice-server\"; username=\"u\"; credential=\"a,b,c\""}]
+      (is (= [{:urls "turn:t.example.net" :username "u" :credential "a,b,c"}]
+             (whip/ice-servers headers)))))
+  (testing "non-ice-server links are ignored"
+    (is (= [] (whip/ice-servers {"Link" "<https://example.net/doc>; rel=\"describedby\""}))))
+  (testing "no Link header at all"
+    (is (= [] (whip/ice-servers {}))))
+  (testing "keys absent from the link are omitted, never nil (RTCPeerConnection rejects null credential)"
+    (let [s (first (whip/ice-servers {"Link" "<stun:s.example.net>; rel=\"ice-server\""}))]
+      (is (= #{:urls} (set (keys s)))))))
+
+;; ---------------------------------------------------------------------------
+;; Requests
+;; ---------------------------------------------------------------------------
+
+(deftest publish-request-shape
+  (let [req (whip/publish-request {:endpoint endpoint :offer-sdp "v=0\r\n" :bearer-token "tok"})]
+    (is (= endpoint (:url req)))
+    (is (= :post (:method req)))
+    (is (= "application/sdp" (get-in req [:headers "Content-Type"])))
+    (is (= "Bearer tok" (get-in req [:headers "Authorization"])))
+    (is (= "v=0\r\n" (:body req))))
+  (testing "a blank token sends no Authorization header at all"
+    (let [req (whip/publish-request {:endpoint endpoint :offer-sdp "v=0" :bearer-token ""})]
+      (is (not (contains? (:headers req) "Authorization"))))
+    (let [req (whip/publish-request {:endpoint endpoint :offer-sdp "v=0"})]
+      (is (not (contains? (:headers req) "Authorization"))))))
+
+(deftest trickle-and-terminate-request-shape
+  (let [req (whip/trickle-request {:resource-url "https://i.example.net/r/1"
+                                   :sdp-fragment "a=ice-ufrag:x\r\n"
+                                   :etag "\"e1\""
+                                   :bearer-token "tok"})]
+    (is (= :patch (:method req)))
+    (is (= "application/trickle-ice-sdpfrag" (get-in req [:headers "Content-Type"])))
+    (is (= "\"e1\"" (get-in req [:headers "If-Match"]))))
+  (testing "no ETag -> no If-Match"
+    (is (not (contains? (:headers (whip/trickle-request {:resource-url "u" :sdp-fragment "f"}))
+                        "If-Match"))))
+  (let [req (whip/terminate-request {:resource-url "https://i.example.net/r/1" :bearer-token "tok"})]
+    (is (= :delete (:method req)))
+    (is (= "https://i.example.net/r/1" (:url req)))
+    (is (nil? (:body req)))))
+
+(deftest trickle-support-detection
+  (is (whip/trickle-supported? {:status 204}))
+  (is (not (whip/trickle-supported? {:status 405})))
+  (is (not (whip/trickle-supported? {:status 501}))))
+
+;; ---------------------------------------------------------------------------
+;; Responses
+;; ---------------------------------------------------------------------------
+
+(deftest publish-response-success
+  (let [parsed (whip/publish-response
+                endpoint
+                {:status 201
+                 :headers {"Location" "session-1"
+                           "ETag" "\"e1\""
+                           "Link" "<stun:stun.example.net>; rel=\"ice-server\""}
+                 :body "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n"})]
+    (is (:ok? parsed))
+    (is (= "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n" (:answer-sdp parsed)))
+    (is (= "https://ingest.example.net/live/whip/session-1" (:resource-url parsed))
+        "relative Location must be resolved, or teardown later hits a URL that does not exist")
+    (is (= "\"e1\"" (:etag parsed)))
+    (is (= [{:urls "stun:stun.example.net"}] (:ice-servers parsed)))))
+
+(defn- status-error [status]
+  (:error (whip/publish-response endpoint {:status status :headers {} :body "boom"})))
+
+(deftest publish-response-failures
+  (testing "status taxonomy"
+    (doseq [[status expected] [[400 :bad-request] [401 :unauthorized] [403 :forbidden]
+                               [404 :not-found] [405 :method-not-allowed]
+                               [406 :unsupported-content-type] [415 :unsupported-content-type]
+                               [409 :conflict] [412 :precondition-failed] [429 :rate-limited]
+                               [418 :client-error] [500 :server-error] [503 :server-error]]]
+      (is (= expected (status-error status)) (str "status " status))))
+  (testing "a 2xx with no answer SDP is a failure, not a silent success"
+    (let [parsed (whip/publish-response endpoint {:status 201 :headers {"Location" "/r/1"} :body ""})]
+      (is (false? (:ok? parsed)))
+      (is (= :missing-answer (:error parsed)))))
+  (testing "a 2xx answer without Location still succeeds, with no resource URL"
+    (let [parsed (whip/publish-response endpoint {:status 200 :headers {} :body "v=0"})]
+      (is (:ok? parsed))
+      (is (nil? (:resource-url parsed)))))
+  (testing "a missing status is not mistaken for success"
+    (is (false? (:ok? (whip/publish-response endpoint {:status nil :body "v=0"}))))))
+
+;; ---------------------------------------------------------------------------
+;; SDP fragments
+;; ---------------------------------------------------------------------------
+
+(deftest sdp-fragment-building
+  (testing "ufrag/pwd, one m-section per mid, in first-seen order"
+    (let [frag (whip/candidates->sdp-fragment
+                {:ice-ufrag "EsAw"
+                 :ice-pwd "P2uYro0U"
+                 :candidates [{:candidate "candidate:1 1 udp 2122260223 192.0.2.1 61764 typ host"
+                               :sdp-mid "0" :media "video"}
+                              {:candidate "candidate:2 1 udp 2122260223 192.0.2.2 61765 typ host"
+                               :sdp-mid "1" :media "audio"}
+                              {:candidate "candidate:3 1 udp 2122260223 192.0.2.3 61766 typ host"
+                               :sdp-mid "0" :media "video"}]})
+          lines (str/split-lines frag)]
+      (is (= "a=ice-ufrag:EsAw" (first lines)))
+      (is (= "a=ice-pwd:P2uYro0U" (second lines)))
+      (is (= ["m=video 9 RTP/AVP 0" "a=mid:0"] (subvec (vec lines) 2 4)))
+      (is (= 2 (count (filter #(str/starts-with? % "m=") lines))))
+      (is (= 3 (count (filter #(str/starts-with? % "a=candidate:") lines))))
+      (is (str/ends-with? frag "\r\n"))))
+  (testing "a browser candidate string is used verbatim; a bare one gets the prefix"
+    (let [frag (whip/candidates->sdp-fragment
+                {:ice-ufrag "u" :candidates [{:candidate "1 1 udp 1 192.0.2.1 1 typ host" :sdp-mid "0"}]})]
+      (is (str/includes? frag "a=candidate:1 1 udp 1 192.0.2.1 1 typ host"))))
+  (testing "a blank candidate signals end-of-candidates for that mid"
+    (let [frag (whip/candidates->sdp-fragment
+                {:ice-ufrag "u" :candidates [{:candidate "" :sdp-mid "0" :media "audio"}]})]
+      (is (str/includes? frag "a=end-of-candidates"))))
+  (testing "nothing to send at all"
+    (is (nil? (whip/candidates->sdp-fragment {:candidates []})))))
+
+;; ---------------------------------------------------------------------------
+;; Session reducer
+;; ---------------------------------------------------------------------------
+
+(defn- effect-types [effects] (mapv first effects))
+
+(deftest session-happy-path
+  (let [s0 (whip/create-session endpoint "tok")
+        {s1 :session e1 :effects} (whip/apply-event s0 {:type :publish :offer-sdp "v=0-offer"})
+        _ (is (= :publishing (:whip/state s1)))
+        _ (is (= [:http-request] (effect-types e1)))
+        _ (is (= :post (:method (second (first e1)))))
+        {s2 :session e2 :effects} (whip/apply-event
+                                   s1 {:type :response
+                                       :response {:status 201
+                                                  :headers {"Location" "/r/9"
+                                                            "Link" "<stun:s.example.net>; rel=\"ice-server\""}
+                                                  :body "v=0-answer"}})]
+    (is (= :published (:whip/state s2)))
+    (is (= "https://ingest.example.net/r/9" (:whip/resource-url s2)))
+    (is (= [:set-remote-description :use-ice-servers] (effect-types e2)))
+    (is (= "v=0-answer" (second (first e2))))
+    (testing "a candidate after publish goes out as a PATCH"
+      (let [{e3 :effects} (whip/apply-event s2 {:type :ice-candidate
+                                                :candidate "candidate:1 1 udp 1 192.0.2.1 1 typ host"
+                                                :sdp-mid "0" :media "video"
+                                                :ice-ufrag "u" :ice-pwd "p"})
+            req (second (first e3))]
+        (is (= :patch (:method req)))
+        (is (= "https://ingest.example.net/r/9" (:url req)))
+        (is (str/includes? (:body req) "a=ice-ufrag:u"))))
+    (testing "terminate DELETEs the resource"
+      (let [{s4 :session e4 :effects} (whip/apply-event s2 {:type :terminate})]
+        (is (= :terminating (:whip/state s4)))
+        (is (= :delete (:method (second (first e4)))))
+        (is (= :ended (:whip/state (:session (whip/apply-event s4 {:type :terminated})))))))))
+
+(deftest candidates-gathered-during-the-round-trip-are-not-lost
+  (let [s0 (whip/create-session endpoint)
+        {s1 :session} (whip/apply-event s0 {:type :publish :offer-sdp "v=0"})
+        {s2 :session e2 :effects} (whip/apply-event s1 {:type :ice-candidate
+                                                        :candidate "candidate:1 1 udp 1 192.0.2.1 1 typ host"
+                                                        :sdp-mid "0" :media "video"
+                                                        :ice-ufrag "u" :ice-pwd "p"})]
+    (is (empty? e2) "nothing can be PATCHed before a resource URL exists")
+    (is (= 1 (count (:whip/pending-candidates s2))))
+    (let [{s3 :session e3 :effects} (whip/apply-event
+                                     s2 {:type :response
+                                         :response {:status 201 :headers {"Location" "/r/1"} :body "v=0-answer"}})]
+      (is (= [:set-remote-description :use-ice-servers :http-request] (effect-types e3))
+          "the buffered candidate is flushed as soon as the resource exists")
+      (is (empty? (:whip/pending-candidates s3)))
+      (is (str/includes? (:body (second (nth e3 2))) "a=candidate:1 1 udp 1 192.0.2.1 1 typ host")))))
+
+(deftest session-failure-paths
+  (testing "a rejected publish fails the session and reports the parsed error"
+    (let [s0 (whip/create-session endpoint)
+          {s1 :session} (whip/apply-event s0 {:type :publish :offer-sdp "v=0"})
+          {s2 :session e2 :effects} (whip/apply-event s1 {:type :response
+                                                          :response {:status 401 :headers {} :body "nope"}})]
+      (is (= :failed (:whip/state s2)))
+      (is (= [:report-error] (effect-types e2)))
+      (is (= :unauthorized (:error (:whip/error s2))))))
+  (testing "a 405 to a trickle PATCH stops further trickling without failing the session"
+    (let [s (assoc (whip/create-session endpoint)
+                   :whip/state :published :whip/resource-url "https://i/r/1")
+          {s' :session} (whip/apply-event s {:type :trickle-response :response {:status 405}})]
+      (is (false? (:whip/trickle? s')))
+      (is (= :published (:whip/state s')))
+      (is (empty? (:effects (whip/apply-event s' {:type :ice-candidate :candidate "c" :sdp-mid "0"}))))))
+  (testing "terminating a session that never got a resource URL just ends"
+    (let [{s :session e :effects} (whip/apply-event (whip/create-session endpoint) {:type :terminate})]
+      (is (= :ended (:whip/state s)))
+      (is (empty? e))))
+  (testing "terminal states absorb further events"
+    (let [ended (assoc (whip/create-session endpoint) :whip/state :ended)]
+      (is (= :ended (:whip/state (:session (whip/apply-event ended {:type :publish :offer-sdp "v=0"})))))))
+  (testing "an unknown event type is a no-op"
+    (let [s (whip/create-session endpoint)]
+      (is (= {:session s :effects []} (whip/apply-event s {:type :nonsense}))))))

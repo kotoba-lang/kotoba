@@ -1,0 +1,50 @@
+(ns vllm.real-metal-verify
+  "Compare one real GGUF Llama step on CPU and persistent Metal Q8_0."
+  (:require [vllm.gguf :as gguf]
+            [vllm.llama :as llama]
+            [vllm.metal-worker :as metal]
+            [vllm.tokenizer :as tokenizer])
+  (:import [java.io Closeable]))
+
+(defn- argmax [^floats values]
+  (loop [i 1 best 0]
+    (if (= i (alength values)) best
+      (recur (inc i) (if (> (aget values i) (aget values best)) i best)))))
+
+(defn- max-error [^floats left ^floats right]
+  (loop [i 0 result 0.0]
+    (if (= i (alength left)) result
+      (recur (inc i) (max result (Math/abs (- (aget left i) (aget right i))))))))
+
+(defn -main [& [path worker-path]]
+  (when-not path
+    (throw (ex-info "usage: kbb -M:real-metal-verify model.gguf [worker.cjs]" {})))
+  (with-open [cpu-file (gguf/open-file path)
+              gpu-file (gguf/open-file path)
+              worker (metal/start ["deno" "run" "--allow-all"
+                                   (or worker-path "../num/target/deno-q8-worker.cjs")])]
+    (let [cpu (llama/load-gguf cpu-file)
+          gpu (llama/load-gguf gpu-file {:accelerator worker})
+          token (first (tokenizer/encode (tokenizer/from-metadata (:metadata cpu-file)) "Once"))
+          cpu-logits (:logits (llama/step! cpu (llama/new-state cpu) token))
+          gpu-state (llama/new-state gpu)
+          started (System/nanoTime)
+          gpu-logits (:logits (llama/step! gpu gpu-state token))
+          _ (llama/close-state! gpu-state)
+          worker-stats (metal/stats worker)
+          report {:token token :logits (alength ^floats gpu-logits)
+                  :cpu-argmax (argmax cpu-logits) :metal-argmax (argmax gpu-logits)
+                  :max-absolute-error (max-error cpu-logits gpu-logits)
+                  :resident-handles (:handles worker-stats)
+                  :resident-kv-handles (:kv-handles worker-stats)
+                  :single-gemv (:gemv worker-stats)
+                  :batched-gemv (:gemv-many worker-stats)
+                  :metal-submissions (:submissions worker-stats)
+                  :metal-seconds (/ (- (System/nanoTime) started) 1.0e9)}]
+      (println (pr-str report))
+      (when-not (and (= (:cpu-argmax report) (:metal-argmax report))
+                     (< (:max-absolute-error report) 0.02)
+                     (pos? (:resident-handles report))
+                     (zero? (:resident-kv-handles report)))
+        (throw (ex-info "real Metal inference diverged from CPU" report)))
+      (llama/close-model! gpu))))
