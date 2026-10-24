@@ -1,0 +1,146 @@
+(ns shomen.classify
+  "決定核。entry 1 件から **3 つの答え**を出す:
+
+  1. `route`    —— 誰に何を求めるか（`shomen.vocabulary/routes`）
+  2. `advocacy` —— その要望をどの経路で届けるか（提言 actor `cloud-itonami/teigen` の入力）
+  3. `interim`  —— 電子の道が開くまでの繋ぎに、物理的に何をするか
+                   （飛脚 actor `cloud-itonami/hikyaku` の入力）
+
+  ## 決定の順序
+
+  ```text
+  :e/status :unknown                       → :unverified      （答えを拒否する）
+  電子の道 in-force かつ analog が残らない   → :electronic-now
+  成立済み未施行                            → :electronic-soon
+  法は許すが行政が用意していない             → :ask-administration
+  残る analog の最重階層が法律               → :ask-legislature
+  残る analog の最重階層が政令・省令         → :ask-ministry
+  残る analog の最重階層が通達・運用         → :ask-administration
+  ```
+
+  **`:unverified` は他のどれにも畳まない。** 測っていない手続きを `:not-permitted`
+  と同じ値で返せば、提言 actor は調べていない法令に向けて改正要望を書く。
+
+  ## 残る analog（`remaining-analog`）
+
+  電子の道が `:in-force` のとき、`:e/removes` に挙げられた種類だけが消える。
+  オンライン申請が開いていても手数料が印紙のまま、は『残る』側
+  （実例: 在留資格の手数料。申請はオンライン、納付は収入印紙）。"
+  (:require [shomen.vocabulary :as v]))
+
+(defn remaining-analog
+  "電子の道を使ってもなお残る analog 制約。"
+  [entry]
+  (let [e (:req/electronic entry)
+        removes (if (= :in-force (:e/status e)) (or (:e/removes e) #{}) #{})]
+    (vec (remove #(contains? removes (:a/kind %)) (:req/analog entry)))))
+
+(defn heaviest-source
+  "残る analog 制約のうち最も重い階層（`v/source-rank`）。無ければ nil。"
+  [remaining]
+  (when (seq remaining)
+    (apply max-key #(get v/source-rank % 0) (map :a/source remaining))))
+
+(defn route
+  "`v/routes` のどれか 1 つ。"
+  [entry]
+  (let [status (get-in entry [:req/electronic :e/status])
+        remaining (remaining-analog entry)
+        heaviest (heaviest-source remaining)]
+    (cond
+      (or (nil? status) (= :unknown status)) :unverified
+      (and (= :in-force status) (empty? remaining)) :electronic-now
+      (= :enacted-not-in-force status) :electronic-soon
+      (= :permitted-not-provided status) :ask-administration
+      (= :statute heaviest) :ask-legislature
+      (contains? #{:cabinet-order :ministerial-ordinance} heaviest) :ask-ministry
+      (contains? #{:notice-or-practice :none} heaviest) :ask-administration
+      ;; :not-permitted だが analog の列が空 —— 記述の矛盾。測り直し
+      :else :unverified)))
+
+(def ^:private advocacy-by-route
+  {:ask-legislature    {:target :diet
+                        :channels #{:petition :regulatory-reform-hotline}
+                        :asks "法律の改正（書面・印紙要件の削除、または電子代替の明文化）"}
+   :ask-ministry       {:target :ministry
+                        :channels #{:public-comment :regulatory-reform-hotline}
+                        :asks "命令等（政令・省令・規則）の改正。意見公募は案の公示中のみ"}
+   :ask-administration {:target :administration
+                        :channels #{:regulatory-reform-hotline :direct-request}
+                        :asks "法令が既に許す電子手段の提供（デジタル手続法 §6 の指定・システム整備）"}})
+
+(defn advocacy
+  "提言の宛先と経路。求めるものが無い route では nil、`:unverified` では
+  `{:refused …}` を返す —— **提言 actor が nil と拒否を区別できる**ように。"
+  [entry]
+  (let [r (route entry)]
+    (case r
+      :unverified {:refused :unverified
+                   :detail "電子の道の状態が :unknown。調べる前に提言を書かない"}
+      (:electronic-now :electronic-soon) nil
+      (let [remaining (remaining-analog entry)]
+        (assoc (advocacy-by-route r)
+               :route r
+               :remaining (mapv :a/kind remaining)
+               :legal-bases (mapv :a/legal-basis remaining))))))
+
+(def ^:private undelegable
+  "本人でなければできない analog 制約。使者（飛脚）には渡せない。
+  出頭は本人、押印は本人（使者が印を押せば私文書偽造の問題になる）、
+  公証は嘱託人本人（代理嘱託は別手続き）。"
+  #{:presence :seal :notarisation})
+
+(defn interim
+  "電子の道が開くまでの繋ぎ。`{:delegable? bool :tasks [..]}`。
+  route が `:electronic-now` なら繋ぎは不要（`nil`）。`:unverified` なら拒否。
+
+  task は飛脚 actor が**事実行為として**行えるものだけ: 印紙の購入・貼付・封入・
+  発送・受領証の保全。文書の作成・補正・署名・押印は含めない（行政書士法 §19、
+  司法書士法 §73、弁護士法 §72 の境界は飛脚側の governor が再度検査する）。"
+  [entry]
+  (let [r (route entry)]
+    (cond
+      (= r :unverified) {:refused :unverified}
+      (= r :electronic-now) nil
+      :else
+      (let [remaining (remaining-analog entry)
+            kinds (set (map :a/kind remaining))
+            fee (:req/fee entry)
+            blocked (filter undelegable kinds)
+            stamp? (or (contains? kinds :revenue-stamp)
+                       (contains? (or (:fee/channels fee) #{}) :revenue-stamp))
+            tasks (cond-> [{:task :receive-principal-documents
+                            :note "本人が作成・署名・押印済みの文書を受け取る。飛脚は作成しない"}]
+                    stamp?
+                    (into [{:task :buy-revenue-stamp
+                            :amount-jpy (:fee/amount-jpy fee)
+                            :amount-rule (:fee/rule fee)}
+                           {:task :affix-revenue-stamp
+                            :cancel-by (or (:fee/cancel-by fee) :receiving-office)
+                            :note (if (= :applicant (:fee/cancel-by fee))
+                                    "本人が消印する（印紙税法 §8 ②）。飛脚は消印しない"
+                                    "消印しない。受理した官署が消印する")}])
+                    (contains? kinds :original-attachment)
+                    (conj {:task :enclose-originals :note "原本を封入し、封入前後の写真 hash を残す"})
+                    true
+                    (into [{:task :enclose}
+                           {:task :post :traceable? true
+                            :note "追跡できる種別（特定記録・書留・内容証明）。普通郵便にしない"}
+                           {:task :archive-receipt}]))]
+        {:delegable? (empty? blocked)
+         :blocked (vec blocked)
+         :route r
+         :tasks (if (empty? blocked)
+                  tasks
+                  ;; 出頭・押印・公証が残る手続きは繋ぎ自体が成立しない。
+                  ;; 飛脚に送らず、本人が行く。
+                  [{:task :principal-must-act :because (vec blocked)}])}))))
+
+(defn classify
+  "3 つまとめて。"
+  [entry]
+  {:req/id (:req/id entry)
+   :route (route entry)
+   :remaining (mapv :a/kind (remaining-analog entry))
+   :advocacy (advocacy entry)
+   :interim (interim entry)})
