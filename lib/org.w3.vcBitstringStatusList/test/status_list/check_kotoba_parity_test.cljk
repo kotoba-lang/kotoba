@@ -1,0 +1,279 @@
+;; `kotoba/status_list/check.kotoba` against `status-list.core/check-status`.
+;;
+;; The slice is the decision: which bit answers the question, whether the
+;; list may be asked at all, and what the bit means. The base64url, the
+;; GZIP and the 16 KiB buffer stay in the host.
+;;
+;; So the two are handed the SAME entry and the SAME status list credential
+;; — built by `status-list.core` itself — and compared on the status, the
+;; validity and the reason for a refusal.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph).
+;;
+;; ## The host loop is the point
+;;
+;; `drive` expands the `encodedList` once, tells the guest only how many
+;; BYTES it came to, and then hands over exactly the bytes the guest asks
+;; for by index — `needs-byte-at`, one at a time. The guest never holds the
+;; list; the host never learns which bit it is looking at or why.
+;;
+;; ## The negative controls
+;;
+;;   * `index-zero-is-the-left-most-bit` — §3.1. `core.cljc`'s own comment
+;;     says what getting it backwards costs: a list that decodes without
+;;     error and reports the WRONG credential as revoked. This checks the
+;;     two ends of a byte against each other, which is the only way to tell
+;;     MSB-first from LSB-first apart;
+;;   * `a-short-list-is-refused-and-the-reason-is-privacy` — §3.2 step 8.
+;;     The floor protects the holder, not the verifier: below it, fetching
+;;     the list starts to identify whose credential is being checked;
+;;   * `a-purpose-mismatch-is-refused` — §3.2 step 3, on both sides: the
+;;     entry against the list, and the list against what the verifier
+;;     actually asked;
+;;   * `a-refused-check-is-not-valid` — the honest answer to "I could not
+;;     determine this" is not "yes".
+
+(ns status-list.check-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [deflate.core :as deflate]
+            [multiformats.core :as mf]
+            [status-list.core :as sl]
+            [status-list.guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir")
+           "kotoba" "status_list" "check.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'status-list.check (slurp guest-file)}
+                'status-list.check :wasm32-kotoba-v1))))
+
+;; The interpreter default (512) is enough. That was not assumed: the first
+;; version of this file carried a `test-fuel` of 20000 and a bracket test,
+;; and the bracket test failed -- 512 resolved a status, so the budget was
+;; superstition and is gone. `the-default-budget-still-suffices` at the
+;; bottom keeps that honest.
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+;; --- the host: base64url, GZIP, and the buffer -------------------------------
+
+(defn- answer
+  "One shape for a refusal and a resolution alike. The first version of this
+  file returned only `:phase` and `:reason` on the early paths, so the tests
+  asserting that a refusal yields no status read nil and proved nothing."
+  [state reads]
+  {:state state
+   :phase (call 'phase [state])
+   :reason (call 'reason [state])
+   :status (call 'status [state])
+   :valid? (call 'valid? [state])
+   :index (call 'index [state])
+   :purpose (call 'purpose [state])
+   :entries (call 'entries-in-list [state])
+   :reads reads})
+
+(defn- drive
+  "Resolve `entry` against `cred` the way a deployment does: expand the
+  encoded list ONCE, tell the guest only its size in bytes, and hand over
+  exactly the bytes it asks for."
+  [entry cred config]
+  (let [subject (get cred "credentialSubject")
+        bits (sl/expand (get subject "encodedList"))   ; the 16 KiB buffer
+        s1 (call 'offer-entry [(call 'init [(->doc config)]) (->doc entry)])]
+    (if (not= :want-list (call 'phase [s1]))
+      (answer s1 0)
+      (let [s2 (call 'offer-list
+                     [s1 (->doc {:statusPurpose (str (get subject "statusPurpose"))
+                                 :statusSize (get subject "statusSize" 0)
+                                 :bitstring-bytes (count bits)})])]
+        (loop [state s2 reads 0]
+          (let [at (call 'needs-byte-at [state])]
+            (if (neg? at)
+              (answer state reads)
+              (recur (call 'offer-byte [state (bit-and (nth bits at) 0xff)])
+                     (inc reads)))))))))
+
+(defn- oracle [entry cred config]
+  (try (sl/check-status entry cred config)
+       (catch clojure.lang.ExceptionInfo e
+         {:threw (:status-list/error (ex-data e))})))
+
+;; --- fixtures ----------------------------------------------------------------
+
+(defn- credential
+  ([revoked] (credential revoked "revocation"))
+  ([revoked purpose]
+   (sl/status-list-credential
+    {:id "https://issuer.example/status/1"
+     :issuer "https://issuer.example"
+     :purpose purpose
+     :encoded-list (sl/generate revoked)})))
+
+(defn- an-entry
+  ([index] (an-entry index "revocation"))
+  ([index purpose]
+   (sl/entry {:purpose purpose :index index
+              :status-list-credential "https://issuer.example/status/1"})))
+
+;; --- the tests ---------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-revoked-credential-agrees-with-the-oracle
+  (let [cred (credential {7 1, 9 1})
+        g (drive (an-entry 7) cred {})
+        o (oracle (an-entry 7) cred {})]
+    (is (= :resolved (:phase g)) (:reason g))
+    (is (= 1 (:status g)))
+    (is (false? (:valid? g)))
+    (is (= (:status o) (:status g)))
+    (is (= (:valid? o) (:valid? g)))
+    (is (= 7 (:index g)))
+    (is (= 1 (:reads g)) "one byte read, for a one-bit status")))
+
+(deftest an-unrevoked-credential-agrees-with-the-oracle
+  (let [cred (credential {7 1, 9 1})]
+    (doseq [i [0 6 8 10 131071]]
+      (let [g (drive (an-entry i) cred {})
+            o (oracle (an-entry i) cred {})]
+        (is (= :resolved (:phase g)) [i (:reason g)])
+        (is (= 0 (:status g)) i)
+        (is (true? (:valid? g)) i)
+        (is (= (:status o) (:status g)) i)))))
+
+(deftest index-zero-is-the-left-most-bit
+  (testing "§3.1: index 0 is the MOST significant bit of byte 0. `core.cljc`
+            says what getting it backwards costs -- a list that decodes
+            without error and reports the WRONG credential as revoked, which
+            is the worst possible failure mode here.
+
+            Checking index 0 alone cannot tell MSB-first from LSB-first
+            apart: both read byte 0. Checking the two ENDS of byte 0 against
+            each other can."
+    (let [cred (credential {0 1})
+          at-0 (drive (an-entry 0) cred {})
+          at-7 (drive (an-entry 7) cred {})]
+      (is (= 1 (:status at-0)) "index 0 is set")
+      (is (= 0 (:status at-7)) "index 7, the other end of the same byte, is not")
+      (is (= 1 (:status (oracle (an-entry 0) cred {}))))
+      (is (= 0 (:status (oracle (an-entry 7) cred {})))))
+    (testing "and the mirror case, so neither direction passes by luck"
+      (let [cred (credential {7 1})]
+        (is (= 0 (:status (drive (an-entry 0) cred {}))))
+        (is (= 1 (:status (drive (an-entry 7) cred {}))))))))
+
+(deftest a-short-list-is-refused-and-the-reason-is-privacy
+  (testing "§3.2 step 8. The floor is not a sanity check: one fetch answers
+            the question for 131,072 credentials without revealing which one
+            the verifier cares about, and below it the set sharing a list
+            gets small enough that fetching it identifies the subject. The
+            refusal protects the holder, who is not in the room."
+    (let [;; `generate` refuses to build one, which is the right behaviour
+          ;; and is why this is assembled by hand -- the same way a hostile
+          ;; issuer would.
+          short-encoded (str "u" (mf/base64url (deflate/gzip (vec (repeat 16 0)))))
+          short-cred (assoc-in (credential {})
+                               ["credentialSubject" "encodedList"] short-encoded)
+          g (drive (an-entry 7) short-cred {})]
+      (is (= :refused (:phase g)))
+      (is (= :status-list/status-list-length-error (:reason g)))
+      (is (= -1 (:status g)) "and no status comes back out")
+      (is (false? (:valid? g)))
+      (is (= :status-list/status-list-length-error
+             (:threw (oracle (an-entry 7) short-cred {})))))))
+
+(deftest a-purpose-mismatch-is-refused
+  (testing "§3.2 step 3: an answer from a list that tracks something else is
+            not an answer"
+    (let [suspension-list (credential {7 1} "suspension")
+          revocation-entry (an-entry 7 "revocation")
+          g (drive revocation-entry suspension-list {})]
+      (is (= :refused (:phase g)))
+      (is (= :status-list/purpose-mismatch (:reason g)))
+      (is (= :status-list/purpose-mismatch
+             (:threw (oracle revocation-entry suspension-list {}))))))
+  (testing "and the verifier's own question must be the one being answered:
+            asking \"is this revoked\" must not be answered \"it is not
+            suspended\""
+    (let [suspension-list (credential {7 1} "suspension")
+          suspension-entry (an-entry 7 "suspension")
+          g (drive suspension-entry suspension-list
+                   {:expected-purpose "revocation"})]
+      (is (= :refused (:phase g)))
+      (is (= :status-list/purpose-mismatch (:reason g))))))
+
+(deftest a-refused-check-is-not-valid
+  (testing "the honest answer to \"I could not determine this\" is not
+            \"yes\" -- a refusal that reported valid? true would be worse
+            than no check at all"
+    (doseq [[label entry cred cfg]
+            [["bad type" (assoc (an-entry 7) "type" "SomethingElse")
+              (credential {}) {}]
+             ["non-numeric index" (assoc (an-entry 7) "statusListIndex" "seven")
+              (credential {}) {}]
+             ["purpose mismatch" (an-entry 7 "revocation")
+              (credential {} "suspension") {}]]]
+      (let [g (drive entry cred cfg)]
+        (is (= :refused (:phase g)) label)
+        (is (false? (:valid? g)) label)
+        (is (= -1 (:status g)) label)))))
+
+(deftest the-index-is-a-base-ten-string-not-a-number
+  (testing "§3.1: it is an arbitrary-size integer and JSON numbers cannot
+            carry one faithfully, so a value that is not all digits is not
+            an index"
+    (doseq [bad ["" "seven" "7x" "-1" "0x7"]]
+      (let [g (drive (assoc (an-entry 7) "statusListIndex" bad)
+                     (credential {}) {})]
+        (is (= :refused (:phase g)) (pr-str bad))
+        (is (= :status-list/bad-index (:reason g)) (pr-str bad))))))
+
+(deftest an-index-past-the-end-is-refused
+  (let [cred (credential {})
+        g (drive (an-entry 999999999) cred {})]
+    (is (= :refused (:phase g)))
+    (is (= :status-list/index-out-of-range (:reason g)))
+    (is (= -1 (:status g)))))
+
+(deftest the-list-length-is-reported-in-entries
+  (let [g (drive (an-entry 0) (credential {}) {})]
+    (is (= :resolved (:phase g)))
+    (is (<= 131072 (:entries g)))))
+
+;; --- the budget --------------------------------------------------------------
+
+(defn- completes-within? [fuel]
+  (try
+    (let [cred (credential {7 1})
+          bits (sl/expand (get-in cred ["credentialSubject" "encodedList"]))
+          s1 (call 'offer-entry [(call 'init [(->doc {})] fuel)
+                                 (->doc (an-entry 7))] fuel)
+          s2 (call 'offer-list
+                   [s1 (->doc {:statusPurpose "revocation"
+                               :bitstring-bytes (count bits)})] fuel)
+          at (call 'needs-byte-at [s2] fuel)
+          s3 (call 'offer-byte [s2 (bit-and (nth bits at) 0xff)] fuel)]
+      (= :resolved (call 'phase [s3] fuel)))
+    (catch clojure.lang.ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest the-default-budget-still-suffices
+  (testing "no `:fuel` option is passed anywhere in this file, so this is
+            the assertion that keeps that honest"
+    (is (true? (completes-within? 512))))
+  (testing "and the margin is visible, so a guest that grows is noticed
+            before it trips the default rather than after"
+    (let [minimum (first (filter completes-within?
+                                 [150 200 250 300 350 400 450 512]))]
+      (is (some? minimum) "a status does not resolve even at the default")
+      (println (format "  [fuel] a one-bit status resolves at %d; the default is 512"
+                       minimum)))))

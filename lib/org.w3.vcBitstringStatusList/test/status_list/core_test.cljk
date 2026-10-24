@@ -1,0 +1,255 @@
+(ns status-list.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [deflate.core :as deflate]
+            [multiformats.core :as mf]
+            [status-list.core :as sl]))
+
+(def list-url "https://issuer.example/status/1")
+
+(defn- an-entry
+  ([index] (an-entry index {}))
+  ([index opts]
+   (sl/entry (merge {:index index :status-list-credential list-url} opts))))
+
+(defn- a-list-credential
+  ([encoded] (a-list-credential encoded {}))
+  ([encoded opts]
+   (sl/status-list-credential
+    (merge {:id list-url :issuer "did:example:issuer" :encoded-list encoded} opts))))
+
+;; ── §3.1 Generate / §3.4 Expand ──────────────────────────────────────────────
+
+(deftest generated-list-has-the-minimum-size
+  (testing "§3.2 step 2: 131,072 entries, i.e. a 16 KiB bitstring"
+    (let [bits (sl/expand (sl/generate {}))]
+      (is (= 16384 (count bits)) "16 KiB of bytes")
+      (is (= 131072 (* 8 (count bits))) "131,072 bits")
+      (is (every? zero? bits) "an empty list is all zeros"))))
+
+(deftest set-bits-round-trip-through-gzip-and-multibase
+  (testing "the indices set by the issuer are the indices the verifier reads back"
+    (let [revoked #{0 1 7 8 9 4095 131071}
+          encoded (sl/generate revoked)]
+      (doseq [i (sort revoked)]
+        (is (= 1 (:status (sl/check-status (an-entry i) (a-list-credential encoded))))
+            (str "index " i " should be set")))
+      (doseq [i [2 3 6 10 4094 4096 131070]]
+        (is (= 0 (:status (sl/check-status (an-entry i) (a-list-credential encoded))))
+            (str "index " i " should be clear"))))))
+
+(deftest bit-zero-is-the-most-significant-bit-of-byte-zero
+  (testing "§3.1: index 0 is the LEFT-MOST bit. If this were the least
+            significant bit instead, the list would still decode cleanly and
+            simply report the wrong credentials as revoked."
+    (let [bits (sl/expand (sl/generate #{0}))]
+      (is (= 0x80 (first bits)) "index 0 sets 0b1000_0000, not 0b0000_0001"))
+    (let [bits (sl/expand (sl/generate #{7}))]
+      (is (= 0x01 (first bits)) "index 7 sets the least significant bit of byte 0"))
+    (let [bits (sl/expand (sl/generate #{8}))]
+      (is (= 0x00 (first bits)))
+      (is (= 0x80 (second bits)) "index 8 is the most significant bit of byte 1"))))
+
+(deftest encoded-list-is-multibase-base64url-gzip
+  (let [encoded (sl/generate #{5})]
+    (testing "multibase prefix `u` = base64url, no padding"
+      (is (= "u" (subs encoded 0 1)))
+      (is (not (re-find #"=" encoded)) "no base64 padding")
+      (is (not (re-find #"[+/]" encoded)) "url alphabet, not standard base64"))
+    (testing "the payload really is a gzip member"
+      (let [gz (vec (map #(bit-and % 0xff) (mf/base64url-decode (subs encoded 1))))]
+        (is (= [0x1f 0x8b] (subvec gz 0 2)) "gzip magic")
+        (is (= 16384 (count (deflate/gunzip gz))))))))
+
+(deftest a-mostly-empty-list-compresses
+  (testing "the 16 KiB minimum is affordable precisely because it compresses;
+            if this ever regressed to stored blocks the value would be ~22 KB"
+    (let [encoded (sl/generate #{7})]
+      (is (< (count encoded) 1000)
+          (str "expected a small encodedList, got " (count encoded) " chars")))))
+
+(def cross-host-pinned-encoded-list
+  "The exact `encodedList` for indices #{0 7 8 4095}, pinned identically here and
+  in `test/nbb_smoke.cljk`.
+
+  This is the cross-host invariant, and it cannot be expressed inside one suite:
+  the value sits inside a SIGNED credential, so if :clj and :cljs ever gzip or
+  base64url differently, one host issues a status list the other host's verifier
+  rejects — and both suites would still pass on their own. Two copies of one
+  literal is the cheapest way to make that divergence fail something.
+
+  Measured identical on both hosts 2026-07-30."
+  "uH4sIAAAAAAAA_-3BAQ0AAAgDoNtcm1vDTWA6_FUBAAAAAAAAAAAAAAAAAADghAUtkbYtAEAAAA")
+
+(deftest generate-matches-the-cross-host-pinned-value
+  (is (= cross-host-pinned-encoded-list (sl/generate #{0 7 8 4095}))))
+
+(deftest generate-is-deterministic
+  (testing "the same input yields the same encodedList, because this value goes
+            inside a signed credential — a gzip MTIME would change the signature
+            on every regeneration of an unchanged list"
+    (is (= (sl/generate #{1 2 3}) (sl/generate #{3 2 1})))
+    (is (= (sl/generate {4 1}) (sl/generate #{4})))))
+
+;; ── multi-bit status (statusSize > 1) ────────────────────────────────────────
+
+(def message-list
+  [{"status" "0x0" "message" "valid"}
+   {"status" "0x1" "message" "invalid"}
+   {"status" "0x2" "message" "pending_review"}
+   {"status" "0x3" "message" "revoked_for_cause"}])
+
+(deftest multi-bit-status-values
+  (testing "§3.2 step 9: the position is index * statusSize"
+    (let [encoded (sl/generate {0 3, 1 1, 2 0, 3 2} {:status-size 2})
+          cred (a-list-credential encoded {:status-size 2 :purpose "message"})
+          check (fn [i] (sl/check-status
+                         (an-entry i {:purpose "message" :status-size 2
+                                      :status-message message-list})
+                         cred))]
+      (is (= 3 (:status (check 0))))
+      (is (= 1 (:status (check 1))))
+      (is (= 0 (:status (check 2))))
+      (is (= 2 (:status (check 3))))
+      (testing "statusMessage names the value"
+        (is (= "revoked_for_cause" (:message (check 0))))
+        (is (= "valid" (:message (check 2)))))
+      (testing "only status 0 is valid"
+        (is (:valid? (check 2)))
+        (is (not (:valid? (check 0))))))))
+
+(deftest multi-bit-list-still-holds-the-minimum-entries
+  (testing "statusSize 2 means twice the bitstring for the same entry count"
+    (let [bits (sl/expand (sl/generate {} {:status-size 2}))]
+      (is (= 32768 (count bits)))
+      (is (= 131072 (quot (* 8 (count bits)) 2))))))
+
+;; ── fail-closed behaviour ────────────────────────────────────────────────────
+
+(deftest short-lists-are-refused-at-generation
+  (testing "the 131,072 minimum is a privacy property, so a smaller list is
+            refused rather than silently padded"
+    (is (= :status-list/too-few-entries
+           (:status-list/error
+            (ex-data (try (sl/generate #{1} {:entries 1024})
+                          (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest short-lists-are-refused-at-validation
+  (testing "§3.2 step 8: STATUS_LIST_LENGTH_ERROR on a list served too short"
+    (let [short-encoded (str "u" (mf/base64url (deflate/gzip (vec (repeat 1024 0)))))
+          e (try (sl/check-status (an-entry 1) (a-list-credential short-encoded))
+                 (catch clojure.lang.ExceptionInfo ex ex))]
+      (is (= :status-list/status-list-length-error
+             (:status-list/error (ex-data e)))))))
+
+(deftest purpose-mismatch-is-refused
+  (testing "§3.2 step 3: answering from a list that tracks something else would
+            be a wrong answer, not a missing one"
+    (let [encoded (sl/generate #{1})
+          suspension-list (a-list-credential encoded {:purpose "suspension"})
+          revocation-entry (an-entry 1 {:purpose "revocation"})]
+      (is (= :status-list/purpose-mismatch
+             (:status-list/error
+              (ex-data (try (sl/check-status revocation-entry suspension-list)
+                            (catch clojure.lang.ExceptionInfo e e)))))))
+
+    (testing "and the verifier can pin the purpose it actually asked about"
+      (let [encoded (sl/generate #{1})]
+        (is (= :status-list/purpose-mismatch
+               (:status-list/error
+                (ex-data (try (sl/check-status (an-entry 1) (a-list-credential encoded)
+                                               {:expected-purpose "suspension"})
+                              (catch clojure.lang.ExceptionInfo e e))))))))))
+
+(deftest non-multibase-encoded-list-is-refused
+  (testing "multibase is self-describing; guessing the base could decode into a
+            plausible but wrong bitstring"
+    (let [encoded (sl/generate #{1})
+          stripped (subs encoded 1)]
+      (is (= :status-list/bad-multibase
+             (:status-list/error
+              (ex-data (try (sl/expand stripped)
+                            (catch clojure.lang.ExceptionInfo e e))))))
+      (is (= :status-list/bad-multibase
+             (:status-list/error
+              (ex-data (try (sl/expand (str "z" stripped))
+                            (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest index-beyond-the-list-is-refused
+  (is (= :status-list/index-out-of-range
+         (:status-list/error
+          (ex-data (try (sl/generate {131072 1})
+                        (catch clojure.lang.ExceptionInfo e e))))))
+  (testing "and on the read side too"
+    (let [encoded (sl/generate #{1})]
+      (is (= :status-list/index-out-of-range
+             (:status-list/error
+              (ex-data (try (sl/check-status (an-entry 999999) (a-list-credential encoded))
+                            (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest status-value-must-fit-the-status-size
+  (testing "statusSize 1 holds 0 or 1; 2 would silently corrupt a neighbour"
+    (is (= :status-list/bad-status-value
+           (:status-list/error
+            (ex-data (try (sl/generate {1 2})
+                          (catch clojure.lang.ExceptionInfo e e))))))
+    (is (= :status-list/bad-status-value
+           (:status-list/error
+            (ex-data (try (sl/generate {1 4} {:status-size 2})
+                          (catch clojure.lang.ExceptionInfo e e))))))))
+
+;; ── document shapes ──────────────────────────────────────────────────────────
+
+(deftest entry-shape
+  (let [e (an-entry 94567)]
+    (is (= "BitstringStatusListEntry" (get e "type")))
+    (is (= "revocation" (get e "statusPurpose")))
+    (testing "statusListIndex is a base-10 STRING: it is an arbitrary-size
+              integer and a JSON number cannot carry one faithfully"
+      (is (= "94567" (get e "statusListIndex")))
+      (is (string? (get e "statusListIndex"))))
+    (is (= list-url (get e "statusListCredential")))
+    (testing "statusSize is omitted when it is the default of 1"
+      (is (not (contains? e "statusSize"))))))
+
+(deftest entry-input-discipline
+  (testing "an unknown statusPurpose is refused"
+    (is (= :status-list/bad-purpose
+           (:status-list/error
+            (ex-data (try (an-entry 1 {:purpose "whatever"})
+                          (catch clojure.lang.ExceptionInfo e e)))))))
+
+  (testing "statusMessage is required once statusSize > 1, since a multi-bit
+            status is otherwise an integer no verifier can interpret"
+    (is (= :status-list/status-message-required
+           (:status-list/error
+            (ex-data (try (an-entry 1 {:purpose "message" :status-size 2})
+                          (catch clojure.lang.ExceptionInfo e e)))))))
+
+  (testing "statusMessage must cover every value the status size can express"
+    (is (= :status-list/bad-status-message
+           (:status-list/error
+            (ex-data (try (an-entry 1 {:purpose "message" :status-size 2
+                                       :status-message (take 3 message-list)})
+                          (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest status-list-credential-shape
+  (let [c (a-list-credential (sl/generate #{1}) {:valid-from "2026-07-30T00:00:00Z"})]
+    (is (= ["VerifiableCredential" "BitstringStatusListCredential"] (get c "type")))
+    (is (= ["https://www.w3.org/ns/credentials/v2"] (get c "@context")))
+    (is (= "BitstringStatusList" (get-in c ["credentialSubject" "type"])))
+    (is (= "revocation" (get-in c ["credentialSubject" "statusPurpose"])))
+    (is (= (str list-url "#list") (get-in c ["credentialSubject" "id"])))
+    (is (= "2026-07-30T00:00:00Z" (get c "validFrom")))
+    (testing "returned unsigned: the issuer's proof is added separately"
+      (is (not (contains? c "proof"))))))
+
+(deftest revocation-flow
+  (testing "the end-to-end shape a verifier actually walks"
+    (let [index 42
+          e (an-entry index)
+          before (a-list-credential (sl/generate {}))
+          after (a-list-credential (sl/generate #{index}))]
+      (is (:valid? (sl/check-status e before)) "not revoked yet")
+      (is (not (:valid? (sl/check-status e after))) "revoked")
+      (is (= index (:index (sl/check-status e after))))
+      (is (= "revocation" (:purpose (sl/check-status e after)))))))

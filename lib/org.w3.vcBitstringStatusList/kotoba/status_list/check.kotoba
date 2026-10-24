@@ -1,0 +1,285 @@
+;; The Bitstring Status List check, as a Kotoba application
+;; (ADR-2608261100) — W3C Bitstring Status List v1.0 §3.2.
+;;
+;;   init          (config)        -> state
+;;   offer-entry   (state, entry)  -> state
+;;   offer-list    (state, list)   -> state
+;;   offer-byte    (state, byte)   -> state   ; the one the guest asked for
+;;
+;; ## The bitstring cannot be a guest value, and does not need to be
+;;
+;; A conformant list holds at least 131,072 entries, which at statusSize 1
+;; is a 16 KiB bitstring — past `:document`'s `:aggregate-utf8-bytes` 65536
+;; once expanded, and past `:container-items` 32 immediately
+;; (ADR-2608039970). But the guest does not want the bitstring. It wants one
+;; bit, and it is the thing that knows WHICH bit:
+;;
+;;   the guest owns   which byte and which bit within it, whether the list
+;;                    is long enough to ask, whether the purposes agree, and
+;;                    what the resulting value means
+;;   the host owns    base64url, GZIP, and the 16 KiB buffer
+;;
+;; `needs-byte-at` names an index; `offer-byte` takes that byte's value.
+;; The host never learns why, and the guest never holds the list.
+;;
+;; ## Index zero is the LEFT-most bit
+;;
+;; §3.1: *"the first index, with a value of zero, is located at the
+;; left-most bit"* — so index 0 is the most significant bit of byte 0, not
+;; the least. `core.cljc`'s own comment says what getting it backwards
+;; costs: *"produces a list that decodes without error and reports the wrong
+;; credential as revoked, which is the worst possible failure mode here."*
+;;
+;; A silent wrong answer about revocation is exactly the kind of decision
+;; worth moving somewhere it can be stated once and tested.
+;; `index-zero-is-the-left-most-bit` is the control.
+;;
+;; ## The length check is a privacy rule, not a sanity check
+;;
+;; §3.2 step 8 refuses a list shorter than 131,072 entries. The reason is
+;; not corruption: it is that one fetch answers the question for 131,072
+;; credentials without revealing which one the verifier cares about, and
+;; below that floor the set sharing a list gets small enough that fetching
+;; it starts to identify the subject. So the refusal protects the holder,
+;; not the verifier, and a verifier that skips it harms someone who is not
+;; in the room.
+;;
+;; ## Purposes must agree, twice
+;;
+;; §3.2 step 3: the entry's `statusPurpose` must match the list's, or the
+;; answer comes from a list that tracks something else entirely. And if the
+;; verifier said which purpose it was asking about, that must match too — a
+;; verifier asking "is this revoked" must not be answered "it is not
+;; suspended".
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/status_list/check.kotoba \
+;;     --target wasm32-browser --output check.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6193-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns status-list.check
+  (:export [init offer-entry offer-list offer-byte
+            phase reason
+            needs-byte-at status valid? purpose index status-size
+            entries-in-list]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+;; --- digits ---------------------------------------------------------------
+;; §3.1: `statusListIndex` is a base-10 STRING, not a number -- it is an
+;; arbitrary-size integer and JSON numbers cannot carry one faithfully. So
+;; it arrives as text and is parsed here, strictly: a value that is not all
+;; digits is not an index.
+
+(defn- at-byte [s :string i :i64] :i64
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- digit? [c :i64] :bool (and (>= c 48) (<= c 57)))
+
+(defn- all-digits? [s :string i :i64] :bool
+  (let [c (at-byte s i)]
+    (cond (= c -1) (> i 0)
+          (not (digit? c)) false
+          :else (all-digits? s (+ i 1)))))
+
+(defn- read-i64 [s :string i :i64 acc :i64] :i64
+  (let [c (at-byte s i)]
+    (if (digit? c)
+      (read-i64 s (+ i 1) (+ (* acc 10) (- c 48)))
+      acc)))
+
+;; --- the minimum (§3.2 step 2 / step 8) -----------------------------------
+
+(defn- minimum-entries [] :i64 131072)
+
+;; --- bit addressing (§3.1) -------------------------------------------------
+;; Index 0 is the MOST significant bit of byte 0. `quot` and a subtraction
+;; rather than `mod`, because `max` is in `:admitted-builtins` and still has
+;; no lowering (measured 2026-08-30) and one such surprise per file is
+;; enough.
+
+;; `bit-shift-right` is in `:admitted-builtins` and has no admitted type
+;; signature (measured 2026-08-31, alongside `max`), so the shift is a
+;; halving. Two names in that set now behave this way; see adr-2608302100
+;; on measuring rather than reading a capability off a list.
+(defn- shift-right [v :i64 n :i64] :i64
+  (if (<= n 0) v (shift-right (quot v 2) (- n 1))))
+
+(defn- byte-of [pos :i64] :i64 (quot pos 8))
+
+(defn- offset-of [pos :i64] :i64 (- 7 (- pos (* (quot pos 8) 8))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc state :phase (document-keyword :refused))
+    :reason (document-keyword why))
+   :need (document-i64 -1)))
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-entry)
+                :reason (document-keyword :none)
+                :expected-purpose (document-string (ds config :expected-purpose))
+                :purpose (document-string "")
+                :index (document-i64 -1)
+                :size (document-i64 1)
+                :entries (document-i64 -1)
+                :bit (document-i64 0)
+                :acc (document-i64 0)
+                :need (document-i64 -1)
+                :status (document-i64 -1)))
+
+;; --- the entry (§3.2) ------------------------------------------------------
+;; `entry`: `:type`, `:statusPurpose`, `:statusListIndex` (a base-10 string),
+;; `:statusSize` (optional).
+
+(defn offer-entry [state :document entry :document] :document
+  (if (not (= (dk state :phase) :want-entry))
+    state
+    (let [idx-text (ds entry :statusListIndex)
+          p (ds entry :statusPurpose)
+          declared (di entry :statusSize)
+          kept (document-assoc state :purpose (document-string p))]
+      (cond
+        (not (string=? (ds entry :type) "BitstringStatusListEntry"))
+        (refuse kept :status-list/bad-entry-type)
+
+        (not (all-digits? idx-text 0)) (refuse kept :status-list/bad-index)
+
+        ;; The verifier said which question it was asking. Being answered a
+        ;; different one -- "it is not suspended" to "is it revoked" -- is
+        ;; worse than no answer, because it looks like one.
+        (and (not (string=? (ds state :expected-purpose) ""))
+             (not (string=? (ds state :expected-purpose) p)))
+        (refuse kept :status-list/purpose-mismatch)
+
+        :else
+        (document-assoc
+         (document-assoc
+          (document-assoc kept :phase (document-keyword :want-list))
+          :index (document-i64 (read-i64 idx-text 0 0)))
+         :size (document-i64 (if (> declared 0) declared 1)))))))
+
+;; --- the list --------------------------------------------------------------
+;; The host base64url-decoded and GZIP-expanded the `encodedList` and reports
+;; how many BYTES it came to. It does not hand over the bytes.
+;; `list`: `:statusPurpose`, `:statusSize` (optional), `:bitstring-bytes`.
+
+(defn offer-list [state :document list :document] :document
+  (if (not (= (dk state :phase) :want-list))
+    state
+    (let [total-bytes (di list :bitstring-bytes)
+          declared (di list :statusSize)
+          size (if (> (di state :size) 1) (di state :size)
+                   (if (> declared 0) declared 1))
+          total-bits (* total-bytes 8)
+          entries (quot total-bits size)
+          first-bit (* (di state :index) size)]
+      (cond
+        ;; §3.2 step 3. An answer from a list that tracks something else is
+        ;; not an answer.
+        (not (string=? (ds list :statusPurpose) (ds state :purpose)))
+        (refuse state :status-list/purpose-mismatch)
+
+        (< total-bytes 0) (refuse state :status-list/bad-list)
+
+        ;; §3.2 step 8, and it protects the holder rather than the verifier:
+        ;; below the floor, fetching the list starts to identify whose
+        ;; credential is being checked.
+        (< entries (minimum-entries))
+        (refuse state :status-list/status-list-length-error)
+
+        (> (+ first-bit size) total-bits)
+        (refuse state :status-list/index-out-of-range)
+
+        :else
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc
+            (document-assoc state :phase (document-keyword :want-byte))
+            :size (document-i64 size))
+           :entries (document-i64 entries))
+          :bit (document-i64 first-bit))
+         :need (document-i64 (byte-of first-bit)))))))
+
+;; --- reading the bits ------------------------------------------------------
+;; One byte at a time, MSB-first. `statusSize` may be more than one bit and
+;; may straddle a byte boundary, so the guest asks again rather than
+;; assuming the bits are all in one place.
+
+(defn offer-byte [state :document value :i64] :document
+  (if (not (= (dk state :phase) :want-byte))
+    state
+    (let [pos (di state :bit)
+          shifted (shift-right value (offset-of pos))
+          bit (- shifted (* (quot shifted 2) 2))
+          acc (+ (* (di state :acc) 2) bit)
+          done (+ (- pos (* (di state :index) (di state :size))) 1)
+          next-pos (+ pos 1)]
+      (if (>= done (di state :size))
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc state :phase (document-keyword :resolved))
+           :status (document-i64 acc))
+          :acc (document-i64 acc))
+         :need (document-i64 -1))
+        (document-assoc
+         (document-assoc
+          (document-assoc state :acc (document-i64 acc))
+          :bit (document-i64 next-pos))
+         :need (document-i64 (byte-of next-pos)))))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; The byte the host must read out of the expanded bitstring, or -1 when the
+;; guest is not waiting for one. The host never learns why this index.
+(defn needs-byte-at [state :document] :i64 (di state :need))
+
+;; Only once resolved. A status handed back from a refusal would make the
+;; refusal decorative, and this one decides whether a credential is used.
+(defn status [state :document] :i64
+  (if (= (dk state :phase) :resolved) (di state :status) -1))
+
+;; For `revocation` and `suspension` a set bit means the credential is no
+;; longer usable. A refused check is NOT valid: the honest answer to "I
+;; could not determine this" is not "yes".
+(defn valid? [state :document] :bool
+  (and (= (dk state :phase) :resolved) (= (di state :status) 0)))
+
+(defn purpose [state :document] :string (ds state :purpose))
+
+(defn index [state :document] :i64 (di state :index))
+
+(defn status-size [state :document] :i64 (di state :size))
+
+(defn entries-in-list [state :document] :i64 (di state :entries))
