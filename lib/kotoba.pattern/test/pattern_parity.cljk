@@ -1,0 +1,205 @@
+#!/usr/bin/env kbb
+;; Differential parity: the Kotoba matcher against the host's own regex engine.
+;;
+;; Both sides RUN. The oracle is JavaScript's RegExp -- the engine this
+;; workspace's `.cljc` actually uses on the ClojureScript side -- and the port
+;; is the ESM amu emitted from `kotoba/pattern_core.kotoba`, driven through
+;; programs that `pattern.compile` produced from the same pattern strings.
+;; So a failure here means one of three real things: the compiler emitted the
+;; wrong program, the machine ran it wrong, or the subset does not mean what
+;; the regex means.
+;;
+;; Two differences are deliberate and asserted rather than hidden:
+;;
+;;   * ⚠ ONE difference used to be listed here that was not one. `.` matched
+;;     a newline, and this header called that deliberate, so the corpus
+;;     deliberately avoided newline inputs for `.` -- the suite was told to
+;;     look away from the very thing it would have caught. Corrected
+;;     2026-09-09: `.` excludes the line terminators, as JavaScript's does,
+;;     and the corpus now reaches it.
+;;   * the machine is leftmost-LONGEST; JS RegExp is leftmost-first. For
+;;     `a|ab` against "ab" the machine answers 2 and JS answers 1. Only the
+;;     START of a search is compared, plus one case that pins the difference.
+;;
+;; Exit codes: 0 passed, 1 failed, 2 REFUSED.
+;;
+;;   kbb --backend sci --classpath src test/pattern_parity.cljk
+
+(ns pattern-parity
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [pattern.compile :as pc]))
+
+(def script
+  (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+      "lib/kotoba.pattern/test/pattern_parity.cljk"))
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".."))
+
+;; Measured 2026-09-09: the default per-instance budget is 512 -- a plain
+;; countdown returns at n=510 -- and a matcher spends fuel per function entry,
+;; so the default cannot finish a six-character search. 5000 already runs a
+;; 40-character one; this is the host choosing, which is the point of the knob.
+(def fuel 200000)
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check! [label expected actual]
+  (swap! checks inc)
+  (when-not (= expected actual)
+    (swap! failures inc)
+    (println "  FAIL" label "\n    RegExp:" (pr-str expected) "\n    kotoba:" (pr-str actual))))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+;; --- the corpus -----------------------------------------------------------
+;;
+;; Every pattern here is either drawn from the browser-stack corpus this
+;; library was built for (htmldom, cssom, kiyaku's postal formats) or is the
+;; boundary of a construct: a class edge, an empty repeat, an anchor on both
+;; sides, a quantifier at exactly {n}.
+
+(def corpus
+  [;; --- `.` and a line terminator ------------------------------------------
+   ;; Absent until 2026-09-09, and deliberately so: the header called `.`
+   ;; matching a newline a deliberate difference, so no input reached it.
+   ["a.b" ["axb" "a\nb" "a\rb" "ab"]]
+   ["." ["a" "\n" "\r" ""]]
+   ["a.*b" ["ab" "axb" "a\nxb" "axxb"]]
+   ["[^x]" ["a" "\n" "x" ""]]
+   ["ab" ["ab" "a" "abc" "" "ba"]]
+   ["a|b" ["a" "b" "c" "ab" ""]]
+   ["[0-9]" ["0" "9" "5" "/" ":" "a" ""]]
+   ["[0-9]+" ["0" "12345" "" "12a" "a12"]]
+   ["[^0-9]" ["a" "7" "" "!"]]
+   ["\\d{3}-\\d{4}" ["123-4567" "12-4567" "1234-567" "123-456" "123-45678" ""]]
+   ["\\d{5}(-\\d{4})?" ["12345" "12345-6789" "1234" "12345-678" ""]]
+   ["[A-Z]\\d[A-Z]\\s?\\d[A-Z]\\d" ["K1A0B1" "K1A 0B1" "K1A  0B1" "k1a0b1" ""]]
+   ["[A-Za-z_][-A-Za-z0-9_]*" ["a" "_x-1" "-x" "" "9a"]]
+   ["-?\\d+" ["1" "-1" "-" "12" "1-2" ""]]
+   ["-?\\d+(\\.\\d+)?(px)?" ["1" "-1.5" "1.5px" "1." "px" ""]]
+   ["\\s+" [" " "   " "\t" "" "a "]]
+   ["[ \\t\\n\\f\\r]+" [" " "\t\n" "" "x"]]
+   ["a*" ["" "a" "aaa" "b"]]
+   ["a?" ["" "a" "aa"]]
+   ["a{2,3}" ["a" "aa" "aaa" "aaaa" ""]]
+   ["^[a-zA-Z0-9]" ["a" "Z" "0" "-" ""]]
+   ["&([a-zA-Z][a-zA-Z0-9]*)" ["&amp" "&a" "&" "&1a" ""]]
+   ["(?i)!important" ["!important" "!IMPORTANT" "!ImPoRtAnT" "important"]]
+   ["\\.[a-z]+" [".css" "." "css" ".CSS"]]
+   ;; --- patterns that END in `$` -------------------------------------------
+   ;;
+   ;; The corpus had none until 2026-09-09, and their absence hid a real bug:
+   ;; a thread that STEPS ONTO a `$` was being told it was not at the end,
+   ;; because the eol flag passed to the step was the one for the position the
+   ;; threads left rather than the one they land on. `^a$` was right (the
+   ;; anchor is reached before any step) and every longer anchored pattern was
+   ;; wrong -- `^(px|em)$` answered false for "px". 216 checks agreed with
+   ;; JavaScript without touching it.
+   ["^a$" ["a" "b" "aa" ""]]
+   ["^(px|em)$" ["px" "em" "pxem" "p" ""]]
+   ["^[-+]?[0-9]+$" ["12" "-12" "+3" "1a" ""]]
+   ["[0-9]+$" ["12" "a12" "12a" ""]]
+   ;; The shape a backtracker dies on. The long inputs are here on purpose:
+   ;; with the thread-list dedup removed the machine answers
+   ;; `doc-vector-too-large` from n=8 (measured 2026-09-09), so these are what
+   ;; make the dedup observable. Without them the corpus passed either way.
+   ["(a+)+b" ["b" "ab" "aaab" "aaaa" ""
+              "aaaaaaaaaaaaaaaaaaaaaaaa" "aaaaaaaaaaaaaaaaaaaaaaaab"]]])
+
+;; JS RegExp has no inline (?i) -- it is a FLAG there. The corpus keeps the
+;; inline spelling because that is how the 38 case-insensitive literals in the
+;; browser stack are written, so the oracle translates rather than the corpus.
+(defn- js-re [re]
+  (if (str/starts-with? re "(?i)")
+    (js/RegExp. (subs re 4) "i")
+    (js/RegExp. re)))
+
+(defn re-full-match? [re s]
+  (let [body (if (str/starts-with? re "(?i)") (subs re 4) re)
+        flags (if (str/starts-with? re "(?i)") "i" "")]
+    (some? (.exec (js/RegExp. (str "^(?:" body ")$") flags) s))))
+
+(defn re-search-start [re s]
+  (let [m (.exec (js-re re) s)]
+    (if m (.-index m) -1)))
+
+;; --- the guest ------------------------------------------------------------
+
+(defn program->doc
+  "The program as the ESM ABI wants it: a document value."
+  [{:keys [code classes fold]}]
+  #js ["map"
+       #js [#js [#js ["keyword" ":classes"]
+                 #js ["vector" (into-array (map (fn [c] #js ["vector" (into-array (map (fn [n] #js ["i64" (js/BigInt n)]) c))]) classes))]]
+            #js [#js ["keyword" ":code"]
+                 #js ["vector" (into-array (map (fn [i] #js ["vector" (into-array (map (fn [n] #js ["i64" (js/BigInt n)]) i))]) code))]]
+            #js [#js ["keyword" ":fold"] #js ["bool" (boolean fold)]]]])
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (println "REFUSED: the kotoba CLI is not runnable here (measured by running it)")
+    (js/process.exit 2))
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "pattern-parity-"))
+        out (path/join dir "pattern_core.mjs")
+        c (sh "kotoba" ["-M" "compile" (path/join repo-root "kotoba" "pattern_core.kotoba")
+                        "--target" "js" "--fuel" (str fuel) "--output" out])]
+    (when-not (zero? (:exit c))
+      (println "compile failed:" (:err c))
+      (js/process.exit 1))
+    (-> (js/import out)
+        (.then
+         (fn [mod]
+           (let [call (fn [export & args]
+                        ;; a fresh instance per call: fuel is spent, not renewed.
+                        ;; A guest trap is recorded as the ANSWER rather than
+                        ;; thrown: an aborted harness reports nothing about the
+                        ;; checks it never reached, and a trap is not a pass.
+                        (try
+                          (let [inst (.instantiateKotoba mod)]
+                            (.apply (aget inst export) inst (clj->js args)))
+                          (catch :default e (str "TRAP: " (.-message e)))))]
+             (doseq [[re inputs] corpus]
+               (let [prog (program->doc (pc/compile-pattern re))]
+                 (doseq [s inputs]
+                   (check! (str "match? /" re "/ " (pr-str s))
+                           (re-full-match? re s)
+                           (call "match?" prog s))
+                   (check! (str "search-start /" re "/ " (pr-str s))
+                           (re-search-start re s)
+                           (js/Number (call "search-start" prog s))))))
+             ;; ONE deliberate difference, pinned -- the other was not one
+             (let [dot (program->doc (pc/compile-pattern "a.b"))]
+               (check! "`.` excludes a line terminator, as JS's does"
+                       [false false]
+                       [(re-full-match? "a.b" "a\nb") (call "match?" dot "a\nb")]))
+             (let [alt (program->doc (pc/compile-pattern "a|ab"))]
+               (check! "leftmost-LONGEST, unlike JS's leftmost-first"
+                       [1 2]
+                       [(.-length (aget (.exec (js/RegExp. "a|ab") "ab") 0))
+                        (js/Number (call "search-end" alt "ab"))]))
+             ;; the refusals are refusals, not silent mistranslations
+             (doseq [[re why] [["(?=a)" "lookahead"]
+                               ["(a)\\1" "back reference"]
+                               ["a*?" "non-greedy quantifier"]
+                               ["(?m)^a" "inline flags other than a leading (?i)"]]]
+               (swap! checks inc)
+               (let [refused (try (pc/compile-pattern re) false
+                                  (catch :default e (:pattern/refused (ex-data e))))]
+                 (when-not (= why refused)
+                   (swap! failures inc)
+                   (println "  FAIL refusal of" re "\n    expected:" why "\n    actual:  " (pr-str refused)))))
+             (println (str "SCANNED\t" @checks))
+             (println (if (zero? @failures)
+                        (str "pattern parity: " @checks "/" @checks
+                             " agree with the host's RegExp (fuel " fuel ")")
+                        (str "pattern parity: " (- @checks @failures) "/" @checks " DISAGREE")))
+             (js/process.exit (if (zero? @failures) 0 1)))))
+        (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1))))))
+
+(main)

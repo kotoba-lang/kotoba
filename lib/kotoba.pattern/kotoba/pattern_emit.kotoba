@@ -1,0 +1,945 @@
+(ns pattern-emit
+  ;; The regex-subset compiler emitting the STRING program `pattern-vm` reads,
+  ;; and building no tree on the way.
+  ;;
+  ;; `pattern-compile` parses to a `:document` AST and emits a `:document`
+  ;; program. Both are bounded -- depth 8, 256 nodes, 32 items per container --
+  ;; and measured over the 200 regex literals in kotoba-lang's browser stack,
+  ;; 43 exceed one of them, 32 of those by DEPTH. A tree is exactly the shape a
+  ;; document cannot hold, so this one does not build a tree: parse and emit
+  ;; are fused, and each function answers the code it emitted AS THE STRING
+  ;; plus the source index it stopped at.
+  ;;
+  ;;   {:code <string> :ranges <string> :nr <i64> :i <i64>}  or  {:error :why :i n}
+  ;;
+  ;; Program counters are absolute: every emitter is told the `base` it will
+  ;; sit at, so nothing is patched and nothing is shifted afterwards.
+  ;;
+  ;; ⚠ This paragraph said "this slice has no quantifiers" until 2026-09-09,
+  ;; and by then `*`, `+`, `?` and `{n,m}` had all landed -- the exports right
+  ;; below it already named five quantifier tests. The header outlived the
+  ;; ceiling it described, which is the exact shape this workspace keeps
+  ;; warning about, so: quantifiers are here, and so are captures.
+  ;;
+  ;; A capturing `(` emits `save(2(g-1))` before the group and
+  ;; `save(2(g-1)+1)` after it; `(?:` emits neither, so a pattern with no
+  ;; capture compiles to the byte-identical program it did before. The group
+  ;; NUMBER is the source's -- the count of capturing `(` at or before this
+  ;; one, scanned rather than threaded through the records, because a group
+  ;; number does not depend on anything downstream.
+  (:export [main compile-text compile-program
+            emit-alt emit-cat emit-atom emit-quant hex6 ins error? error-of
+            group-number count-groups leading-modes leading-width emit-look
+            test-literal test-class test-alternation test-anchor
+            test-group test-escape test-refusals
+            test-star test-plus test-opt test-count test-count-range
+            test-capture-number test-capture-emit test-capture-noncapturing
+            test-leading-modes test-mode-header
+            test-lookahead-emit test-lookbehind-still-refused])
+  (:schemas {:em/cur [:record :em/cur
+                      [[:s :string] [:i :i64] [:stop :i64] [:base :i64]
+                       [:ranges :string] [:nr :i64]]]
+             :em/cat [:record :em/cat
+                      [[:s :string] [:i :i64] [:stop :i64] [:base :i64]
+                       [:code :string] [:ranges :string] [:nr :i64]]]
+             :em/cls [:record :em/cls
+                      [[:s :string] [:i :i64] [:ranges :string] [:n :i64]
+                       [:first :bool]]]
+             ;; A quantifier's operand is a SOURCE SPAN, re-emitted at another
+             ;; program counter. Six fields, because six parameters is past the
+             ;; ABI arity.
+             :em/q [:record :em/q
+                    [[:s :string] [:from :i64] [:to :i64] [:base :i64]
+                     [:ranges :string] [:nr :i64]]]
+             :em/gc [:record :em/gc
+                     [[:s :string] [:i :i64] [:stop :i64]
+                      [:in-class :bool] [:acc :i64]]]
+             :em/rep [:record :em/rep
+                      [[:s :string] [:from :i64] [:to :i64] [:base :i64]
+                       [:ranges :string] [:nr :i64] [:left :i64] [:code :string]]]}))
+
+;; --- answers --------------------------------------------------------------
+
+(defn dget [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn dstr [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (app (ref dget) d k)) ""))
+
+(defn di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (app (ref dget) d k)) 0))
+
+(defn error? [d :document] :bool
+  (document-contains d :error))
+
+(defn error-of [why :keyword at :i64] :document
+  (let [pos (document-i64 at)]
+    (document-map :error (document-keyword why) :i pos)))
+
+(defn ok [code :string ranges :string nr :i64 i :i64] :document
+  (let [c (document-string code)
+        r (document-string ranges)
+        n (document-i64 nr)
+        pos (document-i64 i)]
+    (document-map :code c :ranges r :nr n :i pos)))
+
+;; --- hex ------------------------------------------------------------------
+;;
+;; The same four helpers `pattern-vm` reads with. They are duplicated rather
+;; than required: a cross-module require turns every build of this file into a
+;; module-lock, and these are twenty lines.
+
+(defn nibble [n :i64] :i64
+  (- n (* 16 (quot n 16))))
+
+(defn hex-digit-char [d :i64] :string
+  (if (< d 10)
+    (string-from-i64 d)
+    (if (= d 10) "a"
+        (if (= d 11) "b"
+            (if (= d 12) "c"
+                (if (= d 13) "d"
+                    (if (= d 14) "e" "f")))))))
+
+(defn hex6 [n :i64] :string
+  (string-concat
+   (app (ref hex-digit-char) (app (ref nibble) (quot n 1048576)))
+   (string-concat
+    (app (ref hex-digit-char) (app (ref nibble) (quot n 65536)))
+    (string-concat
+     (app (ref hex-digit-char) (app (ref nibble) (quot n 4096)))
+     (string-concat
+      (app (ref hex-digit-char) (app (ref nibble) (quot n 256)))
+      (string-concat
+       (app (ref hex-digit-char) (app (ref nibble) (quot n 16)))
+       (app (ref hex-digit-char) (app (ref nibble) n))))))))
+
+(defn ins [op :i64 a :i64 b :i64 c :i64] :string
+  (string-concat
+   (app (ref hex-digit-char) op)
+   (string-concat (app (ref hex6) a)
+                  (string-concat (app (ref hex6) b) (app (ref hex-digit-char) c)))))
+
+(defn code-len [code :string] :i64
+  (quot (string-length code) 14))
+
+;; --- source ---------------------------------------------------------------
+
+(defn cp-width [cp :i64] :i64
+  (if (< cp 128) 1 (if (< cp 2048) 2 (if (< cp 65536) 3 4))))
+
+(defn cp-at [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1 (string-code-point-at s i)))
+
+(defn step-i [s :string i :i64] :i64
+  (+ i (app (ref cp-width) (app (ref cp-at) s i))))
+
+(defn digit? [cp :i64] :bool
+  (if (< cp 48) false (<= cp 57)))
+
+;; --- escapes --------------------------------------------------------------
+
+(defn digit-ranges [] :string
+  (string-concat (app (ref hex6) 48) (app (ref hex6) 57)))
+
+(defn space-ranges [] :string
+  (string-concat
+   (string-concat (app (ref hex6) 9) (app (ref hex6) 10))
+   (string-concat
+    (string-concat (app (ref hex6) 11) (app (ref hex6) 13))
+    (string-concat (app (ref hex6) 32) (app (ref hex6) 32)))))
+
+(defn word-ranges [] :string
+  (string-concat
+   (string-concat (string-concat (app (ref hex6) 48) (app (ref hex6) 57))
+                  (string-concat (app (ref hex6) 65) (app (ref hex6) 90)))
+   (string-concat (string-concat (app (ref hex6) 95) (app (ref hex6) 95))
+                  (string-concat (app (ref hex6) 97) (app (ref hex6) 122)))))
+
+(defn escape-ranges [cp :i64] :string
+  (if (= cp 100) (app (ref digit-ranges))
+      (if (= cp 68) (app (ref digit-ranges))
+          (if (= cp 115) (app (ref space-ranges))
+              (if (= cp 83) (app (ref space-ranges))
+                  (if (= cp 119) (app (ref word-ranges))
+                      (if (= cp 87) (app (ref word-ranges)) "")))))))
+
+(defn escape-count [cp :i64] :i64
+  (if (= cp 100) 1
+      (if (= cp 68) 1
+          (if (= cp 115) 3
+              (if (= cp 83) 3
+                  (if (= cp 119) 4 (if (= cp 87) 4 0)))))))
+
+(defn escape-negated? [cp :i64] :bool
+  (if (= cp 68) true (if (= cp 83) true (= cp 87))))
+
+(defn escape-literal [cp :i64] :i64
+  (if (= cp 110) 10 (if (= cp 114) 13 (if (= cp 116) 9 (if (= cp 102) 12 cp)))))
+
+;; --- character classes ----------------------------------------------------
+
+(defn class-scan [x [:ref :em/cls]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        ranges (record-get x :ranges)
+        n (record-get x :n)
+        first? (record-get x :first)
+        cp (app (ref cp-at) s i)]
+    (if (< cp 0)
+      (app (ref error-of) :class/unterminated i)
+      (if (if (= cp 93) (not first?) false)
+        (app (ref ok) "" ranges n (+ i 1))
+        (if (= cp 92)
+          (let [e (app (ref cp-at) s (+ i 1))
+                esc (app (ref escape-ranges) e)]
+            (if (< e 0)
+              (app (ref error-of) :class/trailing-backslash i)
+              (if (> (string-length esc) 0)
+                (if (app (ref escape-negated?) e)
+                  (app (ref error-of) :class/negated-escape i)
+                  (app (ref class-scan)
+                       (record-new [:ref :em/cls] s (+ i 2) (string-concat ranges esc)
+                                   (+ n (app (ref escape-count) e)) false)))
+                (app (ref class-scan)
+                     (record-new [:ref :em/cls] s (+ i 2)
+                                 (string-concat ranges
+                                                (string-concat
+                                                 (app (ref hex6) (app (ref escape-literal) e))
+                                                 (app (ref hex6) (app (ref escape-literal) e))))
+                                 (+ n 1) false)))))
+          (let [j (app (ref step-i) s i)
+                dash (app (ref cp-at) s j)
+                after (if (< dash 0) -1 (app (ref cp-at) s (+ j 1)))]
+            (if (if (= dash 45) (if (< after 0) false (not (= after 93))) false)
+              (app (ref class-scan)
+                   (record-new [:ref :em/cls] s (app (ref step-i) s (+ j 1))
+                               (string-concat ranges
+                                              (string-concat (app (ref hex6) cp)
+                                                             (app (ref hex6) after)))
+                               (+ n 1) false))
+              (app (ref class-scan)
+                   (record-new [:ref :em/cls] s j
+                               (string-concat ranges
+                                              (string-concat (app (ref hex6) cp)
+                                                             (app (ref hex6) cp)))
+                               (+ n 1) false)))))))))
+
+;; --- atoms ----------------------------------------------------------------
+
+(defn emit-class [x [:ref :em/cur]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        neg? (= 94 (app (ref cp-at) s (+ i 1)))
+        scanned (app (ref class-scan)
+                     (record-new [:ref :em/cls] s (if neg? (+ i 2) (+ i 1)) ranges nr true))]
+    (if (app (ref error?) scanned)
+      scanned
+      (app (ref ok)
+           (app (ref ins) 1 nr (- (app (ref di) scanned :nr) nr) (if neg? 1 0))
+           (app (ref dstr) scanned :ranges)
+           (app (ref di) scanned :nr)
+           (app (ref di) scanned :i)))))
+
+(defn emit-escape [x [:ref :em/cur]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        e (app (ref cp-at) s (+ i 1))
+        esc (app (ref escape-ranges) e)]
+    (if (< e 0)
+      (app (ref error-of) :escape/trailing-backslash i)
+      (if (app (ref digit?) e)
+        (app (ref error-of) :escape/back-reference i)
+        (if (> (string-length esc) 0)
+          (app (ref ok)
+               (app (ref ins) 1 nr (app (ref escape-count) e)
+                    (if (app (ref escape-negated?) e) 1 0))
+               (string-concat ranges esc)
+               (+ nr (app (ref escape-count) e))
+               (+ i 2))
+          (app (ref ok) (app (ref ins) 0 (app (ref escape-literal) e) 0 0)
+               ranges nr (+ i 2)))))))
+
+;; --- capture numbering ----------------------------------------------------
+;;
+;; A group's number is the source's: the count of capturing `(` at or before
+;; it. Counting it here rather than threading a counter through every record
+;; keeps the emitter's one-pass shape -- the scan is over the pattern, which is
+;; already bounded, and a group number does not depend on anything downstream.
+;;
+;; What the scan must NOT count: `(` inside a character class (literal there),
+;; `(` after a backslash, and `(?` of any kind.
+(defn count-groups [x [:ref :em/gc]] :i64
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        stop (record-get x :stop)
+        in-class (record-get x :in-class)
+        acc (record-get x :acc)]
+    (if (>= i stop)
+      acc
+      (let [cp (app (ref cp-at) s i)]
+        (if (= cp 92)
+          (app (ref count-groups) (record-new [:ref :em/gc] s (+ i 2) stop in-class acc))
+          (if in-class
+            (app (ref count-groups)
+                 (record-new [:ref :em/gc] s (+ i 1) stop (not (= cp 93)) acc))
+            (if (= cp 91)
+              (app (ref count-groups) (record-new [:ref :em/gc] s (+ i 1) stop true acc))
+              (app (ref count-groups)
+                   (record-new [:ref :em/gc] s (+ i 1) stop false
+                               (if (= cp 40)
+                                 (if (= 63 (app (ref cp-at) s (+ i 1))) acc (+ acc 1))
+                                 acc))))))))))
+
+(defn group-number [s :string i :i64] :i64
+  ;; the group opening AT i is the (count before it) + 1
+  (+ 1 (app (ref count-groups) (record-new [:ref :em/gc] s 0 i false 0))))
+
+;; A lookaround is the sub-pattern's own code, bracketed by an instruction
+;; that runs it as a zero-width test:
+;;
+;;   base      look(a = base+1, b = base+L+2, c = negated)
+;;   base+1    ... the sub-pattern, L instructions ...
+;;   base+L+1  match          <- ends the nested run
+;;   base+L+2  whatever follows
+;;
+;; The `match` is what stops the nested run: op 6 wins and no thread steps
+;; past it, so the sub-code cannot run on into the outer program.
+(defn emit-look [x [:ref :em/cur] neg :i64] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        stop (record-get x :stop)
+        base (record-get x :base)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        inner (app (ref emit-alt)
+                   (record-new [:ref :em/cur] s (+ i 3) stop (+ base 1) ranges nr))]
+    (if (app (ref error?) inner)
+      inner
+      (if (= 41 (app (ref cp-at) s (app (ref di) inner :i)))
+        (let [code (app (ref dstr) inner :code)
+              l (app (ref code-len) code)]
+          (app (ref ok)
+               (string-concat
+                (app (ref ins) 9 (+ base 1) (+ base (+ l 2)) neg)
+                (string-concat code (app (ref ins) 6 0 0 0)))
+               (app (ref dstr) inner :ranges)
+               (app (ref di) inner :nr) (+ (app (ref di) inner :i) 1)))
+        (app (ref error-of) :group/unterminated i)))))
+
+(defn emit-group [x [:ref :em/cur]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        stop (record-get x :stop)
+        base (record-get x :base)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        q (app (ref cp-at) s (+ i 1))
+        after (app (ref cp-at) s (+ i 2))
+        group? (if (= q 63) (= 58 after) false)
+        ;; `(?=` positive, `(?!` negative -- both zero-width
+        look? (if (= q 63) (if (= 61 after) true (= 33 after)) false)
+        look-neg (if (= 33 after) 1 0)]
+    (if look?
+      (app (ref emit-look) x look-neg)
+      (if (if (= q 63) (not group?) false)
+      (app (ref error-of) :group/inline-flags i)
+      ;; A capturing group is the same program with a `save` on each side, so
+      ;; the inner emitter is told a base one instruction further along and the
+      ;; two saves are wrapped around what it answers.
+      (let [cap (not group?)
+            g (if cap (app (ref group-number) s i) 0)
+            inner (app (ref emit-alt)
+                       (record-new [:ref :em/cur] s (if group? (+ i 3) (+ i 1))
+                                   stop (if cap (+ base 1) base) ranges nr))]
+        (if (app (ref error?) inner)
+          inner
+          (if (= 41 (app (ref cp-at) s (app (ref di) inner :i)))
+            (app (ref ok)
+                 (if cap
+                   (string-concat
+                    (app (ref ins) 5 (* 2 (- g 1)) 0 0)
+                    (string-concat (app (ref dstr) inner :code)
+                                   (app (ref ins) 5 (+ 1 (* 2 (- g 1))) 0 0)))
+                   (app (ref dstr) inner :code))
+                 (app (ref dstr) inner :ranges)
+                 (app (ref di) inner :nr) (+ (app (ref di) inner :i) 1))
+            (app (ref error-of) :group/unterminated i))))))))
+
+(defn emit-atom [x [:ref :em/cur]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        cp (app (ref cp-at) s i)]
+    (if (< cp 0)
+      (app (ref error-of) :atom/end i)
+      (if (= cp 40)
+        (app (ref emit-group) x)
+        (if (= cp 91)
+          (app (ref emit-class) x)
+          (if (= cp 46)
+            (app (ref ok) (app (ref ins) 2 0 0 0) ranges nr (+ i 1))
+            (if (= cp 94)
+              (app (ref ok) (app (ref ins) 7 0 0 0) ranges nr (+ i 1))
+              (if (= cp 36)
+                (app (ref ok) (app (ref ins) 8 0 0 0) ranges nr (+ i 1))
+                (if (= cp 92)
+                  (app (ref emit-escape) x)
+                  (app (ref ok) (app (ref ins) 0 cp 0 0) ranges nr
+                       (app (ref step-i) s i)))))))))))
+
+
+(defn quantifier? [cp :i64] :bool
+  (if (= cp 42) true (if (= cp 43) true (if (= cp 63) true (= cp 123)))))
+
+;; --- quantifiers ----------------------------------------------------------
+;;
+;; The operand is not held as a value; it is held as the SOURCE SPAN [from,to)
+;; and emitted again at whatever program counter it needs to sit at. `a{3}`
+;; compiles the same characters three times. That is what removes the tree,
+;; and with it the `:document` depth bound that refused 32 of the corpus's 43
+;; over-large patterns.
+
+(defn emit-span [x [:ref :em/q]] :document
+  (app (ref emit-cat)
+       (record-new [:ref :em/cat] (record-get x :s) (record-get x :from) (record-get x :to)
+                   (record-get x :base) "" (record-get x :ranges) (record-get x :nr))))
+
+(defn copies [x [:ref :em/rep]] :document
+  ;; `left` copies of the span, one after another, each at its own base
+  (let [s (record-get x :s)
+        from (record-get x :from)
+        to (record-get x :to)
+        base (record-get x :base)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        left (record-get x :left)
+        code (record-get x :code)]
+    (if (<= left 0)
+      (app (ref ok) code ranges nr to)
+      (let [one (app (ref emit-span)
+                     (record-new [:ref :em/q] s from to
+                                 (+ base (app (ref code-len) code)) ranges nr))]
+        (if (app (ref error?) one)
+          one
+          (app (ref copies)
+               (record-new [:ref :em/rep] s from to base
+                           (app (ref dstr) one :ranges) (app (ref di) one :nr)
+                           (- left 1)
+                           (string-concat code (app (ref dstr) one :code)))))))))
+
+(defn optionals [x [:ref :em/rep]] :document
+  ;; `left` copies of `span?`, each `split(next, out) body`
+  (let [s (record-get x :s)
+        from (record-get x :from)
+        to (record-get x :to)
+        base (record-get x :base)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        left (record-get x :left)
+        code (record-get x :code)]
+    (if (<= left 0)
+      (app (ref ok) code ranges nr to)
+      (let [at (+ base (app (ref code-len) code))
+            body (app (ref emit-span) (record-new [:ref :em/q] s from to (+ at 1) ranges nr))]
+        (if (app (ref error?) body)
+          body
+          (app (ref optionals)
+               (record-new [:ref :em/rep] s from to base
+                           (app (ref dstr) body :ranges) (app (ref di) body :nr)
+                           (- left 1)
+                           (string-concat
+                            code
+                            (string-concat
+                             (app (ref ins) 3 (+ at 1)
+                                  (+ (+ at 1) (app (ref code-len) (app (ref dstr) body :code))) 0)
+                             (app (ref dstr) body :code))))))))))
+
+(defn digits-from [s :string i :i64 acc :i64] :document
+  (let [cp (app (ref cp-at) s i)]
+    (if (app (ref digit?) cp)
+      (app (ref digits-from) s (+ i 1) (+ (* acc 10) (- cp 48)))
+      (app (ref ok) "" "" acc i))))
+
+(defn parse-count [s :string i :i64] :document
+  ;; `i` is just past the `{`. Answers {:nr lo :i after} plus :code as the hi,
+  ;; because a document map with two i64 fields is cheaper than a third record.
+  (let [lo (app (ref digits-from) s i 0)
+        j (app (ref di) lo :i)
+        c (app (ref cp-at) s j)]
+    (if (= c 125)
+      ;; {n}: hi = lo. `ok` would put a STRING in :code and `di` of a string is
+      ;; 0, so `a{3}` read as `a{3,0}` and answered :count/backwards.
+      (document-map :code (document-i64 (app (ref di) lo :nr))
+                    :ranges (document-string "")
+                    :nr (document-i64 (app (ref di) lo :nr))
+                    :i (document-i64 (+ j 1)))
+      (if (= c 44)
+        (let [hi (app (ref digits-from) s (+ j 1) 0)
+              k (app (ref di) hi :i)]
+          (if (= 125 (app (ref cp-at) s k))
+            (document-map :code (document-i64 (if (= (+ j 1) k) -1 (app (ref di) hi :nr)))
+                          :ranges (document-string "")
+                          :nr (document-i64 (app (ref di) lo :nr))
+                          :i (document-i64 (+ k 1)))
+            (app (ref error-of) :count/unterminated j)))
+        (app (ref error-of) :count/unterminated j)))))
+
+(defn star-of [x [:ref :em/q]] :document
+  ;; split(base+1, out) body jmp(base)
+  (let [s (record-get x :s)
+        from (record-get x :from)
+        to (record-get x :to)
+        base (record-get x :base)
+        body (app (ref emit-span) (record-new [:ref :em/q] s from to (+ base 1)
+                                              (record-get x :ranges) (record-get x :nr)))]
+    (if (app (ref error?) body)
+      body
+      (let [blen (app (ref code-len) (app (ref dstr) body :code))]
+        (app (ref ok)
+             (string-concat
+              (app (ref ins) 3 (+ base 1) (+ (+ base 2) blen) 0)
+              (string-concat (app (ref dstr) body :code) (app (ref ins) 4 base 0 0)))
+             (app (ref dstr) body :ranges) (app (ref di) body :nr) to)))))
+
+(defn plus-of [x [:ref :em/q]] :document
+  ;; body split(base, here+1)
+  (let [base (record-get x :base)
+        body (app (ref emit-span) x)]
+    (if (app (ref error?) body)
+      body
+      (let [blen (app (ref code-len) (app (ref dstr) body :code))]
+        (app (ref ok)
+             (string-concat (app (ref dstr) body :code)
+                            (app (ref ins) 3 base (+ (+ base blen) 1) 0))
+             (app (ref dstr) body :ranges) (app (ref di) body :nr) (record-get x :to))))))
+
+(defn opt-of [x [:ref :em/q]] :document
+  ;; split(base+1, out) body
+  (let [base (record-get x :base)
+        body (app (ref emit-span) (record-new [:ref :em/q] (record-get x :s) (record-get x :from)
+                                              (record-get x :to) (+ base 1)
+                                              (record-get x :ranges) (record-get x :nr)))]
+    (if (app (ref error?) body)
+      body
+      (let [blen (app (ref code-len) (app (ref dstr) body :code))]
+        (app (ref ok)
+             (string-concat (app (ref ins) 3 (+ base 1) (+ (+ base 1) blen) 0)
+                            (app (ref dstr) body :code))
+             (app (ref dstr) body :ranges) (app (ref di) body :nr) (record-get x :to))))))
+
+(defn counted-of [x [:ref :em/q] lo :i64 hi :i64] :document
+  (let [s (record-get x :s)
+        from (record-get x :from)
+        to (record-get x :to)
+        base (record-get x :base)
+        fixed (app (ref copies)
+                   (record-new [:ref :em/rep] s from to base
+                               (record-get x :ranges) (record-get x :nr) lo ""))]
+    (if (app (ref error?) fixed)
+      fixed
+      (let [flen (app (ref code-len) (app (ref dstr) fixed :code))]
+        (if (< hi 0)
+          ;; x{n,} : n copies then x*
+          (let [star (app (ref star-of)
+                          (record-new [:ref :em/q] s from to (+ base flen)
+                                      (app (ref dstr) fixed :ranges) (app (ref di) fixed :nr)))]
+            (if (app (ref error?) star)
+              star
+              (app (ref ok) (string-concat (app (ref dstr) fixed :code)
+                                           (app (ref dstr) star :code))
+                   (app (ref dstr) star :ranges) (app (ref di) star :nr) to)))
+          ;; x{n,m} : n copies then (m-n) optional copies
+          (let [opt (app (ref optionals)
+                         (record-new [:ref :em/rep] s from to (+ base flen)
+                                     (app (ref dstr) fixed :ranges) (app (ref di) fixed :nr)
+                                     (- hi lo) ""))]
+            (if (app (ref error?) opt)
+              opt
+              (app (ref ok) (string-concat (app (ref dstr) fixed :code)
+                                           (app (ref dstr) opt :code))
+                   (app (ref dstr) opt :ranges) (app (ref di) opt :nr) to))))))))
+
+;; Answers the quantified emission and the source index just past the
+;; quantifier, or {:error ..}. `to` is where the operand ended.
+(defn emit-quant [x [:ref :em/q]] :document
+  (let [s (record-get x :s)
+        to (record-get x :to)
+        cp (app (ref cp-at) s to)
+        lazy? (= 63 (app (ref cp-at) s (+ to 1)))]
+    (if (if (= cp 42) true (if (= cp 43) true (= cp 63)))
+      (if lazy?
+        (app (ref error-of) :quantifier/non-greedy to)
+        (let [r (if (= cp 42) (app (ref star-of) x)
+                    (if (= cp 43) (app (ref plus-of) x) (app (ref opt-of) x)))]
+          (if (app (ref error?) r)
+            r
+            (if (app (ref quantifier?) (app (ref cp-at) s (+ to 1)))
+              (app (ref error-of) :quantifier/stacked (+ to 1))
+              (app (ref ok) (app (ref dstr) r :code) (app (ref dstr) r :ranges)
+                   (app (ref di) r :nr) (+ to 1))))))
+      (let [c (app (ref parse-count) s (+ to 1))]
+        (if (app (ref error?) c)
+          c
+          (let [lo (app (ref di) c :nr)
+                hi (if (document-contains c :code) (app (ref di) c :code) (app (ref di) c :nr))
+                after (app (ref di) c :i)]
+            (if (if (>= hi 0) (< hi lo) false)
+              (app (ref error-of) :count/backwards to)
+              (let [r (app (ref counted-of) x lo hi)]
+                (if (app (ref error?) r)
+                  r
+                  (if (app (ref quantifier?) (app (ref cp-at) s after))
+                    (app (ref error-of) :quantifier/stacked after)
+                    (app (ref ok) (app (ref dstr) r :code) (app (ref dstr) r :ranges)
+                         (app (ref di) r :nr) after)))))))))))
+
+;; --- concatenation and alternation ----------------------------------------
+
+(defn emit-cat [x [:ref :em/cat]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        stop (record-get x :stop)
+        base (record-get x :base)
+        code (record-get x :code)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        cp (if (>= i stop) -1 (app (ref cp-at) s i))]
+    (if (if (< cp 0) true (if (= cp 124) true (= cp 41)))
+      (app (ref ok) code ranges nr i)
+      (let [one (app (ref emit-atom)
+                     (record-new [:ref :em/cur] s i stop
+                                 (+ base (app (ref code-len) code)) ranges nr))]
+        (if (app (ref error?) one)
+          one
+          ;; ⚠ `stop` matters here. Re-emitting an operand's span calls this
+          ;; with stop = the span's end, and without the bound the character
+          ;; AT that end -- the quantifier itself -- reads as a quantifier
+          ;; again and the emitter recurses forever. Measured 2026-09-09:
+          ;; every one of `a*`, `a+`, `a?`, `a{1,3}`, `a{2,}` answered
+          ;; "Maximum call stack size exceeded", and `a` alone was fine.
+          (if (if (< (app (ref di) one :i) stop)
+                (app (ref quantifier?) (app (ref cp-at) s (app (ref di) one :i)))
+                false)
+            ;; the atom is quantified: its SOURCE SPAN is re-emitted under the
+            ;; quantifier, at the counter the code so far ends on
+            (let [q (app (ref emit-quant)
+                         (record-new [:ref :em/q] s i (app (ref di) one :i)
+                                     (+ base (app (ref code-len) code)) ranges nr))]
+              (if (app (ref error?) q)
+                q
+                (app (ref emit-cat)
+                     (record-new [:ref :em/cat] s (app (ref di) q :i) stop base
+                                 (string-concat code (app (ref dstr) q :code))
+                                 (app (ref dstr) q :ranges) (app (ref di) q :nr)))))
+            (app (ref emit-cat)
+                 (record-new [:ref :em/cat] s (app (ref di) one :i) stop base
+                             (string-concat code (app (ref dstr) one :code))
+                             (app (ref dstr) one :ranges) (app (ref di) one :nr)))))))))
+
+(defn emit-alt [x [:ref :em/cur]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        stop (record-get x :stop)
+        base (record-get x :base)
+        ranges (record-get x :ranges)
+        nr (record-get x :nr)
+        head (app (ref emit-cat) (record-new [:ref :em/cat] s i stop (+ base 1) "" ranges nr))]
+    (if (app (ref error?) head)
+      head
+      (if (not (= 124 (app (ref cp-at) s (app (ref di) head :i))))
+        ;; One branch: it was emitted one counter high, in case a split had to
+        ;; go in front of it. Emit it again where it actually sits.
+        (app (ref emit-cat) (record-new [:ref :em/cat] s i stop base "" ranges nr))
+        (let [after (+ (+ base 2) (app (ref code-len) (app (ref dstr) head :code)))
+              rest (app (ref emit-alt)
+                        (record-new [:ref :em/cur] s (+ (app (ref di) head :i) 1) stop after
+                                    (app (ref dstr) head :ranges) (app (ref di) head :nr)))]
+          (if (app (ref error?) rest)
+            rest
+            (app (ref ok)
+                 (string-concat
+                  (app (ref ins) 3 (+ base 1) after 0)
+                  (string-concat
+                   (app (ref dstr) head :code)
+                   (string-concat
+                    (app (ref ins) 4 (+ after (app (ref code-len) (app (ref dstr) rest :code))) 0 0)
+                    (app (ref dstr) rest :code))))
+                 (app (ref dstr) rest :ranges) (app (ref di) rest :nr)
+                 (app (ref di) rest :i))))))))
+
+;; --- the public surface ---------------------------------------------------
+
+;; --- leading inline flags -------------------------------------------------
+;;
+;; `(?i)` was the only one, matched as a literal four-character prefix. The
+;; others cssom actually uses are `(?m)`, `(?s)` and the combinations, so this
+;; reads the letters instead of the string: any of `i` `s` `m` in any order,
+;; terminated by `)`.
+;;
+;; Only LEADING. A flag group in the middle of a pattern changes the mode from
+;; that point on, and this VM carries modes in the program header, which is
+;; the whole program -- so a mid-pattern group is refused rather than silently
+;; applied to everything. That refusal is `:group/inline-flags`, the same one
+;; these got before, and it is an implementation limit, not a design decision:
+;; per-instruction mode bits would lift it.
+
+(defn flag-bit [cp :i64] :i64
+  (if (= cp 105) 1 (if (= cp 115) 2 (if (= cp 109) 4 0))))
+
+(defn flag-scan [x [:ref :em/gc]] :i64
+  ;; the accumulated mode bits, or -1 if this is not a well-formed flag group
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        acc (record-get x :acc)]
+    (let [cp (app (ref cp-at) s i)]
+      (if (= cp 41)
+        acc
+        (let [b (app (ref flag-bit) cp)]
+          (if (= b 0)
+            -1
+            (app (ref flag-scan)
+                 (record-new [:ref :em/gc] s (+ i 1) 0 false
+                             (if (= 1 (- (quot acc b) (* 2 (quot acc (* 2 b)))))
+                               acc
+                               (+ acc b))))))))))
+
+;; The mode bits a leading `(?...)` sets, or 0 when there is no such group.
+(defn leading-modes [re :string] :i64
+  (if (< (string-length re) 4)
+    0
+    (if (if (= 40 (app (ref cp-at) re 0)) (= 63 (app (ref cp-at) re 1)) false)
+      (let [m (app (ref flag-scan) (record-new [:ref :em/gc] re 2 0 false 0))]
+        (if (< m 0) 0 m))
+      0)))
+
+(defn close-paren-at [x [:ref :em/gc]] :i64
+  (let [s (record-get x :s)
+        i (record-get x :i)]
+    (if (>= i (string-length s))
+      i
+      (if (= 41 (app (ref cp-at) s i))
+        i
+        (app (ref close-paren-at) (record-new [:ref :em/gc] s (+ i 1) 0 false 0))))))
+
+;; How many characters that group occupies, so the body can skip it.
+(defn leading-width [re :string] :i64
+  (if (= 0 (app (ref leading-modes) re))
+    0
+    (+ 1 (app (ref close-paren-at) (record-new [:ref :em/gc] re 2 0 false 0)))))
+
+;; `(?=` and `(?!` are emitted since 2026-09-09 and are no longer refused here.
+;; `(?<` still is, and the reason is upstream rather than in this file: a
+;; lookbehind needs a backward scan, the scan needs its own function, and that
+;; function joins the machine's recursion group -- which is where amu runs out
+;; of heap. Measured 2026-09-09: `pattern-vm`'s group compiles at 6 members and
+;; OOMs at 7, and a synthetic group of eight trivial mutually recursive
+;; functions OOMs while five, seven, nine through twelve compile.
+;; kotoba-lang/amu#915. `test/lookbehind_probe.cljk` fails when that stops
+;; being true.
+(defn refused-shape [body :string] :keyword
+  (if (string-contains? body "(?<") :refused/lookbehind :none))
+
+;; The nibble after "K" is a bitfield now, not a bool: bit 0 fold, bit 1
+;; dotall, bit 2 multiline. `0` and `1` still mean what they meant, so every
+;; program literal already compiled and committed still reads correctly and
+;; the header did not have to widen.
+(defn assemble [modes :i64 code :string nr :i64 ranges :string] :string
+  (string-concat
+   (string-concat (string-concat "K" (app (ref hex-digit-char) modes))
+                  (string-concat (app (ref hex6) (app (ref code-len) code))
+                                 (app (ref hex6) nr)))
+   (string-concat code ranges)))
+
+(defn compile-program [re :string] :document
+  (let [modes (app (ref leading-modes) re)
+        body (string-substring re (app (ref leading-width) re) (string-length re))
+        shape (app (ref refused-shape) body)]
+    (if (not (= shape :none))
+      (app (ref error-of) shape 0)
+      (let [out (app (ref emit-alt)
+                     (record-new [:ref :em/cur] body 0 (string-length body) 0 "" 0))]
+        (if (app (ref error?) out)
+          out
+          (if (not (= (string-length body) (app (ref di) out :i)))
+            (app (ref error-of) :refused/unparsed (app (ref di) out :i))
+            (let [code (string-concat (app (ref dstr) out :code) (app (ref ins) 6 0 0 0))
+                  text (app (ref assemble) modes code (app (ref di) out :nr)
+                            (app (ref dstr) out :ranges))]
+              (document-map :text (document-string text)))))))))
+
+(defn compile-text [re :string] :string
+  (let [p (app (ref compile-program) re)]
+    (if (app (ref error?) p)
+      (document-edn-print p)
+      (app (ref dstr) p :text))))
+
+;; --- tests ----------------------------------------------------------------
+
+(defn test-literal [] :bool
+  (let [t (app (ref compile-text) "ab")]
+    (and (string=? "K0000003000000" (string-substring t 0 14))
+         (string=? "00000610000000" (string-substring t 14 28))
+         (string=? "60000000000000" (string-substring t 42 56)))))
+
+(defn test-class [] :bool
+  (let [t (app (ref compile-text) "[0-9]")]
+    (and (string=? "K0000002000001" (string-substring t 0 14))
+         (string=? "10000000000010" (string-substring t 14 28))
+         (string=? "000030000039" (string-substring t 42 54)))))
+
+(defn test-alternation [] :bool
+  (let [t (app (ref compile-text) "a|b")]
+    (and (string=? "K0000005000000" (string-substring t 0 14))
+         (string=? "30000010000030" (string-substring t 14 28))
+         (string=? "40000040000000" (string-substring t 42 56)))))
+
+(defn test-anchor [] :bool
+  (let [t (app (ref compile-text) "^a$")]
+    (and (string=? "K0000004000000" (string-substring t 0 14))
+         (string=? "70000000000000" (string-substring t 14 28))
+         (string=? "80000000000000" (string-substring t 42 56)))))
+
+(defn test-group [] :bool
+  (let [t (app (ref compile-text) "(?:ab)c")]
+    (string=? "K0000004000000" (string-substring t 0 14))))
+
+(defn test-escape [] :bool
+  (let [t (app (ref compile-text) "\\d-\\w")]
+    ;; class(1 range) literal class(4 ranges) match, five ranges in all
+    (and (string=? "K0000004000005" (string-substring t 0 14))
+         (string=? "10000000000010" (string-substring t 14 28)))))
+
+(defn test-refusals [] :bool
+  ;; ⚠ This asserted `(?=a)` was refused until 2026-09-10. Lookahead is
+  ;; emitted now, so the line moved to what is still refused -- lookbehind,
+  ;; and for an upstream reason (kotoba-lang/amu#915) rather than a decision.
+  (and (string-contains? (app (ref compile-text) "(?<=a)") ":refused/lookbehind")
+       (string-contains? (app (ref compile-text) "(a)\\1") ":escape/back-reference")
+       ;; A LEADING flag group is admitted since 2026-09-09 -- this line used
+       ;; to assert `(?m)^a` was refused. What is still refused is a flag
+       ;; group in the MIDDLE, because modes live in the program header and
+       ;; would silently apply to the whole pattern.
+       (string-contains? (app (ref compile-text) "a(?m)b") ":group/inline-flags")
+       (string-contains? (app (ref compile-text) "a*?") ":quantifier/non-greedy")
+       (string-contains? (app (ref compile-text) "a+*") ":quantifier/stacked")))
+
+(defn test-star [] :bool
+  (let [t (app (ref compile-text) "a*")]
+    ;; split(1,3) a jmp(0) match
+    (and (string=? "K0000004000000" (string-substring t 0 14))
+         (string=? "30000010000030" (string-substring t 14 28))
+         (string=? "40000000000000" (string-substring t 42 56)))))
+
+(defn test-plus [] :bool
+  (let [t (app (ref compile-text) "a+")]
+    ;; a split(0,2) match
+    (and (string=? "K0000003000000" (string-substring t 0 14))
+         (string=? "30000000000020" (string-substring t 28 42)))))
+
+(defn test-opt [] :bool
+  (let [t (app (ref compile-text) "a?")]
+    ;; split(1,2) a match
+    (and (string=? "K0000003000000" (string-substring t 0 14))
+         (string=? "30000010000020" (string-substring t 14 28)))))
+
+(defn test-count [] :bool
+  (let [t (app (ref compile-text) "a{3}")]
+    ;; three copies then match
+    (string=? "K0000004000000" (string-substring t 0 14))))
+
+(defn test-count-range [] :bool
+  (and
+   ;; a{1,3} : one copy then two optional copies = 1 + 2*2 + match
+   (string=? "K0000006000000" (string-substring (app (ref compile-text) "a{1,3}") 0 14))
+   ;; a{2,} : two copies then a* = 2 + 3 + match
+   (string=? "K0000006000000" (string-substring (app (ref compile-text) "a{2,}") 0 14))))
+
+(defn test-capture-number [] :bool
+  ;; the source's numbering: the count of capturing `(` at or before this one
+  (and (= 1 (app (ref group-number) "(a)(b)" 0))
+       (and (= 2 (app (ref group-number) "(a)(b)" 3))
+            ;; `(?:` does not consume a number
+            (and (= 1 (app (ref group-number) "(?:a)(b)" 5))
+                 ;; `(` inside a class is a literal, not a group
+                 (and (= 1 (app (ref group-number) "[(](x)" 3))
+                      ;; and an escaped one is a literal too
+                      (= 1 (app (ref group-number) "\\((x)" 2)))))))
+
+(defn test-capture-emit [] :bool
+  ;; (a) is save(0) char save(1) match -- four instructions, no ranges
+  (let [t (app (ref compile-text) "(a)")]
+    (and (string=? "K0000004000000" (string-substring t 0 14))
+         (and (string=? "50000000000000" (string-substring t 14 28))
+              (and (string=? "00000610000000" (string-substring t 28 42))
+                   (and (string=? "50000010000000" (string-substring t 42 56))
+                        (string=? "60000000000000" (string-substring t 56 70))))))))
+
+(defn test-capture-noncapturing [] :bool
+  ;; the same pattern without the capture emits no saves at all, which is what
+  ;; keeps a capture-free program byte for byte what it was before captures
+  (let [t (app (ref compile-text) "(?:a)")]
+    (and (string=? "K0000002000000" (string-substring t 0 14))
+         (and (string=? "00000610000000" (string-substring t 14 28))
+              ;; and a second group opens slot 2, so the two do not collide:
+              ;; (a)(b) is save0 char save1 save2 char save3 match
+              (let [two (app (ref compile-text) "(a)(b)")]
+                (and (string=? "50000010000000" (string-substring two 42 56))
+                     (and (string=? "50000020000000" (string-substring two 56 70))
+                          (string=? "50000030000000" (string-substring two 84 98)))))))))
+
+(defn test-leading-modes [] :bool
+  ;; the letters, in any order, and the width of the group they occupy
+  (and (= 1 (app (ref leading-modes) "(?i)ab"))
+       (and (= 2 (app (ref leading-modes) "(?s)ab"))
+            (and (= 4 (app (ref leading-modes) "(?m)ab"))
+                 (and (= 3 (app (ref leading-modes) "(?is)ab"))
+                      (and (= 7 (app (ref leading-modes) "(?smi)ab"))
+                           (and (= 4 (app (ref leading-width) "(?i)ab"))
+                                (and (= 6 (app (ref leading-width) "(?smi)ab"))
+                                     ;; not a flag group: no modes, no width
+                                     (and (= 0 (app (ref leading-modes) "(?:a)b"))
+                                          (and (= 0 (app (ref leading-width) "(?:a)b"))
+                                               (= 0 (app (ref leading-modes) "ab"))))))))))))
+
+(defn test-mode-header [] :bool
+  ;; the nibble after "K" carries the bits, and the body is compiled without
+  ;; the flag group -- (?i)ab and ab differ in exactly one character
+  (and (string=? "K1000003000000" (string-substring (app (ref compile-text) "(?i)ab") 0 14))
+       (and (string=? "K2000003000000" (string-substring (app (ref compile-text) "(?s)ab") 0 14))
+            (and (string=? "K4000003000000" (string-substring (app (ref compile-text) "(?m)ab") 0 14))
+                 (and (string=? "K7000003000000" (string-substring (app (ref compile-text) "(?ism)ab") 0 14))
+                      ;; and no flags is still "K0", which is what every
+                      ;; already-committed program literal reads as
+                      (and (string=? "K0000003000000" (string-substring (app (ref compile-text) "ab") 0 14))
+                           (string=? (string-substring (app (ref compile-text) "(?i)ab") 14 42)
+                                     (string-substring (app (ref compile-text) "ab") 14 42))))))))
+
+(defn test-lookahead-emit [] :bool
+  ;; a(?=b)c  ->  char a / look(2,4) / char b / match / char c / match
+  (let [t (app (ref compile-text) "a(?=b)c")]
+    (and (string=? "K0000006000000" (string-substring t 0 14))
+         (and (string=? "00000610000000" (string-substring t 14 28))
+              (and (string=? "90000020000040" (string-substring t 28 42))
+                   (and (string=? "00000620000000" (string-substring t 42 56))
+                        (and (string=? "60000000000000" (string-substring t 56 70))
+                             (and (string=? "00000630000000" (string-substring t 70 84))
+                                  ;; the negative form differs in one nibble
+                                  (string=? "90000020000041"
+                                            (string-substring (app (ref compile-text) "a(?!b)c") 28 42))))))))))
+
+(defn test-lookbehind-still-refused [] :bool
+  ;; ⚠ This is a BLOCK, not a design decision. It is refused because the
+  ;; backward scan it needs is a seventh member of the machine's recursion
+  ;; group and amu runs out of heap there. `test/lookbehind_probe.cljk` is the
+  ;; removal condition and fails when this stops being true.
+  (and (string-contains? (app (ref compile-text) "(?<=a)b") ":refused/lookbehind")
+       (string-contains? (app (ref compile-text) "(?<!a)b") ":refused/lookbehind")))
+
+(defn main []
+  (string-length (app (ref compile-text) "ab")))

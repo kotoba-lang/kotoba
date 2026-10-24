@@ -1,0 +1,169 @@
+#!/usr/bin/env kbb
+;; Differential parity between the two compilers: `kotoba/pattern_compile.kotoba`
+;; (the port) and `src/pattern/compile.cljk` (the oracle it replaces).
+;;
+;; The corpus is not invented: it is every unique regex literal scraped from
+;; kotoba-lang's browser stack -- htmldom, cssom, browser, html, css, kiyaku --
+;; which is the population this library exists for. Both compilers are RUN over
+;; all of it and their PROGRAMS are compared instruction for instruction, so a
+;; port that merely looks right does not pass.
+;;
+;; Refusals are compared as refusals: the `.cljc` throws with a
+;; `:pattern/refused` reason and the Kotoba port answers `{:error :why}`,
+;; because Kotoba has no nil and an aborting function cannot be exported. The
+;; check is that both refuse the same pattern, not that they spell the reason
+;; the same way.
+;;
+;; Exit codes: 0 passed, 1 disagreement, 2 REFUSED.
+;;
+;;   kbb --backend sci --classpath src test/compile_parity.cljk
+
+(ns compile-parity
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [pattern.compile :as oracle]))
+
+(def script
+  (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+      "lib/kotoba.pattern/test/compile_parity.cljk"))
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".."))
+;; The corpus lives beside this repo in the west layout, but a WORKTREE of it
+;; does not sit there -- measured 2026-09-09, the scrape found 0 patterns and
+;; the run REFUSED (which is the guard working: an empty corpus must not pass).
+;; So the sibling directory is one candidate, the superproject checkout is
+;; another, and PATTERN_CORPUS_ROOT overrides both.
+(def orgs
+  (let [candidates (remove nil?
+                           [(.-PATTERN_CORPUS_ROOT js/process.env)
+                            (path/resolve repo-root "..")
+                            (path/join (.-HOME js/process.env)
+                                       "github" "com-junkawasaki" "orgs" "kotoba-lang")])]
+    (or (first (filter (fn [d] (fs/existsSync (path/join d "cssom"))) candidates))
+        (path/resolve repo-root ".."))))
+
+;; Fuel is charged per function ENTRY, and a compiler written as many small
+;; pure helpers enters a lot of them: measured 2026-09-09, `kotoba -M test`'s
+;; fixed budget traps five of the eight test-* on :js and :wasm while all eight
+;; pass on :jvm-kir. The artifact is therefore built with a budget the host
+;; chooses, which is what the knob is for.
+(def fuel 20000000)
+
+(def failures (atom 0))
+(def checks (atom 0))
+(def refusals (atom 0))
+(def bounded (atom 0))
+
+;; The port carries its AST and its program as `:document` values, and those
+;; are bounded: depth 8, 256 nodes, and 32 items per container
+;; (`kotoba/kir/value.cljc`). Measured 2026-09-09 over this corpus, 43 of the
+;; 200 patterns exceed one of them -- 32 `doc-depth-limit`, 10
+;; `doc-vector-too-large`, 1 `doc-node-limit` -- and NONE of them disagrees
+;; semantically: every pattern that fits produces the identical program.
+;;
+;; So this is a ratchet, not a tolerance. It fails if a semantic disagreement
+;; appears AND it fails if this number moves in either direction, because both
+;; mean something changed that someone should look at.
+(def bounded-baseline 43)
+
+(def document-bounds
+  #{"doc-depth-limit" "doc-vector-too-large" "doc-node-limit"})
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- source-files []
+  (let [r (sh "bash" ["-c" (str "find " orgs "/htmldom " orgs "/cssom " orgs "/browser "
+                                orgs "/html " orgs "/css " orgs "/kiyaku "
+                                "-name '*.cljc' -o -name '*.clj' -o -name '*.cljs' -o -name '*.cljk' 2>/dev/null"
+                                " | grep -v node_modules")])]
+    (remove str/blank? (str/split-lines (:out r)))))
+
+(def literal #"#\"((?:[^\"\\]|\\.)*)\"")
+
+(defn- corpus []
+  (->> (source-files)
+       (mapcat (fn [f] (map second (re-seq literal (fs/readFileSync f "utf8")))))
+       (distinct)
+       (vec)))
+
+(defn- oracle-compile [re]
+  (try {:program (oracle/compile-pattern re)}
+       (catch :default e {:refused (or (:pattern/refused (ex-data e)) :error)})))
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (println "REFUSED: the kotoba CLI is not runnable here (measured by running it)")
+    (js/process.exit 2))
+  (let [patterns (corpus)]
+    (when (< (count patterns) 50)
+      ;; an empty or tiny corpus would make this pass by finding nothing
+      (println "REFUSED: the corpus scrape found only" (count patterns) "patterns")
+      (js/process.exit 2))
+    (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "pattern-compile-parity-"))
+          out (path/join dir "pattern_compile.mjs")
+          c (sh "kotoba" ["-M" "compile" (path/join repo-root "kotoba" "pattern_compile.kotoba")
+                          "--target" "js" "--fuel" (str fuel) "--output" out])]
+      (when-not (zero? (:exit c))
+        (println "compile failed:" (:err c) (:out c))
+        (js/process.exit 1))
+      (-> (js/import out)
+          (.then
+           (fn [mod]
+             (doseq [re patterns]
+               (swap! checks inc)
+               (let [expected (oracle-compile re)
+                     answer (try
+                              (let [inst (.instantiateKotoba mod)]
+                                (cljs.reader/read-string ((aget inst "compile-text") re)))
+                              (catch :default e {:trap (.-message e)}))
+                     port (cond
+                            (:trap answer) {:trap (:trap answer)}
+                            (:error answer) {:refused (:error answer)}
+                            :else {:program {:code (mapv vec (:code answer))
+                                             :classes (mapv vec (:classes answer))
+                                             :fold (boolean (:fold answer))}})]
+                 (cond
+                   ;; both refused: the reasons are spelled differently on
+                   ;; purpose, so agreement is that both said no
+                   (and (:refused expected) (:refused port))
+                   (swap! refusals inc)
+
+                   (and (:program expected) (:program port))
+                   (when-not (= (:program expected) (:program port))
+                     (swap! failures inc)
+                     (println "  DISAGREE" (pr-str re))
+                     (println "    cljc  :" (pr-str (:program expected)))
+                     (println "    kotoba:" (pr-str (:program port))))
+
+                   ;; the port ran out of document, not out of meaning
+                   (contains? document-bounds (:trap port))
+                   (swap! bounded inc)
+
+                   :else
+                   (do (swap! failures inc)
+                       (println "  DISAGREE" (pr-str re))
+                       (println "    cljc  :" (pr-str expected))
+                       (println "    kotoba:" (pr-str port))))))
+             (let [drifted (not= @bounded bounded-baseline)]
+               (when drifted
+                 (println (str "  RATCHET: " @bounded " patterns hit a document bound, baseline "
+                               bounded-baseline
+                               " -- update it and say why, in both directions")))
+               (println (str "SCANNED\t" @checks))
+               (println (str "  identical programs: " (- @checks @refusals @failures @bounded)
+                             "   both refused: " @refusals
+                             "   over a document bound: " @bounded
+                             "   disagreements: " @failures))
+               (println (if (and (zero? @failures) (not drifted))
+                          (str "compile parity: " (- @checks @bounded) "/" (- @checks @bounded)
+                               " agree between the .cljc oracle and the Kotoba port"
+                               " (" @bounded " over a document bound)")
+                          "compile parity: FAILED"))
+               (js/process.exit (if (and (zero? @failures) (not drifted)) 0 1)))))
+          (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1)))))))
+
+(main)

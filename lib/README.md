@@ -98,6 +98,16 @@ The bundled standard libraries live in this repository:
 | `org.ietf.nfs` | `org.ietf.nfs/src` | `nfs.memory`, `nfs.mount`, `nfs.tcp`, `nfs.v3` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
+| `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.persona` | `kotoba.persona/src` | `persona.core`, `persona.relay` (Kotoba project library) |
+| `kotoba.wordId` | `kotoba.wordId/src` | `word-id.core`, `word-id.english`, `word-id.vocabulary` (Kotoba project library) |
+| `kotoba.pedigree` | `kotoba.pedigree/src` | `kotoba.pedigree` (Kotoba project library) |
+| `kotoba.pcb` | `kotoba.pcb/src` | `pcb`, `pcb.erc`, `pcb.layout`, `pcb.netlist` (Kotoba project library) |
+| `kotoba.pbrt` | `kotoba.pbrt/src` | `kotoba.pbrt` (Kotoba project library) |
+| `kotoba.pattern` | `kotoba.pattern/src` | `pattern.compile` (Kotoba project library) |
+| `kotoba.pathfind` | `kotoba.pathfind/src` | `pathfind` (Kotoba project library) |
+| `kotoba.otio` | `kotoba.otio/src` | `kotoba.otio`, `otio.core` (Kotoba project library) |
+| `kotoba.osActor` | `kotoba.osActor/src` | `os.murakumo` (Kotoba project library) |
 | `kotoba.optimalTransport` | `kotoba.optimalTransport/src` | `optimal-transport.mesh-morph`, `optimal-transport.sinkhorn` (Kotoba project library) |
 | `kotoba.openapi` | `kotoba.openapi/src` | `openapi.execute`, `openapi.json`, `openapi.model`, `openapi.ports` (Kotoba project library) |
 | `kotoba.ooyake` | `kotoba.ooyake/src` | `ooyake.cells.reconcile.cell`, `ooyake.cells.reconcile.state-machine`, `ooyake.cells.social-post.state-machine`, `ooyake.cells.world-model.cell` (Kotoba project library) |
