@@ -1,0 +1,756 @@
+(ns datom-model.core
+  "The Datomic-shaped model over a `datalog.index` db value: transact,
+  schema-as-datoms, datoms, q/query, pull, entity, entid/ident.
+
+  Extracted verbatim-in-behavior from the FIRST HALF of
+  `kotoba-lang/kotobase-peer`'s `kotobase-peer.core` (`empty-db` through
+  `ident`, up to but not including `snapshot!`). Everything from `snapshot!`
+  onward in that namespace -- `commit!`, `fold!`, `hydrate-*`, `as-of`/
+  `since`/`history`, `cold-datoms`, `verify-chain` -- is the persistence half
+  and is deliberately NOT here. This namespace never puts, gets, hashes,
+  addresses, or chains anything: a db value goes in, a db value or a query
+  result comes out.
+
+  What that buys: the transitive runtime closure is `datalog` + `datom`
+  (whose own closure is `datom-source`). No prolly-tree, no chain, no IPLD,
+  no CBOR, no multiformats.
+
+  ## Two injected parameters, both REQUIRED
+
+  `ref?` -- the predicate deciding whether a value is a REFERENCE, i.e.
+  whether it (a) survives quad coercion verbatim instead of being
+  stringified and (b) gets a reverse-reference (`:vaet`) index entry.
+  `kotobase-peer` defaulted it to `ipld.core/link?`, which was the only
+  reason its model half needed IPLD at all. `datalog.index` already made
+  `ref?` required for exactly this reason (see its README's \"The one cut\");
+  this namespace follows, rather than inventing a new implicit default --
+  every candidate default is a guess about the caller's data model, and a
+  wrong guess silently yields an empty or over-full reverse index.
+
+  `render-value` (on `datoms`) -- how a stored `:o` becomes the `:v_edn` wire
+  string. `kotobase-peer` hardcoded `#(pr-str (arrangement.core/link->edn %))`,
+  the second and last IPLD coupling in the model half. Also required, for the
+  same reason `visible?` is: a permissive default (`pr-str`) would silently
+  emit `#object[...Link 0x...]` garbage into `:v_edn` for any caller who
+  forgot, which is worse than an arity error. To reproduce `kotobase-peer`'s
+  exact wire bytes, pass `#(pr-str (arrangement.core/link->edn %))`.
+
+  `visible?` is required everywhere it appears, unchanged from the source
+  (ADR-2607050500: query is a first-class effect all the way up this stack).
+  Pass `(constantly true)` to see everything, as an explicit choice."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
+            [kotoba.lang.text :as str]
+            [datalog.index :as index]
+            [datalog.query :as dq]
+            [datalog.core :as dl]
+            [datom.core :as dc]
+            [datom-model.statistics :as stats]))
+
+(defn empty-db
+  "A db value with all four covering indexes empty (`datalog.index/empty-db`)."
+  []
+  (index/empty-db))
+
+(defn- ->quad-value
+  "Coerce one quad position: a value `ref?` accepts passes through unchanged
+   (so it survives to `assert-quad`'s own `ref?` check as the same value it
+   was); anything else stringifies. The SAME `ref?` must be used here and at
+   `assert-quad` -- if they disagreed, a reference would be stringified on the
+   way in and then fail the reverse-index test, silently emptying `:vaet`.
+   General typed-value support beyond references -- int/bytes/bool/list/map --
+   remains a follow-up (ADR-2607023200 §6-5)."
+  [ref? v] (if (ref? v) v (str v)))
+
+(defn- ->quad
+  "Coerce one tx-data item to a `{:s :p :o}` quad (`:s`/`:p` always coerced to
+   strings; `:o` passes a `ref?` value through unchanged, see `->quad-value`).
+   Accepts a `{:s :p :o}` map, `[:db/add e a v]`, `[:db/retract e a v]`,
+   `[:db/retractEntity e]`, or a bare `[e a v]` triple."
+  [ref? item]
+  (cond
+    ;; entity-level retraction (ADR-2607071610): {:s .. :op :retract-entity}
+    ;; carries no :p/:o
+    (and (map? item) (= :retract-entity (:op item)) (contains? item :s))
+    {:s (str (:s item)) :op :retract-entity}
+
+    (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
+    (cond-> {:s (str (:s item)) :p (str (:p item)) :o (->quad-value ref? (:o item))}
+      (:op item) (assoc :op (:op item)))
+
+    (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+    (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value ref? v)})
+
+    ;; attr-level retraction (ADR-2607071610)
+    (and (vector? item) (= 4 (count item)) (= :db/retract (first item)))
+    (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value ref? v) :op :retract})
+
+    ;; entity-level retraction (ADR-2607071610)
+    (and (vector? item) (= 2 (count item)) (= :db/retractEntity (first item)))
+    {:s (str (second item)) :op :retract-entity}
+
+    (and (sequential? item) (= 3 (count item)))
+    (let [[e a v] item] {:s (str e) :p (str a) :o (->quad-value ref? v)})
+
+    :else
+    (throw (ex-info "datom-model: unrecognized tx-data item"
+                    {:item item}))))
+
+(defn- retract-entity*
+  "Retract every quad whose subject is `s` (spo lookup -- O(|entity|),
+  ADR-2607071610 `:retract-entity`)."
+  [db s ref?]
+  (reduce-kv (fn [db p os]
+               (reduce (fn [db o] (index/retract-quad db {:s s :p p :o o} ref?)) db os))
+             db (get-in db [:eavt s] {})))
+
+(defn apply-quad
+  "Apply one `:op`-tagged `{:s :p :o :op}` quad to the db (ADR-2607071610).
+  Missing `:op` = `:assert` -- plain quads stay valid unchanged.
+
+  PUBLIC here although it was private in `kotobase-peer.core`: every one of
+  its call sites there is in the persistence half (`hydrate-db`, `since`,
+  `history`, `hot-datoms`, `fold!`), all of which reduce a decoded novelty
+  block over it. That makes it a model primitive with persistence-side
+  callers, not a persistence detail -- so it is exported rather than deleted,
+  and a re-pointed `kotobase-peer` can drop its private copy."
+  [db {:keys [op] :as q} ref?]
+  (case (or op :assert)
+    :assert         (index/assert-quad db q ref?)
+    :retract        (index/retract-quad db q ref?)
+    :retract-entity (retract-entity* db (:s q) ref?)))
+
+(defn- asserted? [db {:keys [s p o]}]
+  (contains? (get (index/entity-attrs db s) p #{}) o))
+
+(defn transact-effective
+  "Apply raw TX-DATA and return `{:db-after :effective-deltas}` -- only
+  state-CHANGING datom deltas. Duplicate asserts and missing retracts emit
+  nothing. `:retract-entity` expands the entity's currently asserted triples
+  in deterministic order."
+  [db tx-data ref?]
+  (reduce
+   (fn [{:keys [db-after] :as result} item]
+     (let [{:keys [s p o op] :as quad} (->quad ref? item)
+           op (or op :assert)]
+       (case op
+         :assert
+         (if (asserted? db-after quad)
+           result
+           {:db-after (index/assert-quad db-after quad ref?)
+            :effective-deltas (conj (:effective-deltas result)
+                                    {:e s :a p :v o :op :assert})})
+
+         :retract
+         (if-not (asserted? db-after quad)
+           result
+           {:db-after (index/retract-quad db-after quad ref?)
+            :effective-deltas (conj (:effective-deltas result)
+                                    {:e s :a p :v o :op :retract})})
+
+         :retract-entity
+         (let [deltas (->> (index/entity-attrs db-after s)
+                           (mapcat (fn [[attr values]]
+                                     (map (fn [value]
+                                            {:e s :a attr :v value :op :retract})
+                                          values)))
+                           (sort-by (juxt :a #(pr-str (:v %))))
+                           vec)]
+           {:db-after (retract-entity* db-after s ref?)
+            :effective-deltas (into (:effective-deltas result) deltas)}))))
+   {:db-after db :effective-deltas []}
+   tx-data))
+
+(defn transact-with-statistics
+  "Normalize and apply TX-DATA, then refresh scoped query statistics at
+  NEW-EPOCH from the effective deltas only. Returns both immutable results."
+  [db tx-data ref? query-statistics new-epoch]
+  (let [{:keys [db-after effective-deltas]} (transact-effective db tx-data ref?)]
+    {:db-after db-after
+     :effective-deltas effective-deltas
+     :query-statistics (stats/refresh-query-statistics query-statistics
+                                                       effective-deltas new-epoch)}))
+
+(defn transact
+  "Apply `tx-data` (a seq of `{:s :p :o}` quads, `[:db/add e a v]`, or `[e a v]`
+   triples) to `db`. Returns the new (immutable) db value. `ref?` is passed
+   through to `datalog.index/assert-quad` for reverse-reference indexing and
+   to `->quad-value` for value coercion -- see the ns docstring."
+  [db tx-data ref?]
+  (:db-after (transact-effective db tx-data ref?)))
+
+;; ── schema: Datomic-style "schema is just datoms too" ───────────────────────
+;; An attribute is a normal entity, using its own NAME as its entity id
+;; (Datomic's `:db/ident` pattern) -- `db/valueType`/`db/cardinality`/
+;; `db/unique` facts ABOUT it are ordinary datoms, queryable like anything
+;; else, not a side-channel config the db doesn't know about.
+;; `bootstrap-attrs` is the one fixed exception: describing an attribute's
+;; schema requires asserting `db/valueType`/etc. facts, which are themselves
+;; attributes -- Datomic solves this bootstrap problem with a small built-in
+;; meta-schema those specific attributes are exempt from needing a schema
+;; entry for; this does the same.
+
+(def bootstrap-attrs
+  "Meta-schema attributes describing OTHER attributes -- these never need a
+  schema entry of their own. Declaring them about some attribute name IS
+  how that attribute gets its first schema entry; a database with zero
+  schema installed can still bootstrap its first one. `db/tupleTypes`
+  declares a `:tuple` attribute's fixed per-position value types."
+  #{"db/valueType" "db/cardinality" "db/unique" "db/doc" "db/tupleTypes"})
+
+(defn- raw-triple
+  "Like `->quad`, but the `:o`/`v` position is NOT coerced -- the caller's
+  ORIGINAL value, for `transact-with-schema`'s `:db/valueType` check to
+  inspect before `->quad`'s stringification would erase e.g. an int's actual
+  type. Returns `[s p o]`, not yet a quad map; storage still goes through the
+  normal `->quad-value` coercion afterward (schema validates the value's type
+  at the API boundary, it does not change the stored string-based
+  representation every other value already uses)."
+  [item]
+  (cond
+    (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
+    [(str (:s item)) (str (:p item)) (:o item)]
+
+    (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+    (let [[_ e a v] item] [(str e) (str a) v])
+
+    (and (sequential? item) (= 3 (count item)))
+    (let [[e a v] item] [(str e) (str a) v])
+
+    :else
+    (throw (ex-info "datom-model: unrecognized tx-data item" {:item item}))))
+
+(defn- schema-value->wire
+  "One `install-schema` declaration value -> its wire string. A keyword
+  stores by `name` (`:string` -> \"string\"); `db/tupleTypes`'s vector of
+  per-position types stores comma-joined (`[:string :long]` -> \"string,
+  long\") rather than a stringified EDN vector -- simpler to parse back
+  (`str/split`) than round-tripping through `edn/read-string`, and this
+  substrate's other schema fields are already single plain strings."
+  [v]
+  (cond
+    (vector? v) (str/join "," (map #(if (keyword? %) (name %) (str %)) v))
+    (keyword? v) (name v)
+    :else (str v)))
+
+(defn install-schema
+  "Assert schema declarations as ordinary datoms (see the section comment
+  above): `schema` is `{attr-name {:db/valueType t :db/cardinality c
+  :db/unique u :db/doc \"...\" :db/tupleTypes [t1 t2 ...]}}` (each key
+  optional; values may be keywords -- `:string`, `:one`, `:identity`, etc. --
+  or plain strings; `:db/tupleTypes` is a vector of per-position value-types,
+  only meaningful when `:db/valueType` is `:tuple`). `db/doc` is purely
+  informational, never validated by `transact-with-schema`."
+  [db schema ref?]
+  (transact db
+            (for [[attr decl] schema
+                  [k v] decl
+                  :let [k-name (subs (str k) 1)]        ; :db/valueType -> "db/valueType"
+                  :when (contains? bootstrap-attrs k-name)]
+              [attr k-name (schema-value->wire v)])
+            ref?))
+
+(defn schema-of
+  "Derive `{attr-name {:value-type _ :cardinality _ :unique _ :tuple-types _}}`
+  from whatever `db/valueType`/`db/cardinality`/`db/unique`/`db/tupleTypes`
+  datoms already exist in `db` (see `install-schema`) -- schema is just data
+  the db already has, not a side-channel a caller must separately track.
+  `:cardinality` defaults to `\"many\"` (the index layer's own native
+  cardinality-agnostic behavior) when an attribute has SOME schema entry but
+  no explicit `db/cardinality`. `:tuple-types` is a vector of value-type
+  strings (parsed back from `db/tupleTypes`'s comma-joined wire string), or
+  `nil`."
+  [db]
+  (into {}
+        (keep (fn [[ent attrs]]
+                (let [vt (first (get attrs "db/valueType"))
+                      card (first (get attrs "db/cardinality"))
+                      uniq (first (get attrs "db/unique"))
+                      tuple-types-str (first (get attrs "db/tupleTypes"))]
+                  (when (or vt card uniq tuple-types-str)
+                    [ent {:value-type vt :cardinality (or card "many") :unique uniq
+                          :tuple-types (some-> tuple-types-str (str/split #","))}]))))
+        (:eavt db)))
+
+(defn- validate-value-type!
+  "`value-type` -> the check run against the ORIGINAL value `v` (before
+  `->quad-value`'s string coercion -- see `raw-triple`). `tuple-types` (a
+  vector of per-position value-type strings, from `db/tupleTypes`) is only
+  consulted when `value-type` is `\"tuple\"`. `\"ref\"` is checked with the
+  caller's own `ref?` -- the same predicate that decides reverse indexing,
+  so \"declared a ref\" and \"indexed as a ref\" cannot drift apart.
+
+  `\"bigdec\"`/`\"bigint\"` are deliberately NOT included: cljs/JS has no
+  true arbitrary-precision decimal/integer type, so a check that's
+  meaningful on JVM (`decimal?`) would ALWAYS fail on cljs/nbb -- a
+  cross-platform correctness mismatch this codebase avoids elsewhere, not an
+  oversight."
+  [ref? attr value-type v tuple-types]
+  (case value-type
+    "string"  (when-not (string? v)
+                (throw (ex-info "datom-model: schema violation -- expected a string" {:attr attr :value v})))
+    "long"    (when-not (integer? v)
+                (throw (ex-info "datom-model: schema violation -- expected a long" {:attr attr :value v})))
+    "double"  (when-not (number? v)
+                (throw (ex-info "datom-model: schema violation -- expected a double" {:attr attr :value v})))
+    "boolean" (when-not (boolean? v)
+                (throw (ex-info "datom-model: schema violation -- expected a boolean" {:attr attr :value v})))
+    "ref"     (when-not (ref? v)
+                (throw (ex-info "datom-model: schema violation -- expected a ref (per the caller's ref?)" {:attr attr :value v})))
+    "uuid"    (when-not (uuid? v)
+                (throw (ex-info "datom-model: schema violation -- expected a uuid" {:attr attr :value v})))
+    "instant" (when-not (inst? v)
+                (throw (ex-info "datom-model: schema violation -- expected an instant" {:attr attr :value v})))
+    "keyword" (when-not (keyword? v)
+                (throw (ex-info "datom-model: schema violation -- expected a keyword" {:attr attr :value v})))
+    "symbol"  (when-not (symbol? v)
+                (throw (ex-info "datom-model: schema violation -- expected a symbol" {:attr attr :value v})))
+    "bytes"   (when-not #?(:clj (bytes? v) :cljs (instance? js/Uint8Array v))
+                (throw (ex-info "datom-model: schema violation -- expected bytes" {:attr attr :value v})))
+    "tuple"   (do
+                (when-not (vector? v)
+                  (throw (ex-info "datom-model: schema violation -- expected a tuple (vector)" {:attr attr :value v})))
+                (when-not (= (count tuple-types) (count v))
+                  (throw (ex-info "datom-model: schema violation -- tuple arity mismatch"
+                                  {:attr attr :expected (count tuple-types) :got (count v)})))
+                (dorun (map (fn [t elem] (validate-value-type! ref? attr t elem nil)) tuple-types v)))
+    nil))
+
+(defn- normalize-inline-schema
+  "Caller-passed inline schema declarations (`install-schema`'s own
+  `{:db/valueType t :db/cardinality c :db/unique u :db/tupleTypes [t1 ...]}`
+  shape) -> the SAME `{:value-type _ :cardinality _ :unique _ :tuple-types _}`
+  shape `schema-of` derives from already-installed datoms, so
+  `transact-with-schema`'s `(merge (schema-of db) schema)` actually reconciles
+  the two instead of one shape silently shadowing the other with mismatched
+  keys.
+
+  This fixes a real bug: an inline `{:db/valueType :long}` passed directly to
+  `transact-with-schema` (never pre-installed via `install-schema`) was
+  previously a SILENT no-op for value-type validation."
+  [schema]
+  (into {}
+        (map (fn [[attr decl]]
+               [attr {:value-type (some-> (:db/valueType decl) name)
+                      :cardinality (or (some-> (:db/cardinality decl) name) "many")
+                      :unique (some-> (:db/unique decl) name)
+                      :tuple-types (some->> (:db/tupleTypes decl)
+                                            (mapv #(if (keyword? %) (name %) (str %))))}]))
+        schema))
+
+(defn transact-with-schema
+  "Like `transact`, but OPT-IN schema enforcement (plain `transact` is
+  completely unchanged -- every existing caller keeps working exactly as
+  before): validates every tx-data item against `schema` (merged with
+  whatever `schema-of` already derives from `db`, so a caller can declare
+  brand-new attributes in the very same call that writes their first data,
+  Datomic's own \"schema is just a transaction too\" idiom) BEFORE applying
+  any of them.
+    - an attribute with no schema entry (and not `bootstrap-attrs`, which
+      describe schema itself and need none) throws -- Datomic's own
+      \"attribute must be installed before use\" discipline.
+    - a declared `:value-type` mismatch (checked against the ORIGINAL value,
+      before `->quad-value`'s string coercion -- see `raw-triple`) throws.
+    - a declared `:cardinality \"one\"` attribute automatically retracts any
+      PRIOR value(s) for that `(s, p)` pair before asserting the new one --
+      this fn's own job, NOT `datalog.index/assert-quad`'s (the index layer
+      stays cardinality-agnostic; cardinality is a POLICY layered on top
+      here, the same way `visible?`/`ref?` are layered rather than baked in).
+    - a declared `:unique \"identity\"`/`\"value\"` attribute throws if the
+      `(attr, value)` pair already belongs to a DIFFERENT entity.
+  Applied in tx-data order against the RUNNING db, so a later item can rely on
+  an earlier item's cardinality-one retraction having already happened."
+  [db tx-data ref? schema]
+  (let [effective-schema (merge (schema-of db) (normalize-inline-schema schema))]
+    (reduce
+     (fn [db item]
+       (let [[s p o] (raw-triple item)]
+         (when-not (or (contains? bootstrap-attrs p) (contains? effective-schema p))
+           (throw (ex-info "datom-model: unknown attribute -- no schema declared (see install-schema)"
+                           {:attr p})))
+         (when-let [vt (get-in effective-schema [p :value-type])]
+           (validate-value-type! ref? p vt o (get-in effective-schema [p :tuple-types])))
+         (when (= "identity" (get-in effective-schema [p :unique]))
+           (let [quad-o (->quad-value ref? o)
+                 existing (index/by-predicate-value db p quad-o)]
+             (when (and (seq existing) (not= existing #{s}))
+               (throw (ex-info "datom-model: unique attribute violation -- value already belongs to a different entity"
+                               {:attr p :value quad-o :existing existing})))))
+         (let [db (if (= "one" (get-in effective-schema [p :cardinality] "many"))
+                    (reduce (fn [db old-o] (index/retract-quad db {:s s :p p :o old-o} ref?))
+                            db
+                            (disj (get (index/entity-attrs db s) p #{}) (->quad-value ref? o)))
+                    db)]
+           (index/assert-quad db {:s s :p p :o (->quad-value ref? o)} ref?))))
+     db
+     tx-data)))
+
+(defn transact-with-report
+  "Like `transact`, but returns a Datomic-shaped tx-report --
+   `{:db-before :db-after :tx-data}` -- instead of the bare new db value.
+   No `:tempids` (entity ids in this substrate are caller-chosen, never
+   auto-assigned, so there is nothing to resolve)."
+  [db tx-data ref?]
+  {:db-before db :db-after (transact db tx-data ref?)
+   :tx-data (mapv #(->quad ref? %) tx-data)})
+
+(defn with
+  "Datomic's `with`: apply `tx-data` to `db` SPECULATIVELY and return the
+   tx-report -- a pure function, db value in, `{:db-before :db-after
+   :tx-data}` out. Since this whole namespace is already pure, `with` is
+   exactly `transact-with-report` under Datomic's own name, for a caller
+   specifically looking for it."
+  [db tx-data ref?]
+  (transact-with-report db tx-data ref?))
+
+;; ── datafication via the canonical datom model ──────────────────────────────
+;; kotoba : kotobase = Clojure : Datomic (ADR-2607032500). An entity tx-map is
+;; turned into `[e a v]` datoms by `datom.core/eavt` -- kotoba's shared datom
+;; representation, the same `[e a v]` `kotoba.kgraph` speaks and the same shape
+;; `transact`/`->quad` already accept.
+
+(defn tx-map->datoms
+  "Datafy one Datomic-style entity tx-map `{:db/id e :ns/a v …}` → `[e a v]`
+   datoms (`datom.core/eavt`)."
+  [ent]
+  (dc/eavt ent))
+
+(defn entities->datoms
+  "Datafy a seq of entity tx-maps → a flat vector of `[e a v]` datoms."
+  [entities]
+  (vec (mapcat dc/eavt entities)))
+
+(defn transact-tx
+  "`transact`, but taking Datomic-style entity tx-maps instead of raw
+   triples -- `entities->datoms` then `transact`."
+  [db entities ref?]
+  (transact db (entities->datoms entities) ref?))
+
+(defn datoms
+  "`datomic.datoms`-shaped rows `{:e :a :v_edn :added}`.
+
+   `render-value` is REQUIRED: it turns a stored `:o` into the `:v_edn` wire
+   string (see the ns docstring). `pr-str` is the identity-ish choice for a
+   db whose values are all strings; a caller with reference values must
+   render them itself.
+
+   `visible?` is REQUIRED (ADR-2607050500). It is applied as a post-filter
+   over each candidate ROW, i.e. `(visible? {:e :a :v_edn :added})` -- the
+   same `datomic.datoms`-shaped map this fn returns, NOT `datalog.query`'s
+   `{:s :p :o}` quad shape (`:e`/`:a` name the same positions as `:s`/`:p`,
+   but `:v_edn` is already the wire-encoded string, not the raw stored value,
+   and `:added` is present too) -- a caller filtering by entity/attribute (the
+   common case: can this actor see this entity, is this attribute public)
+   needs no decoding to do so; a caller that must decide on the raw value can
+   `clojure.edn/read-string` `:v_edn` itself. Pass `(constantly true)` to see
+   everything, as an explicit choice.
+
+   3-arg (`[db render-value visible?]`) → whole-db (`:eavt` full scan). 4-arg
+   additionally honors an optional `{:index :components :limit}` via the index
+   accessors, so a filtered read (e.g. by entity, or by `[attr value]`)
+   materialises ONLY the matching entity/attr instead of the whole graph.
+
+   `:index` ∈ `#{:eavt :aevt :avet :vaet}` (default `:eavt`); `:components` is
+   an ordered prefix in that index's key order (`:eavt`=[e a v],
+   `:aevt`/`:avet`=[a …], `:vaet`=[v a …] -- reverse-reference only, populated
+   for `ref?`-valued quads). `visible?` is applied BEFORE `:limit` is taken,
+   so `:limit` caps the row count the caller actually receives (all of them
+   visible), not the count of raw candidates scanned."
+  ([db render-value visible?] (datoms db nil render-value visible?))
+  ([db {:keys [index components limit]} render-value visible?]
+   (let [[c0 c1] components
+         triples
+         (case (or index :eavt)
+           ;; EAVT — key order [e a v]
+           :eavt (cond
+                   (and c0 c1) (for [v (get (index/entity-attrs db c0) c1 #{})] [c0 c1 v])
+                   c0          (for [[a vs] (index/entity-attrs db c0), v vs]   [c0 a v])
+                   :else       (for [[e pm] (:eavt db), [a vs] pm, v vs]         [e a v]))
+           ;; AEVT — key order [a e v]
+           :aevt (cond
+                   c0    (for [[e vs] (index/by-predicate db c0), v vs]   [e c0 v])
+                   :else (for [[a em] (:aevt db), [e vs] em, v vs]         [e a v]))
+           ;; AVET — key order [a v e]; [a v] is the point lookup
+           :avet (cond
+                   (and c0 c1) (for [e (index/by-predicate-value db c0 c1)] [e c0 c1])
+                   c0          (for [[e vs] (index/by-predicate db c0), v vs] [e c0 v])
+                   :else       (for [[a em] (:aevt db), [e vs] em, v vs]       [e a v]))
+           ;; VAET — key order [v a e]; [v a] is the reverse-reference point
+           ;; lookup (`refs-to`). Populated ONLY for quads whose value passed
+           ;; the caller's `ref?` -- same scope `refs`/`entity-attr` document.
+           ;; `:components` narrows first by value (`c0`), then by attribute
+           ;; (`c1`) -- reverse order from AEVT/AVET's attribute-first
+           ;; components, matching Datomic's own VAET key order.
+           :vaet (cond
+                   (and c0 c1) (for [e (get (index/refs-to db c0) c1 #{})] [e c1 c0])
+                   c0          (for [[a es] (index/refs-to db c0), e es]   [e a c0])
+                   :else       (for [[o pm] (:vaet db), [a es] pm, e es]    [e a o])))
+         rows (for [[e a v] triples] {:e e :a a :v_edn (render-value v) :added true})
+         rows (filter visible? rows)
+         rows (cond->> rows limit (take limit))]
+     (vec rows))))
+
+(defn q
+  "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
+   the matching index via `datalog.query`. Returns a set of `{:s :p :o}`
+   quads. NOTE: triple-pattern only, no join across clauses -- see `query`
+   below for that.
+
+   `visible?` is REQUIRED, cascaded straight from `datalog.query/query`."
+  [db pattern visible?]
+  (dq/query db pattern visible?))
+
+(defn- datalog-var? [x]
+  (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- reorderable-triple? [clause]
+  (and (vector? clause) (= 3 (count clause))))
+
+(defn- supplied-cardinality [query-statistics statistics-scope query-epoch
+                             max-statistics-age pattern]
+  (let [scope (or (get query-statistics "visibility-scope")
+                  (:visibility-scope query-statistics))
+        statistics-epoch (or (get query-statistics "epoch")
+                             (:epoch query-statistics))
+        clauses (or (get query-statistics "clauses")
+                    (:clauses query-statistics))]
+    (when (and (= statistics-scope scope)
+               (stats/query-statistics-fresh? statistics-epoch query-epoch
+                                              max-statistics-age))
+      (some (fn [statistic]
+              (when (= pattern (or (get statistic "pattern") (:pattern statistic)))
+                (or (get statistic "rows") (:rows statistic))))
+            clauses))))
+
+(defn datalog-query-plan
+  "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
+   Positive triple clauses commute, so their visible cardinalities can drive
+   `datom-model.statistics/plan-clause-order`. Queries containing negation,
+   functions, rules, or `or` retain source order because those forms have
+   binding/safety semantics."
+  ([db query visible?] (datalog-query-plan db query visible? []))
+  ([db query visible? inputs]
+   (let [where (:where query)]
+     (if (every? reorderable-triple? where)
+       (let [input-vars (vec (remove #{'$} (or (:in query) [])))
+             input-bindings (into {} (map vector input-vars inputs))
+             query-statistics (:query-statistics query)
+             statistics-scope (:statistics-scope query)
+             query-epoch (:query-epoch query)
+             max-statistics-age (:max-statistics-age query 0)
+             clauses (mapv (fn [id clause]
+                             (let [pattern (mapv (fn [term]
+                                                   (cond
+                                                     (= term '_) nil
+                                                     (contains? input-bindings term) (get input-bindings term)
+                                                     (datalog-var? term) nil
+                                                     :else term))
+                                                 clause)
+                                   supplied (supplied-cardinality query-statistics
+                                                                  statistics-scope query-epoch
+                                                                  max-statistics-age pattern)]
+                               {:id id
+                                :clause clause
+                                :vars (into #{} (filter datalog-var?) clause)
+                                ;; `dq/cardinality`, not `(count (dq/query
+                                ;; ...))`: the planner wants a NUMBER, and
+                                ;; building a set to count it made this the
+                                ;; single largest term in an LDBC IC09 query --
+                                ;; 361,246 rows hashed into a set and discarded,
+                                ;; 38% of the query's total time, on every call
+                                ;; (measured in `kotobase-peer`,
+                                ;; bench/results/2026-08-02-scan-instrumentation.edn).
+                                ;; Same `visible?`, same number; no set.
+                                :estimated-rows (if (some? supplied)
+                                                  supplied
+                                                  (dq/cardinality db pattern visible?))
+                                :estimate-source (if (some? supplied)
+                                                   :materialized-statistics
+                                                   :visible-scan)}))
+                           (range) where)
+             plan (stats/plan-clause-order clauses)]
+         {:query (assoc query
+                        :where (mapv :clause plan)
+                        ;; The same estimates that chose the order, handed to
+                        ;; the executor so it can also choose a STRATEGY per
+                        ;; clause: one broad scan plus a hash join when a
+                        ;; clause's relation is small relative to the number
+                        ;; of keyed scans a step would issue for it, keyed
+                        ;; scans otherwise (`datalog.core`, ADR-2608021000
+                        ;; §6-4-1). These numbers were already computed and
+                        ;; then thrown away; the executor was left guessing at
+                        ;; something the planner had measured.
+                        :clause-cardinality
+                        (into {} (map (juxt :clause :estimated-rows)) plan))
+          :plan plan
+          :optimized? true})
+       {:query query
+        :plan (mapv (fn [id clause] {:id id :clause clause :step id})
+                    (range) where)
+        :optimized? false}))))
+
+(defn query
+  "`datomic.api/q`-equivalent: `{:find [?var ...] :in [?param ...] :where
+   [[e a v] ...] :rules [...]}` conjunctive multi-clause join over
+   `datalog.core/q`. `:where` clauses may be `(not [e a v])`,
+   `(rule-name ?arg ...)`, `[(fn-sym arg...)]` / `[(fn-sym arg...)
+   result-var]` (a whitelisted predicate/function call), or
+   `(or clause ...)` / `(or-join [?shared ...] clause ...)`. `:find`
+   elements may be `(count ?v)`/`(count-distinct ?v)`/`(sum ?v)`/
+   `(avg ?v)`/`(min ?v)`/`(max ?v)` alongside plain variables, and `:rules`
+   may define recursive relations, evaluated to a least fixpoint via
+   semi-naive iteration. `inputs` (optional 4th arg, positional, matching
+   `:in`'s order) supplies extra query parameters. See `datalog.core`'s ns
+   docstring for the full grammar and for why negation/recursion/`or` are all
+   safe against `visible?` (enforced there; this fn plans the clause order and
+   otherwise passes straight through). Returns a set of `:find`-ordered
+   vectors. `visible?` is REQUIRED, same convention as `q` above."
+  ([db find+where visible?] (query db find+where visible? []))
+  ([db find+where visible? inputs]
+   (let [{planned-query :query} (datalog-query-plan db find+where visible? inputs)]
+     (dl/q db planned-query visible? inputs))))
+
+;; ── pull: a Datomic-shaped pull-pattern language over entity-attrs/refs-to ──
+
+(defn- pull-wildcard? [attr] (= attr '*))
+(defn- pull-map-spec? [attr] (map? attr))
+(defn- reverse-attr? [a] (str/starts-with? a "_"))
+(defn- reverse-attr-name [a] (subs a 1))
+
+(defn- pull1
+  "Pull entity `s` per pull-pattern `pattern` (a vector of pull-attrs, see
+  `pull`'s docstring). `seen` is the set of entity ids already being expanded
+  on this recursion path -- an entity already on the path is returned as `{}`
+  rather than re-expanded, so a cyclic graph can never loop forever,
+  REGARDLESS of whether the caller wrote an explicit `n`/`'...` recursion
+  limit or not (unconditional cycle safety, not just a courtesy for
+  well-behaved callers)."
+  [db s pattern seen]
+  (let [attrs (index/entity-attrs db s)         ; {p #{o...}}
+        seen' (conj seen s)
+        expand (fn [ref sub-pattern]
+                 (if (contains? seen' ref) {} (pull1 db ref sub-pattern seen')))]
+    (reduce
+     (fn [acc attr]
+       (cond
+         (pull-wildcard? attr) (merge acc attrs)
+
+         (and (string? attr) (reverse-attr? attr))
+         (assoc acc attr (get (index/refs-to db s) (reverse-attr-name attr) #{}))
+
+         (string? attr)
+         (assoc acc attr (get attrs attr #{}))
+
+         (pull-map-spec? attr)
+         (let [[a spec] (first attr)
+               reverse? (reverse-attr? a)
+               refs (if reverse? (get (index/refs-to db s) (reverse-attr-name a) #{}) (get attrs a #{}))]
+           (assoc acc a
+                  (cond
+                    (vector? spec)
+                    (into #{} (map #(expand % spec)) refs)
+
+                    (or (integer? spec) (= spec '...))
+                    (if (and (integer? spec) (<= spec 0))
+                      refs
+                      (into #{} (map #(expand % ['* {a (if (integer? spec) (dec spec) '...)}])) refs))
+
+                    :else acc)))
+
+         :else acc))
+     {}
+     pattern)))
+
+(defn pull
+  "`datomic.pull`-equivalent for entity `s`. 2-arg form is the flat
+   `{p #{o...}}` map (the index layer has no cardinality tracking, so every
+   attribute is multi-valued -- a caller expecting single-valued Datomic pull
+   semantics must pick e.g. `first`).
+
+   3-arg form takes a Datomic-shaped pull PATTERN, a vector of pull-attrs:
+     - a plain attr string        -> that attr's value set, flat (as above)
+     - `'*`                        -> every attr the entity has (wildcard)
+     - `\"_attr\"` (leading `_`)   -> reverse nav: every entity referencing
+                                      THIS one via `attr` (`refs`/VAET-style),
+                                      flat
+     - `{attr [sub-pattern ...]}`  -> nested pull: treat attr's value(s) (or,
+                                      for `\"_attr\"`, its referrers) as
+                                      entity ids and pull each with
+                                      sub-pattern
+     - `{attr n}` / `{attr '...}`  -> recursive wildcard pull through attr,
+                                      `n` levels deep or unlimited -- cycle-
+                                      safe either way (see `pull1`)."
+  ([db s] (index/entity-attrs db s))
+  ([db s pattern] (pull1 db s pattern #{})))
+
+;; ── entity: navigational entity API ─────────────────────────────────────────
+;; Datomic's `entity` returns an object that behaves like a Clojure map but
+;; transparently navigates ref-valued attributes into further entity objects
+;; on access. Reimplementing that fully (a custom type overriding
+;; `get`/keyword-invoke to be lazy) would need per-platform protocol dispatch
+;; this codebase has ALREADY hit real portability limits on -- nbb/SCI cannot
+;; dispatch a custom deftype's implementation of a built-in protocol at all
+;; (confirmed empirically), and a `defrecord`'s map/field behavior is fixed,
+;; not overridable to be lazy. So `entity` here is DELIBERATELY a plain map
+;; (identical to `pull`'s 2-arg flat form, under Datomic's own name) plus a
+;; separate, explicit `entity-attr` for the one thing that makes `entity` more
+;; than `pull` -- navigating INTO a ref value's own entity on demand, without
+;; needing a pull pattern known up front.
+
+(defn entity
+  "Datomic's `entity`: `pull`'s flat 2-arg form (`{p #{o...}}`) under
+   Datomic's own name. See the section comment above for why this is a plain
+   map, not a custom lazy-navigating type -- use `entity-attr` to navigate a
+   ref-valued attribute's values into their own nested entities on demand."
+  [db s]
+  (index/entity-attrs db s))
+
+(defn entity-attr
+  "Navigate FROM an already-`entity`/`pull`-ed map at `attr` INTO each of its
+   values as their OWN `entity`. Returns `#{{...} ...}`, one nested entity map
+   per value; a value that was never itself asserted as an entity's own
+   subject simply resolves to `{}`."
+  [db entity-map attr]
+  (into #{} (map #(entity db %)) (get entity-map attr #{})))
+
+(defn refs
+  "`{p #{s...}}`: every entity `s` that references `ref` via predicate `p`
+   (VAET-style reverse lookup). Only populated for quads whose value passed
+   the `ref?` predicate the caller supplied at `transact` time. `ref` is the
+   same value the referencing quad's `:o` was."
+  [db ref]
+  (index/refs-to db ref))
+
+(defn entid
+  "Datomic's `entid`: resolve a caller-given id-or-ident to the entity id.
+   A plain (non-keyword) `id` passes through UNCHANGED -- this substrate's
+   entity ids are already caller-chosen strings (`:db/id \"e1\"`, a CID, …),
+   never Datomic's auto-assigned longs, so there is no numeric-id resolution
+   step to perform.
+
+   A keyword `id` is resolved via `:db/ident`, asserted on an entity via
+   ordinary `transact` (`{:db/id \"e1\" :db/ident :my.ns/thing}`) exactly like
+   any other attribute -- `:db/ident` needs no special engine support, the
+   same \"schema is just data the db already has\" posture
+   `install-schema`/`schema-of` take for attribute schema. Nothing in this
+   substrate enforces `:db/ident` uniqueness (Datomic itself would via
+   `:db/unique :db.unique/identity`, which this substrate has no ENFORCEMENT
+   mechanism for yet, only the schema-as-data description) -- if more than one
+   entity happens to assert the same ident, which one `entid` returns is
+   unspecified (`q`'s result is a set). Returns nil if no entity has that
+   ident asserted."
+  [db id]
+  (if (keyword? id)
+    (some :s (q db [nil ":db/ident" (str id)] (constantly true)))
+    id))
+
+(defn ident
+  "Datomic's `ident`: the inverse of `entid` for keyword idents -- the
+   `:db/ident` keyword `s` has asserted on itself, or nil if it has none
+   (including if the value there isn't actually a keyword-shaped string,
+   e.g. someone asserted `:db/ident \"plain string\"` instead of a real
+   keyword -- treated as \"no ident\" rather than a partial/lossy result)."
+  [db s]
+  (let [v (first (get (entity db s) ":db/ident"))]
+    (when (and (string? v) (str/starts-with? v ":"))
+      (edn/read-string v))))
