@@ -58,8 +58,8 @@ yet perform full semantic admission or compilation, nor expose the CID on the
 public CLI. The public launcher, other `check` modes, and the remaining command
 execution paths are still open.
 
-An input path for `cli-contract` and unsupported `--source-path`, `--json`, or
-`--safe=false` forms are refused rather than silently accepted.
+An input path for `cli-contract` and unsupported `--source-path`, `--json`,
+`--safe=false`, or non-Kotoba target forms are refused rather than silently accepted.
 
 `src/kotoba/cli.kotoba` produces validated requests. Parsing a command does
 not execute it, approve a provider operation, admit a package or qualify a
