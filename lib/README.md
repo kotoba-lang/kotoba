@@ -76,6 +76,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.woff` | `org.w3.woff/src` | `woff.bytes`, `woff.core`, `woff.glyf`, `woff.woff2` (an external specification, publisher w3.org) |
 | `org.ietf.ssh` | `org.ietf.ssh/src` | `ssh.connection`, `ssh.kex`, `ssh.keys`, `ssh.record` (an external specification, publisher ietf.org) |
 | `org.ietf.netconf` | `org.ietf.netconf/src` | `netconf.bytes`, `netconf.framing`, `netconf.message`, `netconf.operations` (an external specification, publisher ietf.org) |
+| `kotoba.dslCore` | `kotoba.dslCore/src` | `kotoba.dsl.problem` (Kotoba project library) |
 | `kotoba.xml` | `kotoba.xml/src` | `kotoba.xml`, `xml.core`, `xml.parse` (Kotoba project library) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
