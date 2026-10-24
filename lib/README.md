@@ -49,6 +49,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.rtp` | `org.ietf.rtp/src` | `rtp.header`, `rtp.rtcp`, `rtp.seq` (an external specification, publisher ietf.org) |
 | `org.ietf.diameter` | `org.ietf.diameter/src` | `diameter.avp`, `diameter.avps`, `diameter.bytes`, `diameter.message` (an external specification, publisher ietf.org) |
 | `org.ietf.coap` | `org.ietf.coap/src` | `coap.block`, `coap.code`, `coap.message`, `coap.options` (an external specification, publisher ietf.org) |
+| `org.ietf.xdr` | `org.ietf.xdr/src` | `xdr.core` (an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
