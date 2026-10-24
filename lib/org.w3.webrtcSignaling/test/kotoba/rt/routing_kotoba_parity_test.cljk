@@ -1,0 +1,210 @@
+;; `kotoba/rt/routing.kotoba` against `kotoba.rt.core/route-message`.
+;;
+;; The slice is the routing decision: who is allowed to send into a room,
+;; who may be addressed, and which clients a broadcast reaches. The room
+;; table, the sockets and every payload byte stay in the host.
+;;
+;; So the two are handed the same room and the same message and compared on
+;; the deliveries and the reason for a refusal. The guest is handed no
+;; payload at all -- the oracle's `:payload` is carried through the host and
+;; never reaches it, which is the relay's whole promise.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph).
+;;
+;; ## The negative controls
+;;
+;; Each is an access-control decision, and each passes on a relay that
+;; simply looks up a room and fans out:
+;;
+;;   * `a-sender-not-in-the-room-cannot-signal-into-it` — anyone who can
+;;     reach the relay can NAME any room; membership is what makes naming
+;;     one different from being in it;
+;;   * `an-addressed-recipient-must-be-in-the-room` — the room is the
+;;     boundary and `:to` must not cross it;
+;;   * `a-broadcast-does-not-echo-to-the-sender` — a relay that echoes makes
+;;     every client answer its own offer;
+;;   * `an-absent-room-is-not-an-empty-broadcast` — both produce an empty
+;;     delivery list and they are not the same fact. One is "nobody to
+;;     tell", the other is "no such call";
+;;   * `a-truncated-member-list-is-refused` — a short broadcast looks
+;;     exactly like a successful one.
+
+(ns kotoba.rt.routing-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [kotoba.rt.core :as rt]
+            [kotoba.rt.routing-guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "rt" "routing.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'rt.routing (slurp guest-file)}
+                                         'rt.routing :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+;; --- driving the guest --------------------------------------------------------
+
+(defn- route
+  "What a transport adapter does: look the room up in its own table, hand
+  the guest the membership, and ask who to deliver to. The payload never
+  goes in."
+  [rooms room-id msg]
+  (let [members (get rooms room-id)
+        ;; A member SET has no order; the host sorts so the comparison is
+        ;; deterministic. Ordering is not a routing decision.
+        ordered (vec (sort members))
+        s0 (call 'offer-room [(call 'init [(->doc {})])
+                              (->doc {:exists? (some? members)
+                                      :members ordered
+                                      :member-count (count ordered)})])]
+    (if (= :refused (call 'phase [s0]))
+      {:state s0 :phase :refused :reason (call 'reason [s0]) :deliveries nil}
+      (let [s1 (call 'offer-message [s0 (->doc (dissoc msg :payload))])]
+        {:state s1
+         :phase (call 'phase [s1])
+         :reason (call 'reason [s1])
+         :broadcast? (call 'broadcast? [s1])
+         :deliveries (when (= :routed (call 'phase [s1]))
+                       (set (map #(call 'delivery-at [s1 %])
+                                 (range (call 'delivery-count [s1])))))}))))
+
+(defn- oracle-deliveries [rooms msg]
+  (let [r (rt/route-message rooms msg)]
+    (if (map? r) {:error (:error r)} {:to (set (map :to r))})))
+
+;; --- fixtures -----------------------------------------------------------------
+
+(def ^:private rooms {"room-1" #{"alice" "bob" "carol"}
+                      "solo" #{"alice"}})
+
+(defn- signal
+  ([from] {:type :signal :room-id "room-1" :from from :payload "v=0 ..."})
+  ([from to] (assoc (signal from) :to to)))
+
+;; --- the tests -----------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-unicast-goes-to-exactly-one-client
+  (let [msg (signal "alice" "bob")
+        g (route rooms "room-1" msg)
+        o (oracle-deliveries rooms msg)]
+    (is (= :routed (:phase g)) (:reason g))
+    (is (false? (:broadcast? g)))
+    (is (= #{"bob"} (:deliveries g)))
+    (is (= (:to o) (:deliveries g)))))
+
+(deftest a-broadcast-does-not-echo-to-the-sender
+  (testing "a relay that echoes makes every client answer its own offer"
+    (let [msg (signal "alice")
+          g (route rooms "room-1" msg)
+          o (oracle-deliveries rooms msg)]
+      (is (= :routed (:phase g)) (:reason g))
+      (is (true? (:broadcast? g)))
+      (is (= #{"bob" "carol"} (:deliveries g)))
+      (is (not (contains? (:deliveries g) "alice")) "the sender is excluded")
+      (is (= (:to o) (:deliveries g)))))
+  (testing "and a sender alone in a room broadcasts to nobody, successfully"
+    (let [msg (assoc (signal "alice") :room-id "solo")
+          g (route rooms "solo" msg)
+          o (oracle-deliveries rooms msg)]
+      (is (= :routed (:phase g)) "which is success, not an error")
+      (is (= #{} (:deliveries g)))
+      (is (= (:to o) (:deliveries g))))))
+
+(deftest a-sender-not-in-the-room-cannot-signal-into-it
+  (testing "anyone who can reach the relay can NAME any room; membership is
+            what makes naming one different from being in it"
+    (let [msg (signal "mallory" "bob")
+          g (route rooms "room-1" msg)
+          o (oracle-deliveries rooms msg)]
+      (is (= :refused (:phase g)))
+      (is (= :rt/sender-not-in-room (:reason g)))
+      (is (nil? (:deliveries g)) "and no delivery list comes back out")
+      (is (= :sender-not-in-room (:error o))))))
+
+(deftest an-addressed-recipient-must-be-in-the-room
+  (testing "the room is the boundary and `:to` must not cross it"
+    (let [msg (signal "alice" "dave")
+          g (route rooms "room-1" msg)
+          o (oracle-deliveries rooms msg)]
+      (is (= :refused (:phase g)))
+      (is (= :rt/recipient-not-in-room (:reason g)))
+      (is (nil? (:deliveries g)))
+      (is (= :recipient-not-in-room (:error o))))))
+
+(deftest an-absent-room-is-not-an-empty-broadcast
+  (testing "a room with no entry and a sender alone in a room both produce an
+            empty delivery list, and they are not the same fact: one is
+            'nobody to tell', the other is 'no such call'"
+    (let [msg (assoc (signal "alice") :room-id "nowhere")
+          g (route rooms "nowhere" msg)
+          o (oracle-deliveries rooms msg)]
+      (is (= :refused (:phase g)))
+      (is (= :rt/room-not-found (:reason g)))
+      (is (= :room-not-found (:error o))))
+    (testing "while the alone-in-a-room case IS success"
+      (is (= :routed (:phase (route rooms "solo"
+                                    (assoc (signal "alice") :room-id "solo"))))))))
+
+(deftest a-truncated-member-list-is-refused
+  (testing "a `:document` vector holds 32 items, and a broadcast computed
+            from a truncated member list silently drops recipients -- which
+            looks exactly like a successful broadcast to a smaller room. So
+            the host reports the room's TRUE size and a disagreement is
+            refused."
+    (let [s (call 'offer-room [(call 'init [(->doc {})])
+                               (->doc {:exists? true
+                                       :members ["alice" "bob"]
+                                       :member-count 40})])]
+      (is (= :refused (call 'phase [s])))
+      (is (= :rt/truncated-member-list (call 'reason [s])))
+      (is (= -1 (call 'delivery-count [s])) "and it routes nothing"))
+    (testing "an honest count routes normally"
+      (let [s (call 'offer-room [(call 'init [(->doc {})])
+                                 (->doc {:exists? true
+                                         :members ["alice" "bob"]
+                                         :member-count 2})])]
+        (is (= :want-message (call 'phase [s])))
+        (is (= 2 (call 'member-count [s])))))))
+
+(deftest a-malformed-message-is-refused
+  (doseq [[label msg oracle-error]
+          [["wrong type" {:type :chat :room-id "room-1" :from "alice"}
+            :malformed-message]
+           ["no room-id" {:type :signal :from "alice"} :malformed-message]
+           ["no from" {:type :signal :room-id "room-1"} :malformed-message]]]
+    (let [g (route rooms "room-1" msg)]
+      (is (= :refused (:phase g)) label)
+      (is (= :rt/malformed-message (:reason g)) label)
+      (is (= oracle-error (:error (oracle-deliveries rooms msg))) label))))
+
+(deftest the-payload-never-enters-the-guest
+  (testing "the relay's whole promise is that it does not look. `route`
+            strips `:payload` before the message reaches the guest, and the
+            guest has no export that could return one."
+    (let [msg (signal "alice" "bob")
+          g (route rooms "room-1" msg)]
+      (is (= :routed (:phase g)))
+      (is (= #{"bob"} (:deliveries g)))
+      (testing "and the same routing holds whatever the payload is"
+        (doseq [p ["v=0" (apply str (repeat 100000 "x")) ""]]
+          (let [g2 (route rooms "room-1" (assoc msg :payload p))]
+            (is (= (:deliveries g) (:deliveries g2))
+                "routing is a function of ids alone")))))))
+
+(deftest a-refused-route-yields-no-deliveries
+  (testing "these are the sockets that get written to; a delivery list handed
+            back from a refusal would make the refusal decorative"
+    (doseq [msg [(signal "mallory") (signal "alice" "dave")
+                 (assoc (signal "alice") :room-id "nowhere")]]
+      (let [g (route rooms (:room-id msg) msg)]
+        (is (= :refused (:phase g)))
+        (is (= -1 (call 'delivery-count [(:state g)])))
+        (is (= "" (call 'delivery-at [(:state g) 0])))))))
