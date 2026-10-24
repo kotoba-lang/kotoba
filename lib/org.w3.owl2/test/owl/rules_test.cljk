@@ -1,0 +1,167 @@
+(ns owl.rules-test
+  "The rules, actually evaluated.
+
+  `owl.rules` emits data and could be tested by comparing that data to
+  itself, which would assert nothing about entailment. Every test here runs
+  the rules through a least-fixpoint Datalog engine over a real triple set
+  and checks what comes out -- including, in each case, a fact that is
+  DERIVED rather than asserted, because a ruleset that never fires still
+  answers correctly for everything that was written down."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [owl.rules :as rules]
+            [datalog.core :as dc]
+            [datom.source :as src]))
+
+(defn- t [s p o] {:s s :p p :o o})
+
+(defn- ask
+  "One query over `triples` under `rules`, as a set of rows."
+  [triples rules query]
+  (dc/q (src/of-quads (set triples))
+        (assoc query :rules rules)
+        (constantly true)))
+
+;; ── the class hierarchy ─────────────────────────────────────────────────
+
+(def ^:private zoo
+  "Four levels deep, so a rule that never recursed is visibly wrong: two
+  levels are answered by the base case alone."
+  [(t "Cat" :rdfs/subClassOf "Mammal")
+   (t "Mammal" :rdfs/subClassOf "Animal")
+   (t "Animal" :rdfs/subClassOf "Thing")
+   (t "Felix" :rdf/type "Cat")])
+
+(deftest subclass-is-transitive
+  (is (= #{["Mammal"] ["Animal"] ["Thing"]}
+         (ask zoo (rules/hierarchy-rules)
+              '{:find [?b] :where [(owl-subclass "Cat" ?b)]}))
+      "Animal and Thing are two and three rounds away from the assertion"))
+
+(deftest type-follows-the-class-hierarchy
+  (is (= #{["Cat"] ["Mammal"] ["Animal"] ["Thing"]}
+         (ask zoo (rules/hierarchy-rules)
+              '{:find [?c] :where [(owl-type "Felix" ?c)]}))))
+
+(deftest equivalent-classes-subsume-both-ways
+  (let [triples (conj zoo (t "Feline" :owl/equivalentClass "Cat"))]
+    (is (= #{["Feline"] ["Cat"] ["Mammal"] ["Animal"] ["Thing"]}
+           (ask triples (rules/hierarchy-rules)
+                '{:find [?c] :where [(owl-type "Felix" ?c)]}))
+        "the axiom is stated once, in one direction, and holds in both")))
+
+(deftest subproperty-is-transitive
+  (let [triples [(t "hasMother" :rdfs/subPropertyOf "hasParent")
+                 (t "hasParent" :rdfs/subPropertyOf "hasAncestor")
+                 (t "hasAncestor" :rdfs/subPropertyOf "relatedTo")]]
+    (is (= #{["hasParent"] ["hasAncestor"] ["relatedTo"]}
+           (ask triples (rules/hierarchy-rules)
+                '{:find [?q] :where [(owl-subproperty "hasMother" ?q)]})))))
+
+(deftest the-narrow-ruleset-names-every-predicate-literally
+  (testing "which is what lets an engine plan a read per predicate"
+    (let [predicates (->> (rules/hierarchy-rules)
+                          (mapcat rest)                 ;; bodies
+                          (filter vector?)              ;; triple patterns
+                          (map second)
+                          set)]
+      (is (every? keyword? predicates))
+      (is (= #{:rdf/type :rdfs/subClassOf :rdfs/subPropertyOf :owl/equivalentClass}
+             predicates)))))
+
+;; ── property-level entailment ───────────────────────────────────────────
+
+(deftest subproperty-propagates-triples
+  (let [triples [(t "hasMother" :rdfs/subPropertyOf "hasParent")
+                 (t "hasParent" :rdfs/subPropertyOf "hasAncestor")
+                 (t "Alice" "hasMother" "Beth")]]
+    (is (= #{["hasMother"] ["hasParent"] ["hasAncestor"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?p] :where [(owl-triple "Alice" ?p "Beth")]}))
+        "rdfs7 through a transitive subPropertyOf chain")))
+
+(deftest domain-and-range-induce-types-that-then-climb
+  (let [triples [(t "hasParent" :rdfs/domain "Person")
+                 (t "hasParent" :rdfs/range "Person")
+                 (t "Person" :rdfs/subClassOf "Agent")
+                 (t "Alice" "hasParent" "Beth")]]
+    (is (= #{["Person"] ["Agent"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?c] :where [(owl-type "Alice" ?c)]}))
+        "rdfs2 then rdfs9 -- neither type is asserted anywhere")
+    (is (= #{["Person"] ["Agent"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?c] :where [(owl-type "Beth" ?c)]}))
+        "rdfs3 for the object position")))
+
+(deftest a-transitive-property-closes
+  (let [triples [(t "partOf" :rdf/type :owl/TransitiveProperty)
+                 (t "Wheel" "partOf" "Car")
+                 (t "Car" "partOf" "Fleet")
+                 (t "Fleet" "partOf" "Company")]]
+    (is (= #{["Car"] ["Fleet"] ["Company"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?o] :where [(owl-triple "Wheel" "partOf" ?o)]})))))
+
+(deftest a-symmetric-property-reads-backwards
+  (let [triples [(t "knows" :rdf/type :owl/SymmetricProperty)
+                 (t "Alice" "knows" "Beth")]]
+    (is (= #{["Alice"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?o] :where [(owl-triple "Beth" "knows" ?o)]})))))
+
+(deftest inverse-properties-hold-in-both-directions
+  (let [triples [(t "hasParent" :owl/inverseOf "hasChild")
+                 (t "Alice" "hasParent" "Beth")
+                 (t "Carl" "hasChild" "Dana")]]
+    (is (= #{["Alice"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?c] :where [(owl-triple "Beth" "hasChild" ?c)]}))
+        "stated as hasParent inverseOf hasChild, read left to right")
+    (is (= #{["Carl"]}
+           (ask triples (rules/triple-rules)
+                '{:find [?p] :where [(owl-triple "Dana" "hasParent" ?p)]}))
+        "and right to left, from the one axiom")))
+
+(deftest the-inverse-of-a-transitive-property-closes
+  (testing "the composition a single materialisation pass cannot produce"
+    ;; `partOf` closes transitively; `hasPart` is only ever its inverse. For
+    ;; hasPart to reach three levels, prp-inv has to run over triples
+    ;; prp-trp derived, and prp-trp over triples prp-inv derived. That is a
+    ;; fixpoint, not two stages -- `owl.reason/materialize` composes its
+    ;; closures ONCE and says so.
+    (let [triples [(t "partOf" :rdf/type :owl/TransitiveProperty)
+                   (t "partOf" :owl/inverseOf "hasPart")
+                   (t "Wheel" "partOf" "Car")
+                   (t "Car" "partOf" "Fleet")
+                   (t "Fleet" "partOf" "Company")]]
+      (is (= #{["Car"] ["Fleet"] ["Company"]}
+             (ask triples (rules/triple-rules)
+                  '{:find [?o] :where [(owl-triple "Wheel" "partOf" ?o)]})))
+      (is (= #{["Wheel"] ["Car"] ["Fleet"]}
+             (ask triples (rules/triple-rules)
+                  '{:find [?s] :where [(owl-triple "Company" "hasPart" ?s)]}))))))
+
+;; ── vocabulary ──────────────────────────────────────────────────────────
+
+(deftest the-iri-vocabulary-answers-the-same-question
+  (let [rdfs "http://www.w3.org/2000/01/rdf-schema#"
+        rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        triples [(t "Cat" (str rdfs "subClassOf") "Mammal")
+                 (t "Mammal" (str rdfs "subClassOf") "Animal")
+                 (t "Felix" (str rdf "type") "Cat")]]
+    (is (= #{["Cat"] ["Mammal"] ["Animal"]}
+           (ask triples (rules/hierarchy-rules rules/iri-vocabulary)
+                '{:find [?c] :where [(owl-type "Felix" ?c)]})))))
+
+(deftest a-vocabulary-missing-a-term-throws-instead-of-matching-nothing
+  (testing "a nil predicate reads as an ontology without those axioms"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (rules/hierarchy-rules (dissoc rules/keyword-vocabulary :sub-class-of))))
+    (is (= [:sub-class-of]
+           (:missing (try (rules/hierarchy-rules (dissoc rules/keyword-vocabulary :sub-class-of))
+                          (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                            (ex-data e))))))))
+
+(deftest an-ontology-with-no-axioms-derives-nothing-rather-than-everything
+  (is (= #{} (ask [(t "Felix" :rdf/type "Cat")] (rules/hierarchy-rules)
+                  '{:find [?b] :where [(owl-subclass "Cat" ?b)]}))))

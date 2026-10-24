@@ -1,0 +1,164 @@
+(ns owl.w3c-rdfxml
+  "TEST-ONLY: just enough RDF/XML to read the W3C OWL 2 test manifest and
+  the premise/conclusion ontologies embedded in it, on top of
+  kotoba-lang/xml's parser (which leaves namespace resolution and DTD
+  entities to the caller -- both done here).
+
+  Covered: rdf:Description and typed node elements; rdf:about / rdf:ID /
+  rdf:nodeID / rdf:resource; nested node elements; property attributes;
+  rdf:parseType Resource / Collection / Literal; rdf:datatype and xml:lang;
+  xml:base; rdf:li. Not a general RDF/XML parser, and it is not on the
+  library's classpath: it exists so the conformance suite can run."
+  (:require [xml.parse :as x]))
+
+(def rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+
+(defn- replace-all [s a b]
+  (loop [s s]
+    (let [i (.indexOf s a)]
+      (if (neg? i) s (recur (str (subs s 0 i) b (subs s (+ i (count a)))))))))
+
+(defn expand-entities
+  "Inline every `<!ENTITY name 'value'>` the document declares, then drop
+  the DOCTYPE (the XML parser processes neither)."
+  [s]
+  (let [decls (re-seq #"<!ENTITY\s+([A-Za-z0-9_-]+)\s+[\"']([^\"']*)[\"']\s*>" s)
+        body (if-let [m (re-find #"(?s)<!DOCTYPE.*?\]>" s)] (replace-all s m "") s)]
+    (reduce (fn [acc [_ n v]] (replace-all acc (str "&" n ";") v)) body decls)))
+
+(defn- strip-fragment [iri] (let [i (.indexOf iri "#")] (if (neg? i) iri (subs iri 0 i))))
+
+(defn- resolve-iri [base ref]
+  (cond
+    (nil? ref) nil
+    (re-find #"^[A-Za-z][A-Za-z0-9+.-]*:" ref) ref
+    (= "" ref) (strip-fragment base)
+    (= "#" (subs ref 0 1)) (str (strip-fragment base) ref)
+    :else (let [b (strip-fragment base) i (.lastIndexOf b "/")]
+            (str (if (neg? i) b (subs b 0 (inc i))) ref))))
+
+(defn- scope
+  "Namespace bindings and xml:base / xml:lang declared on `el`, over `env`."
+  [env el]
+  (reduce-kv (fn [e k v]
+               (cond (= k "xmlns") (assoc-in e [:ns ""] v)
+                     (= "xmlns:" (subs k 0 (min 6 (count k)))) (assoc-in e [:ns (subs k 6)] v)
+                     (= k "xml:base") (assoc e :base (resolve-iri (:base e) v))
+                     (= k "xml:lang") (assoc e :lang v)
+                     :else e))
+             env (x/el-attrs el)))
+
+(defn- qname->iri [env prefix local]
+  (if-let [ns (get-in env [:ns (or prefix "")])]
+    (str ns local)
+    (throw (ex-info "rdfxml: undeclared prefix" {:prefix prefix :local local}))))
+
+(defn- tag-iri [env el]
+  (let [t (x/el-tag el)] (qname->iri env (namespace t) (name t))))
+
+(defn- attr-iri [env k]
+  (let [i (.indexOf k ":")]
+    (if (neg? i) (qname->iri env nil k) (qname->iri env (subs k 0 i) (subs k (inc i))))))
+
+(defn- syntax-attr? [k]
+  (or (= k "xmlns") (.startsWith k "xmlns:") (.startsWith k "xml:")))
+
+(defn- rdf-attr [env el local]
+  (some (fn [[k v]] (when (and (not (syntax-attr? k)) (= (str rdf local) (attr-iri env k))) v))
+        (x/el-attrs el)))
+
+(defn- blank [st label] (str "_:" (:doc @st) "-" label))
+(defn- fresh [st] (blank st (str "g" (:n (swap! st update :n inc)))))
+
+(declare node-element)
+
+(defn- literal [env el text]
+  (let [dt (rdf-attr env el "datatype")]
+    (cond dt {:literal text :datatype (resolve-iri (:base env) dt)}
+          (:lang env) {:literal text :language (:lang env)}
+          :else {:literal text})))
+
+(defn- property-elements [st env subject el]
+  (loop [[c & more] (x/el-elements el) li 1]
+    (when c
+      (let [env (scope env c)
+            p0 (tag-iri env c)
+            [p li] (if (= p0 (str rdf "li")) [(str rdf "_" li) (inc li)] [p0 li])
+            emit! (fn [o] (swap! st update :triples conj [subject p o]))
+            parse-type (rdf-attr env c "parseType")
+            resource (rdf-attr env c "resource")
+            node-id (rdf-attr env c "nodeID")
+            kids (x/el-elements c)
+            prop-attrs (remove (fn [[k _]] (or (syntax-attr? k)
+                                               (contains? #{(str rdf "resource") (str rdf "nodeID")
+                                                            (str rdf "datatype") (str rdf "parseType")
+                                                            (str rdf "ID")}
+                                                          (attr-iri env k))))
+                               (x/el-attrs c))]
+        (cond
+          (= parse-type "Resource")
+          (let [o (fresh st)] (emit! o) (property-elements st env o c))
+
+          (= parse-type "Collection")
+          (let [items (mapv #(node-element st env %) kids)]
+            (if (empty? items)
+              (emit! (str rdf "nil"))
+              (let [nodes (vec (repeatedly (count items) #(fresh st)))]
+                (emit! (first nodes))
+                (doseq [i (range (count items))]
+                  (swap! st update :triples conj [(nth nodes i) (str rdf "first") (nth items i)])
+                  (swap! st update :triples conj
+                         [(nth nodes i) (str rdf "rest")
+                          (if (< (inc i) (count items)) (nth nodes (inc i)) (str rdf "nil"))])))))
+
+          (= parse-type "Literal")
+          (emit! {:literal (pr-str (x/el-children c)) :datatype (str rdf "XMLLiteral")})
+
+          (seq kids) (emit! (node-element st env (first kids)))
+
+          (or resource node-id (seq prop-attrs))
+          (let [o (cond resource (resolve-iri (:base env) resource)
+                        node-id (blank st node-id)
+                        :else (fresh st))]
+            (emit! o)
+            (doseq [[k v] prop-attrs]
+              (swap! st update :triples conj [o (attr-iri env k) (literal env c v)])))
+
+          :else (emit! (literal env c (x/el-text c))))
+        (recur more li)))))
+
+(defn- node-element [st env el]
+  (let [env (scope env el)
+        about (rdf-attr env el "about")
+        id (rdf-attr env el "ID")
+        node-id (rdf-attr env el "nodeID")
+        s (cond about (resolve-iri (:base env) about)
+                id (resolve-iri (:base env) (str "#" id))
+                node-id (blank st node-id)
+                :else (fresh st))
+        t (tag-iri env el)]
+    (when-not (= t (str rdf "Description"))
+      (swap! st update :triples conj [s (str rdf "type") t]))
+    (doseq [[k v] (x/el-attrs el)
+            :when (not (syntax-attr? k))
+            :let [p (attr-iri env k)]
+            :when (not (contains? #{(str rdf "about") (str rdf "ID") (str rdf "nodeID")} p))]
+      (swap! st update :triples conj
+             [s p (if (= p (str rdf "type")) (resolve-iri (:base env) v) (literal env el v))]))
+    (property-elements st env s el)
+    s))
+
+(defn parse
+  "The triples of RDF/XML document `text` as {:s :p :o} maps. Blank nodes
+  are `_:<doc>-<label>` so two documents never share one."
+  ([text] (parse text "d"))
+  ([text doc]
+   (let [root (x/parse (expand-entities text))
+         st (atom {:triples [] :n 0 :doc doc})
+         env (scope {:ns {} :base "urn:x-base:"} root)]
+     (if (= (str rdf "RDF") (tag-iri env root))
+       (doseq [el (x/el-elements root)] (node-element st env el))
+       (node-element st env root))
+     (mapv (fn [[s p o]] {:s s :p p :o o}) (:triples @st)))))
+
+(defn blank? [t] (and (string? t) (.startsWith t "_:")))
