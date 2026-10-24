@@ -1,0 +1,143 @@
+(ns kotoba.captcha.http
+  "Ring transport for the authorized solver API. Credentials are never passed
+  to the core service or retained in task state."
+  (:require [kotoba.bytes :as kbytes] [json.compat :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.captcha.api :as api]))
+
+(def ^:private sensitive-key-pattern
+  #"(?i)(client[_-]?key|api[_-]?key|authorization|token|secret|password|cookie)")
+
+(defn redact [x]
+  (cond
+    (map? x) (into {} (map (fn [[k v]]
+                             [k (if (re-find sensitive-key-pattern (name k))
+                                  "[REDACTED]" (redact v))])) x)
+    (vector? x) (mapv redact x)
+    (sequential? x) (map redact x)
+    :else x))
+
+(defn fixed-window-limiter
+  [{:keys [limit window-ms clock state]
+    :or {limit 60 window-ms 60000 clock #(System/currentTimeMillis)
+         state (atom {})}}]
+  {:allow? (fn [principal]
+             (let [now (clock) allowed? (volatile! false)]
+               (swap! state
+                      (fn [windows]
+                        (let [{:keys [start count]} (get windows principal)
+                              expired? (or (nil? start) (>= (- now start) window-ms))
+                              start (if expired? now start)
+                              count (if expired? 0 count)]
+                          (if (< count limit)
+                            (do (vreset! allowed? true)
+                                (assoc windows principal {:start start :count (inc count)}))
+                            windows))))
+               @allowed?))
+   :state state})
+
+(defn- response [status body]
+  {:status status
+   :headers {"content-type" "application/json; charset=utf-8" "cache-control" "no-store"}
+   :body (json/generate-string body)})
+
+(defn- read-body [request max-bytes]
+  (let [declared (some-> (get-in request [:headers "content-length"]) Long/parseLong)]
+    (when (and declared (> declared max-bytes))
+      (throw (ex-info "body too large" {:type :body-too-large})))
+    (with-open [in (:body request) out (java.io.ByteArrayOutputStream.)]
+      (let [buf (byte-array 4096)]
+        (loop [total 0]
+          (let [n (.read in buf)]
+            (when (pos? n)
+              (let [total (+ total n)]
+                (when (> total max-bytes)
+                  (throw (ex-info "body too large" {:type :body-too-large})))
+                (.write out buf 0 n)
+                (recur total)))))
+        (json/parse-string (.toString out "UTF-8") true)))))
+
+(defn- bearer [request]
+  (some-> (get-in request [:headers "authorization"])
+          (str/replace-first #"(?i)^Bearer\s+" "") not-empty))
+
+(defn- secure-equal? [a b]
+  (and (string? a) (string? b)
+       (java.security.MessageDigest/isEqual (kbytes/utf8-bytes a) (kbytes/utf8-bytes b))))
+
+(defn- authenticated-key [configured request body]
+  (let [presented (or (bearer request) (:clientKey body))]
+    (when (and (seq configured) (some #(secure-equal? presented %) configured))
+      (let [digest (.digest (doto (java.security.MessageDigest/getInstance "SHA-256")
+                              (.update (kbytes/utf8-bytes ^String presented))))]
+        (format "%064x" (java.math.BigInteger. 1 digest))))))
+
+(defn- prometheus [counters]
+  (str "# TYPE kotoba_captcha_http_requests_total counter\n"
+       (apply str (for [[[route status] n] @counters]
+                    (format "kotoba_captcha_http_requests_total{route=\"%s\",status=\"%s\"} %d\n"
+                            route status n)))))
+
+(defn make-handler
+  [{:keys [task-store service api-keys max-body-bytes rate-limiter metrics]
+    :or {max-body-bytes 65536 metrics (atom {})}}]
+  (let [service (merge {:create-task! #(api/create-task! task-store %)
+                        :get-task-result #(api/get-task-result task-store %)} service)
+        limiter (or rate-limiter (fixed-window-limiter {}))
+        record! #(swap! metrics update [%1 %2] (fnil inc 0))]
+    (fn [request]
+      (let [uri (:uri request)]
+        (try
+          (cond
+            (and (= :get (:request-method request)) (= "/health" uri))
+            (do (record! "health" 200) (response 200 {:status "ok"}))
+
+            (and (= :get (:request-method request)) (= "/metrics" uri))
+            {:status 200 :headers {"content-type" "text/plain; version=0.0.4; charset=utf-8"
+                                   "cache-control" "no-store"}
+             :body (prometheus metrics)}
+
+            (and (= :post (:request-method request))
+                 (contains? #{"/createTask" "/getTaskResult"} uri))
+            (let [body (read-body request max-body-bytes)
+                  principal (authenticated-key api-keys request body)]
+              (cond
+                (not (seq api-keys))
+                (do (record! uri 503)
+                    (response 503 (api/error-response "ERROR_SERVICE_NOT_CONFIGURED"
+                                                      "API authentication is not configured")))
+                (nil? principal)
+                (do (record! uri 401)
+                    (response 401 (api/error-response "ERROR_KEY_DOES_NOT_EXIST" "Authentication failed")))
+                (not ((:allow? limiter) principal))
+                (do (record! uri 429)
+                    (response 429 (api/error-response "ERROR_RATE_LIMIT" "Rate limit exceeded")))
+                :else
+                (let [result (case uri
+                               "/createTask" ((:create-task! service) (dissoc body :clientKey))
+                               "/getTaskResult" ((:get-task-result service) (dissoc body :clientKey)))]
+                  (record! uri 200)
+                  (response 200 result))))
+
+            :else
+            (do (record! "not-found" 404)
+                (response 404 (api/error-response "ERROR_ROUTE_NOT_FOUND" "Not found"))))
+          ;; A malformed body must stay a 400 and not become a 500. cheshire
+          ;; signalled that with a Jackson class, which cannot cross to cljs;
+          ;; json.compat signals it with :type :json/parse-error. Both that and
+          ;; :body-too-large now arrive as ExceptionInfo, so clause ORDER no
+          ;; longer separates them -- the :type does, which is why these are one
+          ;; clause rather than two.
+          (catch clojure.lang.ExceptionInfo e
+            (case (:type (ex-data e))
+              :json/parse-error
+              (do (record! uri 400)
+                  (response 400 (api/error-response "ERROR_BAD_PARAMETERS" "Invalid JSON body")))
+              :body-too-large
+              (do (record! uri 413)
+                  (response 413 (api/error-response "ERROR_BODY_TOO_LARGE" "Request body too large")))
+              (do (record! uri 500)
+                  (response 500 (api/error-response "ERROR_INTERNAL" "Internal service error")))))
+          (catch Throwable _
+            (record! uri 500)
+            (response 500 (api/error-response "ERROR_INTERNAL" "Internal service error"))))))))
