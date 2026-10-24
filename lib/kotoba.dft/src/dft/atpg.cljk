@@ -1,0 +1,124 @@
+(ns dft.atpg
+  "Automatic Test Pattern Generation — fault modeling and pattern generation
+  for stuck-at and transition faults. Restored from kami-dft's `atpg`
+  module (kami-engine/kami-dft/src/atpg.rs, deleted PR #82).
+
+  The original Rust used a `u64` xorshift PRNG for deterministic-but-varied
+  pattern fill; ported here with unsigned right-shift (`unsigned-bit-shift-
+  right`) so the 64-bit bit pattern matches the Rust `>>` on `u64` (logical,
+  not arithmetic). No test depends on exact PRNG output values — only on
+  aggregate detection behavior, which is deterministic per fault type.
+
+  Activating values, detection rates, the PRNG seed and the random-fill
+  bit-width cap live in `defaults` (EDN-authority, mirrors
+  `resources/dft/atpg_defaults.edn`); `generate-patterns` still defaults
+  to `defaults` so the existing 2-arity call sites are unaffected — the
+  3-arity overload only matters if a caller wants to override the table."
+  (:require [clojure.edn :as edn]
+            #?(:clj [kotoba.io :as io])))
+
+;; resources/dft/atpg_defaults.edn was datomic/datascript-ized by
+;; edn-datomize.bb (wrap-map-keep-ns): its top level is now
+;; `[{:db/id -1 :atpg/... ...}]` tx-data instead of a plain map. The
+;; already-namespaced keys (:atpg/activating-value etc.) are unchanged;
+;; non-scalar values (nested maps) were pr-str'd into blob strings. This
+;; reconstitutes the original raw map so `defaults` keeps the exact shape
+;; every call site below (and the `:cljs` literal fallback) already expects.
+#?(:clj
+   (defn- unblob [v]
+     (if (string? v)
+       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+            (catch Exception _ v))
+       v)))
+
+#?(:clj
+   (defn- reconstitute-defaults [tx-data]
+     (into {} (map (fn [[k v]] [k (unblob v)]))
+           (dissoc (first tx-data) :db/id))))
+
+(def defaults
+  "ATPG default constants — activating values, detection rates, PRNG
+  seed and random-fill width. Mirrors `resources/dft/atpg_defaults.edn`
+  (loaded on the JVM) and the Rust `atpg.rs` constants."
+  #?(:clj (reconstitute-defaults (edn/read-string (slurp (io/resource "dft/atpg_defaults.edn"))))
+     :cljs (edn/read-string
+            "{:atpg/activating-value {:stuck-at-0 1 :stuck-at-1 0}
+              :atpg/detection-rate-pct {:transition-slow 80 :transition-fast 80
+                                         :bridging-and 60 :bridging-or 60}
+              :atpg/max-random-fill-bits 16
+              :atpg/prng-seed -3819410108451629448}")))
+
+(def fault-types
+  #{:stuck-at-0 :stuck-at-1 :transition-slow :transition-fast
+    :bridging-and :bridging-or})
+
+(defn xorshift64
+  "One xorshift64 PRNG step, matching the original Rust `u64` bit pattern."
+  [state]
+  (let [state (bit-xor state (bit-shift-left state 13))
+        state (bit-xor state (unsigned-bit-shift-right state 7))
+        state (bit-xor state (bit-shift-left state 17))]
+    state))
+
+(defn- umod
+  "`state mod n` treating `state` as an unsigned 64-bit long (matches Rust's
+  unsigned `%`). JVM-only; a CLJS arm can be added if a browser consumer
+  needs ATPG (unsigned 64-bit mod isn't representable in JS doubles without
+  BigInt)."
+  [state n]
+  #?(:clj (Long/remainderUnsigned state n)
+     :cljs (mod state n)))
+
+(defn generate-patterns
+  "Generate test patterns for `faults` (a seq of `{:net-name :fault-type
+  :detected}` maps) against a design with `gate-count` gates. Uses a
+  simplified D-algorithm seed (drive the activating value on the faulted
+  net) + xorshift64 pseudo-random fill for other inputs, with a
+  fault-type-dependent simulated detection rate (stuck-at: always detected;
+  transition/bridging: per `(:atpg/detection-rate-pct defaults)`). Returns
+  `{:patterns :fault-coverage :detected-faults :total-faults
+  :aborted-faults}` plus the faults with `:detected` updated."
+  ([faults gate-count] (generate-patterns faults gate-count defaults))
+  ([faults gate-count defaults]
+   (let [total-faults (count faults)
+         gate-shift (min gate-count (:atpg/max-random-fill-bits defaults))
+         fill-mod (bit-shift-left 1 gate-shift)
+         rate-pct (:atpg/detection-rate-pct defaults)]
+     (loop [remaining faults
+            rng-state (:atpg/prng-seed defaults)
+            patterns []
+            updated-faults []
+            detected 0
+            aborted 0]
+       (if (empty? remaining)
+         {:patterns patterns
+          :fault-coverage (if (pos? total-faults) (/ (double detected) total-faults) 0.0)
+          :detected-faults detected
+          :total-faults total-faults
+          :aborted-faults aborted
+          :faults updated-faults}
+         (let [fault (first remaining)
+               fault-type (:fault-type fault)
+               [activating-value rng-state]
+               (case fault-type
+                 :stuck-at-0 [(get-in defaults [:atpg/activating-value :stuck-at-0]) rng-state]
+                 :stuck-at-1 [(get-in defaults [:atpg/activating-value :stuck-at-1]) rng-state]
+                 (:transition-slow :transition-fast :bridging-and :bridging-or)
+                 (let [s (xorshift64 rng-state)] [(bit-and s 1) s]))
+               rng-state (xorshift64 rng-state)
+               random-input (umod rng-state fill-mod)
+               pattern {:inputs [[(:net-name fault) activating-value]
+                                 ["random_fill" random-input]]
+                        :expected [["out" activating-value]]}
+               [is-detected rng-state]
+               (case fault-type
+                 (:stuck-at-0 :stuck-at-1) [true rng-state]
+                 (:transition-slow :transition-fast :bridging-and :bridging-or)
+                 (let [s (xorshift64 rng-state)]
+                   [(< (umod s 100) (get rate-pct fault-type)) s]))]
+           (recur (rest remaining)
+                  rng-state
+                  (conj patterns pattern)
+                  (conj updated-faults (assoc fault :detected is-detected))
+                  (if is-detected (inc detected) detected)
+                  (if is-detected aborted (inc aborted)))))))))

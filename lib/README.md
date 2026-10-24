@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.dft` | `kotoba.dft/src` | `dft`, `dft.atpg`, `dft.bist`, `dft.jtag` (Kotoba project library) |
 | `kotoba.devtools` | `kotoba.devtools/src` | `devtools`, `devtools.inspect` (Kotoba project library) |
 | `kotoba.device` | `kotoba.device/src` | `kotoba.device`, `kotoba.device.call`, `kotoba.device.denied`, `kotoba.device.describe` (Kotoba project library) |
 | `kotoba.wit` | `kotoba.wit/src` | `kotoba.lang.wit`, `kotoba.wit`, `kotoba.wit.allows`, `kotoba.wit.capabilities` (Kotoba project library) |
