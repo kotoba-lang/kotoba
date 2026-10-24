@@ -1,0 +1,238 @@
+#!/usr/bin/env kbb
+;; Regenerate `resources/kotoba/shokyaku/tables.edn` from the e-Gov law API v2.
+;;
+;;   kbb --backend sci tools/extract-tables.cljk            # fetch and write
+;;   kbb --backend sci tools/extract-tables.cljk --check    # exit 1 if what the API serves
+;;                                            # now differs from what is checked in
+;;
+;; This is the provenance of every number in this library. It exists so that
+;; "read from the ordinance" is a command someone else can run, not a claim.
+;;
+;; ## Two things it does NOT do
+;;
+;; It does not touch 別表第一, 別表第二 or 別表第四. Their 細目 nests up to
+;; three levels and the nesting is marked only by an empty 耐用年数 cell — a
+;; visual convention the JSON does not carry. See the README.
+;;
+;; It does not convert a rate to a double. 〇・三三四 becomes
+;; `{:num 334 :scale 1000}`, because ClojureScript has no distinct float type
+;; and the value would not round-trip.
+;;
+;; Exit 2 means THE RUN COULD NOT ANSWER — the fetch failed, or the response
+;; had no 別表. That must never look like a clean check.
+
+(ns extract-tables
+  (:require [kotoba.lang.text :as str]
+            ["node:fs" :as fs]))
+
+(def law-id "340M50000040015")
+(def api (str "https://laws.e-gov.go.jp/api/2/law_data/" law-id
+              "?response_format=json"))
+(def out "resources/kotoba/shokyaku/tables.edn")
+
+;; --- tree walking -----------------------------------------------------------
+
+(defn- node-text [n]
+  (cond
+    (nil? n) ""
+    (string? n) n
+    (array? n) (str/join "" (map node-text n))
+    (object? n) (if (= "Ruby" (.-tag n))
+                  ;; a Ruby node carries the reading in Rt; keep only the base
+                  (str/join "" (map node-text (remove #(= "Rt" (.-tag %))
+                                                      (or (.-children n) #js []))))
+                  (node-text (.-children n)))
+    :else ""))
+
+(defn- walk! [n f]
+  ;; `array?` MUST be tested before `object?`. ClojureScript's `object?` is
+  ;; `(identical? (type x) js/Object)`, which is FALSE for a JS array — so an
+  ;; `(not (object? n))` guard placed first stops the walk at the root and
+  ;; the run finds zero 別表. It did, on 2026-08-18, and exited 2 rather than
+  ;; writing an empty table, which is the only reason this comment exists
+  ;; instead of a silently truncated resource file.
+  (cond
+    (nil? n) nil
+    (array? n) (doseq [c n] (walk! c f))
+    (object? n) (do (f n) (walk! (.-children n) f))
+    :else nil))
+
+(defn- find-tag [root tag]
+  (let [out (atom [])]
+    (walk! root #(when (= tag (.-tag %)) (swap! out conj %)))
+    @out))
+
+;; --- Japanese numerals ------------------------------------------------------
+
+(def ^:private digit
+  {"〇" 0 "一" 1 "二" 2 "三" 3 "四" 4 "五" 5 "六" 6 "七" 7 "八" 8 "九" 9})
+
+(defn- j->int
+  "Positional digit strings only — 一〇 is 10, 一〇〇 is 100. The ordinance
+  writes its tables this way; it does not use 十/百 here."
+  [s]
+  (let [s (str/trim s)]
+    (when (and (seq s) (every? digit (map str s)))
+      (reduce (fn [acc c] (+ (* 10 acc) (digit (str c)))) 0 s))))
+
+(defn- j->rate
+  "〇・三三四 -> {:num 334 :scale 1000}. A dash row (改定償却率 and 保証率 for a
+  two-year life) is nil, not zero — the ordinance prints ――― there, which
+  means *there is none*, and 0 would be a rate."
+  [s]
+  (let [s (str/trim s)]
+    (when-not (or (empty? s) (re-matches #"[―ー−-]+" s))
+      (let [[ip fp] (str/split s #"・")]
+        (when (and ip fp)
+          (let [i (j->int ip)
+                f (when (every? digit (map str fp))
+                    (reduce (fn [a c] (+ (* 10 a) (digit (str c)))) 0 fp))
+                scale (reduce * 1 (repeat (count fp) 10))]
+            (when (and i f)
+              {:num (+ (* i scale) f) :scale scale})))))))
+
+;; --- table extraction -------------------------------------------------------
+
+(defn- appendix-tables [full-text]
+  (into {}
+        (map (fn [t]
+               [(node-text (first (find-tag t "AppdxTableTitle")))
+                (mapv (fn [r] (mapv #(str/trim (node-text %)) (find-tag r "TableColumn")))
+                      (find-tag t "TableRow"))]))
+        (find-tag full-text "AppdxTable")))
+
+(defn- rate-rows [rows cols]
+  (into (sorted-map)
+        (keep (fn [r]
+                (when-let [y (j->int (first r))]
+                  [y (into {} (keep (fn [[k i]]
+                                      (when-let [v (j->rate (nth r (inc i) ""))] [k v]))
+                                    (map vector cols (range))))])))
+        (drop 2 rows)))
+
+(defn- life-rows
+  "Flat 耐用年数 tables only. Rows carry their 別表 because the same 種類 means
+  different assets in different tables — ソフトウエア is 別表第三 general
+  software and 別表第六 開発研究用 software.
+
+  Two shapes, distinguished by the HEADER column count:
+
+    種類 | 細目 | 耐用年数   別表第三, 別表第六
+    種類 | 耐用年数         別表第五
+
+  ## Why the row is left-padded to the header width
+
+  A cell carried by `rowspan` is represented in TWO different ways in the
+  same document, and both appear in the tables read here:
+
+    別表第三  emits an EMPTY column     [   , 細目, 年数]
+    別表第六  OMITS the column entirely [ 細目, 年数 ]
+
+  Deciding by the row length alone therefore reads 別表第六 細目 as the 種類
+  and its 耐用年数 as the 細目. Deciding by emptiness alone misses the
+  omitted case. Both mistakes were made here on 2026-08-18 and both were
+  caught only by diffing this output against the previous extraction — never
+  by a test, because the resulting table parsed perfectly and simply meant
+  something else.
+
+  Collapsed cells are always the LEFTMOST ones, so padding the row on the
+  left to the header width makes both representations the same shape, after
+  which an empty leading cell means inherit."
+  [rows table]
+  (let [header (first rows)
+        width (count header)
+        has-detail? (= 3 width)]
+    (first
+     (reduce (fn [[acc cur] r]
+               (let [r (into (vec (repeat (max 0 (- width (count r))) "")) r)
+                     k (first r)
+                     kind (if (seq k) k cur)
+                     detail (when has-detail? (second r))
+                     years (j->int (last r))]
+                 [(conj acc {:table table :kind kind
+                             :detail (when (seq detail) detail) :years years})
+                  kind]))
+             [[] nil]
+             (drop 2 rows)))))
+
+(defn- pr-rate [{:keys [num scale]}] (str "{:num " num " :scale " scale "}"))
+
+(defn- render [T revision]
+  (str
+   ";; GENERATED by tools/extract-tables.cljk from the e-Gov law API v2 response for\n"
+   ";;   減価償却資産の耐用年数等に関する省令 (" law-id ")\n"
+   ";; Retrieved 2026-08-18, revision " revision ".\n"
+   ";;   " api "\n"
+   ";;\n"
+   ";; Rates are EXACT INTEGER FRACTIONS, never doubles: 〇・三三四 is {:num 334 :scale 1000}.\n"
+   ";; ClojureScript has no distinct float type — 1.0 reads as 1 — so a rate stored as a\n"
+   ";; double would not survive the portable half of this library.\n"
+   ";;\n"
+   ";; 別表第一 (492 rows), 別表第二 (118) and 別表第四 (44) are deliberately absent.\n"
+   ";; Their 細目 nests up to three levels and the nesting is marked only by an empty\n"
+   ";; 耐用年数 cell, which the JSON does not carry. See the README.\n"
+   "{\n"
+   " ;; 別表第八 — 定額法の償却率表. 施行令 第四十八条の二第一項第一号イ（１）.\n"
+   " :appendix-8\n {"
+   (str/join "" (map (fn [[y m]] (str "\n  " y " {:straight-line " (pr-rate (:straight-line m)) "}"))
+                     (rate-rows (T "別表第八") [:straight-line])))
+   "}\n\n"
+   (str/join ""
+     (for [[title k note] [["別表第九" ":appendix-9" "定率法（250%）— 平成二十四年三月三十一日以前に取得"]
+                           ["別表第十" ":appendix-10" "定率法（200%）— 平成二十四年四月一日以後に取得"]]]
+       (str " ;; " title " — " note ".\n " k "\n {"
+            (str/join ""
+              (map (fn [[y m]]
+                     (str "\n  " y " {"
+                          (str/join " "
+                            (keep (fn [[kk label]] (when-let [v (m kk)] (str label " " (pr-rate v))))
+                                  [[:declining-balance ":declining-balance"]
+                                   [:revised ":revised"] [:guarantee ":guarantee"]]))
+                          "}"))
+                   (rate-rows (T title) [:declining-balance :revised :guarantee])))
+            "}\n\n")))
+   " ;; 別表第三 — 無形減価償却資産の耐用年数表. 18 data rows, 0 with an empty\n"
+   " ;; 耐用年数, so nothing here depends on the sub-grouping convention that\n"
+   " ;; made 別表第一/第二/第四 unreadable.\n"
+   " :appendix-3\n ["
+   (str/join "" (map #(str "\n  " (pr-str %)) (life-rows (T "別表第三") "別表第三")))
+   "]\n\n ;; 別表第六 — 8 data rows, 0 ambiguous.\n :appendix-6\n ["
+   (str/join "" (map #(str "\n  " (pr-str %)) (life-rows (T "別表第六") "別表第六")))
+   "]\n\n ;; 別表第五 — 2 data rows, 0 ambiguous.\n :appendix-5\n ["
+   (str/join "" (map #(str "\n  " (pr-str %)) (life-rows (T "別表第五") "別表第五")))
+   "]}\n"))
+
+(defn -main [& args]
+  (let [check? (some #{"--check"} (vec args))]
+    (-> (js/fetch api)
+        (.then (fn [r]
+                 (when-not (.-ok r)
+                   (println "SCANNED\t0")
+                   (println "Refusing to answer: e-Gov API returned" (.-status r))
+                   (js/process.exit 2))
+                 (.json r)))
+        (.then (fn [j]
+                 (let [T (appendix-tables (.-law_full_text j))
+                       revision (.. j -revision_info -law_revision_id)]
+                   (when (empty? T)
+                     (println "SCANNED\t0")
+                     (println "Refusing to answer: no 別表 in the response")
+                     (js/process.exit 2))
+                   (println "SCANNED\t" (count T) "別表 in the response")
+                   (let [want (render T revision)
+                         have (when (fs/existsSync out) (.toString (fs/readFileSync out)))]
+                     (cond
+                       (not check?) (do (fs/writeFileSync out want)
+                                        (println "wrote" out (count want) "bytes"))
+                       (= want have) (println "OK" out "matches what the API serves today")
+                       :else (do (println "DIFFERS —" out
+                                          "does not match what the API serves today."
+                                          "\nRe-read the ordinance before regenerating:"
+                                          "a changed table is a changed rule.")
+                                 (set! (.-exitCode js/process) 1)))))))
+        (.catch (fn [e]
+                  (println "SCANNED\t0")
+                  (println "Refusing to answer:" (str e))
+                  (js/process.exit 2))))))
+
+(apply -main *command-line-args*)
