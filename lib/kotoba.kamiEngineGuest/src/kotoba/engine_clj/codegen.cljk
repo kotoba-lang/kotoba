@@ -1,0 +1,830 @@
+(ns kotoba.engine-clj.codegen
+  "Code generation: typed AST → WASM-targeted instruction IR.
+
+  Ported from `kami-engine-clj`'s Rust `src/codegen.rs` (deleted,
+  uncommitted, recovered from `kami-engine` git history, clj-wgsl migration
+  ADR-2607010930). Two-pass strategy (same as kotoba-clj):
+
+    Pass 1 — assign stable function indices, evaluate `def` constants,
+             collect string literals and host imports.
+    Pass 2 — emit function bodies.
+
+  ## What this namespace ports vs. what it deliberately leaves out
+
+  `codegen.rs` did two conceptually different things: (1) decide *which*
+  WASM instructions a given AST node compiles to — local/global allocation,
+  the block+loop+br lowering that makes `loop`/`recur` yield a value, the
+  i64<->f32 boxing/unboxing dance, host-call ParamKind/ReturnKind lifting,
+  the bump-allocator algorithm — and (2) call `wasm-encoder` to serialize
+  those `Instruction` values into actual `.wasm` binary bytes (LEB128
+  varints, section framing). (1) is the compiler; this namespace ports ALL
+  of it, faithfully, instruction op for instruction op. (2) is mechanical —
+  a fixed, generic table from instruction keyword to opcode bytes with no
+  further semantic decisions — and is out of scope for this `.cljc` domain
+  port; `compile` below returns a *Module IR* (data: types/imports/
+  functions/globals/exports/memory/data, each function body a flat vector
+  of instruction tuples) instead of raw bytes. A future host-adapter
+  package is expected to do the mechanical byte-emission step (see
+  `kotoba.engine-clj.interp` for how the test suite proves this IR computes
+  the right values without one).
+
+  ## Value model extension for f32
+
+  All guest values are i64. F32 values are stored as their IEEE-754
+  bit-pattern zero-extended to 64 bits. When calling a host import that
+  expects an f32 parameter, codegen emits:
+    `i32.wrap_i64`        — drop the high 32 zero bits
+    `f32.reinterpret_i32` — reinterpret the int bits as an f32
+  When a host import returns f32, codegen emits the reverse:
+    `i32.reinterpret_f32` — capture as i32 bit-pattern
+    `i64.extend_i32_u`    — zero-extend to i64 for the guest value model
+
+  ## String-handle lowering for host calls
+
+  A string handle in the guest is `(offset << 32) | len`. Host imports that
+  take `:string-handle` params receive a `(ptr:i32, len:i32)` pair."
+  (:refer-clojure :exclude [compile])
+  (:require [kotoba.engine-clj.ast :as ast]
+            [kotoba.engine-clj.errors :as err]
+            [kotoba.engine-clj.numerics :as num]))
+
+(def data-base  1024)
+(def heap-align 16)
+(def wasm-page  65536)
+
+(defn- align-up [v align]
+  (bit-and (+ v (dec align)) (bit-not (dec align))))
+
+;; ---------------------------------------------------------------------------
+;; Generic AST tree-walk — shared by literal collection and host-import scan.
+;; Mirrors the (identical) match-arm shape of `collect_str` (codegen.rs:279-
+;; 305) and `scan_imports` (codegen.rs:362-391). NOTE (inherited from the
+;; Rust source, preserved for fidelity): `:atom-set`'s `:value` is NOT
+;; traversed by either pass, matching Rust's `_ => {}` fallthrough for
+;; `Expr::AtomSet`. A string literal or host-call used directly (not nested
+;; in a builtin/call) as a `set-atom!` value would miss the literal pool /
+;; host-import scan in the original compiler too — see this repo's README
+;; "Known upstream gaps" section.
+;; ---------------------------------------------------------------------------
+
+(defn- expr-children [expr]
+  (case (:node expr)
+    :if (let [{:keys [cond then else]} expr] [cond then else])
+    (:let :loop) (into (mapv second (:bindings expr)) (:body expr))
+    :do    (:body expr)
+    :recur (:args expr)
+    (:builtin :call) (:args expr)
+    ;; (set-atom! name value) lowers to {:node :atom-set :name … :value …}
+    ;; (ast.cljc) — value is a full nested expression (may itself call a
+    ;; host-import builtin, or contain a string literal) and must be scanned
+    ;; like any other child, or collect-host-imports/collect-literals silently
+    ;; skip it while codegen's emit step still tries to emit it, throwing
+    ;; "host import … not in import index" downstream (found via
+    ;; `(set-atom! player (spawn-entity "player"))`).
+    :atom-set [(:value expr)]
+    []))
+
+;; ---------------------------------------------------------------------------
+;; String literal collection (Pass 0)
+;; ---------------------------------------------------------------------------
+
+(defn- collect-literals [program]
+  (let [offsets (atom {}) blob (atom [])
+        walk (fn walk [expr]
+               (when (= (:node expr) :str)
+                 (let [bs (num/utf8-bytes (:value expr))]
+                   (when-not (contains? @offsets bs)
+                     (swap! offsets assoc bs (count @blob))
+                     (swap! blob into bs))))
+               (doseq [c (expr-children expr)] (walk c)))]
+    (doseq [f (:functions program)] (doseq [e (:body f)] (walk e)))
+    (doseq [d (:defs program)] (walk (:value d)))
+    {:offsets @offsets :blob @blob}))
+
+;; ---------------------------------------------------------------------------
+;; Constant evaluation (def)
+;; ---------------------------------------------------------------------------
+
+(defn- eval-const-expr [expr consts]
+  (case (:node expr)
+    :int (:value expr)
+    :float (num/f32-bits (:value expr))
+    :var (if (contains? consts (:name expr))
+           (get consts (:name expr))
+           (throw (err/codegen-error (str "def reference to undefined constant `" (:name expr) "`"))))
+    :builtin
+    (let [op (:op expr) args (:args expr)]
+      (case op
+        :add (reduce + 0 (map #(eval-const-expr % consts) args))
+        :sub (if (= (count args) 1)
+               (- (eval-const-expr (first args) consts))
+               (reduce - (eval-const-expr (first args) consts) (map #(eval-const-expr % consts) (rest args))))
+        :mul (reduce * 1 (map #(eval-const-expr % consts) args))
+        (throw (err/codegen-error (str "def initialiser must be a constant expression, found " (pr-str expr))))))
+    (throw (err/codegen-error (str "def initialiser must be a constant expression, found " (pr-str expr))))))
+
+(defn- eval-consts [program]
+  (reduce (fn [consts d] (assoc consts (:name d) (eval-const-expr (:value d) consts)))
+          {} (:defs program)))
+
+;; ---------------------------------------------------------------------------
+;; Host import collection (dedup, first-use order)
+;; ---------------------------------------------------------------------------
+
+(defn- scan-imports [expr seen out]
+  (when (= (:node expr) :builtin)
+    (when-let [imp (ast/host-import (:op expr))]
+      (when-not (contains? @seen imp)
+        (swap! seen conj imp)
+        (swap! out conj imp))))
+  (doseq [c (expr-children expr)] (scan-imports c seen out)))
+
+(defn- collect-host-imports [program]
+  (let [seen (atom #{}) out (atom [])]
+    (doseq [f (:functions program)] (doseq [e (:body f)] (scan-imports e seen out)))
+    @out))
+
+;; ---------------------------------------------------------------------------
+;; Per-function codegen context
+;;
+;; `env`   — read-only per-compile context (consts, fn-index, import-index,
+;;           literals, atoms, heap-global). Mirrors the `&'a …` borrowed
+;;           fields of Rust's `FnCtx`.
+;; `state` — an atom holding the per-function *mutable* bookkeeping (scope,
+;;           locals-count, ctrl-depth, loop-levels, loop-var-locals). Mirrors
+;;           the fields Rust mutates through `&mut self`.
+;; ---------------------------------------------------------------------------
+
+(defn- alloc-local! [state]
+  (let [idx (:locals-count @state)]
+    (swap! state update :locals-count inc)
+    idx))
+
+(declare emit emit-body emit-builtin emit-host-call)
+
+(defn- emit-var [env state name]
+  (if-let [local (get (:scope @state) name)]
+    [[:local-get (:idx local)]]
+    (if (contains? (:consts env) name)
+      [[:i64-const (get (:consts env) name)]]
+      (throw (err/codegen-error (str "unbound variable `" name "`"))))))
+
+(defn- emit-str [env expr]
+  (let [bs (num/utf8-bytes (:value expr))
+        off (get (:offsets (:literals env)) bs)]
+    (when (nil? off)
+      (throw (err/codegen-error "string literal not found in data segment")))
+    (let [abs (+ data-base off)
+          len (count bs)
+          ;; BUGFIX (found via network-isekai's real browser execution, not by
+          ;; inspection): `bit-shift-left`/`bit-or` compile to JS's native `<<`/`|`
+          ;; under ClojureScript, which truncate to 32-bit ints per the JS spec --
+          ;; `(bit-shift-left abs 32)` silently becomes `abs << (32 mod 32)` =
+          ;; `abs << 0` = `abs` in the browser (works correctly on the JVM, where
+          ;; Clojure's bit-shift-left/bit-or operate on full 64-bit longs -- this
+          ;; is why `kbb -M:test` never caught it). `+`/`*` use full-precision
+          ;; arithmetic on both platforms (Long on JVM, double on JS, both exact
+          ;; for these magnitudes) and are mathematically identical to the
+          ;; bitwise form here since `len` never overlaps `abs`'s low 32 bits.
+          handle (+ (* abs 4294967296) len)]
+      [[:i64-const handle]])))
+
+(defn- emit-if [env state cond-e then-e else-e]
+  (let [out (atom [])]
+    (swap! out into (emit env state cond-e))
+    (swap! out conj [:i64-const 0])
+    (swap! out conj [:i64-ne])
+    (swap! out conj [:if :i64])
+    (swap! state update :ctrl-depth inc) ;; the if-block is open across both arms
+    (swap! out into (emit env state then-e))
+    (swap! out conj [:else])
+    (swap! out into (emit env state else-e))
+    (swap! out conj [:end])
+    (swap! state update :ctrl-depth dec)
+    @out))
+
+(defn- emit-let [env state bindings body]
+  (let [out (atom []) added (atom [])]
+    (doseq [[nm val-expr] bindings]
+      (let [idx (alloc-local! state)]
+        (swap! out into (emit env state val-expr))
+        (swap! out conj [:local-set idx])
+        (swap! state update :scope assoc nm {:kind :let :idx idx})
+        (swap! added conj nm)))
+    (swap! out into (emit-body env state body))
+    (doseq [nm @added] (swap! state update :scope dissoc nm))
+    @out))
+
+(defn- emit-loop
+  "Lowering (so a loop yields the body's non-recur value, and `recur`
+  re-enters even when nested inside an `if`):
+
+    block $exit (result i64)     ;; carries the final value out
+      loop $cont                 ;; recur targets this
+        <body -> i64>
+        br $exit                 ;; deliver the value, leave the loop
+      end
+      unreachable                ;; body always br's ($exit or $cont)
+    end
+
+  `recur` sets the loop locals then branches to $cont; that path is
+  unreachable afterwards, so the body's value type still checks out.
+  Mirrors `emit_loop` (codegen.rs:557-611)."
+  [env state bindings body]
+  (let [out (atom []) loop-vars (atom [])]
+    (doseq [[nm val-expr] bindings]
+      (let [idx (alloc-local! state)]
+        (swap! out into (emit env state val-expr))
+        (swap! out conj [:local-set idx])
+        (swap! state update :scope assoc nm {:kind :let :idx idx})
+        (swap! loop-vars conj [nm idx])))
+    (swap! state update :loop-depth inc)
+    (swap! out conj [:block :i64])
+    (swap! state update :ctrl-depth inc)
+    (swap! out conj [:loop :empty])
+    (swap! state update :ctrl-depth inc)
+    (swap! state update :loop-levels conj (:ctrl-depth @state))
+    (swap! state update :loop-var-locals conj (mapv second @loop-vars))
+    (swap! out into (emit-body env state body)) ;; leaves the non-recur i64 on the stack
+    ;; Deliver that value to $exit. The block sits exactly one level out from
+    ;; the (balanced) loop body, so the branch index is always 1.
+    (swap! out conj [:br 1])
+    (swap! state update :loop-var-locals pop)
+    (swap! state update :loop-levels pop)
+    (swap! state update :ctrl-depth dec)
+    (swap! out conj [:end])          ;; loop
+    (swap! out conj [:unreachable])  ;; loop never falls through
+    (swap! state update :ctrl-depth dec)
+    (swap! out conj [:end])          ;; block
+    (swap! state update :loop-depth dec)
+    (doseq [[nm _] @loop-vars] (swap! state update :scope dissoc nm))
+    @out))
+
+(defn- emit-recur [env state args]
+  (let [loop-level (last (:loop-levels @state))]
+    (when (nil? loop-level)
+      (throw (err/codegen-error "recur outside of a loop")))
+    (let [let-locals (or (last (:loop-var-locals @state)) [])]
+      ;; Clojure recur must rebind EXACTLY the loop vars — under-arity would
+      ;; leave the unlisted vars at their prior values (silent infinite loop
+      ;; / wrong result), so reject any mismatch, not just over-arity.
+      (when-not (= (count args) (count let-locals))
+        (throw (err/codegen-error
+                (str "recur arity " (count args) " != loop variables " (count let-locals)))))
+      (let [out (atom []) tmps (atom [])]
+        ;; Evaluate args to tmp locals first so multi-arg recur doesn't
+        ;; clobber a loop var that a later arg still reads.
+        (doseq [a args]
+          (swap! out into (emit env state a))
+          (let [t (alloc-local! state)]
+            (swap! out conj [:local-set t])
+            (swap! tmps conj t)))
+        (doseq [[t idx] (map vector @tmps let-locals)]
+          (swap! out conj [:local-get t])
+          (swap! out conj [:local-set idx]))
+        ;; Branch to the enclosing loop. The relative index accounts for any
+        ;; blocks (e.g. an `if`) the recur is nested inside.
+        (swap! out conj [:br (- (:ctrl-depth @state) loop-level)])
+        ;; Unreachable after the branch; a dummy keeps any enclosing
+        ;; result-typed block's type-checker happy.
+        (swap! out conj [:i64-const 0])
+        @out))))
+
+(defn- emit-body [env state body]
+  (let [out (atom []) n (count body)]
+    (doseq [[i expr] (map-indexed vector body)]
+      (swap! out into (emit env state expr))
+      (when-not (= i (dec n)) (swap! out conj [:drop])))
+    @out))
+
+;; ---- builtins ---------------------------------------------------------
+
+(defn- returns-f32?
+  "Does this expression yield an f32 bit-pattern rather than a real integer?
+  Conservative: true only for f32 literals and the host primitives documented
+  to return f32 bits. We deliberately do NOT track f32 through let/if/calls —
+  this guards the obvious unsound path, not a type system. Mirrors
+  `returns_f32` (codegen.rs:658-670)."
+  [expr]
+  (case (:node expr)
+    :float true
+    :builtin (contains? #{:fadd :fsub :fmul :fdiv :bits-f32
+                           :get-x :get-y :get-z :get-vx :get-vy :get-vz
+                           :get-rx :get-ry :get-rz :get-rw
+                           :axis :pointer-x :pointer-y}
+                         (:op expr))
+    false))
+
+(defn- cmp-chain
+  "`(op a b c …)` = `(a op b) and (b op c) and …`. Each argument is evaluated
+  exactly once into a local, then adjacent locals are compared and the 0/1
+  results AND-folded. Mirrors `cmp_chain` (codegen.rs:677-703)."
+  [env state cmp-instr args]
+  (if (< (count args) 2)
+    [[:i64-const 1]]
+    (let [out (atom [])
+          locals (mapv (fn [_] (alloc-local! state)) args)]
+      (doseq [[a l] (map vector args locals)]
+        (swap! out into (emit env state a))
+        (swap! out conj [:local-set l]))
+      (swap! out conj [:local-get (nth locals 0)])
+      (swap! out conj [:local-get (nth locals 1)])
+      (swap! out conj cmp-instr)
+      (swap! out conj [:i64-extend-i32-u])
+      (doseq [w (range 2 (count args))]
+        (swap! out conj [:local-get (nth locals (dec w))])
+        (swap! out conj [:local-get (nth locals w)])
+        (swap! out conj cmp-instr)
+        (swap! out conj [:i64-extend-i32-u])
+        (swap! out conj [:i64-and]))
+      @out)))
+
+(defn- fcmp-chain
+  "Like `cmp-chain`, but each operand is an f32 bit-pattern: unbox it before
+  the (sign-correct) f32 comparison. Mirrors `fcmp_chain` (codegen.rs:707-738)."
+  [env state cmp-instr args]
+  (if (< (count args) 2)
+    [[:i64-const 1]]
+    (let [out (atom [])
+          locals (mapv (fn [_] (alloc-local! state)) args)
+          unbox (fn [l] (swap! out conj [:local-get l])
+                        (swap! out conj [:i32-wrap-i64])
+                        (swap! out conj [:f32-reinterpret-i32]))]
+      (doseq [[a l] (map vector args locals)]
+        (swap! out into (emit env state a))
+        (swap! out conj [:local-set l]))
+      (unbox (nth locals 0)) (unbox (nth locals 1))
+      (swap! out conj cmp-instr)
+      (swap! out conj [:i64-extend-i32-u])
+      (doseq [w (range 2 (count args))]
+        (unbox (nth locals (dec w))) (unbox (nth locals w))
+        (swap! out conj cmp-instr)
+        (swap! out conj [:i64-extend-i32-u])
+        (swap! out conj [:i64-and]))
+      @out)))
+
+(defn- emit-and [env state args]
+  (let [out (atom [])]
+    (swap! out into (emit env state (first args)))
+    (let [tmp (alloc-local! state)]
+      (swap! out conj [:local-tee tmp])
+      (swap! out conj [:i64-const 0])
+      (swap! out conj [:i64-ne])
+      (swap! out conj [:if :i64])
+      (swap! state update :ctrl-depth inc)
+      (if (= (count args) 1)
+        (swap! out conj [:local-get tmp])
+        (swap! out into (emit-builtin env state :and (vec (rest args)))))
+      (swap! out conj [:else])
+      (swap! out conj [:local-get tmp])
+      (swap! out conj [:end])
+      (swap! state update :ctrl-depth dec))
+    @out))
+
+(defn- emit-or [env state args]
+  (let [out (atom [])]
+    (swap! out into (emit env state (first args)))
+    (let [tmp (alloc-local! state)]
+      (swap! out conj [:local-tee tmp])
+      (swap! out conj [:i64-const 0])
+      (swap! out conj [:i64-ne])
+      (swap! out conj [:if :i64])
+      (swap! state update :ctrl-depth inc)
+      (swap! out conj [:local-get tmp])
+      (swap! out conj [:else])
+      (if (= (count args) 1)
+        (swap! out conj [:local-get tmp])
+        (swap! out into (emit-builtin env state :or (vec (rest args)))))
+      (swap! out conj [:end])
+      (swap! state update :ctrl-depth dec))
+    @out))
+
+(defn- emit-abs [env state args]
+  (let [out (atom []) local (alloc-local! state)]
+    (swap! out into (emit env state (first args)))
+    (swap! out conj [:local-tee local])
+    (swap! out conj [:i64-const 0])
+    (swap! out conj [:i64-lt-s])
+    (swap! out conj [:if :i64])
+    (swap! state update :ctrl-depth inc) ;; keep the recur br-index invariant intact
+    (swap! out conj [:i64-const 0])
+    (swap! out conj [:local-get local])
+    (swap! out conj [:i64-sub])
+    (swap! out conj [:else])
+    (swap! out conj [:local-get local])
+    (swap! out conj [:end])
+    (swap! state update :ctrl-depth dec)
+    @out))
+
+(defn- emit-byte-at [env state args]
+  (let [out (atom []) handle (alloc-local! state)]
+    (swap! out into (emit env state (nth args 0)))
+    (swap! out conj [:local-set handle])
+    (swap! out into (emit env state (nth args 1))) ;; i (i64)
+    (swap! out conj [:i32-wrap-i64])                ;; i as i32
+    (swap! out conj [:local-get handle])
+    (swap! out conj [:i64-const 32])
+    (swap! out conj [:i64-shr-u])
+    (swap! out conj [:i32-wrap-i64])                ;; ptr as i32
+    (swap! out conj [:i32-add])                     ;; ptr + i
+    (swap! out conj [:i32-load8-u 0 0])
+    (swap! out conj [:i64-extend-i32-u])
+    @out))
+
+(defn- emit-bytes-alloc [env state args]
+  ;; Allocate a buffer: [cap:i32@0, len:i32@4, data:@8].
+  ;; Returns a buffer handle (ptr as i64 — NOT a string handle; ptr only).
+  (let [out (atom [])
+        cap-local (alloc-local! state)
+        ptr-local (alloc-local! state)
+        heap-global (:heap-global env)]
+    (swap! out into (emit env state (nth args 0)))
+    (swap! out conj [:local-set cap-local])
+    (swap! out conj [:global-get heap-global])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:local-set ptr-local])
+    ;; global = ptr + 8 + cap
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-const 8])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:local-get cap-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:global-set heap-global])
+    ;; store cap at [ptr+0]
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:local-get cap-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-store 0 2])
+    ;; store len=0 at [ptr+4]
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-const 0])
+    (swap! out conj [:i32-store 4 2])
+    (swap! out conj [:local-get ptr-local])
+    @out))
+
+(defn- emit-byte-append [env state args]
+  (let [out (atom [])
+        ptr-local (alloc-local! state)
+        byte-local (alloc-local! state)
+        len-local (alloc-local! state)]
+    (swap! out into (emit env state (nth args 0)))
+    (swap! out conj [:local-set ptr-local])
+    (swap! out into (emit env state (nth args 1)))
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:local-set byte-local])
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-load 4 2])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:local-set len-local])
+    ;; store byte at [ptr+8+len]
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-const 8])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:local-get len-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:local-get byte-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-store8 0 0])
+    ;; [ptr+4] = len + 1
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:local-get len-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-const 1])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:i32-store 4 2])
+    (swap! out conj [:local-get ptr-local])
+    @out))
+
+(defn- emit-bytes-len [env state args]
+  (let [out (atom [])]
+    (swap! out into (emit env state (first args)))
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-load 4 2])
+    (swap! out conj [:i64-extend-i32-u])
+    @out))
+
+(defn- emit-bytes-finish [env state args]
+  ;; Convert a buffer handle -> string handle ((data_ptr << 32) | len).
+  (let [out (atom []) ptr-local (alloc-local! state)]
+    (swap! out into (emit env state (first args)))
+    (swap! out conj [:local-set ptr-local])
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-const 8])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:i64-const 32])
+    (swap! out conj [:i64-shl])
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-load 4 2])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:i64-or])
+    @out))
+
+(defn- emit-alloc [env state args]
+  (let [out (atom [])
+        n-local (alloc-local! state)
+        ptr-local (alloc-local! state)
+        heap-global (:heap-global env)]
+    (swap! out into (emit env state (first args)))
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-const (dec heap-align)])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:i32-const (- heap-align)])
+    (swap! out conj [:i32-and])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:local-set n-local])
+    (swap! out conj [:global-get heap-global])
+    (swap! out conj [:i64-extend-i32-u])
+    (swap! out conj [:local-set ptr-local])
+    (swap! out conj [:local-get ptr-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:local-get n-local])
+    (swap! out conj [:i32-wrap-i64])
+    (swap! out conj [:i32-add])
+    (swap! out conj [:global-set heap-global])
+    (swap! out conj [:local-get ptr-local])
+    @out))
+
+(def ^:private f32-arith-unsound-ops
+  #{:add :sub :mul :div :mod :inc :dec :lt :gt :le :ge :bit-and :bit-or :bit-xor :shl :shr-s})
+
+(defn- emit-builtin
+  "Mirrors `emit_builtin` (codegen.rs:740-1157)."
+  [env state op args]
+  (if-let [imp (ast/host-import op)]
+    (emit-host-call env state imp args)
+    (do
+      ;; Reject unsound integer math / signed ordering on f32 bit-patterns.
+      (when (and (contains? f32-arith-unsound-ops op) (some returns-f32? args))
+        (throw (err/codegen-error
+                (str "`(" (name op) " …)` operates on an f32 value, which is unsound: the i64 holds "
+                     "float bits, not an integer. Use the f32 ops instead — +f -f *f /f for "
+                     "arithmetic, <f >f <=f >=f =f for comparison — or pass f32 straight to a host "
+                     "primitive."))))
+      (let [out (atom [])]
+        (case op
+          :add (do (swap! out into (emit env state (first args)))
+                   (doseq [a (rest args)] (swap! out into (emit env state a)) (swap! out conj [:i64-add])))
+          :sub (if (= (count args) 1)
+                 (do (swap! out conj [:i64-const 0])
+                     (swap! out into (emit env state (first args)))
+                     (swap! out conj [:i64-sub]))
+                 (do (swap! out into (emit env state (first args)))
+                     (doseq [a (rest args)] (swap! out into (emit env state a)) (swap! out conj [:i64-sub]))))
+          :mul (do (swap! out into (emit env state (first args)))
+                   (doseq [a (rest args)] (swap! out into (emit env state a)) (swap! out conj [:i64-mul])))
+          :div (do (swap! out into (emit env state (nth args 0)))
+                   (swap! out into (emit env state (nth args 1)))
+                   (swap! out conj [:i64-div-s]))
+          :mod (do (swap! out into (emit env state (nth args 0)))
+                   (swap! out into (emit env state (nth args 1)))
+                   (swap! out conj [:i64-rem-s]))
+          :bit-and (do (swap! out into (emit env state (first args)))
+                       (doseq [a (rest args)] (swap! out into (emit env state a)) (swap! out conj [:i64-and])))
+          :bit-or (do (swap! out into (emit env state (first args)))
+                      (doseq [a (rest args)] (swap! out into (emit env state a)) (swap! out conj [:i64-or])))
+          :bit-xor (do (swap! out into (emit env state (first args)))
+                       (doseq [a (rest args)] (swap! out into (emit env state a)) (swap! out conj [:i64-xor])))
+          :shl (do (swap! out into (emit env state (nth args 0))) (swap! out into (emit env state (nth args 1))) (swap! out conj [:i64-shl]))
+          :shr-s (do (swap! out into (emit env state (nth args 0))) (swap! out into (emit env state (nth args 1))) (swap! out conj [:i64-shr-s]))
+          :inc (do (swap! out into (emit env state (first args))) (swap! out conj [:i64-const 1]) (swap! out conj [:i64-add]))
+          :dec (do (swap! out into (emit env state (first args))) (swap! out conj [:i64-const 1]) (swap! out conj [:i64-sub]))
+          :abs (swap! out into (emit-abs env state args))
+          :eq (swap! out into (cmp-chain env state [:i64-eq] args))
+          :lt (swap! out into (cmp-chain env state [:i64-lt-s] args))
+          :gt (swap! out into (cmp-chain env state [:i64-gt-s] args))
+          :le (swap! out into (cmp-chain env state [:i64-le-s] args))
+          :ge (swap! out into (cmp-chain env state [:i64-ge-s] args))
+          :noteq (do (swap! out into (emit env state (nth args 0)))
+                     (swap! out into (emit env state (nth args 1)))
+                     (swap! out conj [:i64-ne])
+                     (swap! out conj [:i64-extend-i32-u]))
+          (:fadd :fsub :fmul :fdiv)
+          (let [fop (case op :fadd [:f32-add] :fsub [:f32-sub] :fmul [:f32-mul] :fdiv [:f32-div])]
+            (swap! out into (emit env state (first args)))
+            (swap! out conj [:i32-wrap-i64])
+            (swap! out conj [:f32-reinterpret-i32])
+            (doseq [a (rest args)]
+              (swap! out into (emit env state a))
+              (swap! out conj [:i32-wrap-i64])
+              (swap! out conj [:f32-reinterpret-i32])
+              (swap! out conj fop))
+            (swap! out conj [:i32-reinterpret-f32])
+            (swap! out conj [:i64-extend-i32-u]))
+          (:flt :fgt :fle :fge :feq)
+          (let [fcmp (case op :flt [:f32-lt] :fgt [:f32-gt] :fle [:f32-le] :fge [:f32-ge] :feq [:f32-eq])]
+            (swap! out into (fcmp-chain env state fcmp args)))
+          :zero (do (swap! out into (emit env state (first args))) (swap! out conj [:i64-eqz]) (swap! out conj [:i64-extend-i32-u]))
+          :pos (do (swap! out into (emit env state (first args))) (swap! out conj [:i64-const 0]) (swap! out conj [:i64-gt-s]) (swap! out conj [:i64-extend-i32-u]))
+          :neg (do (swap! out into (emit env state (first args))) (swap! out conj [:i64-const 0]) (swap! out conj [:i64-lt-s]) (swap! out conj [:i64-extend-i32-u]))
+          :not (do (swap! out into (emit env state (first args))) (swap! out conj [:i64-eqz]) (swap! out conj [:i64-extend-i32-u]))
+          :and (swap! out into (emit-and env state args))
+          :or  (swap! out into (emit-or env state args))
+          :str-len (do (swap! out into (emit env state (first args))) (swap! out conj [:i32-wrap-i64]) (swap! out conj [:i64-extend-i32-u]))
+          :byte-at (swap! out into (emit-byte-at env state args))
+          :bytes-alloc (swap! out into (emit-bytes-alloc env state args))
+          :byte-append (swap! out into (emit-byte-append env state args))
+          :bytes-len (swap! out into (emit-bytes-len env state args))
+          :bytes-finish (swap! out into (emit-bytes-finish env state args))
+          :alloc (swap! out into (emit-alloc env state args))
+          :load64 (do (swap! out into (emit env state (first args))) (swap! out conj [:i32-wrap-i64]) (swap! out conj [:i64-load 0 3]))
+          :store64 (do (swap! out into (emit env state (nth args 0))) (swap! out conj [:i32-wrap-i64])
+                       (swap! out into (emit env state (nth args 1))) (swap! out conj [:i64-store 0 3]) (swap! out conj [:i64-const 0]))
+          :load32 (do (swap! out into (emit env state (first args))) (swap! out conj [:i32-wrap-i64]) (swap! out conj [:i32-load 0 2]) (swap! out conj [:i64-extend-i32-u]))
+          :store32 (do (swap! out into (emit env state (nth args 0))) (swap! out conj [:i32-wrap-i64])
+                       (swap! out into (emit env state (nth args 1))) (swap! out conj [:i32-wrap-i64]) (swap! out conj [:i32-store 0 2]) (swap! out conj [:i64-const 0]))
+          :f32-bits (swap! out into (emit env state (first args)))    ;; identity — bits already i64-boxed
+          :bits-f32 (swap! out into (emit env state (first args)))   ;; identity at this level
+          (throw (err/codegen-error (str "unhandled builtin " op " — should have been covered by host_import path"))))
+        @out))))
+
+;; ---- host calls / guest calls / atoms ----------------------------------
+
+(defn- emit-host-call
+  "Emit a host-import call, handling ParamKind lowering and ReturnKind
+  lifting. Mirrors `emit_host_call` (codegen.rs:1160-1217)."
+  [env state imp args]
+  (let [fn-idx (get (:import-index env) imp)]
+    (when (nil? fn-idx)
+      (throw (err/codegen-error (str "host import " imp " not in import index"))))
+    (let [param-kinds (get ast/host-import->param-kinds imp)]
+      (when-not (= (count args) (count param-kinds))
+        (throw (err/codegen-error
+                (str "host call " imp " expects " (count param-kinds) " args, got " (count args)))))
+      (let [out (atom [])]
+        (doseq [[a kind] (map vector args param-kinds)]
+          (swap! out into (emit env state a)) ;; i64 on stack
+          (case kind
+            :i64 nil ;; leave as i64
+            :f32 (do (swap! out conj [:i32-wrap-i64]) (swap! out conj [:f32-reinterpret-i32]))
+            :string-handle
+            ;; (ptr<<32)|len -> (i32 ptr, i32 len) for the host.
+            (let [handle-local (alloc-local! state)]
+              (swap! out conj [:local-tee handle-local])
+              (swap! out conj [:i64-const 32])
+              (swap! out conj [:i64-shr-u])
+              (swap! out conj [:i32-wrap-i64]) ;; ptr
+              (swap! out conj [:local-get handle-local])
+              (swap! out conj [:i32-wrap-i64])))) ;; len
+        (swap! out conj [:call fn-idx])
+        (case (get ast/host-import->return-kind imp)
+          :void (swap! out conj [:i64-const 0])
+          :i32  (swap! out conj [:i64-extend-i32-u])
+          :i64  nil
+          :f32  (do (swap! out conj [:i32-reinterpret-f32]) (swap! out conj [:i64-extend-i32-u])))
+        @out))))
+
+(defn- emit-call [env state name args]
+  (let [entry (get (:fn-index env) name)]
+    (when (nil? entry)
+      (throw (err/codegen-error (str "call to undefined function `" name "`"))))
+    (let [{:keys [index arity]} entry]
+      (when-not (= (count args) arity)
+        (throw (err/codegen-error
+                (str "function `" name "` called with " (count args) " args, expected " arity))))
+      (let [out (atom [])]
+        (doseq [a args] (swap! out into (emit env state a)))
+        (swap! out conj [:call index])
+        @out))))
+
+(defn- emit-atom-get [env name]
+  (let [idx (get (:atoms env) name)]
+    (when (nil? idx)
+      (throw (err/codegen-error (str "(atom-val " name ") — no such atom; declare it with defatom"))))
+    [[:global-get idx]]))
+
+(defn- emit-atom-set
+  "`(set-atom! name v)` writes the global and evaluates to the new value:
+  stash v in a temp, store it, read the temp back."
+  [env state name val-expr]
+  (let [idx (get (:atoms env) name)]
+    (when (nil? idx)
+      (throw (err/codegen-error (str "(set-atom! " name " …) — no such atom; declare it with defatom"))))
+    (let [out (atom [])]
+      (swap! out into (emit env state val-expr))
+      (let [tmp (alloc-local! state)]
+        (swap! out conj [:local-tee tmp])
+        (swap! out conj [:global-set idx])
+        (swap! out conj [:local-get tmp]))
+      @out)))
+
+(defn- emit [env state expr]
+  (case (:node expr)
+    :int   [[:i64-const (:value expr)]]
+    :float [[:f32-const (:value expr)] [:i32-reinterpret-f32] [:i64-extend-i32-u]]
+    :str   (emit-str env expr)
+    :var   (emit-var env state (:name expr))
+    :if    (emit-if env state (:cond expr) (:then expr) (:else expr))
+    :let   (emit-let env state (:bindings expr) (:body expr))
+    :do    (emit-body env state (:body expr))
+    :loop  (emit-loop env state (:bindings expr) (:body expr))
+    :recur (emit-recur env state (:args expr))
+    :builtin (emit-builtin env state (:op expr) (:args expr))
+    :call  (emit-call env state (:name expr) (:args expr))
+    :atom-get (emit-atom-get env (:name expr))
+    :atom-set (emit-atom-set env state (:name expr) (:value expr))))
+
+;; ---------------------------------------------------------------------------
+;; cabi_realloc — bump allocator. Mirrors codegen.rs:163-208 EXACTLY,
+;; including the leftover dead computation (steps 1-8 compute an aligned
+;; pointer and then immediately double-`Drop` it) inherited from the Rust
+;; source. It is wasteful but not incorrect — the function still returns the
+;; right aligned pointer and updates the heap global correctly (traced and
+;; verified by hand; see README "Known upstream gaps"). Preserved verbatim
+;; rather than "cleaned up" so the ported IR matches the original compiler's
+;; actual output.
+;; ---------------------------------------------------------------------------
+
+(defn- cabi-realloc-instrs
+  "locals: [old_ptr:i32@0, old_sz:i32@1, align:i32@2, new_sz:i32@3]"
+  [heap-global]
+  (let [new-sz 3]
+    [[:global-get heap-global] [:i32-const (dec heap-align)] [:i32-add]
+     [:i32-const (- heap-align)] [:i32-and]
+     [:local-get new-sz] [:drop] [:drop]
+     [:global-get heap-global] [:i32-const (dec heap-align)] [:i32-add]
+     [:i32-const (- heap-align)] [:i32-and]
+     [:local-get new-sz] [:i32-add] [:global-set heap-global]
+     [:global-get heap-global] [:local-get new-sz] [:i32-sub]]))
+
+;; ---------------------------------------------------------------------------
+;; Entry point — mirrors `compile` (codegen.rs:47-229)
+;; ---------------------------------------------------------------------------
+
+(defn compile
+  "Typed AST `Program` -> Module IR (see namespace docstring). Returns:
+
+    {:host-imports     [{:kind :host-import/… :module-field [mod field]
+                          :param-kinds […] :return-kind … :index n} …]
+     :functions        [{:name … :index n :params […] :locals-count n
+                          :body […instr…]} …]
+     :atoms             [{:name … :init i64 :global-index n} …]
+     :consts             {name -> i64}
+     :literals           {:offsets {bytes -> offset} :blob […byte…]}
+     :heap-start          i32
+     :min-pages           i64
+     :cabi-realloc        {:index n :body […instr…]}
+     :export-functions    {name -> fn-index}
+     :export-globals      {name -> global-index}
+     :memory-export       \"memory\"}"
+  [program]
+  (let [literals     (collect-literals program)
+        consts       (eval-consts program)
+        host-imports (collect-host-imports program)
+        import-base  (count host-imports)
+        import-index (into {} (map-indexed (fn [i imp] [imp i])) host-imports)
+        fn-index (reduce (fn [acc [i f]]
+                            (when (contains? acc (:name f))
+                              (throw (err/codegen-error (str "function `" (:name f) "` defined twice"))))
+                            (assoc acc (:name f) {:index (+ import-base i) :arity (count (:params f))}))
+                          {} (map-indexed vector (:functions program)))
+        atom-index (into {} (map-indexed (fn [i a] [(:name a) (inc i)])) (:atoms program))
+        heap-global 0
+        env {:consts consts :fn-index fn-index :import-index import-index
+             :literals literals :atoms atom-index :heap-global heap-global}
+        functions (mapv
+                   (fn [f]
+                     (let [state (atom {:scope (into {} (map-indexed (fn [i p] [p {:kind :param :idx i}])) (:params f))
+                                         :locals-count (count (:params f))
+                                         :loop-depth 0 :ctrl-depth 0
+                                         :loop-levels [] :loop-var-locals []})
+                           body-instrs (emit-body env state (:body f))]
+                       {:name (:name f)
+                        :index (:index (get fn-index (:name f)))
+                        :params (:params f)
+                        :locals-count (:locals-count @state)
+                        :body body-instrs}))
+                   (:functions program))
+        cabi-realloc-index (+ import-base (count (:functions program)))
+        heap-start (align-up (+ data-base (count (:blob literals))) heap-align)
+        min-pages (max 1 (long (Math/ceil (/ (double heap-start) wasm-page))))
+        atoms (mapv (fn [i a] {:name (:name a) :init (:init a) :global-index (inc i)})
+                    (range) (:atoms program))]
+    {:host-imports (mapv (fn [imp]
+                            {:kind imp
+                             :module-field (get ast/host-import->module-field imp)
+                             :param-kinds  (get ast/host-import->param-kinds imp)
+                             :return-kind  (get ast/host-import->return-kind imp)
+                             :index (get import-index imp)})
+                          host-imports)
+     :functions functions
+     :atoms atoms
+     :consts consts
+     :literals literals
+     :heap-start heap-start
+     :min-pages min-pages
+     :cabi-realloc {:index cabi-realloc-index :body (cabi-realloc-instrs heap-global)}
+     :export-functions (into {} (map (fn [f] [(:name f) (:index f)])) functions)
+     :export-globals   (into {} (map (fn [a] [(:name a) (:global-index a)])) atoms)
+     :memory-export "memory"}))

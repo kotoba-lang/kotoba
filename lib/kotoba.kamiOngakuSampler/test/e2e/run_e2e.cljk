@@ -1,0 +1,328 @@
+(ns run-e2e
+  "Real-browser E2E proof for kami-ongaku-sampler: proves the repo's real,
+   unit-tested trigger/lookup logic (kami.ongaku.sampler/trigger-sample --
+   key/velocity-layer zone lookup with exact boundary handling, deterministic
+   round-robin cycling, streaming-lifecycle state machine) correctly drives
+   real audio output once combined with kotoba-lang/audio's real
+   oscillator + ADSR DSP via kotoba-lang/org-w3-webaudio's proven
+   AudioWorkletProcessor path (org-w3-webaudio commit e554d853d640).
+
+   kami-ongaku-sampler has no sample-file decoding of its own (out of scope
+   per its own README) -- test/e2e/src/kami/ongaku/sampler/e2e/fixture.cljk
+   substitutes a distinct real oscillator frequency for each sample-ref
+   (see that namespace's docstring for the exact zone/velocity-layer/
+   round-robin/pitch-offset/gain fixture, which reuses this repo's OWN
+   sampler_test.cljc boundary values rather than inventing new ones).
+
+   For each of a sequence of (note, velocity, trigger-count) inputs, this
+   compiles+runs (via test/e2e/src/kami/ongaku/sampler/e2e/{worklet_dsp,main_driver}.cljs,
+   scripts/build-e2e-bundles.sh):
+     1. kami.ongaku.sampler.e2e.fixture/resolve-trigger (-> kami.ongaku.sampler's
+        REAL trigger-sample) inside a real AudioWorkletProcessor, in a real
+        headless Chromium (Playwright), to decide which zone/variation/
+        pitch-offset/gain should play;
+     2. kotoba-lang/audio's REAL audio.synth oscillator + ADSR envelope,
+        also inside that same worklet, to actually render it;
+     3. captures the real rendered PCM via OfflineAudioContext.
+
+   Then, right here (no browser involved), it:
+     a. requires kami.ongaku.sampler.e2e.fixture directly (the SAME .cljc source the
+        browser bundle was compiled from) and recomputes the trigger
+        decision offline, to cross-verify the browser's decision
+        bit-for-bit;
+     b. requires kotoba-lang/audio's audio.synth directly and recomputes the
+        full expected waveform, to diff against the captured PCM;
+     c. actually MEASURES the frequency present in the captured PCM (via
+        interpolated zero-crossing timing over the steady-state envelope
+        window) -- not merely asserting the decision was followed, but
+        checking what the rendered audio really contains.
+
+   Requires: `bash scripts/build-e2e-bundles.sh` run first, `npm install`
+   inside test/e2e/ for the Playwright dependency, and this repo's own src/
+   plus a checkout of kotoba-lang/audio on the nbb classpath:
+
+     kbb --backend sci -cp \"src:test/e2e/src:$AUDIO_SRC_PATH\" test/e2e/run_e2e.cljk"
+  (:require ["playwright" :refer [chromium]]
+            ["http" :as http]
+            ["fs" :as fs]
+            ["path" :as path]
+            [audio.synth :as synth]
+            [kami.ongaku.sampler.e2e.fixture :as fixture]))
+
+(def site-dir (path/join (js/process.cwd) "test" "e2e" "page"))
+(def port 8941)
+
+(def content-types
+  {".html" "text/html" ".js" "application/javascript"})
+
+(defn start-server []
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [server (http/createServer
+                     (fn [req res]
+                       (let [url (if (= (.-url req) "/") "/index.html" (.-url req))
+                             fpath (path/join site-dir url)
+                             ext (path/extname fpath)
+                             ctype (get content-types ext "application/octet-stream")]
+                         (if (fs/existsSync fpath)
+                           (do (.writeHead res 200 #js {"Content-Type" ctype})
+                               (.end res (fs/readFileSync fpath)))
+                           (do (.writeHead res 404) (.end res "not found"))))))]
+        (.listen server port (fn [] (resolve server)))))))
+
+;; --- shared synth params (same for every trigger input in this E2E) -----
+(def SR 48000)
+(def DUR-SECONDS 0.2)
+(def GATE-OFF-SECONDS 0.15)
+(def ATTACK 0.01)
+(def DECAY 0.02)
+(def SUSTAIN 0.6)
+(def RELEASE 0.05)
+
+(def dur-samples (synth/seconds->samples DUR-SECONDS SR))
+(def gate-off (synth/seconds->samples GATE-OFF-SECONDS SR))
+(def attack-samples (synth/seconds->samples ATTACK SR))
+(def decay-samples (synth/seconds->samples DECAY SR))
+(def steady-start (+ attack-samples decay-samples))
+(def steady-end gate-off)
+
+;; --- test inputs ---------------------------------------------------------
+;; Reuses kami-ongaku-sampler's OWN test/kami/ongaku/sampler_test.cljk
+;; boundary values (60/61 key split, 63/64 velocity split, 1/127 range
+;; bounds) rather than inventing new numbers -- these are the exact cases
+;; already unit-tested, now proven to drive correct real audio.
+(def test-inputs
+  [{:label "zone A round-robin 1/3 (trigger-count 0)"
+    :note 60 :velocity 30 :trigger-count 0}
+   {:label "zone A round-robin 2/3 (trigger-count 1)"
+    :note 60 :velocity 30 :trigger-count 1}
+   {:label "zone A round-robin 3/3 -- wraps back to variation 1 (trigger-count 2)"
+    :note 60 :velocity 30 :trigger-count 2}
+   {:label "zone B round-robin 1/3 (trigger-count 0)"
+    :note 60 :velocity 100 :trigger-count 0}
+   {:label "zone B round-robin 2/3 (trigger-count 1)"
+    :note 60 :velocity 100 :trigger-count 1}
+   {:label "zone B round-robin 3/3 -- wraps back to variation 1 (trigger-count 2)"
+    :note 60 :velocity 100 :trigger-count 2}
+   {:label "velocity boundary: 63 (just below the split -> zone A)"
+    :note 60 :velocity 63 :trigger-count 0}
+   {:label "velocity boundary: 64 (exactly at the split -> zone B)"
+    :note 60 :velocity 64 :trigger-count 0}
+   {:label "velocity boundary: 1 (zone A's lower bound)"
+    :note 60 :velocity 1 :trigger-count 0}
+   {:label "velocity boundary: 127 (zone B's upper bound)"
+    :note 60 :velocity 127 :trigger-count 0}
+   {:label "velocity 0 -- out of range for every layer (vel-low is 1) -> no match"
+    :note 60 :velocity 0 :trigger-count 0}
+   {:label "key 61 -- other-key zone, +7 semitone pitch-offset"
+    :note 61 :velocity 50 :trigger-count 0}
+   {:label "key 59 -- no layer covers this key -> no match"
+    :note 59 :velocity 50 :trigger-count 0}
+   {:label "key 62 -- no layer covers this key -> no match"
+    :note 62 :velocity 50 :trigger-count 0}])
+
+;; --- offline (nbb) reference: SAME fixture.cljc + audio.synth source, a
+;;     different runtime (nbb, not browser-compiled cljs) ------------------
+
+(defn offline-decision [{:keys [note velocity trigger-count]}]
+  (fixture/resolve-trigger note velocity trigger-count))
+
+(defn offline-waveform [decision]
+  "-> vector of doubles, or nil if decision is nil. The exact same
+   computation as kami.ongaku.sampler.e2e.worklet-dsp/synthesize, run here directly
+   on the .cljc source of truth (no browser/worklet involved)."
+  (when decision
+    (let [osc (synth/sine-wave (:freq decision) SR dur-samples)
+          env (synth/adsr {:attack ATTACK :decay DECAY :sustain SUSTAIN
+                            :release RELEASE :gate-off gate-off :sample-rate SR}
+                           dur-samples)]
+      (mapv #(* % (:gain decision)) (synth/apply-envelope osc env)))))
+
+(defn max-abs-diff [a b]
+  (reduce max 0.0 (map (fn [x y] (js/Math.abs (- x y))) a b)))
+
+(defn max-abs [a]
+  (reduce (fn [acc x] (max acc (js/Math.abs x))) 0.0 a))
+
+;; --- frequency measurement from captured PCM: interpolated positive-going
+;;     zero-crossing timing over the steady-state (post attack+decay,
+;;     pre-release) window. This is an actual measurement of the CAPTURED
+;;     waveform -- it does not assume the decision's freq was honored. -----
+
+(defn positive-zero-crossings [samples start end]
+  (loop [i (inc start) acc (transient [])]
+    (if (>= i end)
+      (persistent! acc)
+      (let [prev (nth samples (dec i))
+            cur (nth samples i)]
+        (recur (inc i)
+               (if (and (<= prev 0.0) (> cur 0.0))
+                 (conj! acc (+ (dec i) (/ (- 0.0 prev) (- cur prev))))
+                 acc))))))
+
+(defn measure-frequency
+  "-> Hz (double), or nil if fewer than 2 zero-crossings were found (can't
+   measure a period from that)."
+  [samples sr start end]
+  (let [crossings (positive-zero-crossings samples start end)]
+    (when (>= (count crossings) 2)
+      (let [n-periods (dec (count crossings))
+            span-samples (- (last crossings) (first crossings))]
+        (/ (* n-periods sr) span-samples)))))
+
+;; --- browser call ---------------------------------------------------------
+
+(defn input->js [{:keys [note velocity trigger-count]}]
+  #js {:note note :velocity velocity :triggerCount trigger-count
+       :sr SR :durSamples dur-samples :gateOff gate-off
+       :attack ATTACK :decay DECAY :sustain SUSTAIN :release RELEASE})
+
+(defn run-in-page [page]
+  ;; pageFunction is a plain JS source string, not a Function value, and the
+  ;; params are inlined into the string rather than passed via .evaluate's
+  ;; separate `arg` -- both deliberate, matching org-w3-webaudio's own
+  ;; run_e2e.cljs (Playwright's page.evaluate(pageFunction, arg) silently
+  ;; drops `arg` and resolves undefined when pageFunction is a source
+  ;; string; verified there with plain Node + Playwright, no cljs/nbb
+  ;; involved -- not re-verified here, reusing that finding).
+  (.evaluate page
+    (str "window.runE2E("
+         (js/JSON.stringify
+           #js {:workletUrl "/worklet-processor.js"
+                :processorName "kami-sampler-trigger-processor"
+                :inputs (clj->js (mapv input->js test-inputs))})
+         ")")))
+
+;; --- decision comparison ---------------------------------------------------
+
+(defn browser-decision->clj [d]
+  (when d
+    {:sample-ref (keyword (.-sampleRef d))
+     :freq (.-freq d)
+     :gain (.-gain d)
+     :pan (.-pan d)
+     :pitch-offset (.-pitchOffset d)}))
+
+(defn decisions-match? [offline browser]
+  (cond
+    (and (nil? offline) (nil? browser)) true
+    (or (nil? offline) (nil? browser)) false
+    :else
+    (and (= (:sample-ref offline) (:sample-ref browser))
+         (< (js/Math.abs (- (:freq offline) (:freq browser))) 1e-9)
+         (< (js/Math.abs (- (:gain offline) (:gain browser))) 1e-9)
+         (< (js/Math.abs (- (:pan offline) (:pan browser))) 1e-9)
+         (< (js/Math.abs (- (:pitch-offset offline) (:pitch-offset browser))) 1e-9))))
+
+;; --- per-input evaluation --------------------------------------------------
+
+(def PCM-TOL 1e-6)
+(def FREQ-REL-TOL 0.005) ;; 0.5% -- measured-vs-decided frequency
+
+(defn evaluate-one [input result]
+  (let [offline (offline-decision input)
+        browser (browser-decision->clj (.-decision result))
+        captured (vec (.-pcm result))
+        decision-ok (decisions-match? offline browser)]
+    (if (nil? offline)
+      (let [peak (max-abs captured)
+            silent-ok (< peak 1e-9)]
+        {:input input :offline offline :browser browser
+         :decision-ok decision-ok
+         :pcm-ok silent-ok :pcm-diff peak
+         :measured-freq nil :expected-freq nil :freq-ok true
+         :note "no layer matched -- expect silence"})
+      (let [reference (offline-waveform offline)
+            n (min (count captured) (count reference))
+            diff (max-abs-diff (subvec captured 0 n) (subvec (vec reference) 0 n))
+            pcm-ok (and (= (count captured) (count reference)) (< diff PCM-TOL))
+            measured (measure-frequency captured SR steady-start steady-end)
+            expected (:freq offline)
+            freq-ok (and (some? measured)
+                         (< (js/Math.abs (/ (- measured expected) expected)) FREQ-REL-TOL))]
+        {:input input :offline offline :browser browser
+         :decision-ok decision-ok
+         :pcm-ok pcm-ok :pcm-diff diff
+         :measured-freq measured :expected-freq expected :freq-ok freq-ok}))))
+
+(defn fmt-decision [d]
+  (if d
+    (str (name (:sample-ref d))
+         " freq=" (.toFixed (:freq d) 3)
+         " gain=" (.toFixed (:gain d) 4)
+         " pan=" (:pan d)
+         " pitch-offset=" (:pitch-offset d))
+    "nil (no match)"))
+
+(defn print-report [rows]
+  (println "\n=== kami-ongaku-sampler real-browser AudioWorklet trigger E2E result ===\n")
+  (doseq [{:keys [input offline decision-ok pcm-ok pcm-diff
+                  measured-freq expected-freq freq-ok]} rows]
+    (println (:label input))
+    (println "  input: note=" (:note input) "velocity=" (:velocity input)
+             "trigger-count=" (:trigger-count input))
+    (println "  resolved:" (fmt-decision offline))
+    (println "  browser decision == offline (nbb) decision:" decision-ok)
+    (if expected-freq
+      (println "  captured-PCM max-abs-diff vs offline waveform:" pcm-diff
+               (str "(tol " PCM-TOL ") ok=" pcm-ok))
+      (println "  captured-PCM peak abs value (expect ~0, silence):" pcm-diff
+               (str "ok=" pcm-ok)))
+    (when expected-freq
+      (println "  measured frequency from captured PCM (zero-crossing):"
+               (some-> measured-freq (.toFixed 4)) "Hz, expected:"
+               (.toFixed expected-freq 4) "Hz, ok=" freq-ok))
+    (println))
+  (let [all-decision-ok (every? :decision-ok rows)
+        all-pcm-ok (every? :pcm-ok rows)
+        all-freq-ok (every? :freq-ok rows)
+        rr-a (mapv #(get-in % [:offline :sample-ref]) (subvec (vec rows) 0 3))
+        rr-b (mapv #(get-in % [:offline :sample-ref]) (subvec (vec rows) 3 6))
+        rr-a-ok (= rr-a [:zoneA-rr1 :zoneA-rr2 :zoneA-rr1])
+        rr-b-ok (= rr-b [:zoneB-rr1 :zoneB-rr2 :zoneB-rr1])
+        pass (and all-decision-ok all-pcm-ok all-freq-ok rr-a-ok rr-b-ok)]
+    (println "round-robin zone A sequence (expect zoneA-rr1 zoneA-rr2 zoneA-rr1):" rr-a "ok=" rr-a-ok)
+    (println "round-robin zone B sequence (expect zoneB-rr1 zoneB-rr2 zoneB-rr1):" rr-b "ok=" rr-b-ok)
+    (println "all browser/offline decisions match:" all-decision-ok)
+    (println "all captured-PCM checks ok:" all-pcm-ok)
+    (println "all measured-frequency checks ok:" all-freq-ok)
+    (println "PASS:" pass)
+    pass))
+
+(defn report-and-exit [server browser results]
+  (let [rows (mapv evaluate-one test-inputs results)
+        pass (print-report rows)]
+    (.close browser)
+    (.close server)
+    (if pass (js/process.exit 0) (js/process.exit 1))))
+
+(defn report-error [server browser e]
+  (println "ERROR:" (or (.-stack e) (.-message e) (str e)))
+  (.close browser)
+  (.close server)
+  (js/process.exit 1))
+
+(defn drive-page [server browser page]
+  (.on page "console" (fn [msg] (println "[console]" (.text msg))))
+  (.on page "pageerror" (fn [err] (println "[pageerror]" (str err))))
+  (-> (.goto page (str "http://localhost:" port "/"))
+      (.then (fn [_] (run-in-page page)))
+      (.then (fn [results] (report-and-exit server browser results)))
+      (.catch (fn [e] (report-error server browser e)))))
+
+(defn -main []
+  (when-not (fs/existsSync (path/join site-dir "worklet-processor.js"))
+    (println "ERROR: test/e2e/page/worklet-processor.js not found.")
+    (println "Run scripts/build-e2e-bundles.sh first.")
+    (js/process.exit 1))
+  (-> (start-server)
+      (.then
+        (fn [server]
+          (-> (.launch chromium)
+              (.then
+                (fn [browser]
+                  (-> (.newPage browser)
+                      (.then (fn [page] (drive-page server browser page)))))))))
+      (.catch (fn [e] (println "SETUP ERROR:" (or (.-stack e) (.-message e) (str e))) (js/process.exit 1)))))
+
+(-main)

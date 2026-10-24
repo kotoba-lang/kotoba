@@ -1,0 +1,156 @@
+(ns kami.gen.sdf-agent.render
+  "Offscreen preview render of a compiled mesh, from one fixed camera angle.
+
+  This is a real (if deliberately simple) software rasterizer -- no wgpu, no
+  GPU, no mocked pixels: a fixed isometric orthographic projection, a
+  z-buffered flat-shaded triangle fill, written out as a real PNG via the
+  JDK's own `javax.imageio.ImageIO` (no extra dependency needed for PNG
+  encoding). It follows the spirit of the offscreen-render reference pattern
+  in `kotoba-lang/kami-engine` ADR-0047 (render the actual artifact from a
+  fixed camera so a critique step -- LLM-vision or heuristic -- has a real
+  image to look at), without needing that ADR's wgpu pipeline.
+
+  Mesh shape (matches `kotoba-lang/mesher`): `{:vertex-count n :index-count n
+  :vertices [floats, interleaved pos3+norm3+uv2 per vertex] :indices [ints]}`.
+  `vertex-colors` (from `mesher/sdf-to-colored-mesh`) is a parallel vector of
+  `[r g b a]` (0.0-1.0) per vertex."
+  (:require [kotoba.image :as image] [kotoba.io :as io]))
+
+(def ^:private stride 8) ;; pos3 + norm3 + uv2, per mesher's vertex layout
+
+(def background-rgb [10 10 14])
+
+(defn- vertex-position [vertices i]
+  (let [base (* i stride)]
+    [(nth vertices base) (nth vertices (+ base 1)) (nth vertices (+ base 2))]))
+
+(defn- v- [[ax ay az] [bx by bz]] [(- ax bx) (- ay by) (- az bz)])
+(defn- v+ [[ax ay az] [bx by bz]] [(+ ax bx) (+ ay by) (+ az bz)])
+(defn- dot [[ax ay az] [bx by bz]] (+ (* ax bx) (* ay by) (* az bz)))
+(defn- cross [[ax ay az] [bx by bz]]
+  [(- (* ay bz) (* az by)) (- (* az bx) (* ax bz)) (- (* ax by) (* ay bx))])
+(defn- vlen [v] (Math/sqrt (double (dot v v))))
+(defn- normalize [v]
+  (let [l (vlen v)]
+    (if (zero? l) v (mapv #(/ % l) v))))
+(defn- clamp [x lo hi] (max lo (min hi x)))
+
+(defn- pack-argb
+  "Packs opaque 0-255 r/g/b into a Java BufferedImage TYPE_INT_RGB pixel int.
+  `unchecked-int` is required (not `int`): 0xFF alpha sets the sign bit, so
+  the packed value exceeds Integer/MAX_VALUE as a long and a checked `int`
+  cast would throw -- BufferedImage's own pixel ints are always this
+  \"wraps to negative\" 2's-complement encoding."
+  [r g b]
+  (unchecked-int (bit-or (bit-shift-left 0xFF 24)
+                          (bit-shift-left (int r) 16)
+                          (bit-shift-left (int g) 8)
+                          (int b))))
+
+(defn mesh-bounds
+  "[[minx miny minz] [maxx maxy maxz]] over a mesh's positions, or nil for an
+  empty mesh."
+  [{:keys [vertex-count vertices]}]
+  (when (pos? vertex-count)
+    (reduce (fn [[lo hi] i]
+              (let [p (vertex-position vertices i)]
+                [(mapv min lo p) (mapv max hi p)]))
+            (let [p0 (vertex-position vertices 0)] [p0 p0])
+            (range 1 vertex-count))))
+
+(defn- camera-basis
+  "Fixed isometric-ish camera: looking from the +[1 1 1] direction, z-up
+  world. Returns {:right :up :dir} orthonormal basis, `:dir` pointing FROM
+  the scene TOWARD the camera."
+  []
+  (let [dir (normalize [1.0 1.0 1.0])
+        world-up [0.0 0.0 1.0]
+        right (normalize (cross world-up dir))
+        up (normalize (cross dir right))]
+    {:right right :up up :dir dir}))
+
+(defn- project
+  "World point -> [screen-x screen-y depth] in camera space (depth larger =
+  closer to the camera)."
+  [{:keys [right up dir]} center p]
+  (let [rel (v- p center)]
+    [(dot rel right) (dot rel up) (dot rel dir)]))
+
+(defn render-preview!
+  "Rasterizes `mesh` (+ optional parallel `vertex-colors`) to a PNG at
+  `path`. Returns `{:path :width :height :triangle-count
+  :non-background-pixel-count}`. Options: `:width` `:height` (default 220)."
+  ([mesh vertex-colors path] (render-preview! mesh vertex-colors path {}))
+  ([{:keys [vertex-count vertices indices] :as mesh} vertex-colors path
+    {:keys [width height] :or {width 220 height 220}}]
+   (let [[bg-r bg-g bg-b] background-rgb
+         img (image/create width height :rgb)
+         bg-argb (pack-argb bg-r bg-g bg-b)]
+     (dotimes [y height] (dotimes [x width] (image/set-rgb! img x y bg-argb)))
+     (if (or (zero? vertex-count) (empty? indices))
+       (do (io/make-parents path)
+           (image/write-png-file! img (io/file (str path)))
+           {:path (str path) :width width :height height :triangle-count 0
+            :non-background-pixel-count 0})
+       (let [basis (camera-basis)
+             [lo hi] (mesh-bounds mesh)
+             center (mapv #(/ (+ %1 %2) 2.0) lo hi)
+             positions (mapv #(vertex-position vertices %) (range vertex-count))
+             projected (mapv #(project basis center %) positions)
+             xs (mapv first projected) ys (mapv second projected)
+             min-x (apply min xs) max-x (apply max xs)
+             min-y (apply min ys) max-y (apply max ys)
+             extent (max 1e-6 (max (- max-x min-x) (- max-y min-y)))
+             margin 0.08
+             scale (/ (* width (- 1.0 (* 2 margin))) extent)
+             mid-x (/ (+ min-x max-x) 2.0) mid-y (/ (+ min-y max-y) 2.0)
+             to-px (fn [[sx sy _]]
+                     [(+ (/ width 2.0) (* (- sx mid-x) scale))
+                      ;; flip y: screen-space y grows downward, up-axis grows upward
+                      (- (/ height 2.0) (* (- sy mid-y) scale))])
+             pixels (mapv to-px projected)
+             depths (mapv #(nth % 2) projected)
+             colors (or vertex-colors (vec (repeat vertex-count [0.55 0.55 0.58 1.0])))
+             zbuf (double-array (* width height) Double/NEGATIVE_INFINITY)
+             cbuf (int-array (* width height) bg-argb)
+             tri-count (quot (count indices) 3)]
+         (dotimes [t tri-count]
+           (let [i0 (nth indices (* t 3)) i1 (nth indices (+ (* t 3) 1)) i2 (nth indices (+ (* t 3) 2))
+                 [x0 y0] (nth pixels i0) [x1 y1] (nth pixels i1) [x2 y2] (nth pixels i2)
+                 z0 (nth depths i0) z1 (nth depths i1) z2 (nth depths i2)
+                 p0 (nth positions i0) p1 (nth positions i1) p2 (nth positions i2)
+                 face-normal (normalize (cross (v- p1 p0) (v- p2 p0)))
+                 shade (clamp (Math/abs (double (dot face-normal (:dir basis)))) 0.25 1.0)
+                 [cr0 cg0 cb0] (nth colors i0) [cr1 cg1 cb1] (nth colors i1) [cr2 cg2 cb2] (nth colors i2)
+                 tri-color [(/ (+ cr0 cr1 cr2) 3.0) (/ (+ cg0 cg1 cg2) 3.0) (/ (+ cb0 cb1 cb2) 3.0)]
+                 [fr fg fb] (mapv #(clamp (* % shade) 0.0 1.0) tri-color)
+                 argb (pack-argb (int (* 255 fr)) (int (* 255 fg)) (int (* 255 fb)))
+                 area (- (* (- x1 x0) (- y2 y0)) (* (- y1 y0) (- x2 x0)))]
+             (when-not (zero? area)
+               (let [min-px (max 0 (int (Math/floor (double (min x0 x1 x2)))))
+                     max-px (min (dec width) (int (Math/ceil (double (max x0 x1 x2)))))
+                     min-py (max 0 (int (Math/floor (double (min y0 y1 y2)))))
+                     max-py (min (dec height) (int (Math/ceil (double (max y0 y1 y2)))))]
+                 (doseq [py (range min-py (inc max-py))
+                         px (range min-px (inc max-px))]
+                   (let [cx (+ px 0.5) cy (+ py 0.5)
+                         e0 (- (* (- x2 x1) (- cy y1)) (* (- y2 y1) (- cx x1)))
+                         e1 (- (* (- x0 x2) (- cy y2)) (* (- y0 y2) (- cx x2)))
+                         e2 (- (* (- x1 x0) (- cy y0)) (* (- y1 y0) (- cx x0)))
+                         inside? (or (and (>= e0 0.0) (>= e1 0.0) (>= e2 0.0))
+                                     (and (<= e0 0.0) (<= e1 0.0) (<= e2 0.0)))]
+                     (when inside?
+                       (let [w0 (/ e1 area) w1 (/ e2 area) w2 (/ e0 area)
+                             depth (+ (* w0 z0) (* w1 z1) (* w2 z2))
+                             idx (+ px (* py width))]
+                         (when (> depth (aget zbuf idx))
+                           (aset zbuf idx depth)
+                           (aset cbuf idx (int argb)))))))))))
+
+         (dotimes [y height]
+           (dotimes [x width]
+             (image/set-rgb! img x y (aget cbuf (+ x (* y width))))))
+         (io/make-parents path)
+         (image/write-png-file! img (io/file (str path)))
+         {:path (str path) :width width :height height :triangle-count tri-count
+          :non-background-pixel-count (count (remove #(= % bg-argb) cbuf))})))))
