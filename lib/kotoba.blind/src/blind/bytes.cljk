@@ -1,0 +1,156 @@
+(ns blind.bytes
+  "Byte-sequence helpers shared by `blind.core`, portable across the JVM
+  (`byte[]`) and ClojureScript (`js/Uint8Array`).
+
+  Deliberately dependency-free. Base64 and hex are implemented here in
+  portable Clojure rather than delegating to `java.util.Base64` /
+  `js/btoa`, because this library's whole point is that a JVM writer and a
+  browser/Worker writer must produce BYTE-IDENTICAL blinded tokens — a
+  platform-specific codec is one more place for those two to silently
+  disagree (padding, URL-safe alphabet, line wrapping). The volumes here
+  are 32-byte MACs, so the portable implementation's cost is irrelevant.
+
+  Nothing in this namespace prints, logs, or otherwise emits its input."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]))
+
+(defn bytes?*
+  "True if `x` is this platform's byte-sequence type (`byte[]` on the JVM,
+  `js/Uint8Array` on cljs)."
+  [x]
+  #?(:clj  (and (some? x) (.isArray (class x)) (= Byte/TYPE (.getComponentType (class x))))
+     :cljs (instance? js/Uint8Array x)))
+
+(defn blength
+  "Length in bytes."
+  [bs]
+  #?(:clj  (alength ^bytes bs)
+     :cljs (.-length ^js bs)))
+
+(defn to-vec
+  "Byte sequence -> vector of UNSIGNED ints (0-255). The JVM's `byte` is
+  signed, cljs' `Uint8Array` element is not; normalising here is what lets
+  the rest of this namespace be written once."
+  [bs]
+  #?(:clj  (mapv #(bit-and (long %) 0xff) (seq bs))
+     :cljs (vec (array-seq bs))))
+
+(defn of-ints
+  "Vector/seq of ints (0-255) -> this platform's byte sequence."
+  [ints]
+  #?(:clj  (byte-array (map unchecked-byte ints))
+     :cljs (js/Uint8Array. (into-array ints))))
+
+(defn utf8
+  "String -> UTF-8 bytes."
+  [^String s]
+  #?(:clj  (kbytes/utf8-bytes s)
+     :cljs (.encode (js/TextEncoder.) s)))
+
+(defn utf8->str
+  "UTF-8 bytes -> string."
+  [bs]
+  #?(:clj  (kbytes/utf8-string ^bytes bs)
+     :cljs (.decode (js/TextDecoder.) bs)))
+
+(defn concat-bytes
+  "Concatenate two byte sequences into a new one."
+  [a b]
+  (of-ints (into (to-vec a) (to-vec b))))
+
+(defn slice
+  "Sub-range `[start end)` as a new byte sequence. `end` defaults to the
+  end of `bs`."
+  ([bs start] (slice bs start (blength bs)))
+  ([bs start end] (of-ints (subvec (to-vec bs) start end))))
+
+(defn bytes-equal?
+  "Length-then-content equality in time independent of WHERE the first
+  differing byte is (it still reveals the lengths, which are public here:
+  a MAC is always 32 bytes). Used for comparing MACs/tags; never use `=`
+  on raw arrays, which on the JVM compares identity, not content."
+  [a b]
+  (let [va (to-vec a)
+        vb (to-vec b)]
+    (if (not= (count va) (count vb))
+      false
+      (zero? (reduce bit-or 0 (map bit-xor va vb))))))
+
+;; ── hex ─────────────────────────────────────────────────────────────────────
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn hex
+  "Bytes -> lowercase hex string."
+  [bs]
+  (->> (to-vec bs)
+       (mapcat (fn [b] [(nth hex-digits (bit-shift-right b 4))
+                        (nth hex-digits (bit-and b 0x0f))]))
+       (apply str)))
+
+(defn unhex
+  "Hex string (either case, even length) -> bytes."
+  [s]
+  (let [s (str/lower s)]
+    (when (odd? (count s))
+      (throw (ex-info "blind.bytes/unhex: odd-length hex string"
+                      {:blind/error :bad-hex :length (count s)})))
+    (of-ints
+     (map (fn [[a b]]
+            (let [hi (str/index-of hex-digits (str a))
+                  lo (str/index-of hex-digits (str b))]
+              (when (or (nil? hi) (nil? lo))
+                (throw (ex-info "blind.bytes/unhex: non-hex character"
+                                {:blind/error :bad-hex})))
+              (+ (* 16 hi) lo)))
+          (partition 2 (seq s))))))
+
+;; ── base64 (RFC 4648 §4, standard alphabet, padded) ─────────────────────────
+
+(def ^:private b64-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(defn base64
+  "Bytes -> standard (RFC 4648 §4) base64, `+/` alphabet, `=`-padded, no
+  line breaks. Matches `java.util.Base64/getEncoder` and `js/btoa`."
+  [bs]
+  (let [v (to-vec bs)
+        n (count v)]
+    (loop [i 0 out []]
+      (if (>= i n)
+        (apply str out)
+        (let [b0 (nth v i)
+              b1 (when (< (+ i 1) n) (nth v (+ i 1)))
+              b2 (when (< (+ i 2) n) (nth v (+ i 2)))
+              c0 (bit-shift-right b0 2)
+              c1 (bit-or (bit-shift-left (bit-and b0 0x03) 4)
+                         (if b1 (bit-shift-right b1 4) 0))
+              c2 (when b1 (bit-or (bit-shift-left (bit-and b1 0x0f) 2)
+                                  (if b2 (bit-shift-right b2 6) 0)))
+              c3 (when b2 (bit-and b2 0x3f))]
+          (recur (+ i 3)
+                 (conj out
+                       (nth b64-alphabet c0)
+                       (nth b64-alphabet c1)
+                       (if c2 (nth b64-alphabet c2) \=)
+                       (if c3 (nth b64-alphabet c3) \=))))))))
+
+(defn unbase64
+  "Standard base64 string -> bytes."
+  [s]
+  (loop [cs (->> (seq s) (map str) (remove #(= "=" %)))
+         acc 0 nbits 0 out []]
+    (if-let [c (first cs)]
+      (let [v (str/index-of b64-alphabet c)]
+        (when (nil? v)
+          (throw (ex-info "blind.bytes/unbase64: non-base64 character"
+                          {:blind/error :bad-base64})))
+        (let [acc' (bit-or (bit-shift-left acc 6) v)
+              nb (+ nbits 6)]
+          (if (>= nb 8)
+            (let [shift (- nb 8)]
+              (recur (rest cs)
+                     (bit-and acc' (dec (bit-shift-left 1 shift)))
+                     shift
+                     (conj out (bit-and (bit-shift-right acc' shift) 0xff))))
+            (recur (rest cs) acc' nb out))))
+      (of-ints out))))

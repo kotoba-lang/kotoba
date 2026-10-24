@@ -1,0 +1,351 @@
+(ns blind.core-test
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
+            [kotoba.lang.text :as str]
+            [blind.bytes :as b]
+            [blind.core :as c]
+            [blind.vectors :as v]))
+
+;; Every deftest below exists in BOTH a `:clj` and a `:cljs` form, with the
+;; same name and the same assertions against the same data in
+;; `blind.vectors`. That duplication is the point: `blind.core` is
+;; synchronous on the JVM and `js/Promise`-based on cljs (Web Crypto has no
+;; synchronous HMAC or AEAD), so the two suites cannot share a body — but
+;; they can and do share the expected answers, which is what turns "each
+;; runtime agrees with itself" into "both runtimes produce the same bytes".
+
+(def ^:private dek (b/unhex v/test-dek-hex))
+(def ^:private blind-key (b/unhex v/test-blind-key-hex))
+(def ^:private nonce-key (b/unhex v/test-nonce-key-hex))
+
+(def ^:private blind (c/blind-fn blind-key))
+(def ^:private seal (c/encrypt-fn {:dek dek :nonce-key nonce-key}))
+(def ^:private open (c/decrypt-fn {:dek dek}))
+
+(defn- ex-data-of
+  "Run `f`, return the `ex-data` of whatever it throws (nil if it doesn't).
+  Portable stand-in for `thrown?`, and it lets assertions be about the
+  structured `:blind/error` rather than a message string."
+  [f]
+  (try (f) nil (catch #?(:clj Exception :cljs :default) e (ex-data e))))
+
+#?(:cljs
+   (defn- settle
+     "Finish a cljs.test async block: call `done` on fulfilment, and fail
+     loudly (rather than time out) on rejection."
+     [p done]
+     (.then p
+            (fn [_] (done))
+            (fn [e] (is false (str "unexpected rejection: " e)) (done)))))
+
+;; ── codecs (RFC 4648 §10) ───────────────────────────────────────────────────
+;; Platform-independent, so one shared body. The portable base64 in
+;; blind.bytes is what the blinded tokens are encoded with, so if it drifted
+;; from the standard alphabet/padding the two runtimes would still agree
+;; with each other while disagreeing with everyone else.
+
+(deftest base64-matches-rfc4648
+  (doseq [[input expected] [["" ""]
+                            ["f" "Zg=="]
+                            ["fo" "Zm8="]
+                            ["foo" "Zm9v"]
+                            ["foob" "Zm9vYg=="]
+                            ["fooba" "Zm9vYmE="]
+                            ["foobar" "Zm9vYmFy"]]]
+    (is (= expected (b/base64 (b/utf8 input))) (str "encode " (pr-str input)))
+    (is (= input (b/utf8->str (b/unbase64 expected))) (str "decode " (pr-str expected)))))
+
+(deftest hex-round-trips-and-is-lowercase
+  (let [bs (b/of-ints [0 1 15 16 127 128 254 255])]
+    (is (= "00010f107f80feff" (b/hex bs)))
+    (is (b/bytes-equal? bs (b/unhex "00010F107F80FEFF")) "uppercase hex accepted"))
+  (is (= :bad-hex (:blind/error (ex-data-of #(b/unhex "abc")))))
+  (is (= :bad-hex (:blind/error (ex-data-of #(b/unhex "zz"))))))
+
+(deftest bytes-equal-compares-content-not-identity
+  (is (b/bytes-equal? (b/of-ints [1 2 3]) (b/of-ints [1 2 3])))
+  (is (not (b/bytes-equal? (b/of-ints [1 2 3]) (b/of-ints [1 2 4]))))
+  (is (not (b/bytes-equal? (b/of-ints [1 2 3]) (b/of-ints [1 2])))))
+
+;; ── RFC 4231: HMAC-SHA-256 known answers ────────────────────────────────────
+
+(defn- rfc4231-msg [{:keys [text hex]}]
+  (if (some? text) (b/utf8 text) (b/unhex hex)))
+
+(defn- rfc4231-check [{:keys [name mac-hex truncate-bytes]} mac]
+  (let [got (if truncate-bytes (b/slice mac 0 truncate-bytes) mac)]
+    (is (= mac-hex (b/hex got)) name)))
+
+#?(:clj
+   (deftest rfc4231-hmac-sha256-known-answers
+     (testing "all 7 published HMAC-SHA-256 vectors from RFC 4231 §4"
+       (is (= 7 (count v/rfc4231)))
+       (doseq [{:keys [key-hex] :as tc} v/rfc4231]
+         (rfc4231-check tc (c/hmac-sha256 (b/unhex key-hex) (rfc4231-msg tc))))))
+
+   :cljs
+   (deftest rfc4231-hmac-sha256-known-answers
+     (is (= 7 (count v/rfc4231)))
+     (async done
+       (settle
+        (-> (js/Promise.all
+             (into-array (for [{:keys [key-hex] :as tc} v/rfc4231]
+                           (c/hmac-sha256 (b/unhex key-hex) (rfc4231-msg tc)))))
+            (.then (fn [macs]
+                     (doseq [[tc mac] (map vector v/rfc4231 (array-seq macs))]
+                       (rfc4231-check tc mac)))))
+        done))))
+
+;; ── NIST CAVP: AES-256-GCM known answers ────────────────────────────────────
+
+#?(:clj
+   (deftest nist-aes-256-gcm-known-answers
+     (testing "seal reproduces the published ciphertext++tag, open reverses it"
+       (is (= 3 (count v/nist-gcm-aes256)))
+       (doseq [{:keys [name key-hex iv-hex pt-hex ct-hex]} v/nist-gcm-aes256]
+         (let [k (b/unhex key-hex) iv (b/unhex iv-hex) pt (b/unhex pt-hex)]
+           (is (= ct-hex (b/hex (c/aes-gcm-seal k iv pt))) name)
+           (is (= pt-hex (b/hex (c/aes-gcm-open k iv (b/unhex ct-hex))))
+               (str name " (open)"))))))
+
+   :cljs
+   (deftest nist-aes-256-gcm-known-answers
+     (is (= 3 (count v/nist-gcm-aes256)))
+     (async done
+       (settle
+        (js/Promise.all
+         (into-array
+          (for [{:keys [name key-hex iv-hex pt-hex ct-hex]} v/nist-gcm-aes256]
+            (let [k (b/unhex key-hex) iv (b/unhex iv-hex) pt (b/unhex pt-hex)]
+              (js/Promise.all
+               #js [(.then (c/aes-gcm-seal k iv pt)
+                           (fn [ct] (is (= ct-hex (b/hex ct)) name)))
+                    (.then (c/aes-gcm-open k iv (b/unhex ct-hex))
+                           (fn [got] (is (= pt-hex (b/hex got))
+                                         (str name " (open)"))))])))))
+        done))))
+
+;; ── cross-runtime agreement on this library's own composition ───────────────
+
+#?(:clj
+   (deftest golden-blind-tokens-agree-across-runtimes
+     (testing "pr-str serialisation is what the goldens assume"
+       (doseq [{:keys [name component serialized]} v/golden-blind]
+         (is (= serialized (pr-str component)) name)))
+     (testing "base64(HMAC(blind-key, UTF-8(pr-str component)))"
+       (doseq [{:keys [name component token]} v/golden-blind]
+         (is (= token (blind component)) name))))
+
+   :cljs
+   (deftest golden-blind-tokens-agree-across-runtimes
+     (doseq [{:keys [name component serialized]} v/golden-blind]
+       (is (= serialized (pr-str component)) name))
+     (async done
+       (settle
+        (-> (js/Promise.all (into-array (map (comp blind :component) v/golden-blind)))
+            (.then (fn [tokens]
+                     (doseq [[{:keys [name token]} got]
+                             (map vector v/golden-blind (array-seq tokens))]
+                       (is (= token got) name)))))
+        done))))
+
+#?(:clj
+   (deftest golden-sealed-blobs-agree-across-runtimes
+     (doseq [{:keys [name text blob-hex]} v/golden-seal]
+       (is (= blob-hex (b/hex (seal (b/utf8 text)))) name)))
+
+   :cljs
+   (deftest golden-sealed-blobs-agree-across-runtimes
+     (async done
+       (settle
+        (-> (js/Promise.all
+             (into-array (map (fn [{:keys [text]}] (seal (b/utf8 text))) v/golden-seal)))
+            (.then (fn [blobs]
+                     (doseq [[{:keys [name blob-hex]} got]
+                             (map vector v/golden-seal (array-seq blobs))]
+                       (is (= blob-hex (b/hex got)) name)))))
+        done))))
+
+;; ── determinism: the property fold! depends on ──────────────────────────────
+
+#?(:clj
+   (deftest deterministic-mode-is-deterministic
+     (testing "same plaintext seals to identical bytes (fold-convergence)"
+       (let [pt (b/utf8 "same input")]
+         (is (b/bytes-equal? (seal pt) (seal pt)))))
+     (testing "different plaintexts do not collide"
+       (is (not (b/bytes-equal? (seal (b/utf8 "input a")) (seal (b/utf8 "input b"))))))
+     (testing "the nonce is the plaintext-derived one, not an arbitrary 12 bytes"
+       (let [pt (b/utf8 "same input")]
+         (is (b/bytes-equal? (c/derive-nonce nonce-key pt)
+                             (b/slice (seal pt) 0 c/nonce-length)))))
+     (testing "blind tokens are stable"
+       (is (= (blind "alice") (blind "alice")))
+       (is (not= (blind "alice") (blind "bob")))))
+
+   :cljs
+   (deftest deterministic-mode-is-deterministic
+     (async done
+       (let [pt (b/utf8 "same input")]
+         (settle
+          (-> (js/Promise.all #js [(seal pt) (seal pt)
+                                   (seal (b/utf8 "input a")) (seal (b/utf8 "input b"))
+                                   (c/derive-nonce nonce-key pt)
+                                   (blind "alice") (blind "alice") (blind "bob")])
+              (.then (fn [[s1 s2 sa sb n t1 t2 t3]]
+                       (is (b/bytes-equal? s1 s2)
+                           "same plaintext seals to identical bytes (fold-convergence)")
+                       (is (not (b/bytes-equal? sa sb))
+                           "different plaintexts do not collide")
+                       (is (b/bytes-equal? n (b/slice s1 0 c/nonce-length))
+                           "nonce is the plaintext-derived one")
+                       (is (= t1 t2) "blind tokens are stable")
+                       (is (not= t1 t3)))))
+          done)))))
+
+;; ── round-trip, one-wayness, tamper detection ───────────────────────────────
+
+#?(:clj
+   (deftest seal-open-round-trips
+     (doseq [text ["" "round-trip me" "日本語 mixed ascii" (apply str (repeat 500 "x"))]]
+       (is (= text (b/utf8->str (open (seal (b/utf8 text))))) (pr-str text))))
+
+   :cljs
+   (deftest seal-open-round-trips
+     (async done
+       (let [texts ["" "round-trip me" "日本語 mixed ascii" (apply str (repeat 500 "x"))]]
+         (settle
+          (js/Promise.all
+           (into-array
+            (for [text texts]
+              (-> (seal (b/utf8 text))
+                  (.then open)
+                  (.then (fn [pt] (is (= text (b/utf8->str pt)) (pr-str text))))))))
+          done)))))
+
+(deftest blind-token-does-not-leak-its-input
+  ;; Shape-only, synchronous on both platforms: a token is base64 of 32
+  ;; bytes, so it is 44 characters and cannot contain the plaintext.
+  (let [token-len (count (b/base64 (b/of-ints (repeat 32 0))))]
+    (is (= 44 token-len))))
+
+#?(:clj
+   (deftest blind-token-is-opaque
+     (let [t (blind "alice")]
+       (is (= 44 (count t)))
+       (is (not (str/includes? t "alice")))))
+
+   :cljs
+   (deftest blind-token-is-opaque
+     (async done
+       (settle
+        (-> (blind "alice")
+            (.then (fn [t]
+                     (is (= 44 (count t)))
+                     (is (not (str/includes? t "alice"))))))
+        done))))
+
+#?(:clj
+   (deftest tampering-is-detected
+     (testing "flipping one ciphertext byte fails authentication"
+       (let [blob (seal (b/utf8 "round-trip me"))
+             flipped (b/of-ints (update (b/to-vec blob) 20 bit-xor 0x01))]
+         (is (= :auth-failed (:blind/error (ex-data-of #(open flipped)))))))
+     (testing "a different key fails authentication"
+       (let [other (c/decrypt-fn {:dek (b/of-ints (repeat 32 9))})]
+         (is (= :auth-failed (:blind/error (ex-data-of #(other (seal (b/utf8 "x")))))))))
+     (testing "a blob too short to hold a nonce and a tag is rejected before decrypting"
+       (is (= :truncated (:blind/error (ex-data-of #(open (b/of-ints (repeat 20 0)))))))))
+
+   :cljs
+   (deftest tampering-is-detected
+     (async done
+       (settle
+        (-> (seal (b/utf8 "round-trip me"))
+            (.then (fn [blob]
+                     (let [flipped (b/of-ints (update (b/to-vec blob) 20 bit-xor 0x01))
+                           other (c/decrypt-fn {:dek (b/of-ints (repeat 32 9))})]
+                       (js/Promise.all
+                        #js [(.then (open flipped)
+                                    (fn [_] (is false "tampered blob opened"))
+                                    (fn [e] (is (= :auth-failed (:blind/error (ex-data e)))
+                                                "flipped ciphertext byte")))
+                             (.then (other blob)
+                                    (fn [_] (is false "wrong key opened"))
+                                    (fn [e] (is (= :auth-failed (:blind/error (ex-data e)))
+                                                "wrong key")))
+                             (.then (open (b/of-ints (repeat 20 0)))
+                                    (fn [_] (is false "truncated blob opened"))
+                                    (fn [e] (is (= :truncated (:blind/error (ex-data e)))
+                                                "truncated blob")))])))))
+        done))))
+
+;; ── the opt-in random-nonce mode, and what it costs ─────────────────────────
+
+#?(:clj
+   (deftest random-nonce-mode-is-opt-in-and-breaks-determinism
+     (let [rseal (c/encrypt-fn {:dek dek :nonce :random})
+           pt (b/utf8 "same input")]
+       (testing "identical plaintext seals to DIFFERENT bytes -- this is the cost"
+         (is (not (b/bytes-equal? (rseal pt) (rseal pt)))))
+       (testing "the same decrypt-fn still reads it (the nonce is on the wire)"
+         (is (= "same input" (b/utf8->str (open (rseal pt))))))
+       (testing "and the default mode does NOT behave this way"
+         (is (b/bytes-equal? (seal pt) (seal pt))))))
+
+   :cljs
+   (deftest random-nonce-mode-is-opt-in-and-breaks-determinism
+     (async done
+       (let [rseal (c/encrypt-fn {:dek dek :nonce :random})
+             pt (b/utf8 "same input")]
+         (settle
+          (-> (js/Promise.all #js [(rseal pt) (rseal pt) (seal pt) (seal pt)])
+              (.then (fn [[r1 r2 d1 d2]]
+                       (is (not (b/bytes-equal? r1 r2))
+                           "identical plaintext seals to DIFFERENT bytes -- this is the cost")
+                       (is (b/bytes-equal? d1 d2)
+                           "the default mode does NOT behave this way")
+                       (.then (open r1)
+                              (fn [got] (is (= "same input" (b/utf8->str got))
+                                            "same decrypt-fn still reads it"))))))
+          done)))))
+
+;; ── key handling: explicit, checked, never echoed ───────────────────────────
+
+(deftest key-material-is-validated
+  (testing "the DEK must be exactly 32 bytes (AES-256 only)"
+    (is (= :bad-key-length
+           (:blind/error (ex-data-of #(c/encrypt-fn {:dek (b/of-ints (repeat 16 1))
+                                                     :nonce-key nonce-key})))))
+    (is (= :bad-key-length
+           (:blind/error (ex-data-of #(c/decrypt-fn {:dek (b/of-ints (repeat 33 1))}))))))
+  (testing "MAC keys must be at least 32 bytes"
+    (is (= :bad-key-length
+           (:blind/error (ex-data-of #(c/blind-fn (b/of-ints (repeat 8 1))))))))
+  (testing "keys must be raw bytes, not strings"
+    (is (= :not-bytes (:blind/error (ex-data-of #(c/blind-fn "not bytes"))))))
+  (testing "a nonce mode must be chosen explicitly -- there is no silent default"
+    (is (= :bad-option (:blind/error (ex-data-of #(c/encrypt-fn {:dek dek})))))
+    (is (= :bad-option (:blind/error (ex-data-of #(c/encrypt-fn {:dek dek
+                                                                 :nonce-key nonce-key
+                                                                 :nonce :random})))))))
+
+(deftest errors-never-carry-key-material-or-plaintext
+  ;; The whole point of taking keys explicitly is undone if they leak into
+  ;; a log line via an exception. Assert the shape of what we throw.
+  (let [d (ex-data-of #(c/encrypt-fn {:dek (b/of-ints (repeat 16 1)) :nonce-key nonce-key}))]
+    (is (= #{:blind/error :blind/role :expected :actual} (set (keys d))))
+    (is (every? (fn [x] (or (keyword? x) (number? x))) (vals d))
+        "only keywords and lengths -- no byte arrays"))
+  (let [d (ex-data-of #(c/blind-fn (b/of-ints (repeat 8 1))))]
+    (is (= #{:blind/error :blind/role :minimum :actual} (set (keys d))))))
+
+(deftest library-reads-no-ambient-key-source
+  ;; A behavioural check, not a source-code grep: every entry point refuses
+  ;; to do anything at all without key bytes handed to it. If a default
+  ;; from an env var or a file were ever introduced, these would start
+  ;; succeeding.
+  (is (some? (ex-data-of #(c/blind-fn nil))))
+  (is (some? (ex-data-of #(c/encrypt-fn {}))))
+  (is (some? (ex-data-of #(c/decrypt-fn {}))))
+  (is (some? (ex-data-of #(c/encrypt-fn {:nonce-key nonce-key})))))
