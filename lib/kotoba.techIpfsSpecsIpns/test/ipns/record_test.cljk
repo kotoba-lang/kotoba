@@ -1,0 +1,184 @@
+(ns ipns.record-test
+  "Byte-level assertions about the IPNS record. The 'signer' returns its input,
+  so every test here is about *which bytes* get signed and stored — the half
+  that actually decides whether a real IPFS node accepts the record."
+  (:require [cbor.core :as cbor]
+            [kotoba.test :refer [deftest is testing]]
+            [ipns.core :as core]
+            [ipns.record :as rec]
+            [protobuf.wire :as pb]))
+
+(def pubkey (vec (range 32)))
+(def name (core/pubkey->name pubkey))
+
+(defn- echo-sign [octets] (vec octets))
+(defn- echo-verify [_pub message sig] (= (vec message) (vec sig)))
+
+(def validity (rec/rfc3339-nanos {:year 2030 :month 1 :day 1 :hour 0 :minute 0 :second 0}))
+(def now-2026 1767225600000)   ; 2026-01-01T00:00:00Z
+
+(defn- make [& {:as opts}]
+  (rec/create (merge {:value "/ipfs/bafkqaaa" :validity validity
+                      :sequence 1 :sign-fn echo-sign}
+                     opts)))
+
+;; ── the routing key ───────────────────────────────────────────────────────
+
+(deftest the-routing-key-is-slash-ipns-plus-the-binary-multihash
+  (let [k (rec/routing-key name)
+        prefix (vec (pb/utf8-bytes "/ipns/"))]
+    (is (= prefix (subvec k 0 6)))
+    (is (= (rec/name->multihash name) (subvec k 6)))
+    (testing "the multihash is the CID with its version/codec prefix removed"
+      (let [mh (rec/name->multihash name)]
+        (is (= 0x00 (first mh)) "identity multihash")
+        (is (= 36 (second mh)) "the 36-byte libp2p PublicKey protobuf")))
+    (testing "it is NOT the text name — that would address a key nobody looks at"
+      (is (not= k (vec (pb/utf8-bytes (str "/ipns/" name)))))
+      (is (< (count k) (count (pb/utf8-bytes (str "/ipns/" name))))))))
+
+(deftest the-routing-key-round-trips-to-the-same-public-key
+  (let [mh (rec/name->multihash name)]
+    ;; identity multihash: [0x00 len protobuf...]; the protobuf is
+    ;; [0x08 0x01 0x12 0x20 <32-byte key>]
+    (is (= pubkey (vec (drop 6 mh))))
+    (is (= pubkey (core/name->pubkey name)))))
+
+;; ── the signing input ─────────────────────────────────────────────────────
+
+(deftest the-signature-covers-the-cbor-not-the-protobuf
+  (let [r (make)
+        input (rec/signing-input (:data r))]
+    (is (= (vec (pb/utf8-bytes "ipns-signature:")) (subvec input 0 15))
+        "the prefix is mandatory; a validator rebuilds this exact input")
+    (is (= (rec/->ints (:data r)) (subvec input 15)))
+    (is (= input (:signature-v2 r)) "the echo signer makes the signed bytes visible")
+    (testing "signing the protobuf instead would produce a different input"
+      (is (not= input (rec/serialize r))))))
+
+;; ── round trip ────────────────────────────────────────────────────────────
+
+(deftest a-record-serializes-parses-and-validates
+  (let [r (make)
+        bs (rec/serialize r)
+        parsed (rec/parse bs)
+        v (rec/validate parsed name {:verify-fn echo-verify :now-ms now-2026})]
+    (is (:valid? v) (pr-str (dissoc v :fields)))
+    (is (= "/ipfs/bafkqaaa" (pb/utf8-string (get-in v [:fields :value]))))
+    (is (= 1 (get-in v [:fields :sequence])))
+    (is (= rec/default-ttl-ns (get-in v [:fields :ttl])))
+    (testing "and the protobuf round-trips byte-for-byte"
+      (is (pb/round-trips? rec/schema bs)))))
+
+(deftest both-halves-are-written-and-agree
+  (let [r (make)]
+    (testing "the duplicate protobuf fields exist for pre-V2 readers"
+      (is (some? (:value r)))
+      (is (some? (:validity r)))
+      (is (= 1 (:sequence r)))
+      (is (= rec/validity-eol (:validity-type r))))
+    (testing "and carry the same values as the signed CBOR"
+      (let [v (rec/validate r name {:verify-fn echo-verify :now-ms now-2026})]
+        (is (:valid? v))
+        (is (= (rec/->ints (:value r)) (get-in v [:fields :value])))))))
+
+;; ── the checks that matter ────────────────────────────────────────────────
+
+(deftest a-rewritten-protobuf-half-is-caught
+  ;; The attack the duplication invites: sign a CBOR saying one thing, then
+  ;; edit the unsigned protobuf fields to say another. The signature still
+  ;; verifies — it only covers the CBOR.
+  (let [r (make)
+        tampered (assoc r :value (vec (pb/utf8-bytes "/ipfs/bafyEVIL")))
+        v (rec/validate tampered name {:verify-fn echo-verify :now-ms now-2026})]
+    (is (false? (:valid? v)))
+    (is (= :protobuf-cbor-mismatch (:reason v)))
+    (is (= [:value] (:fields v)))
+    (testing "a signature check alone would have passed it"
+      (is (echo-verify pubkey (rec/signing-input (:data tampered)) (:signature-v2 tampered))))))
+
+(deftest a-sequence-bumped-only-in-the-protobuf-is-caught
+  (let [r (make :sequence 1)
+        v (rec/validate (assoc r :sequence 9999) name
+                        {:verify-fn echo-verify :now-ms now-2026})]
+    (is (= :protobuf-cbor-mismatch (:reason v)))
+    (is (= [:sequence] (:fields v)))))
+
+(deftest a-v1-only-record-is-refused
+  (let [r (dissoc (make) :signature-v2 :data)
+        v (rec/validate (assoc r :signature-v1 [1 2 3]) name
+                        {:verify-fn echo-verify :now-ms now-2026})]
+    (is (false? (:valid? v)))
+    (is (= :missing-v2 (:reason v)))
+    (testing "V1 signatures were forgeable by rewriting the unsigned fields — accepting them reopens that"
+      (is (re-find #"forgeable" (:detail v))))))
+
+(deftest a-bad-signature-is-refused
+  (let [r (assoc (make) :signature-v2 [0 0 0])
+        v (rec/validate r name {:verify-fn echo-verify :now-ms now-2026})]
+    (is (= :bad-signature (:reason v)))))
+
+(deftest an-expired-record-is-refused
+  (let [r (make :validity (rec/rfc3339-nanos {:year 2020 :month 1 :day 1
+                                              :hour 0 :minute 0 :second 0}))
+        v (rec/validate r name {:verify-fn echo-verify :now-ms now-2026})]
+    (is (= :expired (:reason v))))
+  (testing "and an unparseable validity fails closed rather than open"
+    (is (rec/expired? {:validity (pb/utf8-bytes "not a timestamp")} now-2026))))
+
+(deftest an-unknown-validity-type-is-refused-rather-than-assumed-eol
+  ;; Sign a CBOR whose ValidityType is 7, and make the protobuf half agree so
+  ;; the mismatch check passes and the validity-type check is what fires.
+  (let [data (rec/->ints
+              (cbor/encode (rec/data-map {:value (pb/utf8-bytes "/ipfs/bafkqaaa")
+                                          :validity (pb/utf8-bytes validity)
+                                          :validity-type 7
+                                          :sequence 1
+                                          :ttl rec/default-ttl-ns})))
+        r {:value (vec (pb/utf8-bytes "/ipfs/bafkqaaa"))
+           :validity (vec (pb/utf8-bytes validity))
+           :validity-type 7 :sequence 1 :ttl rec/default-ttl-ns
+           :data data :signature-v2 (echo-sign (rec/signing-input data))}
+        v (rec/validate r name {:verify-fn echo-verify :now-ms now-2026})]
+    (is (false? (:valid? v)))
+    (is (= :unsupported-validity-type (:reason v))
+        "guessing would mean deciding a record is valid when its author said something we did not understand")))
+
+(deftest a-record-over-ten-kib-is-refused-before-parsing
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (rec/parse (vec (repeat (inc rec/max-size) 0))))))
+
+(deftest a-name-we-cannot-derive-a-key-from-is-refused
+  (let [v (rec/validate (make) "not-an-ipns-name" {:verify-fn echo-verify :now-ms now-2026})]
+    (is (= :unsupported-name (:reason v)))))
+
+;; ── validity formatting ───────────────────────────────────────────────────
+
+(deftest validity-is-rfc3339-with-exactly-nine-fractional-digits
+  (is (= "2030-01-01T00:00:00.000000000Z" validity))
+  (is (= 30 (count validity)))
+  (testing "and parses back"
+    (is (= {:year 2030 :month 1 :day 1 :hour 0 :minute 0 :second 0 :nanos 0}
+           (rec/parse-rfc3339 validity))))
+  (testing "a looser form is refused — we could not reproduce it byte-identically"
+    (is (nil? (rec/parse-rfc3339 "2030-01-01T00:00:00Z")))
+    (is (nil? (rec/parse-rfc3339 "2030-01-01T00:00:00.000Z")))))
+
+(deftest validity-converts-to-epoch-milliseconds
+  (is (= 1893456000000 (rec/validity->ms "2030-01-01T00:00:00.000000000Z")))
+  (is (= 0 (rec/validity->ms "1970-01-01T00:00:00.000000000Z"))))
+
+;; ── selection ─────────────────────────────────────────────────────────────
+
+(deftest selection-prefers-the-higher-sequence-then-the-later-expiry
+  (let [a {:sequence 1 :validity (pb/utf8-bytes validity)}
+        b {:sequence 2 :validity (pb/utf8-bytes validity)}
+        c {:sequence 2 :validity (pb/utf8-bytes
+                                  (rec/rfc3339-nanos {:year 2031 :month 1 :day 1
+                                                      :hour 0 :minute 0 :second 0}))}]
+    (is (rec/better? b a))
+    (is (not (rec/better? a b)))
+    (is (rec/better? c b) "same sequence, later EOL wins")
+    (is (= c (rec/select [a b c])))
+    (is (= b (rec/select [a b])))
+    (is (nil? (rec/select [])))))

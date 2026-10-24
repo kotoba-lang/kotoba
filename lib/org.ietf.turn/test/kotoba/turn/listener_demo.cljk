@@ -1,0 +1,393 @@
+;; Not a unit test — an EXECUTABLE end-to-end demo that must genuinely pass
+;; when run. Mirrors the rigor `kotoba-lang/dtn`'s
+;; `test/kotoba/dtn/transport/tcp_demo.cljs` established for that repo's own
+;; first "does this actually move real bytes" namespace: PASS/FAIL printed
+;; per scenario, a final "RESULT: N/3 scenarios passed" line, and
+;; `js/process.exit` 0 iff all 3 passed (else 1).
+;;
+;; What this proves that a plain unit test on `kotoba.turn.listener`'s own
+;; functions could not: this demo builds every client-side STUN message BY
+;; HAND, directly from `kotoba.turn.stun`'s primitives (encode-header /
+;; push-attr / set-attr-length / append-message-integrity /
+;; append-fingerprint — the exact same "how do I build a signed request"
+;; sequence this repo's README already documents) over a REAL
+;; `node:dgram` socket the demo controls directly — never by calling into
+;; `kotoba.turn.listener`'s own internal handler functions. That is the
+;; only honest way to prove the LISTENER's own parsing/dispatch/relay logic
+;; is real: an assertion that only exercised the listener's internals from
+;; the same process, without a real socket round-trip, could pass even if
+;; the wire-format handling were subtly broken.
+;;
+;; The "peer" is a second real `node:dgram` socket, deliberately NOT
+;; TURN-aware in any way (no STUN/ChannelData framing on its side at all)
+;; — the honest simulation of an arbitrary UDP endpoint (a game server, a
+;; SIP media peer, anything) that a TURN relay exists to reach. It just
+;; echoes back whatever bytes arrive, with "-echo" appended, so replies are
+;; trivially distinguishable from requests.
+;;
+;; Run from this repo's root (nbb, not `kbb -M:test` — this is `.cljs`,
+;; real socket I/O, see `kotoba.turn.listener`'s own namespace docstring for
+;; why that split exists):
+;;
+;;   kbb --backend sci --classpath "src:test:../bytes/src" test/kotoba/turn/listener_demo.cljk
+;;
+;; Scenario 1 proves the full authenticated Allocate -> CreatePermission ->
+;; Send-indication data path in BOTH directions: client -> peer (hop 1,
+;; asserted via the peer's own raw socket actually receiving the payload)
+;; AND peer -> client (hop 2, the harder direction most integrations get
+;; lazy about — asserted via the client's own raw socket actually receiving
+;; a real STUN Data indication carrying the peer's echoed reply).
+;;
+;; Scenario 2 proves the ChannelBind fast path is a SEPARATE real code path,
+;; not just a re-skin of scenario 1: binds a channel number, sends the
+;; client -> peer leg as raw ChannelData (no STUN framing at all) instead of
+;; a Send indication, and confirms the peer -> client return leg arrives as
+;; ChannelData too (not a Data indication) — checked with
+;; `kotoba.turn.demux/classify-datagram` on the raw bytes the client socket
+;; actually received, not just by trusting `kotoba.turn.channeldata/decode`
+;; to succeed (a STUN message could coincidentally decode-shaped-wrong; the
+;; demux check is what actually distinguishes the two wire formats).
+;;
+;; Scenario 3 proves the auth boundary: an Allocate request signed with a
+;; credential minted under the WRONG shared secret (a different value than
+;; the listener was started with) is rejected — no allocation is created
+;; (checked directly against the listener's own exposed state atom, not
+;; just "we got an error response"), and a subsequent Send indication from
+;; that same unauthenticated address relays nothing (the peer's receive
+;; count is unchanged) — mirroring the rigor `dtn`'s own auth-rejection
+;; scenario (4b, forged-signature bundle) established: reject the direct
+;; response AND confirm the attacker gains no side effect.
+(ns kotoba.turn.listener-demo
+  (:require ["node:dgram" :as dgram]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [kotoba.bytes :as b]
+            [kotoba.turn.stun :as stun]
+            [kotoba.turn.credential :as cred]
+            [kotoba.turn.channeldata :as cd]
+            [kotoba.turn.demux :as demux]
+            [kotoba.turn.listener :as listener]))
+
+;; ---------------------------------------------------------------------------
+;; Generic Node/byte-vector plumbing (deliberately re-implemented here, not
+;; required from kotoba.turn.listener — see this ns's docstring for why).
+;; ---------------------------------------------------------------------------
+
+(defn- buf->vec [buf] (vec buf))
+(defn- vec->buf [v] (js/Buffer.from (clj->js v)))
+(defn- ip-str->vec [s] (mapv #(js/parseInt % 10) (str/split s #"\.")))
+(defn- rand-txid [] (vec (repeatedly 12 #(rand-int 256))))
+
+(defn- sleep-ms [ms]
+  (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- bind! [sock port host]
+  (js/Promise. (fn [resolve _] (.bind sock port host (fn [] (resolve (.address sock)))))))
+
+(defn- send-and-wait!
+  "Send `data` from `sock` to `host:port`, then wait for the NEXT message
+   received on `sock` (assumed to be the reply to this send). Registers the
+   `\"message\"` listener BEFORE sending — a real race exists here (a fast
+   local reply can arrive before a naively-later-registered listener would
+   catch it; this was verified empirically while building this demo: a
+   `promesa.core/p/let` binding of a not-yet-registered listener promise
+   deadlocks exactly this way) — so this function is deliberately a single
+   Promise executor that does listener-registration and send synchronously
+   in order, not two separately-await'd steps. Resolves `[data-vec rinfo]`,
+   or `nil` if nothing arrives within `timeout-ms` (e.g. scenario 3's
+   rejected/unrelayed cases)."
+  [sock data port host timeout-ms]
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [done (atom false)
+            finish! (fn [v] (when-not @done (reset! done true) (resolve v)))
+            timer (js/setTimeout #(finish! nil) timeout-ms)]
+        (.once sock "message"
+               (fn [msg rinfo]
+                 (js/clearTimeout timer)
+                 (finish! [(buf->vec msg) rinfo])))
+        (.send sock (vec->buf data) port host
+               (fn [err] (when err (println "  (send error:" err ")"))))))))
+
+(defn- wait-for-message!
+  "Like `send-and-wait!`'s receive half alone: registers a one-shot
+   `\"message\"` listener on `sock` right now (synchronously) and returns a
+   Promise that resolves `[data-vec rinfo]` on the next message, or `nil`
+   after `timeout-ms`. Used (unlike `send-and-wait!`) when the reply we
+   care about is NOT a direct response to the very next thing we send —
+   e.g. scenario 1's Data indication, which only arrives after the PEER's
+   echo completes a full extra round trip through the relay. Callers must
+   capture this Promise in a plain `let` (never inline inside a `p/let`
+   binding vector) so the listener is armed before whatever triggers the
+   reply is sent — see `send-and-wait!`'s docstring for why."
+  [sock timeout-ms]
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [timer (js/setTimeout #(resolve nil) timeout-ms)]
+        (.once sock "message"
+               (fn [msg rinfo]
+                 (js/clearTimeout timer)
+                 (resolve [(buf->vec msg) rinfo])))))))
+
+(def default-timeout-ms 1500)
+
+;; ---------------------------------------------------------------------------
+;; A real, non-TURN-aware UDP "peer": echoes payload+"-echo" to whoever sent
+;; it. Tracks every {:payload :address :port} it has ever received so
+;; scenarios can assert on real receipt (not assumed relay).
+;; ---------------------------------------------------------------------------
+
+(defn- start-echo-peer! []
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [sock (dgram/createSocket "udp4")
+            received (atom [])]
+        (.on sock "error" (fn [e] (println "  (peer socket error:" e ")")))
+        (.on sock "message"
+             (fn [msg rinfo]
+               (let [payload (.toString msg "utf8")
+                     reply (str payload "-echo")]
+                 (swap! received conj {:payload payload :address (.-address rinfo) :port (.-port rinfo)})
+                 (.send sock (js/Buffer.from reply "utf8") (.-port rinfo) (.-address rinfo)))))
+        (.bind sock 0 "127.0.0.1"
+               (fn [] (resolve {:socket sock :port (.-port (.address sock)) :received received})))))))
+
+;; ---------------------------------------------------------------------------
+;; Hand-built client-side STUN messages, using kotoba.turn.stun's primitives
+;; directly — the same encode-header -> push-attr* -> set-attr-length ->
+;; append-message-integrity -> append-fingerprint sequence this repo's
+;; README already documents for building a signed request.
+;; ---------------------------------------------------------------------------
+
+(defn- requested-transport-udp
+  "REQUESTED-TRANSPORT attribute value (RFC 8656 §14.7): protocol number 17
+   (UDP) + 3 reserved zero bytes. Included for wire realism only — this
+   listener does not inspect it (see kotoba.turn.listener's docstring)."
+  []
+  [0x11 0 0 0])
+
+(defn- build-allocate-request [username credential]
+  (-> (stun/encode-header {:typ stun/allocate-request :length 0 :txid (rand-txid)})
+      (stun/push-attr stun/attr-username (b/utf8-encode username))
+      (stun/push-attr stun/attr-requested-transport (requested-transport-udp))
+      stun/set-attr-length
+      (stun/append-message-integrity (b/utf8-encode credential))
+      stun/append-fingerprint))
+
+(defn- build-create-permission-request [username credential peer-ip peer-port]
+  (-> (stun/encode-header {:typ stun/create-permission-request :length 0 :txid (rand-txid)})
+      (stun/push-attr stun/attr-username (b/utf8-encode username))
+      (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+      stun/set-attr-length
+      (stun/append-message-integrity (b/utf8-encode credential))
+      stun/append-fingerprint))
+
+(defn- build-channel-bind-request [username credential channel-num peer-ip peer-port]
+  (-> (stun/encode-header {:typ stun/channel-bind-request :length 0 :txid (rand-txid)})
+      (stun/push-attr stun/attr-username (b/utf8-encode username))
+      (stun/push-attr stun/attr-channel-number (into (b/u16->bytes channel-num) [0 0]))
+      (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+      stun/set-attr-length
+      (stun/append-message-integrity (b/utf8-encode credential))
+      stun/append-fingerprint))
+
+(defn- build-send-indication [peer-ip peer-port payload-bytes]
+  ;; RFC 8656 §10.3: Send indications are not authenticated (indications
+  ;; have no error-response mechanism to challenge a bad credential with),
+  ;; so no MESSAGE-INTEGRITY here — matches kotoba.turn.listener's own
+  ;; handle-send-indication!, which never checks one.
+  (-> (stun/encode-header {:typ stun/send-indication :length 0 :txid (rand-txid)})
+      (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+      (stun/push-attr stun/attr-data payload-bytes)
+      stun/set-attr-length
+      stun/append-fingerprint))
+
+(defn- parse-response
+  "raw byte vector -> {:header ... :attrs ...}, or nil if it doesn't even
+   decode as a STUN header (e.g. a ChannelData frame, or nothing arrived)."
+  [raw]
+  (when raw
+    (try
+      (let [header (stun/decode-header raw)]
+        {:header header :attrs (stun/attributes (subvec (vec raw) 20))})
+      (catch :default _ nil))))
+
+(defn- find-attr [attrs typ] (some (fn [[t v]] (when (= t typ) v)) attrs))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 1 — authenticated Allocate -> CreatePermission -> Send
+;; indication, both relay directions proven over real sockets.
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-1 [listener-port shared-secret peer]
+  (println "\n--- Scenario 1: authenticated Allocate + CreatePermission + Send-indication relay (both directions) ---")
+  (p/let [client (dgram/createSocket "udp4")
+          _ (.on client "error" (fn [e] (println "  (client socket error:" e ")")))
+          _client-addr (bind! client 0 "127.0.0.1")
+          now-s (quot (js/Date.now) 1000)
+          {:keys [username credential]} (cred/mint-credential shared-secret "scenario1-user" 600 now-s)
+          allocate-req (build-allocate-request username credential)
+          [alloc-raw _rinfo] (send-and-wait! client allocate-req listener-port "127.0.0.1" default-timeout-ms)
+          {:keys [header attrs]} (parse-response alloc-raw)
+          relayed (some-> (find-attr attrs stun/attr-xor-relayed-address) stun/decode-xor-mapped-v4)
+          alloc-ok? (and header (= (:typ header) stun/allocate-response) (some? relayed))]
+    (println "  Allocate response type=" (:typ header) "(want" stun/allocate-response ") XOR-RELAYED-ADDRESS="
+              (when relayed (str (str/join "." (:ip relayed)) ":" (:port relayed))))
+    (if-not alloc-ok?
+      (do (println "FAIL scenario 1: Allocate did not succeed") false)
+      (p/let [perm-req (build-create-permission-request username credential (ip-str->vec "127.0.0.1") (:port peer))
+              [perm-raw _] (send-and-wait! client perm-req listener-port "127.0.0.1" default-timeout-ms)
+              {perm-header :header} (parse-response perm-raw)
+              perm-ok? (and perm-header (= (:typ perm-header) stun/create-permission-response))]
+        (println "  CreatePermission response type=" (:typ perm-header) "(want" stun/create-permission-response ")")
+        (if-not perm-ok?
+          (do (println "FAIL scenario 1: CreatePermission did not succeed") false)
+          (let [payload (b/utf8-encode "hello-hop1-s1")
+                send-ind (build-send-indication (ip-str->vec "127.0.0.1") (:port peer) payload)
+                ;; Arm the "wait for the relayed Data indication" listener
+                ;; BEFORE sending the Send indication that triggers the
+                ;; whole peer round trip — see wait-for-message!'s docstring.
+                data-ind-promise (wait-for-message! client (* 3 default-timeout-ms))]
+            (p/let [before-count (count @(:received peer))
+                    _ (.send client (vec->buf send-ind) listener-port "127.0.0.1" (fn [_]))
+                    _ (sleep-ms 300)
+                    after (deref (:received peer))
+                    hop1-ok? (and (> (count after) before-count)
+                                  (some #(= (:payload %) "hello-hop1-s1") after))
+                    _ (println "  peer received hop-1 payload for real?" (boolean hop1-ok?)
+                                " (peer's own :received log now has" (count after) "entr(y/ies))")
+                    [dind-raw _] data-ind-promise
+                    {dind-header :header dind-attrs :attrs} (parse-response dind-raw)
+                    dind-data (find-attr dind-attrs stun/attr-data)
+                    hop2-ok? (and dind-header (= (:typ dind-header) stun/data-indication)
+                                  (some? dind-data)
+                                  (= (vec dind-data) (vec (b/utf8-encode "hello-hop1-s1-echo"))))]
+              (println "  client received hop-2 Data indication for real? type=" (:typ dind-header)
+                        "(want" stun/data-indication ") payload matches echoed reply?" (boolean hop2-ok?))
+              (.close client)
+              (let [pass? (and hop1-ok? hop2-ok?)]
+                (println (if pass? "PASS" "FAIL")
+                          " scenario 1: client->peer relay (hop 1) and peer->client relay via Data indication (hop 2) both real")
+                pass?))))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 2 — ChannelBind fast path, both directions, proven to actually
+;; use ChannelData framing (not Data indications) on the return leg.
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-2 [listener-port shared-secret peer]
+  (println "\n--- Scenario 2: ChannelBind + ChannelData relay (both directions, fast-path framing proven) ---")
+  (p/let [client (dgram/createSocket "udp4")
+          _ (.on client "error" (fn [e] (println "  (client socket error:" e ")")))
+          _client-addr (bind! client 0 "127.0.0.1")
+          now-s (quot (js/Date.now) 1000)
+          {:keys [username credential]} (cred/mint-credential shared-secret "scenario2-user" 600 now-s)
+          allocate-req (build-allocate-request username credential)
+          [alloc-raw _] (send-and-wait! client allocate-req listener-port "127.0.0.1" default-timeout-ms)
+          {alloc-header :header} (parse-response alloc-raw)
+          alloc-ok? (and alloc-header (= (:typ alloc-header) stun/allocate-response))]
+    (if-not alloc-ok?
+      (do (println "FAIL scenario 2: Allocate did not succeed") false)
+      (let [channel-num 0x4001]
+        (p/let [bind-req (build-channel-bind-request username credential channel-num
+                                                       (ip-str->vec "127.0.0.1") (:port peer))
+                [bind-raw _] (send-and-wait! client bind-req listener-port "127.0.0.1" default-timeout-ms)
+                {bind-header :header} (parse-response bind-raw)
+                bind-ok? (and bind-header (= (:typ bind-header) stun/channel-bind-response))]
+          (println "  ChannelBind response type=" (:typ bind-header) "(want" stun/channel-bind-response ")")
+          (if-not bind-ok?
+            (do (println "FAIL scenario 2: ChannelBind did not succeed") false)
+            (let [payload (b/utf8-encode "hello-hop1-s2")
+                  framed (cd/encode channel-num payload)
+                  return-promise (wait-for-message! client (* 3 default-timeout-ms))]
+              (p/let [before-count (count @(:received peer))
+                      _ (.send client (vec->buf framed) listener-port "127.0.0.1" (fn [_]))
+                      _ (sleep-ms 300)
+                      after (deref (:received peer))
+                      hop1-ok? (and (> (count after) before-count)
+                                    (some #(= (:payload %) "hello-hop1-s2") after))
+                      _ (println "  peer received hop-1 ChannelData payload for real?" (boolean hop1-ok?))
+                      [return-raw _] return-promise
+                      classified (demux/classify-datagram return-raw)
+                      decoded (when return-raw (cd/decode return-raw))
+                      hop2-ok? (and (= classified :channel-data)
+                                    (some? decoded)
+                                    (= (:channel-number decoded) channel-num)
+                                    (= (vec (:data decoded)) (vec (b/utf8-encode "hello-hop1-s2-echo"))))]
+                (println "  client received hop-2 reply for real? wire classification=" classified
+                          "(want :channel-data, i.e. NOT a STUN Data indication) channel-number matches?"
+                          (= (:channel-number decoded) channel-num) " payload matches echoed reply?" (boolean hop2-ok?))
+                (.close client)
+                (let [pass? (and hop1-ok? hop2-ok?)]
+                  (println (if pass? "PASS" "FAIL")
+                            " scenario 2: ChannelBind fast path relays both directions as real ChannelData, not Data indications")
+                  pass?)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 3 — an Allocate signed with the WRONG shared secret is rejected:
+;; no allocation created, and a follow-up Send indication from that same
+;; unauthenticated address relays nothing to the peer.
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-3
+  "`_shared-secret` is intentionally unused — eve never needs the real
+   secret; the whole point of this scenario is that she mints a
+   self-consistent (username, credential) pair under a WRONG one instead."
+  [listener-handle listener-port _shared-secret peer]
+  (println "\n--- Scenario 3: Allocate with a deliberately WRONG credential is rejected (no allocation, no relay) ---")
+  (p/let [eve (dgram/createSocket "udp4")
+          _ (.on eve "error" (fn [e] (println "  (eve socket error:" e ")")))
+          _eve-addr (bind! eve 0 "127.0.0.1")
+          now-s (quot (js/Date.now) 1000)
+          ;; Minted under a DIFFERENT secret than the listener was started
+          ;; with — self-consistent (username/credential agree with each
+          ;; other) but the listener re-derives the expected credential
+          ;; from ITS OWN :shared-secret, so this signs with the wrong key.
+          {:keys [username credential]} (cred/mint-credential "an-attackers-guess" "eve" 600 now-s)
+          _ (println "  eve signs an Allocate request under a wrong shared secret (\"an-attackers-guess\" != the real one)")
+          allocate-req (build-allocate-request username credential)
+          [alloc-raw _] (send-and-wait! eve allocate-req listener-port "127.0.0.1" default-timeout-ms)
+          {alloc-header :header alloc-attrs :attrs} (parse-response alloc-raw)
+          rejected-with-error? (and alloc-header (= (:typ alloc-header) stun/allocate-error)
+                                     (some? (find-attr alloc-attrs stun/attr-error-code)))]
+    (println "  Allocate response type=" (:typ alloc-header) "(want" stun/allocate-error "= rejected) carries ERROR-CODE?"
+              (boolean (find-attr alloc-attrs stun/attr-error-code)))
+    (let [eve-key {:address "127.0.0.1" :port (.-port (.address eve))}
+          no-allocation-created? (nil? (get-in @(:state listener-handle) [:allocations eve-key]))]
+      (println "  listener's own state has NO allocation for eve's address/port?" no-allocation-created?)
+      (p/let [before-count (count @(:received peer))
+              bogus-send-ind (build-send-indication (ip-str->vec "127.0.0.1") (:port peer) (b/utf8-encode "should-never-arrive"))
+              _ (.send eve (vec->buf bogus-send-ind) listener-port "127.0.0.1" (fn [_]))
+              _ (sleep-ms 300)
+              after-count (count @(:received peer))
+              no-relay-happened? (= before-count after-count)]
+        (println "  peer's :received count unchanged after eve's post-rejection Send indication?" no-relay-happened?
+                  " (" before-count "->" after-count ")")
+        (.close eve)
+        (let [pass? (and rejected-with-error? no-allocation-created? no-relay-happened?)]
+          (println (if pass? "PASS" "FAIL")
+                    " scenario 3: unauthenticated Allocate rejected — no allocation, no relay side effect")
+          pass?)))))
+
+;; ---------------------------------------------------------------------------
+;; Driver
+;; ---------------------------------------------------------------------------
+
+(def shared-secret "demo-shared-secret-do-not-use-in-prod")
+
+(-> (p/let [handle (listener/start-listener! {:port 0 :shared-secret shared-secret})
+            _ (println "listener bound on 127.0.0.1:" (:port handle))
+            peer (start-echo-peer!)
+            _ (println "echo peer bound on 127.0.0.1:" (:port peer))
+            r1 (scenario-1 (:port handle) shared-secret peer)
+            r2 (scenario-2 (:port handle) shared-secret peer)
+            r3 (scenario-3 handle (:port handle) shared-secret peer)]
+      (let [results [r1 r2 r3]
+            passed (count (filter true? results))]
+        (println (str "\nRESULT: " passed "/3 scenarios passed"))
+        (p/let [_ (listener/stop-listener! handle)]
+          (.close (:socket peer))
+          (js/process.exit (if (= passed 3) 0 1)))))
+    (.catch (fn [e]
+              (println "DEMO CRASHED:" e)
+              (js/process.exit 1))))

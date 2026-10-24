@@ -86,6 +86,30 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.phone` | `kotoba.phone/src` | `kotoba.phone`, `kotoba.phone.export`, `kotoba.phone.lifecycle`, `kotoba.phone.numbering` (Kotoba project library) |
+| `kotoba.wire` | `kotoba.wire/src` | `kotoba.wire.edn`, `kotoba.wire.framing`, `kotoba.wire.tcp` (Kotoba project library) |
+| `kotoba.techIpfsSpecsIpns` | `kotoba.techIpfsSpecsIpns/src` | `ipns.core`, `ipns.head`, `ipns.pubsub`, `ipns.record` (Kotoba project library) |
+| `kotoba.ioLibp2pSpecsTransport` | `kotoba.ioLibp2pSpecsTransport/src` | `libp2p.multistream`, `libp2p.provider.node`, `libp2p.provider.node-muxed`, `libp2p.yamux` (Kotoba project library) |
+| `kotoba.ioLibp2pSpecsKadDht` | `kotoba.ioLibp2pSpecsKadDht/src` | `kad.key`, `kad.lookup`, `kad.message`, `kad.routing` (Kotoba project library) |
+| `kotoba.drawingml` | `kotoba.drawingml/src` | `drawingml.core`, `drawingml.parse` (Kotoba project library) |
+| `kotoba.dot` | `kotoba.dot/src` | `dot.dot`, `dot.emit`, `dot.model`, `dot.validate` (Kotoba project library) |
+| `kotoba.ooxml` | `kotoba.ooxml/src` | `ooxml.core` (Kotoba project library) |
+| `kotoba.dns` | `kotoba.dns/src` | `kotoba-lang.dns.desktop`, `kotoba-lang.dns.state`, `kotoba-lang.dns.ui` (Kotoba project library) |
+| `kotoba.dft` | `kotoba.dft/src` | `dft`, `dft.atpg`, `dft.bist`, `dft.jtag` (Kotoba project library) |
+| `kotoba.devtools` | `kotoba.devtools/src` | `devtools`, `devtools.inspect` (Kotoba project library) |
+| `kotoba.device` | `kotoba.device/src` | `kotoba.device`, `kotoba.device.call`, `kotoba.device.denied`, `kotoba.device.describe` (Kotoba project library) |
+| `kotoba.wit` | `kotoba.wit/src` | `kotoba.lang.wit`, `kotoba.wit`, `kotoba.wit.allows`, `kotoba.wit.capabilities` (Kotoba project library) |
+| `kotoba.designQuality` | `kotoba.designQuality/src` | `design-quality.audit`, `design-quality.cli`, `design-quality.persona` (Kotoba project library) |
+| `kotoba.shamir` | `kotoba.shamir/src` | `shamir.core` (Kotoba project library) |
+| `kotoba.denchu` | `kotoba.denchu/src` | `denchu.area`, `denchu.datoms`, `denchu.enrich`, `denchu.facts` (Kotoba project library) |
+| `kotoba.okugai` | `kotoba.okugai/src` | `okugai.datoms`, `okugai.facts`, `okugai.medium`, `okugai.operator` (Kotoba project library) |
+| `kotoba.dec` | `kotoba.dec/src` | `dec` (Kotoba project library) |
+| `kotoba.ddl` | `kotoba.ddl/src` | `ddl.ddl`, `ddl.execute`, `ddl.model`, `ddl.validate` (Kotoba project library) |
+| `kotoba.datomModel` | `kotoba.datomModel/src` | `datom-model.core`, `datom-model.statistics` (Kotoba project library) |
+| `kotoba.datom` | `kotoba.datom/src` | `datom.core` (Kotoba project library) |
+| `kotoba.daichou` | `kotoba.daichou/src` | `daichou.canonical`, `daichou.chain`, `daichou.hash`, `daichou.receipt` (Kotoba project library) |
+| `kotoba.d3` | `kotoba.d3/src` | `kotoba.lang.d3.scale`, `kotoba.lang.d3.shape` (Kotoba project library) |
 | `kotoba.search` | `kotoba.search/src` | `search.model`, `search.origin`, `search.postings`, `search.validate` (Kotoba project library) |
 | `kotoba.robotics` | `kotoba.robotics/src` | `kotoba.robotics`, `kotoba.robotics.export`, `kotoba.robotics.process`, `kotoba.robotics.process.fluid` (Kotoba project library) |
 | `kotoba.kudaki` | `kotoba.kudaki/src` | `kudaki.contact`, `kudaki.demo`, `kudaki.element`, `kudaki.integrate` (Kotoba project library) |

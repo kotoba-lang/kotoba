@@ -1,0 +1,124 @@
+(ns kotoba.wire.framing-test
+  "Boundary-case coverage for kotoba.wire.framing/defragment — the core
+  stream-reassembly logic this whole library exists for. Pure `.cljc`, runs
+  under plain `kbb -M:test` (no socket, no nbb needed) even though the
+  logic under test is what a real TCP stream reassembly needs."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.bytes :as bytes]
+            [kotoba.wire.framing :as framing]))
+
+(defn- payload
+  "A payload byte-vector for a given string, via kotoba.bytes/utf8-encode —
+  arbitrary bytes are fine for framing (it doesn't know or care this is
+  UTF-8), a readable string source just makes test intent obvious."
+  [s]
+  (bytes/utf8-encode s))
+
+(deftest frame-length-prefix-roundtrip
+  (testing "prepends a correct 4-byte BE length prefix"
+    (let [p (payload "hello")
+          framed (framing/frame-length-prefix p)]
+      (is (= (+ 4 (count p)) (count framed)))
+      (is (= (count p) (bytes/bytes->u32 (subvec framed 0 4))))
+      (is (= p (subvec framed 4)))))
+  (testing "zero-length payload"
+    (let [framed (framing/frame-length-prefix [])]
+      (is (= [0 0 0 0] framed)))))
+
+(deftest defragment-empty-input
+  (testing "empty buffer -> no frames, empty remainder"
+    (is (= {:frames [] :remainder []} (framing/defragment [])))))
+
+(deftest defragment-fewer-than-4-bytes
+  (testing "1, 2, 3 bytes (not even a complete length prefix) all come back as :remainder"
+    (doseq [n [1 2 3]]
+      (let [partial (vec (repeat n 0xAB))]
+        (is (= {:frames [] :remainder partial} (framing/defragment partial)))))))
+
+(deftest defragment-exactly-length-prefix-no-payload-yet
+  (testing "exactly 4 bytes of a nonzero-length prefix, no payload bytes at all yet"
+    (let [prefix (bytes/u32->bytes 5)]
+      (is (= {:frames [] :remainder prefix} (framing/defragment prefix))))))
+
+(deftest defragment-one-complete-frame-nothing-left-over
+  (testing "single complete frame, :remainder is empty"
+    (let [p (payload "hello")
+          framed (framing/frame-length-prefix p)]
+      (is (= {:frames [p] :remainder []} (framing/defragment framed))))))
+
+(deftest defragment-frame-split-across-two-calls
+  (testing "a frame's bytes arriving in two pieces across two defragment calls"
+    (let [p (payload "hello world, this is a longer payload")
+          framed (framing/frame-length-prefix p)
+          split-at 6
+          first-chunk (subvec framed 0 split-at)
+          second-chunk (subvec framed split-at)
+          {frames-1 :frames remainder-1 :remainder} (framing/defragment first-chunk)
+          combined (into remainder-1 second-chunk)
+          {frames-2 :frames remainder-2 :remainder} (framing/defragment combined)]
+      (is (= [] frames-1) "no complete frame yet from the first partial chunk")
+      (is (= first-chunk remainder-1))
+      (is (= [p] frames-2) "the frame completes once the rest of the bytes arrive")
+      (is (= [] remainder-2))))
+
+  (testing "split exactly at the length-prefix/payload boundary (first chunk is exactly the 4-byte prefix)"
+    (let [p (payload "boundary-case")
+          framed (framing/frame-length-prefix p)
+          first-chunk (subvec framed 0 4)
+          second-chunk (subvec framed 4)
+          {frames-1 :frames remainder-1 :remainder} (framing/defragment first-chunk)
+          combined (into remainder-1 second-chunk)
+          {frames-2 :frames remainder-2 :remainder} (framing/defragment combined)]
+      (is (= [] frames-1))
+      (is (= first-chunk remainder-1))
+      (is (= [p] frames-2))
+      (is (= [] remainder-2))))
+
+  (testing "split byte-by-byte across many defragment calls still reassembles correctly"
+    (let [p (payload "reassembled one byte at a time")
+          framed (framing/frame-length-prefix p)]
+      (loop [remaining framed
+             carry []
+             seen-frames []]
+        (if (empty? remaining)
+          (is (= [p] seen-frames))
+          (let [next-byte (subvec remaining 0 1)
+                rest-bytes (subvec remaining 1)
+                combined (into carry next-byte)
+                {:keys [frames remainder]} (framing/defragment combined)]
+            (recur rest-bytes remainder (into seen-frames frames))))))))
+
+(deftest defragment-multiple-frames-in-one-call
+  (testing "two complete frames arriving together in a single buffer"
+    (let [p1 (payload "first")
+          p2 (payload "second-payload")
+          buf (into (framing/frame-length-prefix p1) (framing/frame-length-prefix p2))]
+      (is (= {:frames [p1 p2] :remainder []} (framing/defragment buf)))))
+
+  (testing "two complete frames plus a trailing partial third frame"
+    (let [p1 (payload "one")
+          p2 (payload "two")
+          p3 (payload "three-incomplete")
+          framed-3 (framing/frame-length-prefix p3)
+          partial-3 (subvec framed-3 0 (dec (count framed-3)))
+          buf (-> (framing/frame-length-prefix p1)
+                  (into (framing/frame-length-prefix p2))
+                  (into partial-3))
+          {:keys [frames remainder]} (framing/defragment buf)]
+      (is (= [p1 p2] frames))
+      (is (= partial-3 remainder))
+      (testing "delivering the final missing byte completes the third frame"
+        (let [last-byte (subvec framed-3 (dec (count framed-3)))
+              {:keys [frames remainder]} (framing/defragment (into remainder last-byte))]
+          (is (= [p3] frames))
+          (is (= [] remainder)))))))
+
+(deftest defragment-zero-length-payload-frame
+  (testing "a frame whose payload is itself zero bytes long is still a complete frame"
+    (let [framed (framing/frame-length-prefix [])]
+      (is (= {:frames [[]] :remainder []} (framing/defragment framed)))))
+
+  (testing "a zero-length frame immediately followed by a normal frame"
+    (let [p (payload "after-empty")
+          buf (into (framing/frame-length-prefix []) (framing/frame-length-prefix p))]
+      (is (= {:frames [[] p] :remainder []} (framing/defragment buf))))))
