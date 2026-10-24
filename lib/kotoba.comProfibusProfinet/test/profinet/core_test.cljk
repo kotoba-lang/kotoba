@@ -1,0 +1,253 @@
+(ns profinet.core-test
+  "FrameID ranges, the DCP header/TLV layout, ServiceID/ServiceType/
+  Option/Suboption values, and the Data Status bit table are PROFINET IO
+  specification constants reproduced identically across Wireshark's
+  packet-pn-rt.c/packet-pn-dcp.c dissectors and rt-labs' open-source
+  device stack p-net (github.com/rtlabs-com/p-net). Concrete worked byte
+  examples not cited to a public source are `;; constructed, not a
+  published spec vector`, hand-derived and checked in this file's own
+  comments rather than against the PROFINET IO specification text, which
+  is a paywalled PROFIBUS & PROFINET International (profibus.com)
+  membership document this project has no access to."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [profinet.rt :as rt]
+            [profinet.dcp :as dcp]
+            [profinet.ethernet :as eth]))
+
+;; ── FrameID classification ───────────────────────────────────────────────
+
+(deftest frame-id-classification-known-values
+  (is (= :dcp-hello-request (rt/classify-frame-id 0xFEFC)))
+  (is (= :dcp-get-set (rt/classify-frame-id 0xFEFD)))
+  (is (= :dcp-identify-request (rt/classify-frame-id 0xFEFE)))
+  (is (= :dcp-identify-response (rt/classify-frame-id 0xFEFF)))
+  (is (= :alarm-high (rt/classify-frame-id 0xFC01)))
+  (is (= :alarm-low (rt/classify-frame-id 0xFE01)))
+  (is (= :cyclic-rt-class-3 (rt/classify-frame-id 0x8000)))
+  (is (= :cyclic-rt-class-3 (rt/classify-frame-id 0xBBFF)))
+  (is (= :cyclic-rt-class-1-or-2 (rt/classify-frame-id 0xC000)))
+  (is (= :cyclic-rt-class-1-or-2 (rt/classify-frame-id 0xFBFF)))
+  (is (= :reserved (rt/classify-frame-id 0x0000))))
+
+(deftest frame-id-encode-decode-round-trip-full-16-bit-space
+  ;; Exhaustive: all 65536 possible FrameID values.
+  (doseq [id (range 0x10000)]
+    (let [[pst bytes] (rt/encode-frame-id id)]
+      (is (= :ok pst))
+      (is (= [:ok id] (rt/decode-frame-id bytes))))))
+
+(deftest negative-frame-id-out-of-range
+  (let [[st reason] (rt/encode-frame-id 0x10000)]
+    (is (= :error st))
+    (is (= :profinet/frame-id-out-of-range reason))))
+
+;; ── data status ──────────────────────────────────────────────────────────
+
+(deftest data-status-worked-example
+  ;; constructed, hand-verified — {:state :data-valid} -> bit0 + bit2 =
+  ;; 0b00000101 = 5.
+  (is (= 5 (rt/pack-data-status #{:state :data-valid})))
+  (is (= #{:state :data-valid} (rt/unpack-data-status 5))))
+
+(deftest data-status-round-trip-full-byte-space
+  ;; Exhaustive over all 256 byte values (bits 6/7 are reserved/unused so
+  ;; not every byte round-trips through the NAMED-bit-set representation
+  ;; unchanged — assert the weaker, still-meaningful property: re-packing
+  ;; the unpacked flags reproduces the byte with reserved bits masked).
+  (doseq [b (range 256)]
+    (let [flags (rt/unpack-data-status b)
+          repacked (rt/pack-data-status flags)]
+      (is (= (bit-and b 0x3F) repacked)))))
+
+(deftest trailer-worked-example
+  ;; constructed, hand-verified — cycle-counter 0x1234 (BE ->
+  ;; [0x12 0x34]), data-status {:state :data-valid} (5), transfer-status 0.
+  (is (= [:ok [0x12 0x34 0x05 0x00]]
+         (rt/encode-trailer {:cycle-counter 0x1234 :data-status #{:state :data-valid}
+                              :transfer-status 0}))))
+
+(deftest trailer-round-trip
+  (dotimes [_ 500]
+    (let [cc (rand-int 0x10000)
+          ts (rand-int 0x100)
+          flags (into #{} (random-sample 0.5 (keys rt/data-status-bits)))
+          [pst bytes] (rt/encode-trailer {:cycle-counter cc :data-status flags :transfer-status ts})]
+      (is (= :ok pst))
+      (let [[ust decoded] (rt/decode-trailer bytes)]
+        (is (= :ok ust))
+        (is (= cc (:cycle-counter decoded)))
+        (is (= ts (:transfer-status decoded)))
+        (is (= flags (:data-status decoded)))))))
+
+(deftest negative-trailer-wrong-length
+  (let [[st reason] (rt/decode-trailer [1 2 3])]
+    (is (= :error st))
+    (is (= :profinet/trailer-wrong-length reason))))
+
+;; ── IOxS ─────────────────────────────────────────────────────────────────
+
+(deftest ioxs-worked-examples
+  ;; constructed, hand-verified.
+  (is (= [:ok 0x80] (rt/pack-ioxs {:good? true :instance 0 :more? false})))
+  (is (= [:ok 0x00] (rt/pack-ioxs {:good? false :instance 0 :more? false})))
+  ;; good=true instance=5 more=true: bit7 | (5<<2) | bit0 = 0x80|0x14|0x01=0x95
+  (is (= [:ok 0x95] (rt/pack-ioxs {:good? true :instance 5 :more? true})))
+  (is (= rt/ioxs-good 0x80))
+  (is (= rt/ioxs-bad 0x00)))
+
+(deftest ioxs-round-trip-full-byte-space
+  ;; Exhaustive over all 256 byte values. Bit 1 is reserved/always-0 on
+  ;; the wire and `unpack-ioxs` does not surface it as a field (there is
+  ;; nothing meaningful to round-trip), so assert the weaker,
+  ;; still-meaningful property: re-packing the unpacked fields reproduces
+  ;; the byte with the reserved bit masked off, exactly like
+  ;; `data-status-round-trip-full-byte-space` above.
+  (doseq [b (range 256)]
+    (let [[ust fields] (rt/unpack-ioxs b)]
+      (is (= :ok ust))
+      (is (= [:ok (bit-and b 0xFD)] (rt/pack-ioxs fields))))))
+
+(deftest negative-ioxs-instance-out-of-range
+  (let [[st reason] (rt/pack-ioxs {:good? true :instance 32 :more? false})]
+    (is (= :error st))
+    (is (= :profinet/ioxs-instance-out-of-range reason))))
+
+;; ── cyclic data ──────────────────────────────────────────────────────────
+
+(deftest cyclic-data-round-trip
+  (dotimes [_ 300]
+    (let [io-data (vec (repeatedly (rand-int 32) #(rand-int 0x100)))
+          [pst bytes] (rt/encode-cyclic-data {:io-data io-data :iops-byte rt/ioxs-good
+                                               :iocs-byte rt/ioxs-good :cycle-counter 42
+                                               :data-status #{:state :data-valid}
+                                               :transfer-status 0})]
+      (is (= :ok pst))
+      (let [[ust decoded] (rt/decode-cyclic-data bytes)]
+        (is (= :ok ust))
+        (is (= io-data (:io-data decoded)))
+        (is (= rt/ioxs-good (:iops-byte decoded)))
+        (is (= 42 (:cycle-counter decoded)))))))
+
+(deftest negative-cyclic-data-too-short
+  (let [[st reason] (rt/decode-cyclic-data [1 2 3])]
+    (is (= :error st))
+    (is (= :profinet/cyclic-data-too-short reason))))
+
+;; ── DCP TLV block ────────────────────────────────────────────────────────
+
+(deftest dcp-block-worked-example-even-length-no-pad
+  ;; constructed, not a published spec vector — NameOfStation "plc1".
+  ;; option=0x02 (Device Properties), suboption=0x02 (NameOfStation),
+  ;; length=4 (even, no pad), value = ASCII "plc1".
+  (is (= [:ok [0x02 0x02 0x00 0x04 0x70 0x6C 0x63 0x31]]
+         (dcp/encode-block {:option :device-properties :suboption :name-of-station
+                             :value [0x70 0x6C 0x63 0x31]}))))
+
+(deftest dcp-block-worked-example-odd-length-with-pad
+  ;; constructed, hand-verified — DeviceVendor "A" (1 byte, odd -> one
+  ;; pad byte appended). option=0x02, suboption=0x01, length=1, value=
+  ;; [0x41], pad=[0x00].
+  (is (= [:ok [0x02 0x01 0x00 0x01 0x41 0x00]]
+         (dcp/encode-block {:option :device-properties :suboption :device-vendor
+                             :value [0x41]}))))
+
+(deftest dcp-block-round-trip-both-parities
+  (doseq [n (range 0 20)]
+    (let [value (vec (repeatedly n #(rand-int 0x100)))
+          [pst bytes] (dcp/encode-block {:option :ip :suboption :ip-parameter :value value})]
+      (is (= :ok pst))
+      ;; every block is padded to an even total.
+      (is (even? (count bytes)))
+      (let [[ust decoded] (dcp/decode-block bytes)]
+        (is (= :ok ust))
+        (is (= :ip (:option decoded)))
+        (is (= :ip-parameter (:suboption decoded)))
+        (is (= value (:value decoded)))
+        (is (= (count bytes) (:consumed decoded)))))))
+
+(deftest dcp-multiple-blocks-round-trip
+  (let [blocks [{:option :device-properties :suboption :device-vendor :value [0x41]}
+                {:option :device-properties :suboption :name-of-station :value [0x70 0x6C 0x63 0x31]}
+                {:option :control :suboption :signal :value []}]
+        [pst bytes] (dcp/encode-blocks blocks)]
+    (is (= :ok pst))
+    (let [[ust decoded] (dcp/decode-blocks bytes)]
+      (is (= :ok ust))
+      (is (= [{:option :device-properties :suboption :device-vendor :value [0x41]}
+              {:option :device-properties :suboption :name-of-station :value [0x70 0x6C 0x63 0x31]}
+              {:option :control :suboption :signal :value []}]
+             decoded)))))
+
+(deftest negative-dcp-block-truncated
+  (let [[st reason] (dcp/decode-block [0x02 0x02 0x00 0x04 0x70 0x6C])]
+    (is (= :error st))
+    (is (= :profinet/dcp-block-truncated reason))))
+
+(deftest negative-unknown-dcp-option
+  (let [[st reason] (dcp/encode-block {:option :not-a-real-option :suboption :x :value []})]
+    (is (= :error st))
+    (is (= :profinet/unknown-dcp-option reason))))
+
+;; ── DCP PDU ──────────────────────────────────────────────────────────────
+
+(deftest dcp-identify-request-worked-example
+  ;; constructed, not a published spec vector — a multicast Identify
+  ;; request asking for 'all' blocks, xid 1, no response delay.
+  ;; Hand-derived: sid=5(0x05) stype=0(request) xid=[0,0,0,1]
+  ;; response-delay=[0,0] block=[0xFF,0xFF,0x00,0x00] (Option ALL,
+  ;; Suboption ALL, length 0) -> DCPDataLength=4=[0,4].
+  (is (= [:ok [0x05 0x00 0x00 0x00 0x00 0x01 0x00 0x00 0x00 0x04 0xFF 0xFF 0x00 0x00]]
+         (dcp/encode-pdu {:service-id :identify :service-type :request :xid 1
+                           :blocks [{:option :all :suboption :all :value []}]}))))
+
+(deftest dcp-pdu-round-trip
+  (doseq [service-id [:get :set :identify :hello]
+          service-type [:request :response-success :response-unsupported]]
+    (let [blocks [{:option :device-properties :suboption :device-role :value [0x01]}]
+          [pst bytes] (dcp/encode-pdu {:service-id service-id :service-type service-type
+                                        :xid 0xCAFEBABE :response-delay 10 :blocks blocks})]
+      (is (= :ok pst))
+      (let [[ust decoded] (dcp/decode-pdu bytes)]
+        (is (= :ok ust))
+        (is (= service-id (:service-id decoded)))
+        (is (= service-type (:service-type decoded)))
+        (is (= 0xCAFEBABE (:xid decoded)))
+        (is (= 10 (:response-delay decoded)))
+        (is (= blocks (:blocks decoded)))))))
+
+(deftest negative-dcp-pdu-wrong-length
+  (let [[_ good] (dcp/encode-pdu {:service-id :get :service-type :request :xid 1
+                                   :blocks [{:option :control :suboption :signal :value [0x01 0x02]}]})
+        truncated (vec (butlast good))
+        [st reason] (dcp/decode-pdu truncated)]
+    (is (= :error st))
+    (is (= :profinet/dcp-pdu-wrong-length reason))))
+
+(deftest negative-unknown-dcp-service-id-byte
+  (let [[_ good] (dcp/encode-pdu {:service-id :get :service-type :request :xid 1
+                                   :blocks [{:option :control :suboption :signal :value [0x01 0x02]}]})
+        corrupted (assoc (vec good) 0 0xEE)
+        [st reason] (dcp/decode-pdu corrupted)]
+    (is (= :error st))
+    (is (= :profinet/unknown-dcp-service-id-byte reason))))
+
+;; ── ethernet L2 ──────────────────────────────────────────────────────────
+
+(deftest ethernet-round-trip
+  (let [[_ payload] (dcp/encode-pdu {:service-id :identify :service-type :request :xid 1
+                                      :blocks [{:option :all :suboption :all :value []}]})
+        [pst frame-bytes] (eth/encode {:dst-mac [0x01 0x0E 0xCF 0x00 0x00 0x00]
+                                        :src-mac [0x02 0x00 0x00 0x00 0x00 0x01]
+                                        :frame-id 0xFEFE :payload payload})]
+    (is (= :ok pst))
+    (let [[ust decoded] (eth/decode frame-bytes)]
+      (is (= :ok ust))
+      (is (= eth/ethertype (:ethertype decoded)))
+      (is (= 0xFEFE (:frame-id decoded)))
+      (is (= (vec payload) (:payload decoded))))))
+
+(deftest negative-ethernet-bad-mac
+  (let [[st reason] (eth/encode {:dst-mac [0 0 0] :src-mac [0 0 0 0 0 0]
+                                  :frame-id 0xFEFE :payload []})]
+    (is (= :error st))
+    (is (= :profinet/bad-mac reason))))
