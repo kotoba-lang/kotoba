@@ -1,0 +1,157 @@
+(ns css-core
+  ;; No :export: parity harness appends zero-arg case defns and executes them
+  ;; via KIR (same as pre-T5.2). Schemas alone enable record-new/get.
+  (:schemas {;; T5.2 native guest record: multi-arg pure → single record
+             :css/number-value [:record :css/number-value
+                                [[:prop :keyword] [:n :i64]]]
+             :css/declaration [:record :css/declaration
+                               [[:prop :keyword] [:value :string]]]
+             :css/declarations-from [:record :css/declarations-from
+                                     [[:decls [:map :keyword :string]]
+                                      [:index :i64]
+                                      [:acc :string]]]
+             :css/rule [:record :css/rule
+                        [[:selector :string]
+                         [:decls [:map :keyword :string]]]]}))
+
+;; A `.kotoba` port of the string-producing core of `css.core` (ADR-2607270100
+;; §10, form A: components are :string-returning pure functions, the tree lives
+;; in the call graph). No capabilities: CSS generation is data -> text, so this
+;; whole module sits in the kotoba/pure profile.
+;;
+;; Kotoba has no recursive value types, so a stylesheet is NOT modelled as
+;; nested data here. Declarations are a `[:map :keyword :string]` -- which
+;; `typed-map-entry-at` walks in sorted key order, making the emitted text
+;; deterministic by construction. The .cljc original walks a Clojure map, whose
+;; order is insertion-defined only up to 8 entries and hash-defined above it;
+;; parity therefore holds against a key-sorted .cljc run (see the parity test).
+;;
+;; T5.2: multi-arg pure folded into single guest records (number-value,
+;; declaration, declarations-from, rule).
+
+;; --- integers -------------------------------------------------------------
+;; There is no number->string builtin, so digits come out of a literal by
+;; index. `string-substring` is byte-indexed, which is exact for ASCII digits.
+
+(defn digit-char [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn nat-str [n :i64] :string
+  (if (< n 10)
+    (digit-char n)
+    (string-concat (nat-str (quot n 10))
+                   (digit-char (- n (* (quot n 10) 10))))))
+
+(defn i64-str [n :i64] :string
+  (if (< n 0)
+    (string-concat "-" (nat-str (- 0 n)))
+    (nat-str n)))
+
+;; --- breakout guard -------------------------------------------------------
+;; The .cljc original uses a regex; `string-contains?` covers the same four
+;; sequences without one. Values and selectors are spliced into
+;; `prop: VALUE;` / `SELECTOR { ... }` with no other escaping, so `{` `}` `;`
+;; and `/*` are the sequences that let attacker-controlled data close the
+;; current block and inject sibling rules.
+
+(defn safe? [s :string] :bool
+  ;; Nested `if` rather than `(not (or ...))`: `or` yields an i64 in this
+  ;; profile, so folding bools through it is a type error, not a shorthand.
+  (if (string-contains? s "{") false
+      (if (string-contains? s "}") false
+          (if (string-contains? s ";") false
+              (if (string-contains? s "/*") false true)))))
+
+;; --- values ---------------------------------------------------------------
+;; `unitless` is the same set the .cljc original carries. A typed set holds at
+;; most 32 items and this is 28, so it fits the closed profile as-is.
+
+(defn unitless [] [:set :keyword]
+  (typed-set [:set :keyword]
+             :animation-iteration-count :border-image-outset :border-image-slice
+             :border-image-width :box-flex :box-flex-group :box-ordinal-group
+             :column-count :columns :flex :flex-grow :flex-positive :flex-shrink
+             :flex-negative :flex-order :grid-column :grid-row :font-weight
+             :line-clamp :line-height :opacity :order :orphans :scale :tab-size
+             :widows :z-index :zoom))
+
+(defn unitless? [prop :keyword] :bool
+  (typed-set-contains [:set :keyword] (unitless) prop))
+
+(defn number-value [x [:ref :css/number-value]] :string
+  ;; T5.2: prop+n on one guest record
+  (let [prop (record-get x :prop)
+        n (record-get x :n)]
+    (if (unitless? prop)
+      (i64-str n)
+      (if (= n 0)
+        (i64-str n)
+        (string-concat (i64-str n) "px")))))
+
+;; --- declarations and rules ----------------------------------------------
+;; Each returns [:result :string :string]: ok with the text, or err naming what
+;; would have broken out. The original throws; a Kotoba guest returns the
+;; failure as a value instead.
+
+(defn declaration [x [:ref :css/declaration]] [:result :string :string]
+  ;; T5.2: prop+value on one guest record
+  (let [prop (record-get x :prop)
+        value (record-get x :value)]
+    (if (safe? value)
+      (result-ok-of [:result :string :string]
+                    (string-concat (keyword-name prop)
+                                   (string-concat ": " (string-concat value ";"))))
+      (result-err-of [:result :string :string]
+                     (string-concat "unsafe value for " (keyword-name prop))))))
+
+(defn declarations-from [x [:ref :css/declarations-from]]
+  [:result :string :string]
+  ;; T5.2: decls+index+acc on one guest record
+  (let [decls (record-get x :decls)
+        index (record-get x :index)
+        acc (record-get x :acc)]
+    (match-option (typed-map-entry-at [:map :keyword :string] decls index)
+                  [:option [:vector [:keyword :string]]]
+                  (none (result-ok-of [:result :string :string] acc))
+                  (some entry
+                        (match-result
+                         (declaration (record-new [:ref :css/declaration]
+                                                  (hetero-vector-at [:vector [:keyword :string]] entry 0)
+                                                  (hetero-vector-at [:vector [:keyword :string]] entry 1)))
+                         [:result :string :string]
+                         (ok text
+                             (declarations-from
+                              (record-new [:ref :css/declarations-from]
+                                          decls (+ index 1)
+                                          (if (string=? acc "")
+                                            text
+                                            (string-concat acc (string-concat " " text))))))
+                         (err message
+                              (result-err-of [:result :string :string] message)))))))
+
+(defn declarations [decls [:map :keyword :string]] [:result :string :string]
+  (declarations-from (record-new [:ref :css/declarations-from] decls 0 "")))
+
+(defn rule [x [:ref :css/rule]] [:result :string :string]
+  ;; T5.2: selector+decls on one guest record
+  (let [selector (record-get x :selector)
+        decls (record-get x :decls)]
+    (if (safe? selector)
+      (match-result (declarations decls) [:result :string :string]
+                    (ok body
+                        (result-ok-of [:result :string :string]
+                                      (string-concat selector
+                                                     (string-concat " { "
+                                                                    (string-concat body " }")))))
+                    (err message (result-err-of [:result :string :string] message)))
+      (result-err-of [:result :string :string] "unsafe selector"))))
+
+(defn main []
+  ;; Self-check: a rule the .cljc original produces identically.
+  (string-byte-length
+   (result-value-of [:result :string :string]
+                    (rule (record-new [:ref :css/rule]
+                                      ".card"
+                                      (typed-map-new [:map :keyword :string]
+                                                     :color "#fff" :padding "16px")))
+                    "")))
