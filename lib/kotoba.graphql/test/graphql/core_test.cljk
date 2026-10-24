@@ -1,0 +1,181 @@
+(ns graphql.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [graphql.model :as m]
+            [graphql.sdl :as sdl]
+            [graphql.query :as q]
+            [graphql.validate :as v]
+            [graphql.ports :as p]
+            [graphql.execute :as e]))
+
+;; --- shared fixtures ---
+
+(def sample-sdl
+  "type Query {
+     user(id: ID!): User
+     users: [User]!
+   }
+   type User {
+     id: ID!
+     name: String
+     age: Int
+   }
+   scalar Date")
+
+(def sample-schema (sdl/parse-schema sample-sdl))
+
+;; ============================================================
+;; SDL パース: graphql.sdl / graphql.model
+;; ============================================================
+
+(deftest parse-sdl-type-names-and-kinds
+  (testing "object 型と scalar 型"
+    (is (= :object (:graphql/kind (m/get-type sample-schema "Query"))))
+    (is (= :object (:graphql/kind (m/get-type sample-schema "User"))))
+    (is (= :scalar (:graphql/kind (m/get-type sample-schema "Date"))))))
+
+(deftest parse-sdl-field-type-modifiers
+  (testing "通常フィールドの型名"
+    (let [user-field (m/field-by-name (m/get-type sample-schema "Query") "user")]
+      (is (= "User" (:graphql/type user-field)))
+      (is (= false (:graphql/list? user-field)))))
+  (testing "! non-null 修飾子"
+    (let [id-field (m/field-by-name (m/get-type sample-schema "User") "id")]
+      (is (= true (:graphql/non-null? id-field)))))
+  (testing "[] list 修飾子"
+    (let [users-field (m/field-by-name (m/get-type sample-schema "Query") "users")]
+      (is (= true (:graphql/list? users-field)))
+      (is (= true (:graphql/non-null? users-field))))))
+
+(deftest parse-sdl-field-arguments
+  (let [user-field (m/field-by-name (m/get-type sample-schema "Query") "user")
+        args       (:graphql/args user-field)]
+    (is (= 1 (count args)))
+    (is (= "id" (:graphql/name (first args))))
+    (is (= "ID" (:graphql/type (first args))))
+    (is (= true (:graphql/non-null? (first args))))))
+
+(deftest parse-enum-and-union-types
+  (let [schema (sdl/parse-schema
+                "enum Status { ACTIVE INACTIVE }
+                 union Result = User | Error
+                 type User { name: String }
+                 type Error { msg: String }
+                 type Query { result: Result }")]
+    (testing "enum 型と値リスト"
+      (is (= :enum (get-in schema [:graphql/types "Status" :graphql/kind])))
+      (is (= ["ACTIVE" "INACTIVE"]
+             (get-in schema [:graphql/types "Status" :graphql/values]))))
+    (testing "union 型とメンバーリスト"
+      (is (= :union (get-in schema [:graphql/types "Result" :graphql/kind])))
+      (is (= ["User" "Error"]
+             (get-in schema [:graphql/types "Result" :graphql/members]))))))
+
+(deftest schema-block-sets-query-root
+  (let [schema (sdl/parse-schema
+                "type MyQuery { ping: String }
+                 schema { query: MyQuery }")]
+    (is (= "MyQuery" (:graphql/query-root schema)))))
+
+;; ============================================================
+;; クエリパース: graphql.query
+;; ============================================================
+
+(deftest parse-shorthand-query-with-arg
+  (let [ast (q/parse-query "{ user(id: \"1\") { name } }")]
+    (is (= 1 (count ast)))
+    (is (= "user" (:graphql/field (first ast))))
+    (is (= {"id" "1"} (:graphql/args (first ast))))
+    (is (= 1 (count (:graphql/selections (first ast)))))
+    (is (= "name" (:graphql/field (first (:graphql/selections (first ast))))))))
+
+(deftest parse-named-query-multiple-selections
+  (let [ast (q/parse-query "query GetUser { user(id: \"42\") { name age } }")]
+    (is (= 1 (count ast)))
+    (is (= "user" (:graphql/field (first ast))))
+    (is (= 2 (count (:graphql/selections (first ast)))))))
+
+(deftest parse-integer-arg
+  (let [ast (q/parse-query "{ item(id: 99) { title } }")]
+    (is (= 99 (get (:graphql/args (first ast)) "id")))))
+
+;; ============================================================
+;; バリデーション: graphql.validate
+;; ============================================================
+
+(deftest valid-schema-passes
+  (is (v/valid? sample-schema))
+  (is (empty? (v/errors sample-schema))))
+
+(deftest dangling-field-type-is-error
+  (let [schema (sdl/parse-schema "type Query { foo: NonExistent }")]
+    (is (not (v/valid? schema)))
+    (is (contains? (set (map :graphql/code (v/errors schema)))
+                   :field/unknown-type))))
+
+(deftest missing-query-root-is-error
+  (let [schema (m/schema)]   ; 空スキーマ: query-root = nil
+    (is (not (v/valid? schema)))
+    (is (contains? (set (map :graphql/code (v/errors schema)))
+                   :schema/missing-query-root))))
+
+(deftest duplicate-field-name-is-error
+  (let [schema (sdl/parse-schema "type Query { name: String name: Int }")]
+    (is (not (v/valid? schema)))
+    (is (contains? (set (map :graphql/code (v/errors schema)))
+                   :field/duplicate-name))))
+
+(deftest undefined-query-root-type-is-error
+  (let [schema (-> (m/schema)
+                   (m/add-type (m/type-def "User" :object []))
+                   (m/set-query-root "NoSuchType"))]
+    (is (not (v/valid? schema)))
+    (is (contains? (set (map :graphql/code (v/errors schema)))
+                   :schema/missing-query-root))))
+
+;; ============================================================
+;; 実行: graphql.execute + graphql.ports
+;; ============================================================
+
+(deftest execute-top-level-field-via-default-resolver
+  (let [ports  (e/default-ports)
+        ast    (q/parse-query "{ user { name } }")
+        root   {:user {:name "Alice" :age 30}}
+        result (e/execute-query ports sample-schema ast root nil)]
+    (is (= {"user" {"name" "Alice"}} result))))
+
+(deftest execute-nested-object-via-fixture-resolver
+  (let [db     {"1" {:id "1" :name "Bob" :age 25}}
+        ports  {:resolver
+                (reify p/IResolver
+                  (resolve [_ type-name field-name parent args ctx]
+                    (if (and (= "Query" type-name) (= "user" field-name))
+                      (get db (get args "id"))
+                      (get parent (keyword field-name)))))}
+        ast    (q/parse-query "{ user(id: \"1\") { name age } }")
+        result (e/execute-query ports sample-schema ast nil nil)]
+    (is (= {"user" {"name" "Bob" "age" 25}} result))))
+
+(deftest execute-list-field-maps-sub-selection-over-collection
+  (let [users  [{:id "1" :name "Alice" :age 30}
+                {:id "2" :name "Bob"   :age 25}]
+        ports  {:resolver
+                (reify p/IResolver
+                  (resolve [_ type-name field-name parent args ctx]
+                    (if (and (= "Query" type-name) (= "users" field-name))
+                      users
+                      (get parent (keyword field-name)))))}
+        ast    (q/parse-query "{ users { name } }")
+        result (e/execute-query ports sample-schema ast nil nil)]
+    (is (= {"users" [{"name" "Alice"} {"name" "Bob"}]} result))))
+
+(deftest execute-args-passed-through-to-resolver
+  (let [captured (atom nil)
+        ports    {:resolver
+                  (reify p/IResolver
+                    (resolve [_ type-name field-name parent args ctx]
+                      (when (= "user" field-name)
+                        (reset! captured args))
+                      nil))}
+        ast      (q/parse-query "{ user(id: \"99\") { name } }")]
+    (e/execute-query ports sample-schema ast nil nil)
+    (is (= {"id" "99"} @captured))))
