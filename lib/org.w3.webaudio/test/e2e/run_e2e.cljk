@@ -1,0 +1,145 @@
+(ns run-e2e
+  "Real-browser E2E proof for org-w3-webaudio + kotoba-lang/audio: compiles
+   the two bundles (scripts/build-e2e-bundles.sh), serves test/e2e/page/ over
+   HTTP (Web Audio / AudioWorklet require a secure context -- about:blank/
+   file: do not expose audioWorklet), drives a real headless Chromium via
+   Playwright, loads the worklet DSP bundle into a real AudioWorkletProcessor
+   via ctx.audioWorklet.addModule + AudioWorkletNode, renders it through an
+   OfflineAudioContext, captures the actual PCM samples, and compares them
+   against kotoba-lang/audio's OWN offline render of the identical note
+   parameters (computed independently, right here, via audio.synth --
+   requires -cp pointing at a checkout of kotoba-lang/audio, see
+   AUDIO_SRC_PATH below).
+
+   Requires: `bash scripts/build-e2e-bundles.sh` run first, and
+   `npm install` inside test/e2e/ for the Playwright dependency.
+
+   Run from the repo root:
+     kbb --backend sci -cp \"$AUDIO_SRC_PATH\" test/e2e/run_e2e.cljk"
+  (:require ["playwright" :refer [chromium]]
+            ["http" :as http]
+            ["fs" :as fs]
+            ["path" :as path]
+            [audio.synth :as synth]))
+
+(def site-dir (path/join (js/process.cwd) "test" "e2e" "page"))
+(def port 8940)
+
+(def content-types
+  {".html" "text/html" ".js" "application/javascript"})
+
+(defn start-server []
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [server (http/createServer
+                     (fn [req res]
+                       (let [url (if (= (.-url req) "/") "/index.html" (.-url req))
+                             fpath (path/join site-dir url)
+                             ext (path/extname fpath)
+                             ctype (get content-types ext "application/octet-stream")]
+                         (if (fs/existsSync fpath)
+                           (do (.writeHead res 200 #js {"Content-Type" ctype})
+                               (.end res (fs/readFileSync fpath)))
+                           (do (.writeHead res 404) (.end res "not found"))))))]
+        (.listen server port (fn [] (resolve server)))))))
+
+;; --- note parameters, shared between the offline reference and the
+;;     browser-side worklet render ---------------------------------------
+(def SR 48000)
+(def FREQ 440.0)
+(def DUR-SECONDS 0.2)
+(def GATE-OFF-SECONDS 0.15)
+(def ATTACK 0.01)
+(def DECAY 0.02)
+(def SUSTAIN 0.6)
+(def RELEASE 0.05)
+
+(def dur-samples (synth/seconds->samples DUR-SECONDS SR))
+(def gate-off (synth/seconds->samples GATE-OFF-SECONDS SR))
+
+(defn offline-reference []
+  "-> vector of doubles. The exact same computation as
+   w3.webaudio.e2e.worklet-dsp/render-note, run here directly on the .cljc
+   source of truth (not through a browser/worklet at all) -- this is the
+   independent ground truth the browser-captured PCM is checked against."
+  (let [osc (synth/sine-wave FREQ SR dur-samples)
+        env (synth/adsr {:attack ATTACK :decay DECAY :sustain SUSTAIN
+                          :release RELEASE :gate-off gate-off :sample-rate SR}
+                         dur-samples)]
+    (synth/apply-envelope osc env)))
+
+(defn max-abs-diff [a b]
+  (reduce max 0.0 (map (fn [x y] (Math/abs (- x y))) a b)))
+
+(defn run-in-page [page]
+  ;; pageFunction is a plain JS source string (not a cljs/nbb-compiled fn
+  ;; value) deliberately: Playwright serializes function *values* via
+  ;; .toString() and re-evaluates them in the page's isolated context, which
+  ;; breaks for nbb-compiled closures (they reference nbb's own internal
+  ;; module aliases, e.g. munged locals, that don't exist in the browser).
+  ;;
+  ;; The params are inlined as a JSON literal into the expression string
+  ;; rather than passed via .evaluate's separate `arg` parameter --
+  ;; verified (with plain Node + Playwright, no nbb involved) that
+  ;; page.evaluate(<string>, arg) silently drops `arg` and resolves to
+  ;; undefined when pageFunction is a source STRING (as opposed to an
+  ;; actual Function value, where `arg` works fine). Not an nbb bug.
+  (.evaluate page
+    (str "window.runE2E("
+         (js/JSON.stringify
+           #js {:freq FREQ :sr SR :durSamples dur-samples :gateOff gate-off
+                :attack ATTACK :decay DECAY :sustain SUSTAIN :release RELEASE
+                :workletUrl "/worklet-processor.js"
+                :processorName "kami-note-processor"})
+         ")")))
+
+(defn report-and-exit [server browser reference result]
+  (let [captured (vec (.-pcm result))
+        n (min (count captured) (count reference))
+        captured-n (subvec captured 0 n)
+        reference-n (subvec (vec reference) 0 n)
+        diff (max-abs-diff captured-n reference-n)
+        tol 1e-6
+        pass (and (= (count captured) (count reference))
+                  (< diff tol))]
+    (println "=== org-w3-webaudio real-browser AudioWorklet E2E result ===")
+    (println "captured length:" (count captured) "reference length:" (count reference))
+    (println "first 10 captured:" (take 10 captured))
+    (println "first 10 reference:" (take 10 reference))
+    (println "max abs diff:" diff "tolerance:" tol)
+    (println "PASS:" pass)
+    (.close browser)
+    (.close server)
+    (if pass (js/process.exit 0) (js/process.exit 1))))
+
+(defn report-error [server browser e]
+  (println "ERROR:" (.-message e))
+  (.close browser)
+  (.close server)
+  (js/process.exit 1))
+
+(defn drive-page [server browser page reference]
+  (.on page "console" (fn [msg] (println "[console]" (.text msg))))
+  (.on page "pageerror" (fn [err] (println "[pageerror]" (str err))))
+  (-> (.goto page (str "http://localhost:" port "/"))
+      (.then (fn [_] (run-in-page page)))
+      (.then (fn [result] (report-and-exit server browser reference result)))
+      (.catch (fn [e] (report-error server browser e)))))
+
+(defn -main []
+  (when-not (fs/existsSync (path/join site-dir "worklet-processor.js"))
+    (println "ERROR: test/e2e/page/worklet-processor.js not found.")
+    (println "Run scripts/build-e2e-bundles.sh first.")
+    (js/process.exit 1))
+  (let [reference (offline-reference)]
+    (-> (start-server)
+        (.then
+          (fn [server]
+            (-> (.launch chromium)
+                (.then
+                  (fn [browser]
+                    (-> (.newPage browser)
+                        (.then (fn [page] (drive-page server browser page reference)))))))))
+        (.catch (fn [e] (println "SETUP ERROR:" (.-message e)) (js/process.exit 1))))))
+
+(-main)
