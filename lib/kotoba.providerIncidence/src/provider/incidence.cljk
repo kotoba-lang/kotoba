@@ -1,0 +1,349 @@
+(ns provider.incidence
+  "Physical, capability-scoped incidence storage over an explicit directory."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.capability-values :as capabilities]
+            [kotoba.lang.incidence :as incidence]
+            [kotoba.lang.incidence-port :as port]
+            [kotoba.lang.incidence-replication :as replication])
+  (:import [java.nio ByteBuffer]
+           [java.nio.channels FileChannel]
+           [java.nio.file AtomicMoveNotSupportedException FileAlreadyExistsException
+            Files LinkOption OpenOption Path StandardCopyOption StandardOpenOption]
+           [java.nio.file.attribute FileAttribute]))
+
+(def version 1)
+(def default-max-blocks 100000)
+(def default-max-block-bytes (* 1024 1024))
+(def default-max-bundle-bytes (* 64 1024 1024))
+
+(defprotocol ^:private DurableStoreValue
+  (-store-info [store])
+  (-store-lock [store]))
+
+(deftype ^:private DurableStore [info lock]
+  DurableStoreValue
+  (-store-info [_] info)
+  (-store-lock [_] lock))
+
+(defn store?
+  [x]
+  (satisfies? DurableStoreValue x))
+
+(defn description
+  "Return inert audit metadata, never the directory capability or lock."
+  [store]
+  (when (store? store)
+    (dissoc (-store-info store) :store/root :store/blocks)))
+
+(defn- non-empty-string? [x]
+  (capabilities/non-empty-string? x))
+
+(defn- reject-tag [tag _value]
+  (throw (ex-info "tagged EDN is not admitted"
+                  {:problem :incidence-store/tagged-edn :tag tag})))
+
+(defn- read-edn-bytes [bytes]
+  (edn/read-string {:readers {} :default reject-tag}
+                   (kbytes/utf8-string ^bytes bytes)))
+
+(defn- write-all! [^FileChannel channel ^bytes bytes]
+  (let [buffer (ByteBuffer/wrap bytes)]
+    (while (.hasRemaining buffer)
+      (.write channel buffer))
+    (.force channel true)))
+
+(defn- fsync-directory! [^Path directory]
+  (with-open [channel (FileChannel/open directory
+                                        (into-array OpenOption
+                                                    [StandardOpenOption/READ]))]
+    (.force channel true)))
+
+(defn- durable-create! [^Path directory ^Path target ^bytes bytes]
+  (let [temp (Files/createTempFile directory ".pending-" ".tmp"
+                                   (make-array FileAttribute 0))]
+    (try
+      (with-open [channel (FileChannel/open
+                           temp
+                           (into-array OpenOption
+                                       [StandardOpenOption/WRITE
+                                        StandardOpenOption/TRUNCATE_EXISTING]))]
+        (write-all! channel bytes))
+      (try
+        (Files/move temp target
+                    (into-array java.nio.file.CopyOption
+                                [StandardCopyOption/ATOMIC_MOVE]))
+        (catch FileAlreadyExistsException _
+          (Files/deleteIfExists temp))
+        (catch AtomicMoveNotSupportedException error
+          (throw (ex-info "atomic move is required for durable incidence"
+                          {:problem :incidence-store/atomic-move-unsupported}
+                          error))))
+      (fsync-directory! directory)
+      (finally
+        (Files/deleteIfExists temp)))))
+
+(defn- metadata-bytes [dataspace]
+  (kbytes/utf8-bytes (pr-str {:store/version version :store/dataspace dataspace})))
+
+(defn- ensure-metadata! [^Path root dataspace]
+  (let [path (.resolve root "store.edn")
+        expected {:store/version version :store/dataspace dataspace}]
+    (if (Files/exists path (make-array LinkOption 0))
+      (when-not (= expected (read-edn-bytes (Files/readAllBytes path)))
+        (throw (ex-info "incidence store metadata does not match"
+                        {:problem :incidence-store/metadata-mismatch})))
+      (durable-create! root path (metadata-bytes dataspace)))))
+
+(defn open-store
+  "Open one exact DATASPACE in explicit DIRECTORY capability.
+
+  The directory is exclusive to this provider instance. Callers must not hand
+  the same path to concurrent writers; multi-node replication uses independent
+  directories."
+  ([directory dataspace] (open-store directory dataspace {}))
+  ([directory dataspace {:keys [max-blocks max-block-bytes]
+                         :or {max-blocks default-max-blocks
+                              max-block-bytes default-max-block-bytes}}]
+   (when-not (instance? Path directory)
+     (throw (ex-info "explicit Path directory capability required"
+                     {:problem :incidence-store/directory-required})))
+   (when-not (non-empty-string? dataspace)
+     (throw (ex-info "dataspace is invalid"
+                     {:problem :incidence-store/dataspace-invalid})))
+   (when-not (and (int? max-blocks) (pos? max-blocks)
+                  (int? max-block-bytes) (pos? max-block-bytes))
+     (throw (ex-info "store bounds are invalid"
+                     {:problem :incidence-store/bounds-invalid})))
+   (Files/createDirectories directory (make-array FileAttribute 0))
+   (when (Files/isSymbolicLink directory)
+     (throw (ex-info "store root may not be a symbolic link"
+                     {:problem :incidence-store/symlink-root})))
+   (let [root (.toRealPath directory (make-array LinkOption 0))
+         blocks (.resolve root "blocks")]
+     (Files/createDirectories blocks (make-array FileAttribute 0))
+     (when (Files/isSymbolicLink blocks)
+       (throw (ex-info "blocks directory may not be a symbolic link"
+                       {:problem :incidence-store/symlink-blocks})))
+     (ensure-metadata! root dataspace)
+     (DurableStore.
+      {:store/version version
+       :store/dataspace dataspace
+       :store/root root
+       :store/blocks blocks
+       :store/max-blocks max-blocks
+       :store/max-block-bytes max-block-bytes}
+      (Object.)))))
+
+(defn- block-path [store cid]
+  (.resolve ^Path (:store/blocks (-store-info store)) (str cid ".edn")))
+
+(defn- entry-bytes [entry]
+  (kbytes/utf8-bytes (pr-str entry)))
+
+(defn- read-entry! [store ^Path path]
+  (let [info (-store-info store)
+        bytes (Files/readAllBytes path)]
+    (when (> (alength bytes) (:store/max-block-bytes info))
+      (throw (ex-info "stored incidence exceeds byte bound"
+                      {:problem :incidence-store/block-too-large
+                       :path (str (.getFileName path))})))
+    (let [entry (try
+                  (read-edn-bytes bytes)
+                  (catch Exception error
+                    (throw (ex-info "stored incidence is not inert EDN"
+                                    {:problem :incidence-store/edn-invalid
+                                     :path (str (.getFileName path))}
+                                    error))))
+          verified (incidence/verify-addressed entry)
+          filename (str (.getFileName path))
+          expected-name (when (:ok? verified) (str (:cid verified) ".edn"))]
+      (when-not (and (:ok? verified) (= expected-name filename))
+        (throw (ex-info "stored incidence CID does not match its filename"
+                        {:problem :incidence-store/cid-mismatch
+                         :path filename})))
+      entry)))
+
+(defn- append-error [store request]
+  (let [info (-store-info store)
+        expected-dataspace (:store/dataspace info)
+        cap (:capability request)
+        verified (when (map? (:entry request))
+                   (incidence/verify-addressed (:entry request)))]
+    (cond
+      (not (map? request)) {:problem :incidence-store/request-not-a-map}
+      (not= #{:dataspace :entry :capability} (set (keys request)))
+      {:problem :incidence-store/request-fields}
+      (not= expected-dataspace (:dataspace request))
+      {:problem :incidence-store/dataspace-mismatch}
+      (not (:ok? verified))
+      {:problem :incidence-store/entry-invalid :verification verified}
+      (not (capabilities/capability? cap))
+      {:problem :incidence-store/capability-invalid}
+      (not= port/append-kind (:cap/kind cap))
+      {:problem :incidence-store/capability-kind}
+      (not= expected-dataspace (:cap/resource cap))
+      {:problem :incidence-store/capability-resource})))
+
+(defn append!
+  "Durably append one verified addressed incidence and return its deterministic
+  durability receipt. The receipt is emitted only after disk readback."
+  [store request]
+  (when-not (store? store)
+    (throw (ex-info "durable incidence store required"
+                    {:problem :incidence-store/store-required})))
+  (when-let [error (append-error store request)]
+    (throw (ex-info "incidence append denied" error)))
+  (locking (-store-lock store)
+    (let [info (-store-info store)
+          entry (:entry request)
+          cid (:incidence/cid entry)
+          path (block-path store cid)
+          bytes (entry-bytes entry)]
+      (when (> (alength bytes) (:store/max-block-bytes info))
+        (throw (ex-info "incidence exceeds byte bound"
+                        {:problem :incidence-store/block-too-large})))
+      (when (and (not (Files/exists path (make-array LinkOption 0)))
+                 (>= (with-open [stream (Files/list ^Path (:store/blocks info))]
+                       (.count stream))
+                     (:store/max-blocks info)))
+        (throw (ex-info "incidence store capacity reached"
+                        {:problem :incidence-store/capacity})))
+      (when-not (Files/exists path (make-array LinkOption 0))
+        (durable-create! (:store/blocks info) path bytes))
+      (when-not (= entry (read-entry! store path))
+        (throw (ex-info "durable incidence readback differs"
+                        {:problem :incidence-store/readback-mismatch})))
+      (incidence/append-durable-receipt (:store/dataspace info) entry))))
+
+(defn append-provider
+  "Return the lexical append function consumed by incidence-port."
+  [store]
+  (when-not (store? store)
+    (throw (ex-info "durable incidence store required"
+                    {:problem :incidence-store/store-required})))
+  (fn [request] (append! store request)))
+
+(defn entries
+  "Read and verify all physically stored entries in stable CID order."
+  [store]
+  (when-not (store? store)
+    (throw (ex-info "durable incidence store required"
+                    {:problem :incidence-store/store-required})))
+  (locking (-store-lock store)
+    (let [blocks ^Path (:store/blocks (-store-info store))
+          paths (with-open [stream (Files/list blocks)]
+                  (->> (.iterator stream)
+                       iterator-seq
+                       (filter #(str (.endsWith (str (.getFileName ^Path %)) ".edn")))
+                       (sort-by #(str (.getFileName ^Path %)))
+                       vec))]
+      (when (> (count paths) (:store/max-blocks (-store-info store)))
+        (throw (ex-info "incidence store capacity exceeded on recovery"
+                        {:problem :incidence-store/capacity})))
+      (mapv #(read-entry! store %) paths))))
+
+(defn recover
+  "Rebuild a bounded in-memory anti-entropy replica from physical files."
+  [store]
+  (let [info (-store-info store)
+        initial (replication/replica
+                 (:store/dataspace info)
+                 {:max-batch replication/default-max-batch
+                  :max-block-bytes (:store/max-block-bytes info)})]
+    (reduce (fn [state batch]
+              (let [result (replication/ingest state (vec batch))]
+                (when-not (:ok? result)
+                  (throw (ex-info "physical incidence recovery failed"
+                                  {:problem :incidence-store/recovery-failed
+                                   :reason (:reason result)})))
+                (:replica result)))
+            initial
+            (partition-all replication/default-max-batch (entries store)))))
+
+(defn replicate!
+  "Copy every verified block from SOURCE into independent TARGET stores.
+
+  TARGETS is a vector of `{:store durable-store :capability concrete-cap}`.
+  The target append boundary re-checks scope and performs its own fsync and
+  readback before this function reports success."
+  [source targets]
+  (when-not (and (store? source) (vector? targets) (seq targets))
+    (throw (ex-info "replication inputs are invalid"
+                    {:problem :incidence-store/replication-input})))
+  (let [dataspace (:store/dataspace (-store-info source))
+        source-entries (entries source)]
+    (mapv (fn [{:keys [store capability] :as target}]
+            (when-not (= #{:store :capability} (set (keys target)))
+              (throw (ex-info "replication target shape is invalid"
+                              {:problem :incidence-store/replication-target})))
+            (doseq [entry source-entries]
+              (append! store {:dataspace dataspace
+                              :entry entry
+                              :capability capability}))
+            {:store (description store)
+             :entries (count source-entries)})
+          targets)))
+
+(defn export-bundle
+  "Export verified entries as inert EDN bytes, never serialized authority.
+
+  The bundle is transport-independent: a caller may carry these bytes over an
+  authenticated CapTP/net capability, removable media, or a fleet channel.
+  Import still needs a fresh append capability scoped to the target store."
+  [store]
+  (when-not (store? store)
+    (throw (ex-info "durable incidence store required"
+                    {:problem :incidence-store/store-required})))
+  (let [info (-store-info store)]
+    (kbytes/utf8-bytes
+     (pr-str {:incidence-bundle/version version
+              :incidence-bundle/dataspace (:store/dataspace info)
+              :incidence-bundle/entries (entries store)}))))
+
+(defn import-bundle!
+  "Verify and fsync every entry from inert bundle BYTES into STORE.
+
+  Import is not authority reconstruction. CAPABILITY is rechecked for every
+  append, and a malformed, oversized, cross-dataspace, or forged bundle is
+  rejected before any entry is written."
+  ([store capability bytes]
+   (import-bundle! store capability bytes {}))
+  ([store capability bytes {:keys [max-bundle-bytes]
+                            :or {max-bundle-bytes default-max-bundle-bytes}}]
+   (when-not (and (store? store)
+                  (= (class bytes) (Class/forName "[B"))
+                  (int? max-bundle-bytes) (pos? max-bundle-bytes))
+     (throw (ex-info "bundle import inputs are invalid"
+                     {:problem :incidence-store/bundle-input})))
+   (when (> (alength ^bytes bytes) max-bundle-bytes)
+     (throw (ex-info "incidence bundle exceeds byte bound"
+                     {:problem :incidence-store/bundle-too-large})))
+   (let [bundle (try
+                  (read-edn-bytes bytes)
+                  (catch Exception error
+                    (throw (ex-info "incidence bundle is not inert EDN"
+                                    {:problem :incidence-store/bundle-edn-invalid}
+                                    error))))
+         info (-store-info store)
+         expected-keys #{:incidence-bundle/version
+                         :incidence-bundle/dataspace
+                         :incidence-bundle/entries}
+         bundle-entries (:incidence-bundle/entries bundle)]
+     (when-not (and (map? bundle)
+                    (= expected-keys (set (keys bundle)))
+                    (= version (:incidence-bundle/version bundle))
+                    (= (:store/dataspace info)
+                       (:incidence-bundle/dataspace bundle))
+                    (vector? bundle-entries)
+                    (<= (count bundle-entries) (:store/max-blocks info))
+                    ;; Validate the complete transfer before the first fsync.
+                    (every? #(true? (:ok? (incidence/verify-addressed %)))
+                            bundle-entries))
+       (throw (ex-info "incidence bundle is invalid"
+                       {:problem :incidence-store/bundle-invalid})))
+     (doseq [entry bundle-entries]
+       (append! store {:dataspace (:store/dataspace info)
+                       :entry entry
+                       :capability capability}))
+     {:incidence-bundle/imported (count bundle-entries)
+      :incidence-bundle/cids (mapv :incidence/cid bundle-entries)})))
