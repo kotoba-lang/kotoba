@@ -1,0 +1,170 @@
+(ns macos-inventory.core-test
+  "Parsers tested against output captured from a real machine. Every fixture here
+  is verbatim command output — the shapes are all easy to almost-parse, and a
+  verdict derived from a misread line is reported with the same confidence as a
+  correct one."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [macos-inventory.core :as c]))
+
+;; --- codesign ---------------------------------------------------------------
+
+(deftest codesign-reads-stderr-not-stdout
+  (testing "codesign writes its whole report to stderr and exits 0; reading only
+            stdout made every verdict :unknown, which reported a fleet of
+            properly signed daemons as unverifiable"
+    (is (= :dev-signed
+           (c/parse-codesign
+            {:exit 0 :notarized? false
+             :stderr (str "Identifier=com.macpaw.CleanMyMac4.Agent\n"
+                          "Signature size=9047\n"
+                          "Authority=Developer ID Application: MacPaw Way Ltd (S8EX82NJP6)\n"
+                          "Authority=Developer ID Certification Authority\n"
+                          "Authority=Apple Root CA\n"
+                          "TeamIdentifier=S8EX82NJP6\n")})))))
+
+(deftest developer-id-is-not-notarization
+  (testing "Developer ID says who signed it; only spctl says Apple notarized it"
+    (let [stderr "Authority=Developer ID Application: Acme (ABCDE12345)\n"]
+      (is (= :dev-signed (c/parse-codesign {:exit 0 :stderr stderr :notarized? false})))
+      (is (= :notarized (c/parse-codesign {:exit 0 :stderr stderr :notarized? true}))))))
+
+(deftest codesign-negative-verdicts
+  (is (= :unsigned (c/parse-codesign {:exit 1 :stderr "code object is not signed at all"})))
+  (is (= :adhoc (c/parse-codesign {:exit 0 :stderr "Signature=adhoc\n"})))
+  (is (= :apple-signed (c/parse-codesign {:exit 0 :stderr "Authority=Software Signing\n"})))
+  (is (= :revoked (c/parse-codesign {:exit 1 :stderr "certificate revoked"})))
+  (is (= :broken (c/parse-codesign {:exit 1 :stderr "invalid signature (code or signature have been modified)"}))))
+
+(deftest a-missing-file-is-unknown-not-broken
+  (testing "not knowing is not evidence of wrongdoing"
+    (is (= :unknown (c/parse-codesign {:exit 1 :stderr "No such file or directory"})))))
+
+(deftest spctl-notarization
+  (is (c/parse-spctl-notarized? {:stdout "" :stderr "accepted\nsource=Notarized Developer ID\n"}))
+  (is (not (c/parse-spctl-notarized? {:stdout "" :stderr "accepted\nsource=Developer ID\n"}))))
+
+(deftest gatekeeper-status
+  (is (= :enabled (c/parse-gatekeeper {:stdout "assessments enabled\n"})))
+  (is (= :disabled (c/parse-gatekeeper {:stdout "assessments disabled\n"})))
+  (is (= :unknown (c/parse-gatekeeper {:stdout ""}))))
+
+;; --- lsof -------------------------------------------------------------------
+
+(deftest lsof-groups-ports-per-pid
+  (let [out "p123\ncnode\nn*:8080\nn127.0.0.1:9229\np456\ncssh\nn*:22\n"
+        parsed (c/parse-lsof out)]
+    (is (= #{"8080" "9229"} (get-in parsed ["123" :ports])))
+    (is (= "node" (get-in parsed ["123" :command])))
+    (is (= #{"22"} (get-in parsed ["456" :ports])))))
+
+(deftest lsof-tolerates-empty-output
+  (is (= {} (c/parse-lsof ""))))
+
+;; --- TCC --------------------------------------------------------------------
+
+(deftest tcc-keeps-only-granted-rows
+  (let [out (str "kTCCServiceSystemPolicyAllFiles|com.a.app|2\n"
+                 "kTCCServiceCamera|com.b.app|0\n"
+                 "kTCCServiceScreenCapture|com.a.app|3\n")]
+    (is (= 2 (count (c/parse-tcc-rows out))))
+    (is (= {:full-disk-access :screen-recording}
+           (let [g (get (c/tcc-by-client (c/parse-tcc-rows out)) "com.a.app")]
+             (zipmap [(first (sort g))] [(second (sort g))]))))))
+
+(deftest high-impact-grants-are-the-system-database-ones
+  (testing "these four live only in the system TCC.db — a user-only probe omits
+            exactly the grants that matter most"
+    (is (every? c/high-impact-grants
+                [:full-disk-access :screen-recording :accessibility :input-monitoring]))
+    (is (not (c/high-impact-grants :calendar)))))
+
+;; --- system extensions ------------------------------------------------------
+
+(def sysext-fixture
+  (str "2 extension(s)\n"
+       "--- com.apple.system_extension.driver_extension (Go to 'System Settings > General' to modify these system extension(s))\n"
+       "enabled\tactive\tteamID\tbundleID (version)\tname\t[state]\n"
+       "*\t*\tQED4VVPZWA\tcom.logi.ghub.hidfilter (1.1.10.394804/1.1.10)\tLogitech G HUB HID Driver Extension\t[activated enabled]\n"
+       "*\t*\tG43BCU2T37\torg.pqrs.Karabiner-DriverKit-VirtualHIDDevice (1.8.0/1.8.0)\torg.pqrs.Karabiner-DriverKit-VirtualHIDDevice\t[activated enabled]\n"))
+
+(deftest system-extensions-skips-headers-and-counts
+  (let [items (c/parse-system-extensions sysext-fixture)]
+    (is (= 2 (count items)) "the header row also contains (version) and must not parse")
+    (is (= #{"com.logi.ghub.hidfilter" "org.pqrs.Karabiner-DriverKit-VirtualHIDDevice"}
+           (set (map :bundle-id items))))
+    (is (= "QED4VVPZWA" (:team-id (first items))))
+    (is (every? :enabled? items))
+    (is (= "activated enabled" (:state (first items))))))
+
+;; --- kexts ------------------------------------------------------------------
+
+(def kext-fixture
+  (str "No variant specified, falling back to release\n"
+       "Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>\n"
+       "   10   20 0xfffffe0007c7b630 0x1e9b0    0x1e9b0    com.apple.kec.corecrypto (26.0) 0B130D5E <9 8 7>\n"
+       "   99    0 0xfffffe0007438f00 0x51f      0x51f      com.vendor.driver (2.1) DCD7681C <10 8>\n"))
+
+(deftest kexts-separate-apple-from-third-party
+  (let [items (c/parse-kext-list kext-fixture)]
+    (is (= 2 (count items)) "the header's 'Name (Version)' must not parse as a record")
+    (is (= 1 (count (remove :apple? items))))
+    (is (= "com.vendor.driver" (:bundle-id (first (remove :apple? items)))))
+    (is (= "2.1" (:version (first (remove :apple? items)))))))
+
+;; --- config profiles --------------------------------------------------------
+
+(deftest profiles-handles-the-empty-machine
+  (testing "profiles -L -o stdout-xml on a machine with none yields an empty dict"
+    (is (= [] (c/parse-profiles {})))
+    (is (= [] (c/parse-profiles nil)))))
+
+(deftest profiles-flattens-domains-and-reads-removability
+  (let [data {"_computerlevel" [{"ProfileIdentifier" "com.example.mdm"
+                                 "ProfileDisplayName" "Corp MDM"
+                                 "ProfileOrganization" "Example"
+                                 "ProfileRemovalDisallowed" "never"}]}
+        [p] (c/parse-profiles data)]
+    (is (= "com.example.mdm" (:identifier p)))
+    (is (= "Corp MDM" (:display-name p)))
+    (is (false? (:removable? p)) "a profile the user cannot remove is a different fact")))
+
+;; --- browser extensions -----------------------------------------------------
+
+(deftest risky-permissions-flag-broad-observation
+  (is (seq (c/risky-permissions ["<all_urls>"])))
+  (is (seq (c/risky-permissions ["cookies" "storage"])))
+  (is (seq (c/risky-permissions ["*://*/*"])))
+  (is (empty? (c/risky-permissions ["storage" "alarms" "contextMenus"]))))
+
+(deftest chromium-manifest-v2-and-v3
+  (testing "v2 mixes hosts into :permissions; v3 splits them into host_permissions"
+    (let [v2 (c/parse-chromium-manifest {"name" "Old" "version" "1.0"
+                                         "manifest_version" 2
+                                         "permissions" ["tabs" "<all_urls>"]})
+          v3 (c/parse-chromium-manifest {"name" "New" "version" "2.0"
+                                         "manifest_version" 3
+                                         "permissions" ["storage"]
+                                         "host_permissions" ["<all_urls>"]})]
+      (is (= 2 (count (:risky-permissions v2))))
+      (is (= ["<all_urls>"] (:risky-permissions v3)))
+      (is (= 3 (:manifest-version v3))))))
+
+(deftest an-unnamed-extension-still-parses
+  (is (= "(unnamed)" (:name (c/parse-chromium-manifest {"version" "1"})))))
+
+;; --- coverage ---------------------------------------------------------------
+
+(deftest a-denial-is-never-masked-by-a-success
+  (is (= :denied (c/combine-status [:complete :denied])))
+  (is (= :denied (c/combine-status [:denied :complete])))
+  (is (= :partial (c/combine-status [:complete :not-attempted])))
+  (is (= :complete (c/combine-status [:complete :complete])))
+  (is (= :not-attempted (c/combine-status []))))
+
+(deftest coverage-details-accumulate-across-sources
+  (let [c1 (-> {}
+               (c/add-coverage :launch-agents :complete "18 in ~/Library/LaunchAgents")
+               (c/add-coverage :launch-agents :complete "0 in /Library/LaunchAgents"))]
+    (is (= :complete (get-in c1 [:launch-agents :status])))
+    (is (re-find #"18 in" (get-in c1 [:launch-agents :detail])))
+    (is (re-find #"0 in" (get-in c1 [:launch-agents :detail])))))
