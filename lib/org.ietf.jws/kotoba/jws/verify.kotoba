@@ -1,0 +1,280 @@
+;; JWS Compact Serialization verification, as a Kotoba application
+;; (ADR-2608261100) — RFC 7515.
+;;
+;;   init             (config)          -> state
+;;   offer-compact    (state, compact)  -> state   ; the three dotted parts
+;;   offer-header     (state, header)   -> state   ; the host decoded it
+;;   signature-checked(state, ok)       -> state   ; the host did the crypto
+;;
+;; ## Why this is the slice where the guest/host line matters most
+;;
+;; `jws.core`'s own docstring already draws it: signing and verifying are
+;; INJECTED, because a JWS library that owns the cryptography ends up owning
+;; key custody too. This module takes that one step further and moves the
+;; *decisions* out of the same process as the key.
+;;
+;;   the guest owns   whether this token may be verified at all: is `alg`
+;;                    present, is it `none`, is it one the caller named, and
+;;                    does `crit` demand something unimplemented -- plus what
+;;                    the signing input is;
+;;   the host owns    the key, the signature check, base64url and JSON.
+;;
+;; The guest never sees a key, a signature byte, or a decoded payload. It
+;; sees the header's fields and three base64url strings, and it answers one
+;; question: may this be verified, and over what bytes. `signature-checked`
+;; takes a bool, which is the entire result of the cryptography.
+;;
+;; That is the `:authority` shielding axis (adr-2608301500) applied to the
+;; place it was invented for: the decision is the guest's, the secret is the
+;; host's.
+;;
+;; ## The three refusals that are the point
+;;
+;; Every one of these is a decision, not a computation, and every one has a
+;; CVE-shaped history:
+;;
+;;   * **`alg: none` is refused unconditionally** (§6, "Unsecured JWS") and
+;;     cannot be enabled -- not even by naming it in `:allowed`. RFC 7515
+;;     stops short of prohibiting it; every deployment that has accepted one
+;;     has regretted it. `unsecured-cannot-be-allowed-in` is the control.
+;;   * **the header does not choose the algorithm** (§10). `alg` is supplied
+;;     by whoever produced the token, so a verifier that reads it and then
+;;     uses it to pick the check lets the attacker choose the check. The
+;;     caller must name what it accepts, and `init` REFUSES a state with no
+;;     names at all -- before a single byte is parsed.
+;;   * **`crit` naming an unimplemented header invalidates** (§4.1.11). Not
+;;     ignored: the producer used `crit` precisely to say "reject this if you
+;;     do not handle it", so ignoring it inverts the one thing it means.
+;;
+;; ## What does not pass through the guest
+;;
+;; The payload stays base64url and is handed back as it arrived; the host
+;; decodes it, and only after the signature checked out. A JWT payload can
+;; be large and a `:document` cannot hold one (`:container-items` 32,
+;; `:aggregate-utf8-bytes` 65536 -- ADR-2608039970). Signature bytes never
+;; enter at all: the guest sees only whether the check succeeded.
+;;
+;; The header DOES enter, as a decoded `:document`, because its fields are
+;; the decision inputs. That is bounded -- `alg` is a token and `crit` is a
+;; short list -- and it is the one thing this module has to read.
+;;
+;; No regular expressions: the oracle splits on `#"\."`; here the split is
+;; positional (ADR-2608650000 decision 6).
+;;
+;; The byte-scanning helpers are the fourth copy in this workspace. They
+;; cannot be shared: the only linking route is the project route, which the
+;; CLI runs on the JVM, which Q9 forbids -- adr-2608302100 has the
+;; measurement and the removal conditions.
+;;
+;; `.cljc` remains the oracle and is not required from here (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/jws/verify.kotoba \
+;;     --target wasm32-browser --output verify.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6476-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns jws.verify
+  (:export [init offer-compact offer-header signature-checked
+            phase reason
+            header-b64 payload-b64 signature-b64 signing-input
+            alg unsupported-critical allowed-count]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+;; An absent key is an empty list, not a null: `document-count` needs a
+;; container, and "the header carried no `crit`" and "`crit` was empty" are
+;; the same fact for every decision here.
+(defn- dv [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-vector)))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-str [v :document i :i64] :string
+  (option-value-of [:option :string] (document-string-value (at v i)) ""))
+
+;; --- byte scanning --------------------------------------------------------
+;; base64url and the dot separators are US-ASCII (§2), so byte offsets are
+;; the right unit. No payload or signature byte is scanned here.
+
+(defn- at-byte [s :string i :i64] :i64
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- index-of [s :string c :i64 i :i64] :i64
+  (let [x (at-byte s i)]
+    (cond (= x -1) -1
+          (= x c) i
+          :else (index-of s c (+ i 1)))))
+
+(defn- count-dots [s :string i :i64 acc :i64] :i64
+  (let [d (index-of s 46 i)]
+    (if (< d 0) acc (count-dots s (+ d 1) (+ acc 1)))))
+
+;; --- the understood header parameters (§4.1.11) ---------------------------
+;; `crit` can only be checked against something real. JSON member names are
+;; case-sensitive (RFC 8259 §4), so these compare exactly.
+
+(defn- understood? [name :string] :bool
+  (or (or (or (string=? name "alg") (string=? name "typ"))
+          (or (string=? name "cty") (string=? name "kid")))
+      (or (or (or (string=? name "jku") (string=? name "jwk"))
+              (or (string=? name "x5u") (string=? name "x5c")))
+          (or (or (string=? name "x5t") (string=? name "x5t#S256"))
+              (string=? name "crit")))))
+
+(defn- unsecured-alg [] :string "none")
+
+;; --- state ----------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :rejected))
+   :reason (document-keyword why)))
+
+;; §10, and the reason `:expected-alg` is required rather than defaulted:
+;; a verifier with no named algorithms has not decided anything, and the
+;; only place left for the decision to come from is the token. So this is
+;; refused at construction, before a byte is parsed.
+(defn init [config :document] :document
+  (let [allowed (dv config :allowed)
+        n (document-count allowed)
+        base (document-map :phase (document-keyword :want-compact)
+                           :reason (document-keyword :none)
+                           :allowed allowed
+                           :allowed-count (document-i64 n)
+                           :header-b64 (document-string "")
+                           :payload-b64 (document-string "")
+                           :signature-b64 (document-string "")
+                           :alg (document-string "")
+                           :bad-crit (document-string ""))]
+    (if (= n 0)
+      (refuse base :jws/expected-alg-required)
+      base)))
+
+;; --- the compact serialization (§7.1) -------------------------------------
+
+(defn offer-compact [state :document compact :string] :document
+  (if (not (= (dk state :phase) :want-compact))
+    state
+    ;; Exactly two dots, exactly three parts. base64url has no `.` (§2), so
+    ;; counting them is the whole of the check.
+    (if (not (= (count-dots compact 0 0) 2))
+      (refuse state :jws/malformed)
+      (let [d1 (index-of compact 46 0)
+            d2 (index-of compact 46 (+ d1 1))]
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc state :phase (document-keyword :want-header))
+           :header-b64 (document-string (string-substring compact 0 d1)))
+          :payload-b64 (document-string (string-substring compact (+ d1 1) d2)))
+         :signature-b64 (document-string
+                         (string-substring compact (+ d2 1)
+                                           (string-byte-length compact))))))))
+
+;; --- the decision ---------------------------------------------------------
+
+(defn- allowed? [state :document a :string i :i64] :bool
+  (let [allowed (dv state :allowed)]
+    (cond
+      (>= i (document-count allowed)) false
+      (string=? (at-str allowed i) a) true
+      :else (allowed? state a (+ i 1)))))
+
+;; The first `crit` entry this implementation does not understand, or "".
+(defn- bad-crit [crit :document i :i64] :string
+  (cond
+    (>= i (document-count crit)) ""
+    (not (understood? (at-str crit i))) (at-str crit i)
+    :else (bad-crit crit (+ i 1))))
+
+;; The host base64url-decoded the protected header and turned its JSON into
+;; a document: `:alg` a string, `:crit` a vector of strings. Nothing it
+;; contains is trustworthy yet -- that is precisely what is being decided.
+(defn offer-header [state :document header :document] :document
+  (if (not (= (dk state :phase) :want-header))
+    state
+    (let [a (ds header :alg)
+          kept (document-assoc state :alg (document-string a))
+          crit (dv header :crit)
+          bad (bad-crit crit 0)]
+      (cond
+        (string=? a "") (refuse kept :jws/missing-alg)
+
+        ;; Before the allow-list, and not reachable through it: naming
+        ;; `none` in :allowed must not enable it.
+        (string=? a (unsecured-alg)) (refuse kept :jws/unsecured)
+
+        ;; Named, not reported as a bad signature: the token may be
+        ;; perfectly signed with an algorithm this caller does not accept,
+        ;; and those are different facts.
+        (not (allowed? kept a 0)) (refuse kept :jws/unexpected-alg)
+
+        (not (string=? bad ""))
+        (refuse (document-assoc kept :bad-crit (document-string bad))
+                :jws/unsupported-critical-header)
+
+        (string=? (ds kept :signature-b64) "") (refuse kept :jws/empty-signature)
+
+        :else (document-assoc kept :phase (document-keyword :want-signature))))))
+
+;; The host verified the signing input against the signature with the key it
+;; holds. A bool is the entire result of the cryptography that this module
+;; needs, and the entire amount of it that may cross.
+(defn signature-checked [state :document ok :bool] :document
+  (if (not (= (dk state :phase) :want-signature))
+    state
+    (if ok
+      (document-assoc state :phase (document-keyword :verified))
+      (refuse state :jws/bad-signature))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+(defn header-b64 [state :document] :string (ds state :header-b64))
+
+;; Still encoded: the host decodes it, and only once the signature checked
+;; out. A JWT payload can be large, and a decoded one has no business being
+;; a guest value.
+(defn payload-b64 [state :document] :string (ds state :payload-b64))
+
+(defn signature-b64 [state :document] :string (ds state :signature-b64))
+
+;; §5.1: `BASE64URL(UTF8(header)) || '.' || BASE64URL(payload)`. The ASCII
+;; of that concatenation -- the host encodes it, because handing back bytes
+;; would mean the guest choosing a charset for something it does not own.
+;;
+;; Built from the ENCODED parts. A verifier that re-encodes the decoded
+;; header signs a different string than the producer did, and the failure
+;; looks like a bad key.
+(defn signing-input [state :document] :string
+  (string-concat (ds state :header-b64)
+                 (string-concat "." (ds state :payload-b64))))
+
+(defn alg [state :document] :string (ds state :alg))
+
+(defn unsupported-critical [state :document] :string (ds state :bad-crit))
+
+(defn allowed-count [state :document] :i64 (di state :allowed-count))
