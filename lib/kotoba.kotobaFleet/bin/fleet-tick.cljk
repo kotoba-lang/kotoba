@@ -1,0 +1,92 @@
+#!/usr/bin/env kbb
+(ns fleet-tick
+  "One bounded tick of the fleet: pick up to N work-units, dispatch each to an
+  eligible node, and stop.
+
+  A tick is deliberately BOUNDED and idempotent-by-lease rather than a daemon:
+  every unit it touches is leased, every decision it makes is a signed receipt,
+  and if it dies halfway the lease expires and the next tick picks the unit up.
+  That is the durable-outer-loop shape (ADR-2606280001) — cadence belongs to
+  whatever schedules the tick (launchd, a cron trigger), not to a process that
+  must stay alive.
+
+  It reuses `fleet.dispatch` rather than reimplementing the flow, and it probes
+  nodes ONCE and reuses the capability set for every unit in the tick.
+
+  Usage:
+    kbb --backend sci --classpath src:hosts/nbb:<libs> bin/fleet-tick.cljk \\
+        --work-dir examples/work/ [--max 3] [--store kotobase] [--db-name fleet-log]
+        [--nodes a,b,c | --fleet-edn <path>] [--materialize dry-run|push|none]
+        [--publish] [--identity kagi:<item>]"
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]
+            [fleet.cli :as cli]
+            [fleet.dispatch :as dispatch]
+            [fleet.identity :as fid]
+            [fleet.node :as node]
+            [kotoba.fleet.view :as view]))
+
+(def work-dir (cli/opt "--work-dir" "examples"))
+(def max-units (js/parseInt (cli/opt "--max" "3")))
+(def log-path (cli/opt "--log" (path/resolve ".fleet/log.edn")))
+(def state-dir (path/dirname (path/resolve log-path)))
+(def agent-src (cli/opt "--agent-src" "hosts/nbb/fleet/sandbox_agent.cljk"))
+(def started (js/Date.now))
+
+(defn- work-specs []
+  (->> (fs/readdirSync work-dir)
+       (filter #(str/ends-with? % ".edn"))
+       sort
+       (map #(reader/read-string (fs/readFileSync (path/join work-dir %) "utf8")))
+       (take max-units)
+       vec))
+
+(defn -main []
+  (fs/mkdirSync state-dir #js {:recursive true})
+  (let [me (fid/resolve-identity (cli/opt "--identity" "kagi:fleet-agent-sandbox-dispatch"))
+        db (dispatch/open-store! {:store (keyword (cli/opt "--store" "file"))
+                                  :log-path log-path
+                                  :db-name (cli/opt "--db-name" "fleet-log")
+                                  :identity me})
+        specs (work-specs)
+        agent-name (cli/opt "--agent" (str "tick-" (.-pid js/process)))
+        ;; probe once per tick, not once per unit
+        caps (mapv #(node/probe % {:agent-path agent-src})
+                   (node/inventory {:nodes (cli/opt "--nodes" nil)
+                                    :fleet-edn (cli/opt "--fleet-edn" nil)}))
+        _ (cli/say (str "tick: " (count specs) " unit(s), "
+                        (count (filter :contains-exec caps)) "/" (count caps)
+                        " node(s) with contained exec"))
+        results
+        (mapv (fn [spec]
+                (cli/say (str "\n— " (:work-id spec) " (" (:unit spec) ")"))
+                (let [{:keys [node why]} (node/choose caps {:requires (set (get spec :requires [:nbb :git]))
+                                                            :runtime-sha256 (get-in spec [:kcm/identity :runtime-sha256])
+                                                            :allow-unsandboxed? (:allow-unsandboxed-exec spec)})]
+                  (cond
+                    (and (not node) (:node spec)) {:work-id (:work-id spec) :status :no-eligible-node :why why}
+                    (not node) (do (cli/say (str "  skipped: " why))
+                                   {:work-id (:work-id spec) :status :no-eligible-node})
+                    :else
+                    (try
+                      (assoc (dispatch/dispatch!
+                              {:spec spec :agent-name agent-name :identity me :db db
+                               :state-dir state-dir :agent-src agent-src :node-name node
+                               :materialize (keyword (cli/opt "--materialize" "dry-run"))
+                               :publish? (cli/flag? "--publish")
+                               :settle-ms (js/parseInt (cli/opt "--settle-ms" "1500"))
+                               :signoff-dids []})
+                             :work-id (:work-id spec))
+                      (catch :default e
+                        (cli/warn (str "  tick: unit failed — " (ex-message e)))
+                        {:work-id (:work-id spec) :status :error :error (ex-message e)})))))
+              specs)]
+    (cli/say (str "\ntick done in " (quot (- (js/Date.now) started) 1000) "s"))
+    (doseq [r results]
+      (cli/say (str "  " (:work-id r) " → " (name (or (:status r) :?))
+                    (when (:verdicts r) (str " " (pr-str (:verdicts r)))))))
+    (cli/say (pr-str (view/snapshot db (js/Date.now))))))
+
+(-main)

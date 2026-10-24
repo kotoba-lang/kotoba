@@ -1,0 +1,452 @@
+#!/usr/bin/env kbb
+(ns selftest
+  "Host-layer selftest: does `fleet.filestore` still satisfy the invariants the
+  portable `.cljc` assumes once the log lives in a FILE and the writers are
+  separate OS processes?
+
+  The interesting one is the ordinal race. `store.cljc` documents that a
+  two-step `next-t` + `transact!` produced only 23-37 distinct ordinals out of
+  50 concurrent claims on an atom, which hands the same exclusive lease to two
+  agents. The file host has to reproduce swap!'s atomicity with a lock, so this
+  spawns REAL concurrent nbb processes (not threads in one runtime) against one
+  log file and asserts exactly one winner.
+
+  Run:  kbb --backend sci --classpath src:hosts/nbb hosts/nbb/selftest.cljk"
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]
+            [fleet.filestore :as filestore]
+            [fleet.gate :as gate]
+            [fleet.identity :as fid]
+            [fleet.kcm :as kcm]
+            [fleet.kcm-evaluate :as kcm-evaluate]
+            [fleet.kcm-provider :as kcm-provider]
+            [fleet.kcm-receipt :as kcm-receipt]
+            [fleet.kotobase-store :as kbs]
+            [fleet.eval :as ev]
+            [fleet.node :as fnode]
+            [fleet.receipt :as receipt]
+            [kotoba.fleet.agent :as agent]
+            [kotoba.fleet.governor :as gov]
+            [kotoba.fleet.lease :as lease]
+            [kotoba.fleet.store :as store]))
+
+(def argv (vec (.-argv js/process)))
+(defn- opt [flag] (second (drop-while #(not= flag %) argv)))
+
+(def failures (atom 0))
+(defn- check [label ok? & [detail]]
+  (println (str (if ok? "  ok   " "  FAIL ") label (when detail (str " — " detail))))
+  (when-not ok? (swap! failures inc)))
+
+;; ---------------------------------------------------------------------------
+;; child mode: one process, one claim (used by the concurrency check)
+
+(when-let [child (opt "--claim-child")]
+  (let [db (filestore/file-store (opt "--log"))
+        r (lease/claim! db {:work "race/unit" :agent child :ttl-ms 60000 :now (js/Date.now)})]
+    (println (pr-str (assoc r :agent child)))
+    (js/process.exit 0)))
+
+;; ---------------------------------------------------------------------------
+
+(def tmp (fs/mkdtempSync (path/join (os/tmpdir) "fleet-selftest-")))
+
+(println "1. :db-api contract on a file-backed log")
+(let [db (filestore/file-store (path/join tmp "a.edn"))]
+  (agent/enqueue! db {:unit "u/1" :created-by "t"})
+  (check "work is visible as open" (= 1 (count (agent/open-work db 1000))))
+  (let [c (lease/claim! db {:work "u/1" :agent "a" :ttl-ms 1000 :now 1000})]
+    (check "claim wins on a free unit" (:ok c)))
+  (check "holder is the claimant" (= "a" (lease/holder db "u/1" 1000)))
+  (check "lease expires by TTL" (nil? (lease/holder db "u/1" 2500)))
+  (check "log survives a fresh store handle over the same file"
+         (let [db2 (filestore/file-store (path/join tmp "a.edn"))]
+           (= "a" (lease/holder db2 "u/1" 1000)))))
+
+(println "\n2. cross-PROCESS lease race (8 concurrent nbb processes, one unit)")
+(let [log (path/join tmp "race.edn")
+      _ (filestore/file-store log)
+      ;; children must load the SAME classpath as this process — the host now
+      ;; pulls in the cacao / ed25519 / langchain libs, and a child that cannot
+      ;; load them just dies silently and looks like a lost race
+      cp-arg (or (second (drop-while #(not= "--classpath" %) argv)) "src:hosts/nbb")
+      cmd (str "for i in 1 2 3 4 5 6 7 8; do "
+               "kbb --backend sci --classpath '" cp-arg "' hosts/nbb/selftest.cljk "
+               "--claim-child agent-$i --log " log " & done; wait")
+      out (cp/execFileSync "sh" #js ["-c" cmd] #js {:encoding "utf8" :maxBuffer 8388608})
+      results (->> (str/split-lines out) (remove str/blank?) (mapv reader/read-string))
+      db (filestore/file-store log)
+      ts (->> (store/datoms db) (filter #(= :lease/t (second %))) (map #(nth % 2)))]
+  (check "all 8 processes reported" (= 8 (count results)) (str (count results)))
+  (check "exactly one process won the lease"
+         (= 1 (count (filter :ok results)))
+         (str "winners=" (mapv :agent (filter :ok results))))
+  (check "every claim got a distinct ordinal (no TOCTOU collision)"
+         (= (count ts) (count (distinct ts)))
+         (str (count (distinct ts)) "/" (count ts) " distinct"))
+  (check "all processes agree on the holder"
+         (= 1 (count (distinct (map :holder results))))
+         (str (distinct (map :holder results)))))
+
+(println "\n3. governor is the only writer, receipts are append-only")
+(let [db (filestore/file-store (path/join tmp "gov.edn"))
+      writes (atom [])]
+  (agent/enqueue! db {:unit "u/2" :created-by "t"})
+  (agent/claim-and-propose! db {:unit "u/2" :agent "a" :ttl-ms 60000 :now 1000
+                                :run (fn [_] {:diff "d" :ok true})})
+  ;; a second agent proposes WITHOUT holding the lease (the case the gate exists for)
+  (gov/submit-proposal! db {:work "u/2" :agent "intruder" :payload {:diff "x"}})
+  (check "two proposals pending" (= 2 (count (gov/pending-proposals db))))
+  (let [receipts (gov/drain! db {:gate (fn [p] (= (:proposal/agent p)
+                                                  (lease/holder db (:proposal/work p) 1000)))
+                                 :materialize (fn [p] (swap! writes conj (:proposal/agent p)))})]
+    (check "one accepted, one rejected"
+           (= [:accepted :rejected] (mapv :receipt/verdict receipts))
+           (pr-str (mapv :receipt/verdict receipts)))
+    (check "only the lease holder's payload was materialized" (= ["a"] @writes))
+    (check "nothing pending after the drain" (empty? (gov/pending-proposals db)))
+    (check "re-draining does not re-materialize"
+           (do (gov/drain! db {:gate (constantly true)
+                               :materialize (fn [p] (swap! writes conj :again))})
+               (= ["a"] @writes)))))
+
+(println "\n4. the governor admits isolation, it does not take the node's word")
+(let [ok {:diff "diff --git a/src/x.cljc b/src/x.cljc\n+1\n" :pin "abc"
+          :exec-backing :sandbox-exec :exec-probe {:leaked []}
+          :stop :model-done :tests {:final-exit 0}}
+      ctx {:payload ok :agent "a" :holder "a" :pin "abc"
+           :protected-paths ["manifest/"] :allow-unsandboxed? false :patch-applies? true}
+      why (fn [m] (gate/reasons (merge ctx m)))]
+  (check "a clean sandboxed proposal is admissible" (empty? (why {})))
+  (check "unsandboxed exec is rejected even with green tests"
+         (some #(str/includes? % "not :sandbox-exec")
+               (why {:payload (assoc ok :exec-backing :none)})))
+  (check "a backing that leaked during its own probe is rejected"
+         (some #(str/includes? % "leaked")
+               (why {:payload (assoc ok :exec-probe {:leaked [:network-curl]})})))
+  (check "the work-unit can opt out explicitly, and only explicitly"
+         (empty? (why {:payload (assoc ok :exec-backing :none) :allow-unsandboxed? true})))
+  (check "a non-holder is rejected" (seq (why {:holder "b"})))
+  (check "a protected path is rejected"
+         (seq (why {:payload (assoc ok :diff "diff --git a/manifest/west.yml b/manifest/west.yml\n+x\n")})))
+  (check "red tests are rejected" (seq (why {:payload (assoc ok :tests {:final-exit 1})})))
+  (check "a patch that does not apply is rejected" (seq (why {:patch-applies? false}))))
+
+(println "\n5. exec backing contains agent-authored code")
+(let [probe (reader/read-string
+             (cp/execFileSync "nbb" #js ["--classpath" "hosts/nbb"
+                                           "hosts/nbb/fleet/sandbox_agent.cljk" "--exec-probe"]
+                              #js {:encoding "utf8"}))]
+  (check "backing is sandbox-exec" (= :sandbox-exec (:backing probe)) (pr-str (:backing probe)))
+  (check "every escape is blocked (home read, ssh keys, network, outside write)"
+         (empty? (:leaked probe))
+         (str "blocked=" (pr-str (:blocked probe)) " leaked=" (pr-str (:leaked probe)))))
+
+(println "\n6. fleet agent identity + signed receipts (throwaway PEM, not the kagi key)")
+(let [pem-path (path/join tmp "agent.pem")
+      kp (crypto/generateKeyPairSync
+          "ed25519" #js {:privateKeyEncoding #js {:format "pem" :type "pkcs8"}
+                         :publicKeyEncoding #js {:format "der" :type "spki"}})
+      _ (fs/writeFileSync pem-path (.-privateKey kp))
+      me (fid/resolve-identity (str "pem:" pem-path))
+      body (pr-str {:receipt/id "r1" :receipt/verdict :accepted})
+      cid (fid/sha256-hex body)
+      sig (fid/sign-hex me cid)]
+  (check "DID is derived from the key, not configured"
+         (str/starts-with? (:did me) "did:key:z6Mk") (:did me))
+  (check "a receipt signature verifies against the DID alone"
+         (fid/verify-hex (:did me) cid sig))
+  (check "a tampered receipt is rejected"
+         (not (fid/verify-hex (:did me) (fid/sha256-hex (str body "!")) sig)))
+  (check "another key cannot pass as this signer"
+         (let [other (do (fs/writeFileSync (path/join tmp "other.pem")
+                                           (.-privateKey (crypto/generateKeyPairSync
+                                                          "ed25519" #js {:privateKeyEncoding #js {:format "pem" :type "pkcs8"}
+                                                                         :publicKeyEncoding #js {:format "der" :type "spki"}})))
+                         (fid/resolve-identity (str "pem:" (path/join tmp "other.pem"))))]
+           (not (fid/verify-hex (:did me) cid (fid/sign-hex other cid))))))
+
+(println "\n7. kotobase graph identity (offline)")
+(check "canonical-graph matches the edge's derivation (golden vector)"
+       (= "bafyreihzrcxrk34ffo56uetcw7lyioslfulczqh5zpqwy5vok54vkwdfwm"
+          (kbs/canonical-graph "did:key:z6MkhnmvngYxx3h13RsVyizeSXwDp54kkWfc87w8yVuLffBa"
+                               "fleet-log"))
+       (kbs/canonical-graph "did:key:z6MkhnmvngYxx3h13RsVyizeSXwDp54kkWfc87w8yVuLffBa" "fleet-log"))
+(check "a different DID gets a different graph (tenant isolation is structural)"
+       (not= (kbs/canonical-graph "did:key:z6MkhnmvngYxx3h13RsVyizeSXwDp54kkWfc87w8yVuLffBa" "fleet-log")
+             (kbs/canonical-graph "did:key:z6MkhKgm9LbcxSN5uVDBJAhZ3B7s31MHXfS2omgkmCnWu3Ve" "fleet-log")))
+
+(println "\n8. signed receipts, sign-off and node eligibility")
+(let [pem (path/join tmp "receipt.pem")
+      _ (fs/writeFileSync pem (.-privateKey (crypto/generateKeyPairSync
+                                             "ed25519" #js {:privateKeyEncoding #js {:format "pem" :type "pkcs8"}
+                                                            :publicKeyEncoding #js {:format "der" :type "spki"}})))
+      me (fid/resolve-identity (str "pem:" pem))
+      b (receipt/body {:receipt {:receipt/work "u" :receipt/proposal "p1" :receipt/verdict :accepted}
+                       :payload {:repo "o/r" :pin "abc" :diff "d" :exec-backing :sandbox-exec
+                                 :tests {:final-exit 0} :source-auth :none}
+                       :work-id "w1" :node "n1" :at "2026-07-25T00:00:00Z"})
+      signed (receipt/sign me b)]
+  (check "a signed receipt verifies" (receipt/verify signed))
+  (check "a receipt with an edited body does not verify"
+         (not (receipt/verify (assoc-in signed [:receipt :fleet.sandbox/verdict] :rejected))))
+  (check "a receipt with a swapped cid does not verify"
+         (not (receipt/verify (assoc signed :cid (fid/sha256-hex "other")))))
+  (check "the ledger round-trips a signed receipt"
+         (= [signed] (receipt/read-ledger (str (pr-str signed) "\n"))))
+
+  (check "a patch touching a sign-off path is held"
+         (receipt/needs-signoff? ["test/a_test.cljc" "src/a.cljc"] ["test/"]))
+  (check "a patch outside sign-off paths is not held"
+         (not (receipt/needs-signoff? ["src/a.cljc"] ["test/"])))
+  (let [ds (receipt/approval-datoms me "p1" 0)]
+    (check "a valid approval from an enrolled DID counts"
+           (receipt/approved? ds "p1" [(:did me)]))
+    (check "an approval from an unenrolled DID does not count"
+           (not (receipt/approved? ds "p1" ["did:key:z6MkOTHER"])))
+    (check "an approval cannot be moved to another proposal"
+           (not (receipt/approved? (mapv (fn [[e a v t]]
+                                           (if (= a :approval/proposal) [e a "p2" t] [e a v t])) ds)
+                                   "p2" [(:did me)])))))
+
+(let [caps [{:node "down" :up false}
+            {:node "leaky" :up true :caps #{:nbb :git} :contains-exec false}
+            {:node "good" :up true :caps #{:nbb :git} :contains-exec true
+             :runtime-sha256 "node22"}
+            {:node "jvm" :up true :caps #{:nbb :git :jdk} :contains-exec true
+             :runtime-sha256 "node26"}]]
+  (check "an unreachable node is not chosen"
+         (not= "down" (:node (fnode/choose caps {:requires #{:nbb}}))))
+  (check "a node whose exec backing leaks is not chosen"
+         (= "good" (:node (fnode/choose caps {:requires #{:nbb}}))))
+  (check "a capability requirement narrows the choice"
+         (= "jvm" (:node (fnode/choose caps {:requires #{:jdk}}))))
+  (check "a KCM runtime digest narrows placement before dispatch"
+         (= "jvm" (:node (fnode/choose caps {:requires #{:nbb}
+                                              :runtime-sha256 "node26"}))))
+  (check "no eligible node explains itself"
+         (str/includes? (:why (fnode/choose caps {:requires #{:cuda}})) "no node satisfies")))
+
+(println "\n9. the benchmark checker cannot be talked into a pass")
+(let [expect {:files-subset-of ["src/a.cljc" "test/a_test.cljc"]
+              :must-touch ["src/a.cljc" "test/a_test.cljc"] :max-files 2
+              :must-add ["defn wanted" "deftest"]}
+      good (str "diff --git a/src/a.cljc b/src/a.cljc\n+(defn wanted [x] x)\n"
+                "diff --git a/test/a_test.cljc b/test/a_test.cljc\n+(deftest t)\n")]
+  (check "a patch that does the task passes" (:meets-spec (ev/check good expect)))
+  (check "a patch that only claims it in a DELETED line fails"
+         (not (:meets-spec (ev/check (str "diff --git a/src/a.cljc b/src/a.cljc\n-(defn wanted [x] x)\n"
+                                          "diff --git a/test/a_test.cljc b/test/a_test.cljc\n+(deftest t)\n")
+                                     expect))))
+  (check "a patch that skips a required file fails"
+         (not (:meets-spec (ev/check "diff --git a/src/a.cljc b/src/a.cljc\n+(defn wanted [x] x)\n" expect))))
+  (check "a patch that sprays extra files fails"
+         (not (:meets-spec (ev/check (str good "diff --git a/other.cljc b/other.cljc\n+x\n") expect))))
+  (check "an empty patch fails" (not (:meets-spec (ev/check "" expect))))
+  (check "a gate rejection fails the run even when the patch meets the spec"
+         (not (:pass (ev/score-run {:task "t" :rep 1 :expect expect
+                                    :payload {:diff good} :verdict :rejected}))))
+  (check "pass rate is over attempts, not best-of-N"
+         (= 1 (get-in (ev/summarize [{:task "t" :pass true} {:task "t" :pass false}
+                                     {:task "t" :pass false}])
+                      [:tasks "t" :passed]))))
+
+(println "\n10. sandbox path confinement")
+(let [out (cp/execFileSync "nbb" #js ["--classpath" "hosts/nbb"
+                                       "hosts/nbb/fleet/sandbox_agent.cljk" "--selftest"]
+                           #js {:encoding "utf8"})]
+  (print out)
+  (when-not (str/includes? out "confinement ok") (swap! failures inc)))
+
+(println "\n11. Kotoba Capability Machine is content-addressed and has no shell surface")
+(let [base {:machine :kotoba-capability-machine
+            :kcm/provider {:archive "/tmp/provider.tar"
+                           :manifest "/tmp/provider.manifest.edn"
+                           :archive-sha256 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+            :kcm/identity {:definition-closure-cid "bafy-def"
+                           :compiler-cid "bafy-compiler"
+                           :module-lock-cid "bafy-lock"
+                           :target-abi :wasm32-component-v1
+                           :hostcaps-policy-cid "bafy-policy"
+                           :provider-closure-sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                           :runtime-sha256 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                           :effects []}
+            :kcm/capabilities #{:code/list :code/read :code/edit :build/check :build/compile}
+            :kcm/checks [{:id :test :args ["check" "src/main.kotoba"]
+                          :pure? true}]
+            :kcm/builds [{:id :wasm :args ["compile" "src/main.kotoba"
+                                           "--target" "wasm32-wasi"
+                                           "--output" "target/main.wasm"]}]}
+      id (kcm/machine-id base)]
+  (check "a complete KCM contract validates" (empty? (kcm/validation-reasons base)))
+  (check "machine identity is a SHA-256 content identity" (str/starts-with? id "sha256:") id)
+  (check "map/set ordering does not change machine identity"
+         (= id (kcm/machine-id (assoc base :kcm/capabilities
+                                      #{:build/compile :build/check :code/edit :code/read :code/list}))))
+  (check "changing the compiler changes machine identity"
+         (not= id (kcm/machine-id (assoc-in base [:kcm/identity :compiler-cid] "bafy-other"))))
+  (check "changing the HostCaps policy changes machine identity"
+         (not= id (kcm/machine-id (assoc-in base [:kcm/identity :hostcaps-policy-cid] "bafy-other"))))
+  (check "changing the provider closure changes machine identity"
+         (not= id (kcm/machine-id
+                   (assoc-in base [:kcm/identity :provider-closure-sha256]
+                             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))))
+  (check "a shell-shaped check is rejected"
+         (some #(str/includes? % "beginning with check")
+               (kcm/validation-reasons
+                (assoc base :kcm/checks [{:id :test :args ["sh" "-c" "kotoba check"]}]))))
+  (check "an absolute source path is rejected"
+         (some #(str/includes? % "beginning with check")
+               (kcm/validation-reasons
+                (assoc base :kcm/checks [{:id :test :args ["check" "/tmp/main.kotoba"]}]))))
+  (check "parent traversal in a build output is rejected"
+         (some #(str/includes? % "build must have")
+               (kcm/validation-reasons
+                (assoc base :kcm/builds [{:id :wasm
+                                          :args ["compile" "src/main.kotoba"
+                                                 "--output=../main.wasm"]}]))))
+  (check "a shell-shaped build is rejected"
+         (some #(str/includes? % "build must have")
+               (kcm/validation-reasons
+                (assoc base :kcm/builds [{:id :wasm :args ["sh" "-c" "kotoba compile"]}]))))
+  (check "an ambient process capability is rejected"
+         (some #(str/includes? % "unknown KCM capabilities")
+               (kcm/validation-reasons
+                (update base :kcm/capabilities conj :process/spawn))))
+  (let [policy {:format kcm-evaluate/policy-format
+                :target-abi :wasm32-wasi :effects []
+                :capabilities #{:code/read :build/check}
+                :checks [{:id :check :args ["check" "main.kotoba"] :pure? true}]}
+        invalid (update policy :capabilities conj :process/spawn)]
+    (check "the public evaluator accepts a closed typed policy"
+           (= policy (kcm-evaluate/validate-policy! policy)))
+    (check "the public evaluator fails closed on ambient authority"
+           (try (kcm-evaluate/validate-policy! invalid) false
+                (catch :default _ true)))
+    (let [source (path/join tmp "kcm-evaluate-source")
+          _ (fs/mkdirSync source #js {:recursive true})
+          _ (fs/writeFileSync (path/join source "main.kotoba") "(ns example)\n")
+          _ (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                          "init" "-q"])
+          _ (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                          "add" "main.kotoba"])
+          _ (fs/writeFileSync (path/join source "untracked.txt") "must stay outside KCM\n")
+          closure (kcm-evaluate/source-closure source)]
+      (check "the public evaluator content-addresses only the Git-tracked source closure"
+             (and (= 1 (:files closure))
+                  (str/starts-with? (:cid closure) "sha256:")))
+      (fs/writeFileSync (path/join source ".env") "TOKEN=must-not-enter\n")
+      (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                    "add" "-f" ".env"])
+      (check "the public evaluator rejects tracked credential-shaped paths"
+             (try (kcm-evaluate/source-closure source) false
+                  (catch :default _ true)))
+      (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                    "rm" "--cached" "-q" ".env"])
+      (fs/unlinkSync (path/join source ".env"))
+      (fs/symlinkSync "/etc/passwd" (path/join source "escape"))
+      (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                    "add" "escape"])
+      (check "the public evaluator rejects source symlinks"
+             (try (kcm-evaluate/source-closure source) false
+                  (catch :default _ true)))
+      (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                    "rm" "--cached" "-q" "escape"])
+      (fs/unlinkSync (path/join source "escape"))
+      (let [auto (kcm-evaluate/auto-policy source nil)]
+        (check "the design-partner pilot discovers one Kotoba entrypoint"
+               (= ["check" "main.kotoba"] (get-in auto [:checks 0 :args])))
+        (check "the automatic pilot grants only read, check, and compile"
+               (= #{:code/read :build/check :build/compile} (:capabilities auto))))
+      (fs/writeFileSync (path/join source "other.kotoba") "(ns other)\n")
+      (cp/execFileSync "git" #js ["-c" "core.fsmonitor=false" "-C" source
+                                    "add" "other.kotoba"])
+      (check "the pilot refuses to guess between multiple entrypoints"
+             (try (kcm-evaluate/auto-policy source nil) false
+                  (catch :default _ true)))
+      (check "an explicit entrypoint resolves a multi-program repository"
+             (= ["check" "other.kotoba"]
+                (get-in (kcm-evaluate/auto-policy source "./other.kotoba")
+                        [:checks 0 :args])))
+      (fs/unlinkSync (path/join source "other.kotoba")))
+    (let [blocked [:read-home-ssh :read-home :read-ambient-env
+                   :network-curl :network-node
+                   :write-home :write-outside]
+          report (kcm-evaluate/evaluation-report
+                  {:policy policy
+                   :closure {:cid "sha256:source" :files 1 :bytes 1}
+                   :provider-build {}
+                   :result {:machine-id "sha256:machine"
+                            :backing {:blocked blocked :leaked []}
+                            :first [] :second [] :builds []}})]
+      (check "an incomplete evaluator result cannot become accepted evidence"
+             (= :rejected (:decision report)))
+      (let [share (kcm-evaluate/pilot-share-report
+                   (assoc report :reason "private compiler failure"
+                          :checks {:verified [{:id :check :exit 1 :cache :miss :ms 4
+                                              :tail "private source text"}]}))]
+        (check "the pilot share report contains no output tails or rejection text"
+               (and (nil? (:reason share))
+                    (nil? (:tail (first (:checks share))))
+                    (= kcm-evaluate/pilot-share-format (:format share))))
+        (let [round-trip (reader/read-string (pr-str share))]
+          (check "the shared EDN round-trips namespaced capabilities and format"
+                 (and (= share round-trip)
+                      (= :kotoba-kcm-pilot-share/v1 (:format round-trip))
+                      (= [:build/check :code/read]
+                         (get-in round-trip [:policy :capabilities])))))
+        (let [key-path (path/join tmp "pilot-receipt-key.pem")
+              pair (crypto/generateKeyPairSync "ed25519")
+              _ (fs/writeFileSync key-path
+                                  (.export (.-privateKey pair)
+                                           #js {:format "pem" :type "pkcs8"}))
+              signed (kcm-receipt/sign share key-path)]
+          (check "a signed KCM pilot EDN receipt verifies offline"
+                 (= signed (kcm-receipt/verify! signed)))
+          (check "receipt body tampering is rejected"
+                 (try (kcm-receipt/verify!
+                       (assoc-in signed [:receipt :decision] :accepted))
+                      false (catch :default _ true)))
+          (check "receipt signature tampering is rejected"
+                 (try (kcm-receipt/verify!
+                       (assoc-in signed [:signature :value] (apply str (repeat 128 "0"))))
+                      false (catch :default _ true)))))))
+  (let [manifest {:format kcm-provider/manifest-format
+                  :compiler-revision "git:test" :module-lock-sha256 (apply str (repeat 64 "a"))
+                  :entry {:nbb-cli "../node_modules/nbb/cli.js"
+                          :classpath ["../outside"] :main "../main.cljs"}
+                  :files [{:path "../main.cljs" :size 1
+                           :sha256 (apply str (repeat 64 "b"))}]}
+        rejected? (try (kcm-provider/verify-manifest!
+                        manifest (kcm-provider/closure-sha256 manifest))
+                       false (catch :default _ true))]
+    (check "provider manifest paths cannot escape the verified closure" rejected?))
+  (check "the model receives no run_tests or shell tool"
+         (= #{"list_files" "read_file" "edit_file" "kotoba_check" "kotoba_build"}
+            (kcm/tool-names base)))
+  (check "cache identity changes with the edited definition graph"
+         (not= (kcm/cache-key base (first (:kcm/checks base)) "patch-a")
+               (kcm/cache-key base (first (:kcm/checks base)) "patch-b")))
+  (let [payload {:diff "diff --git a/src/x.cljc b/src/x.cljc\n+1\n"
+                 :pin "abc" :exec-backing :sandbox-exec :exec-probe {:leaked []}
+                 :stop :model-done :tests {:final-exit 0}
+                 :machine :kotoba-capability-machine :machine-id id
+                 :kcm-contract kcm/contract-version}
+        ctx {:payload payload :agent "a" :holder "a" :pin "abc"
+             :protected-paths [] :patch-applies? true :kcm-spec base}]
+    (check "governor admits the exact dispatched KCM identity"
+           (empty? (gate/reasons ctx)))
+    (check "governor rejects a substituted KCM closure/policy"
+           (some #(str/includes? % "machine identity")
+                 (gate/reasons (assoc-in ctx [:payload :machine-id] "sha256:other"))))
+    (check "governor rejects a legacy sandbox claiming KCM work"
+           (some #(str/includes? % "outside the Kotoba Capability Machine")
+                 (gate/reasons (assoc-in ctx [:payload :machine] :legacy-sandbox))))))
+
+(println (str "\n" (if (zero? @failures) "ALL CHECKS PASSED" (str @failures " CHECK(S) FAILED"))))
+(js/process.exit (if (zero? @failures) 0 1))

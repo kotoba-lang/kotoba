@@ -1,0 +1,105 @@
+#!/usr/bin/env kbb
+(ns fleet-sandbox-dispatch
+  "Dispatch one work-unit to a sandboxed coding agent on a murakumo fleet node.
+
+  The flow itself lives in `fleet.dispatch` so the standing tick runs exactly
+  the same one. This script is argument handling, node selection, and the
+  sign-off approval command.
+
+      lease → sandboxed run on a fleet node → proposal
+            → gate → sign-off → materialize → signed receipt → published ledger
+
+  Usage:
+    kbb --backend sci --classpath src:hosts/nbb:<libs> bin/fleet-sandbox-dispatch.cljk \\
+        --work examples/work-kotoba-delta.edn [--agent a1]
+        [--store file|kotobase] [--log .fleet/log.edn] [--db-name fleet-log]
+        [--node <name>|auto] [--materialize dry-run|push|none] [--publish]
+        [--identity kagi:<item>] [--approve <proposal-id>]"
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]
+            [fleet.cli :as cli]
+            [fleet.dispatch :as dispatch]
+            [fleet.identity :as fid]
+            [fleet.node :as node]
+            [fleet.receipt :as receipt]
+            [kotoba.fleet.store :as store]
+            [kotoba.fleet.view :as view]))
+
+(def spec (reader/read-string (fs/readFileSync (cli/req "--work") "utf8")))
+(def agent-name (cli/opt "--agent" (str "agent-" (.-pid js/process))))
+(def log-path (cli/opt "--log" (path/resolve ".fleet/log.edn")))
+(def state-dir (path/dirname (path/resolve log-path)))
+(def agent-src (cli/opt "--agent-src" "hosts/nbb/fleet/sandbox_agent.cljk"))
+
+(defn- authorized-signoff-dids
+  "Who may sign off. Defaults to the DIDs enrolled in the fleet agent registry
+  when one is reachable; an explicit list always wins. Empty means nobody can
+  approve, which is the safe direction: work waits instead of landing."
+  []
+  (if-let [csv (cli/opt "--signoff-dids" nil)]
+    (vec (remove str/blank? (str/split csv #",")))
+    (let [reg (cli/opt "--agents-edn"
+                       (str (or (.-FLEET_ROOT js/process.env) ".") "/manifest/fleet-agents.edn"))]
+      (if (fs/existsSync reg)
+        (->> (str/split-lines (fs/readFileSync reg "utf8"))
+             (remove str/blank?) (map reader/read-string) (mapv :did))
+        []))))
+
+(defn -main []
+  (fs/mkdirSync state-dir #js {:recursive true})
+  (let [me (fid/resolve-identity (cli/opt "--identity" "kagi:fleet-agent-sandbox-dispatch"))
+        db (dispatch/open-store! {:store (keyword (cli/opt "--store" "file"))
+                                  :log-path log-path
+                                  :db-name (cli/opt "--db-name" (get spec :db-name "fleet-log"))
+                                  :identity me})]
+    (cli/say (str "unit=" (:unit spec) " agent=" agent-name " signer=" (:did me)))
+
+    ;; --- sign-off approval is its own command: it appends a signed approval
+    ;;     datom and exits, leaving the next dispatch to do the work.
+    (if-let [pid (cli/opt "--approve" nil)]
+      (do (store/transact-with-t! db (fn [t] (receipt/approval-datoms me pid t)))
+          (cli/say (str "approved " pid " as " (:did me))))
+
+      ;; --- drain: decide on proposals that are already pending (after a
+      ;;     sign-off) without spending another sandbox run to reproduce them
+      (if (cli/flag? "--drain")
+        (let [{:keys [tarball pristine]} (dispatch/prepare {:spec spec :state-dir state-dir})
+              r (dispatch/decide! {:spec spec :agent-name agent-name :identity me :db db
+                                   :state-dir state-dir :node-name (cli/opt "--node" (:node spec))
+                                   :materialize (keyword (cli/opt "--materialize" "dry-run"))
+                                   :publish? (cli/flag? "--publish")
+                                   :signoff-dids (authorized-signoff-dids)
+                                   :pristine pristine :tarball tarball
+                                   :protected (get spec :protected-paths dispatch/default-protected)
+                                   :signoff-paths (get spec :signoff-paths [])})]
+          (cli/say (str "drain: " (name (:status r))))
+          (when (= :held (:status r)) (js/process.exit 4)))
+
+      (let [chosen (if (= "auto" (cli/opt "--node" nil))
+                     (let [caps (mapv #(node/probe % {:agent-path agent-src})
+                                      (node/inventory {:nodes (cli/opt "--nodes" nil)
+                                                       :fleet-edn (cli/opt "--fleet-edn" nil)}))
+                           {:keys [node why]} (node/choose caps {:requires (set (get spec :requires [:nbb :git]))
+                                                                 :runtime-sha256 (get-in spec [:kcm/identity :runtime-sha256])
+                                                                 :allow-unsandboxed? (:allow-unsandboxed-exec spec)})]
+                       (when-not node (cli/say (str "  no eligible node: " why)))
+                       node)
+                     (cli/opt "--node" (:node spec)))]
+        (if-not chosen
+          (js/process.exit 3)
+          (let [result (dispatch/dispatch!
+                        {:spec spec :agent-name agent-name :identity me :db db
+                         :state-dir state-dir :agent-src agent-src
+                         :node-name chosen
+                         :materialize (keyword (cli/opt "--materialize" "dry-run"))
+                         :publish? (cli/flag? "--publish")
+                         :settle-ms (js/parseInt (cli/opt "--settle-ms"
+                                                          (if (= "kotobase" (cli/opt "--store" "file")) "1500" "0")))
+                         :signoff-dids (authorized-signoff-dids)})]
+            (cli/say "\nfleet view:")
+            (cli/say (pr-str (view/snapshot db (js/Date.now))))
+            (when (= :held (:status result)) (js/process.exit 4)))))))))
+
+(-main)
