@@ -1,0 +1,359 @@
+;; ed25519.core — pure-Clojure Ed25519 PUBLIC-KEY derivation from a raw seed.
+;;
+;; The JVM's JCA "Ed25519" provider can SIGN with a PKCS8 seed and VERIFY with an
+;; X.509 SPKI pubkey, but it gives you NO way to recover the PUBLIC key (hence the
+;; did:key) FROM an existing raw 32-byte seed — and on babashka/GraalVM the EdEC
+;; interface classes are absent and BouncyCastle is not on the path. So if you hold
+;; a raw seed (a stored signing key, a wallet/tenant secret) you cannot get its
+;; public key without either generating a fresh keypair or pulling in a native dep.
+;;
+;; This implements the derivation directly per RFC 8032 §5.1.5 (edwards25519):
+;;   A = clamp(SHA-512(seed)[0..32]) · B ;  pubkey = compress(A)
+;; using ONLY java.security.MessageDigest (SHA-512) + BigInteger. No BouncyCastle,
+;; no JCA EdEC, no native code — it runs anywhere clojure + SHA-512 do, babashka
+;; included. Correctness is cross-checked at runtime against the JCA signer
+;; (a signature made by the PKCS8(seed) private key verifies under the derived
+;; SPKI pubkey), and pinned by a fixed regression vector in the tests.
+;;
+;; PORTABLE (.cljc). :clj keeps the original pure-BigInteger derivation + JCA
+;; sign/verify verbatim. :cljs targets Node (nbb / cljs.main --target node):
+;; ALL crypto goes through node:crypto's SYNCHRONOUS Ed25519 APIs
+;; (createPrivateKey/createPublicKey over hand-built PKCS8/SPKI DER wraps +
+;; crypto.sign/crypto.verify with a nil digest) — no Promise infection, no npm
+;; deps; the byte type is js/Uint8Array, the same convention cbor.core uses.
+;; Browser cljs is out of scope (browsers only expose the ASYNC SubtleCrypto);
+;; the pure derivation could be ported with js/BigInt if that ever matters.
+;;
+;;   (require '[ed25519.core :as ed])
+;;   (ed/pubkey-from-seed seed-bytes)   ; ^bytes 32   (seed = raw 32 bytes)
+;;   (ed/seed-hex->pubkey-hex "9d61…")  ; hex → hex
+;;   (ed/did-key-from-seed seed-bytes)  ; "did:key:z6Mk…"
+;;   (ed/verify-derivation seed-bytes)  ; true   (signer self-check, no vector needed)
+(ns ed25519.core
+  {:kotoba/export [b58 b58-decode did-key->pubkey did-key-from-pub did-key-from-seed did-key-from-seed-hex hexify private-from-seed pubkey-from-seed public-from-raw seed-hex->pubkey-hex sign unhex verify verify-derivation verify-did]}
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            #?(:cljs ["crypto" :as ncrypto]))
+  #?(:clj (:import (java.security MessageDigest KeyFactory PrivateKey PublicKey Signature)
+                   (java.security.spec PKCS8EncodedKeySpec X509EncodedKeySpec))))
+
+;; ── platform byte helpers ─────────────────────────────────────────────────────
+(defn- blen [b] #?(:clj (count b) :cljs (.-length b)))
+#?(:cljs (defn- byte-ints
+           "Bytes → vector of ints 0..255. The input may be a Uint8Array /
+           Buffer (this library's own output) or a SIGNED byte container: on
+           the kbb engine a Java-shaped byte[] (`byte-array`, `.getEncoded`,
+           `.getBytes`) is an Int8Array, whose 0xff reads as -1. Without the
+           mask `hexify` printed \"-1\" for 0xff and b58 / did:key divided
+           negative digits (measured 2026-09-24: 16 of 16 JCA-oracle cases and
+           hex-roundtrip red on kbb -M:test)."
+           [b] (mapv #(bit-and % 0xff) (array-seq b))))
+
+;; ── field GF(2^255-19) (JVM-only — :cljs derives via node:crypto instead) ─────
+#?(:clj (def ^BigInteger P (.subtract (.pow (biginteger 2) 255) (biginteger 19))))
+#?(:clj (def ^:private ^BigInteger ONE BigInteger/ONE))
+#?(:clj (def ^:private ^BigInteger ZERO BigInteger/ZERO))
+#?(:clj (def ^:private ^BigInteger TWO (biginteger 2)))
+
+#?(:clj (defn- fadd ^BigInteger [^BigInteger a ^BigInteger b] (.mod (.add a b) P)))
+#?(:clj (defn- fsub ^BigInteger [^BigInteger a ^BigInteger b] (.mod (.subtract a b) P)))
+#?(:clj (defn- fmul ^BigInteger [^BigInteger a ^BigInteger b] (.mod (.multiply a b) P)))
+#?(:clj (defn- finv ^BigInteger [^BigInteger a] (.modPow a (.subtract P TWO) P))) ; Fermat inverse
+
+;; d = -121665 / 121666  (edwards25519 curve constant)
+#?(:clj (def ^BigInteger D (fmul (.mod (biginteger -121665) P) (finv (biginteger 121666)))))
+#?(:clj (def ^:private ^BigInteger TWO-D (fmul TWO D)))
+
+;; Base point B (affine, RFC 8032 §5.1) in EXTENDED coords (X:Y:Z:T), T = X·Y/Z.
+#?(:clj (def ^:private ^BigInteger BX (biginteger "15112221349535400772501151409588531511454012693041857206046113283949847762202")))
+#?(:clj (def ^:private ^BigInteger BY (biginteger "46316835694926478169428394003475163141307993866256225615783033603165251855960")))
+#?(:clj (def ^:private B [BX BY ONE (fmul BX BY)]))
+#?(:clj (def ^:private IDENT [ZERO ONE ONE ZERO]))
+
+;; ── twisted-Edwards (a=-1) complete addition; d is non-square so it doubles too ──
+#?(:clj
+(defn- point-add [[X1 Y1 Z1 T1] [X2 Y2 Z2 T2]]
+  (let [a (fmul (fsub Y1 X1) (fsub Y2 X2))
+        b (fmul (fadd Y1 X1) (fadd Y2 X2))
+        c (fmul (fmul T1 TWO-D) T2)
+        dd (fmul (fmul TWO Z1) Z2)
+        e (fsub b a)
+        f (fsub dd c)
+        g (fadd dd c)
+        h (fadd b a)]
+    [(fmul e f) (fmul g h) (fmul f g) (fmul e h)])))
+
+#?(:clj
+(defn- point-mul [^BigInteger s pt]
+  (loop [i (dec (.bitLength s)) q IDENT]
+    (if (neg? i)
+      q
+      (let [q2 (point-add q q)]
+        (recur (dec i) (if (.testBit s i) (point-add q2 pt) q2)))))))
+
+;; ── little-endian <-> BigInteger (32-byte) ────────────────────────────────────
+#?(:clj
+(defn- le->bigint ^BigInteger [^bytes b]
+  (BigInteger. 1 (byte-array (reverse (seq b))))))
+
+#?(:clj
+(defn- bigint->le32 ^bytes [^BigInteger n]
+  (let [out (byte-array 32)]
+    (loop [i 0 v n]
+      (if (< i 32)
+        (do (aset-byte out i (unchecked-byte (.intValue (.and v (biginteger 0xff)))))
+            (recur (inc i) (.shiftRight v 8)))
+        out)))))
+
+;; ── compress a point → 32-byte pubkey (y little-endian, bit 255 = x parity) ───
+#?(:clj
+(defn- compress ^bytes [[X Y Z _T]]
+  (let [zi (finv Z)
+        x  (fmul X zi)
+        y  (fmul Y zi)
+        out (bigint->le32 y)]
+    (when (.testBit x 0)                                   ; x is odd → set sign bit
+      (aset-byte out 31 (unchecked-byte (bit-or (aget out 31) 0x80))))
+    out)))
+
+;; ── the derivation (RFC 8032 §5.1.5) ──────────────────────────────────────────
+#?(:clj
+(defn- clamp ^bytes [^bytes h]
+  (let [b (byte-array 32)]
+    (System/arraycopy h 0 b 0 32)
+    (aset-byte b 0  (unchecked-byte (bit-and (aget b 0) 0xf8)))   ; clear low 3 bits
+    (aset-byte b 31 (unchecked-byte (bit-and (aget b 31) 0x7f)))  ; clear bit 255
+    (aset-byte b 31 (unchecked-byte (bit-or  (aget b 31) 0x40)))  ; set bit 254
+    b)))
+
+;; ── DER wraps (:clj as byte arrays, :cljs as hex for Buffer.from) ─────────────
+#?(:clj
+(def ^:private pkcs8-ed25519-prefix
+  (byte-array (map unchecked-byte [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x04 0x22 0x04 0x20]))))
+#?(:clj
+(def ^:private spki-ed25519-prefix
+  (byte-array (map unchecked-byte [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x03 0x21 0x00]))))
+#?(:cljs (def ^:private pkcs8-prefix-hex "302e020100300506032b657004220420"))
+#?(:cljs (def ^:private spki-prefix-hex "302a300506032b6570032100"))
+
+(defn private-from-seed
+  "A platform private-key handle from a raw 32-byte seed (PKCS8 wrap):
+   JCA PrivateKey on :clj, node:crypto KeyObject on :cljs."
+  [seed]
+  #?(:clj (.generatePrivate (KeyFactory/getInstance "Ed25519")
+                            (PKCS8EncodedKeySpec. (byte-array (concat (seq pkcs8-ed25519-prefix) (seq seed)))))
+     :cljs (.createPrivateKey ncrypto
+                              #js {:key (js/Buffer.concat
+                                         #js [(js/Buffer.from pkcs8-prefix-hex "hex")
+                                              (js/Buffer.from seed)])
+                                   :format "der" :type "pkcs8"})))
+
+(defn public-from-raw
+  "A platform public-key handle from a raw 32-byte pubkey (X.509 SPKI wrap)."
+  [pub]
+  #?(:clj (.generatePublic (KeyFactory/getInstance "Ed25519")
+                           (X509EncodedKeySpec. (byte-array (concat (seq spki-ed25519-prefix) (seq pub)))))
+     :cljs (.createPublicKey ncrypto
+                             #js {:key (js/Buffer.concat
+                                        #js [(js/Buffer.from spki-prefix-hex "hex")
+                                             (js/Buffer.from pub)])
+                                  :format "der" :type "spki"})))
+
+(defn pubkey-from-seed
+  "Raw 32-byte Ed25519 seed → 32-byte PUBLIC key (RFC 8032 edwards25519).
+   :clj derives it with pure BigInteger math (babashka-safe); :cljs asks
+   node:crypto (createPublicKey over the PKCS8-wrapped seed, then drops
+   the 12-byte SPKI DER prefix)."
+  [seed]
+  (when (not= 32 (blen seed))
+    (throw (ex-info "ed25519 seed must be exactly 32 bytes" {:got (blen seed)})))
+  #?(:clj
+     (let [h (.digest (MessageDigest/getInstance "SHA-512") seed)
+           a (le->bigint (clamp h))]
+       (compress (point-mul a B)))
+     :cljs
+     (let [spki (.export (.createPublicKey ncrypto (private-from-seed seed))
+                         #js {:format "der" :type "spki"})]
+       (js/Uint8Array. (.subarray spki 12)))))
+
+;; ── hex + did:key conveniences ────────────────────────────────────────────────
+(defn hexify ^String [b]
+  #?(:clj (apply str (map #(format "%02x" (bit-and (int %) 0xff)) b))
+     :cljs (apply str (map #(-> (.toString % 16) (.padStart 2 "0")) (byte-ints b)))))
+
+(defn unhex [^String s]
+  (let [s (str/replace s #"\s" "")]
+    (when (odd? (count s))
+      ;; `(partition 2 s)` on an odd-length string silently drops the
+      ;; trailing incomplete nibble instead of erroring -- a truncated/
+      ;; malformed hex string (an odd number of hex digits is never valid
+      ;; encoded byte data) must fail loudly, not quietly decode a
+      ;; shorter-than-intended byte array. Concretely dangerous here: a
+      ;; 65-char (one-too-many) seed-hex silently truncates to exactly 32
+      ;; bytes -- pubkey-from-seed's OWN `(not= 32 (count seed))` guard
+      ;; then can't catch it, since the truncated result happens to be
+      ;; the "right" length, just the WRONG bytes -- silently deriving a
+      ;; pubkey/did:key from truncated seed material with no error
+      ;; anywhere. Matches the identical fix already landed in this
+      ;; ecosystem's multiformats.core/unhex (same bug class, same fn
+      ;; name, independently hand-rolled here).
+      (throw (ex-info "unhex: odd-length hex string" {:s s})))
+    #?(:clj (byte-array (map (fn [[a b]] (unchecked-byte (Integer/parseInt (str a b) 16)))
+                             (partition 2 s)))
+       :cljs (js/Uint8Array. (into-array (map (fn [[a b]] (js/parseInt (str a b) 16))
+                                              (partition 2 s)))))))
+
+(defn seed-hex->pubkey-hex
+  "Hex seed → hex public key."
+  ^String [^String seed-hex]
+  (hexify (pubkey-from-seed (unhex seed-hex))))
+
+(def ^:private b58-alphabet
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn b58
+  "base58btc (Bitcoin alphabet) encode."
+  ^String [b]
+  #?(:clj
+     (let [n (BigInteger. 1 ^bytes b) fifty8 (biginteger 58)]
+       (loop [n n acc ""]
+         (if (pos? (.signum n))
+           (recur (.divide n fifty8)
+                  (str (.charAt ^String b58-alphabet (.intValue (.mod n fifty8))) acc))
+           (str (apply str (repeat (count (take-while zero? (seq b))) \1)) acc))))
+     :cljs
+     ;; classic byte-vector long division -- no BigInt (nbb's SCI has no js*,
+     ;; and cljs.core arithmetic isn't BigInt-safe), sizes here are tiny.
+     (let [ints (byte-ints b)
+           digits (reduce
+                   (fn [digits in-byte]
+                     (loop [j 0 carry in-byte digits digits]
+                       (if (< j (count digits))
+                         (let [v (+ (* (nth digits j) 256) carry)]
+                           (recur (inc j) (quot v 58) (assoc digits j (rem v 58))))
+                         (loop [carry carry digits digits]
+                           (if (pos? carry)
+                             (recur (quot carry 58) (conj digits (rem carry 58)))
+                             digits)))))
+                   [] ints)]
+       (str (apply str (repeat (count (take-while zero? ints)) "1"))
+            (apply str (map #(.charAt b58-alphabet %) (reverse digits)))))))
+
+(defn did-key-from-pub
+  "Raw 32-byte Ed25519 pubkey → did:key (multicodec 0xed01 + base58btc, z-prefixed)."
+  ^String [pub]
+  (str "did:key:z"
+       (b58 #?(:clj (byte-array (concat [(unchecked-byte 0xed) (unchecked-byte 0x01)] (seq pub)))
+               :cljs (js/Uint8Array. (into-array (concat [0xed 0x01] (byte-ints pub))))))))
+
+(defn did-key-from-seed
+  "Raw 32-byte seed → did:key:z6Mk…"
+  ^String [seed]
+  (did-key-from-pub (pubkey-from-seed seed)))
+
+(defn did-key-from-seed-hex
+  "Hex seed → did:key:z6Mk…"
+  ^String [^String seed-hex]
+  (did-key-from-seed (unhex seed-hex)))
+
+;; ── runtime self-check via the platform signer (no hardcoded vector needed) ───
+(defn verify-derivation
+  "Independent correctness check: sign a fixed message with the platform's
+   PKCS8(seed) private key, then verify it under the pubkey THIS namespace
+   derived. Returns true iff they agree — proving the derived pubkey matches
+   the seed's true key without relying on any external test vector."
+  [seed]
+  #?(:clj
+     (let [msg (kbytes/utf8-bytes "ed25519.core self-check")
+           s   (doto (Signature/getInstance "Ed25519") (.initSign (private-from-seed seed)))
+           _   (.update s msg)
+           sig (.sign s)
+           v   (doto (Signature/getInstance "Ed25519")
+                 (.initVerify ^PublicKey (public-from-raw (pubkey-from-seed seed))))
+           _   (.update v msg)]
+       (.verify v sig))
+     :cljs
+     (let [msg (js/Buffer.from (.encode (js/TextEncoder.) "ed25519.core self-check"))
+           sig (.sign ncrypto nil msg (private-from-seed seed))]
+       (.verify ncrypto nil msg (public-from-raw (pubkey-from-seed seed)) sig))))
+
+;; ── base58 decode (for did:key parsing) ───────────────────────────────────────
+(def ^:private b58-idx
+  (into {} (map-indexed (fn [i c] [c i]) b58-alphabet)))
+
+(defn b58-decode
+  "base58btc (Bitcoin alphabet) decode → byte-array. Leading '1's → leading 0x00."
+  [^String s]
+  #?(:clj
+     (let [^BigInteger n (reduce (fn [^BigInteger acc c]
+                       (.add (.multiply acc (biginteger 58))
+                             (biginteger (int (or (b58-idx c)
+                                                  (throw (ex-info "bad base58 char" {:c c})))))))
+                     BigInteger/ZERO (seq s))
+           body (if (zero? (.signum n))
+                  (byte-array 0)
+                  (let [ba (.toByteArray n)]
+                    (if (and (> (count ba) 1) (zero? (aget ba 0))) (byte-array (rest (seq ba))) ba)))
+           leading (count (take-while #(= \1 %) s))]
+       (byte-array (concat (repeat leading (byte 0)) (seq body))))
+     :cljs
+     ;; same long-division shape as the :cljs b58 encoder, base 58 -> 256.
+     (let [bytes (reduce
+                  (fn [bytes c]
+                    (let [v (or (b58-idx c)
+                                (throw (ex-info "bad base58 char" {:c c})))]
+                      (loop [j 0 carry v bytes bytes]
+                        (if (< j (count bytes))
+                          (let [x (+ (* (nth bytes j) 58) carry)]
+                            (recur (inc j) (quot x 256) (assoc bytes j (rem x 256))))
+                          (loop [carry carry bytes bytes]
+                            (if (pos? carry)
+                              (recur (quot carry 256) (conj bytes (rem carry 256)))
+                              bytes))))))
+                  [] (seq s))
+           leading (count (take-while #(= \1 %) (seq s)))]
+       (js/Uint8Array. (into-array (concat (repeat leading 0) (reverse bytes)))))))
+
+;; ── did:key parsing ───────────────────────────────────────────────────────────
+(defn did-key->pubkey
+  "Parse a did:key:z6Mk… (Ed25519) → raw 32-byte public key. Verifies the
+   multicodec 0xed01 prefix; throws on a non-Ed25519 did:key."
+  [^String did]
+  (when-not (str/starts-with? did "did:key:z")
+    (throw (ex-info "expected a did:key:z… multibase did" {:did did})))
+  (let [bytes (b58-decode (subs did (count "did:key:z")))
+        nth-b (fn [i] #?(:clj (bit-and (aget ^bytes bytes (int i)) 0xff)
+                         :cljs (aget bytes i)))]
+    (when-not (and (= 34 (blen bytes))
+                   (= 0xed (nth-b 0))
+                   (= 0x01 (nth-b 1)))
+      (throw (ex-info "not an Ed25519 did:key (expected 0xed01 multicodec)" {:did did})))
+    #?(:clj (byte-array (drop 2 (seq bytes)))
+       :cljs (js/Uint8Array. (.subarray bytes 2)))))
+
+;; ── sign / verify (platform Ed25519; the seed/pubkey-bytes facing API) ────────
+(defn sign
+  "Sign `msg` (bytes) with the raw 32-byte seed → 64-byte Ed25519 signature."
+  [seed msg]
+  #?(:clj
+     (let [s (doto (Signature/getInstance "Ed25519")
+               (.initSign ^PrivateKey (private-from-seed seed)))]
+       (.update s ^bytes msg)
+       (.sign s))
+     :cljs
+     (js/Uint8Array. (.sign ncrypto nil (js/Buffer.from msg) (private-from-seed seed)))))
+
+(defn verify
+  "Verify a 64-byte Ed25519 signature of `msg` under a raw 32-byte public key."
+  [pub msg sig]
+  #?(:clj
+     (let [v (doto (Signature/getInstance "Ed25519")
+               (.initVerify ^PublicKey (public-from-raw pub)))]
+       (.update v ^bytes msg)
+       (.verify v ^bytes sig))
+     :cljs
+     (.verify ncrypto nil (js/Buffer.from msg) (public-from-raw pub) (js/Buffer.from sig))))
+
+(defn verify-did
+  "Verify a signature where the signer is identified by a did:key:z… (Ed25519)."
+  [^String did msg sig]
+  (verify (did-key->pubkey did) msg sig))

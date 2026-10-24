@@ -1,0 +1,479 @@
+;; ed25519.selfhost -- SHA-512 (FIPS 180-4) and Ed25519 (RFC 8032) in the
+;; Amu selfhost seed subset, so a loaderless static image can derive a key
+;; from a seed, sign and verify with no host crypto (Linear JUN-326;
+;; com-junkawasaki/root ADR-2610222140: the L1 intent and the L2
+;; observations are signed). TweetNaCl's arithmetic: a field element is 16
+;; limbs of 16 bits in a :vector-i64, a scalar works on byte limbs, every
+;; product fits an i64 (and i64 + and * wrap, measured).
+;;
+;;   sha512             bytes -> 64 bytes
+;;   public-from-seed   32-byte seed -> 32-byte public key (RFC 8032 5.1.5)
+;;   sign               seed, message -> 64-byte signature (5.1.6)
+;;   sign-into          the same signature written into the caller's 64-byte
+;;                      vector; 0, or -1 (nothing written) for another size
+;;   verify?            public key, message, signature -> bool (5.1.7, with
+;;                      the S < L check TweetNaCl leaves out)
+;;   hex-bytes          lowercase hex -> bytes (for vectors and callers)
+;;
+;; Memory: a static image frees nothing by itself, and one verify allocates
+;; about 8 MiB. verify? runs inside (arena-scope ..), which releases all of
+;; it when the bool comes back, and sign-into does the same around sign, so a
+;; long-lived image can verify and sign without growing. sign and
+;; public-from-seed return vectors, which cannot leave a scope: use them
+;; only for one-off work, or inside the caller's own scope.
+;;
+;; Bytes are :vector-i64 of 0..255. Signing is not constant time beyond what
+;; TweetNaCl's select gives; this module is for node identity in static
+;; images, not for a secret on a shared host.
+;;
+;; Written in the Amu selfhost seed subset; README "Selfhost" has the gate.
+(ns ed25519.selfhost
+  (:export [sha512 public-from-seed sign sign-into verify? hex-bytes bytes=?
+            test-sha512 test-public test-sign test-verify test-sign-into]))
+
+;; ---------------------------------------------------------------------------
+;; Bytes
+
+(defn bzero [n :i64] :vector-i64
+  (let [v (vector-alloc n)] (loop [i 0] (if (>= i n) v (let [z (vector-assoc! v i 0)] (recur (inc i)))))))
+
+(defn bcopy-into [d :vector-i64 off :i64 s :vector-i64] :vector-i64
+  (loop [i 0] (if (>= i (vector-count s)) d (let [z (vector-assoc! d (+ off i) (vector-at s i))] (recur (inc i))))))
+
+(defn bslice [s :vector-i64 a :i64 n :i64] :vector-i64
+  (let [d (bzero n)] (loop [i 0] (if (>= i n) d (let [z (vector-assoc! d i (vector-at s (+ a i)))] (recur (inc i)))))))
+
+(defn bcat [a :vector-i64 b :vector-i64] :vector-i64
+  (bcopy-into (bcopy-into (bzero (+ (vector-count a) (vector-count b))) 0 a) (vector-count a) b))
+
+(defn bytes=? [a :vector-i64 b :vector-i64] :bool
+  (and (= (vector-count a) (vector-count b))
+       (loop [i 0] (cond (>= i (vector-count a)) true (= (vector-at a i) (vector-at b i)) (recur (inc i)) :else false))))
+
+(defn nib [c :i64] :i64 (if (< c 58) (- c 48) (- c 87)))
+
+(defn hex-bytes [s :string] :vector-i64
+  (let [n (quot (string-length s) 2) d (bzero n)]
+    (loop [i 0]
+      (if (>= i n) d
+        (let [z (vector-assoc! d i (+ (* 16 (nib (string-code-point-at s (* 2 i)))) (nib (string-code-point-at s (inc (* 2 i))))))]
+          (recur (inc i)))))))
+
+;; ---------------------------------------------------------------------------
+;; SHA-512
+
+(defn w64 [hi :i64 lo :i64] :i64 (bit-or (i64-shift-left hi 32) lo))
+(defn rotr [x :i64 n :i64] :i64 (bit-or (u64-shift-right x n) (i64-shift-left x (- 64 n))))
+
+(defn k512 [i :i64] :i64
+  (case i
+    0 (w64 0x428a2f98 0xd728ae22)
+    1 (w64 0x71374491 0x23ef65cd)
+    2 (w64 0xb5c0fbcf 0xec4d3b2f)
+    3 (w64 0xe9b5dba5 0x8189dbbc)
+    4 (w64 0x3956c25b 0xf348b538)
+    5 (w64 0x59f111f1 0xb605d019)
+    6 (w64 0x923f82a4 0xaf194f9b)
+    7 (w64 0xab1c5ed5 0xda6d8118)
+    8 (w64 0xd807aa98 0xa3030242)
+    9 (w64 0x12835b01 0x45706fbe)
+    10 (w64 0x243185be 0x4ee4b28c)
+    11 (w64 0x550c7dc3 0xd5ffb4e2)
+    12 (w64 0x72be5d74 0xf27b896f)
+    13 (w64 0x80deb1fe 0x3b1696b1)
+    14 (w64 0x9bdc06a7 0x25c71235)
+    15 (w64 0xc19bf174 0xcf692694)
+    16 (w64 0xe49b69c1 0x9ef14ad2)
+    17 (w64 0xefbe4786 0x384f25e3)
+    18 (w64 0x0fc19dc6 0x8b8cd5b5)
+    19 (w64 0x240ca1cc 0x77ac9c65)
+    20 (w64 0x2de92c6f 0x592b0275)
+    21 (w64 0x4a7484aa 0x6ea6e483)
+    22 (w64 0x5cb0a9dc 0xbd41fbd4)
+    23 (w64 0x76f988da 0x831153b5)
+    24 (w64 0x983e5152 0xee66dfab)
+    25 (w64 0xa831c66d 0x2db43210)
+    26 (w64 0xb00327c8 0x98fb213f)
+    27 (w64 0xbf597fc7 0xbeef0ee4)
+    28 (w64 0xc6e00bf3 0x3da88fc2)
+    29 (w64 0xd5a79147 0x930aa725)
+    30 (w64 0x06ca6351 0xe003826f)
+    31 (w64 0x14292967 0x0a0e6e70)
+    32 (w64 0x27b70a85 0x46d22ffc)
+    33 (w64 0x2e1b2138 0x5c26c926)
+    34 (w64 0x4d2c6dfc 0x5ac42aed)
+    35 (w64 0x53380d13 0x9d95b3df)
+    36 (w64 0x650a7354 0x8baf63de)
+    37 (w64 0x766a0abb 0x3c77b2a8)
+    38 (w64 0x81c2c92e 0x47edaee6)
+    39 (w64 0x92722c85 0x1482353b)
+    40 (w64 0xa2bfe8a1 0x4cf10364)
+    41 (w64 0xa81a664b 0xbc423001)
+    42 (w64 0xc24b8b70 0xd0f89791)
+    43 (w64 0xc76c51a3 0x0654be30)
+    44 (w64 0xd192e819 0xd6ef5218)
+    45 (w64 0xd6990624 0x5565a910)
+    46 (w64 0xf40e3585 0x5771202a)
+    47 (w64 0x106aa070 0x32bbd1b8)
+    48 (w64 0x19a4c116 0xb8d2d0c8)
+    49 (w64 0x1e376c08 0x5141ab53)
+    50 (w64 0x2748774c 0xdf8eeb99)
+    51 (w64 0x34b0bcb5 0xe19b48a8)
+    52 (w64 0x391c0cb3 0xc5c95a63)
+    53 (w64 0x4ed8aa4a 0xe3418acb)
+    54 (w64 0x5b9cca4f 0x7763e373)
+    55 (w64 0x682e6ff3 0xd6b2b8a3)
+    56 (w64 0x748f82ee 0x5defb2fc)
+    57 (w64 0x78a5636f 0x43172f60)
+    58 (w64 0x84c87814 0xa1f0ab72)
+    59 (w64 0x8cc70208 0x1a6439ec)
+    60 (w64 0x90befffa 0x23631e28)
+    61 (w64 0xa4506ceb 0xde82bde9)
+    62 (w64 0xbef9a3f7 0xb2c67915)
+    63 (w64 0xc67178f2 0xe372532b)
+    64 (w64 0xca273ece 0xea26619c)
+    65 (w64 0xd186b8c7 0x21c0c207)
+    66 (w64 0xeada7dd6 0xcde0eb1e)
+    67 (w64 0xf57d4f7f 0xee6ed178)
+    68 (w64 0x06f067aa 0x72176fba)
+    69 (w64 0x0a637dc5 0xa2c898a6)
+    70 (w64 0x113f9804 0xbef90dae)
+    71 (w64 0x1b710b35 0x131c471b)
+    72 (w64 0x28db77f5 0x23047d84)
+    73 (w64 0x32caab7b 0x40c72493)
+    74 (w64 0x3c9ebe0a 0x15c9bebc)
+    75 (w64 0x431d67c4 0x9c100d4c)
+    76 (w64 0x4cc5d4be 0xcb3e42b6)
+    77 (w64 0x597f299c 0xfc657e2a)
+    78 (w64 0x5fcb6fab 0x3ad6faec)
+    79 (w64 0x6c44198c 0x4a475817)
+    0))
+
+(defn be64 [p :vector-i64 off :i64] :i64
+  (loop [k 0 v 0] (if (= k 8) v (recur (inc k) (bit-or (i64-shift-left v 8) (vector-at p (+ off k)))))))
+
+(defn sha-w [p :vector-i64 off :i64] :vector-i64
+  (let [w (bzero 80)]
+    (loop [t 0]
+      (if (>= t 80) w
+        (let [v (if (< t 16) (be64 p (+ off (* 8 t)))
+                  (let [a (vector-at w (- t 15)) b (vector-at w (- t 2))]
+                    (+ (bit-xor (bit-xor (rotr b 19) (rotr b 61)) (u64-shift-right b 6))
+                       (+ (vector-at w (- t 7))
+                          (+ (bit-xor (bit-xor (rotr a 1) (rotr a 8)) (u64-shift-right a 7))
+                             (vector-at w (- t 16)))))))
+              z (vector-assoc! w t v)]
+          (recur (inc t)))))))
+
+(defn sha-rounds [s :vector-i64 w :vector-i64] :vector-i64
+  (loop [t 0]
+    (if (>= t 80) s
+      (let [a (vector-at s 0) b (vector-at s 1) c (vector-at s 2) d (vector-at s 3)
+            e (vector-at s 4) f (vector-at s 5) g (vector-at s 6) h (vector-at s 7)
+            t1 (+ h (+ (bit-xor (bit-xor (rotr e 14) (rotr e 18)) (rotr e 41))
+                       (+ (bit-xor (bit-and e f) (bit-and (bit-xor e -1) g))
+                          (+ (k512 t) (vector-at w t)))))
+            t2 (+ (bit-xor (bit-xor (rotr a 28) (rotr a 34)) (rotr a 39))
+                  (bit-xor (bit-xor (bit-and a b) (bit-and a c)) (bit-and b c)))
+            z7 (vector-assoc! s 7 g) z6 (vector-assoc! s 6 f) z5 (vector-assoc! s 5 e)
+            z4 (vector-assoc! s 4 (+ d t1)) z3 (vector-assoc! s 3 c) z2 (vector-assoc! s 2 b)
+            z1 (vector-assoc! s 1 a) z0 (vector-assoc! s 0 (+ t1 t2))]
+        (recur (inc t))))))
+
+(defn sha-iv [] :vector-i64
+  (let [h (bzero 8)
+        a (vector-assoc! h 0 (w64 0x6a09e667 0xf3bcc908)) b (vector-assoc! h 1 (w64 0xbb67ae85 0x84caa73b))
+        c (vector-assoc! h 2 (w64 0x3c6ef372 0xfe94f82b)) d (vector-assoc! h 3 (w64 0xa54ff53a 0x5f1d36f1))
+        e (vector-assoc! h 4 (w64 0x510e527f 0xade682d1)) f (vector-assoc! h 5 (w64 0x9b05688c 0x2b3e6c1f))
+        g (vector-assoc! h 6 (w64 0x1f83d9ab 0xfb41bd6b)) i (vector-assoc! h 7 (w64 0x5be0cd19 0x137e2179))]
+    h))
+
+(defn sha512 [m :vector-i64] :vector-i64
+  (let [n (vector-count m)
+        total (* 128 (quot (+ n 144) 128))
+        p (bcopy-into (bzero total) 0 m)
+        z (vector-assoc! p n 128)
+        bits (* 8 n)
+        y (loop [k 0] (if (= k 8) 0 (let [x (vector-assoc! p (- total (inc k)) (bit-and (u64-shift-right bits (* 8 k)) 255))] (recur (inc k)))))
+        h (sha-iv)
+        hh (loop [off 0]
+             (if (>= off total) h
+               (let [s (bcopy-into (bzero 8) 0 h)
+                     r (sha-rounds s (sha-w p off))
+                     u (loop [i 0] (if (= i 8) 0 (let [x (vector-assoc! h i (+ (vector-at h i) (vector-at r i)))] (recur (inc i)))))]
+                 (recur (+ off 128)))))
+        d (bzero 64)]
+    (loop [i 0]
+      (if (= i 64) d
+        (let [x (vector-assoc! d i (bit-and (u64-shift-right (vector-at hh (quot i 8)) (* 8 (- 7 (- i (* 8 (quot i 8)))))) 255))]
+          (recur (inc i)))))))
+
+;; ---------------------------------------------------------------------------
+;; GF(2^255 - 19): 16 limbs of 16 bits
+
+(defn gf [l :vector-i64] :vector-i64 (bcopy-into (bzero 16) 0 l))
+
+(defn gf-car [o :vector-i64] :vector-i64
+  (loop [i 0]
+    (if (= i 16) o
+      (let [v (+ (vector-at o i) 65536) c (i64-shift-right v 16)
+            j (if (< i 15) (inc i) 0)
+            z (vector-assoc! o i (- v (i64-shift-left c 16)))
+            y (vector-assoc! o j (+ (vector-at o j) (if (= i 15) (* 38 (- c 1)) (- c 1))))]
+        (recur (inc i))))))
+
+;; swap p and q in place when b = 1
+(defn gf-sel [p :vector-i64 q :vector-i64 b :i64] :i64
+  (let [c (bit-xor (- b 1) -1)]
+    (loop [i 0]
+      (if (= i (vector-count p)) 0
+        (let [t (bit-and c (bit-xor (vector-at p i) (vector-at q i)))
+              z (vector-assoc! p i (bit-xor (vector-at p i) t)) y (vector-assoc! q i (bit-xor (vector-at q i) t))]
+          (recur (inc i)))))))
+
+(defn gf-add [a :vector-i64 b :vector-i64] :vector-i64
+  (let [o (bzero 16)] (loop [i 0] (if (= i 16) o (let [z (vector-assoc! o i (+ (vector-at a i) (vector-at b i)))] (recur (inc i)))))))
+
+(defn gf-sub [a :vector-i64 b :vector-i64] :vector-i64
+  (let [o (bzero 16)] (loop [i 0] (if (= i 16) o (let [z (vector-assoc! o i (- (vector-at a i) (vector-at b i)))] (recur (inc i)))))))
+
+(defn gf-mul [a :vector-i64 b :vector-i64] :vector-i64
+  (let [t (bzero 31)
+        x (loop [i 0]
+            (if (= i 16) 0
+              (let [ai (vector-at a i)
+                    y (loop [j 0] (if (= j 16) 0 (let [z (vector-assoc! t (+ i j) (+ (vector-at t (+ i j)) (* ai (vector-at b j))))] (recur (inc j)))))]
+                (recur (inc i)))))
+        y (loop [i 0] (if (= i 15) 0 (let [z (vector-assoc! t i (+ (vector-at t i) (* 38 (vector-at t (+ i 16)))))] (recur (inc i)))))
+        o (bslice t 0 16)]
+    (gf-car (gf-car o))))
+
+(defn gf-sq [a :vector-i64] :vector-i64 (gf-mul a a))
+
+(defn gf-inv [x :vector-i64] :vector-i64
+  (loop [a 253 c (gf x)] (if (< a 0) c (recur (dec a) (let [s (gf-sq c)] (if (or (= a 2) (= a 4)) s (gf-mul s x)))))))
+
+(defn gf-pow2523 [x :vector-i64] :vector-i64
+  (loop [a 250 c (gf x)] (if (< a 0) c (recur (dec a) (let [s (gf-sq c)] (if (= a 1) s (gf-mul s x)))))))
+
+(defn gf-pack [n :vector-i64] :vector-i64
+  (let [t (gf-car (gf-car (gf-car (gf n))))
+        m (bzero 16)
+        z (loop [j 0]
+            (if (= j 2) 0
+              (let [a (vector-assoc! m 0 (- (vector-at t 0) 65517))
+                    b (loop [i 1]
+                        (if (= i 15) 0
+                          (let [x (vector-assoc! m i (- (- (vector-at t i) 65535) (bit-and (i64-shift-right (vector-at m (dec i)) 16) 1)))
+                                y (vector-assoc! m (dec i) (bit-and (vector-at m (dec i)) 65535))]
+                            (recur (inc i)))))
+                    c (vector-assoc! m 15 (- (- (vector-at t 15) 32767) (bit-and (i64-shift-right (vector-at m 14) 16) 1)))
+                    bb (bit-and (i64-shift-right (vector-at m 15) 16) 1)
+                    d (vector-assoc! m 14 (bit-and (vector-at m 14) 65535))
+                    e (gf-sel t m (- 1 bb))]
+                (recur (inc j)))))
+        o (bzero 32)]
+    (loop [i 0]
+      (if (= i 16) o
+        (let [x (vector-assoc! o (* 2 i) (bit-and (vector-at t i) 255))
+              y (vector-assoc! o (inc (* 2 i)) (i64-shift-right (vector-at t i) 8))]
+          (recur (inc i)))))))
+
+(defn gf-neq? [a :vector-i64 b :vector-i64] :bool (not (bytes=? (gf-pack a) (gf-pack b))))
+(defn gf-par [a :vector-i64] :i64 (bit-and (vector-at (gf-pack a) 0) 1))
+
+(defn gf-unpack [n :vector-i64] :vector-i64
+  (let [o (bzero 16)
+        z (loop [i 0] (if (= i 16) 0 (let [x (vector-assoc! o i (+ (vector-at n (* 2 i)) (i64-shift-left (vector-at n (inc (* 2 i))) 8)))] (recur (inc i)))))
+        y (vector-assoc! o 15 (bit-and (vector-at o 15) 32767))]
+    o))
+
+(defn gf0 [] :vector-i64 (bzero 16))
+(defn gf1 [] :vector-i64 (gf [1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]))
+(defn gf-d [] :vector-i64 (gf [30883 4953 19914 30187 55467 16705 2637 112 59544 30585 16505 36039 65139 11119 27886 20995]))
+(defn gf-d2 [] :vector-i64 (gf [61785 9906 39828 60374 45398 33411 5274 224 53552 61171 33010 6542 64743 22239 55772 9222]))
+(defn gf-x [] :vector-i64 (gf [54554 36645 11616 51542 42930 38181 51040 26924 56412 64982 57905 49316 21502 52590 14035 8553]))
+(defn gf-y [] :vector-i64 (gf [26200 26214 26214 26214 26214 26214 26214 26214 26214 26214 26214 26214 26214 26214 26214 26214]))
+(defn gf-i [] :vector-i64 (gf [41136 18958 6951 50414 58488 44335 6150 12099 55207 15867 153 11085 57099 20417 9344 11139]))
+
+;; ---------------------------------------------------------------------------
+;; Points: x y z t, 16 limbs each, in one vector of 64
+
+(defn pt [x :vector-i64 y :vector-i64 z :vector-i64 t :vector-i64] :vector-i64
+  (bcopy-into (bcopy-into (bcopy-into (bcopy-into (bzero 64) 0 x) 16 y) 32 z) 48 t))
+(defn pc [p :vector-i64 k :i64] :vector-i64 (bslice p (* 16 k) 16))
+
+(defn pt-add [p :vector-i64 q :vector-i64] :vector-i64
+  (let [a (gf-mul (gf-sub (pc p 1) (pc p 0)) (gf-sub (pc q 1) (pc q 0)))
+        b (gf-mul (gf-add (pc p 0) (pc p 1)) (gf-add (pc q 0) (pc q 1)))
+        c (gf-mul (gf-mul (pc p 3) (pc q 3)) (gf-d2))
+        d0 (gf-mul (pc p 2) (pc q 2)) d (gf-add d0 d0)
+        e (gf-sub b a) f (gf-sub d c) g (gf-add d c) h (gf-add b a)]
+    (pt (gf-mul e f) (gf-mul h g) (gf-mul g f) (gf-mul e h))))
+
+(defn pt-mul [q0 :vector-i64 s :vector-i64] :vector-i64
+  (loop [i 255 p (pt (gf0) (gf1) (gf1) (gf0)) q (bcat q0 (bzero 0))]
+    (if (< i 0) p
+      (let [b (bit-and (i64-shift-right (vector-at s (quot i 8)) (bit-and i 7)) 1)
+            x (gf-sel p q b)
+            q2 (pt-add q p) p2 (pt-add p p)
+            y (gf-sel p2 q2 b)]
+        (recur (dec i) p2 q2)))))
+
+(defn pt-base [] :vector-i64 (pt (gf-x) (gf-y) (gf1) (gf-mul (gf-x) (gf-y))))
+
+(defn pt-pack [p :vector-i64] :vector-i64
+  (let [zi (gf-inv (pc p 2)) tx (gf-mul (pc p 0) zi) ty (gf-mul (pc p 1) zi)
+        r (gf-pack ty) z (vector-assoc! r 31 (bit-xor (vector-at r 31) (i64-shift-left (gf-par tx) 7)))]
+    r))
+
+;; -A from its encoding, or an empty vector when it is not a point
+(defn pt-unpackneg [b :vector-i64] :vector-i64
+  (let [z (gf1) y (gf-unpack b)
+        num0 (gf-sq y) den (gf-add z (gf-mul num0 (gf-d))) num (gf-sub num0 z)
+        den2 (gf-sq den) den4 (gf-sq den2) den6 (gf-mul den4 den2)
+        t (gf-mul (gf-mul (gf-pow2523 (gf-mul (gf-mul den6 num) den)) num) (gf-mul den den))
+        x0 (gf-mul t den)
+        x1 (if (gf-neq? (gf-mul (gf-sq x0) den) num) (gf-mul x0 (gf-i)) x0)]
+    (if (gf-neq? (gf-mul (gf-sq x1) den) num) (vector-alloc 0)
+      (let [x (if (= (gf-par x1) (i64-shift-right (vector-at b 31) 7)) (gf-sub (gf0) x1) x1)]
+        (pt x y z (gf-mul x y))))))
+
+;; ---------------------------------------------------------------------------
+;; Scalars mod L
+
+(defn l-byte [j :i64] :i64
+  (case j 0 237 1 211 2 245 3 92 4 26 5 99 6 18 7 88 8 214 9 156 10 247 11 162 12 222 13 249 14 222 15 20 31 16 0))
+
+(defn mod-l [x :vector-i64] :vector-i64
+  (let [a (loop [i 63]
+            (if (< i 32) 0
+              (let [xi (vector-at x i)
+                    carry (loop [j (- i 32) c 0]
+                            (if (>= j (- i 12)) (let [z (vector-assoc! x j (+ (vector-at x j) c))] c)
+                              (let [v (- (+ (vector-at x j) c) (* 16 (* xi (l-byte (- j (- i 32))))))
+                                    c2 (i64-shift-right (+ v 128) 8)
+                                    z (vector-assoc! x j (- v (i64-shift-left c2 8)))]
+                                (recur (inc j) c2))))
+                    z (vector-assoc! x i 0)]
+                (recur (dec i)))))
+        x31 (vector-at x 31)
+        c1 (loop [j 0 c 0]
+             (if (= j 32) c
+               (let [v (- (+ (vector-at x j) c) (* (i64-shift-right x31 4) (l-byte j)))
+                     c2 (i64-shift-right v 8) z (vector-assoc! x j (bit-and v 255))]
+                 (recur (inc j) c2))))
+        b (loop [j 0] (if (= j 32) 0 (let [z (vector-assoc! x j (- (vector-at x j) (* c1 (l-byte j))))] (recur (inc j)))))
+        r (bzero 32)]
+    (loop [i 0]
+      (if (= i 32) r
+        (let [z (if (< i 31) (vector-assoc! x (inc i) (+ (vector-at x (inc i)) (i64-shift-right (vector-at x i) 8))) x)
+              y (vector-assoc! r i (bit-and (vector-at x i) 255))]
+          (recur (inc i)))))))
+
+(defn reduce64 [h :vector-i64] :vector-i64 (mod-l (bcopy-into (bzero 64) 0 h)))
+
+;; S < L, compared from the top byte
+(defn below-l? [s :vector-i64] :bool
+  (loop [j 31] (cond (< j 0) false (< (vector-at s j) (l-byte j)) true (> (vector-at s j) (l-byte j)) false :else (recur (dec j)))))
+
+;; ---------------------------------------------------------------------------
+;; Ed25519
+
+(defn clamped [seed :vector-i64] :vector-i64
+  (let [d (sha512 seed) a (vector-assoc! d 0 (bit-and (vector-at d 0) 248))
+        b (vector-assoc! d 31 (bit-or (bit-and (vector-at d 31) 127) 64))]
+    d))
+
+(defn public-from-seed [seed :vector-i64] :vector-i64 (pt-pack (pt-mul (pt-base) (bslice (clamped seed) 0 32))))
+
+(defn sign [seed :vector-i64 m :vector-i64] :vector-i64
+  (let [d (clamped seed) a (bslice d 0 32) pk (pt-pack (pt-mul (pt-base) a))
+        r (reduce64 (sha512 (bcat (bslice d 32 32) m)))
+        rr (pt-pack (pt-mul (pt-base) r))
+        h (reduce64 (sha512 (bcat (bcat rr pk) m)))
+        x (bcopy-into (bzero 64) 0 r)
+        y (loop [i 0]
+            (if (= i 32) 0
+              (let [z (loop [j 0] (if (= j 32) 0 (let [w (vector-assoc! x (+ i j) (+ (vector-at x (+ i j)) (* (vector-at h i) (vector-at a j))))] (recur (inc j)))))]
+                (recur (inc i)))))]
+    (bcat rr (mod-l x))))
+
+(defn verify? [pk :vector-i64 m :vector-i64 sig :vector-i64] :bool
+  (arena-scope
+    (if (or (not (= (vector-count pk) 32)) (not (= (vector-count sig) 64))) false
+      (let [s (bslice sig 32 32) q (pt-unpackneg pk)]
+        (if (or (not (below-l? s)) (= (vector-count q) 0)) false
+          (let [rr (bslice sig 0 32)
+                h (reduce64 (sha512 (bcat (bcat rr pk) m)))
+                p (pt-add (pt-mul q h) (pt-mul (pt-base) s))]
+            (bytes=? (pt-pack p) rr)))))))
+
+;; sign, with every intermediate released: only the 64 bytes written into out
+;; (allocated by the caller, outside the scope) survive
+(defn sign-into [out :vector-i64 seed :vector-i64 m :vector-i64] :i64
+  (if (not (= (vector-count out) 64)) -1
+    (arena-scope
+      (let [s (sign seed m)]
+        (loop [i 0] (if (= i 64) 0 (let [z (vector-assoc! out i (vector-at s i))] (recur (inc i)))))))))
+
+;; ---------------------------------------------------------------------------
+;; test-* : zero-arity, true when every assertion holds. Vectors: FIPS 180-4
+;; and RFC 8032 7.1, checked with RFC 8032's own reference code.
+
+(defn test-sha512 [] :bool
+  (if (and (bytes=? (sha512 (bzero 0)) (hex-bytes "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"))
+           (bytes=? (sha512 (hex-bytes "616263")) (hex-bytes "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"))
+           (bytes=? (sha512 (hex-bytes "61626364656667686263646566676869636465666768696a6465666768696a6b65666768696a6b6c666768696a6b6c6d6768696a6b6c6d6e68696a6b6c6d6e6f696a6b6c6d6e6f706a6b6c6d6e6f70716b6c6d6e6f7071726c6d6e6f707172736d6e6f70717273746e6f707172737475"))
+                    (hex-bytes "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909")))
+    true false))
+
+(defn seed1 [] :vector-i64 (hex-bytes "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))
+(defn seed2 [] :vector-i64 (hex-bytes "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
+(defn seed3 [] :vector-i64 (hex-bytes "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"))
+(defn pk1 [] :vector-i64 (hex-bytes "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"))
+(defn pk2 [] :vector-i64 (hex-bytes "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"))
+(defn pk3 [] :vector-i64 (hex-bytes "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"))
+(defn sig1 [] :vector-i64 (hex-bytes "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"))
+(defn sig2 [] :vector-i64 (hex-bytes "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"))
+(defn sig3 [] :vector-i64 (hex-bytes "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"))
+
+(defn test-public [] :bool
+  (if (and (bytes=? (public-from-seed (seed1)) (pk1))
+           (bytes=? (public-from-seed (seed2)) (pk2))
+           (bytes=? (public-from-seed (seed3)) (pk3)))
+    true false))
+
+(defn test-sign [] :bool
+  (if (and (bytes=? (sign (seed1) (bzero 0)) (sig1))
+           (bytes=? (sign (seed2) (hex-bytes "72")) (sig2))
+           (bytes=? (sign (seed3) (hex-bytes "af82")) (sig3)))
+    true false))
+
+;; one caller-owned vector, reused: each signature overwrites the last
+(defn test-sign-into [] :bool
+  (let [out (bzero 64)]
+    (and (= (sign-into out (seed1) (bzero 0)) 0) (bytes=? out (sig1))
+         (= (sign-into out (seed2) (hex-bytes "72")) 0) (bytes=? out (sig2))
+         (= (sign-into out (seed3) (hex-bytes "af82")) 0) (bytes=? out (sig3))
+         (= (sign-into (bzero 63) (seed1) (bzero 0)) -1))))
+
+;; flip one bit of a copy
+(defn flipped [v :vector-i64 i :i64] :vector-i64
+  (let [c (bcat v (bzero 0)) z (vector-assoc! c i (bit-xor (vector-at c i) 1))] c))
+
+(defn test-verify [] :bool
+  (if (and (verify? (pk1) (bzero 0) (sig1))
+           (verify? (pk2) (hex-bytes "72") (sig2))
+           (verify? (pk3) (hex-bytes "af82") (sig3))
+           ;; a changed signature, message or key fails
+           (not (verify? (pk2) (hex-bytes "72") (flipped (sig2) 0)))
+           (not (verify? (pk2) (hex-bytes "72") (flipped (sig2) 40)))
+           (not (verify? (pk2) (hex-bytes "73") (sig2)))
+           (not (verify? (pk3) (hex-bytes "72") (sig2)))
+           ;; S + L is the same scalar, so only the S < L check (RFC 8032; TweetNaCl
+           ;; has none) refuses it; S = L is refused too
+           (not (verify? (pk1) (bzero 0) (bcat (bslice (sig1) 0 32) (hex-bytes "4c8c7872aa064e049dbb3013fbf29380d25bf5f0595bbe24655141438e7a101b"))))
+           (not (verify? (pk1) (bzero 0) (bcat (bslice (sig1) 0 32) (hex-bytes "edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"))))
+           (not (verify? (bslice (pk1) 0 31) (bzero 0) (sig1))))
+    true false))

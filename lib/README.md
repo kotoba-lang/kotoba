@@ -33,6 +33,7 @@ The bundled standard libraries live in this repository:
 | `gov.nist.sha2` | `gov.nist.sha2/src` | `sha2.core`, `sha2.sha512`, `hash.subpath-dispatch` (FIPS 180-4 SHA-2; an external specification, publisher nist.gov) |
 | `gov.nist.mlKem` | `gov.nist.mlKem/src` | `mlkem.core` (FIPS 203 ML-KEM-768: keygen, encaps, decaps; an external specification, publisher nist.gov) |
 | `org.ietf.x25519` | `org.ietf.x25519/src` | `x25519.core`, `x25519.field` (RFC 7748 X25519; an external specification, publisher ietf.org) |
+| `org.ietf.ed25519` | `org.ietf.ed25519/src` | `ed25519.core`, `ed25519.sign`, `ed25519.edwards`, `ed25519.scalar` (RFC 8032 Ed25519 keys, signing and verification; an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
