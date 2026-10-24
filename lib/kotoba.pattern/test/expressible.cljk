@@ -1,0 +1,120 @@
+#!/usr/bin/env kbb
+;; How much of the browser stack's regex corpus this library can express.
+;;
+;; The other suites ask whether the patterns that compile give the right
+;; answers. This one asks the goal-level question the library exists for:
+;; can htmldom, cssom and the rest be written in Kotoba at all, and if not,
+;; WHICH FEATURE is missing. A count alone would not say that -- "16 refused"
+;; is not actionable, "5 inline flags, 3 non-greedy, 2 lookaround" is.
+;;
+;; Ratcheted, not fixed: the gap counts may only go DOWN. A new inexpressible
+;; literal in a consumer repo turns this red on the day it is written rather
+;; than on the day someone tries the migration.
+;;
+;; ⚠ Some scraped strings are not regexes at all -- the literal scrape can run
+;; past a string boundary and pick up ordinary source. Those are counted
+;; separately as `unparsed` and are NOT ratcheted, because their number tracks
+;; the scrape rather than this library.
+;;
+;; Exit codes: 0 within the ratchet, 1 over it, 2 REFUSED.
+;;
+;;   kbb --backend sci --classpath "src:$HOME/github/com-junkawasaki/orgs/kotoba-lang/text/src" \
+;;       test/expressible.cljk
+
+(ns expressible
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def script
+  (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+      "lib/kotoba.pattern/test/expressible.cljk"))
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".."))
+(def fuel 200000000)
+
+;; Measured 2026-09-09, the day captures landed. Every entry is a language
+;; feature this emitter does not have; none of them is in htmldom.
+(def ratchet
+  ;; `:group/inline-flags` was 5 here on 2026-09-09 and is gone the same day:
+  ;; leading (?i)(?s)(?m) are admitted, so the entry had to LEAVE rather than
+  ;; sit at 5 granting room nothing uses. That is the second direction of the
+  ;; ratchet doing its job on its first day.
+  ;; `:refused/lookahead` was 2 and is gone: `(?=` and `(?!` are emitted since
+  ;; 2026-09-09. One of those two patterns also has `(?<=`, so it moved to the
+  ;; lookbehind entry rather than disappearing -- which is why the total
+  ;; expressible count goes up by one, not two.
+  {":quantifier/non-greedy"   3     ; *? +? -- cssom, css
+   ":refused/lookbehind"      1})   ; (?<=) -- cssom, blocked upstream, see
+                                    ; test/lookbehind_probe.cljk
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- corpus []
+  (let [orgs (or (first (filter (fn [d] (fs/existsSync (path/join d "cssom")))
+                                [(path/resolve repo-root "..")
+                                 (path/join (.-HOME js/process.env)
+                                            "github" "com-junkawasaki" "orgs" "kotoba-lang")]))
+                 (path/resolve repo-root ".."))
+        r (sh "bash" ["-c" (str "find " orgs "/htmldom " orgs "/cssom " orgs "/browser "
+                                orgs "/html " orgs "/css " orgs "/kiyaku "
+                                "-name '*.cljc' -o -name '*.clj' 2>/dev/null | grep -v node_modules")])
+        files (remove str/blank? (str/split-lines (:out r)))
+        lit #"#\"((?:[^\"\\]|\\.)*)\""]
+    (vec (distinct (mapcat (fn [f] (map second (re-seq lit (fs/readFileSync f "utf8")))) files)))))
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (println "REFUSED: the kotoba CLI is not runnable here") (js/process.exit 2))
+  (let [patterns (corpus)]
+    (when (< (count patterns) 50)
+      (println "REFUSED: the corpus scrape found only" (count patterns) "patterns")
+      (js/process.exit 2))
+    (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "expressible-"))
+          out (path/join dir "pattern_emit.mjs")
+          c (sh "kotoba" ["-M" "compile" (path/join repo-root "kotoba" "pattern_emit.kotoba")
+                          "--target" "js" "--fuel" (str fuel) "--output" out])]
+      (when-not (zero? (:exit c))
+        (println "compile failed:" (:out c)) (js/process.exit 1))
+      (-> (js/import out)
+          (.then
+           (fn [module]
+             (let [emit (.instantiateKotoba module)
+                   ok (atom 0)
+                   gaps (atom {})
+                   unparsed (atom 0)]
+               (doseq [re patterns]
+                 (let [t (try ((aget emit "compile-text") re)
+                              (catch :default e (str "{:error :trap/" (.-message e))))]
+                   (if-not (str/starts-with? t "{:error")
+                     (swap! ok inc)
+                     (let [why (second (re-find #":error\s+(:[^\s,}]+)" t))]
+                       (if (= why ":refused/unparsed")
+                         (swap! unparsed inc)
+                         (swap! gaps update (str why) (fnil inc 0)))))))
+               (println (str "SCANNED\t" (count patterns)))
+               (println (str "expressible: " @ok "/" (count patterns)
+                             "   not a regex (scrape artifact): " @unparsed))
+               (let [over (for [[why n] (sort-by (comp - val) @gaps)
+                                :let [limit (get ratchet why 0)]]
+                            (do (println (str "  " why " " n
+                                              (if (> n limit) (str "  OVER the ratchet of " limit) "")))
+                                (if (> n limit) 1 0)))
+                     regressions (reduce + 0 over)
+                     ;; a gap that has been CLOSED should leave the ratchet, so
+                     ;; the table cannot quietly grant room it no longer needs
+                     stale (remove (fn [[why _]] (contains? @gaps why)) ratchet)]
+                 (doseq [[why n] stale]
+                   (println (str "  " why " is in the ratchet at " n " and no longer occurs"
+                                 " -- remove the entry")))
+                 (println (if (and (zero? regressions) (empty? stale))
+                            (str "expressible: within the ratchet; htmldom is "
+                                 "fully expressible and the gaps are cssom's")
+                            "expressible: OVER the ratchet"))
+                 (js/process.exit (if (and (zero? regressions) (empty? stale)) 0 1))))))
+          (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1)))))))
+
+(main)

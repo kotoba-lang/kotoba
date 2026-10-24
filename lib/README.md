@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.pattern` | `kotoba.pattern/src` | `pattern.compile` (Kotoba project library) |
 | `kotoba.pathfind` | `kotoba.pathfind/src` | `pathfind` (Kotoba project library) |
 | `kotoba.otio` | `kotoba.otio/src` | `kotoba.otio`, `otio.core` (Kotoba project library) |
 | `kotoba.osActor` | `kotoba.osActor/src` | `os.murakumo` (Kotoba project library) |

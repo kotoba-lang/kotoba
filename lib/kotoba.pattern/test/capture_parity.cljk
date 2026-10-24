@@ -1,0 +1,182 @@
+#!/usr/bin/env kbb
+;; Captured groups, THROUGH THE MACHINE, against JavaScript's own RegExp.
+;;
+;; The oracle here is not the `.cljc` compiler -- that one has no captures
+;; either, so it could only agree with this by construction. It is
+;; `RegExp.prototype.exec`, which is what a caller replacing `re-find` is
+;; actually replacing.
+;;
+;; ⚠ The two engines do not have the same match semantics, and this file does
+;; not pretend they do. This VM is a Pike VM: leftmost-LONGEST (POSIX).
+;; JavaScript backtracks: leftmost-FIRST (Perl). On `(a|ab)` against "ab" the
+;; VM takes "ab" and JavaScript takes "a", and BOTH ARE RIGHT for their
+;; semantics. So a disagreement about the match EXTENT is counted and reported
+;; as a semantic difference rather than a failure, and only a disagreement
+;; about GROUP BOUNDARIES WITHIN AN AGREED EXTENT is a failure -- that is the
+;; part where the two must not differ.
+;;
+;; The final section asserts the divergence in the direction it exists, so a
+;; day when this VM quietly becomes leftmost-first fails here rather than
+;; passing unnoticed.
+;;
+;; Exit codes: 0 passed, 1 disagreement, 2 REFUSED.
+;;
+;;   kbb --backend sci --classpath "src:$HOME/github/com-junkawasaki/orgs/kotoba-lang/text/src" \
+;;       test/capture_parity.cljk
+
+(ns capture-parity
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def script
+  (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+      "lib/kotoba.pattern/test/capture_parity.cljk"))
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".."))
+(def fuel 200000000)
+
+(def inputs
+  ["" "a" "ab" "abc" "0" "12" "px" "12px" " " "-1.5" "a@b.co" "]" "."
+   "&amp;" "&#38;" "&#x26;" "<div>" "</div>" "class=\"x\"" "id='y'" "a=b"
+   "\r\n" "  \t " "A1" "SW1A 2AA" "rgb(1,2,3)" "url(x.png)" "--var" "1e3"])
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- corpus []
+  (let [orgs (or (first (filter (fn [d] (fs/existsSync (path/join d "cssom")))
+                                [(path/resolve repo-root "..")
+                                 (path/join (.-HOME js/process.env)
+                                            "github" "com-junkawasaki" "orgs" "kotoba-lang")]))
+                 (path/resolve repo-root ".."))
+        r (sh "bash" ["-c" (str "find " orgs "/htmldom " orgs "/cssom " orgs "/browser "
+                                orgs "/html " orgs "/css " orgs "/kiyaku "
+                                "-name '*.cljc' -o -name '*.clj' 2>/dev/null | grep -v node_modules")])
+        files (remove str/blank? (str/split-lines (:out r)))
+        lit #"#\"((?:[^\"\\]|\\.)*)\""]
+    (vec (distinct (mapcat (fn [f] (map second (re-seq lit (fs/readFileSync f "utf8")))) files)))))
+
+;; JavaScript's answer for one pattern and one input, as [start end g1s g1e ...]
+;; or nil. Anchors are honoured by RegExp itself, so nothing is stripped.
+(defn- js-groups [re s]
+  (try
+    (let [rx (js/RegExp. re "d")
+          m (.exec rx s)]
+      (when m
+        (let [ind (.-indices m)]
+          (vec (mapcat (fn [i]
+                         (let [p (aget ind i)]
+                           (if (or (nil? p) (undefined? p)) [-1 -1] [(aget p 0) (aget p 1)])))
+                       (range (.-length m)))))))
+    (catch :default _ :unsupported)))
+
+(defn- kotoba-groups [vm prog s ng]
+  (let [k (.instantiateKotoba vm)
+        v ((aget k "find") prog s)]
+    (when (aget k "found?") v
+      nil)
+    (if-not ((aget k "found?") v)
+      nil
+      (vec (mapcat (fn [g]
+                     [(js/Number ((aget k "group-start") v (js/BigInt g)))
+                      (js/Number ((aget k "group-end") v (js/BigInt g)))])
+                   (range (inc ng)))))))
+
+(def failures (atom 0))
+(def checks (atom 0))
+(def extent-differs (atom 0))
+(def js-unsupported (atom 0))
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (println "REFUSED: the kotoba CLI is not runnable here") (js/process.exit 2))
+  (let [patterns (corpus)]
+    (when (< (count patterns) 50)
+      (println "REFUSED: the corpus scrape found only" (count patterns) "patterns")
+      (js/process.exit 2))
+    (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "capture-parity-"))
+          emit-out (path/join dir "pattern_emit.mjs")
+          vm-out (path/join dir "pattern_vm.mjs")
+          c1 (sh "kotoba" ["-M" "compile" (path/join repo-root "kotoba" "pattern_emit.kotoba")
+                           "--target" "js" "--fuel" (str fuel) "--output" emit-out])
+          c2 (sh "kotoba" ["-M" "compile" (path/join repo-root "kotoba" "pattern_vm.kotoba")
+                           "--target" "js" "--fuel" (str fuel) "--output" vm-out])]
+      (when-not (and (zero? (:exit c1)) (zero? (:exit c2)))
+        (println "compile failed:" (:out c1) (:out c2)) (js/process.exit 1))
+      (-> (js/Promise.all #js [(js/import emit-out) (js/import vm-out)])
+          (.then
+           (fn [mods]
+             (let [emit (aget mods 0)
+                   vm (aget mods 1)
+                   with-groups (atom 0)]
+               (doseq [re patterns]
+                 (let [prog (try ((aget (.instantiateKotoba emit) "compile-text") re)
+                                 (catch :default _ "{:error"))]
+                   (when-not (str/starts-with? prog "{:error")
+                     (let [ng (js/Number ((aget (.instantiateKotoba vm) "group-count") prog))]
+                       (when (pos? ng)
+                         (swap! with-groups inc)
+                         (doseq [s inputs]
+                           (let [theirs (js-groups re s)]
+                             (if (= theirs :unsupported)
+                               (swap! js-unsupported inc)
+                               (let [mine (kotoba-groups vm prog s ng)]
+                                 (swap! checks inc)
+                                 (cond
+                                   ;; both say no match here
+                                   (and (nil? mine) (nil? theirs)) nil
+                                   ;; one matched and the other did not, or the
+                                   ;; extents differ: leftmost-longest vs
+                                   ;; leftmost-first, counted not failed
+                                   (or (nil? mine) (nil? theirs)
+                                       (not= (take 2 mine) (take 2 theirs)))
+                                   (swap! extent-differs inc)
+                                   ;; same extent: the groups must agree
+                                   (not= mine theirs)
+                                   (do (swap! failures inc)
+                                       (println "  DISAGREE" (pr-str re) "on" (pr-str s))
+                                       (println "    js    :" (pr-str theirs))
+                                       (println "    kotoba:" (pr-str mine)))
+                                   :else nil))))))))))
+               ;; ⚠ Captures inside a LOOKAROUND are not reported here and are
+               ;; in JavaScript: the nested run has its own slots and drops
+               ;; them when it answers. No corpus pattern puts a group inside a
+               ;; lookaround, and the emitter does not refuse one, so this is a
+               ;; real difference rather than a refusal -- pinned here so it is
+               ;; a known one.
+               (let [prog ((aget (.instantiateKotoba emit) "compile-text") "a(?=(b))")
+                     mine (kotoba-groups vm prog "ab" 1)
+                     theirs (js-groups "a(?=(b))" "ab")]
+                 (swap! checks inc)
+                 (when-not (and (= [0 1 -1 -1] mine) (= [0 1 1 2] theirs))
+                   (swap! failures inc)
+                   (println "  the lookaround-capture difference has moved:")
+                   (println "    expected kotoba [0 1 -1 -1] and js [0 1 1 2]")
+                   (println "    got      kotoba" (pr-str mine) "and js" (pr-str theirs))))
+               ;; The divergence, asserted in the direction it exists. If this
+               ;; VM ever becomes leftmost-first these two flip and the file
+               ;; fails rather than quietly agreeing with JavaScript.
+               (let [prog ((aget (.instantiateKotoba emit) "compile-text") "(a|ab)")
+                     mine (kotoba-groups vm prog "ab" 1)
+                     theirs (js-groups "(a|ab)" "ab")]
+                 (swap! checks inc)
+                 (when-not (and (= [0 2 0 2] mine) (= [0 1 0 1] theirs))
+                   (swap! failures inc)
+                   (println "  the POSIX/Perl divergence has moved:")
+                   (println "    expected kotoba [0 2 0 2] (longest) and js [0 1 0 1] (first)")
+                   (println "    got      kotoba" (pr-str mine) "and js" (pr-str theirs))))
+               (println (str "SCANNED\t" @checks))
+               (println (str "  patterns with groups: " @with-groups
+                             "   extent differs (POSIX vs Perl): " @extent-differs
+                             "   js refused the pattern: " @js-unsupported))
+               (println (if (zero? @failures)
+                          (str "capture parity: " (- @checks @failures) "/" @checks
+                               " agree with JavaScript on group boundaries")
+                          (str "capture parity: " (- @checks @failures) "/" @checks " DISAGREE")))
+               (js/process.exit (if (zero? @failures) 0 1)))))
+          (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1)))))))
+
+(main)

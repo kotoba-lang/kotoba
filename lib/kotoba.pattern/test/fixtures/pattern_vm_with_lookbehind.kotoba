@@ -1,0 +1,1025 @@
+;; NOT COMPILED INTO THE LIBRARY. This is `pattern-vm` as it would be WITH
+;; lookbehind: identical except for `behind-scan`, the backward scan the
+;; feature needs. That one function is the SEVENTH member of the machine's
+;; recursion group, and amu runs out of heap there -- kotoba-lang/amu#915,
+;; measured 2026-09-09.
+;;
+;; `test/lookbehind_probe.cljk` compiles this and expects it to FAIL. On the
+;; day amu can compile it the probe goes red, and lookbehind stops being
+;; blocked. Nobody has to remember.
+(ns pattern-vm-with-lookbehind
+  ;; The matcher again, over a program carried as a STRING.
+  ;;
+  ;; ## Why
+  ;;
+  ;; `pattern-core` carries its program as a `:document`, and a document is
+  ;; bounded: depth 8, 256 nodes, and **32 items per container**
+  ;; (`osaho/src/kotoba/kir/value.cljc`). Measured 2026-09-09 over the 200
+  ;; regex literals in kotoba-lang's browser stack, 43 of them exceed one of
+  ;; those. None of them disagreed about MEANING -- every pattern that fits
+  ;; produces the identical program -- so the ceiling is the value shape and
+  ;; nothing else. A program of more than 32 instructions simply cannot be a
+  ;; guest document.
+  ;;
+  ;; Nor is there anywhere else to put it: every guest container is bounded
+  ;; near 32 (typed map 31, typed set 32, record 32 fields, heterogeneous
+  ;; vector 32), `[:vector T]` is a bounded TUPLE type, and no backend has a
+  ;; sequence parameter type at all. The one unbounded-ish value a guest can
+  ;; hold is a `:string` -- 65536 bytes -- so that is where the program goes.
+  ;;
+  ;; 65536 / 14 is about 4,680 instructions, against 32. The corpus needs 84.
+  ;;
+  ;; ## The format
+  ;;
+  ;;   header   "K" modes(1) nc(6 hex) nr(6 hex)                 14 chars
+  ;;   code     nc x [ op(1) a(6) b(6) c(1) ]                    14 chars each
+  ;;   ranges   nr x [ lo(6) hi(6) ]                             12 chars each
+  ;;
+  ;;   op 0 char   a = code point        op 4 jmp    a = pc
+  ;;   op 1 class  a = first range, b = range count, c = negated
+  ;;   op 2 any                          op 5 save   a = slot
+  ;;   op 3 split  a = pc, b = pc        op 6 match
+  ;;                                     op 7 bol    op 8 eol
+  ;;
+  ;; ## Captures
+  ;;
+  ;; `save` writes the current input position into a thread's slot, so a
+  ;; thread entry is `pc(6)` followed by `nslots` slots and the entry width is
+  ;; `6 + 6*nslots`. A program with no `save` has nslots 0 and width 6, which
+  ;; is byte for byte the entry this VM carried before captures existed --
+  ;; the capture-free path is not a special case, it is nslots = 0, and the
+  ;; 270-check parity suite is what says so.
+  ;;
+  ;; nslots is SCANNED from the code rather than carried in the header:
+  ;; widening the header would invalidate every program literal already
+  ;; compiled and committed (kiyaku carries six), and the scan is bounded by
+  ;; the instruction count.
+  ;;
+  ;; ⚠ This is a Pike VM: leftmost-LONGEST (POSIX). JavaScript backtracks:
+  ;; leftmost-FIRST (Perl). On `(a|ab)` against "ab" this takes "ab" and
+  ;; JavaScript takes "a", and both are right for their semantics. Measured
+  ;; 2026-09-09 over the 60 corpus patterns that have groups: the two agree on
+  ;; every one of 1277 checks, and the divergence appears only in the probe
+  ;; written for it -- but preferring the shortest match instead makes 86 of
+  ;; those checks diverge, so the corpus is not blind to match length, it just
+  ;; never distinguishes longest from first. `test/capture_parity.cljk` asserts
+  ;; the divergence in the direction it exists.
+  ;;
+  ;; Fixed width on purpose: an instruction is addressed by arithmetic, so
+  ;; nothing has to be scanned to find it. The class table is inline and an
+  ;; instruction names its ranges by (first, count), so there is no second
+  ;; indirection to bound either.
+  ;;
+  ;; ## What this costs
+  ;;
+  ;; Fuel is charged per function ENTRY and every field is now six hex digits
+  ;; read one at a time, so an instruction costs about a dozen entries where
+  ;; the document form cost one. That is the trade the ceiling forces, and the
+  ;; host chooses the budget (`--fuel`). Nothing else changed: this is
+  ;; `pattern-core`'s machine -- a Pike VM with a deduplicated thread list,
+  ;; linear in input x program -- reading a different container.
+  ;;
+  ;; `pattern-core` stays as the oracle: `test/vm_parity.cljk` runs both over
+  ;; the same patterns, and the small ones must agree.
+  (:export [main
+            prog-fold? prog-dotall? prog-multiline? prog-count range-count
+            ins-op ins-a ins-b ins-c range-lo range-hi
+            hex-at nslots-of width-of look-hit? look-negated? look-behind?
+            match? search search-start search-end
+            find found? group-count group-start group-end group-text
+            test-hex test-header test-literal test-class test-quantifier
+            test-alternation test-anchor test-search test-fold test-bounded
+            test-capture test-capture-optional test-capture-nested
+            test-dot-excludes-newline test-mode-bits test-multiline-anchors
+            test-lookahead test-lookahead-negative])
+  (:schemas {:pat/hex [:record :pat/hex [[:s :string] [:i :i64] [:n :i64] [:acc :i64]]]
+             ;; `slots`, `w` and `sp` are the capture machinery. A program
+             ;; with no `save` has `w` 6 and `slots` "", which is byte for byte
+             ;; the thread entry this VM carried before captures existed.
+             :pat/add [:record :pat/add
+                       [[:prog :string] [:list :string] [:pc :i64]
+                        [:bol :bool] [:eol :bool] [:blen :i64]
+                        [:slots :string] [:w :i64] [:sp :i64] [:s :string]]]
+             :pat/threads [:record :pat/threads
+                           [[:prog :string] [:list :string] [:i :i64]
+                            [:cp :i64] [:next :string] [:blen :i64] [:eol :bool]
+                            [:w :i64] [:sp :i64] [:s :string]]]
+             :pat/run [:record :pat/run
+                       [[:prog :string] [:list :string] [:s :string]
+                        [:pos :i64] [:len :i64] [:blen :i64] [:w :i64]]]
+             :pat/scan [:record :pat/scan
+                        [[:prog :string] [:s :string] [:pos :i64]
+                         [:len :i64] [:want-end :bool]]]
+             :pat/range [:record :pat/range
+                         [[:prog :string] [:i :i64] [:n :i64] [:cp :i64]]]
+             :pat/start [:record :pat/start
+                         [[:prog :string] [:s :string] [:pos :i64]
+                          [:len :i64] [:blen :i64] [:w :i64] [:pc :i64]]]
+             :pat/behind [:record :pat/behind
+                          [[:prog :string] [:s :string] [:sp :i64]
+                           [:sub :i64] [:j :i64]]]
+             :pat/zeros [:record :pat/zeros [[:acc :string] [:n :i64]]]
+             :pat/fills [:record :pat/fills [[:acc :string] [:n :i64]]]
+             :pat/slot [:record :pat/slot
+                        [[:slots :string] [:k :i64] [:pos :i64]]]
+             :pat/scan-ng [:record :pat/scan-ng
+                           [[:prog :string] [:pc :i64] [:n :i64] [:acc :i64]]]}))
+
+;; --- hex ------------------------------------------------------------------
+
+(defn hex-digit [cp :i64] :i64
+  (if (< cp 48) -1
+      (if (<= cp 57) (- cp 48)
+          (if (< cp 97) -1
+              (if (<= cp 102) (+ 10 (- cp 97)) -1)))))
+
+(defn hex-scan [x [:ref :pat/hex]] :i64
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        n (record-get x :n)
+        acc (record-get x :acc)]
+    (if (<= n 0)
+      acc
+      (let [d (app (ref hex-digit) (string-code-point-at s i))]
+        (if (< d 0)
+          -1
+          (app (ref hex-scan) (record-new [:ref :pat/hex] s (+ i 1) (- n 1) (+ (* acc 16) d))))))))
+
+(defn hex-at [s :string i :i64 n :i64] :i64
+  (app (ref hex-scan) (record-new [:ref :pat/hex] s i n 0)))
+
+;; --- the program ----------------------------------------------------------
+
+;; The character after "K" was a single fold BIT and is now a bitfield, which
+;; is why the header did not have to widen: bit 0 is fold, so "K0" and "K1"
+;; mean exactly what they meant, and every program literal already compiled
+;; and committed still reads correctly. Bits 1 and 2 are new.
+;;
+;;   bit 0  1  fold      (?i)   case-insensitive
+;;   bit 1  2  dotall    (?s)   `.` matches a line terminator
+;;   bit 2  4  multiline (?m)   ^ and $ match at line boundaries
+(defn mode-bit? [p :string v :i64] :bool
+  (let [d (app (ref hex-at) p 1 1)]
+    (= 1 (- (quot d v) (* 2 (quot d (* 2 v)))))))
+
+(defn prog-fold? [p :string] :bool
+  (app (ref mode-bit?) p 1))
+
+(defn prog-dotall? [p :string] :bool
+  (app (ref mode-bit?) p 2))
+
+(defn prog-multiline? [p :string] :bool
+  (app (ref mode-bit?) p 4))
+
+;; ⚠ `.` matched a line terminator until 2026-09-09, and JavaScript's does not.
+;; Measured that day: `a.b` against "a\nb" answered TRUE here and false there,
+;; and so did `.` against "\n" and `a.*b` against "a\nxb". The 270-check
+;; `vm_parity` and the 252-check `pattern_parity` had both been green for days
+;; -- neither corpus put a newline where a `.` was tested, which is the same
+;; shape as the `$` bug this file already records above. The corpora now do.
+;;
+;; The set is JavaScript's: LF, CR, and the two Unicode separators. A NEGATED
+;; CLASS still matches them, in both engines -- `[^x]` is not `.`.
+(defn line-terminator? [cp :i64] :bool
+  (if (= cp 10) true (if (= cp 13) true (if (= cp 8232) true (= cp 8233)))))
+
+;; Under (?m) an anchor also holds at a line boundary, so `^` asks about the
+;; character BEFORE the position and `$` about the one AT it. Off the end in
+;; either direction is not a terminator -- the two callers handle the real
+;; edges themselves.
+;; --- lookaround ----------------------------------------------------------
+;;
+;; `op 9 look` costs no input, so like split, jmp, save and the anchors it
+;; lives in the epsilon closure.
+;;
+;;   a  the pc its sub-code starts at
+;;   b  the pc to continue at, past the sub-code's terminating `match`
+;;   c  bit 0 negated, bit 1 behind
+;;
+;; The sub-code is the SAME program run from another pc, so there is no second
+;; machine and no second format. A lookahead asks whether the sub-pattern
+;; matches starting here; a lookbehind asks whether one ends here.
+;;
+;; ⚠ Captures inside a lookaround are not reported. The nested run has its own
+;; slots and they are dropped when it answers. JavaScript keeps them. No
+;; pattern in the corpus puts a group inside a lookaround, and the emitter
+;; does not refuse one, so this is a real difference rather than a refusal --
+;; it is asserted in `test/capture_parity.cljk` rather than left to be found.
+
+(defn look-negated? [c :i64] :bool
+  (= 1 (- c (* 2 (quot c 2)))))
+
+(defn look-behind? [c :i64] :bool
+  (= 1 (- (quot c 2) (* 2 (quot c 4)))))
+
+(defn terminator-at? [s :string i :i64] :bool
+  (if (< i 0)
+    false
+    (if (>= i (string-length s))
+      false
+      (app (ref line-terminator?) (string-code-point-at s i)))))
+
+(defn prog-count [p :string] :i64
+  (app (ref hex-at) p 2 6))
+
+(defn range-count [p :string] :i64
+  (app (ref hex-at) p 8 6))
+
+(defn ins-off [i :i64] :i64
+  (+ 14 (* i 14)))
+
+(defn ins-op [p :string i :i64] :i64
+  (app (ref hex-at) p (app (ref ins-off) i) 1))
+
+(defn ins-a [p :string i :i64] :i64
+  (app (ref hex-at) p (+ (app (ref ins-off) i) 1) 6))
+
+(defn ins-b [p :string i :i64] :i64
+  (app (ref hex-at) p (+ (app (ref ins-off) i) 7) 6))
+
+(defn ins-c [p :string i :i64] :i64
+  (app (ref hex-at) p (+ (app (ref ins-off) i) 13) 1))
+
+(defn range-off [p :string r :i64] :i64
+  (+ (+ 14 (* (app (ref prog-count) p) 14)) (* r 12)))
+
+(defn range-lo [p :string r :i64] :i64
+  (app (ref hex-at) p (app (ref range-off) p r) 6))
+
+(defn range-hi [p :string r :i64] :i64
+  (app (ref hex-at) p (+ (app (ref range-off) p r) 6) 6))
+
+;; --- code points ----------------------------------------------------------
+
+(defn fold-cp [cp :i64] :i64
+  (if (>= cp 65) (if (<= cp 90) (+ cp 32) cp) cp))
+
+(defn cp-width [cp :i64] :i64
+  (if (< cp 128) 1 (if (< cp 2048) 2 (if (< cp 65536) 3 4))))
+
+;; --- classes --------------------------------------------------------------
+
+(defn range-hit? [x [:ref :pat/range]] :bool
+  (let [prog (record-get x :prog)
+        i (record-get x :i)
+        n (record-get x :n)
+        cp (record-get x :cp)]
+    (if (<= n 0)
+      false
+      (if (if (>= cp (app (ref range-lo) prog i)) (<= cp (app (ref range-hi) prog i)) false)
+        true
+        (app (ref range-hit?) (record-new [:ref :pat/range] prog (+ i 1) (- n 1) cp))))))
+
+(defn in-class? [p :string first :i64 count :i64 neg :i64 cp :i64] :bool
+  (let [hit (app (ref range-hit?) (record-new [:ref :pat/range] p first count cp))]
+    (if (= neg 1) (not hit) hit)))
+
+;; --- the thread set -------------------------------------------------------
+;;
+;; One string, two sections: a BITSET of visited program counters followed by
+;; the list of live ones, six hex digits each.
+;;
+;;   [ bits: ceil(nc/4) hex chars ][ pcs: 6 hex chars each ]
+;;
+;; Both sections are here for the same reason the program is a string: a
+;; `:document` vector holds 32 items, and 32 simultaneously-live threads is a
+;; real ceiling. Measured 2026-09-09: with the thread list as a document, the
+;; 257-instruction email pattern from `kiyaku` answered `doc-vector-too-large`
+;; on "a@b.co" while the 88-instruction IPv4 ran. Moving the PROGRAM out of a
+;; document lifted one ceiling and left the next one standing behind it.
+;;
+;; The bitset is not an optimisation of taste. With membership as a linear
+;; scan -- six hex digits decoded per entry -- that same email pattern took
+;; **20.4 seconds** for one `match?` (measured, correct answer). A scan is
+;; O(threads) FUNCTION ENTRIES per insert and fuel is charged per entry, so
+;; the dedup that keeps a Pike VM linear was itself quadratic. A bit test is
+;; one hex read and one mask.
+
+(defn zeros [x [:ref :pat/zeros]] :string
+  (let [acc (record-get x :acc)
+        n (record-get x :n)]
+    (if (<= n 0)
+      acc
+      (app (ref zeros) (record-new [:ref :pat/zeros] (string-concat acc "0") (- n 1))))))
+
+(defn bits-len [prog :string] :i64
+  (quot (+ (app (ref prog-count) prog) 3) 4))
+
+(defn new-set [blen :i64] :string
+  (app (ref zeros) (record-new [:ref :pat/zeros] "" blen)))
+
+(defn hex-digit-char [d :i64] :string
+  (if (< d 10)
+    (string-from-i64 d)
+    (if (= d 10) "a"
+        (if (= d 11) "b"
+            (if (= d 12) "c"
+                (if (= d 13) "d"
+                    (if (= d 14) "e" "f")))))))
+
+;; `mod` is listed among the builtins and is not one here ("unknown operation:
+;; mod is not a builtin, a sugar head, or a function of this module", measured
+;; 2026-09-09), so the low bits are arithmetic.
+(defn nibble [n :i64] :i64
+  (- n (* 16 (quot n 16))))
+
+(defn hex6 [n :i64] :string
+  (string-concat
+   (app (ref hex-digit-char) (quot n 1048576))
+   (string-concat
+    (app (ref hex-digit-char) (app (ref nibble) (quot n 65536)))
+    (string-concat
+     (app (ref hex-digit-char) (app (ref nibble) (quot n 4096)))
+     (string-concat
+      (app (ref hex-digit-char) (app (ref nibble) (quot n 256)))
+      (string-concat
+       (app (ref hex-digit-char) (app (ref nibble) (quot n 16)))
+       (app (ref hex-digit-char) (app (ref nibble) n))))))))
+
+;; --- capture slots --------------------------------------------------------
+;;
+;; A thread entry is `pc(6)` followed by `nslots` slots of 6 hex each, so the
+;; entry width `w` is `6 + 6*nslots`. A program with no `save` has nslots 0 and
+;; w 6, which is exactly the entry this VM carried before captures existed --
+;; the capture-free path is not a special case, it is nslots = 0.
+;;
+;; The unset slot is `ffffff`. Positions are byte offsets into a `:string`,
+;; capped at 65536, so the sentinel cannot collide with a real one.
+
+(defn fills [x [:ref :pat/fills]] :string
+  (let [acc (record-get x :acc)
+        n (record-get x :n)]
+    (if (<= n 0)
+      acc
+      (app (ref fills) (record-new [:ref :pat/fills] (string-concat acc "f") (- n 1))))))
+
+(defn slot-unset [] :i64
+  16777215)
+
+;; nslots = 1 + the largest slot index any `save` names, or 0 when there is no
+;; `save` at all. Scanned once per top-level call rather than carried in the
+;; header: widening the header would invalidate every program literal already
+;; compiled and committed, and this pass is bounded by the instruction count.
+(defn scan-ng [x [:ref :pat/scan-ng]] :i64
+  (let [prog (record-get x :prog)
+        pc (record-get x :pc)
+        n (record-get x :n)
+        acc (record-get x :acc)]
+    (if (>= pc n)
+      acc
+      (app (ref scan-ng)
+           (record-new [:ref :pat/scan-ng] prog (+ pc 1) n
+                       (if (= 5 (app (ref ins-op) prog pc))
+                         (let [k (+ 1 (app (ref ins-a) prog pc))]
+                           (if (> k acc) k acc))
+                         acc))))))
+
+(defn nslots-of [prog :string] :i64
+  (app (ref scan-ng)
+       (record-new [:ref :pat/scan-ng] prog 0 (app (ref prog-count) prog) 0)))
+
+(defn width-of [prog :string] :i64
+  (+ 6 (* 6 (app (ref nslots-of) prog))))
+
+(defn no-slots [nslots :i64] :string
+  (app (ref fills) (record-new [:ref :pat/fills] "" (* 6 nslots))))
+
+(defn slot-set [x [:ref :pat/slot]] :string
+  (let [slots (record-get x :slots)
+        k (record-get x :k)
+        pos (record-get x :pos)
+        at (* k 6)]
+    (string-concat (string-substring slots 0 at)
+                   (string-concat (app (ref hex6) pos)
+                                  (string-substring slots (+ at 6)
+                                                    (string-length slots))))))
+
+;; `bit-shift-left` is not the name here -- the builtin is `i64-shift-left`
+;; ("nearest defined: i32-shift-left (builtin), i64-shift-left (builtin)",
+;; measured 2026-09-09). Four bits per hex digit, so the shift is 0..3.
+;; Not a shift: `i64-shift-left` takes a LITERAL count in [0,63] (measured
+;; 2026-09-09), and this one is computed. Four bits per hex digit, so the
+;; whole domain is four values.
+(defn bit-of [pc :i64] :i64
+  (let [b (- pc (* 4 (quot pc 4)))]
+    (if (= b 0) 1 (if (= b 1) 2 (if (= b 2) 4 8)))))
+
+;; ⚠ Arithmetic, not `bit-and`/`bit-or`: those are refused by the JS backend
+;; with "unsupported KIR operation" at the :kotoba-script phase (measured
+;; 2026-09-09 — `string-from-i64` compiles there, the two bit heads do not).
+;; For a hex digit d and a bit value v in {1,2,4,8}, the bit is set exactly
+;; when (quot d v) is odd.
+(defn bit-set? [d :i64 v :i64] :bool
+  (= 1 (- (quot d v) (* 2 (quot d (* 2 v))))))
+
+(defn set-has? [set :string pc :i64] :bool
+  (app (ref bit-set?) (app (ref hex-at) set (quot pc 4) 1) (app (ref bit-of) pc)))
+
+(defn set-add [set :string blen :i64 pc :i64 slots :string] :string
+  (let [at (quot pc 4)
+        v (app (ref bit-of) pc)
+        d (app (ref hex-at) set at 1)
+        d2 (if (app (ref bit-set?) d v) d (+ d v))]
+    (string-concat
+     (string-concat (string-substring set 0 at) (app (ref hex-digit-char) d2))
+     (string-concat (string-substring set (+ at 1) (string-length set))
+                    (string-concat (app (ref hex6) pc) slots)))))
+
+(defn thread-count [set :string blen :i64 w :i64] :i64
+  (quot (- (string-length set) blen) w))
+
+(defn pc-at [set :string blen :i64 w :i64 i :i64] :i64
+  (app (ref hex-at) set (+ blen (* i w)) 6))
+
+(defn slots-at [set :string blen :i64 w :i64 i :i64] :string
+  (let [at (+ blen (+ (* i w) 6))]
+    (string-substring set at (+ at (- w 6)))))
+
+;; Epsilon closure: split, jmp and the anchors cost no input, so a thread that
+;; lands on one keeps moving within the same step.
+(defn add-thread [x [:ref :pat/add]] :string
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        pc (record-get x :pc)
+        bol (record-get x :bol)
+        eol (record-get x :eol)
+        blen (record-get x :blen)
+        slots (record-get x :slots)
+        w (record-get x :w)
+        sp (record-get x :sp)
+        subject (record-get x :s)]
+    (if (if (app (ref set-has?) list pc) true (>= pc (app (ref prog-count) prog)))
+      list
+      (let [op (app (ref ins-op) prog pc)]
+        (if (= op 4)
+          (app (ref add-thread) (record-new [:ref :pat/add] prog list (app (ref ins-a) prog pc) bol eol blen slots w sp subject))
+          (if (= op 3)
+            (app (ref add-thread)
+                 (record-new [:ref :pat/add] prog
+                             (app (ref add-thread)
+                                  (record-new [:ref :pat/add] prog list (app (ref ins-a) prog pc) bol eol blen slots w sp subject))
+                             (app (ref ins-b) prog pc) bol eol blen slots w sp subject))
+            (if (= op 7)
+              (if bol
+                (app (ref add-thread) (record-new [:ref :pat/add] prog list (+ pc 1) bol eol blen slots w sp subject))
+                list)
+              (if (= op 8)
+                (if eol
+                  (app (ref add-thread) (record-new [:ref :pat/add] prog list (+ pc 1) bol eol blen slots w sp subject))
+                  list)
+                ;; A lookaround is a zero-width TEST: run the sub-code, and
+                ;; either walk on past it or drop the thread. Nothing is
+                ;; consumed and no slot is written.
+                (if (= op 9)
+                  (if (= (app (ref look-hit?) prog subject sp pc)
+                         (not (app (ref look-negated?) (app (ref ins-c) prog pc))))
+                    (app (ref add-thread)
+                         (record-new [:ref :pat/add] prog list
+                                     (app (ref ins-b) prog pc)
+                                     bol eol blen slots w sp subject))
+                    list)
+                ;; `save` costs no input either, so it belongs in the closure
+                ;; with split, jmp and the anchors -- writing the slot and
+                ;; walking on with the WRITTEN slots, not the ones it was
+                ;; handed.
+                (if (= op 5)
+                  (app (ref add-thread)
+                       (record-new [:ref :pat/add] prog list (+ pc 1) bol eol blen
+                                   (app (ref slot-set)
+                                        (record-new [:ref :pat/slot] slots
+                                                    (app (ref ins-a) prog pc) sp))
+                                   w sp subject))
+                  (app (ref set-add) list blen pc slots)))))))))))
+
+;; A record rather than a parameter list: the two flags are functions of `pos`
+;; and, under (?m), of the string around it, so this needs `s` as well -- which
+;; is seven values, past `:max-parameters 5`.
+;;
+;; ⚠ `^` under (?m) asks about the character BEFORE `pos`, not at it. Asking
+;; at it makes `^` true wherever a newline begins rather than wherever a line
+;; does, which is off by exactly one line.
+(defn start-list [x [:ref :pat/start]] :string
+  (let [prog (record-get x :prog)
+        s (record-get x :s)
+        pos (record-get x :pos)
+        len (record-get x :len)
+        blen (record-get x :blen)
+        w (record-get x :w)
+        multi (app (ref prog-multiline?) prog)]
+    (app (ref add-thread)
+         (record-new [:ref :pat/add] prog (app (ref new-set) blen)
+                     (record-get x :pc)
+                     (if (= pos 0) true (if multi (app (ref terminator-at?) s (- pos 1)) false))
+                     (if (>= pos len) true (if multi (app (ref terminator-at?) s pos) false))
+                     blen
+                     (app (ref no-slots) (quot (- w 6) 6)) w pos s))))
+
+;; --- one input position ---------------------------------------------------
+
+(defn matches-here? [prog :string pc :i64 cp :i64] :bool
+  (let [op (app (ref ins-op) prog pc)]
+    (if (= op 2)
+      (if (app (ref prog-dotall?) prog)
+        true
+        (not (app (ref line-terminator?) cp)))
+      (if (= op 0)
+        (if (app (ref prog-fold?) prog)
+          (= (app (ref fold-cp) cp) (app (ref fold-cp) (app (ref ins-a) prog pc)))
+          (= cp (app (ref ins-a) prog pc)))
+        (if (= op 1)
+          (let [first (app (ref ins-a) prog pc)
+                count (app (ref ins-b) prog pc)
+                neg (app (ref ins-c) prog pc)]
+            (if (app (ref prog-fold?) prog)
+              (if (app (ref in-class?) prog first count neg cp)
+                true
+                (app (ref in-class?) prog first count neg (app (ref fold-cp) cp)))
+              (app (ref in-class?) prog first count neg cp)))
+          false)))))
+
+;; The index of the first thread sitting on `match`, or -1. First rather than
+;; any, because the thread list is in priority order and its slots are the ones
+;; the answer reports.
+(defn win-index [x [:ref :pat/threads]] :i64
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        i (record-get x :i)
+        blen (record-get x :blen)
+        w (record-get x :w)]
+    (if (>= i (app (ref thread-count) list blen w))
+      -1
+      (if (= 6 (app (ref ins-op) prog (app (ref pc-at) list blen w i)))
+        i
+        (app (ref win-index) (record-new [:ref :pat/threads] prog list (+ i 1) 0 "" blen false w 0 ""))))))
+
+(defn any-match? [x [:ref :pat/threads]] :bool
+  (>= (app (ref win-index) x) 0))
+
+;; ⚠ `eol` is the flag for the position the surviving threads land ON, not the
+;; one they left. Passing `false` here drops every thread that steps onto a `$`
+;; -- which is every anchored pattern longer than one character.
+;;
+;; Measured 2026-09-09: `^(px|em)$` against "px" answered FALSE, and so did
+;; `^[-+]?[0-9]+$` against "12", while `^a$` against "a" was right. The parity
+;; corpus had no pattern ENDING in `$`, so 216 checks agreed with JavaScript
+;; and none of them exercised this. The corpus now has four.
+;;
+;; An earlier shape tried to repair this after the fact by re-opening the
+;; stepped list with eol=true; it cannot, because the thread was already gone.
+(defn step-threads [x [:ref :pat/threads]] :string
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        i (record-get x :i)
+        cp (record-get x :cp)
+        next (record-get x :next)
+        blen (record-get x :blen)
+        eol (record-get x :eol)
+        w (record-get x :w)
+        sp (record-get x :sp)
+        subject (record-get x :s)]
+    (if (>= i (app (ref thread-count) list blen w))
+      next
+      (let [pc (app (ref pc-at) list blen w i)]
+        (app (ref step-threads)
+             (record-new [:ref :pat/threads] prog list (+ i 1) cp
+                         (if (app (ref matches-here?) prog pc cp)
+                           (app (ref add-thread)
+                                (record-new [:ref :pat/add] prog next (+ pc 1)
+                                            ;; under (?m), consuming a
+                                            ;; terminator lands on a line start
+                                            (if (app (ref prog-multiline?) prog)
+                                              (app (ref line-terminator?) cp)
+                                              false)
+                                            eol blen
+                                            (app (ref slots-at) list blen w i) w sp subject))
+                           next)
+                         blen eol w sp subject))))))
+
+;; --- running --------------------------------------------------------------
+
+;; The verdict is a STRING rather than the end position alone, because a match
+;; has to carry its capture slots out with it and there is one return value.
+;;
+;;   ""                    no match from here
+;;   end(6) ++ slots       the longest match, and the slots of the thread that
+;;                         made it
+;;
+;; A capture-free program has empty slots, so the verdict is 6 characters and
+;; `match-end-at` reads exactly what it read before.
+(defn run-from [x [:ref :pat/run]] :string
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        s (record-get x :s)
+        pos (record-get x :pos)
+        len (record-get x :len)
+        blen (record-get x :blen)
+        w (record-get x :w)]
+    (if (= 0 (app (ref thread-count) list blen w))
+      ""
+      (let [wi (app (ref win-index)
+                    (record-new [:ref :pat/threads] prog list 0 0 "" blen false w 0 ""))
+            here (if (>= wi 0)
+                   (string-concat (app (ref hex6) pos)
+                                  (app (ref slots-at) list blen w wi))
+                   "")]
+        (if (>= pos len)
+          here
+          (let [cp (string-code-point-at s pos)
+                nxt (+ pos (app (ref cp-width) cp))
+                deeper (app (ref run-from)
+                            (record-new [:ref :pat/run] prog
+                                        (app (ref step-threads)
+                                             (record-new [:ref :pat/threads] prog list 0 cp
+                                                         (app (ref new-set) blen) blen
+                                                         (if (>= nxt len)
+                                                           true
+                                                           (if (app (ref prog-multiline?) prog)
+                                                             (app (ref terminator-at?) s nxt)
+                                                             false))
+                                                         w nxt s))
+                                        s nxt len blen w))]
+            (if (> (string-length deeper) 0) deeper here)))))))
+
+;; `pc` rather than always 0: a lookaround runs the SAME program from the
+;; instruction its own sub-code starts at, so there is no second machine and
+;; no second program format.
+(defn run-at-pc [prog :string s :string pos :i64 pc :i64] :string
+  (let [len (string-length s)
+        blen (app (ref bits-len) prog)
+        w (app (ref width-of) prog)]
+    (app (ref run-from)
+         (record-new [:ref :pat/run] prog
+                     (app (ref start-list)
+                          (record-new [:ref :pat/start] prog s pos len blen w pc))
+                     s pos len blen w))))
+
+(defn run-at [prog :string s :string pos :i64] :string
+  (app (ref run-at-pc) prog s pos 0))
+
+;; --- the lookaround test --------------------------------------------------
+;;
+;; Lookahead is one nested run: does the sub-pattern match STARTING at `sp`.
+;;
+;; Lookbehind is a backward scan, because the question is whether one ENDS at
+;; `sp` and the machine only answers forward. Truncating the subject at `sp`
+;; turns "some match from j ends at sp" into "the LONGEST match from j is
+;; exactly sp" -- a match ending at sp is a match ending at the truncated end,
+;; so the longest is at least that and cannot exceed it. Scanning down from
+;; `sp` finds a fixed-width lookbehind in its first step or two; the cost is
+;; O(sp) nested runs in the worst case, which is what an unbounded lookbehind
+;; costs anywhere.
+
+(defn behind-scan [x [:ref :pat/behind]] :bool
+  (let [prog (record-get x :prog)
+        s (record-get x :s)
+        sp (record-get x :sp)
+        sub (record-get x :sub)
+        j (record-get x :j)]
+    (if (< j 0)
+      false
+      (if (= sp (app (ref verdict-end)
+                     (app (ref run-at-pc) prog (string-substring s 0 sp) j sub)))
+        true
+        (app (ref behind-scan)
+             (record-new [:ref :pat/behind] prog s sp sub (- j 1)))))))
+
+(defn look-hit? [prog :string s :string sp :i64 pc :i64] :bool
+  (let [sub (app (ref ins-a) prog pc)]
+    (if (app (ref look-behind?) (app (ref ins-c) prog pc))
+      (app (ref behind-scan) (record-new [:ref :pat/behind] prog s sp sub sp))
+      (> (string-length (app (ref run-at-pc) prog s sp sub)) 0))))
+
+(defn verdict-end [v :string] :i64
+  (if (= 0 (string-length v)) -1 (app (ref hex-at) v 0 6)))
+
+(defn match-end-at [prog :string s :string pos :i64] :i64
+  (app (ref verdict-end) (app (ref run-at) prog s pos)))
+
+(defn match? [prog :string s :string] :bool
+  (= (string-length s) (app (ref match-end-at) prog s 0)))
+
+(defn scan-from [x [:ref :pat/scan]] :i64
+  (let [prog (record-get x :prog)
+        s (record-get x :s)
+        pos (record-get x :pos)
+        len (record-get x :len)
+        want-end (record-get x :want-end)
+        e (app (ref match-end-at) prog s pos)]
+    (if (>= e 0)
+      (if want-end e pos)
+      (if (>= pos len)
+        -1
+        (app (ref scan-from)
+             (record-new [:ref :pat/scan] prog s
+                         (+ pos (app (ref cp-width) (string-code-point-at s pos)))
+                         len want-end))))))
+
+(defn search-start [prog :string s :string] :i64
+  (app (ref scan-from) (record-new [:ref :pat/scan] prog s 0 (string-length s) false)))
+
+(defn search-end [prog :string s :string] :i64
+  (app (ref scan-from) (record-new [:ref :pat/scan] prog s 0 (string-length s) true)))
+
+(defn search [prog :string s :string] :document
+  (let [start (app (ref search-start) prog s)
+        end (app (ref match-end-at) prog s start)]
+    (if (< start 0)
+      (document-null)
+      (document-map :start (document-i64 start) :end (document-i64 end)))))
+
+;; --- captures -------------------------------------------------------------
+;;
+;; `find` answers the whole verdict for the leftmost match, so a caller reads
+;; group 0 and every explicit group out of ONE run rather than re-running the
+;; machine per group. The empty string means no match anywhere.
+;;
+;; Group numbering is the source's: group 1 is the first `(` that is not
+;; `(?:`. Slots 2k and 2k+1 hold group (k+1)'s start and end, and a group that
+;; did not participate in the match keeps `ffffff` in both.
+
+(defn find [prog :string s :string] :string
+  (let [start (app (ref search-start) prog s)]
+    (if (< start 0)
+      ""
+      (string-concat (app (ref hex6) start) (app (ref run-at) prog s start)))))
+
+(defn found? [v :string] :bool
+  (> (string-length v) 0))
+
+(defn group-count [prog :string] :i64
+  (quot (app (ref nslots-of) prog) 2))
+
+;; `find`'s verdict is start(6) ++ end(6) ++ slots, so group 0 is the two
+;; leading fields and group k>0 is slots 2(k-1) and 2(k-1)+1 after them.
+(defn slot-of [v :string k :i64] :i64
+  (let [raw (app (ref hex-at) v (+ 12 (* k 6)) 6)]
+    (if (= raw (app (ref slot-unset))) -1 raw)))
+
+(defn group-start [v :string g :i64] :i64
+  (if (= 0 (string-length v))
+    -1
+    (if (= g 0)
+      (app (ref hex-at) v 0 6)
+      (app (ref slot-of) v (* 2 (- g 1))))))
+
+(defn group-end [v :string g :i64] :i64
+  (if (= 0 (string-length v))
+    -1
+    (if (= g 0)
+      (app (ref hex-at) v 6 6)
+      (app (ref slot-of) v (+ 1 (* 2 (- g 1)))))))
+
+;; The captured text itself, or "" when the group did not participate. A caller
+;; that has to tell "" from "did not match" asks `group-start` for -1.
+(defn group-text [v :string s :string g :i64] :string
+  (let [a (app (ref group-start) v g)
+        b (app (ref group-end) v g)]
+    (if (< a 0) "" (if (< b a) "" (string-substring s a b)))))
+
+;; --- tests ----------------------------------------------------------------
+;;
+;; The programs are written out by hand, in the format itself. That is the
+;; point: the machine is tested without the compiler, so a compiler bug cannot
+;; make it look right. Each is annotated with the regex it encodes.
+
+(defn p-ab [] :string
+  ;; /ab/ : char 'a', char 'b', match
+  (string-concat "K0" (string-concat "000003" (string-concat "000000"
+    (string-concat "00000610000000" (string-concat "00000620000000" "60000000000000"))))))
+
+(defn p-digit [] :string
+  ;; /[0-9]/ : class(first 0, count 1, neg 0), match ; range 30-39
+  (string-concat "K0" (string-concat "000002" (string-concat "000001"
+    (string-concat "10000000000010" (string-concat "60000000000000" "000030000039"))))))
+
+(defn p-digits [] :string
+  ;; /[0-9]+/ : class, split(0,2), match
+  (string-concat "K0" (string-concat "000003" (string-concat "000001"
+    (string-concat "10000000000010"
+      (string-concat "30000000000020" (string-concat "60000000000000" "000030000039")))))))
+
+(defn p-a-or-b [] :string
+  ;; /a|b/ : split(1,3) char a jmp(4) char b match
+  (string-concat "K0" (string-concat "000005" (string-concat "000000"
+    (string-concat "30000010000030"
+      (string-concat "00000610000000"
+        (string-concat "40000040000000"
+          (string-concat "00000620000000" "60000000000000"))))))))
+
+(defn p-anchored-a [] :string
+  ;; /^a$/ : bol char a eol match
+  (string-concat "K0" (string-concat "000004" (string-concat "000000"
+    (string-concat "70000000000000"
+      (string-concat "00000610000000"
+        (string-concat "80000000000000" "60000000000000")))))))
+
+(defn p-fold-a [] :string
+  ;; /a/i
+  (string-concat "K1" (string-concat "000002" (string-concat "000000"
+    (string-concat "00000610000000" "60000000000000")))))
+
+(defn p-nested [] :string
+  ;; /(a+)+b/ : class a, split(0,2), split(0,3), char b, match ; range 61-61
+  (string-concat "K0" (string-concat "000005" (string-concat "000001"
+    (string-concat "10000000000010"
+      (string-concat "30000000000020"
+        (string-concat "30000000000030"
+          (string-concat "00000620000000"
+            (string-concat "60000000000000" "000061000061")))))))))
+
+(defn test-hex [] :bool
+  (and (= 0 (app (ref hex-at) "000000" 0 6))
+       (= 97 (app (ref hex-at) "000061" 0 6))
+       (= 255 (app (ref hex-at) "0000ff" 0 6))
+       (= 1114111 (app (ref hex-at) "10ffff" 0 6))
+       ;; a digit outside the alphabet answers -1 rather than a wrong number
+       (= -1 (app (ref hex-at) "00zz00" 0 6))))
+
+(defn test-header [] :bool
+  (and (= 3 (app (ref prog-count) (p-ab)))
+       (= 0 (app (ref range-count) (p-ab)))
+       (= 1 (app (ref range-count) (p-digit)))
+       (not (app (ref prog-fold?) (p-ab)))
+       (app (ref prog-fold?) (p-fold-a))
+       ;; the ranges sit after the code, so their offset moves with it
+       (= 48 (app (ref range-lo) (p-digit) 0))
+       (= 57 (app (ref range-hi) (p-digit) 0))))
+
+(defn test-literal [] :bool
+  (and (app (ref match?) (p-ab) "ab")
+       (not (app (ref match?) (p-ab) "a"))
+       (not (app (ref match?) (p-ab) "abc"))
+       (not (app (ref match?) (p-ab) ""))
+       (not (app (ref match?) (p-ab) "ba"))))
+
+(defn test-class [] :bool
+  (and (app (ref match?) (p-digit) "5")
+       (app (ref match?) (p-digit) "0")
+       (app (ref match?) (p-digit) "9")
+       (not (app (ref match?) (p-digit) "/"))
+       (not (app (ref match?) (p-digit) ":"))
+       (not (app (ref match?) (p-digit) "a"))))
+
+(defn test-quantifier [] :bool
+  (and (app (ref match?) (p-digits) "0")
+       (app (ref match?) (p-digits) "12345")
+       (not (app (ref match?) (p-digits) ""))
+       (not (app (ref match?) (p-digits) "12a"))))
+
+(defn test-alternation [] :bool
+  (and (app (ref match?) (p-a-or-b) "a")
+       (app (ref match?) (p-a-or-b) "b")
+       (not (app (ref match?) (p-a-or-b) "c"))
+       (not (app (ref match?) (p-a-or-b) "ab"))))
+
+(defn test-anchor [] :bool
+  (and (app (ref match?) (p-anchored-a) "a")
+       (not (app (ref match?) (p-anchored-a) "ba"))
+       (not (app (ref match?) (p-anchored-a) "ab"))))
+
+(defn test-search [] :bool
+  (and (= 3 (app (ref search-start) (p-digits) "abc123"))
+       (= 6 (app (ref search-end) (p-digits) "abc123"))
+       (= 0 (app (ref search-start) (p-digits) "12ab34"))
+       (= 2 (app (ref search-end) (p-digits) "12ab34"))
+       (= -1 (app (ref search-start) (p-digits) "abc"))))
+
+(defn test-fold [] :bool
+  (and (app (ref match?) (p-fold-a) "A")
+       (app (ref match?) (p-fold-a) "a")
+       (not (app (ref match?) (p-ab) "AB"))))
+
+(defn test-bounded [] :bool
+  (and (not (app (ref match?) (p-nested) "aaaaaaaaaaaaaaaaaaaaaaaa"))
+       (app (ref match?) (p-nested) "aaaaaaaaaaaaaaaaaaaaaaaab")))
+
+;; --- capture tests ---------------------------------------------------------
+;;
+;; Hand-written in the format, like the rest: this module does not depend on
+;; the emitter, and a test that used it would be testing two things.
+
+;; (a)b
+(defn p-cap [] :string
+  "K00000050000005000000000000000000610000000500000100000000000062000000060000000000000")
+
+;; (a)?b -- the group may not participate
+(defn p-opt [] :string
+  "K0000006000000300000100000405000000000000000000610000000500000100000000000062000000060000000000000")
+
+;; ((a)b) -- group 1 is the whole thing, group 2 the inner
+(defn p-nest [] :string
+  "K000000700000050000000000000500000200000000000061000000050000030000000000006200000005000001000000060000000000000")
+
+(defn test-capture [] :bool
+  (let [v (app (ref find) (app (ref p-cap)) "xxab")]
+    (and (app (ref found?) v)
+         (and (= 2 (app (ref group-start) v 0))
+              (and (= 4 (app (ref group-end) v 0))
+                   (and (= 2 (app (ref group-start) v 1))
+                        (and (= 3 (app (ref group-end) v 1))
+                             (and (string=? "a" (app (ref group-text) v "xxab" 1))
+                                  (and (string=? "ab" (app (ref group-text) v "xxab" 0))
+                                       (and (= 1 (app (ref group-count) (app (ref p-cap))))
+                                            ;; a capture-free program still
+                                            ;; answers, with no groups
+                                            (= 0 (app (ref group-count) (app (ref p-ab))))))))))))))
+
+(defn test-capture-optional [] :bool
+  (let [hit (app (ref find) (app (ref p-opt)) "ab")
+        skip (app (ref find) (app (ref p-opt)) "b")
+        miss (app (ref find) (app (ref p-cap)) "zz")]
+    (and (= 0 (app (ref group-start) hit 1))
+         (and (= 1 (app (ref group-end) hit 1))
+              ;; the group did not participate: -1, not 0, and the text is ""
+              (and (= -1 (app (ref group-start) skip 1))
+                   (and (= -1 (app (ref group-end) skip 1))
+                        (and (string=? "" (app (ref group-text) skip "b" 1))
+                             (and (= 0 (app (ref group-start) skip 0))
+                                  (and (not (app (ref found?) miss))
+                                       (= -1 (app (ref group-start) miss 0)))))))))))
+
+(defn test-capture-nested [] :bool
+  (let [v (app (ref find) (app (ref p-nest)) "ab")]
+    (and (= 2 (app (ref group-count) (app (ref p-nest))))
+         (and (string=? "ab" (app (ref group-text) v "ab" 1))
+              (and (string=? "a" (app (ref group-text) v "ab" 2))
+                   ;; the widened thread entry is arithmetic, so assert it:
+                   ;; two groups are four slots, and 6 + 6*4 is 30
+                   (and (= 4 (app (ref nslots-of) (app (ref p-nest))))
+                        (and (= 30 (app (ref width-of) (app (ref p-nest))))
+                             ;; and a capture-free program is still 6, which is
+                             ;; the entry this VM had before captures
+                             (= 6 (app (ref width-of) (app (ref p-ab)))))))))))
+
+;; --- dot and mode tests ----------------------------------------------------
+
+;; a.b  and the same program with the dotall bit set
+(defn p-dot [] :string
+  "K000000400000000000610000000200000000000000000062000000060000000000000")
+(defn p-dot-s [] :string
+  "K200000400000000000610000000200000000000000000062000000060000000000000")
+
+;; ^b$  and the same program with the multiline bit set
+(defn p-anch [] :string
+  "K000000400000070000000000000000006200000008000000000000060000000000000")
+(defn p-anch-m [] :string
+  "K400000400000070000000000000000006200000008000000000000060000000000000")
+
+(defn test-dot-excludes-newline [] :bool
+  ;; the bug this slice fixes: `.` answered true for a line terminator, and
+  ;; JavaScript's answers false
+  (and (app (ref match?) (app (ref p-dot)) "axb")
+       (and (not (app (ref match?) (app (ref p-dot)) "a\nb"))
+            (and (not (app (ref match?) (app (ref p-dot)) "a\rb"))
+                 ;; and the same program with the dotall bit takes them
+                 (and (app (ref match?) (app (ref p-dot-s)) "a\nb")
+                      (and (app (ref match?) (app (ref p-dot-s)) "a\rb")
+                           (app (ref match?) (app (ref p-dot-s)) "axb")))))))
+
+(defn test-mode-bits [] :bool
+  ;; the nibble is a bitfield and "K0"/"K1" still mean what they meant
+  (and (not (app (ref prog-dotall?) (app (ref p-dot))))
+       (and (app (ref prog-dotall?) (app (ref p-dot-s)))
+            (and (not (app (ref prog-fold?) (app (ref p-dot-s))))
+                 (and (app (ref prog-multiline?) (app (ref p-anch-m)))
+                      (and (not (app (ref prog-multiline?) (app (ref p-anch))))
+                           (not (app (ref prog-fold?) (app (ref p-anch-m))))))))))
+
+(defn test-multiline-anchors [] :bool
+  ;; ^b$ finds nothing in "a\nb" without (?m) and finds the second line with it
+  (and (< (app (ref search-start) (app (ref p-anch)) "a\nb") 0)
+       (and (= 2 (app (ref search-start) (app (ref p-anch-m)) "a\nb"))
+            ;; the first line still anchors, with or without the flag
+            (and (= 0 (app (ref search-start) (app (ref p-anch-m)) "b\na"))
+                 (and (= 0 (app (ref search-start) (app (ref p-anch)) "b"))
+                      ;; ^ asks about the character BEFORE the position: with
+                      ;; the off-by-one this answers 1 rather than 2
+                      (= 2 (app (ref search-start) (app (ref p-anch-m)) "a\nb\nc")))))))
+
+;; --- lookahead tests -------------------------------------------------------
+
+;; a(?=b)  and a(?!b), hand-written in the format
+(defn p-look [] :string
+  "K00000050000000000061000000090000020000040000006200000006000000000000060000000000000")
+(defn p-look-neg [] :string
+  "K00000050000000000061000000090000020000041000006200000006000000000000060000000000000")
+
+(defn test-lookahead [] :bool
+  ;; zero-width: the match is "a", not "ab"
+  (and (= 1 (app (ref match-end-at) (app (ref p-look)) "ab" 0))
+       (and (< (app (ref match-end-at) (app (ref p-look)) "ac" 0) 0)
+            (and (< (app (ref match-end-at) (app (ref p-look)) "a" 0) 0)
+                 ;; and it searches, so it finds the `a` at offset 1
+                 (= 1 (app (ref search-start) (app (ref p-look)) "xab"))))))
+
+(defn test-lookahead-negative [] :bool
+  (and (< (app (ref match-end-at) (app (ref p-look-neg)) "ab" 0) 0)
+       (and (= 1 (app (ref match-end-at) (app (ref p-look-neg)) "ac" 0))
+            ;; at the end of the string the sub-pattern cannot match, so the
+            ;; NEGATIVE one holds -- the case an implementation that forgets
+            ;; the empty tail gets wrong
+            (and (= 1 (app (ref match-end-at) (app (ref p-look-neg)) "a" 0))
+                 (app (ref look-negated?) 1)))))
+
+(defn main []
+  (app (ref prog-count) (p-ab)))
