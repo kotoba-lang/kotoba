@@ -1,0 +1,156 @@
+(ns iceberg.manifest
+  "Manifests and manifest lists: the Avro files that say which data files a
+  table snapshot consists of.
+
+  A snapshot points at ONE manifest list. The manifest list names manifests.
+  Each manifest names data files. The indirection is what lets a commit that
+  adds one file reuse every existing manifest by reference instead of
+  rewriting the table's file list.
+
+  ## Both files carry metadata the reader needs before the rows
+
+  Avro's container metadata is a map of string to bytes, and Iceberg puts the
+  table's schema, the partition spec and the format version in it. A manifest
+  whose rows are perfect but whose metadata is missing is not readable as an
+  Iceberg manifest -- the reader has nowhere to learn what partition the
+  `partition` struct's members mean."
+  (:require [kotoba.bytes :as kbytes] [avro.file :as avro]
+            [iceberg.schema :as s]
+            [json.core :as json]))
+
+(def ^:const status-added 1)
+(def ^:const content-data 0)
+
+(defn- kv
+  "A map<int,X> as Iceberg writes it: a sequence of key/value records."
+  [m]
+  (when (seq m)
+    (mapv (fn [[k v]] {"key" k "value" v}) (sort-by key m))))
+
+(defn- le-bytes
+  "`n` little-endian two's-complement bytes of an integer.
+
+  Arithmetic rather than `bit-shift-right`, which is a **32-bit** operation on
+  ClojureScript: shifting a long by 32 or more wraps, so bytes 4-7 come back
+  as copies of bytes 0-3. Measured -- the JVM suite passed and nbb did not,
+  which is the runtime this workspace deploys to.
+
+  `mod` is non-negative for a positive divisor and the division floors, so
+  negative values come out as two's complement without ever forming a number
+  larger than the input."
+  [v n]
+  (loop [k 0 x v out []]
+    (if (= k n)
+      out
+      (recur (inc k) (long (Math/floor (/ x 256))) (conj out (mod x 256))))))
+
+(defn bound-bytes
+  "Iceberg's binary single-value serialisation, for the types this writes.
+
+  Bounds are compared as BYTES by a reader, so the encoding is not a detail:
+  a long written big-endian sorts wrongly against another long, and a reader
+  that prunes on it drops rows silently rather than erroring. Little-endian
+  for the numerics, raw UTF-8 for strings, which is what the specification
+  says and what pyiceberg decodes."
+  [type v]
+  (case type
+    :string (mapv #(bit-and % 0xff)
+                  #?(:clj (kbytes/utf8-bytes (str v))
+                     :cljs (vec (.encode (js/TextEncoder.) (str v)))))
+    :boolean [(if v 1 0)]
+    (:int :date) (le-bytes v 4)
+    :long (le-bytes v 8)
+    (throw (ex-info (str "iceberg: no bound encoding for " (pr-str type))
+                    {:type :iceberg/unsupported-bound :given type}))))
+
+(defn data-file
+  "One data file's entry, as the `data_file` struct.
+
+  `:file-path` must be the location a reader will resolve -- the same string
+  the metadata's `location` prefixes, not a path relative to anything.
+
+  `:lower-bounds` / `:upper-bounds` / `:null-counts` / `:value-counts` /
+  `:column-sizes` are maps of Iceberg field id to value, and every one is
+  optional. **Omitted means unknown, and that is a truthful answer a reader
+  handles** -- it reads every file rather than pruning. A bound that is wrong
+  in the narrowing direction is not: it deletes rows from a query's result
+  with no error anywhere. So these are supplied by a caller that measured
+  them, typically from the Parquet footer the file was written with
+  (`parquet.footer/parse` reports per-chunk statistics), and are never
+  estimated here.
+
+  Bounds arrive already encoded, via `bound-bytes`."
+  [{:keys [file-path record-count file-size-bytes file-format
+           lower-bounds upper-bounds null-counts value-counts column-sizes]
+    :or {file-format "PARQUET"}}]
+  {"content" content-data
+   "file_path" file-path
+   "file_format" file-format
+   "partition" {}
+   "record_count" record-count
+   "file_size_in_bytes" file-size-bytes
+   "column_sizes" (kv column-sizes)
+   "value_counts" (kv value-counts)
+   "null_value_counts" (kv null-counts)
+   "lower_bounds" (kv lower-bounds)
+   "upper_bounds" (kv upper-bounds)})
+
+(defn write-manifest
+  "The bytes of one manifest file.
+
+  Every entry is written with status `ADDED`: this writer only appends, and
+  saying `EXISTING` about a file it did not carry forward would be a claim
+  about a previous snapshot it never read."
+  [{:keys [schema spec-id spec-fields snapshot-id sequence-number data-files]
+    :or {spec-id 0 spec-fields [] sequence-number 1}}]
+  (let [entry-schema (s/manifest-entry-schema spec-fields)]
+    (avro/write
+     {:schema entry-schema
+      :codec "deflate"
+      :meta {"schema" (json/encode schema)
+             "schema-id" (str (get schema "schema-id" 0))
+             "partition-spec" (json/encode (vec spec-fields))
+             "partition-spec-id" (str spec-id)
+             "format-version" (str s/format-version)
+             "content" "data"}
+      :records (mapv (fn [df]
+                       {"status" status-added
+                        "snapshot_id" snapshot-id
+                        "sequence_number" sequence-number
+                        "file_sequence_number" sequence-number
+                        "data_file" df})
+                     data-files)})))
+
+(defn manifest-file-entry
+  "One row of a manifest list, describing a manifest that was just written."
+  [{:keys [manifest-path manifest-length spec-id snapshot-id sequence-number
+           added-files added-rows]
+    :or {spec-id 0 sequence-number 1}}]
+  {"manifest_path" manifest-path
+   "manifest_length" manifest-length
+   "partition_spec_id" spec-id
+   "content" content-data
+   "sequence_number" sequence-number
+   "min_sequence_number" sequence-number
+   "added_snapshot_id" snapshot-id
+   "added_files_count" added-files
+   "existing_files_count" 0
+   "deleted_files_count" 0
+   "added_rows_count" added-rows
+   "existing_rows_count" 0
+   "deleted_rows_count" 0
+   "partitions" nil
+   "key_metadata" nil})
+
+(defn write-manifest-list
+  "The bytes of a manifest list."
+  [{:keys [snapshot-id parent-snapshot-id sequence-number entries]
+    :or {sequence-number 1}}]
+  (avro/write
+   {:schema s/manifest-file-schema
+    :codec "deflate"
+    :meta (cond-> {"snapshot-id" (str snapshot-id)
+                   "sequence-number" (str sequence-number)
+                   "format-version" (str s/format-version)}
+            parent-snapshot-id (assoc "parent-snapshot-id" (str parent-snapshot-id)))
+    :records (vec entries)}))
