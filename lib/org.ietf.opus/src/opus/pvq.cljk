@@ -1,0 +1,159 @@
+(ns opus.pvq
+  "Opus (IETF RFC 6716) CELT Pyramid Vector Quantizer (PVQ) shape coding --
+   RFC 6716 Section 4.3.4 'Shape Decoding'. Pure combinatorial math, no
+   entropy coder dependency: given the codeword index (already decoded as
+   a uniform integer via opus.range-decoder/ec-dec-uint) this recovers the
+   integer pulse vector, and vice versa. Pure cljc, zero dependencies.
+
+   V(N,K) is the number of ways to place K pulses (each +-1, summed with
+   repetition) across N dimensions -- RFC 6716 SS4.3.4.2's combinatorial
+   codebook size, computed via the given recursion
+   V(N,K) = V(N-1,K) + V(N,K-1) + V(N-1,K-1), V(N,0)=1, V(0,K)=0 (K!=0).
+
+   New implementation, part of the CELT-mode audio decode increment for
+   kotoba-lang/org-ietf-opus (see opus.celt)."
+  (:refer-clojure :exclude [spread]))
+
+;; --- V(N,K) combinatorial pulse-count table -------------------------------
+;;
+;; V(N,K) grows combinatorially (e.g. V(176,9) already exceeds 2^53, the
+;; largest exactly-representable integer in an IEEE-754 double -- the same
+;; representation ClojureScript numbers use, since portable .cljc code has
+;; no arbitrary-precision integer type available on that target, unlike
+;; the JVM's auto-promoting `+'`/`*'`, which don't exist in cljs.core at
+;; all). This repo's decode scope (see opus.celt docstring) never actually
+;; needs V(N,K) that large: the bits->pulses search always stops well
+;; before V(N,K) reaches 2^31 (avoiding the reference's band-splitting
+;; mechanism, RFC SS4.3.4.4). So V(N,K) is computed via memoized recursion
+;; (RFC SS4.3.4.2's exact V(N,K)=V(N-1,K)+V(N,K-1)+V(N-1,K-1) formula),
+;; clamped at a ceiling (2^40, comfortably above the 2^31 decode-time
+;; clamp with margin, comfortably below both a JVM long and a JS safe
+;; integer) so no arithmetic step ever needs more precision than a plain
+;; fixnum -- clamping only ever affects codebooks this decoder would
+;; refuse to use anyway.
+
+(defn two-pow
+  "2^n for n in 0..52, exact on both runtimes.
+
+  Not `(bit-shift-left 1 n)`. Every ClojureScript bitwise operator coerces to
+  int32 first, so there the expression is -2147483648 at n=31 (the sign bit),
+  1 at n=32 (the count is taken mod 32) and 256 at n=40. Measured 2026-08-25
+  under nbb; the JVM answers 2147483648, 4294967296 and 1099511627776.
+
+  The paragraph above chose 2^40 precisely because it sits comfortably between
+  the 2^31 decode-time clamp and a JS safe integer. On ClojureScript it was
+  **256** -- below both, and below almost every V(N,K) this decoder computes,
+  so the clamp the comment calls unreachable fired constantly."
+  [n]
+  (loop [i 0 v 1] (if (>= i n) v (recur (inc i) (* v 2)))))
+
+(def ^:private ceiling (two-pow 40))
+
+(def ^:private memo (atom {}))
+
+(defn v-n-k
+  "V(N,K): number of PVQ codewords for K pulses in N dimensions, clamped at
+   2^40 (see above) -- values at or above the clamp are already far beyond
+   what this repo's decode scope will ever use, so the exact count above
+   that point is never needed."
+  [n k]
+  (cond
+    (or (neg? n) (neg? k)) 0
+    (zero? k) 1
+    (zero? n) 0
+    :else
+    (if-let [v (@memo [n k])]
+      v
+      (let [v (min ceiling (+ (v-n-k (dec n) k) (v-n-k n (dec k)) (v-n-k (dec n) (dec k))))]
+        (swap! memo assoc [n k] v)
+        v))))
+
+(defn bit-cost
+  "Cost, in whole bits, of range-coding a PVQ index for K pulses over N
+   dimensions (ceil(log2 V(N,K))), K=0 costs 0 bits (the all-zero vector
+   needs no index at all)."
+  [n k]
+  (if (zero? k)
+    0
+    (let [ft (v-n-k n k)]
+      (loop [b 0 v 1] (if (>= v ft) b (recur (inc b) (* 2 v)))))))
+
+;; --- index <-> pulse vector (RFC 6716 SS4.3.4.2) --------------------------
+
+(defn decode-pulses
+  "Decode PVQ index `i` (0<=i<V(n,k)) into the length-`n` integer pulse
+   vector X (RFC 6716 SS4.3.4.2, steps 1-5)."
+  [n k i]
+  (loop [j 0 k k i i x (transient (vec (repeat n 0)))]
+    (if (= j n)
+      (persistent! x)
+      (let [p0    (quot (+ (v-n-k (- n j 1) k) (v-n-k (- n j) k)) 2)
+            neg?  (>= i p0)
+            i1    (if neg? (- i p0) i)
+            k0    k
+            p1    (- p0 (v-n-k (- n j 1) k))
+            [k' p'] (loop [k k p p1] (if (> p i1) (recur (dec k) (- p (v-n-k (- n j 1) (dec k)))) [k p]))
+            xj    (* (if neg? -1 1) (- k0 k'))
+            i2    (- i1 p')]
+        (recur (inc j) k' i2 (assoc! x j xj))))))
+
+(defn encode-pulses
+  "Inverse of `decode-pulses`: the PVQ index for integer pulse vector `x`
+   (length n, sum(|x|)=k). Used by test-support encoders (this repo ships
+   only a CELT *decoder*; encoding is exposed here because it is the same
+   combinatorial bijection, needed to build genuine round-trippable test
+   bitstreams -- see test/opus/support/celt_encoder.cljk)."
+  [n k x]
+  (loop [j 0 k k i 0 x x]
+    (if (= j n)
+      i
+      (let [xj    (nth x j)
+            k0    k
+            k'    (- k0 (if (neg? xj) (- xj) xj))
+            p0    (quot (+ (v-n-k (- n j 1) k0) (v-n-k (- n j) k0)) 2)
+            p1    (- p0 (v-n-k (- n j 1) k0))
+            p'    (loop [kk k0 p p1] (if (> kk k') (recur (dec kk) (- p (v-n-k (- n j 1) (dec kk)))) p))
+            neg?  (neg? xj)
+            i'    (+ i (if neg? p0 0) p')]
+        (recur (inc j) k' i' x)))))
+
+(defn normalize
+  "Scale integer pulse vector `x` to unit L2 norm (RFC 6716 SS4.3.4.2, final
+   step)."
+  [x]
+  (let [n (double (Math/sqrt (double (reduce + (map #(* % %) x)))))]
+    (if (zero? n)
+      (vec x)
+      (mapv #(/ % n) x))))
+
+;; --- spreading rotation (RFC 6716 SS4.3.4.3) ------------------------------
+
+(def spread-f_r
+  "RFC 6716 Table 59: f_r per 'spread' parameter (0 = no rotation)."
+  {0 nil, 1 15, 2 10, 3 5})
+
+(defn- rotate-pair
+  "2-D rotation R(x_i,x_j) by `theta` (RFC 6716 SS4.3.4.3)."
+  [x i j c s]
+  (let [xi (nth x i) xj (nth x j)]
+    (-> x
+        (assoc i (+ (* c xi) (* s xj)))
+        (assoc j (+ (- (* s xi)) (* c xj))))))
+
+(defn spread
+  "Apply the CELT spreading rotation to normalized vector `x` (length N)
+   for PVQ parameters `k` pulses and bitstream `spread-param` (0-3). Single
+   time-block only (B0=1, i.e. non-transient long-block frames) -- this
+   repo's decode scope does not cover the additional interleaved rotation
+   used for multiple short blocks (RFC 6716 SS4.3.4.3, last paragraph)."
+  [x n k spread-param]
+  (let [f_r (spread-f_r spread-param)]
+    (if (or (nil? f_r) (< n 2) (zero? k))
+      (vec x)
+      (let [g_r   (/ (double n) (+ n (* f_r k)))
+            theta (/ (* Math/PI g_r g_r) 4.0)
+            c     (Math/cos theta)
+            s     (Math/sin theta)]
+        (as-> (vec x) v
+          (reduce (fn [v i] (rotate-pair v i (inc i) c s)) v (range 0 (dec n)))
+          (reduce (fn [v i] (rotate-pair v i (inc i) c s)) v (range (- n 3) -1 -1)))))))
