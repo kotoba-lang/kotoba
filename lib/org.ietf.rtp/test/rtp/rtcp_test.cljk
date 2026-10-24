@@ -1,0 +1,178 @@
+(ns rtp.rtcp-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [rtp.rtcp :as rtcp]))
+
+;; ---------------------------------------------------------------------
+;; report block round-trip, including the 24-bit signed cumulative-lost
+;; field — RFC 3550 §6.4.1.
+;; ---------------------------------------------------------------------
+
+(deftest report-block-round-trip
+  (doseq [cumulative [0 1 -1 8388607 -8388608 12345 -12345]]
+    (let [rb {:ssrc 0x11223344 :fraction-lost 42 :cumulative-lost cumulative
+              :highest-seq 0xAABBCCDD :jitter 999 :lsr 111 :dlsr 222}
+          bytes (rtcp/encode-report-block rb)
+          decoded (rtcp/decode-report-block bytes 0)]
+      (is (= rtcp/report-block-size (count bytes)))
+      (is (= rb decoded) (str "mismatch for cumulative=" cumulative)))))
+
+;; ---------------------------------------------------------------------
+;; SR / RR
+;; ---------------------------------------------------------------------
+
+(def sr-packet
+  {:type :sr :ssrc 0x12345678
+   :ntp-sec 3944000000 :ntp-frac 1234567890
+   :rtp-timestamp 90000 :packet-count 150 :octet-count 24000
+   :reports [{:ssrc 0x87654321 :fraction-lost 5 :cumulative-lost -2
+              :highest-seq 1005 :jitter 30 :lsr 555 :dlsr 66}]})
+
+(deftest sr-round-trip
+  (let [bs (rtcp/encode-one sr-packet)
+        [decoded rest-bytes] (rtcp/decode-one bs)]
+    (is (= sr-packet decoded))
+    (is (= [] rest-bytes))))
+
+(def rr-packet
+  {:type :rr :ssrc 0xAAAAAAAA
+   :reports [{:ssrc 1 :fraction-lost 0 :cumulative-lost 0 :highest-seq 10
+              :jitter 0 :lsr 0 :dlsr 0}
+             {:ssrc 2 :fraction-lost 255 :cumulative-lost -1 :highest-seq 20
+              :jitter 1 :lsr 2 :dlsr 3}]})
+
+(deftest rr-round-trip
+  (let [bs (rtcp/encode-one rr-packet)
+        [decoded rest-bytes] (rtcp/decode-one bs)]
+    (is (= rr-packet decoded))
+    (is (= [] rest-bytes))))
+
+(deftest rr-no-reports
+  (testing "RC=0 is legal — a receiver with nothing new to report since the last one"
+    (let [pkt {:type :rr :ssrc 7 :reports []}
+          [decoded _] (rtcp/decode-one (rtcp/encode-one pkt))]
+      (is (= pkt decoded)))))
+
+;; ---------------------------------------------------------------------
+;; SDES — multiple chunks, multiple item types, multi-byte UTF-8 text
+;; ---------------------------------------------------------------------
+
+(def sdes-packet
+  {:type :sdes
+   :chunks [{:ssrc 1 :items [{:type :cname :text "alice@example.com"}
+                              {:type :tool :text "libtest 1.0"}]}
+            {:ssrc 2 :items [{:type :cname :text "bob@example.org"}]}]})
+
+(deftest sdes-round-trip
+  (let [bs (rtcp/encode-one sdes-packet)
+        [decoded rest-bytes] (rtcp/decode-one bs)]
+    (is (= sdes-packet decoded))
+    (is (= [] rest-bytes))))
+
+(deftest sdes-utf8-text
+  (testing "SDES text is length-prefixed by BYTES not characters, so multi-byte UTF-8 must round-trip exactly"
+    (let [pkt {:type :sdes :chunks [{:ssrc 1 :items [{:type :cname :text "山田太郎@example.jp"}]}]}
+          [decoded _] (rtcp/decode-one (rtcp/encode-one pkt))]
+      (is (= pkt decoded)))))
+
+(deftest sdes-padding-alignment
+  (testing "every chunk is padded to a 32-bit boundary independent of the others"
+    (doseq [text-len (range 0 10)]
+      (let [text (apply str (repeat text-len \a))
+            pkt {:type :sdes :chunks [{:ssrc 1 :items [{:type :cname :text text}]}]}
+            bs (rtcp/encode-one pkt)]
+        (is (zero? (mod (count bs) 4)) (str "not 32-bit aligned for text-len=" text-len))
+        (is (= pkt (first (rtcp/decode-one bs))))))))
+
+;; ---------------------------------------------------------------------
+;; BYE
+;; ---------------------------------------------------------------------
+
+(deftest bye-round-trip-no-reason
+  (let [pkt {:type :bye :sources [1 2 3]}
+        [decoded _] (rtcp/decode-one (rtcp/encode-one pkt))]
+    (is (= pkt decoded))))
+
+(deftest bye-round-trip-with-reason
+  (let [pkt {:type :bye :sources [0xDEADBEEF] :reason "camera switching"}
+        [decoded _] (rtcp/decode-one (rtcp/encode-one pkt))]
+    (is (= pkt decoded))))
+
+;; ---------------------------------------------------------------------
+;; APP
+;; ---------------------------------------------------------------------
+
+(deftest app-round-trip-aligned-data
+  (let [pkt {:type :app :subtype 7 :ssrc 42 :name "ABCD" :data [1 2 3 4 5 6 7 8]}
+        [decoded _] (rtcp/decode-one (rtcp/encode-one pkt))]
+    (is (= pkt decoded))))
+
+(deftest app-unaligned-data-still-recovers-exactly
+  (testing "data whose length isn't a multiple of 4 is auto-aligned via the P bit and recovered byte-exact"
+    (doseq [n (range 0 9)]
+      (let [data (vec (range n))
+            pkt {:type :app :subtype 1 :ssrc 1 :name "XYZ0" :data data}
+            [decoded _] (rtcp/decode-one (rtcp/encode-one pkt))]
+        (is (= data (:data decoded)) (str "mismatch for data length " n))
+        (is (= (:name pkt) (:name decoded)))))))
+
+;; ---------------------------------------------------------------------
+;; compound packets — RFC 3550 §6.1
+;; ---------------------------------------------------------------------
+
+(deftest compound-round-trip
+  (let [packets [sr-packet sdes-packet rr-packet {:type :bye :sources [9]}]
+        bs (rtcp/encode-compound packets)
+        decoded (rtcp/decode-all bs)]
+    (is (= packets decoded))))
+
+(deftest compound-single-packet
+  (is (= [rr-packet] (rtcp/decode-all (rtcp/encode-compound [rr-packet])))))
+
+;; ---------------------------------------------------------------------
+;; negative tests — every one asserts the SPECIFIC reason keyword
+;; ---------------------------------------------------------------------
+
+(deftest error-short-header
+  (is (= [[:error :rtcp/short-header] nil] (rtcp/decode-one [])))
+  (is (= [[:error :rtcp/short-header] nil] (rtcp/decode-one [0x80 200 0]))))
+
+(deftest error-bad-version
+  ;; V=1 -> top 2 bits 01, PT=200
+  (is (= [[:error :rtcp/bad-version] nil]
+         (rtcp/decode-one [0x40 200 0 1 0 0 0 0]))))
+
+(deftest error-unknown-type
+  (is (= [[:error :rtcp/unknown-type] nil]
+         (rtcp/decode-one [0x80 199 0 1 0 0 0 0]))))
+
+(deftest error-short-packet
+  (testing "length field claims more 32-bit words than are actually present"
+    (is (= [[:error :rtcp/short-packet] nil]
+           (rtcp/decode-one [0x80 201 0 10 0 0 0 1])))))
+
+(deftest error-bad-padding
+  (testing "P=1 but trailing count octet is 0"
+    ;; RR, RC=0, length=1 (8 bytes total), P bit set, SSRC + pad-octet=0
+    (is (= [[:error :rtcp/bad-padding] nil]
+           (rtcp/decode-one [0xA0 201 0 1 0 0 0 0])))))
+
+(deftest error-short-sdes
+  (testing "SDES item declares more text bytes than remain in the packet"
+    ;; SC=1, PT=202: SSRC(4) + type=1(CNAME) + len=200(!) + nothing
+    (is (= [[:error :rtcp/short-sdes] nil]
+           (rtcp/decode-one [0x81 202 0 2 0 0 0 1 1 200 0 0])))))
+
+;; ---------------------------------------------------------------------
+;; discrimination proof — different malformed inputs, different reasons
+;; ---------------------------------------------------------------------
+
+(deftest discriminates-specific-reasons
+  (let [short (rtcp/decode-one [0x80])
+        bad-version (rtcp/decode-one [0x40 200 0 1 0 0 0 0])
+        unknown-type (rtcp/decode-one [0x80 199 0 1 0 0 0 0])]
+    (is (not= short bad-version))
+    (is (not= bad-version unknown-type))
+    (is (not= short unknown-type))
+    (is (= :rtcp/short-header (second (first short))))
+    (is (= :rtcp/bad-version (second (first bad-version))))
+    (is (= :rtcp/unknown-type (second (first unknown-type))))))

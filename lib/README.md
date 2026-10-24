@@ -46,6 +46,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sip` | `org.ietf.sip/src` | `sip.grammar`, `sip.headers`, `sip.message`, `sip.uri` (an external specification, publisher ietf.org) |
 | `org.ietf.opus` | `org.ietf.opus/src` | `opus.celt`, `opus.mdct`, `opus.packet`, `opus.pvq` (an external specification, publisher ietf.org) |
 | `org.ietf.sdp` | `org.ietf.sdp/src` | `sdp.attrs`, `sdp.core`, `sdp.grammar` (an external specification, publisher ietf.org) |
+| `org.ietf.rtp` | `org.ietf.rtp/src` | `rtp.header`, `rtp.rtcp`, `rtp.seq` (an external specification, publisher ietf.org) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package

@@ -1,0 +1,192 @@
+(ns rtp.seq-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [rtp.seq :as s]))
+
+(deftest seq-delta-basic
+  (is (= 1 (s/seq-delta 100 101)))
+  (is (= 65535 (s/seq-delta 100 99)))
+  (testing "wraps correctly at the 16-bit boundary"
+    (is (= 1 (s/seq-delta 65535 0)))
+    (is (= 65535 (s/seq-delta 0 65535)))))
+
+(deftest seq-more-recent-basic
+  (is (true? (s/seq-more-recent? 100 101)))
+  (is (false? (s/seq-more-recent? 101 100)))
+  (testing "wraparound: 0 is more recent than 65535"
+    (is (true? (s/seq-more-recent? 65535 0)))
+    (is (false? (s/seq-more-recent? 0 65535))))
+  (testing "equal is not more recent"
+    (is (false? (s/seq-more-recent? 42 42)))))
+
+;; ---------------------------------------------------------------------
+;; new-source / probation — Appendix A.1's rule that a source is not
+;; trusted until min-sequential (2) consecutive in-order packets confirm
+;; it.
+;; ---------------------------------------------------------------------
+
+(deftest new-source-first-packet-is-on-probation
+  (let [state (s/update-seq (s/new-source 100) 100)]
+    (is (false? (:accepted? state)))
+    (is (= 1 (:probation state)))))
+
+(deftest new-source-second-sequential-packet-confirms
+  (let [s1 (s/update-seq (s/new-source 100) 100)
+        s2 (s/update-seq s1 101)]
+    (is (true? (:accepted? s2)))
+    (is (zero? (:probation s2)))
+    (is (= 101 (:base-seq s2)) "init-seq resyncs base-seq to the confirming packet")
+    (is (= 1 (:received s2)) "the provisional first packet was not counted")))
+
+(deftest new-source-non-sequential-second-packet-restarts-probation
+  (testing "a gap during probation doesn't confirm the source; it resets the countdown"
+    (let [s1 (s/update-seq (s/new-source 100) 100)
+          s2 (s/update-seq s1 200)]
+      (is (false? (:accepted? s2)))
+      (is (= 1 (:probation s2)) "probation-1's countdown restarts rather than continuing to decrement"))))
+
+(deftest update-seq-nil-state-means-brand-new-source
+  (testing "(update-seq nil seq) is (update-seq (new-source seq) seq) — still has to clear probation"
+    (is (= (s/update-seq (s/new-source 7) 7) (s/update-seq nil 7)))))
+
+(deftest update-seq-in-order-after-confirmation
+  (testing "once confirmed, a clean run of in-order packets accepts every one and never bumps cycles"
+    (let [confirmed (-> nil (s/update-seq 1) (s/update-seq 2))
+          final (reduce s/update-seq confirmed (range 3 21))]
+      (is (true? (:accepted? final)))
+      (is (= 20 (:max-seq final)))
+      (is (= 0 (:cycles final)))
+      ;; base-seq resynced to 2 on confirmation; received counts 2..20 inclusive
+      (is (= 2 (:base-seq final)))
+      (is (= 19 (:received final))))))
+
+(deftest update-seq-wraps-cycle
+  (testing "sequence number wrapping 65535 -> 0 bumps :cycles by seq-mod, RFC 3550 App. A.1"
+    (let [state (-> nil
+                     (s/update-seq 65533)
+                     (s/update-seq 65534)
+                     (s/update-seq 65535)
+                     (s/update-seq 0)
+                     (s/update-seq 1))]
+      (is (= 0x10000 (:cycles state)))
+      (is (= 1 (:max-seq state)))
+      ;; extended sequence number is monotonic across the wrap
+      (is (= 0x10001 (+ (:cycles state) (:max-seq state)))))))
+
+;; ---------------------------------------------------------------------
+;; a mid-stream jump this large is treated as a probable source restart,
+;; not thousands of lost packets — confirmed only once the SAME new
+;; sequence range repeats.
+;; ---------------------------------------------------------------------
+
+(deftest update-seq-large-jump-is-provisionally-rejected
+  (testing "an already-validated source that jumps by more than max-dropout is held pending confirmation"
+    (let [state (s/update-seq (s/init-seq 100) 5000)]
+      (is (false? (:accepted? state)))
+      (is (= 100 (:max-seq state)) "max-seq is untouched until the jump is confirmed"))))
+
+(deftest update-seq-large-jump-confirmed-by-repeat-resyncs
+  (testing "seeing seq+1 in the new range confirms the restart and resyncs base-seq/cycles"
+    (let [s1 (s/update-seq (s/init-seq 100) 5000)
+          s2 (s/update-seq s1 5001)]
+      (is (true? (:accepted? s2)))
+      (is (= 5001 (:base-seq s2)))
+      (is (= 0 (:cycles s2))))))
+
+(deftest update-seq-large-jump-not-confirmed-stays-rejected
+  (testing "a different follow-up sequence number does not confirm the restart"
+    (let [s1 (s/update-seq (s/init-seq 100) 5000)
+          s2 (s/update-seq s1 6000)]
+      (is (false? (:accepted? s2))))))
+
+;; ---------------------------------------------------------------------
+;; loss-stats / advance-interval
+;; ---------------------------------------------------------------------
+
+(deftest loss-stats-no-loss
+  (let [confirmed (-> nil (s/update-seq 1) (s/update-seq 2))
+        state (reduce s/update-seq confirmed (range 3 11))
+        stats (s/loss-stats state)]
+    (is (= 9 (:expected stats)))
+    (is (= 0 (:lost stats)))
+    (is (= 0 (:fraction-lost stats)))))
+
+(deftest loss-stats-with-loss
+  (testing "half the packets missing from a confirmed run, past the probation-clearing pair"
+    ;; 1,2 confirm the source (base-seq resyncs to 2, exact +1 required
+    ;; during probation); 4,6,8,10 are then fast-path accepted with gaps
+    ;; (the fast path only needs udelta < max-dropout, not an exact +1)
+    (let [state (reduce s/update-seq nil [1 2 4 6 8 10])
+          stats (s/loss-stats state)]
+      (is (= 9 (:expected stats)))
+      (is (= 4 (:lost stats)))
+      ;; lost-interval = 9 - 5 = 4; fraction = (4 << 8) / 9 = 113
+      (is (= 113 (:fraction-lost stats))))))
+
+(deftest loss-stats-100-percent-loss-clamps-not-wraps
+  (testing "lost-interval == expected-interval computes to 256, which is clamped to 255 (0xFF), not masked down to 0"
+    ;; a confirmed source (1,2) whose extended max then jumps far ahead
+    ;; without a single further packet actually arriving is not directly
+    ;; expressible through update-seq (every call implies a received
+    ;; packet), so this drives loss-stats from a hand-built state that
+    ;; represents exactly that: expected grew, received did not.
+    (let [state {:base-seq 1 :max-seq 100 :cycles 0 :received 2
+                 :expected-prior 2 :received-prior 2}
+          stats (s/loss-stats state)]
+      (is (= 100 (:expected stats)))
+      (is (= 98 (:lost stats)))
+      (is (= 255 (:fraction-lost stats)) "not 0 — the naive bit-and 0xFF translation of the RFC's div would report 0% loss here"))))
+
+(deftest loss-stats-advance-interval-resets-window
+  (testing "fraction-lost is windowed by advance-interval; :lost stays cumulative across the whole session"
+    (let [confirmed (-> nil (s/update-seq 1) (s/update-seq 2))
+          ;; window 1: 4,6,8,10 (fast path, no exact +1 needed post-confirmation)
+          ;; loses 3,5,7,9 -> 4 packets lost, a nonzero fraction-lost
+          state1 (reduce s/update-seq confirmed [4 6 8 10])
+          stats1 (s/loss-stats state1)
+          state1' (s/advance-interval state1)
+          ;; window 2: fully in-order, nothing new lost
+          state2 (reduce s/update-seq state1' [11 12 13 14 15])
+          stats2 (s/loss-stats state2)]
+      (is (= 4 (:lost stats1)))
+      (is (pos? (:fraction-lost stats1)) "window 1 itself had loss")
+      (is (= 4 (:lost stats2))
+          "cumulative loss is unchanged — nothing new was lost in window 2")
+      (is (= 0 (:fraction-lost stats2))
+          "but the windowed fraction correctly reports 0 for a loss-free window 2, not smeared from window 1"))))
+
+;; ---------------------------------------------------------------------
+;; jitter (Appendix A.8)
+;; ---------------------------------------------------------------------
+
+(deftest jitter-first-packet-is-zero
+  (let [j (s/update-jitter nil 1000 500)]
+    (is (= 0 (:jitter j)))
+    (is (= 500 (:transit j)))))
+
+(deftest jitter-converges-toward-constant-delay
+  (testing "a perfectly regular stream (constant transit time) converges jitter toward 0"
+    (let [state (reduce (fn [prev [arrival ts]] (s/update-jitter prev arrival ts))
+                         nil
+                         (map (fn [i] [(* i 160) (* i 160)]) (range 1 50)))]
+      (is (= 0 (s/jitter-estimate state))))))
+
+(deftest jitter-tracks-known-single-step
+  (testing "matches RFC 3550 App. A.8's J(i) = J(i-1) + (|D| - J(i-1))/16 by hand for a two-packet sequence"
+    ;; packet 1: arrival 1000, ts 0    -> transit 1000
+    ;; packet 2: arrival 2010, ts 1000 -> transit 1010, D = 10, J = 0 + (10-0)/16 = 5/8
+    (let [j1 (s/update-jitter nil 1000 0)
+          j2 (s/update-jitter j1 2010 1000)]
+      (is (= 1000 (:transit j1)))
+      (is (= 1010 (:transit j2)))
+      (is (= 5/8 (:jitter j2))))))
+
+;; ---------------------------------------------------------------------
+;; discrimination proof for update-seq's :accepted? signal
+;; ---------------------------------------------------------------------
+
+(deftest discriminates-in-order-vs-jump
+  (let [in-order (s/update-seq (s/init-seq 1) 2)
+        jumped (s/update-seq (s/init-seq 1) 5000)]
+    (is (true? (:accepted? in-order)))
+    (is (false? (:accepted? jumped)))
+    (is (not= (:accepted? in-order) (:accepted? jumped)))))
