@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.baseL2` | `kotoba.baseL2/src` | `kotoba.lang.base-l2.abi`, `kotoba.lang.base-l2.l2`, `kotoba.lang.base-l2.paymaster`, `kotoba.lang.base-l2.rpc` (Kotoba project library) |
 | `kotoba.ethCrypto` | `kotoba.ethCrypto/src` | `eth-crypto.core`, `eth-crypto.js-core`, `eth-crypto.keccak`, `eth-crypto.secp256k1` (Kotoba project library) |
 | `kotoba.touchid` | `kotoba.touchid/src` | `touchid.adapters.apple-local-authentication`, `touchid.adapters.edn-local-auth`, `touchid.adapters.local-auth`, `touchid.core` (Kotoba project library) |
 | `kotoba.saml` | `kotoba.saml/src` | `saml.adapters.conditions`, `saml.adapters.metadata`, `saml.adapters.xml`, `saml.adapters.xml-parser` (Kotoba project library) |
