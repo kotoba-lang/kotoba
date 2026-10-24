@@ -1,0 +1,221 @@
+(ns loop-ka.loop-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [loop-ka.decide :as decide]
+            [loop-ka.evaluate :as ev]
+            [loop-ka.ledger :as ledger]
+            [loop-ka.observe :as obs]
+            [loop-ka.task :as task]))
+
+(def channels
+  [{:id :dougaka :repo "orgs/cloud-itonami/dougaka-actor"
+    :producer ["kbb" "-M:dev" "-m" "dougaka.outer-loop"]
+    :produces :episode-from-catalog :slots 1 :requires #{:ffmpeg :clojure}}
+   {:id :vector :repo "orgs/cloud-itonami/dougaka-vector"
+    :producer ["kbb" "--backend" "sci" "--classpath" "src" "bin/render.cljk"]
+    :produces :episode-from-topic :slots 2 :requires #{:ffmpeg :nbb}}])
+
+;; ── observe ─────────────────────────────────────────────────────────────────
+
+(deftest slot-key-makes-a-replayed-tick-a-no-op
+  (is (= "dougaka/2026-07-30/0" (obs/slot-key :dougaka "2026-07-30" 0)))
+  (testing "the same tick always resolves to the same key — that is the point"
+    (is (= (obs/slot-key :dougaka "2026-07-30" 0) (obs/slot-key :dougaka "2026-07-30" 0))))
+  (testing "a different slot on the same day is a different unit of work"
+    (is (not= (obs/slot-key :dougaka "2026-07-30" 0) (obs/slot-key :dougaka "2026-07-30" 1)))))
+
+(deftest unconsumed-preserves-running-order
+  (is (= ["b" "d"] (obs/unconsumed ["a" "b" "c" "d"] #{"a" "c"})))
+  (testing "a catalog is a running order, not a set"
+    (is (= ["c" "a" "b"] (obs/unconsumed ["c" "a" "b"] #{}))))
+  (is (= [] (obs/unconsumed ["a"] #{"a"}))))
+
+(deftest due-distinguishes-nothing-to-do-from-nothing-produced
+  (let [cat (first channels) topic (second channels)]
+    (is (obs/due? cat {:remaining ["x"]}))
+    (testing "an exhausted catalog is NOT due — producing from it would be empty"
+      (is (not (obs/due? cat {:remaining []}))))
+    (testing "an already-produced slot is never due again"
+      (is (not (obs/due? cat {:remaining ["x"] :slot-consumed? true}))))
+    (testing "a topic channel always has something to produce"
+      (is (obs/due? topic {:remaining []})))
+    (is (not (obs/due? topic {:slot-consumed? true})))))
+
+(deftest plan-reports-the-not-due-with-a-reason
+  (let [p (obs/plan channels {:date "2026-07-30"
+                              :world {:dougaka {:remaining []}
+                                      :vector {:remaining ["t"]}}})
+        by-id (into {} (map (juxt :channel identity)) p)]
+    (testing "both channels appear — a silently omitted channel cannot be audited"
+      (is (= 2 (count p))))
+    (is (false? (:due? (:dougaka by-id))))
+    (is (= :catalog-exhausted (:reason (:dougaka by-id))))
+    (is (true? (:due? (:vector by-id))))
+    (is (= 1 (count (obs/due-only p))))
+    (testing "'nothing ran last night' has more than one cause, so they are named"
+      (is (= :already-produced-this-slot
+             (:reason (first (obs/plan [(first channels)]
+                                       {:date "d" :world {:dougaka {:slot-consumed? true
+                                                                    :remaining ["x"]}}})))))))
+  (testing "summary renders both states"
+    (let [s (obs/summary (obs/plan channels {:date "d" :world {:dougaka {:remaining []}
+                                                               :vector {:remaining ["t"]}}}))]
+      (is (str/includes? s "skip dougaka"))
+      (is (str/includes? s "DUE  vector")))))
+
+;; ── evaluate ────────────────────────────────────────────────────────────────
+
+(def clean-legs {:video [:murakumo :murakumo] :voice [:murakumo :murakumo]
+                 :sfx [0] :bed true :overlays 2})
+(def shipped-legs {:video [:placeholder :placeholder] :voice [:local :local]
+                   :sfx [] :bed false :overlays 0})
+
+(deftest verdict-catches-the-thing-that-shipped-for-two-weeks
+  (testing "all-generated + bed -> clean"
+    (is (= :clean (:grade (ev/verdict clean-legs)))))
+  (testing "the flat-colour nightly episode grades :degraded, not :clean"
+    (let [v (ev/verdict shipped-legs)]
+      (is (= :degraded (:grade v)))
+      (is (= [0 1] (ev/degraded-shots shipped-legs)))
+      (is (some #(= :placeholder-images (:reason %)) (:reasons v)))
+      (is (some #(= :no-music-bed (:reason %)) (:reasons v)))))
+  (testing "generated images but no bed -> thin, not degraded"
+    (is (= :thin (:grade (ev/verdict (assoc clean-legs :bed false))))))
+  (testing "a channel with no bed by design is not permanently thin"
+    (is (= :clean (:grade (ev/verdict (assoc clean-legs :bed false)
+                                      {:require-bed? false})))))
+  (testing "silent narration is a degrade even when every image generated"
+    (is (= :degraded (:grade (ev/verdict (assoc clean-legs :voice [:murakumo :silent]))))))
+  (testing "a producer that reported nothing is :empty, not :clean"
+    (is (= :empty (:grade (ev/verdict {})))))
+  (testing "an explicit tolerance can admit N placeholder shots"
+    (is (= :thin (:grade (ev/verdict (assoc clean-legs :video [:murakumo :placeholder])
+                                     {:allow-degraded-shots 1}))))))
+
+(deftest explain-is-one-line
+  (let [s (ev/explain (ev/verdict shipped-legs))]
+    (is (str/starts-with? s "DEGRADED"))
+    (is (str/includes? s "shots=2"))
+    (is (str/includes? s "bed=no"))
+    (is (str/includes? s "placeholder-images"))))
+
+;; ── decide ──────────────────────────────────────────────────────────────────
+
+(deftest degraded-never-reaches-the-public-feed
+  (let [v (ev/verdict shipped-legs)]
+    (doseq [phase [0 1 2]]
+      (let [d (decide/decide v {:phase phase :approvals #{:publish :auto-publish}})]
+        (is (= :hold (:action d)) (str "phase " phase " must not publish a degraded cut"))
+        (is (= :degraded-never-auto-publishes (:reason d)))))))
+
+(deftest phases
+  (let [v (ev/verdict clean-legs)]
+    (testing "phase 0 records only"
+      (is (= :hold (:action (decide/decide v {:phase 0})))))
+    (testing "phase 1 publishes an unlisted preview without a grant"
+      (is (= :publish (:action (decide/decide v {:phase 1})))))
+    (testing "phase 2 needs a grant — the artifact is fine, the authority is missing"
+      (is (= :hold (:action (decide/decide v {:phase 2}))))
+      (is (= :public-phase-needs-grant (:reason (decide/decide v {:phase 2}))))
+      (is (= :publish (:action (decide/decide v {:phase 2 :approvals #{:publish}}))))
+      (is (= :publish (:action (decide/decide v {:phase 2 :approvals #{:auto-publish}})))))
+    (testing "an unknown phase falls back to the safest one"
+      (is (= :hold (:action (decide/decide v {:phase 99})))))))
+
+(deftest empty-is-discarded-not-held
+  (is (= :discard (:action (decide/decide (ev/verdict {}) {:phase 1})))))
+
+;; ── act (task batch) ────────────────────────────────────────────────────────
+
+(deftest batch-is-data-and-carries-placement
+  (let [due [{:channel :dougaka :slot-key "dougaka/d/0" :due? true :next "asaichi"}]
+        [t] (task/batch channels due {:workspace "/w"})]
+    (is (str/includes? (:cmd t) "cd '/w/orgs/cloud-itonami/dougaka-actor'"))
+    (is (str/includes? (:cmd t) "dougaka.outer-loop"))
+    (is (str/includes? (:cmd t) "'asaichi'") "the chosen episode is passed, quoted")
+    (is (= ["clojure" "ffmpeg"] (:roles t)) "a node without ffmpeg must not get an assembly job")
+    (is (= 1 (:slots t)))
+    (is (= "loop-ka/dougaka" (:label t))))
+  (testing "an unknown channel in the work list is dropped, not crashed on"
+    (is (= [] (task/batch channels [{:channel :nope :due? true}] {}))))
+  (testing "a shell-hostile episode id cannot break out of the command"
+    (let [[t] (task/batch channels [{:channel :dougaka :next "a'; rm -rf /"}] {:workspace "/w"})]
+      (is (str/includes? (:cmd t) "'a'\\''; rm -rf /'")))))
+
+(deftest murakumo-argv-is-the-quoted-invocation
+  (let [a (task/murakumo-argv {:tasks-file "/tmp/t.edn" :murakumo-dir "/m" :max-inflight 4})]
+    (is (= ["kbb" "--backend" "sci" "/m/scripts/run-task.cljk" "task" "run" "--tasks" "/tmp/t.edn"
+            "--max-inflight" "4"] a))))
+
+;; ── record-evidence ─────────────────────────────────────────────────────────
+
+(deftest run-record-carries-what-a-human-can-act-on
+  (let [v (ev/verdict clean-legs)
+        d (decide/decide v {:phase 1})
+        r (ledger/run-record {:slot-key "dougaka/2026-07-30/0" :channel :dougaka
+                              :episode "asaichi" :at "2026-07-30T01:00:00Z"
+                              :verdict v :decision d
+                              :artifacts [{:cid "bafk1" :kind :mp4}]
+                              :job-ids ["j1"] :producer-exit 0 :node "asher"})]
+    (is (= ledger/dataset (:source/dataset r)) "queryable alongside the other datasets")
+    (is (= "clean" (:run/grade r)))
+    (is (= "publish" (:run/action r)))
+    (is (= 2 (:run/shots r)))
+    (is (true? (:run/bed r)))
+    (is (str/includes? (:run/artifacts r) "bafk1") "the CID is how the artifact stays fetchable")
+    (is (= 0 (:run/producer-exit r))))
+  (testing "a degraded run records WHY, so the panel can show it"
+    (let [v (ev/verdict shipped-legs)
+          r (ledger/run-record {:slot-key "k" :channel :dougaka :at "t"
+                                :verdict v :decision (decide/decide v {:phase 1})})]
+      (is (str/includes? (:run/degrade-reasons r) "placeholder-images"))
+      (is (= "hold" (:run/action r))))))
+
+(deftest a-discarded-run-leaves-the-slot-open
+  (let [records [{:run/slot-key "a/d/0" :run/action "publish" :run/channel "dougaka" :run/episode "e1"}
+                 {:run/slot-key "a/d/1" :run/action "discard" :run/channel "dougaka" :run/episode "e2"}
+                 {:run/slot-key "a/d/2" :run/action "hold" :run/channel "dougaka" :run/episode "e3"}]]
+    (testing "discard does not consume the slot — tonight should try again"
+      (is (= #{"a/d/0" "a/d/2"} (ledger/consumed-slot-keys records))))
+    (testing "hold DOES consume it — the episode was produced, just not published"
+      (is (contains? (ledger/consumed-slot-keys records) "a/d/2")))
+    (testing "and the catalog advances past held episodes but not discarded ones"
+      (is (= #{"e1" "e3"} (ledger/consumed-episodes records :dougaka))))
+    (testing "another channel's records do not advance this one's catalog"
+      (is (= #{} (ledger/consumed-episodes records :vector))))))
+
+(deftest report-is-sorted-by-time
+  (let [rs [{:run/at "2026-07-30T02:00:00Z" :run/channel "b" :run/slot-key "k2"
+             :run/grade "clean" :run/action "publish" :run/shots 1}
+            {:run/at "2026-07-30T01:00:00Z" :run/channel "a" :run/slot-key "k1"
+             :run/grade "thin" :run/action "hold" :run/shots 2}]
+        out (ledger/report rs)]
+    (is (< (.indexOf out "k1") (.indexOf out "k2")))))
+
+(deftest a-missing-workspace-fails-loudly
+  (testing "nil :workspace used to yield \"/orgs/...\" — a real path that is not
+            the checkout, so the node cd'd elsewhere and failed confusingly"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (task/batch channels [{:channel :dougaka :next "e"}] {})))))
+
+(deftest unreadable-catalog-is-not-an-exhausted-one
+  (testing "\"could not look\" and \"nothing left\" render identically and mean
+            opposite things — an operator reading 'exhausted' concludes the
+            channel is finished when in fact nothing looked"
+    (let [p (obs/plan [(first channels)]
+                      {:date "d" :world {:dougaka {:catalog-readable? false :remaining []}}})]
+      (is (= :catalog-unreadable (:reason (first p)))))
+    (let [p (obs/plan [(first channels)]
+                      {:date "d" :world {:dougaka {:catalog-readable? true :remaining []}}})]
+      (is (= :catalog-exhausted (:reason (first p)))))))
+
+(deftest a-seed-record-consumes-its-episode-but-not-a-slot
+  ;; An empty ledger means "nothing was ever produced", which is false for a
+  ;; channel that is already publishing — without seeding, the first tick
+  ;; re-cuts live episodes.
+  (let [seeded [{:run/slot-key "seed/dougaka/amaoto-no-arcade" :run/action "seed"
+                 :run/channel "dougaka" :run/episode "amaoto-no-arcade"}]]
+    (is (= #{"amaoto-no-arcade"} (ledger/consumed-episodes seeded :dougaka))
+        "the catalog must advance past an already-published episode")
+    (is (not (contains? (ledger/consumed-slot-keys seeded) "dougaka/2026-07-30/0"))
+        "but seeding must not consume tonight's slot")))

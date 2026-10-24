@@ -1,0 +1,154 @@
+(ns kotoba.labor.portable-test
+  "What this library promises on every host, checked on every host.
+
+  `kotoba.labor` says it is portable `.cljc` across JVM / ClojureScript / SCI /
+  GraalVM, and until now that sentence was the only place the claim existed:
+  `deps.edn` had one runner and it was the JVM one, so ClojureScript never ran
+  a single assertion. The claim was not failing -- it was unmeasured, which
+  reads exactly like measured-and-fine.
+
+  Running the existing suite on a second host immediately separated the two.
+  `(+ 8 nil)` throws NullPointerException on the JVM and evaluates to `8` on
+  ClojureScript, so a timesheet with one entry missing its hours crashed one
+  host and quietly under-reported the other. The under-reported number is not
+  an error value; it flows through `wages-for` into a payroll `gross` and gets
+  paid. Nothing downstream can tell it from a shorter shift.
+
+  These tests run under both `kbb -M:test` and `kbb --backend sci test/run_portable.cljk`.
+  A test that only ever runs on one host cannot see a divergence between two."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.labor :as labor]
+            [kotoba.labor.export :as ex]))
+
+(defn- refusal
+  "Run `f` and return the `:labor/error` it refused with, or a marker.
+
+  Returning the *reason* rather than a boolean is deliberate. A test that only
+  asserts `thrown?` counts a run that failed for some unrelated reason as a
+  successful demonstration of the refusal it names."
+  [f]
+  (try
+    (f)
+    ::no-refusal
+    (catch #?(:clj Exception :cljs :default) e
+      (or (:labor/error (ex-data e)) ::threw-without-labor-error))))
+
+(defn- refused-field [f]
+  (try
+    (f)
+    ::no-refusal
+    (catch #?(:clj Exception :cljs :default) e
+      (:labor/field (ex-data e)))))
+
+;; ---------------------------------------------------------------------------
+;; Hosts must agree about a missing amount
+;; ---------------------------------------------------------------------------
+
+(deftest total-hours-refuses-an-entry-with-no-hours
+  (testing "an entry whose :ts/hours is missing is refused, not summed as zero"
+    ;; Before: JVM threw NullPointerException, ClojureScript returned 8.
+    ;; Both hosts now answer with the same named refusal.
+    (let [entries [(labor/timesheet "worker" "2026-07-01" 8)
+                   {:ts/worker "worker" :ts/date "2026-07-02"}]]
+      (is (= :non-numeric-amount (refusal #(labor/total-hours entries))))
+      (is (= :ts/hours (refused-field #(labor/total-hours entries)))))))
+
+(deftest total-hours-refuses-a-non-numeric-hours-value
+  (testing "hours arriving as a string is refused rather than concatenated or coerced"
+    (is (= :non-numeric-amount
+           (refusal #(labor/total-hours [{:ts/worker "w" :ts/date "d" :ts/hours "8"}]))))))
+
+(deftest total-hours-still-sums-well-formed-entries
+  (testing "the guard does not change the answer for entries that have hours"
+    (is (= 0 (labor/total-hours [])))
+    (is (= 14 (labor/total-hours [(labor/timesheet "w" "2026-07-01" 8)
+                                  (labor/timesheet "w" "2026-07-02" 6)])))
+    (is (= 7.5 (labor/total-hours [(labor/timesheet "w" "2026-07-01" 7.5)])))))
+
+(deftest payroll-refuses-a-missing-gross
+  (testing "a payroll with no gross is refused, not recorded as a net of zero"
+    ;; A payroll record whose gross went missing used to become net 0 on
+    ;; ClojureScript: a worker paid nothing, described by a well-formed record.
+    (is (= :non-numeric-amount (refusal #(labor/payroll "P1" "worker" "2026-07" nil))))
+    (is (= :payroll/gross (refused-field #(labor/payroll "P1" "worker" "2026-07" nil))))))
+
+(deftest payroll-refuses-non-numeric-deductions
+  (testing "deductions supplied as a string is refused"
+    (is (= :non-numeric-amount
+           (refusal #(labor/payroll "P1" "worker" "2026-07" 21000 :deductions "2000"))))
+    (is (= :payroll/deductions
+           (refused-field #(labor/payroll "P1" "worker" "2026-07" 21000 :deductions "2000"))))))
+
+(deftest payroll-still-computes-net-for-well-formed-input
+  (testing "the guard does not change the answer for amounts that are numbers"
+    (is (= 19000 (:payroll/net (labor/payroll "P1" "w" "2026-07" 21000 :deductions 2000))))
+    (is (= 1000 (:payroll/net (labor/payroll "P1" "w" "2026-07" 1000))))))
+
+;; ---------------------------------------------------------------------------
+;; JSON export: every string field escaped, every number field a number
+;; ---------------------------------------------------------------------------
+
+(deftest contracts-json-escapes-the-currency-field
+  (testing "currency is escaped like every other string field on the object"
+    ;; contract_id, worker and role went through the escaper; currency did not,
+    ;; and :currency is an ordinary argument of labor/contract. Verified with
+    ;; Python's json module: one quote in currency ended the JSON string early
+    ;; and the whole document stopped parsing.
+    (let [j (ex/contracts->json
+              [(labor/contract "C1" "worker" "employer" "nanny" :hourly 1500
+                               :currency "US\"D")])]
+      (is (str/includes? j "\"currency\":\"US\\\"D\""))
+      (is (not (str/includes? j "\"currency\":\"US\"D\""))))))
+
+(deftest contracts-json-refuses-a-non-numeric-rate
+  (testing "a rate that is not a number cannot be written as a bare JSON number"
+    ;; Unquoted interpolation is only correct for actual numbers. Verified with
+    ;; Python's json module: the rate below did not produce a rate at all -- it
+    ;; produced a SECOND key on the object, so a value supplied in one field
+    ;; became a field of its own.
+    (is (= :non-numeric-amount
+           (refusal #(ex/contracts->json
+                       [(labor/contract "C1" "w" "e" "nanny" :hourly
+                                        "15,\"approved\":true")]))))
+    (is (= :contract/rate
+           (refused-field #(ex/contracts->json
+                             [(labor/contract "C1" "w" "e" "nanny" :hourly nil)]))))))
+
+(deftest payrolls-json-refuses-a-non-numeric-amount
+  (testing "an amount that is not a number is refused rather than emitted bare"
+    (is (= :non-numeric-amount
+           (refusal #(ex/payrolls->json [{:payroll/id "P1" :payroll/worker "w"
+                                          :payroll/period "2026-07"
+                                          :payroll/gross "12000"
+                                          :payroll/deductions 0 :payroll/net 12000}]))))))
+
+;; ---------------------------------------------------------------------------
+;; The two exports must describe the same payroll
+;; ---------------------------------------------------------------------------
+
+(deftest payroll-json-carries-every-column-the-csv-carries
+  (testing "a field the record has and the CSV exports does not vanish from the JSON"
+    ;; payrolls->csv had a currency column and payrolls->json did not, so the
+    ;; same payroll showed a JSON reader three unlabelled amounts and a CSV
+    ;; reader labelled ones. Stated as an invariant rather than as `currency
+    ;; appears`, so that the next column added to one exporter and not the
+    ;; other is caught too.
+    (let [p (labor/payroll "P1" "worker" "2026-07" 12000 :deductions 2000 :currency "JPY")
+          columns (str/split (first (str/split-lines (ex/payrolls->csv [p]))) #",")
+          j (ex/payrolls->json [p])
+          missing (remove #(str/includes? j (str "\"" % "\":")) columns)]
+      (is (seq columns))
+      (is (= [] (vec missing))
+          (str "columns exported to CSV but absent from JSON: " (pr-str (vec missing))))
+      (is (str/includes? j "\"currency\":\"JPY\"")))))
+
+(deftest payroll-csv-and-json-agree-on-the-amounts
+  (testing "the same record renders the same numbers through both exporters"
+    (let [p (labor/payroll "P1" "worker" "2026-07" 12000 :deductions 2000 :currency "JPY")
+          csv (ex/payrolls->csv [p])
+          j (ex/payrolls->json [p])]
+      (is (str/includes? csv "P1,worker,2026-07,12000,2000,10000,JPY"))
+      (is (str/includes? j "\"gross\":12000"))
+      (is (str/includes? j "\"deductions\":2000"))
+      (is (str/includes? j "\"net\":10000")))))

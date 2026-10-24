@@ -1,0 +1,216 @@
+(ns kotoba.logistics.export-test
+  "The exporters, checked by reading their output back.
+
+  The three tests at the top are the original ones and stay as they are. The
+  rest decode with `kotoba.logistics.readback` -- an RFC 4180 reader and an RFC
+  8259 reader written from the grammars and pinned against Python's `csv` and
+  `json` modules -- because a `re-find` over the emitted text cannot see the
+  failures these exporters actually have: a row that no longer has as many
+  fields as its header, a quote that was opened and never closed, a control
+  character that makes the document unreadable to every conforming parser."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.logistics :as log]
+            [kotoba.logistics.export :as ex]
+            [kotoba.logistics.readback :as rb]))
+
+(deftest csv-export
+  (let [csv (ex/trackings->csv ["1Z999AA101234" "x"])]
+    (is (re-find #"tracking,valid,normalized" csv))
+    (is (re-find #"1Z999AA101234,yes" csv))))
+
+(deftest shipments-csv-export-quotes-a-bare-carriage-return
+  ;; RFC 4180 requires quoting a field containing CR, LF, or a comma --
+  ;; \r alone is also a line terminator every standard CSV reader
+  ;; recognizes, but the check here only ever covered \n. Verified
+  ;; against Python's csv module: an unquoted bare \r split the row into
+  ;; two corrupted rows on read-back.
+  (let [s [(log/shipment "S1" (str "Warehouse" (char 13) "A") "Store B" "Carrier X")]
+        csv (ex/shipments->csv s)]
+    (is (str/includes? csv "\"Warehouse\rA\""))))
+
+(deftest shipments-json-export-escapes-every-c0-control-character
+  ;; RFC 8259 requires EVERY control character U+0000-U+001F to be
+  ;; escaped, not just \ " and \n -- a shipment origin containing a raw
+  ;; tab or other control byte would otherwise be copied through raw,
+  ;; producing invalid JSON (verified against Python's strict json
+  ;; module).
+  (let [s [(log/shipment "S1" (str "Warehouse" (char 9) "A" (char 1) "x") "Store B" "Carrier X")]
+        j (ex/shipments->json s)]
+    (is (str/includes? j "\"origin\":\"Warehouse\\tA\\u0001x\""))))
+
+;; ---------------------------------------------------------------------------
+;; Values an operator can actually put in a field
+;; ---------------------------------------------------------------------------
+
+(def ^:private hostile
+  "Field values that are ordinary operator data and adversarial to a serializer
+  at the same time. A warehouse called `Store B, Annex` and a carrier note with
+  a stray CR from a Windows-entered address are not hypothetical."
+  ["plain"
+   "Store B, Annex"                 ; the separator
+   "Carrier \"Fast\" Ltd"           ; the quote character
+   "Dock 3\nGate 7"                 ; LF
+   "Dock 3\rGate 7"                 ; CR alone -- the one that used to corrupt
+   "Dock 3\r\nGate 7"               ; CRLF
+   "Bay\tWest"                      ; tab: legal unquoted in CSV, must escape in JSON
+   " padded "                       ; surrounding space is data, not decoration
+   ""                               ; empty
+   "\"\""                           ; text that looks like an empty quoted field
+   "港区・芝浦"                      ; non-ASCII
+   (str "Bay" (char 1) "West")      ; a control character that is not tab or newline
+   (str "Bay" (char 0x1f) "West")]) ; the top of the C0 range
+
+(def ^:private shipment-columns
+  "Each shared column of the shipment exports, with a way to put a value there."
+  [["shipment_id" (fn [v] (log/shipment v "Origin" "Dest" "Carrier"))]
+   ["origin"      (fn [v] (log/shipment "S1" v "Dest" "Carrier"))]
+   ["destination" (fn [v] (log/shipment "S1" "Origin" v "Carrier"))]
+   ["carrier"     (fn [v] (log/shipment "S1" "Origin" "Dest" v))]
+   ["tracking"    (fn [v] (log/shipment "S1" "Origin" "Dest" "Carrier" :tracking v))]])
+
+;; ---------------------------------------------------------------------------
+;; CSV
+;; ---------------------------------------------------------------------------
+
+(deftest every-csv-column-survives-a-round-trip-through-an-rfc4180-reader
+  (doseq [[col build] shipment-columns
+          v hostile]
+    (let [doc (rb/csv-records (ex/shipments->csv [(build v)]))]
+      (testing (str col " = " (rb/describe (str v)))
+        (is (= 1 (count (:rows doc)))
+            "one shipment must read back as exactly one record")
+        (is (= v (rb/csv-column doc (first (:rows doc)) col)))))))
+
+(deftest every-csv-export-row-has-as-many-fields-as-its-header
+  ;; Counting commas cannot check this: a quoted field may contain any number of
+  ;; them. Only a reader that has already decided where the field boundaries are
+  ;; can tell a row that lost a column from a row that gained a comma.
+  (doseq [[label doc]
+          [["trackings"
+            (ex/trackings->csv ["1Z999AA101234" "a,b\"c" (str "x" (char 13) "y") ""])]
+           ["shipments"
+            (ex/shipments->csv [(log/shipment "S,1" "a\"b" "c\nd" "e\rf" :tracking "g,h")
+                                (log/shipment "S2" "Origin" "Dest" "Carrier" :status :exception)])]
+           ["consignments"
+            (ex/consignments->csv
+             [(log/consignment "C,1"
+                               (log/shipment "S1" "A" "B" "C" :status :exception)
+                               [(log/leg "A" "B" :road)]
+                               :declared-value "1,000")])]]]
+    (testing label
+      (let [{:keys [header rows]} (rb/csv-records doc)]
+        (is (pos? (count rows)) "the fixture must produce rows, or this checks nothing")
+        (doseq [r rows]
+          (is (= (count header) (count r))
+              (str "row " (pr-str r) " against header " (pr-str header))))))))
+
+(deftest csv-headers-are-the-published-column-names
+  ;; Downstream settlement importers key on these strings. Renaming one is a
+  ;; breaking change to a contract that is not written down anywhere else.
+  (is (= ["tracking" "valid" "normalized"]
+         (:header (rb/csv-records (ex/trackings->csv [])))))
+  (is (= ["shipment_id" "origin" "destination" "carrier" "tracking" "status"]
+         (:header (rb/csv-records (ex/shipments->csv [])))))
+  (is (= ["consignment_id" "shipment" "legs" "declared_value" "status"]
+         (:header (rb/csv-records (ex/consignments->csv []))))))
+
+(deftest an-empty-export-is-still-a-well-formed-document
+  ;; Nothing to report is not the same as nothing to write. A consumer that
+  ;; receives an empty file cannot tell "no shipments today" from "the export
+  ;; crashed"; a header-only file says the first one.
+  (doseq [[label doc] [["trackings"    (ex/trackings->csv [])]
+                       ["shipments"    (ex/shipments->csv [])]
+                       ["consignments" (ex/consignments->csv [])]]]
+    (testing label
+      (let [{:keys [header rows]} (rb/csv-records doc)]
+        (is (seq header))
+        (is (= [] rows)))))
+  (is (= [] (rb/read-json (ex/trackings->json []))))
+  (is (= [] (rb/read-json (ex/shipments->json [])))))
+
+(deftest the-consignment-legs-column-is-a-count-not-the-route
+  ;; If the route itself reached the column, the value would be a printed
+  ;; collection full of commas -- quoted, so the row would still parse, and a
+  ;; substring assertion would still find the digits it was looking for.
+  (let [c (log/consignment "C1" (log/shipment "S1" "A" "B" "C")
+                           [(log/leg "A" "B" :road)
+                            (log/leg "B" "C" :rail)
+                            (log/leg "C" "D" :sea)])
+        doc (rb/csv-records (ex/consignments->csv [c]))]
+    (is (= "3" (rb/csv-column doc (first (:rows doc)) "legs")))))
+
+;; ---------------------------------------------------------------------------
+;; JSON
+;; ---------------------------------------------------------------------------
+
+(deftest every-json-member-survives-a-round-trip-through-an-rfc8259-reader
+  (doseq [[col build] (remove #(= "tracking" (first %)) shipment-columns)
+          v hostile]
+    (testing (str col " = " (rb/describe (str v)))
+      (let [[o] (rb/read-json (ex/shipments->json [(build v)]))]
+        (is (= v (get o col)))))))
+
+(deftest the-json-export-is-readable-for-every-c0-control-character
+  ;; The stronger form of `shipments-json-export-escapes-every-c0-control-character`
+  ;; above: that one looks for two known escapes in the text, this one hands the
+  ;; whole document to a reader that refuses raw control characters exactly as
+  ;; Python's json module does, for all thirty-two of them.
+  (doseq [n (range 0x20)]
+    (let [v (str "Bay" (char n) "West")
+          [o] (rb/read-json (ex/shipments->json [(log/shipment "S1" v "Dest" "Carrier")]))]
+      (is (= v (get o "origin")) (str "control character at code point " n)))))
+
+(deftest the-shipment-exports-publish-different-columns-on-purpose
+  ;; The CSV carries `tracking`; the JSON does not. Recorded as a fact rather
+  ;; than quietly repaired: an importer keyed on one of these shapes must not
+  ;; receive the other, and whoever adds the member to the JSON should find out
+  ;; here which published contract they are widening.
+  (let [s (log/shipment "S1" "Origin" "Dest" "Carrier" :tracking "1Z999AA101234")]
+    (is (= ["shipment_id" "origin" "destination" "carrier" "tracking" "status"]
+           (:header (rb/csv-records (ex/shipments->csv [s])))))
+    (is (= ["shipment_id" "origin" "destination" "carrier" "status"]
+           (rb/member-order (first (rb/read-json (ex/shipments->json [s]))))))))
+
+;; ---------------------------------------------------------------------------
+;; The two surfaces of one decision
+;; ---------------------------------------------------------------------------
+
+(deftest the-csv-and-json-tracking-exports-decide-the-same-way
+  ;; `trackings->csv` and `trackings->json` are two renderings of one call to
+  ;; `validate-tracking`. Nothing made them stay in agreement: each spells the
+  ;; verdict differently ("yes"/"no" against true/false) and each formats the
+  ;; normalized form itself, so a change to one is invisible to a test that
+  ;; only reads the other.
+  (let [ts ["1Z999AA101234"
+            "  1z-999 aa1 0123 4567  "
+            "x"
+            ""
+            "a,b\"c"
+            nil
+            12345678
+            (apply str (repeat 36 "A"))]
+        doc (rb/csv-records (ex/trackings->csv ts))
+        js  (rb/read-json (ex/trackings->json ts))]
+    (is (= (count ts) (count (:rows doc))))
+    (is (= (count ts) (count js)))
+    (doseq [[row obj t] (map vector (:rows doc) js ts)]
+      (testing (rb/describe (str t))
+        (is (= (get obj "valid") (= "yes" (rb/csv-column doc row "valid")))
+            "the two exports must reach the same verdict")
+        (is (= (get obj "normalized") (rb/csv-column doc row "normalized"))
+            "and publish the same normalized form")))))
+
+(deftest the-tracking-exports-agree-with-the-library-they-render
+  ;; And both must agree with `kotoba.logistics` itself, so that a change to the
+  ;; validator cannot be absorbed by matching changes in both exporters.
+  (doseq [t ["1Z999AA101234" "x" "" "1Z-999 AA1 0123 4567" (apply str (repeat 36 "A"))]]
+    (let [expected (log/validate-tracking t)
+          doc (rb/csv-records (ex/trackings->csv [t]))
+          row (first (:rows doc))
+          [obj] (rb/read-json (ex/trackings->json [t]))]
+      (testing (rb/describe (str t))
+        (is (= (boolean (:logistics/valid? expected)) (get obj "valid")))
+        (is (= (boolean (:logistics/valid? expected)) (= "yes" (rb/csv-column doc row "valid"))))
+        (is (= (or (:logistics/normalized expected) "") (get obj "normalized")))
+        (is (= (or (:logistics/normalized expected) "") (rb/csv-column doc row "normalized")))))))

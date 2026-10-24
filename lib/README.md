@@ -88,6 +88,23 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.mail` | `kotoba.mail/src` | `mail.draft`, `mail.inbound`, `mail.mailbox`, `mail.message` (Kotoba project library) |
+| `kotoba.macosInventory` | `kotoba.macosInventory/src` | `macos-inventory.cli`, `macos-inventory.core`, `macos-inventory.host` (Kotoba project library) |
+| `kotoba.loopUxKaizen` | `kotoba.loopUxKaizen/src` | `loop.ux-kaizen` (Kotoba project library) |
+| `kotoba.loopMaturityAudit` | `kotoba.loopMaturityAudit/src` | `loop-maturity-audit.core` (Kotoba project library) |
+| `kotoba.loopLeiCatalog` | `kotoba.loopLeiCatalog/src` | `loop-lei-catalog.core` (Kotoba project library) |
+| `kotoba.loopKaProduction` | `kotoba.loopKaProduction/src` | `loop-ka.decide`, `loop-ka.evaluate`, `loop-ka.ledger`, `loop-ka.observe` (Kotoba project library) |
+| `kotoba.shinka` | `kotoba.shinka/src` | `shinka.evolve`, `shinka.genome`, `shinka.rng`, `shinka.variation` (Kotoba project library) |
+| `kotoba.logistics` | `kotoba.logistics/src` | `kotoba.logistics`, `kotoba.logistics.export`, `kotoba.logistics.ui` (Kotoba project library) |
+| `kotoba.labor` | `kotoba.labor/src` | `kotoba.labor`, `kotoba.labor.export`, `kotoba.labor.ui` (Kotoba project library) |
+| `kotoba.kyoninka` | `kotoba.kyoninka/src` | `kyoninka.deu-abfall-transport`, `kyoninka.dossier`, `kyoninka.errand`, `kyoninka.gbr-scrap-metal` (Kotoba project library) |
+| `kotoba.merkleSum` | `kotoba.merkleSum/src` | `merkle-sum.core` (Kotoba project library) |
+| `kotoba.kowane` | `kotoba.kowane/src` | `kowane.lpc` (Kotoba project library) |
+| `kotoba.kototamaComponent` | `kotoba.kototamaComponent/src` | `tender.component` (Kotoba project library) |
+| `kotoba.kotobaseProjection` | `kotoba.kotobaseProjection/src` | `kotobase.projection`, `kotobase.projection.datalog`, `kotobase.projection.publication`, `kotobase.projection.statistics` (Kotoba project library) |
+| `kotoba.merkleLsm` | `kotoba.merkleLsm/src` | `merkle-lsm.compaction`, `merkle-lsm.core` (Kotoba project library) |
+| `kotoba.kotobaseMaintenance` | `kotoba.kotobaseMaintenance/src` | `kotobase.maintenance.restore`, `kotobase.maintenance.resumable`, `kotobase.maintenance.retention` (Kotoba project library) |
+| `kotoba.kotobaseFederation` | `kotoba.kotobaseFederation/src` | `kotobase.federation` (Kotoba project library) |
 | `kotoba.kotobaseBlockCodec` | `kotoba.kotobaseBlockCodec/src` | `kotobase.blockcodec.core`, `kotobase.blockcodec.node`, `kotobase.blockcodec.statemix` (Kotoba project library) |
 | `kotoba.kotobaseAnchorFevm` | `kotoba.kotobaseAnchorFevm/src` | `kotobase.anchor.checkpoint`, `kotobase.anchor.fevm`, `kotobase.anchor.fevm.queue` (Kotoba project library) |
 | `kotoba.kotobaseEngineContract` | `kotoba.kotobaseEngineContract/src` | `kotobase.engine.archive`, `kotobase.engine.canonical`, `kotobase.engine.completion`, `kotobase.engine.conformance` (Kotoba project library) |

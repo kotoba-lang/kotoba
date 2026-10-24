@@ -1,0 +1,281 @@
+(ns tender.component
+  "Narrow native Wasmtime adapter for provider-free Kotoba Components.
+
+  It intentionally exposes no WASI directories, environment, arguments, or
+  inherited stdio. Effectful Components stay rejected until their typed WIT
+  provider adapters are implemented; the CLI must never become an ambient
+  authority escape hatch."
+  (:require [kotoba.lang.text :as str]
+            [json.data-json :as json]
+            [kotoba.abi.component :as abi]
+            [kototama.aiueos-adapter :as aiueos-adapter]
+            [kototama.component-platform :as platform]
+            [kototama.component-provider :as provider])
+  (:import [java.io BufferedReader BufferedWriter File InputStreamReader OutputStreamWriter]
+           [java.nio.file Files]
+           [java.security MessageDigest]
+           [java.util.concurrent TimeUnit]))
+
+(defn- reject [code message]
+  (throw (ex-info message {:phase :wasmtime-component :tender.component/code code})))
+
+(defn- parse-i64 [text]
+  (let [trimmed (str/trim text)]
+    (try (Long/parseLong trimmed)
+         (catch NumberFormatException _
+           (reject :invalid-engine-output "Wasmtime did not return one i64 result")))))
+
+(defn- provider-free-argv [path]
+  ;; Wasmtime 42 parses Component invocations as expressions.  Bare `main`
+  ;; was accepted by older releases but is rejected by the qualified runtime
+  ;; pin; keep the exact CLI spelling covered by the real Component test.
+  ["wasmtime" "run" "--invoke" "main()" (str path)])
+
+(defn- sha256-file [^File file]
+  (let [digest (MessageDigest/getInstance "SHA-256")]
+    (with-open [input (java.io.FileInputStream. file)]
+      (let [buffer (byte-array 8192)]
+        (loop [read (.read input buffer)]
+          (when (pos? read)
+            (.update digest buffer 0 read)
+            (recur (.read input buffer))))))
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) (.digest digest)))))
+
+(defn- host-executable! [path expected-sha256]
+  (let [file (when path (File. ^String path))]
+    (when-not (and file (.isAbsolute file) (.isFile file) (.canExecute file))
+      (reject :invalid-component-host
+              "effectful Component execution requires an absolute executable native host path"))
+    (when-not (and (string? expected-sha256)
+                   (re-matches #"[0-9a-f]{64}" expected-sha256))
+      (reject :invalid-component-host-identity
+              "effectful Component execution requires a pinned host SHA-256"))
+    (when-not (= expected-sha256 (sha256-file file))
+      (reject :component-host-identity-mismatch
+              "native Component host bytes do not match the admitted SHA-256"))
+    (.getPath file)))
+
+(defn- write-json-line! [^BufferedWriter writer value]
+  (.write writer (json/write-str value))
+  (.newLine writer)
+  (.flush writer))
+
+(defn- read-json-line! [^BufferedReader reader]
+  (when-let [line (.readLine reader)]
+    (json/read-str line :key-fn keyword)))
+
+(defn- host-import-name [import]
+  (when-not (= "aiueos.component" (namespace import))
+    (reject :invalid-import "Component host only admits aiueos Component imports"))
+  (name import))
+
+(defn- host-ability [ability]
+  ;; EDN uses a namespaced keyword for the operation while the native JSON
+  ;; protocol carries its canonical WIT spelling as a string.
+  (update ability :operation
+          (fn [operation]
+            (when-not (qualified-keyword? operation)
+              (reject :invalid-ability
+                      "Component ability operation must be a qualified keyword"))
+            (str (namespace operation) "/" (name operation)))))
+
+(defn run-effectful!
+  "Run an admitted effectful Component through a pinned JSON-protocol
+   Component host. Wasmtime and jco are independent engines behind the same
+   fail-closed provider protocol.
+   The host links no WASI interfaces and every imported WIT function is
+   synchronously delegated through the previously admitted provider boundary."
+  [{:keys [runtime component-bytes imports abilities budgets artifact providers
+           component-host runtime-bindings lease lease-epoch now-ms
+           lease-authorize? execution-identity audit-sink]}]
+  (when-not (contains? provider/component-runtimes runtime)
+    (reject :runtime-mismatch "a qualified Component adapter was not selected"))
+  (when-not (bytes? component-bytes)
+    (reject :invalid-component "Component bytes are required"))
+  (when (empty? imports)
+    (reject :provider-free-component "effectful runner requires an admitted import"))
+  (when-not (= (set (keys imports)) (set (keys abilities)))
+    (reject :ability-mismatch "native Component imports and abilities must be exact"))
+  (let [typed-v3? (= abi/typed-capability-world-v3 (:component-world artifact))
+        _ (when (and typed-v3?
+                     (not (and (map? lease) (ifn? audit-sink))))
+            (reject :typed-proof-required
+                    "typed v0.3 execution requires an admitted lease and persistent audit sink"))
+        prepared (provider/prepare!
+                  {:runtime runtime :component? true :artifact artifact
+                   :grants (set (keys imports)) :providers providers
+                   :lease lease :lease-epoch lease-epoch :now-ms now-ms
+                   :lease-authorize? lease-authorize?})
+        executable (host-executable! component-host (:component-host-sha256 runtime-bindings))
+        deadline-ms (long (or (:deadline-ms budgets) 30000))
+        path (Files/createTempFile "kototama-component-" ".wasm"
+                                   (make-array java.nio.file.attribute.FileAttribute 0))]
+    (try
+      (Files/write path component-bytes (make-array java.nio.file.OpenOption 0))
+      (let [process (.start (doto (ProcessBuilder. (into-array String [executable]))
+                              (.redirectInput java.lang.ProcessBuilder$Redirect/PIPE)
+                              (.redirectError java.lang.ProcessBuilder$Redirect/PIPE)
+                              (.redirectOutput java.lang.ProcessBuilder$Redirect/PIPE)))
+            reader (BufferedReader. (InputStreamReader. (.getInputStream process) "UTF-8"))
+            writer (BufferedWriter. (OutputStreamWriter. (.getOutputStream process) "UTF-8"))
+            request {:type "run" :component (.toString path)
+                     :capability-mode (name (or (:capability-mode artifact) :function))
+                     ;; `imports` is the admitted provider binding map; its
+                     ;; values are opaque callbacks.  The native protocol must
+                     ;; receive the separately admitted ability descriptors.
+                     :imports (mapv (fn [[import ability]]
+                                      {:name (host-import-name import)
+                                       :ability (host-ability ability)})
+                                    abilities)
+                     :fuel (long (or (:fuel budgets) 1))
+                     :memory-pages (long (or (:memory-pages budgets) 1))
+                     :lease (when typed-v3?
+                              {:epoch (:aiueos/epoch lease)
+                               :not-before (:aiueos/not-before lease)
+                               :expires-at (:aiueos/expires-at lease)})}
+            outcome (future
+                      (write-json-line! writer request)
+                      (loop []
+                        (let [message (read-json-line! reader)]
+                          (when-not message
+                            (reject :engine-failed "native Component host closed its protocol"))
+                          (case (:type message)
+                            "provider-call"
+                            (let [import (keyword "aiueos.component" (:import message))
+                                  payload (:payload message)
+                                  legacy-scalar? (contains? payload :value)
+                                  result (provider/invoke! prepared import payload)
+                                  observed-at (long (if (ifn? now-ms) (now-ms) now-ms))
+                                  audit-receipt
+                                  (when typed-v3?
+                                    (audit-sink
+                                     {:audit-id (get-in abilities [import :audit-id])
+                                      :import import :ability (get abilities import)
+                                      :payload payload :result result
+                                      :lease-id (:aiueos/lease-id lease)
+                                      :epoch lease-epoch :observed-at observed-at}))]
+                              (when-not (= (host-ability (get abilities import))
+                                           (:ability message))
+                                (reject :ability-mismatch "native host changed an ability descriptor"))
+                              (when (and legacy-scalar? (not (integer? result)))
+                                (reject :invalid-provider-result "Component provider must return i64"))
+                              (write-json-line!
+                               writer
+                               (cond-> {:type "provider-result"
+                                        :import (:import message)}
+                                 legacy-scalar? (assoc :value (long result))
+                                 (not legacy-scalar?)
+                                 (assoc :payload result
+                                        :audit-id (get-in abilities [import :audit-id])
+                                        :audit-receipt audit-receipt
+                                        :lease-proof
+                                        {:epoch lease-epoch
+                                         :observed-at observed-at
+                                         :expires-at (:aiueos/expires-at lease)})))
+                              (recur))
+                            "result" (cond-> {:result (long (:value message))
+                                             :runtime runtime}
+                                       execution-identity
+                                       (assoc :execution-identity execution-identity))
+                            "error" (reject :engine-failed
+                                            (str "native Component host rejected execution: "
+                                                 (:message message)))
+                            (reject :invalid-engine-output
+                                    "native Component host emitted an unknown envelope")))))
+            result (try
+                     (deref outcome deadline-ms ::deadline)
+                     (catch java.util.concurrent.ExecutionException error
+                       (.destroyForcibly process)
+                       (throw (.getCause error))))]
+        (when (= ::deadline result)
+          (.destroyForcibly process)
+          (reject :deadline-exceeded "Component exceeded its execution deadline"))
+        (.waitFor process 1000 TimeUnit/MILLISECONDS)
+        (when-not (zero? (.exitValue process))
+          (reject :engine-failed "native Component host exited unsuccessfully"))
+        result)
+      (catch java.io.IOException _
+        (reject :runtime-unavailable "native Wasmtime Component host is unavailable"))
+      (finally (Files/deleteIfExists path)))))
+
+(defn run-provider-free!
+  "Execute a verified, provider-free Component's main export through the
+  Wasmtime binary. REQUEST is the already-admitted linker payload plus
+  :runtime :wasmtime-component; it is not an alternative admission path."
+  [{:keys [runtime component-bytes imports abilities budgets]}]
+  (when-not (= :wasmtime-component runtime)
+    (reject :runtime-mismatch "Wasmtime Component adapter was not selected"))
+  (when-not (bytes? component-bytes)
+    (reject :invalid-component "Component bytes are required"))
+  (when-not (and (empty? imports) (empty? abilities))
+    (reject :provider-adapter-required
+            "effectful Components require a typed in-process provider adapter"))
+  (let [deadline-ms (long (or (:deadline-ms budgets) 30000))
+        path (Files/createTempFile "kototama-component-" ".wasm"
+                                   (make-array java.nio.file.attribute.FileAttribute 0))]
+    (try
+      (Files/write path component-bytes (make-array java.nio.file.OpenOption 0))
+      (let [process (.start (doto (ProcessBuilder.
+                                   (into-array String (provider-free-argv path)))
+                             (.redirectInput java.lang.ProcessBuilder$Redirect/PIPE)
+                             (.redirectError java.lang.ProcessBuilder$Redirect/PIPE)
+                             (.redirectOutput java.lang.ProcessBuilder$Redirect/PIPE)))]
+        (when-not (.waitFor process deadline-ms TimeUnit/MILLISECONDS)
+          (.destroyForcibly process)
+          (reject :deadline-exceeded "Component exceeded its execution deadline"))
+        (let [out (slurp (.getInputStream process))
+              err (slurp (.getErrorStream process))]
+          (if (zero? (.exitValue process))
+            {:result (parse-i64 out) :runtime runtime}
+            (reject :engine-failed (str "Wasmtime Component execution failed: " (str/trim err))))))
+      (catch java.io.IOException _
+        (reject :runtime-unavailable "Wasmtime Component runtime is unavailable"))
+      (finally (Files/deleteIfExists path)))))
+
+(defn admit-and-run-provider-free!
+  "The concrete Component-first execution path for a pure Kotoba app.
+  Identity/world validation happens before Wasmtime receives bytes; capability
+  imports are rejected by `run-provider-free!`, so this path cannot silently
+  acquire WASI or host authority."
+  ([world component-bytes]
+   (admit-and-run-provider-free! world nil component-bytes))
+  ([world execution-identity component-bytes]
+   (platform/admit-and-link!
+    world execution-identity component-bytes
+    #(run-provider-free! (assoc % :runtime :wasmtime-component)))))
+
+(defn admit-and-run-effectful!
+  ([world component-bytes artifact providers component-host]
+   (admit-and-run-effectful! world nil component-bytes artifact providers component-host))
+  ([world execution-identity component-bytes artifact providers component-host]
+   (platform/admit-and-link!
+    world execution-identity component-bytes
+    #(run-effectful! (assoc % :runtime :wasmtime-component
+                            :artifact artifact :providers providers
+                            :component-host component-host)))))
+
+(defn- effective-run-request
+  "Preserve the authority-narrowed artifact supplied by Kototama admission.
+  The compiler artifact is only a compatibility fallback; it must never widen
+  the effective abilities already placed in the admitted request."
+  [admitted artifact providers
+   {:keys [runtime component-host execution-identity audit-sink]}]
+  (assoc admitted
+         :runtime runtime
+         :artifact (or (:artifact admitted) artifact)
+         :providers providers
+         :component-host component-host
+         :execution-identity execution-identity
+         :audit-sink audit-sink))
+
+(defn admit-and-run-with-aiueos!
+  "Convenience composition kept outside kototama core: aiueos decides and
+  kototama validates the world, then this adapter executes it."
+  [artifact world component-bytes providers
+   {:keys [component-host execution-identity] :as opts}]
+  (aiueos-adapter/admit-component-with-aiueos!
+   artifact world component-bytes
+   (fn [admitted]
+     (run-effectful!
+      (effective-run-request admitted artifact providers opts)))
+   providers opts))
