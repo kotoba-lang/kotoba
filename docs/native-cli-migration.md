@@ -39,11 +39,33 @@ deployment is a separate workflow.
 
 ## Public command execution remains open
 
+An isolated native execution slice now validates `check --kind cli-contract`
+and `check --kind lock` inside the Kotoba guest. The contract check covers the
+exact twelve command IDs, command and option uniqueness, option types and flag
+shapes. The lock check reads an explicitly named file through Amu's bounded
+FS2 provider and uses an explicit `--blocks` directory to resolve the complete
+declared source closure by CID. It verifies every fetched source byte, the
+namespace and dependency graph, and returns the canonical lock CID to the
+internal caller. The native fixture checks the frozen two-module CID. Invalid
+pins, tampered or missing blocks, undeclared dependencies, and missing or extra
+lock paths are refused; the fixture also denies the FS grant and filesystem scope.
+Mutated version/command-set inputs are refused, and unimplemented verbs return
+`:cli/native-execution-unavailable`. The source is
+`src/kotoba/cli_exec.kotoba`; the native ARM fixture executes it through the
+Amu selfhost compiler and pins Kotoba Lang main `6621519576f91624ae79a62b73a81246351a2567`
+for the `--blocks` contract. These are internal check modes. The lock mode does not
+yet perform full semantic admission or compilation, nor expose the CID on the
+public CLI. The public launcher, other `check` modes, and the remaining command
+execution paths are still open.
+
+An input path for `cli-contract` and unsupported `--source-path`, `--json`,
+`--safe=false`, or non-Kotoba target forms are refused rather than silently accepted.
+
 `src/kotoba/cli.kotoba` produces validated requests. Parsing a command does
 not execute it, approve a provider operation, admit a package or qualify a
 target. The public `bin/kotoba` still has legacy dispatch and must not be used
 for this migration's execution proofs. The native implementation must finish
-all12 command/provider paths, CID/lock caller integration and general FS
+all12 command/provider paths, caller-wide CID/lock integration and general FS
 fault/cleanup checks before public CLI parity can be claimed. Existing Web,
 Wasm, signature and package contracts remain acceptance criteria.
 
