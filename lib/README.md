@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kamiEngineGuest` | `kotoba.kamiEngineGuest/src` | `kotoba.engine-clj`, `kotoba.engine-clj.ast`, `kotoba.engine-clj.codegen`, `kotoba.engine-clj.component` (Kotoba project library) |
 | `kotoba.kamiEngWeb` | `kotoba.kamiEngWeb/src` | `eng-web`, `eng-web.cam`, `eng-web.coverage`, `eng-web.dft` (Kotoba project library) |
 | `kotoba.kamiArticulated` | `kotoba.kamiArticulated/src` | `kami_articulated`, `kami_articulated.urdf` (Kotoba project library) |
 | `kotoba.kamiAppQuarryWalk` | `kotoba.kamiAppQuarryWalk/src` | `kami-app-quarry-walk` (Kotoba project library) |

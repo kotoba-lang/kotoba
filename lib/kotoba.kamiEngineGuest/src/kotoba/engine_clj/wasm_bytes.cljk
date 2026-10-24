@@ -1,0 +1,365 @@
+(ns kotoba.engine-clj.wasm-bytes
+  "Module IR -> real `.wasm` binary bytes.
+
+  Closes the gap `kotoba.engine-clj.codegen`'s namespace docstring and the
+  README's \"Where this port draws the line\" section describe: codegen.cljc
+  ports ALL of the *semantic* decision-making the deleted Rust `codegen.rs`
+  made (which WASM instructions a given AST node compiles to); this
+  namespace ports the other half — the *mechanical* step Rust did by calling
+  the `wasm-encoder` crate (LEB128 varints + section framing) to turn the
+  already-correct instruction IR into actual `.wasm` binary bytes. That
+  mechanical step has no further semantic decisions of its own: it's a
+  fixed table from instruction keyword -> WASM opcode byte(s), a handful of
+  LEB128/section-framing rules, and nothing else. This file follows the
+  original Rust `codegen.rs::compile` (kami-engine-clj, recovered read-only
+  from `kami-engine`'s git history at
+  `a8368f9c0d784dbc9d11e8fa8f407aa95c7ce4fa:kami-engine-clj/src/codegen.rs`)
+  section-by-section, matching its exact section order and layout, so the
+  emitted module has the same shape the original Rust binary did.
+
+  ## What this namespace does NOT do
+
+  Two items from the README's \"Unported items\" list stay unported here
+  too, for the same reasons: `component.rs`'s WIT-text generation
+  (`kami_game_wit`) and the `wit-component` adapter encoding — both
+  `component.rs`/Phase-3-TODO concerns, unrelated to core-module byte
+  emission. This namespace only emits a *core* `.wasm` module (WebAssembly
+  1.0 MVP binary format), the same artifact the original `compile(): Vec<u8>`
+  returned.
+
+  ## Portable, `.cljc`
+
+  Pure data manipulation (no I/O, no Java/JS-specific byte APIs beyond a
+  thin `#?(:clj ... :cljs ...)` conversion at the very end) — same
+  discipline as `numerics.cljc` and the rest of this port."
+  (:require [kotoba.engine-clj.numerics :as num]))
+
+;; ---------------------------------------------------------------------------
+;; LEB128 (WASM binary format §5.2.2 "Integers")
+;; ---------------------------------------------------------------------------
+
+;; BUGFIX (found via network-isekai's real browser execution of a def-bound-fn
+;; string-handle reference, e.g. `(defn player [] (nearest-tagged "player" ...))`
+;; -- not by inspection): `bit-and`/`bit-shift-right`/`unsigned-bit-shift-right`
+;; compile to JS's native 32-bit bitwise operators under ClojureScript, which
+;; implicitly ToInt32/ToUint32-coerce their operand FIRST, silently discarding
+;; any bits above bit 31. `emit-str` (codegen.cljc) packs a 64-bit string handle
+;; as `(abs << 32) | len` -- once that packed value needs more than 32 bits
+;; (any real game, since `abs` includes the 1024-byte data-segment base), the
+;; original `n (bit-and n 0x7f)`/`n (bit-shift-right n 7)` here silently
+;; truncated it to its low 32 bits before ever looking at a single byte, so the
+;; *encoded* i64.const bytes represented the wrong (truncated) value -- correct
+;; on the JVM (`kbb -M:test`), where Clojure's bitwise ops operate on full
+;; 64-bit longs, which is why this never surfaced there. `shr7` below uses
+;; `mod`/`quot`/`-` (floored division, not JS bitwise truncation) to compute
+;; "arithmetic shift right by 7" correctly on both platforms for any magnitude
+;; within the double-safe-integer range (2^53) -- ample headroom for this
+;; compiler's actual i64.const payloads (packed string handles, atom inits,
+;; small literals). `b` itself is always in [0,127] after `mod`, so the
+;; existing `(bit-and b 0x40)`/`(bit-or b 0x80)` calls on `b` (not `n`) stay
+;; bitwise -- those were never the bug, `b` never exceeds 32-bit range.
+(defn- shr7
+  "Arithmetic shift-right-by-7, i.e. floor(n / 128) -- correct for negative n
+  too (floored, not truncated), via `mod`/`quot` instead of a bitwise shift."
+  [n]
+  (let [b (mod n 128)]
+    (quot (- n b) 128)))
+
+(defn uleb128
+  "Unsigned LEB128 encoding of a non-negative integer `n` -> vector of bytes."
+  [n]
+  (loop [n (long n) out []]
+    (let [b (mod n 128)
+          n (shr7 n)]
+      (if (zero? n)
+        (conj out b)
+        (recur n (conj out (bit-or b 0x80)))))))
+
+(defn sleb128
+  "Signed LEB128 encoding of a (possibly negative) integer `n` -> vector of
+  bytes. Used for `i32.const`/`i64.const` immediates per the WASM spec
+  (`s32`/`s64` are signed LEB128, unlike `u32` indices which use `uleb128`)."
+  [n]
+  (loop [n (long n) out []]
+    (let [b (mod n 128)
+          n (shr7 n)
+          done? (or (and (zero? n) (zero? (bit-and b 0x40)))
+                    (and (= n -1) (not (zero? (bit-and b 0x40)))))]
+      (if done?
+        (conj out b)
+        (recur n (conj out (bit-or b 0x80)))))))
+
+(defn f32-le-bytes
+  "4 little-endian bytes for an f32 bit-pattern (already an i64-zero-extended
+  u32, per `numerics/f32-bits`) — `f32.const`'s immediate is NOT LEB128, it's
+  4 raw bytes (WASM binary format §5.4.3)."
+  [bits]
+  (let [b (bit-and (long bits) 0xFFFFFFFF)]
+    [(bit-and b 0xff)
+     (bit-and (bit-shift-right b 8) 0xff)
+     (bit-and (bit-shift-right b 16) 0xff)
+     (bit-and (bit-shift-right b 24) 0xff)]))
+
+(defn vec-encode
+  "WASM's ubiquitous `vec(B)` production: `uleb128(count) ++ concat(items)`.
+  `items` is a sequence of already-encoded byte-vectors (or a sequence of
+  raw byte ints, if `raw?` true, for e.g. a data blob)."
+  ([items] (vec-encode items false))
+  ([items raw?]
+   (into (uleb128 (count items))
+         (if raw? items (mapcat identity items)))))
+
+(defn utf8-name
+  "WASM `name` production: `vec(byte)` of the UTF-8 encoding of `s`."
+  [s]
+  (vec-encode (num/utf8-bytes s) true))
+
+;; ---------------------------------------------------------------------------
+;; Value types / block types
+;; ---------------------------------------------------------------------------
+
+(def valtype->byte
+  {:i32 0x7F :i64 0x7E :f32 0x7D :f64 0x7C})
+
+(defn blocktype->bytes
+  "`:empty` -> the empty blocktype byte (0x40); a value-type keyword -> that
+  type's single byte (WASM binary format §5.3.6, MVP subset — no multi-value
+  block types, matching what `codegen.cljc` ever emits: `:i64` or `:empty`)."
+  [bt]
+  [(if (= bt :empty) 0x40 (valtype->byte bt))])
+
+;; ---------------------------------------------------------------------------
+;; Instruction encoding — keyword+immediates -> opcode byte(s)+immediate bytes
+;; ---------------------------------------------------------------------------
+;; Opcode values per the WebAssembly Core Spec release 2.0 §5.4 "Instructions"
+;; binary opcode table. Only instructions `codegen.cljc`/`interp.cljc` ever
+;; produce are covered (see `interp.cljc`'s `exec-simple`/`exec-structural`
+;; dispatch for the exhaustive list this mirrors).
+
+(def simple-opcode
+  "Instructions with no immediate operand."
+  {:drop 0x1A :unreachable 0x00 :else 0x05 :end 0x0B
+   :i64-eqz 0x50 :i32-wrap-i64 0xA7 :i64-extend-i32-u 0xAD
+   :f32-reinterpret-i32 0xBE :i32-reinterpret-f32 0xBC
+   :i64-add 0x7C :i64-sub 0x7D :i64-mul 0x7E
+   :i64-div-s 0x7F :i64-rem-s 0x81
+   :i64-and 0x83 :i64-or 0x84 :i64-xor 0x85
+   :i64-shl 0x86 :i64-shr-s 0x87 :i64-shr-u 0x88
+   :i64-eq 0x51 :i64-ne 0x52 :i64-lt-s 0x53 :i64-gt-s 0x55
+   :i64-le-s 0x57 :i64-ge-s 0x59
+   :i32-add 0x6A :i32-sub 0x6B :i32-and 0x71
+   :f32-add 0x92 :f32-sub 0x93 :f32-mul 0x94 :f32-div 0x95
+   :f32-lt 0x5D :f32-gt 0x5E :f32-le 0x5F :f32-ge 0x60 :f32-eq 0x5B})
+
+(defn- memarg
+  "`memarg ::= align:u32 offset:u32` (both `uleb128`). `align` is a hint only
+  (execution is correct regardless of its value, WASM spec §2.5.6) — we pick
+  the natural alignment for the access width, matching what a real compiler
+  would emit, but any value here is equally *valid* WASM."
+  [align-log2 offset]
+  (into (uleb128 align-log2) (uleb128 offset)))
+
+(defn instr->bytes
+  "One Module-IR instruction tuple -> its encoded byte vector."
+  [instr]
+  (let [op (first instr)]
+    (cond
+      (contains? simple-opcode op) [(get simple-opcode op)]
+
+      (= op :i64-const) (into [0x42] (sleb128 (second instr)))
+      (= op :i32-const) (into [0x41] (sleb128 (second instr)))
+      ;; BUGFIX (found via kami-script-runtime-rs's real tick-loop verification,
+      ;; not by inspection): `:f32-const`'s IR payload is the raw Clojure float
+      ;; literal (see codegen.cljc's `:float` node handling), NOT an already
+      ;; zero-extended-u32 bit pattern — `f32-le-bytes` needs the latter (see its
+      ;; own docstring). Passing the raw float straight through silently emitted
+      ;; garbage bytes for every literal NOT already bit-converted upstream: a
+      ;; `def`-bound constant like `spawn-radius` happened to route through a
+      ;; different, already-correct path, but any literal used inline (e.g. the
+      ;; `-520.0` in isekai-network's `spawn-tick` cond branches) decoded back to
+      ;; NaN (negative values) or a ~1e-43 denormal (small positive values) --
+      ;; `wasm-tools validate` never caught this because any 4 bytes are
+      ;; structurally valid IEEE-754, just semantically wrong. `num/f32-bits`
+      ;; is the missing conversion.
+      (= op :f32-const) (into [0x43] (f32-le-bytes (num/f32-bits (second instr))))
+
+      (= op :local-get)  (into [0x20] (uleb128 (second instr)))
+      (= op :local-set)  (into [0x21] (uleb128 (second instr)))
+      (= op :local-tee)  (into [0x22] (uleb128 (second instr)))
+      (= op :global-get) (into [0x23] (uleb128 (second instr)))
+      (= op :global-set) (into [0x24] (uleb128 (second instr)))
+
+      (= op :call) (into [0x10] (uleb128 (second instr)))
+      (= op :br)   (into [0x0C] (uleb128 (second instr)))
+
+      (= op :i32-load)    (into [0x28] (memarg 2 (second instr)))
+      (= op :i32-load8-u) (into [0x2D] (memarg 0 (second instr)))
+      (= op :i32-store)   (into [0x36] (memarg 2 (second instr)))
+      (= op :i32-store8)  (into [0x3A] (memarg 0 (second instr)))
+      (= op :i64-load)    (into [0x29] (memarg 3 (second instr)))
+      (= op :i64-store)   (into [0x37] (memarg 3 (second instr)))
+
+      (= op :block) (into [0x02] (blocktype->bytes (second instr)))
+      (= op :loop)  (into [0x03] (blocktype->bytes (second instr)))
+      (= op :if)    (into [0x04] (blocktype->bytes (second instr)))
+
+      :else (throw (ex-info "wasm-bytes: unencodable instruction"
+                             {:instr instr})))))
+
+(defn body->bytes
+  "A flat Module-IR instruction stream (already containing any nested
+  `:block`/`:loop`/`:if`/`:else`/`:end` markers `codegen.cljc` emitted for
+  control-flow bodies — see that namespace's docstring: the IR's structural
+  instructions are already a flat token stream isomorphic to WASM's own
+  binary encoding, not a nested tree) -> concatenated byte vector. Does NOT
+  append the function-terminating `end` byte — callers add that (mirrors
+  `codegen.rs::compile` adding `Instruction::End` itself, once, after the
+  `instrs` loop, separately from whatever `:end`s are already inside
+  `instrs` for nested blocks)."
+  [instrs]
+  (into [] (mapcat instr->bytes) instrs))
+
+;; ---------------------------------------------------------------------------
+;; Sections (WASM binary format §5.5, section id table)
+;; ---------------------------------------------------------------------------
+
+(defn- section [id payload-bytes]
+  (into (into [id] (uleb128 (count payload-bytes))) payload-bytes))
+
+(defn- functype-bytes [params results]
+  (-> [0x60]
+      (into (vec-encode (mapv (fn [t] [(valtype->byte t)]) params)))
+      (into (vec-encode (mapv (fn [t] [(valtype->byte t)]) results)))))
+
+(defn host-import-functype
+  "Core-WASM `(params results)` for a host import — expands `:string-handle`
+  to two i32s and `:f32` to f32, mirroring the deleted Rust
+  `codegen.rs::host_import_sig`."
+  [param-kinds return-kind]
+  (let [params (into [] (mapcat (fn [k] (case k
+                                           :i64 [:i64]
+                                           :f32 [:f32]
+                                           :string-handle [:i32 :i32])))
+                      param-kinds)
+        results (case return-kind :void [] :i32 [:i32] :i64 [:i64] :f32 [:f32])]
+    [params results]))
+
+(defn emit-module
+  "Module IR (`kotoba.engine-clj.codegen/compile`'s return value) -> a
+  vector of bytes for a complete WASM core module. Mirrors
+  `codegen.rs::compile`'s section assembly (lines ~47-229): type, import,
+  function, memory, global, export, code, data — same order, same content,
+  same `cabi_realloc` bump-allocator special-case."
+  [ir]
+  (let [host-imports (:host-imports ir)
+        import-base (count host-imports)
+        guest-fns (:functions ir)
+
+        ;; --- type section: one entry per host-import signature, one per
+        ;; distinct guest-function arity (all i64->i64), plus cabi_realloc's
+        ;; fixed (i32 i32 i32 i32)->i32 signature. Matches the Rust original's
+        ;; `type_for_arity` cache — re-derive it the same way here so
+        ;; `:function-section`'s typeidx references line up.
+        import-functypes (mapv (fn [hi] (host-import-functype (:param-kinds hi) (:return-kind hi)))
+                                host-imports)
+        arities (into (sorted-set) (map (fn [f] (count (:params f))) guest-fns))
+        arity->typeidx (into {} (map-indexed (fn [i a] [a (+ import-base i)])) arities)
+        realloc-typeidx (+ import-base (count arities))
+        types (into import-functypes
+                     (into (mapv (fn [a] [(vec (repeat a :i64)) [:i64]]) arities)
+                           [[[:i32 :i32 :i32 :i32] [:i32]]]))
+        type-section (section 1 (vec-encode (mapv (fn [[p r]] (functype-bytes p r)) types)))
+
+        ;; --- import section
+        import-entries (mapv (fn [hi]
+                                (let [[modname field] (:module-field hi)]
+                                  (-> (utf8-name modname)
+                                      (into (utf8-name field))
+                                      (conj 0x00)
+                                      (into (uleb128 (:index hi))))))
+                              host-imports)
+        import-section (section 2 (vec-encode import-entries))
+
+        ;; --- function section (typeidx per defined function, in index
+        ;; order: guest functions first, then cabi_realloc)
+        func-typeidxs (into (mapv (fn [f] (get arity->typeidx (count (:params f)))) guest-fns)
+                             [realloc-typeidx])
+        function-section (section 3 (vec-encode (mapv uleb128 func-typeidxs)))
+
+        ;; --- memory section (one memory, matching heap-start/min-pages)
+        min-pages (or (:min-pages ir)
+                       (max 1 (long (Math/ceil (/ (double (:heap-start ir)) 65536.0)))))
+        memory-section (section 5 (vec-encode [(into [0x00] (uleb128 min-pages))]))
+
+        ;; --- global section: global 0 = heap pointer (i32, mutable), then
+        ;; one mutable i64 global per `defatom` cell, in declared order.
+        heap-global-bytes (-> [0x7F 0x01]
+                               (into [0x41]) (into (sleb128 (:heap-start ir)))
+                               (conj 0x0B))
+        atom-global-bytes (mapv (fn [a]
+                                   (-> [0x7E 0x01]
+                                       (into [0x42]) (into (sleb128 (:init a)))
+                                       (conj 0x0B)))
+                                 (:atoms ir))
+        global-section (section 6 (vec-encode (into [heap-global-bytes] atom-global-bytes)))
+
+        ;; --- export section: guest functions, "memory", "cabi_realloc",
+        ;; then one export per defatom global (host-readable game state).
+        realloc-idx (:index (:cabi-realloc ir))
+        func-exports (mapv (fn [f] (-> (utf8-name (:name f)) (conj 0x00) (into (uleb128 (:index f)))))
+                            guest-fns)
+        mem-export [(-> (utf8-name "memory") (conj 0x02) (into (uleb128 0)))]
+        realloc-export [(-> (utf8-name "cabi_realloc") (conj 0x00) (into (uleb128 realloc-idx)))]
+        atom-exports (mapv (fn [a] (-> (utf8-name (:name a)) (conj 0x03) (into (uleb128 (:global-index a)))))
+                            (:atoms ir))
+        export-section (section 7 (vec-encode (-> [] (into func-exports) (into mem-export)
+                                                    (into realloc-export) (into atom-exports))))
+
+        ;; --- code section: one entry per guest function, then cabi_realloc.
+        ;; Locals-decl vec = a single (count, i64) run for the non-param
+        ;; locals `codegen.cljc` allocated (all guest locals are i64, the
+        ;; all-i64 ABI's whole point) -- cabi_realloc declares zero extra
+        ;; locals (its 4 params ARE the i32 locals it uses, matching the
+        ;; original Rust `Function::new([])`).
+        code-fn-bytes (fn [locals-decl body]
+                        (let [payload (-> (vec-encode locals-decl)
+                                           (into body)
+                                           (conj 0x0B))]
+                          (into (uleb128 (count payload)) payload)))
+        guest-code (mapv (fn [f]
+                            (let [extra (- (:locals-count f) (count (:params f)))
+                                  locals-decl (if (pos? extra) [(into (uleb128 extra) [0x7E])] [])]
+                              (code-fn-bytes locals-decl (body->bytes (:body f)))))
+                          guest-fns)
+        realloc-code [(code-fn-bytes [] (body->bytes (:body (:cabi-realloc ir))))]
+        ;; each of guest-code/realloc-code is already a fully-encoded,
+        ;; self-size-prefixed function-body byte vector (`code-fn-bytes`
+        ;; already emitted its own leading `uleb128(count(payload))`) — the
+        ;; vec(func) production just needs `uleb128(num-functions)` in front
+        ;; and the bodies spliced in one level, i.e. the DEFAULT (non-raw)
+        ;; `vec-encode`, not `raw? true` (which would push whole byte-vectors
+        ;; in as if each were a single already-raw byte).
+        code-section (section 10 (vec-encode (into guest-code realloc-code)))
+
+        ;; --- data section (only emitted if there are string literals,
+        ;; matching the original: `if !literals.blob.is_empty() { ... }`)
+        blob (:blob (:literals ir))
+        data-section (when (seq blob)
+                       (section 11 (vec-encode
+                                     [(-> [0x00 0x41] (into (sleb128 1024)) (conj 0x0B)
+                                          (into (vec-encode blob true)))])))]
+
+    (-> [0x00 0x61 0x73 0x6D 0x01 0x00 0x00 0x00] ;; magic "\0asm" + version 1
+        (into type-section) (into import-section) (into function-section)
+        (into memory-section) (into global-section) (into export-section)
+        (into code-section)
+        (cond-> data-section (into data-section)))))
+
+(defn emit-module-bytes
+  "Like `emit-module`, but returns a real byte array/`Uint8Array` for the
+  host platform instead of a plain vector of ints — the form callers
+  actually need to write a `.wasm` file or hand to a WASM runtime."
+  [ir]
+  (let [v (emit-module ir)]
+    #?(:clj (byte-array (map (fn [b] (unchecked-byte b)) v))
+       :cljs (js/Uint8Array. (clj->js v)))))
