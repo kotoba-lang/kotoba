@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.robotics` | `kotoba.robotics/src` | `kotoba.robotics`, `kotoba.robotics.export`, `kotoba.robotics.process`, `kotoba.robotics.process.fluid` (Kotoba project library) |
 | `kotoba.kudaki` | `kotoba.kudaki/src` | `kudaki.contact`, `kudaki.demo`, `kudaki.element`, `kudaki.integrate` (Kotoba project library) |
 | `kotoba.catalogMaturity` | `kotoba.catalogMaturity/src` | `catalog-maturity.core` (Kotoba project library) |
 | `kotoba.cartpoleMath` | `kotoba.cartpoleMath/src` | `kami.cartpole-math`, `kotoba.cartpole-math` (Kotoba project library) |

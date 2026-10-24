@@ -1,0 +1,107 @@
+(ns kotoba.robotics.process.thermal
+  "Transient 1-D conduction through a slab (a wall, a panel, a mould, a
+  part in an oven, a packaged sample on a hot plate, a battery cell),
+  time-stepped by the explicit FTCS scheme at a Fourier number of 0.35; the
+  convective faces add their own bound so the half-cell update stays
+  positive (2 Fo + 2 Bi Fo <= 0.9).
+
+  Front face (x = 0): convection from a fluid at the hot-side temperature
+  with coefficient `:h-front-w-m2k`, or held at it when `:front-fixed? true`.
+  The hot-side temperature is `:t-hot-c`, or with `:hot-curve :iso-834` the
+  ISO 834-1 standard fire curve T = T0 + 345 log10(8 t/min + 1) from `:t0-c`
+  (945 C at 60 min for T0 = 20 C). After `:heating-s` (default: the whole
+  run) the hot side drops to `:t-cool-c` (default `:t-back-ambient-c`), so
+  the run also measures the heat still arriving at the back face after the
+  exposure ends -- where a thick wall's back face peaks.
+  Back face: convection to `:t-back-ambient-c` with `:h-back-w-m2k` (0 =
+  adiabatic), or held at it when `:back-fixed? true`.
+  `:q-gen-w-m3`: volumetric heat generated inside the slab (battery losses,
+  curing, a heating element).
+
+  The quantities robots and governors care about: when the back face (the
+  protected side: the cold side of a fire wall, the core of a part) reaches
+  `:threshold-c` (or, with `:threshold-direction :falling`, when it cools down
+  to it), its temperature at the end, and its peak and when.
+
+  Held to (tests): a fixed-temperature front with a fixed back reaches the
+  linear steady profile; with both faces adiabatic the heat content never
+  changes, and with generation it rises by exactly q L t; the fire curve
+  matches ISO 834 at 60 min; a thick wall's back face peaks after the
+  exposure has ended.")
+
+(def defaults
+  {:thickness-m 0.05 :conductivity-w-mk 1.0 :density-kg-m3 2000.0 :specific-heat-j-kgk 900.0
+   :t0-c 20.0 :t-hot-c 600.0 :h-front-w-m2k 25.0 :t-back-ambient-c 20.0 :h-back-w-m2k 10.0
+   :threshold-c 140.0 :duration-s 3600.0 :nodes 21 :front-fixed? false :back-fixed? false
+   :hot-curve nil :heating-s nil :t-cool-c nil :q-gen-w-m3 0.0
+   :threshold-direction :rising})
+
+(defn iso-834
+  "ISO 834-1 standard fire curve: gas temperature [C] at `t-s` from `t0-c`."
+  [t0-c t-s]
+  (+ t0-c (* 345.0 (/ (Math/log (+ 1.0 (* 8.0 (/ t-s 60.0)))) (Math/log 10.0)))))
+
+(defn simulate
+  "Run the slab. Returns scalar quantities plus `:back-history` samples."
+  [params]
+  (let [{:keys [thickness-m conductivity-w-mk density-kg-m3 specific-heat-j-kgk t0-c t-hot-c
+                h-front-w-m2k t-back-ambient-c h-back-w-m2k threshold-c duration-s nodes
+                front-fixed? back-fixed? hot-curve heating-s t-cool-c q-gen-w-m3 threshold-direction]}
+        (merge defaults params)
+        n (long nodes)
+        dx (/ thickness-m (dec n))
+        alpha (/ conductivity-w-mk (* density-kg-m3 specific-heat-j-kgk))
+        ;; half-cells at the faces carry half the capacity: conduction takes
+        ;; 2 Fo = 0.7 of their update budget, convection at most 0.2 more
+        dt (min (/ (* 0.35 dx dx) alpha)
+                (if (and (not front-fixed?) (pos? h-front-w-m2k)) (/ (* 0.1 density-kg-m3 specific-heat-j-kgk dx) h-front-w-m2k) 1e30)
+                (if (and (not back-fixed?) (pos? h-back-w-m2k)) (/ (* 0.1 density-kg-m3 specific-heat-j-kgk dx) h-back-w-m2k) 1e30))
+        steps (long (Math/ceil (/ duration-s dt)))
+        cap (* density-kg-m3 specific-heat-j-kgk dx)   ; J/(m^2 K) per interior node
+        k conductivity-w-mk
+        heat-end (or heating-s ##Inf)   ; unset: the hot side never switches off
+        cool (double (or t-cool-c t-back-ambient-c))
+        hot-at (fn [t] (cond (> t heat-end) cool
+                             (= hot-curve :iso-834) (iso-834 t0-c t)
+                             :else (double t-hot-c)))
+        step-fn (fn [T t]
+                  (let [last-i (dec n) th (hot-at t)]
+                    (mapv (fn [i]
+                            (let [Ti (nth T i)
+                                  q-left (if (zero? i)
+                                           (* h-front-w-m2k (- th Ti))
+                                           (* (/ k dx) (- (nth T (dec i)) Ti)))
+                                  q-right (if (= i last-i)
+                                            (* h-back-w-m2k (- t-back-ambient-c Ti))
+                                            (* (/ k dx) (- (nth T (inc i)) Ti)))
+                                  face? (or (zero? i) (= i last-i))
+                                  c (if face? (/ cap 2.0) cap)
+                                  gen (* q-gen-w-m3 (if face? (/ dx 2.0) dx))]
+                              (cond (and front-fixed? (zero? i)) th
+                                    (and back-fixed? (= i last-i)) (double t-back-ambient-c)
+                                    :else (+ Ti (* dt (/ (+ q-left q-right gen) c))))))
+                          (range n))))
+        sample (max 1 (quot steps 60))]
+    (loop [s 0
+           T (cond-> (vec (repeat n (double t0-c)))
+               front-fixed? (assoc 0 (hot-at 0.0))
+               back-fixed? (assoc (dec n) (double t-back-ambient-c)))
+           cross nil peak (double t0-c) t-peak 0.0 hist []]
+      (let [t (* s dt)
+            back (peek T)
+            cross (or cross (when (if (= threshold-direction :falling) (<= back threshold-c) (>= back threshold-c)) t))
+            [peak t-peak] (if (> back peak) [back t] [peak t-peak])
+            hist (if (zero? (mod s sample)) (conj hist [t back]) hist)]
+        (if (>= s steps)
+          {:time-to-threshold-s cross
+           :reached-threshold? (boolean cross)
+           :final-back-c back
+           :peak-back-c peak
+           :time-of-peak-back-s t-peak
+           :final-front-c (first T)
+           :final-hot-side-c (hot-at t)
+           :mean-c (/ (reduce + T) n)
+           :heat-content-j-m2 (* cap (- (reduce + T) (/ (+ (first T) (peek T)) 2.0)))
+           :dt-s dt :steps steps
+           :back-history hist}
+          (recur (inc s) (step-fn T t) cross peak t-peak hist))))))

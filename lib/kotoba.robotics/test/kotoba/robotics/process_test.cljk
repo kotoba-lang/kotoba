@@ -1,0 +1,233 @@
+(ns kotoba.robotics.process-test
+  "Each solver held to a physical law it cannot pass by accident, and the
+  spec runner held to refusing what it cannot measure -- each refusal by its
+  own reason."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.robotics.process :as process]
+            [kotoba.robotics.process.transport :as transport]
+            [kotoba.robotics.process.manipulator :as manipulator]
+            [kotoba.robotics.process.material :as material]
+            [kotoba.robotics.process.thermal :as thermal]
+            [kotoba.robotics.process.fluid :as fluid]))
+
+(defn- rel= [a b tol] (<= (Math/abs (- (double a) (double b))) (* tol (Math/abs (double b)))))
+
+;; ── transport ───────────────────────────────────────────────────────────
+
+(deftest transport-matches-trapezoid-when-not-force-limited
+  (let [p {:mass-kg 50.0 :payload-kg 10.0 :distance-m 30.0 :v-max-mps 1.5 :a-max-mps2 0.5
+           :brake-decel-mps2 0.8 :drive-force-n 2000.0 :dt-s 0.002}
+        r (transport/move p)]
+    (is (:reached? r))
+    (is (not (:drive-limited? r)))
+    (is (rel= (:cycle-time-s r) (transport/trapezoid-time 30.0 1.5 0.5 0.8) 0.01))))
+
+(deftest transport-short-leg-never-cruises
+  (let [r (transport/move {:distance-m 0.5 :v-max-mps 2.0 :a-max-mps2 0.5 :brake-decel-mps2 0.5
+                           :drive-force-n 5000.0 :dt-s 0.001})]
+    (is (< (:peak-speed-mps r) 2.0))
+    (is (rel= (:cycle-time-s r) (transport/trapezoid-time 0.5 2.0 0.5 0.5) 0.02))))
+
+(deftest heavier-payload-is-slower-once-force-limited-and-finally-stalls
+  (let [t (fn [kg] (:cycle-time-s (transport/move {:payload-kg kg :drive-force-n 120.0})))]
+    (is (< (t 10.0) (t 200.0)))
+    (let [stalled (transport/move {:payload-kg 900.0 :drive-force-n 120.0})]
+      (is (:stalled? stalled))
+      (is (false? (:reached? stalled))))))
+
+(deftest tip-over-margin-falls-with-cog-height
+  (let [m (fn [h] (:min-tipover-margin (transport/move {:cog-height-m h})))]
+    (is (> (m 0.3) (m 0.9)))))
+
+;; ── manipulator ─────────────────────────────────────────────────────────
+
+(deftest static-horizontal-torque-is-the-moment-of-the-weights
+  (let [p {:l1-m 0.4 :l2-m 0.3 :m1-kg 2.0 :m2-kg 1.5 :payload-kg 0.5}
+        [t1 t2] (manipulator/torques p [0.0 0.0] [0.0 0.0] [0.0 0.0])
+        g manipulator/g]
+    (is (rel= t1 (* g (+ (* 2.0 0.2) (* 1.5 (+ 0.4 0.15)) (* 0.5 0.7))) 1e-9))
+    (is (rel= t2 (* g (+ (* 1.5 0.15) (* 0.5 0.3))) 1e-9))))
+
+(deftest joint-work-equals-potential-change-over-a-rest-to-rest-move
+  (testing "work-energy theorem: a wrong inertia or Coriolis term breaks this"
+    (let [r (manipulator/pick-place {:from [0.5 0.0] :to [0.05 0.6] :duration-s 1.2 :steps 1200 :payload-kg 2.0})]
+      (is (:reachable? r))
+      (is (rel= (:joint-work-j r) (:delta-potential-j r) 0.005)))))
+
+(deftest faster-moves-need-more-torque-and-heavier-payloads-too
+  (let [pk (fn [o] (:peak-tau1-nm (manipulator/pick-place o)))]
+    (is (> (pk {:duration-s 0.5}) (pk {:duration-s 3.0})))
+    (is (> (pk {:payload-kg 5.0}) (pk {:payload-kg 0.5})))))
+
+(deftest unreachable-target-invents-no-torque
+  (is (= {:reachable? false} (manipulator/pick-place {:to [2.0 2.0]}))))
+
+;; ── material (kudaki) ───────────────────────────────────────────────────
+
+(deftest elastic-stiffness-is-ea-over-l-and-below-yield-nothing-yields
+  (let [r (material/tensile-test {:max-force-n 15000.0})]   ; sigma_y*A = 25 kN
+    (is (rel= (:elastic-stiffness-n-per-m r) (:theoretical-stiffness-n-per-m r) 0.02))
+    (is (not (:yielded? r)))))
+
+(deftest yield-load-is-found-near-sigma-y-times-area
+  (let [r (material/tensile-test {:max-force-n 35000.0})]
+    (is (:yielded? r))
+    (is (rel= (:yield-force-n r) (:nominal-yield-force-n r) 0.05))
+    (is (pos? (:plastic-energy-j r)))))
+
+(deftest a-stiffer-longer-specimen-answers-differently
+  (let [k (fn [o] (:elastic-stiffness-n-per-m (material/tensile-test (merge {:max-force-n 10000.0} o))))]
+    (is (rel= (k {:length-m 0.2}) (/ (k {:length-m 0.1}) 2.0) 0.03))
+    (is (> (k {:youngs-modulus-pa 400e9}) (k {})))))
+
+;; the 0.2 % offset rule: yield at (sigma_y + H * 0.002) * A = 25.2 kN, to 1 %.
+;; With the old fast ramp (400 transits, 8 elements) the undamped bar's own
+;; inertia read +2.1 %, and minimum-yield checks passed bars below spec
+;; (SD345 from 333.7 MPa) -- this is what pins the quasi-static default.
+(deftest yield-is-the-0-2-percent-offset-load
+  (let [r (material/tensile-test {:max-force-n 35000.0})]
+    (is (> (:yield-force-n r) (:nominal-yield-force-n r)))
+    (is (rel= (:yield-force-n r) (* (+ 250.0e6 (* 1.0e9 0.002)) 1.0e-4) 0.01))))
+
+(deftest a-peak-far-past-yield-still-fits-the-elastic-line
+  (testing "max force 8x the yield load: 25 % of it is twice the yield load"
+    (let [r (material/tensile-test {:max-force-n 200000.0})]
+      (is (rel= (:elastic-stiffness-n-per-m r) (:theoretical-stiffness-n-per-m r) 0.02))
+      (is (rel= (:yield-force-n r) (* (+ 250.0e6 (* 1.0e9 0.002)) 1.0e-4) 0.02)))))
+
+(deftest a-peak-twenty-times-the-yield-load-still-reads-yield
+  (let [r (material/tensile-test {:area-m2 8.78e-6 :yield-stress-pa 240e6 :max-force-n 40000.0})]
+    (is (number? (:yield-force-n r)))
+    (is (rel= (:yield-force-n r) (:nominal-yield-force-n r) 0.05))))
+
+(deftest a-bar-below-the-minimum-yield-does-not-pass-it
+  (testing "sigma_y 2 % under 345 MPa must read under 345 MPa x A"
+    (let [area 1.0e-4
+          r (material/tensile-test {:yield-stress-pa (* 0.98 345.0e6) :area-m2 area :max-force-n 45000.0})]
+      (is (< (:yield-force-n r) (* 345.0e6 area))))))
+
+;; ── thermal ─────────────────────────────────────────────────────────────
+
+(deftest fixed-faces-reach-a-linear-steady-profile
+  (let [r (thermal/simulate {:front-fixed? true :back-fixed? true :t-hot-c 100.0 :t-back-ambient-c 0.0
+                             :t0-c 0.0 :thickness-m 0.02 :duration-s 20000.0 :nodes 11})]
+    (is (rel= (:mean-c r) 50.0 0.01))))
+
+(deftest the-hot-side-stays-on-when-heating-s-is-unset
+  (is (= 600.0 (:final-hot-side-c (thermal/simulate {:duration-s 100.0})))))
+
+(deftest adiabatic-slab-conserves-heat
+  (let [r0 (thermal/simulate {:h-front-w-m2k 0.0 :h-back-w-m2k 0.0 :duration-s 0.0})
+        r1 (thermal/simulate {:h-front-w-m2k 0.0 :h-back-w-m2k 0.0 :duration-s 5000.0})]
+    (is (rel= (:heat-content-j-m2 r1) (:heat-content-j-m2 r0) 1e-9))))
+
+(deftest thicker-wall-delays-the-back-face
+  (let [t (fn [L] (:time-to-threshold-s (thermal/simulate {:thickness-m L :front-fixed? true :t-hot-c 800.0
+                                                           :duration-s 20000.0 :h-back-w-m2k 0.0})))]
+    (is (< (t 0.03) (t 0.06)))))
+
+;; ── fluid ───────────────────────────────────────────────────────────────
+
+(deftest drain-time-matches-torricelli-closed-form
+  (let [p {:dt-s 0.05}
+        r (fluid/tank-drain p)]
+    (is (rel= (:time-to-target-s r) (fluid/drain-time-closed-form (merge fluid/tank-defaults p)) 0.002))))
+
+(deftest inflow-above-orifice-capacity-never-drains
+  (let [r (fluid/tank-drain {:q-in-m3s 0.02 :max-time-s 5000.0})]
+    (is (not (:reached-target? r)))
+    (is (> (:equilibrium-level-m r) 2.0))))
+
+(deftest laminar-friction-is-64-over-re-and-turbulent-agrees-with-haaland
+  (let [lam (fluid/pipe-flow {:q-m3s 1e-5 :viscosity-pa-s 0.1})
+        tur (fluid/pipe-flow {:q-m3s 0.01})]
+    (is (:laminar? lam))
+    (is (rel= (:friction-factor lam) (/ 64.0 (:reynolds lam)) 1e-12))
+    (is (rel= (:friction-factor tur) (fluid/haaland (:reynolds tur) (/ 4.5e-5 0.05)) 0.02))))
+
+;; ── extensions: fire curve, cool-down, generation, slope, payload CoG ──
+
+(deftest iso-834-matches-the-standard-at-60-minutes
+  (is (rel= (thermal/iso-834 20.0 3600.0) 945.3 0.001))
+  (is (< (thermal/iso-834 20.0 600.0) (thermal/iso-834 20.0 1800.0))))
+
+(deftest a-thick-wall-back-face-peaks-after-the-fire-ends
+  (let [r (thermal/simulate {:thickness-m 0.10 :hot-curve :iso-834 :heating-s 3600.0
+                             :duration-s 14400.0 :h-back-w-m2k 5.0})]
+    (is (> (:time-of-peak-back-s r) 3600.0))
+    (is (> (:peak-back-c r) (:final-back-c r)))))
+
+(deftest adiabatic-generation-adds-exactly-q-l-t
+  (let [base {:h-front-w-m2k 0.0 :h-back-w-m2k 0.0 :q-gen-w-m3 5000.0 :thickness-m 0.05}
+        r0 (thermal/simulate (assoc base :duration-s 0.0))
+        r1 (thermal/simulate (assoc base :duration-s 2000.0))
+        t (* (:steps r1) (:dt-s r1))]
+    (is (rel= (- (:heat-content-j-m2 r1) (:heat-content-j-m2 r0)) (* 5000.0 0.05 t) 1e-9))))
+
+(deftest uphill-is-slower-and-too-steep-stalls
+  (let [t (fn [deg] (:cycle-time-s (transport/move {:slope-deg deg :drive-force-n 150.0 :payload-kg 40.0})))]
+    (is (< (t 0.0) (t 5.0)))
+    (is (:stalled? (transport/move {:slope-deg 20.0 :drive-force-n 150.0 :payload-kg 40.0})))))
+
+(deftest a-higher-stacked-heavier-payload-lowers-the-tip-over-margin
+  (let [m (fn [kg h] (:min-tipover-margin (transport/move {:payload-kg kg :payload-cog-height-m h})))]
+    (is (> (m 10.0 0.5) (m 40.0 0.5)))
+    (is (> (m 20.0 0.4) (m 20.0 1.2)))))
+
+;; ── slope tip-over, stopping distance, cooling threshold ──────────────
+
+(deftest a-grade-eats-the-tip-over-margin
+  (let [m (fn [deg] (:min-tipover-margin (transport/move {:slope-deg deg :drive-force-n 600.0})))]
+    (is (> (m 0.0) (m 8.0)))))
+
+(deftest stopping-distance-is-v-squared-over-2b
+  (let [r (transport/move {:v-max-mps 1.2 :brake-decel-mps2 1.0})]
+    (is (rel= (:stopping-distance-m r) (/ (* 1.2 1.2) 2.0) 1e-9))))
+
+(deftest a-cooling-part-reports-when-it-falls-to-the-threshold
+  (let [r (thermal/simulate {:t0-c 200.0 :t-hot-c 20.0 :h-front-w-m2k 50.0 :h-back-w-m2k 0.0
+                             :threshold-c 60.0 :threshold-direction :falling :duration-s 20000.0
+                             :thickness-m 0.02})]
+    (is (number? (:time-to-threshold-s r)))
+    (is (< (:final-back-c r) 60.0))))
+
+;; ── the spec runner ─────────────────────────────────────────────────────
+
+(def spec
+  {:physics/schema "itonami.physical-ai.spec.v1"
+   :repo "cloud-itonami/example"
+   :cases [{:id :courier :kind :transport :procedure "document courier leg"
+            :params {:distance-m 40.0 :drive-force-n 150.0}
+            :sweep {:param :payload-kg :values [5.0 20.0 60.0]}
+            :quantity :cycle-time-s
+            :limit {:max 45.0 :basis "estimate: one floor-to-floor leg"}
+            :boundary {:lo 1.0 :hi 2000.0}}]})   ; stalls near 960 kg at 150 N
+
+(deftest probe-measures-every-run-and-finds-the-boundary
+  (let [p (process/probe spec)
+        b (get-in p [:derived :courier])]
+    (is (= "itonami.physical-ai.probe.v1" (:physics-probe/schema p)))
+    (is (= 3 (:count p) (:expected p)))
+    (is (number? (:value b)))
+    (testing "the boundary really separates pass from fail"
+      (let [c (first (:cases spec))]
+        (is (not= (:out-of-tolerance? (process/run-case c (* 0.98 (:value b))))
+                  (:out-of-tolerance? (process/run-case c (* 1.02 (:value b))))))))))
+
+(deftest spec-refusals-name-their-reason
+  (is (some #(re-find #"schema is not" %) (process/spec-problems (dissoc spec :physics/schema))))
+  (is (some #(re-find #"unknown :kind" %) (process/spec-problems (assoc-in spec [:cases 0 :kind] :warp))))
+  (is (some #(re-find #":basis must say" %) (process/spec-problems (assoc-in spec [:cases 0 :limit :basis] ""))))
+  (is (some #(re-find #":sweep :values must be numbers" %) (process/spec-problems (assoc-in spec [:cases 0 :sweep :values] []))))
+  (is (= 0 (:count (process/probe (assoc spec :cases []))))))
+
+(deftest never-reaching-a-threshold-satisfies-a-min-and-fails-a-max
+  (let [c {:kind :thermal :quantity :time-to-threshold-s}
+        r {:time-to-threshold-s nil :reached-threshold? false}]
+    (is (false? (process/out-of-tolerance? (assoc c :limit {:min 600.0 :basis "x"}) r)))
+    (is (true? (process/out-of-tolerance? (assoc c :limit {:max 600.0 :basis "x"}) r)))))
+
+(deftest a-stall-is-a-measurement-and-out-of-tolerance
+  (let [r (process/run-case (assoc-in (first (:cases spec)) [:params :drive-force-n] 20.0) 500.0)]
+    (is (not (:error r)))
+    (is (true? (:out-of-tolerance? r)))))

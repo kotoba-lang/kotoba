@@ -1,0 +1,107 @@
+(ns kotoba.robotics.process.transport
+  "A mobile robot (AMR / AGV / courier cart) carrying a payload from rest to
+  rest over a straight leg, time-stepped.
+
+  Longitudinal dynamics of one rigid body: the drive supplies at most
+  `:drive-force-n`, rolling resistance is `crr * m * g`, acceleration is
+  further capped by `:a-max-mps2` (the controller's limit) and speed by
+  `:v-max-mps`. The robot starts braking at `:brake-decel-mps2` when the
+  remaining distance falls to its stopping distance. Integration is
+  semi-implicit Euler at `:dt-s`.
+
+  What makes this physics rather than a formula: whether the leg is
+  force-limited or controller-limited, whether it ever reaches cruise, and
+  whether the drive can overcome rolling resistance at all (a payload too
+  heavy STALLS, `:reached? false`) all come out of the integration. The
+  closed form it must agree with when unconstrained by force is the
+  trapezoid `t = d/v + v/(2a) + v/(2b)` (pinned in the tests).
+
+  `:slope-deg` (uphill positive) adds the grade force `m g sin(theta)` to the
+  resistance the drive must overcome (a slope too steep for the drive
+  STALLS). Tip-over margin is the longitudinal static-stability margin of
+  the loaded robot under its own acceleration on the grade: `1 - (|a| + g sin(theta)) h /
+  (g cos(theta) s)`, with `s`
+  the horizontal distance from the CoG to the tipping edge and `h` the
+  combined CoG height -- `:cog-height-m` as given, or, when
+  `:payload-cog-height-m` is set, the mass-weighted height of the robot
+  (`:cog-height-m`) and its payload, so a heavier or higher-stacked load
+  lowers the margin. Below 0 the robot tips.")
+
+(def g 9.80665)
+
+(def defaults
+  {:mass-kg 60.0 :payload-kg 20.0 :distance-m 20.0 :v-max-mps 1.2
+   :a-max-mps2 0.8 :brake-decel-mps2 1.0 :drive-force-n 300.0 :crr 0.015
+   :cog-height-m 0.45 :support-half-length-m 0.30 :dt-s 0.01 :max-time-s 3600.0
+   :slope-deg 0.0 :payload-cog-height-m nil})
+
+(defn move
+  "Run one leg. Returns scalar quantities plus a thinned `:trajectory`."
+  [params]
+  (let [{:keys [mass-kg payload-kg distance-m v-max-mps a-max-mps2 brake-decel-mps2
+                drive-force-n crr cog-height-m support-half-length-m dt-s max-time-s
+                slope-deg payload-cog-height-m]}
+        (merge defaults params)
+        m (+ (double mass-kg) (double payload-kg))
+        theta (* slope-deg (/ Math/PI 180.0))
+        ;; rolling resistance on the normal force, plus the grade component
+        roll (+ (* crr m g (Math/cos theta)) (* m g (Math/sin theta)))
+        cog-height-m (if payload-cog-height-m
+                       (/ (+ (* mass-kg cog-height-m) (* payload-kg payload-cog-height-m)) m)
+                       cog-height-m)
+        a-drive (/ (- drive-force-n roll) m)
+        a-up (min a-max-mps2 a-drive)
+        b (double brake-decel-mps2)
+        dt (double dt-s)
+        steps-max (long (/ max-time-s dt))]
+    (if (<= a-up 0.0)
+      {:reached? false :stalled? true :cycle-time-s nil :peak-speed-mps 0.0
+       :peak-accel-mps2 0.0 :energy-j 0.0 :min-tipover-margin 1.0
+       :final-position-m 0.0 :steps 0 :rolling-resistance-n roll
+       :drive-limited? true :trajectory []}
+      (loop [i 0 x 0.0 v 0.0 e 0.0 peak-v 0.0 peak-a 0.0 braking? false traj []]
+        (let [remaining (- distance-m x)
+              stop-d (/ (* v v) (* 2.0 b))
+              brake? (or braking? (and (pos? v) (<= remaining stop-d)))
+              a (cond brake? (- b)
+                      (< v v-max-mps) (min a-up (/ (- v-max-mps v) dt))
+                      :else 0.0)
+              v' (max 0.0 (+ v (* a dt)))
+              x' (+ x (* v' dt))
+              tractive (if brake? 0.0 (+ (* m (max a 0.0)) roll))
+              e' (+ e (* tractive v' dt))
+              traj' (if (zero? (mod i 50)) (conj traj {:t (* i dt) :x x' :v v' :a a}) traj)]
+          (cond
+            (and brake? (zero? v'))
+            {:reached? (>= x' (* 0.98 distance-m)) :stalled? false
+             :cycle-time-s (* (inc i) dt) :peak-speed-mps peak-v
+             :peak-accel-mps2 (max peak-a b) :energy-j e'
+             ;; tipping about the downhill edge: the worst longitudinal
+             ;; acceleration plus the grade's own component, against the
+             ;; restoring moment of the weight's normal component
+             :min-tipover-margin (- 1.0 (/ (* (+ (max peak-a b) (* g (Math/abs (Math/sin theta)))) cog-height-m)
+                                           (* g (Math/cos theta) support-half-length-m)))
+             :stopping-distance-m (/ (* peak-v peak-v) (* 2.0 b))
+             :final-position-m x' :steps (inc i) :rolling-resistance-n roll
+             :combined-cog-height-m cog-height-m
+             :drive-limited? (< a-drive a-max-mps2) :trajectory traj'}
+
+            (>= i steps-max)
+            {:reached? false :stalled? false :cycle-time-s nil :peak-speed-mps peak-v
+             :peak-accel-mps2 peak-a :energy-j e' :min-tipover-margin nil
+             :final-position-m x' :steps i :rolling-resistance-n roll
+             :drive-limited? (< a-drive a-max-mps2) :trajectory traj'}
+
+            :else
+            (recur (inc i) x' v' e' (max peak-v v') (max peak-a (Math/abs (double a)))
+                   brake? traj')))))))
+
+(defn trapezoid-time
+  "Closed-form rest-to-rest time for constant accel `a`, decel `b`, cruise
+  `v` over `d` (triangular profile when the leg is too short to cruise)."
+  [d v a b]
+  (let [d-ramps (+ (/ (* v v) (* 2 a)) (/ (* v v) (* 2 b)))]
+    (if (>= d d-ramps)
+      (+ (/ d v) (/ v (* 2 a)) (/ v (* 2 b)))
+      (let [vp (Math/sqrt (/ (* 2 d a b) (+ a b)))]
+        (+ (/ vp a) (/ vp b))))))
