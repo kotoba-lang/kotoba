@@ -1,0 +1,287 @@
+(ns sd-jwt-vc.core-test
+  (:require [kotoba.json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ed25519.core :as ed]
+            [jws.core]
+            [sd-jwt.core :as sd]
+            [sd-jwt-vc.core :as vc]))
+
+;; Real Ed25519 for both the issuer and the holder — the point of this library is
+;; composition, and a toy signer would not prove the pieces fit.
+(def issuer-seed (byte-array (repeat 32 (byte 11))))
+(def holder-seed (byte-array (repeat 32 (byte 22))))
+(def issuer-pub (delay (ed/pubkey-from-seed issuer-seed)))
+(def holder-pub (delay (ed/pubkey-from-seed holder-seed)))
+
+(defn- salts [] (let [n (atom 0)] (fn [] (str "salt000000000000000000" (swap! n inc)))))
+
+(defn- base-opts []
+  {:json-encode json/write-str
+   :json-decode #(json/read-str %)
+   :salt-fn (salts)
+   :shuffle-fn identity
+   :alg "EdDSA"})
+
+(defn- issuer-opts [] (assoc (base-opts) :sign (fn [i] (ed/sign issuer-seed i))))
+(defn- holder-opts [] (assoc (base-opts) :sign (fn [i] (ed/sign holder-seed i))))
+
+(def claims
+  {"iss" "https://acme.example"
+   "vct" "https://acme.example/credentials/membership"
+   "exp" 1893456000
+   "cnf" {"jwk" {"kty" "OKP" "crv" "Ed25519"}}
+   "role" "auditor"
+   "name" "Alice"
+   "employee_id" "E-1234"})
+
+(defn- verify-opts [& {:as extra}]
+  (merge (base-opts)
+         {:expected-alg "EdDSA"
+          :verify (fn [i s] (ed/verify @issuer-pub i s))}
+         extra))
+
+;; ── the seven protected claims ───────────────────────────────────────────────
+
+(deftest protected-claims-cannot-be-concealed
+  (testing "each is load-bearing for the Verifier's own decision, so a Holder able
+            to withhold one would be choosing what the credential means"
+    (doseq [claim vc/protected-claims]
+      (let [payload (assoc claims claim (if (= "cnf" claim) {"jwk" {}} "x"))
+            e (try (vc/issue payload [[claim]] (issuer-opts))
+                   (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (= :sd-jwt-vc/protected-claim (:sd-jwt-vc/error (ex-data e)))
+            (str claim " must be refused")))))
+  (testing "and the list is exactly the seven the draft names"
+    (is (= #{"iss" "nbf" "exp" "cnf" "vct" "vct#integrity" "status"}
+           vc/protected-claims))))
+
+(deftest ordinary-claims-can-be-concealed
+  (let [{:keys [issuer-jwt disclosures]}
+        (vc/issue claims [["name"] ["employee_id"]] (issuer-opts))]
+    (is (= 2 (count disclosures)))
+    (testing "the signed payload keeps the protected claims in the clear"
+      (let [payload (json/read-str (jws.core/b64url->string
+                                    (second (str/split issuer-jwt #"\."))))]
+        (is (= "https://acme.example" (get payload "iss")))
+        (is (= 1893456000 (get payload "exp")))
+        (is (= "auditor" (get payload "role")))
+        (is (not (contains? payload "name")))))))
+
+;; ── typ ──────────────────────────────────────────────────────────────────────
+
+(deftest the-issuer-jwt-is-typed
+  (let [{:keys [issuer-jwt]} (vc/issue claims [["name"]] (issuer-opts))
+        header (json/read-str (jws.core/b64url->string (first (str/split issuer-jwt #"\."))))]
+    (is (= "dc+sd-jwt" (get header "typ")))))
+
+(deftest an-untyped-token-is-refused
+  (testing "explicit typing (RFC 8725): without it a token minted for another
+            purpose under the same key could be presented as a credential"
+    (let [{:keys [disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+          untyped (jws.core/sign {"alg" "EdDSA"}
+                                 (json/write-str (assoc claims "_sd_alg" "sha-256"))
+                                 (issuer-opts))
+          r (vc/verify (sd/present untyped disclosures) (verify-opts))]
+      (is (false? (:valid? r)))
+      (is (= :sd-jwt-vc/bad-typ (:reason r))))))
+
+(deftest the-legacy-typ-is-accepted-but-never-produced
+  ;; The first version of this asserted two constants and never used the token it
+  ;; built, which tested the source rather than the behaviour. It verifies a real
+  ;; legacy-typ presentation now.
+  (testing "we produce dc+sd-jwt"
+    (let [{:keys [issuer-jwt]} (vc/issue claims [["name"]] (issuer-opts))
+          header (json/read-str (jws.core/b64url->string
+                                 (first (str/split issuer-jwt #"\."))))]
+      (is (= "dc+sd-jwt" (get header "typ")))))
+
+  (testing "and still accept vc+sd-jwt during the transition the draft allows"
+    (let [{:keys [payload disclosures]}
+          (sd/conceal claims [["name"]] (assoc (base-opts) :salt-fn (salts)))
+          legacy (jws.core/sign {"alg" "EdDSA" "typ" "vc+sd-jwt"}
+                                (json/write-str payload) (issuer-opts))
+          r (vc/verify (sd/present legacy disclosures) (verify-opts))]
+      (is (:valid? r) (pr-str r))
+      (is (= "Alice" (get (:claims r) "name"))))))
+
+;; ── round trip without key binding ───────────────────────────────────────────
+
+(deftest a-presentation-discloses-only-what-was-forwarded
+  (let [{:keys [issuer-jwt disclosures]}
+        (vc/issue claims [["name"] ["employee_id"]] (issuer-opts))]
+    (testing "everything forwarded"
+      (let [r (vc/verify (sd/present issuer-jwt disclosures) (verify-opts))]
+        (is (:valid? r))
+        (is (= "Alice" (get (:claims r) "name")))
+        (is (= "E-1234" (get (:claims r) "employee_id")))))
+    (testing "nothing forwarded — the enterprise case"
+      (let [r (vc/verify (sd/present issuer-jwt []) (verify-opts))]
+        (is (:valid? r))
+        (is (= "auditor" (get (:claims r) "role")) "the role still proves out")
+        (is (not (contains? (:claims r) "name")))
+        (is (not (contains? (:claims r) "employee_id")))))
+    (testing "one of the two"
+      (let [r (vc/verify (sd/present issuer-jwt [(first disclosures)]) (verify-opts))]
+        (is (:valid? r))
+        (is (= "Alice" (get (:claims r) "name")))
+        (is (not (contains? (:claims r) "employee_id")))))))
+
+(deftest a-tampered-payload-fails-at-the-issuer-jwt
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+        [h _ s] (str/split issuer-jwt #"\.")
+        forged (str h "." (jws.core/b64url (json/write-str (assoc claims "role" "owner"))) "." s)
+        r (vc/verify (sd/present forged disclosures) (verify-opts))]
+    (is (false? (:valid? r)))
+    (is (= :issuer-jwt (:stage r)))))
+
+;; ── §4.3.1 sd_hash ───────────────────────────────────────────────────────────
+
+(def cross-host-sd-hash
+  "sd_hash over a fixed presentation prefix, pinned identically here and in
+   test/nbb_smoke.cljk.
+
+   §4.3.1 hashes the US-ASCII bytes of that prefix, so if the hosts encode them
+   differently a Holder on one produces a proof a Verifier on the other rejects as
+   :bad-sd-hash — which reads as tampering and is not.
+
+   Measured identical on both hosts 2026-07-31."
+  "_00mjj_YhwRTfK_jKgm8mqjuxlcnaupJJ_Ehm-A4Au4")
+
+(deftest sd-hash-matches-across-hosts
+  (is (= cross-host-sd-hash (vc/sd-hash "JWT~d1~d2~"))))
+
+
+(deftest sd-hash-includes-the-trailing-tilde
+  (testing "§4.3.1 hashes `<JWT>~<D.1>~…~<D.N>~`. Dropping the tilde produces a
+            digest that fails against every other implementation."
+    (let [prefix (vc/presentation-prefix "JWT" ["d1" "d2"])]
+      (is (= "JWT~d1~d2~" prefix))
+      (is (str/ends-with? prefix "~"))
+      (is (string? (vc/sd-hash prefix)))
+      (testing "and a prefix without it is refused rather than hashed anyway"
+        (is (= :sd-jwt-vc/prefix-missing-trailing-separator
+               (:sd-jwt-vc/error
+                (ex-data (try (vc/sd-hash "JWT~d1~d2")
+                              (catch clojure.lang.ExceptionInfo e e))))))))))
+
+(deftest sd-hash-changes-with-the-disclosure-set
+  (testing "this is what binds a holder proof to THIS set of disclosures"
+    (let [{:keys [issuer-jwt disclosures]}
+          (vc/issue claims [["name"] ["employee_id"]] (issuer-opts))]
+      (is (not= (vc/sd-hash (vc/presentation-prefix issuer-jwt disclosures))
+                (vc/sd-hash (vc/presentation-prefix issuer-jwt [(first disclosures)]))))
+      (is (not= (vc/sd-hash (vc/presentation-prefix issuer-jwt disclosures))
+                (vc/sd-hash (vc/presentation-prefix issuer-jwt [])))))))
+
+;; ── key binding ──────────────────────────────────────────────────────────────
+
+(defn- kb-verify-opts [& {:as extra}]
+  (merge (verify-opts)
+         {:require-key-binding? true
+          :expected-audience "https://verifier.example"
+          :expected-nonce "n-once-1"
+          :verify-holder (fn [i s] (ed/verify @holder-pub i s))}
+         extra))
+
+(deftest a-valid-key-binding-verifies
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+        kb (vc/key-binding-jwt issuer-jwt disclosures
+                               (assoc (holder-opts)
+                                      :audience "https://verifier.example"
+                                      :nonce "n-once-1" :iat 1893450000))
+        r (vc/verify (sd/present issuer-jwt disclosures kb) (kb-verify-opts))]
+    (is (:valid? r) (pr-str r))
+    (is (= "https://verifier.example" (get-in r [:key-binding :audience])))
+    (is (= "n-once-1" (get-in r [:key-binding :nonce])))))
+
+(deftest reusing-a-key-binding-with-fewer-disclosures-fails
+  (testing "the sd_hash covers the presentation, so dropping a Disclosure and
+            reusing the proof changes the hashed bytes — which is the point"
+    (let [{:keys [issuer-jwt disclosures]}
+          (vc/issue claims [["name"] ["employee_id"]] (issuer-opts))
+          kb (vc/key-binding-jwt issuer-jwt disclosures
+                                 (assoc (holder-opts)
+                                        :audience "https://verifier.example"
+                                        :nonce "n-once-1" :iat 1893450000))
+          fewer (sd/present issuer-jwt [(first disclosures)] kb)
+          r (vc/verify fewer (kb-verify-opts))]
+      (is (false? (:valid? r)))
+      (is (= :sd-jwt-vc/bad-sd-hash (:reason r))))))
+
+(deftest a-key-binding-for-another-verifier-or-nonce-fails
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+        kb (vc/key-binding-jwt issuer-jwt disclosures
+                               (assoc (holder-opts)
+                                      :audience "https://other.example"
+                                      :nonce "n-once-1" :iat 1893450000))
+        r (vc/verify (sd/present issuer-jwt disclosures kb) (kb-verify-opts))]
+    (is (= :sd-jwt-vc/bad-audience (:reason r))))
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+        kb (vc/key-binding-jwt issuer-jwt disclosures
+                               (assoc (holder-opts)
+                                      :audience "https://verifier.example"
+                                      :nonce "replayed" :iat 1893450000))
+        r (vc/verify (sd/present issuer-jwt disclosures kb) (kb-verify-opts))]
+    (is (= :sd-jwt-vc/bad-nonce (:reason r)))))
+
+(deftest a-key-binding-signed-by-the-wrong-key-fails
+  (testing "the holder key comes from `cnf`, not from the KB-JWT — accepting the
+            latter would let the Holder nominate themselves"
+    (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+          ;; signed by the ISSUER's key, presented as the holder's proof
+          kb (vc/key-binding-jwt issuer-jwt disclosures
+                                 (assoc (issuer-opts)
+                                        :audience "https://verifier.example"
+                                        :nonce "n-once-1" :iat 1893450000))
+          r (vc/verify (sd/present issuer-jwt disclosures kb) (kb-verify-opts))]
+      (is (false? (:valid? r)))
+      (is (= :kb-jwt (:stage r))))))
+
+(deftest a-missing-key-binding-is-refused-when-required
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+        r (vc/verify (sd/present issuer-jwt disclosures) (kb-verify-opts))]
+    (is (= :sd-jwt-vc/key-binding-required (:reason r)))))
+
+(deftest key-binding-requires-cnf-in-the-credential
+  (testing "§3.2.2: without cnf there is no key to check the KB-JWT against"
+    (let [{:keys [issuer-jwt disclosures]}
+          (vc/issue (dissoc claims "cnf") [["name"]] (issuer-opts))
+          kb (vc/key-binding-jwt issuer-jwt disclosures
+                                 (assoc (holder-opts)
+                                        :audience "https://verifier.example"
+                                        :nonce "n-once-1" :iat 1893450000))
+          r (vc/verify (sd/present issuer-jwt disclosures kb) (kb-verify-opts))]
+      (is (= :sd-jwt-vc/missing-cnf (:reason r))))))
+
+(deftest the-kb-jwt-must-be-typed
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [["name"]] (issuer-opts))
+        mistyped (jws.core/sign
+                  {"alg" "EdDSA" "typ" "JWT"}
+                  (json/write-str
+                   {"aud" "https://verifier.example" "nonce" "n-once-1" "iat" 1
+                    "sd_hash" (vc/sd-hash (vc/presentation-prefix issuer-jwt disclosures))})
+                  (holder-opts))
+        r (vc/verify (sd/present issuer-jwt disclosures mistyped) (kb-verify-opts))]
+    (is (= :sd-jwt-vc/bad-kb-typ (:reason r)))))
+
+;; ── required claims ──────────────────────────────────────────────────────────
+
+(deftest vct-and-iss-are-required-at-issuance
+  (is (= :sd-jwt-vc/missing-vct
+         (:sd-jwt-vc/error (ex-data (try (vc/issue (dissoc claims "vct") [] (issuer-opts))
+                                         (catch clojure.lang.ExceptionInfo e e))))))
+  (is (= :sd-jwt-vc/missing-iss
+         (:sd-jwt-vc/error (ex-data (try (vc/issue (dissoc claims "iss") [] (issuer-opts))
+                                         (catch clojure.lang.ExceptionInfo e e)))))))
+
+(deftest the-key-binding-builder-requires-its-claims
+  (let [{:keys [issuer-jwt disclosures]} (vc/issue claims [] (issuer-opts))]
+    (doseq [[missing opts] [[:sd-jwt-vc/missing-audience {:nonce "n" :iat 1}]
+                            [:sd-jwt-vc/missing-nonce {:audience "a" :iat 1}]
+                            [:sd-jwt-vc/missing-iat {:audience "a" :nonce "n"}]]]
+      (is (= missing
+             (:sd-jwt-vc/error
+              (ex-data (try (vc/key-binding-jwt issuer-jwt disclosures
+                                                (merge (holder-opts) opts))
+                            (catch clojure.lang.ExceptionInfo e e)))))))))
