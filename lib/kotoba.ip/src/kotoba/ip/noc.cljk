@@ -1,0 +1,172 @@
+(ns kotoba.ip.noc
+  "Network-on-Chip (NoC) topology synthesis and router generation.
+
+  Ported from kami-engine's `kami-ip` Rust crate (`src/noc.rs`). Pure data
+  synthesis — no network, no I/O, no GPU. Portable `.cljc` across JVM /
+  ClojureScript.")
+
+;; ---------------------------------------------------------------------------
+;; Area/latency model constants
+;; ---------------------------------------------------------------------------
+
+(def area-model
+  "Empirical area/latency model constants used by `generate-noc`. Canonical
+  source is `resources/kotoba/ip/noc/area_model.edn` (round-trip checked in
+  `test/kotoba/ip/noc_test.cljk`); embedded here as plain data so this
+  namespace stays usable without resource IO on every platform."
+  {:mesh {:port-cost 5000.0}
+   :ring {:node-multiplier 3.0 :port-cost 5000.0}
+   :crossbar {:port-cost 3000.0}
+   :tree {:node-multiplier 2.0 :port-cost 5000.0}
+   :width-baseline 32.0})
+
+(def routing-algorithms
+  "Routing algorithm."
+  #{:xy :west-first :odd-even})
+
+(def port-directions
+  "Router port direction."
+  #{:north :south :east :west :local})
+
+;; ---------------------------------------------------------------------------
+;; Constructors
+;; ---------------------------------------------------------------------------
+
+(defn mesh-topology
+  "2D mesh with `rows` x `cols` routers."
+  [rows cols]
+  {:type :mesh :rows rows :cols cols})
+
+(defn ring-topology
+  "Ring with `nodes` routers."
+  [nodes]
+  {:type :ring :nodes nodes})
+
+(defn crossbar-topology
+  "Full crossbar with `ports` router ports."
+  [ports]
+  {:type :crossbar :ports ports})
+
+(defn tree-topology
+  "Fat tree with `levels` levels."
+  [levels]
+  {:type :tree :levels levels})
+
+(defn noc-port
+  [direction bandwidth-gbps latency-cycles]
+  {:direction direction :bandwidth-gbps bandwidth-gbps :latency-cycles latency-cycles})
+
+(defn noc-config
+  "NoC configuration. `data-width`/`flit-size` are in bits; `routing` is one
+  of `routing-algorithms`."
+  [topology data-width flit-size routing]
+  {:topology topology :data-width data-width :flit-size flit-size :routing routing})
+
+;; ---------------------------------------------------------------------------
+;; Topology synthesis
+;; ---------------------------------------------------------------------------
+
+(defn- ilog2
+  "Floor of log2(n), for integer n >= 1. Matches Rust's `u32::ilog2`."
+  [n]
+  (loop [n n acc 0]
+    (if (<= n 1) acc (recur (quot n 2) (inc acc)))))
+
+(defn- local-port [link-bw]
+  {:direction :local :bandwidth-gbps link-bw :latency-cycles 0})
+
+(defn- mesh-router-and-links [r c rows cols link-bw link-latency]
+  (let [id (+ (* r cols) c)
+        north? (> r 0)
+        south? (< r (dec rows))
+        west? (> c 0)
+        east? (< c (dec cols))
+        ports (cond-> [(local-port link-bw)]
+                north? (conj {:direction :north :bandwidth-gbps link-bw :latency-cycles link-latency})
+                south? (conj {:direction :south :bandwidth-gbps link-bw :latency-cycles link-latency})
+                west? (conj {:direction :west :bandwidth-gbps link-bw :latency-cycles link-latency})
+                east? (conj {:direction :east :bandwidth-gbps link-bw :latency-cycles link-latency}))
+        links (cond-> []
+                north? (conj {:src-id id :dst-id (+ (* (dec r) cols) c) :bandwidth-gbps link-bw})
+                west? (conj {:src-id id :dst-id (+ (* r cols) (dec c)) :bandwidth-gbps link-bw}))]
+    [{:id id :x c :y r :ports ports} links]))
+
+(defn- mesh-design [{:keys [rows cols]} data-width link-bw link-latency]
+  (let [port-cost (get-in area-model [:mesh :port-cost])
+        width-baseline (:width-baseline area-model)
+        pairs (for [r (range rows) c (range cols)]
+                (mesh-router-and-links r c rows cols link-bw link-latency))
+        routers (mapv first pairs)
+        links (vec (mapcat second pairs))
+        total-ports (reduce + (map (comp count :ports) routers))
+        area (* total-ports port-cost (/ data-width width-baseline))
+        diameter (+ (dec rows) (dec cols))]
+    {:routers routers
+     :links links
+     :total-area-um2 area
+     :estimated-latency-cycles (+ (* diameter link-latency) 1)}))
+
+(defn- ring-design [{:keys [nodes]} data-width link-bw link-latency]
+  (let [port-cost (get-in area-model [:ring :port-cost])
+        node-multiplier (get-in area-model [:ring :node-multiplier])
+        width-baseline (:width-baseline area-model)
+        routers (mapv (fn [i]
+                        {:id i :x i :y 0
+                         :ports [(local-port link-bw)
+                                 {:direction :east :bandwidth-gbps link-bw :latency-cycles link-latency}
+                                 {:direction :west :bandwidth-gbps link-bw :latency-cycles link-latency}]})
+                      (range nodes))
+        links (mapv (fn [i] {:src-id i :dst-id (mod (inc i) nodes) :bandwidth-gbps link-bw})
+                    (range nodes))
+        area (* nodes node-multiplier port-cost (/ data-width width-baseline))
+        diameter (quot nodes 2)]
+    {:routers routers
+     :links links
+     :total-area-um2 area
+     :estimated-latency-cycles (+ (* diameter link-latency) 1)}))
+
+(defn- crossbar-design [{:keys [ports]} data-width link-bw]
+  (let [port-cost (get-in area-model [:crossbar :port-cost])
+        width-baseline (:width-baseline area-model)
+        routers (mapv (fn [i] {:id i :x i :y 0 :ports [(local-port link-bw)]})
+                      (range ports))
+        links (vec (for [i (range ports) j (range ports) :when (not= i j)]
+                     {:src-id i :dst-id j :bandwidth-gbps link-bw}))
+        area (* (double ports) ports port-cost (/ data-width width-baseline))]
+    {:routers routers
+     :links links
+     :total-area-um2 area
+     :estimated-latency-cycles 2}))
+
+(defn- tree-design [{:keys [levels]} data-width link-bw link-latency]
+  (let [port-cost (get-in area-model [:tree :port-cost])
+        node-multiplier (get-in area-model [:tree :node-multiplier])
+        width-baseline (:width-baseline area-model)
+        total-nodes (dec (bit-shift-left 1 levels))
+        routers (mapv (fn [i]
+                        {:id i :x i :y (ilog2 (inc i))
+                         :ports [(local-port link-bw)
+                                 {:direction :north :bandwidth-gbps link-bw :latency-cycles link-latency}]})
+                      (range total-nodes))
+        links (vec (keep (fn [i]
+                            (when (> i 0)
+                              {:src-id i :dst-id (quot (dec i) 2) :bandwidth-gbps link-bw}))
+                          (range total-nodes)))
+        area (* total-nodes node-multiplier port-cost (/ data-width width-baseline))]
+    {:routers routers
+     :links links
+     :total-area-um2 area
+     :estimated-latency-cycles (* 2 levels)}))
+
+(defn generate-noc
+  "Generate a NoC design from `config`. Creates routers and links according
+  to the topology, then estimates area and latency from data width, flit
+  size, and topology diameter."
+  [{:keys [topology data-width]}]
+  (let [link-bw (double data-width)
+        link-latency 1]
+    (case (:type topology)
+      :mesh (mesh-design topology data-width link-bw link-latency)
+      :ring (ring-design topology data-width link-bw link-latency)
+      :crossbar (crossbar-design topology data-width link-bw)
+      :tree (tree-design topology data-width link-bw link-latency))))
