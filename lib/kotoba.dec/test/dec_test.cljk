@@ -1,0 +1,138 @@
+(ns dec-test
+  "Ported 1:1 from kami-dec/src/lib.rs `mod tests` (kotoba-lang/kami-engine,
+  deleted in PR #82). See dec.cljc for restoration context (ADR-2607010930)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [dec :as dec]))
+
+(defn- sin* [x] #?(:clj (Math/sin (double x)) :cljs (js/Math.sin x)))
+(defn- abs* [x] #?(:clj (Math/abs (double x)) :cljs (js/Math.abs x)))
+(defn- nan? [x] #?(:clj (Double/isNaN x) :cljs (js/isNaN x)))
+
+(deftest namespace-loads
+  (testing "the restored CLJC namespace loads"
+    (is (some? (find-ns 'dec)))
+    (is (fn? dec/scalar-diffuse))))
+
+(deftest point-source-diffuses-isotropically
+  (let [f (dec/scalar-set (dec/scalar-field) 0 0 0 100.0)]
+    (is (= 0.0 (dec/scalar-get f 1 0 0)))
+    (let [f2 (dec/scalar-diffuse f 0.1 1.0 0.0)]
+      ;; Each of 6 neighbours receives α·dt·100 = 10. Centre drops by 60.
+      (is (< (abs* (- (dec/scalar-get f2 1 0 0) 10.0)) 0.01))
+      (is (< (abs* (- (dec/scalar-get f2 -1 0 0) 10.0)) 0.01))
+      (is (< (abs* (- (dec/scalar-get f2 0 0 0) 40.0)) 0.01)))))
+
+(deftest decay-prunes-empty-chunks
+  (let [f (dec/scalar-set (dec/scalar-field) 0 0 0 0.001)
+        f2 (dec/scalar-diffuse f 0.1 1.0 10.0)] ; heavy decay
+    (is (= 0 (dec/scalar-chunk-count f2)))))
+
+(deftest d1-of-d0-is-zero
+  ;; Bianchi identity: curl of a gradient vanishes.
+  (let [s (reduce (fn [s [x y z]]
+                     (dec/scalar-set s x y z (double (+ (* x x) (* 2 y) (* 3 z)))))
+                   (dec/scalar-field)
+                   (for [z (range -2 3) y (range -2 3) x (range -2 3)] [x y z]))
+        grad (dec/d-0 s)
+        curl (dec/d-1 grad)
+        max-mag (reduce (fn [m [x y z]] (max m (dec/face-magnitude curl x y z)))
+                         0.0
+                         (for [z (range -1 2) y (range -1 2) x (range -1 2)] [x y z]))]
+    (is (< max-mag 1e-4) (str "curl of grad should be ~0, got " max-mag))))
+
+(deftest maxwell-energy-bounded
+  ;; Dipole in free space. Energy should neither vanish nor blow up
+  ;; exponentially over a handful of leapfrog steps.
+  (let [m0 (dec/maxwell-dipole-e (dec/maxwell 0.3) 0 0 0 1 1.0) ; well under CFL
+        e0 (dec/maxwell-energy m0)
+        m1 (reduce (fn [m _] (dec/maxwell-step m 1.0)) m0 (range 20))
+        e1 (dec/maxwell-energy m1)]
+    (is (> e0 0.0))
+    (is (not (nan? e1)) "energy NaN")
+    ;; Without a source, energy drifts at most slowly; require it stays
+    ;; within a factor of 4 over 20 steps.
+    (is (< e1 (* e0 4.0)) (str "energy blew up: " e0 " -> " e1))))
+
+(deftest multigrid-produces-bounded-residual
+  ;; Verify `solve-poisson-multigrid` doesn't NaN / diverge on a non-trivial
+  ;; RHS. The 2-level V-cycle with piecewise-constant prolongation is a
+  ;; conservative baseline; its asymptotic O(N) advantage over Jacobi shows
+  ;; up at larger grid sizes than this test exercises.
+  (let [rhs (reduce (fn [r [x y z]]
+                       (if (zero? (mod (+ x y z) 2))
+                         (dec/scalar-set r x y z (sin* (+ (* x y) z)))
+                         r))
+                     (dec/scalar-field)
+                     (for [z (range -4 5) y (range -4 5) x (range -4 5)] [x y z]))
+        p (dec/solve-poisson-multigrid rhs 2 6 4)
+        res (dec/compute-residual p rhs 1.0)
+        max-abs (reduce (fn [m [x y z]] (max m (abs* (dec/scalar-get res x y z))))
+                         0.0
+                         (for [z (range -5 6) y (range -5 6) x (range -5 6)] [x y z]))]
+    (is (and (not (nan? max-abs)) (< max-abs 1.0))
+        (str "residual blew up: " max-abs))))
+
+(deftest cross-chunk-boundary-diffusion
+  (let [f (dec/scalar-set (dec/scalar-field) (- dec/chunk-size 1) 0 0 60.0) ; CHUNK_SIZE - 1
+        f2 (dec/scalar-diffuse f 0.16 1.0 0.0)]
+    ;; +X neighbour is in the next chunk.
+    (is (> (dec/scalar-get f2 dec/chunk-size 0 0) 5.0))))
+
+;; ── Conservation-law validation (fluid/heat: fire, water, air, wind) ───────
+;;
+;; Closed-form properties any correct diffusion + incompressible-flow solver
+;; must satisfy — clean-room evidence that the kami-dec fields obey the same
+;; physics NVIDIA Flow / PhysX-fluid obey, shown without running NVIDIA.
+;; Pixel-identical match across different algorithms is impossible and is
+;; never claimed (ADR-2605261800).
+
+(defn- field-total [s]
+  (let [total (atom 0.0)]
+    (dec/scalar-for-each-nonzero s 0.0 (fn [_ _ _ v] (swap! total + v)))
+    @total))
+
+(deftest heat-diffusion-conserves-total-without-decay
+  ;; Pure diffusion (decay=0): the 7-point Laplacian sums to zero, so total
+  ;; heat Σ T is invariant (up to the ~1e-4 prune threshold) while the blob
+  ;; spreads. This is the discrete heat equation's mass law.
+  (let [s0 (dec/scalar-set (dec/scalar-field) 8 8 8 100.0)
+        t0 (field-total s0)
+        s1 (reduce (fn [s _] (dec/scalar-diffuse s 0.1 0.05 0.0)) s0 (range 40)) ; α·dt=0.005, well under CFL 1/6
+        t1 (field-total s1)
+        rel (/ (abs* (- t1 t0)) t0)]
+    (is (< rel 2e-3) (str "heat not conserved: t0=" t0 " t1=" t1 " (rel " rel ")"))
+    (let [cells (atom 0)]
+      (dec/scalar-for-each-nonzero s1 0.01 (fn [_ _ _ _] (swap! cells inc)))
+      (is (> @cells 1) (str "blob did not diffuse: " @cells " cell(s)")))))
+
+(deftest heat-diffusion-with-decay-decreases-monotonically
+  ;; decay>0 models radiative loss: Σ T strictly non-increasing each step,
+  ;; never negative.
+  (let [s0 (dec/scalar-set (dec/scalar-field) 8 8 8 100.0)]
+    (loop [s s0 prev (field-total s0) n 30]
+      (if (zero? n)
+        (is (< prev 100.0) (str "decay did not reduce total: " prev))
+        (let [s' (dec/scalar-diffuse s 0.1 0.05 0.5)
+              now (field-total s')]
+          (is (<= now (+ prev 1e-3)) (str "decay increased total: " prev " -> " now))
+          (is (>= now -1e-4) (str "total went negative: " now))
+          (recur s' now (dec n)))))))
+
+(deftest helmholtz-projection-is-near-divergence-free
+  ;; Incompressibility ∇·u ≈ 0: after projection the squared-divergence L2
+  ;; must collapse to a small fraction of the unprojected field.
+  (let [wind0 (reduce (fn [w i]
+                         (-> w
+                             (dec/edge-set i 8 8 0 (* (- (double i) 8.0) 0.5))
+                             (dec/edge-set 8 i 8 1 (* (- (double i) 8.0) 0.3))
+                             (dec/edge-set 8 8 i 2 (* (- (double i) 8.0) 0.4))))
+                       (dec/edge-field)
+                       (range 4 12))
+        d0 (atom 0.0)
+        _ (dec/scalar-for-each-nonzero (dec/div wind0) 0.0 (fn [_ _ _ v] (swap! d0 + (* v v))))
+        wind1 (dec/project-divergence-free wind0 60)
+        d1 (atom 0.0)
+        _ (dec/scalar-for-each-nonzero (dec/div wind1) 0.0 (fn [_ _ _ v] (swap! d1 + (* v v))))]
+    (is (> @d0 0.0) "test field had no divergence to begin with")
+    (let [ratio (/ @d1 @d0)]
+      (is (< ratio 0.2) (str "projection left too much divergence: after/before = " ratio)))))
