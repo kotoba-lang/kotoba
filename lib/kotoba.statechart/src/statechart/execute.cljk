@@ -1,0 +1,195 @@
+(ns statechart.execute
+  "Pure interpreter for Harel statecharts. State is plain data — inspectable,
+  replayable, testable offline with fixture ports.
+
+  Configuration: a set of currently-active state ids (atomic states + their
+  compound/parallel ancestors, mirroring SCXML semantics).
+
+  Entry actions run parent-first (shallow to deep); exit actions run child-first
+  (deep to shallow). Parallel states activate all orthogonal regions; compound
+  states recurse into their :sc/initial child.
+
+  A machine state is: {:sc/config #{...} :sc/ctx ctx :sc/done? bool}.
+  Ports map: {:action IAction :guard IGuard}."
+  (:require [kotoba.lang.coll :as set]
+            [statechart.model :as m]
+            [statechart.ports :as p]))
+
+;; ---- private helpers ----
+
+(defn- run-actions
+  "Thread `ctx` through a sequence of action name strings via IAction port."
+  [ports actions ctx]
+  (reduce (fn [c a] (p/run (:action ports) a c)) ctx (or actions [])))
+
+(defn- depth
+  "Depth of state `id` in chart (0 = top-level, 1 = child of top-level, …)."
+  [chart id]
+  (count (m/ancestors chart id)))
+
+(defn- enter-states
+  "Compute the full set of state ids that become active when entering `id`.
+   Compound → recurse into :sc/initial; parallel → recurse into every child."
+  [chart id]
+  (let [s (m/lookup chart id)]
+    (cond
+      (or (nil? s) (m/atomic? s) (m/final? s))
+        #{id}
+      (m/compound? s)
+        (into #{id} (enter-states chart (:sc/initial s)))
+      (m/parallel? s)
+        (reduce (fn [acc cid] (into acc (enter-states chart cid)))
+                #{id}
+                (sort (keys (:sc/states s {}))))
+      :else #{id})))
+
+(defn- sorted-entry
+  "Sort state ids for entry: shallowest first (parent before child)."
+  [chart ids]
+  (sort-by #(depth chart %) ids))
+
+(defn- sorted-exit
+  "Sort state ids for exit: deepest first (child before parent)."
+  [chart ids]
+  (sort-by #(- (depth chart %)) ids))
+
+(defn- lca
+  "Lowest Common Ancestor of states `a` and `b`: the deepest state that is an
+   ancestor of both `a` and `b`. Returns nil when they share no ancestor
+   (both top-level siblings)."
+  [chart a b]
+  (let [ancs-b (set (m/ancestors chart b))]
+    (first (filter ancs-b (m/ancestors chart a)))))
+
+(defn- find-transition
+  "Find the first eligible transition for `event` starting from `state-id`,
+   bubbling up through ancestors if the state itself has no matching handler.
+   Returns [source-state-id transition-map] or nil."
+  [ports chart ctx event state-id]
+  (some (fn [sid]
+          (let [s   (m/lookup chart sid)
+                txs (get (:sc/on s {}) event [])]
+            (some (fn [tx]
+                    (when (p/allow? (:guard ports) (:sc/cond tx) ctx)
+                      [sid tx]))
+                  txs)))
+        (cons state-id (m/ancestors chart state-id))))
+
+(defn- apply-targeted-transition
+  "Apply a targeted transition (non-nil :sc/target) — the exit/entry/LCA machinery."
+  [ports chart machine-state src-id tx]
+  (let [{:sc/keys [config ctx]} machine-state
+        tgt-id     (:sc/target tx)
+        lca-id     (lca chart src-id tgt-id)
+        ;; Exit set: all active states that are strictly below the LCA.
+        ;; If no LCA (top-level transition), exit everything in config.
+        exit-set   (if lca-id
+                     (filter (fn [sid]
+                               (and (not= sid lca-id)
+                                    (some #(= lca-id %) (m/ancestors chart sid))))
+                             config)
+                     (seq config))
+        exit-set   (sorted-exit chart exit-set)
+        ;; Entry set: target auto-expansion + intermediate states from LCA to target.
+        enter-base (enter-states chart tgt-id)
+        ;; Ancestors of tgt strictly between tgt and lca-id (exclusive on both ends).
+        path-ints  (reverse
+                     (if lca-id
+                       (take-while #(not= lca-id %) (m/ancestors chart tgt-id))
+                       (m/ancestors chart tgt-id)))
+        enter-set  (into enter-base path-ints)
+        ;; New config: remove exited, add entered.
+        pre-config (set/difference (set config) (set exit-set))
+        new-config (into pre-config enter-set)
+        ;; Only run entry actions for states not already active after exits.
+        new-entries (set/difference enter-set pre-config)
+        ;; Run actions: exit (child-first) → transition → entry (parent-first).
+        ctx'       (reduce (fn [c sid]
+                             (run-actions ports (-> (m/lookup chart sid) :sc/exit) c))
+                           ctx exit-set)
+        ctx'       (run-actions ports (:sc/actions tx) ctx')
+        ctx'       (reduce (fn [c sid]
+                             (run-actions ports (-> (m/lookup chart sid) :sc/entry) c))
+                           ctx'
+                           (sorted-entry chart new-entries))]
+    {:sc/config new-config
+     :sc/ctx    ctx'
+     :sc/done?  (boolean (some #(m/final? (m/lookup chart %)) new-config))}))
+
+(defn- apply-transition
+  "Apply a single transition (src-id → tx) to machine-state and return updated state."
+  [ports chart machine-state src-id tx]
+  (if (nil? (:sc/target tx))
+    ;; Internal/actions-only transition (SCXML-style, no :sc/target): the
+    ;; active configuration is unchanged, only the transition's own actions
+    ;; run. Routing this through apply-targeted-transition would compute lca
+    ;; as (lca chart src-id nil) => nil, exit the ENTIRE config, and enter
+    ;; (enter-states chart nil) => #{nil}, corrupting :sc/config to #{nil}
+    ;; permanently -- the model/validator both explicitly allow nil-target
+    ;; transitions (see statechart.validate's all-targets / dangling-target
+    ;; check, both of which skip a nil :sc/target), so the interpreter must
+    ;; handle them too.
+    (update machine-state :sc/ctx #(run-actions ports (:sc/actions tx) %))
+    (apply-targeted-transition ports chart machine-state src-id tx)))
+
+;; ---- public API ----
+
+(defn start
+  "Enter the initial configuration of `chart` with optional context map `ctx`.
+   Runs entry actions (parent-first) for all states entered.
+   Returns {:sc/config :sc/ctx :sc/done?}."
+  ([ports chart] (start ports chart {}))
+  ([ports chart ctx]
+   (let [config (enter-states chart (:sc/initial chart))
+         ctx'   (reduce (fn [c sid]
+                          (run-actions ports (-> (m/lookup chart sid) :sc/entry) c))
+                        ctx
+                        (sorted-entry chart config))]
+     {:sc/config config
+      :sc/ctx    ctx'
+      :sc/done?  (boolean (some #(m/final? (m/lookup chart %)) config))})))
+
+(defn done?
+  "True when any :final state is active in `machine-state`."
+  [machine-state]
+  (boolean (:sc/done? machine-state)))
+
+(defn send
+  "Process `event` (string) against `machine-state`. Returns updated machine state.
+   For parallel regions, all eligible transitions (one per region) fire.
+   If no eligible transition is found, returns `machine-state` unchanged."
+  ([ports chart machine-state event] (send ports chart machine-state event {}))
+  ([ports chart machine-state event _data]
+   (let [{:sc/keys [config ctx]} machine-state
+         ;; Active atomic/final states sorted innermost-first (highest priority).
+         atomics    (->> config
+                         (filter #(let [s (m/lookup chart %)]
+                                    (or (m/atomic? s) (m/final? s))))
+                         (sort-by #(- (depth chart %))))
+         ;; Find one eligible transition per atomic state; deduplicate by source-id
+         ;; so a shared ancestor can only fire once even in malformed configs.
+         found-map  (into {}
+                          (keep (fn [aid]
+                                  (when-let [[src tx] (find-transition ports chart ctx event aid)]
+                                    [src [src tx]]))
+                                atomics))
+         all-found  (sort-by first (vals found-map))]
+     (if (empty? all-found)
+       machine-state
+       (reduce (fn [ms [src-id tx]]
+                 (apply-transition ports chart ms src-id tx))
+               machine-state
+               all-found)))))
+
+;; ---- default-ports: host-free baseline ----
+
+(defn default-ports
+  "No-op IAction (ctx unchanged); IGuard reads `(get ctx (keyword cond))` truthiness,
+  nil cond → always true. Enough to run control flow; replace for real work."
+  []
+  {:action (reify p/IAction  (run    [_ _ ctx]      ctx))
+   :guard  (reify p/IGuard
+             (allow? [_ cond ctx]
+               (if (nil? cond)
+                 true
+                 (boolean (get ctx (keyword cond))))))})
