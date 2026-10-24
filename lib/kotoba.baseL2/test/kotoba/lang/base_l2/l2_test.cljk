@@ -1,0 +1,242 @@
+(ns kotoba.lang.base-l2.l2-test
+  "JVM-only: exercises kotoba.lang.base-l2.l2 against a real,
+  dependency-free mock JSON-RPC HTTP server (com.sun.net.httpserver.HttpServer,
+  part of the JDK -- same technique kotoba-lang/ipfs's test suite uses;
+  babashka cannot load this class, hence `kbb -M:test`, not `bb`), via
+  the reference `kotoba.lang.base-l2.jvm-http-transport` `ITransport`
+  adapter (`babashka.http-client`-backed) -- a real end-to-end socket
+  round-trip through the injected-transport core, not a fake.
+
+  The write-path (`anchor-mst-root!`) known-answer test reuses
+  test/resources/base_l2/eth-vectors.json's \"anchor\" case: a raw
+  EIP-155 legacy transaction signed by viem itself
+  (`privateKeyToAccount(pk).signTransaction(...)`) for the exact
+  nonce/gasPrice/gas/chainId/to/data this test supplies via `opts` --
+  proving this namespace's RLP+ECDSA signing (via kotoba-lang/eth-crypto)
+  produces byte-identical output to viem for a real anchor() call. The
+  read-path (`root-count` / `find-anchor-for-root`) tests reuse
+  test/resources/base_l2/abi-vectors.json's own viem-generated
+  `decodeFunctionResult` fixtures.
+
+  See `kotoba.lang.base-l2.rpc-test` for lighter-weight, no-real-network
+  unit coverage of the same rpc.clj JSON-RPC envelope logic against a
+  fake `ITransport`."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.lang.text :as str]
+            [kotoba.io :as io]
+            [json.data-json :as json]
+            [kotoba.lang.base-l2.l2 :as l2]
+            [kotoba.lang.base-l2.rpc :as rpc]
+            [kotoba.lang.base-l2.abi :as abi]
+            [kotoba.lang.base-l2.jvm-http-transport :as jvm-http]
+            [eth-crypto.core :as eth])
+  (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
+           [java.net InetSocketAddress]
+           [java.io ByteArrayOutputStream]))
+
+(def ^:private eth-vectors
+  (json/read-str (slurp (io/resource "base_l2/eth-vectors.json")) :key-fn keyword))
+
+(def ^:private abi-vectors
+  (json/read-str (slurp (io/resource "base_l2/abi-vectors.json")) :key-fn keyword))
+
+(def ^:private transport (jvm-http/make-transport))
+
+(def ^:private anchor-vector (first (filter #(= (:label %) "anchor") eth-vectors)))
+(def ^:private pk-hex (:pk (first (filter #(= (:label %) "address") eth-vectors))))
+(def ^:private contract-addr (get-in anchor-vector [:tx :to]))
+
+(defn- ->bi
+  "Coerce a JSON-parsed numeric field (String or Long) to a BigInteger."
+  ^BigInteger [v]
+  (if (string? v) (BigInteger. ^String v) (biginteger v)))
+
+(defn- slurp-bytes [^java.io.InputStream is]
+  (let [out (ByteArrayOutputStream.)]
+    (.transferTo is out)
+    (.toByteArray out)))
+
+(defn- respond! [^HttpExchange exchange status ^String body]
+  (let [bytes (kbytes/utf8-bytes body)]
+    (.sendResponseHeaders exchange status (count bytes))
+    (with-open [os (.getResponseBody exchange)]
+      (.write os bytes))))
+
+(defn- rpc-response [id result]
+  (json/write-str {:jsonrpc "2.0" :id id :result result}))
+
+;; Each test `reset!`s handler-atom to `(fn [method params] result)`, dispatching
+;; on the JSON-RPC method name -- this lets one mock HTTP server stand in
+;; for the whole eth_* surface without a separate context per method.
+;;
+;; NOTE: this MUST be a plain atom, not a `^:dynamic` var read via
+;; `binding` -- com.sun.net.httpserver.HttpServer invokes the HttpHandler
+;; callback on its own internal dispatch thread, not the thread that set
+;; up the test, so a `binding` (thread-local) would be invisible there
+;; (dereferencing the un-bound root value throws inside the handler,
+;; which aborts the connection with no response -- surfacing on the
+;; client side as a confusing `EOFException` / \"header parser received
+;; no bytes\", not an obviously-thread-local-related error).
+(def ^:dynamic *base-url* nil)
+(def ^:private handler-atom (atom nil))
+(def ^:private server (atom nil))
+
+(defn- mock-rpc-handler [^HttpExchange exchange]
+  (let [body (kbytes/utf8-string (slurp-bytes (.getRequestBody exchange)))
+        {:keys [id method params]} (json/read-str body :key-fn keyword)
+        result (@handler-atom method params)]
+    (respond! exchange 200 (rpc-response id result))))
+
+(defn- with-mock-rpc [f]
+  (let [s (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.createContext s "/" (reify HttpHandler (handle [_ ex] (mock-rpc-handler ex))))
+    (.start s)
+    (reset! server s)
+    (try
+      (binding [*base-url* (str "http://127.0.0.1:" (.getPort (.getAddress s)))]
+        (f))
+      (finally
+        (.stop s 0)))))
+
+(use-fixtures :each with-mock-rpc)
+
+(deftest anchor-mst-root-byte-exact-write-path-test
+  (testing "anchor-mst-root! (opts override nonce/gas-price/gas/chain-id) produces the SAME raw signed tx viem produced for this exact anchor() call"
+    (let [sent-raw-tx (atom nil)
+          root-hash (str "0x" (apply str (repeat 32 "11")))
+          ipfs-cid-hex (str "0x" (eth/bytes->hex (eth/utf8 "bafy-test-cid-123")))
+          {:keys [nonce gasPrice gas chainId]} (:tx anchor-vector)
+          handler (fn [method params]
+                    (case method
+                      "eth_sendRawTransaction" (do (reset! sent-raw-tx (first params)) (:hash anchor-vector))
+                      "eth_getTransactionReceipt" {:status "0x1" :blockNumber "0x2a"}
+                      (throw (ex-info (str "unexpected RPC method in this test: " method) {:method method}))))]
+      (reset! handler-atom handler)
+      (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr :private-key pk-hex})
+            result (l2/anchor-mst-root! client root-hash ipfs-cid-hex 42
+                                        {:nonce nonce :gas-price (->bi gasPrice) :gas (->bi gas) :chain-id chainId})]
+        (is (= (:signed anchor-vector) @sent-raw-tx)
+            "the exact raw signed tx bytes sent to eth_sendRawTransaction match viem's")
+        (is (= (:hash anchor-vector) (:tx-hash result)))
+        (is (= 42N (bigint (:block-number result))))))))
+
+(deftest anchor-mst-root-resolves-rpc-params-when-not-overridden-test
+  (testing "nonce/gas-price/gas/chain-id are fetched via eth_getTransactionCount/eth_gasPrice/eth_estimateGas/eth_chainId when opts omits them"
+    (let [root-hash (str "0x" (apply str (repeat 32 "11")))
+          ipfs-cid-hex (str "0x" (eth/bytes->hex (eth/utf8 "bafy-test-cid-123")))
+          nonce 7 gas-price 1000000000 gas 100000 chain-id 31337
+          expected-calldata (abi/encode-function-call "anchor(bytes32,bytes,uint64)"
+                                                       ["bytes32" "bytes" "uint64"]
+                                                       [root-hash ipfs-cid-hex 42])
+          expected-raw (eth/sign-tx-legacy {:nonce nonce :gas-price gas-price :gas gas
+                                             :to contract-addr :data expected-calldata :chain-id chain-id}
+                                            (eth/hex->bytes pk-hex))
+          expected-hash (str "0x" (eth/bytes->hex (eth/keccak256 (eth/hex->bytes expected-raw))))
+          sent-raw-tx (atom nil)
+          handler (fn [method _params]
+                    (case method
+                      "eth_getTransactionCount" (rpc/->hex nonce)
+                      "eth_gasPrice" (rpc/->hex gas-price)
+                      "eth_chainId" (rpc/->hex chain-id)
+                      "eth_estimateGas" (rpc/->hex gas)
+                      "eth_sendRawTransaction" (do (reset! sent-raw-tx (first _params)) expected-hash)
+                      "eth_getTransactionReceipt" {:status "0x1" :blockNumber "0x1"}
+                      (throw (ex-info (str "unexpected RPC method in this test: " method) {:method method}))))]
+      (reset! handler-atom handler)
+      (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr :private-key pk-hex})
+            result (l2/anchor-mst-root! client root-hash ipfs-cid-hex 42)]
+        (is (= expected-raw @sent-raw-tx))
+        (is (= expected-hash (:tx-hash result)))))))
+
+(deftest anchor-mst-root-reverted-test
+  (testing "throws ex-info when the mined receipt's status is not success"
+    (let [root-hash (str "0x" (apply str (repeat 32 "11")))
+          ipfs-cid-hex (str "0x" (eth/bytes->hex (eth/utf8 "bafy-test-cid-123")))
+          {:keys [nonce gasPrice gas chainId]} (:tx anchor-vector)
+          handler (fn [method _params]
+                    (case method
+                      "eth_sendRawTransaction" (:hash anchor-vector)
+                      "eth_getTransactionReceipt" {:status "0x0" :blockNumber "0x2a"}
+                      (throw (ex-info (str "unexpected method " method) {}))))]
+      (reset! handler-atom handler)
+      (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr :private-key pk-hex})]
+        (is (thrown? kerror/ExceptionInfo
+                     (l2/anchor-mst-root! client root-hash ipfs-cid-hex 42
+                                          {:nonce nonce :gas-price (->bi gasPrice) :gas (->bi gas) :chain-id chainId})))))))
+
+(deftest anchor-mst-root-requires-private-key-test
+  (testing "throws when called on a read-only (keyless) client"
+    (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr})]
+      (is (thrown? kerror/ExceptionInfo
+                   (l2/anchor-mst-root! client "0x00" "0x00" 1))))))
+
+(deftest root-count-test
+  (testing "decodes the uint256 return value using viem's own rootCount() vector"
+    (let [handler (fn [method _params]
+                    (case method
+                      "eth_call" (get-in abi-vectors [:decodeFunctionResult :rootCount :data])
+                      (throw (ex-info (str "unexpected method " method) {}))))]
+      (reset! handler-atom handler)
+      (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr})]
+        (is (= 12345N (bigint (l2/root-count client))))))))
+
+(deftest find-anchor-for-root-anchored-test
+  (testing "decodes the anchors() tuple using viem's own anchors(bytes32) return vector"
+    (let [handler (fn [method _params]
+                    (case method
+                      "eth_call" (get-in abi-vectors [:decodeFunctionResult :anchors :data])
+                      (throw (ex-info (str "unexpected method " method) {}))))]
+      (reset! handler-atom handler)
+      (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr})
+            found (l2/find-anchor-for-root client (str "0x" (apply str (repeat 32 "22"))))]
+        (is (some? found))
+        (is (= 999N (bigint (:block-number found))))
+        (is (= 42N (bigint (:batch-size found))))
+        (is (= 1735689600N (bigint (:anchored-at found))))
+        (is (= (str/lower (get-in abi-vectors [:decodeFunctionResult :anchors :anchorerAddr]))
+               (str/lower (:tx-anchorer-address found))))))))
+
+(deftest find-anchor-for-root-not-anchored-test
+  (testing "returns nil when blockNumber == 0 (never anchored)"
+    (let [zero-return (str "0x" (eth/bytes->hex
+                                 (abi/encode-abi-params
+                                  ["bytes32" "bytes" "uint256" "address" "uint64" "uint64"]
+                                  [(str "0x" (apply str (repeat 32 "00")))
+                                   "0x"
+                                   0
+                                   "0x0000000000000000000000000000000000000000"
+                                   0
+                                   0])))
+          handler (fn [method _params]
+                    (case method
+                      "eth_call" zero-return
+                      (throw (ex-info (str "unexpected method " method) {}))))]
+      (reset! handler-atom handler)
+      (let [client (l2/make-anchor-client {:transport transport :rpc-url *base-url* :contract contract-addr})]
+        (is (nil? (l2/find-anchor-for-root client (str "0x" (apply str (repeat 32 "00"))))))))))
+
+(deftest submit-mst-root-derives-keccak-root-hash-test
+  (testing "submit-mst-root! keccak256-hashes a non-hex root-cid, matching l2.ts's rootHash derivation"
+    (let [root-cid "hello-mst-root"
+          expected-root-hash (str "0x" (eth/bytes->hex (eth/keccak256 (eth/utf8 root-cid))))
+          expected-calldata (abi/encode-function-call "anchor(bytes32,bytes,uint64)"
+                                                       ["bytes32" "bytes" "uint64"]
+                                                       [expected-root-hash (str "0x" (eth/bytes->hex (eth/utf8 root-cid))) 1])
+          sent-raw-tx (atom nil)
+          handler (fn [method _params]
+                    (case method
+                      "eth_getTransactionCount" (rpc/->hex 0)
+                      "eth_gasPrice" (rpc/->hex 1000000000)
+                      "eth_chainId" (rpc/->hex 31337)
+                      "eth_estimateGas" (rpc/->hex 100000)
+                      "eth_sendRawTransaction" (do (reset! sent-raw-tx (first _params)) "0xabc")
+                      "eth_getTransactionReceipt" {:status "0x1" :blockNumber "0x1"}
+                      (throw (ex-info (str "unexpected method " method) {}))))]
+      (reset! handler-atom handler)
+      (l2/submit-mst-root! transport *base-url* contract-addr root-cid pk-hex)
+      ;; Confirm the raw tx actually sent used our independently-derived
+      ;; root-hash + calldata, by re-signing the same fields and comparing.
+      (let [reconstructed (eth/sign-tx-legacy {:nonce 0 :gas-price 1000000000 :gas 100000
+                                                :to contract-addr :data expected-calldata :chain-id 31337}
+                                               (eth/hex->bytes pk-hex))]
+        (is (= reconstructed @sent-raw-tx))))))

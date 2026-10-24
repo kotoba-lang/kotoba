@@ -1,0 +1,135 @@
+(ns kotoba.lang.base-l2.rpc-test
+  "JVM tests for kotoba.lang.base-l2.rpc. The source is portable `.cljc`
+  (JVM + CLJS) except its `Thread/sleep`-blocking
+  `wait-for-transaction-receipt`, which is `#?(:clj ...)`-gated and JVM-only
+  (see the source namespace's docstring); this test file stays `.clj`
+  rather than `.cljc` -- there is no CLJS test runner in this repo (nor in
+  any sibling `kotoba-lang` repo with a portable `.cljc` source, e.g.
+  `kotoba.lang.ipfs`/`kotoba.lang.atproto-client`, which follow the same
+  convention: JVM-only tests exercising the `:clj` branch; a CLJS
+  consumer's own async poll loop over `eth-get-transaction-receipt` would
+  be covered by host-side integration tests, not here).
+
+  Unit tests for the pure kotoba.lang.base-l2.rpc JSON-RPC envelope logic
+  (request construction, :error detection, :result extraction, the
+  eth_* method wrappers, and wait-for-transaction-receipt's polling)
+  against a FAKE in-memory ITransport -- no real socket, no JDK
+  HttpServer, complementing kotoba.lang.base-l2.l2-test's end-to-end
+  coverage of the same code against a real babashka.http-client-backed
+  adapter (kotoba.lang.base-l2.jvm-http-transport)."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [json.data-json :as json]
+            [kotoba.lang.base-l2.rpc :as rpc]))
+
+(defn- fake-transport
+  "`respond-fn` is `(fn [url body-str] => {:status Int :body String})`.
+  `body-str` is the exact JSON-RPC request body rpc-call built, so a test
+  can `json/read-str` it to dispatch on `:method`/`:params` or assert on
+  its shape directly."
+  [respond-fn]
+  (reify rpc/ITransport
+    (-post [_ url body] (respond-fn url body))))
+
+(defn- ok-result [result]
+  (fn [_url _body] {:status 200 :body (json/write-str {:jsonrpc "2.0" :id 1 :result result})}))
+
+(deftest rpc-call-builds-envelope-and-extracts-result-test
+  (testing "POSTs a well-formed JSON-RPC 2.0 envelope and returns :result"
+    (let [seen-body (atom nil)
+          transport (fake-transport (fn [url body]
+                                      (reset! seen-body {:url url :body (json/read-str body :key-fn keyword)})
+                                      {:status 200 :body (json/write-str {:jsonrpc "2.0" :id 1 :result "0xdead"})}))]
+      (is (= "0xdead" (rpc/rpc-call transport "http://rpc" "eth_chainId" [])))
+      (let [{:keys [url body]} @seen-body]
+        (is (= "http://rpc" url))
+        (is (= "2.0" (:jsonrpc body)))
+        (is (= "eth_chainId" (:method body)))
+        (is (= [] (:params body)))
+        (is (pos-int? (:id body)))))))
+
+(deftest rpc-call-throws-on-http-error-test
+  (testing "throws ex-info on a non-2xx transport response"
+    (let [transport (fake-transport (fn [_url _body] {:status 500 :body "boom"}))
+          ex (is (thrown? kerror/ExceptionInfo (rpc/rpc-call transport "http://rpc" "eth_gasPrice" [])))]
+      (is (= 500 (:status (ex-data ex)))))))
+
+(deftest rpc-call-throws-on-json-rpc-error-object-test
+  (testing "throws ex-info on a 200 response carrying a JSON-RPC :error object"
+    (let [transport (fake-transport
+                     (fn [_url _body]
+                       {:status 200
+                        :body (json/write-str {:jsonrpc "2.0" :id 1
+                                                :error {:code -32000 :message "execution reverted"}})}))
+          ex (is (thrown-with-msg? kerror/ExceptionInfo #"execution reverted"
+                                   (rpc/rpc-call transport "http://rpc" "eth_call" [])))]
+      (is (= "execution reverted" (get-in (ex-data ex) [:error :message]))))))
+
+(deftest eth-call-test
+  (testing "defaults block to \"latest\" and passes {:to :data} + block as params"
+    (let [seen (atom nil)
+          transport (fake-transport (fn [_url body]
+                                      (reset! seen (json/read-str body :key-fn keyword))
+                                      {:status 200 :body (json/write-str {:jsonrpc "2.0" :id 1 :result "0xret"})}))]
+      (is (= "0xret" (rpc/eth-call transport "http://rpc" "0xTO" "0xDATA")))
+      (is (= [{:to "0xTO" :data "0xDATA"} "latest"] (:params @seen)))))
+  (testing "an explicit block tag overrides the default"
+    (let [seen (atom nil)
+          transport (fake-transport (fn [_url body]
+                                      (reset! seen (json/read-str body :key-fn keyword))
+                                      {:status 200 :body (json/write-str {:jsonrpc "2.0" :id 1 :result "0xret"})}))]
+      (rpc/eth-call transport "http://rpc" "0xTO" "0xDATA" "0x2a")
+      (is (= [{:to "0xTO" :data "0xDATA"} "0x2a"] (:params @seen))))))
+
+(deftest eth-send-raw-transaction-test
+  (testing "wraps raw-tx in a single-element params array and returns the tx hash"
+    (let [transport (fake-transport (ok-result "0xhash123"))]
+      (is (= "0xhash123" (rpc/eth-send-raw-transaction transport "http://rpc" "0xRAWTX"))))))
+
+(deftest eth-get-transaction-receipt-test
+  (testing "returns nil (not-yet-mined) when :result is JSON null"
+    (let [transport (fake-transport (ok-result nil))]
+      (is (nil? (rpc/eth-get-transaction-receipt transport "http://rpc" "0xhash")))))
+  (testing "returns the keywordized receipt map once mined"
+    (let [transport (fake-transport (ok-result {:status "0x1" :blockNumber "0x2a"}))]
+      (is (= {:status "0x1" :blockNumber "0x2a"} (rpc/eth-get-transaction-receipt transport "http://rpc" "0xhash"))))))
+
+(deftest eth-get-transaction-count-test
+  (testing "defaults block to \"pending\" and parses the hex nonce to a long"
+    (let [seen (atom nil)
+          transport (fake-transport (fn [_url body]
+                                      (reset! seen (json/read-str body :key-fn keyword))
+                                      {:status 200 :body (json/write-str {:jsonrpc "2.0" :id 1 :result "0x7"})}))]
+      (is (= 7 (rpc/eth-get-transaction-count transport "http://rpc" "0xADDR")))
+      (is (= ["0xADDR" "pending"] (:params @seen))))))
+
+(deftest eth-gas-price-chain-id-estimate-gas-test
+  (testing "all three parse a hex :result to a long"
+    (is (= 1000000000 (rpc/eth-gas-price (fake-transport (ok-result "0x3b9aca00")) "http://rpc")))
+    (is (= 31337 (rpc/eth-chain-id (fake-transport (ok-result "0x7a69")) "http://rpc")))
+    (is (= 100000 (rpc/eth-estimate-gas (fake-transport (ok-result "0x186a0")) "http://rpc" {:from "0xA" :to "0xB" :data "0x"})))))
+
+(deftest hex-round-trip-test
+  (testing "->hex: zero and non-zero integral values"
+    (is (= "0x0" (rpc/->hex 0)))
+    (is (= "0x2a" (rpc/->hex 42)))
+    (is (= "0x3b9aca00" (rpc/->hex 1000000000)))))
+
+(deftest wait-for-transaction-receipt-polls-until-non-nil-test
+  (testing "polls eth_getTransactionReceipt until a non-nil receipt appears"
+    (let [call-count (atom 0)
+          transport (fake-transport
+                     (fn [_url _body]
+                       (swap! call-count inc)
+                       {:status 200
+                        :body (json/write-str {:jsonrpc "2.0" :id 1
+                                                :result (when (>= @call-count 3) {:status "0x1" :blockNumber "0x1"})})}))]
+      (is (= {:status "0x1" :blockNumber "0x1"}
+             (rpc/wait-for-transaction-receipt transport "http://rpc" "0xhash" {:interval-ms 1 :timeout-ms 5000})))
+      (is (>= @call-count 3)))))
+
+(deftest wait-for-transaction-receipt-timeout-test
+  (testing "throws ex-info if the receipt never appears before timeout-ms"
+    (let [transport (fake-transport (ok-result nil))]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"timed out"
+                            (rpc/wait-for-transaction-receipt transport "http://rpc" "0xhash"
+                                                               {:interval-ms 1 :timeout-ms 10}))))))
