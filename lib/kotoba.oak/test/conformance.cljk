@@ -1,0 +1,251 @@
+(ns conformance
+  "JVM-free conformance run for the OaK kernel: analyze kernel.kotoba, lower
+  it, instantiate it in the reference KIR runtime with the dataspace provider
+  on capability 24, and drive it only through `oak-call`."
+  (:require [kotoba.kir.admission :as admission]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as ir]
+            [provider.dataspace :as ds]
+            [kotoba.compiler.reference-runtime :as runtime]
+            ["node:fs" :as fs]))
+
+(def source (.readFileSync fs (aget (.-env js/process) "OAK_SOURCE") "utf8"))
+
+(def call-type
+  [:variant :oak/call
+   [[:declare [:record :oak/declare [[:entity :string] [:type :keyword]]]]
+    [:relate [:record :oak/relate
+              [[:subject :string] [:relation :keyword] [:object :string]]]]
+    [:related [:record :oak/related [[:subject :string] [:relation :keyword]]]]
+    [:census [:record :oak/census [[:type :keyword]]]]]])
+
+(defn- payload-type [tag]
+  (second (first (filter #(= tag (first %)) (nth call-type 2)))))
+
+(defn- call [tag & fields]
+  [call-type tag (into [(payload-type tag)] fields)])
+
+(def hir (sema/analyze source))
+(admission/check hir {:allow #{[:cap/call (js/BigInt 24)]}})
+(def kir (ir/lower hir))
+
+(defn- kernel
+  "One kernel over one fresh dataspace. Analysis and lowering are done once --
+  they are the compiler's work, not the kernel's, and repeating them per case
+  measures nbb rather than the kernel."
+  []
+  (let [rt (runtime/instantiate kir {:allow #{24} :providers {24 (ds/provider)}})]
+    {:invoke (fn [f args] ((:invoke rt) f args))
+     :exports (:exports rt)}))
+
+(defn- outcome
+  "`[:ok value evidence]` or `[:rejected code detail]`, flattened out of the
+  kernel's outcome variant."
+  [k c]
+  (let [v ((:invoke k) 'oak-call [c])
+        tag (second v)
+        payload (nth v 2)]
+    (if (= :ok tag)
+      [:ok (nth payload 1) (nth payload 2)]
+      [:rejected (nth payload 1) (nth payload 2)])))
+
+(def failures (atom 0))
+
+(defn- check [label ok? detail]
+  (if ok?
+    (println "PASS" label)
+    (do (println "FAIL" label (pr-str detail)) (swap! failures inc))))
+
+(defn- doc-items
+  "The item vector of a `[\"vector\" items]` document."
+  [d]
+  (second d))
+
+(defn- i64-doc [d] (str (second d)))
+
+;; -- the kernel is the only door -------------------------------------------
+
+(let [k (kernel)
+      exports (set (:exports k))]
+  ;; The `call-*` entries exist because a browser host cannot mint a call
+  ;; value to pass in (see test/wasm-conformance.cljk). They are doors, not
+  ;; kernels: each assembles the call and hands it to `oak-call`. What must
+  ;; stay true is that NOTHING reaching the dataspace is exported -- no
+  ;; `do-declare`, no `assert!` wrapper, no schema mutator.
+  (check "the kernel exports its entry, its doors, its digest, and main"
+         (= #{'main 'schema-digest 'oak-call
+              'call-declare 'call-relate 'call-related 'call-census
+              'app-ontology 'app-ontology-digest 'compile-app 'compile-app-transaction
+              'query-app 'run-app
+              'compile-tender-app-at 'compile-tender-app-effect-at 'compile-tender-app
+              'run-tender-app-event 'run-tender-app}
+            exports)
+         exports)
+  (check "nothing that touches the graph without admission is exported"
+         (empty? (filter #(re-find #"^(do-|all-|ds-|type-of|assert)" (name %)) exports))
+         exports))
+
+;; -- S admits what it declares, and refuses what it does not ----------------
+
+(let [k (kernel)
+      good (outcome k (call :declare "t-1" :tender))
+      bad (outcome k (call :declare "x-1" :spaceship))]
+  (check "an entity of a declared type is admitted" (= :ok (first good)) good)
+  (check "an entity of an undeclared type is refused"
+         (and (= :rejected (first bad)) (= :oak/unknown-entity-type (second bad)))
+         bad))
+
+;; -- domain and range are enforced from S, against types held in the KG -----
+
+(let [k (kernel)
+      _ (outcome k (call :declare "t-1" :tender))
+      _ (outcome k (call :declare "s-9" :supplier))
+      _ (outcome k (call :declare "a-4" :agency))
+      admitted (outcome k (call :relate "t-1" :awarded-to "s-9"))
+      wrong-domain (outcome k (call :relate "s-9" :awarded-to "t-1"))
+      wrong-range (outcome k (call :relate "t-1" :awarded-to "a-4"))
+      unknown-rel (outcome k (call :relate "t-1" :sponsors "s-9"))
+      untyped (outcome k (call :relate "t-1" :awarded-to "ghost"))]
+  (check "a fact whose endpoints match domain and range is admitted"
+         (= :ok (first admitted)) admitted)
+  (check "a subject of the wrong type is refused as a domain violation"
+         (and (= :rejected (first wrong-domain))
+              (= :oak/domain-violation (second wrong-domain)))
+         wrong-domain)
+  (check "an object of the wrong type is refused as a range violation"
+         (and (= :rejected (first wrong-range))
+              (= :oak/range-violation (second wrong-range)))
+         wrong-range)
+  (check "a relation absent from S is refused by name"
+         (and (= :rejected (first unknown-rel))
+              (= :oak/unknown-relation (second unknown-rel)))
+         unknown-rel)
+  (check "an endpoint the graph has no type for is refused as untyped"
+         (and (= :rejected (first untyped))
+              (= :oak/untyped-object (second untyped)))
+         untyped))
+
+;; -- a refusal must not leave the graph changed ----------------------------
+
+(let [k (kernel)
+      _ (outcome k (call :declare "t-1" :tender))
+      _ (outcome k (call :declare "s-9" :supplier))
+      _ (outcome k (call :declare "a-4" :agency))
+      _ (outcome k (call :relate "t-1" :awarded-to "a-4"))     ;; range violation
+      _ (outcome k (call :relate "s-9" :awarded-to "t-1"))     ;; domain violation
+      after (outcome k (call :related "t-1" :awarded-to))]
+  (check "a refused call writes nothing the graph will answer with"
+         (and (= :ok (first after)) (empty? (doc-items (second after))))
+         after))
+
+;; -- reads come back with their evidence ------------------------------------
+
+(let [k (kernel)
+      _ (outcome k (call :declare "t-1" :tender))
+      _ (outcome k (call :declare "t-2" :tender))
+      _ (outcome k (call :declare "s-9" :supplier))
+      _ (outcome k (call :relate "t-1" :awarded-to "s-9"))
+      _ (outcome k (call :relate "t-2" :awarded-to "s-9"))
+      related (outcome k (call :related "t-1" :awarded-to))
+      census (outcome k (call :census :tender))
+      digest ((:invoke k) 'schema-digest [])]
+  (check "a read returns exactly the objects the admitted facts named"
+         (= [["string" "s-9"]] (doc-items (second related)))
+         related)
+  (check "a count is over the type the caller named, not over everything"
+         (= "2" (i64-doc (second census)))
+         census)
+  (check "every result carries the digest of the schema that admitted it"
+         (= ["string" digest] (first (doc-items (nth related 2))))
+         (nth related 2))
+  (check "the schema digest is a sha256"
+         (and (string? digest) (= 64 (count digest)))
+         digest))
+
+
+;; -- the structural ceiling is refused on the write side --------------------
+;;
+;; A query result is one document and a document container holds 32 items, so
+;; a 33rd typed entity would be one the kernel could never report. That bound
+;; is in the value ABI, not in any one interpreter, so it is asserted by
+;; number.
+
+(let [k (kernel)
+      ;; A trap here is the finding, not an accident: without the write-side
+      ;; guard the 33rd fact makes the PROVIDER trap while encoding its reply,
+      ;; and the suite must say so rather than stop with a host error.
+      results (reduce (fn [acc i]
+                        (conj acc (try (outcome k (call :declare (str "t-" i) :tender))
+                                       (catch :default e
+                                         [:trap (:trap (ex-data e)) (.-message e)]))))
+                      [] (range 34))
+      admitted (take-while #(= :ok (first %)) results)
+      after (drop (count admitted) results)]
+  (check "the kernel admits entities up to the ceiling a document can hold"
+         (= 32 (count admitted))
+         (count admitted))
+  (check "past it the kernel refuses by name rather than growing a graph it cannot report"
+         (and (seq after)
+              (every? #(and (= :rejected (first %))
+                            (= :oak/graph-at-capacity (second %)))
+                      after))
+         (vec (take 2 after))))
+
+;; -- the host's own ceiling stays inside the language -----------------------
+;;
+;; Reading is additionally bounded by the interpreter's fuel, which is a
+;; property of the HOST and not of the kernel -- the reference interpreter and
+;; a browser wasm host do not spend it alike, and the guest cannot catch a
+;; trap in any case. So this does not name a size. It probes for this host's
+;; own ceiling and then asserts the invariant on both sides of it: below it a
+;; read answers, and above it what comes out is a Kotoba trap and never a
+;; wrong answer or a host error object.
+;;
+;; The same self-calibrating shape `kir_host_stack_trap_test` uses, and for
+;; the same reason: a test that named a size would be testing the release.
+
+(defn- read-back
+  "Declare N entities and ask for the census: `[:ok count]`, or the trap."
+  [n]
+  (let [k (kernel)]
+    (dotimes [i n] (outcome k (call :declare (str "t-" i) :tender)))
+    (try [:ok (i64-doc (second (outcome k (call :census :tender))))]
+         (catch :default e
+           (let [data (ex-data e)]
+             (if (:trap data) [:trap (:trap data)] [:host-error (.-message e)]))))))
+
+(let [sizes (range 2 33 2)
+      answered (take-while #(= :ok (first (read-back %))) sizes)
+      ceiling (count answered)]
+  (check "a graph small enough for this host reads back exactly what was declared"
+         (and (pos? ceiling)
+              (= [:ok (str (last answered))] (read-back (last answered))))
+         {:largest-answered (last answered)})
+  (let [past (drop ceiling sizes)]
+    (if (empty? past)
+      (check "this host answered every size probed, so there is no ceiling to cross"
+             true {:probed (vec sizes)})
+      (let [outcome-past (read-back (first past))]
+        (check "crossing this host's ceiling stays inside the language"
+               (= :trap (first outcome-past))
+               {:size (first past) :outcome outcome-past})
+        (check "and it names fuel, the resource that actually ran out"
+               (= :fuel-exhausted (second outcome-past))
+               outcome-past)))))
+
+;; -- two observe patterns, so the observer budget is not spent per entity ---
+;;
+;; 20 entities is one observe pattern used 21 times, not 21 patterns. The kit
+;; allows 64 observers; a kernel that opened one per entity would have failed
+;; here rather than at its own ceiling.
+
+(let [k (kernel)]
+  (dotimes [i 20] (outcome k (call :declare (str "t-" i) :tender)))
+  (let [census (outcome k (call :census :tender))]
+    (check "asking about twenty entities does not spend the observer budget"
+           (and (= :ok (first census)) (= "20" (i64-doc (second census))))
+           census)))
+
+(println (str "\noak: " (if (zero? @failures) "all checks passed"
+                            (str @failures " failed"))))
+(set! (.-exitCode js/process) (if (zero? @failures) 0 1))
