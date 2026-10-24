@@ -1,0 +1,539 @@
+(ns kotoba.ffi
+  "Declared foreign-function bindings and native memory as a host capability.
+
+  Two halves in one namespace:
+
+  PURE (both hosts) -- C scalar types as keywords, their LP64 sizes and
+  alignments, `signature` data and its validation, C struct layout math
+  (`struct-layout`), and the declared binding table (`library` / `declared`).
+  Nothing here touches native code.
+
+  HOST (JVM only, `java.lang.foreign`, JDK 22+) -- linker, symbol lookup,
+  downcalls, arenas and memory segments. Native code is ambient authority,
+  so it only enters where the host provides it: on the kbb engine (SCI on
+  Node) there is no built-in FFI, and every host fn throws
+  `{:kotoba.ffi/error :unsupported-host :host :node}`.
+
+  Errors are `ex-info` whose data carries `:kotoba.ffi/error <keyword>`; the
+  keyword is the contract, the message is prose.")
+
+;; ---------------------------------------------------------------------------
+;; errors
+
+(defn- refuse
+  ([reason data] (refuse reason data nil))
+  ([reason data cause]
+   (let [m (merge {:kotoba.ffi/error reason} data)]
+     (if cause
+       (throw (ex-info (str "kotoba.ffi: " (name reason)) m cause))
+       (throw (ex-info (str "kotoba.ffi: " (name reason)) m))))))
+
+(defn error-reason
+  "The `:kotoba.ffi/error` keyword of an exception thrown by this namespace,
+  or nil."
+  [e]
+  (:kotoba.ffi/error (ex-data e)))
+
+;; ---------------------------------------------------------------------------
+;; PURE: C scalar types (LP64: long and pointer are 8 bytes)
+
+(def type-table
+  "keyword -> {:size :align :kind :signed?}. `:void` is a return type only."
+  {:i8   {:size 1 :align 1 :kind :int :signed? true}
+   :u8   {:size 1 :align 1 :kind :int :signed? false}
+   :i16  {:size 2 :align 2 :kind :int :signed? true}
+   :u16  {:size 2 :align 2 :kind :int :signed? false}
+   :i32  {:size 4 :align 4 :kind :int :signed? true}
+   :u32  {:size 4 :align 4 :kind :int :signed? false}
+   :i64  {:size 8 :align 8 :kind :int :signed? true}
+   :f32  {:size 4 :align 4 :kind :float}
+   :f64  {:size 8 :align 8 :kind :float}
+   :ptr  {:size 8 :align 8 :kind :ptr}
+   :void {:size 0 :align 1 :kind :void}})
+
+(defn type?
+  "Is `t` a known C type keyword (including `:void`)?"
+  [t]
+  (contains? type-table t))
+
+(defn- check-type [t]
+  (when-not (type? t) (refuse :unknown-type {:type t}))
+  t)
+
+(defn- check-value-type [t]
+  (check-type t)
+  (when (= :void t) (refuse :void-has-no-value {:type t}))
+  t)
+
+(defn type-size [t] (:size (type-table (check-value-type t))))
+(defn type-align [t] (:align (type-table (check-value-type t))))
+
+(def ^:private int-ranges
+  {:i8  [-128 127]
+   :u8  [0 255]
+   :i16 [-32768 32767]
+   :u16 [0 65535]
+   :i32 [-2147483648 2147483647]
+   :u32 [0 4294967295]
+   :i64 [-9223372036854775808 9223372036854775807]})
+
+(defn check-value
+  "Validate that `v` fits C type `t`; returns `v`. Integers must be integral
+  and within the type's range (`:value-out-of-range`), floats must be numbers
+  (`:not-a-number`). `:ptr` values are host objects and are checked by the
+  host fns."
+  [t v]
+  (check-value-type t)
+  (case (:kind (type-table t))
+    :int (do (when-not (integer? v) (refuse :not-an-integer {:type t :value v}))
+             (let [[lo hi] (int-ranges t)]
+               (when-not (<= lo v hi) (refuse :value-out-of-range {:type t :value v :min lo :max hi})))
+             v)
+    :float (do (when-not (number? v) (refuse :not-a-number {:type t :value v})) v)
+    :ptr v))
+
+;; ---------------------------------------------------------------------------
+;; PURE: signatures
+
+(defn signature
+  "A foreign function's C signature as data:
+  `{:kotoba.ffi/ret ret :kotoba.ffi/args [arg ...]}`. `ret` is a type or
+  `:void`; `args` a sequential of non-void types. Refusals: `:unknown-type`,
+  `:args-not-sequential`, `:void-argument`."
+  [ret args]
+  (check-type ret)
+  (when-not (sequential? args) (refuse :args-not-sequential {:args args}))
+  (doseq [a args]
+    (check-type a)
+    (when (= :void a) (refuse :void-argument {:args (vec args)})))
+  {:kotoba.ffi/ret ret :kotoba.ffi/args (vec args)})
+
+(defn signature-void
+  "`(signature :void args)` -- FunctionDescriptor/ofVoid."
+  [args]
+  (signature :void args))
+
+(defn signature?
+  [x]
+  (and (map? x) (contains? x :kotoba.ffi/ret) (contains? x :kotoba.ffi/args)))
+
+;; ---------------------------------------------------------------------------
+;; PURE: struct layout (C rules: each field at the next multiple of its
+;; alignment, struct alignment = max field alignment, size rounded up to it)
+
+(defn- align-up [n a] (* a (quot (+ n (dec a)) a)))
+
+(declare struct-layout)
+
+(defn- field-shape
+  "size/align of a field type: a scalar keyword, a nested struct-layout
+  result, or `[:array elem n]`."
+  [t]
+  (cond
+    (keyword? t) {:size (type-size t) :align (type-align t)}
+    (and (map? t) (contains? t :size) (contains? t :align)) {:size (:size t) :align (:align t)}
+    (and (vector? t) (= :array (first t)) (= 3 (count t)))
+    (let [[_ elem n] t]
+      (when-not (and (integer? n) (pos? n)) (refuse :bad-array-length {:type t}))
+      (let [{:keys [size align]} (field-shape elem)]
+        {:size (* size n) :align align}))
+    :else (refuse :unknown-type {:type t})))
+
+(defn struct-layout
+  "C layout of `fields` = `[[name type] ...]` in declaration order. A type is
+  a scalar keyword, another `struct-layout` result (nested struct) or
+  `[:array type n]`. Returns `{:size :align :offsets {name offset} :fields
+  [{:name :type :offset :size :align} ...]}`. Refusals: `:empty-struct`,
+  `:duplicate-field`, `:unknown-type`, `:bad-field`, `:bad-array-length`."
+  [fields]
+  (when-not (and (sequential? fields) (seq fields)) (refuse :empty-struct {:fields fields}))
+  (loop [fs (seq fields) off 0 align 1 out [] seen #{}]
+    (if-not fs
+      {:size (align-up off align) :align align
+       :offsets (into {} (map (juxt :name :offset)) out)
+       :fields out}
+      (let [f (first fs)]
+        (when-not (and (sequential? f) (= 2 (count f))) (refuse :bad-field {:field f}))
+        (let [[nm t] f]
+          (when (seen nm) (refuse :duplicate-field {:name nm}))
+          (let [{fs-size :size fs-align :align} (field-shape t)
+                at (align-up off fs-align)]
+            (recur (next fs) (+ at fs-size) (max align fs-align)
+                   (conj out {:name nm :type t :offset at :size fs-size :align fs-align})
+                   (conj seen nm))))))))
+
+;; ---------------------------------------------------------------------------
+;; PURE: declared binding table
+
+(defn library
+  "A declared binding table: `{:symbols {\"name\" signature ...}}`. Every
+  signature is validated (`signature?` or refused `:bad-signature`). Only a
+  declared symbol can be bound."
+  [{:keys [symbols] :as spec}]
+  (when-not (map? symbols) (refuse :bad-library {:spec spec}))
+  (doseq [[k s] symbols]
+    (when-not (string? k) (refuse :bad-symbol-name {:name k}))
+    (when-not (signature? s) (refuse :bad-signature {:name k :signature s})))
+  {:kotoba.ffi/symbols symbols})
+
+(defn declared
+  "The declared signature of `name` in `lib`, or refuse `:undeclared-symbol`."
+  [lib name]
+  (or (get (:kotoba.ffi/symbols lib) name)
+      (refuse :undeclared-symbol {:name name :declared (vec (sort (keys (:kotoba.ffi/symbols lib))))})))
+
+;; ---------------------------------------------------------------------------
+;; HOST
+
+#?(:clj
+   (do
+     (import '[java.lang.foreign Arena Linker Linker$Option FunctionDescriptor
+               ValueLayout MemoryLayout MemorySegment SymbolLookup AddressLayout
+               ValueLayout$OfByte ValueLayout$OfShort ValueLayout$OfInt
+               ValueLayout$OfLong ValueLayout$OfFloat ValueLayout$OfDouble]
+             '[java.lang.invoke MethodHandle]
+             '[java.nio.channels FileChannel FileChannel$MapMode]
+             '[java.nio.file Path OpenOption StandardOpenOption])
+
+     (def host :jvm)
+
+     (def jdk-feature
+       "The running JDK's feature release. FFM is final from 22; on 21 it is a
+       preview API that loads without --enable-preview for everything this
+       namespace uses except the String helpers, which were renamed in 22
+       (allocateUtf8String -> allocateFrom, getUtf8String -> getString)."
+       (.feature (Runtime/version)))
+     (def ^:private jdk22? (>= jdk-feature 22))
+
+     (defn layout
+       "The ValueLayout for type keyword `t` (unsigned types share the signed
+       layout of their width; `fetch`/`invoke` re-read them unsigned)."
+       [t]
+       (check-value-type t)
+       (case t
+         (:i8 :u8) ValueLayout/JAVA_BYTE
+         (:i16 :u16) ValueLayout/JAVA_SHORT
+         (:i32 :u32) ValueLayout/JAVA_INT
+         :i64 ValueLayout/JAVA_LONG
+         :f32 ValueLayout/JAVA_FLOAT
+         :f64 ValueLayout/JAVA_DOUBLE
+         :ptr ValueLayout/ADDRESS))
+
+     (defn descriptor
+       "The FunctionDescriptor of a `signature`."
+       ^FunctionDescriptor [sig]
+       (when-not (signature? sig) (refuse :bad-signature {:signature sig}))
+       (let [args (into-array MemoryLayout (map layout (:kotoba.ffi/args sig)))]
+         (if (= :void (:kotoba.ffi/ret sig))
+           (FunctionDescriptor/ofVoid args)
+           (FunctionDescriptor/of (layout (:kotoba.ffi/ret sig)) args))))
+
+     (defn segment? [x] (instance? MemorySegment x))
+     (defn arena? [x] (instance? Arena x))
+
+     ;; FFM throws JDK exceptions; they are translated to ex-info with a
+     ;; pinned reason and the original as cause.
+     (defn- translate [e data]
+       (let [msg (str (.getMessage ^Throwable e))]
+         (cond
+           (instance? clojure.lang.ExceptionInfo e) (throw e)
+           (instance? IndexOutOfBoundsException e) (refuse :out-of-bounds data e)
+           (instance? java.lang.WrongThreadException e) (refuse :wrong-thread data e)
+           (instance? IllegalStateException e) (refuse :scope-closed data e)
+           ;; FFM reports both as IllegalArgumentException; the message is the
+           ;; only discriminator (measured on JDK 26: "Target offset 1 is
+           ;; incompatible with alignment constraint 4 ..." / "Attempt to
+           ;; write a read-only segment").
+           (and (instance? IllegalArgumentException e) (re-find #"(?i)misaligned|alignment constraint" msg))
+           (refuse :misaligned data e)
+           (and (instance? IllegalArgumentException e) (re-find #"(?i)read-only" msg))
+           (refuse :read-only data e)
+           (instance? UnsupportedOperationException e) (refuse :read-only data e)
+           :else (throw e))))
+
+     (defmacro ^:private guarded [data & body]
+       `(try ~@body (catch RuntimeException e# (translate e# ~data))))
+
+     ;; -- linker / lookup ---------------------------------------------------
+
+     (defn native-linker ^Linker [] (Linker/nativeLinker))
+     (defn default-lookup ^SymbolLookup [^Linker linker] (.defaultLookup linker))
+     (defn loader-lookup ^SymbolLookup [] (SymbolLookup/loaderLookup))
+     (defn library-lookup
+       "SymbolLookup/libraryLookup(String, Arena); the library is unloaded when
+       `arena` closes. Refuses `:library-load-failed`."
+       ^SymbolLookup [path ^Arena arena]
+       (try (SymbolLookup/libraryLookup ^String (str path) arena)
+            (catch IllegalArgumentException e
+              (refuse :library-load-failed {:path (str path)} e))))
+     (defn load-library!
+       "System/load(path) into the loader lookup. `path` must be absolute.
+       Refuses `:library-load-failed`."
+       [path]
+       (try (System/load (str path)) nil
+            (catch UnsatisfiedLinkError e
+              (refuse :library-load-failed {:path (str path)} e))))
+
+     (defn find-symbol
+       "The symbol's MemorySegment, or nil."
+       [^SymbolLookup lookup name]
+       (.orElse (.find lookup ^String name) nil))
+
+     (defn find-symbol!
+       [lookup name]
+       (or (find-symbol lookup name)
+           (refuse :symbol-not-found {:name name})))
+
+     ;; -- downcalls ---------------------------------------------------------
+
+     (defrecord Handle [^MethodHandle method-handle args ret])
+
+     (defn- fd->sig [^FunctionDescriptor fd]
+       (let [kw (fn [^MemoryLayout l]
+                  (let [c (.carrier ^ValueLayout l)]
+                    (cond (= c Byte/TYPE) :i8 (= c Short/TYPE) :i16 (= c Integer/TYPE) :i32
+                          (= c Long/TYPE) :i64 (= c Float/TYPE) :f32 (= c Double/TYPE) :f64
+                          (= c MemorySegment) :ptr
+                          :else (refuse :unknown-type {:layout (str l)}))))]
+         {:kotoba.ffi/ret (if (.isPresent (.returnLayout fd)) (kw (.get (.returnLayout fd))) :void)
+          :kotoba.ffi/args (mapv kw (.argumentLayouts fd))}))
+
+     (defn downcall
+       "Linker.downcallHandle(symbol, descriptor). `sig` is a `signature` (or a
+       raw FunctionDescriptor). Returns a handle for `invoke`."
+       [^Linker linker ^MemorySegment symbol sig]
+       (let [sig (if (instance? FunctionDescriptor sig) (fd->sig sig) sig)
+             mh (.downcallHandle linker symbol (descriptor sig) (make-array Linker$Option 0))]
+         (->Handle mh (:kotoba.ffi/args sig) (:kotoba.ffi/ret sig))))
+
+     (defn method-handle
+       "The underlying java.lang.invoke.MethodHandle of a downcall handle."
+       ^MethodHandle [h] (:method-handle h))
+
+     (defn- coerce-arg [t v]
+       (if (= :ptr t)
+         (cond (nil? v) MemorySegment/NULL
+               (instance? MemorySegment v) v
+               :else (refuse :not-a-segment {:type t :value v}))
+         (do (check-value t v)
+             (case t
+               (:i8 :u8) (unchecked-byte v)
+               (:i16 :u16) (unchecked-short v)
+               (:i32 :u32) (unchecked-int v)
+               :i64 (long v)
+               :f32 (float v)
+               :f64 (double v)))))
+
+     (defn- uncoerce [t v]
+       (case t
+         :u8 (bit-and (long v) 0xff)
+         :u16 (bit-and (long v) 0xffff)
+         :u32 (bit-and (long v) 0xffffffff)
+         v))
+
+     (defn invoke-list
+       "Call a downcall handle with `args`, each coerced to its declared C type
+       (a Clojure long becomes the `int` an `:i32` parameter needs; nil is
+       NULL for `:ptr`). Refuses `:arity-mismatch`, `:value-out-of-range`,
+       `:not-an-integer`, `:not-a-number`, `:not-a-segment`."
+       [h args]
+       (when-not (instance? Handle h) (refuse :not-a-handle {:value h}))
+       (let [types (:args h) args (vec args)]
+         (when-not (= (count types) (count args))
+           (refuse :arity-mismatch {:expected (count types) :got (count args)}))
+         (let [boxed (object-array (map coerce-arg types args))
+               r (guarded {:op :invoke} (.invokeWithArguments ^MethodHandle (:method-handle h) ^objects boxed))]
+           (uncoerce (:ret h) r))))
+
+     (defn invoke [h & args] (invoke-list h args))
+
+     ;; -- arenas ------------------------------------------------------------
+
+     (defn confined-arena ^Arena [] (Arena/ofConfined))
+     (defn shared-arena ^Arena [] (Arena/ofShared))
+     (defn auto-arena ^Arena [] (Arena/ofAuto))
+     (defn global-arena ^Arena [] (Arena/global))
+
+     ;; -- memory ------------------------------------------------------------
+
+     (defn- check-size [n]
+       (when-not (and (integer? n) (>= n 0)) (refuse :negative-size {:size n})))
+
+     (defn- check-align [a]
+       (when-not (and (integer? a) (pos? a) (zero? (bit-and a (dec a))))
+         (refuse :bad-alignment {:align a})))
+
+     (defn alloc
+       "Arena.allocate(layout-of t): one zeroed, naturally aligned `t`."
+       ^MemorySegment [^Arena arena t]
+       (let [l (layout t)] (guarded {:op :alloc} (.allocate arena ^MemoryLayout l))))
+
+     (defn alloc-bytes
+       "Arena.allocate(n, align) (align defaults to 1)."
+       (^MemorySegment [arena n] (alloc-bytes arena n 1))
+       (^MemorySegment [^Arena arena n align]
+        (check-size n) (check-align align)
+        (guarded {:op :alloc} (.allocate arena (long n) (long align)))))
+
+     (defn c-string
+       "Arena.allocateFrom(String): UTF-8, NUL-terminated."
+       ^MemorySegment [^Arena arena s]
+       (when-not (string? s) (refuse :not-a-string {:value s}))
+       (guarded {:op :c-string}
+                (if jdk22?
+                  (clojure.lang.Reflector/invokeInstanceMethod arena "allocateFrom" (object-array [s]))
+                  ;; JDK 21 (preview FFM): the same operation was allocateUtf8String
+                  (clojure.lang.Reflector/invokeInstanceMethod arena "allocateUtf8String" (object-array [s])))))
+
+     (defn put!
+       "MemorySegment.set(layout-of t, offset, v). Returns nil. Refuses
+       `:out-of-bounds`, `:misaligned`, `:scope-closed`, `:read-only`,
+       `:value-out-of-range`, `:not-a-segment`."
+       [^MemorySegment seg t offset v]
+       (when-not (segment? seg) (refuse :not-a-segment {:value seg}))
+       (let [off (long offset) data {:op :put! :type t :offset off}]
+         (case t
+           (:i8 :u8) (do (check-value t v) (guarded data (.set seg ^ValueLayout$OfByte ValueLayout/JAVA_BYTE off (unchecked-byte v))))
+           (:i16 :u16) (do (check-value t v) (guarded data (.set seg ^ValueLayout$OfShort ValueLayout/JAVA_SHORT off (unchecked-short v))))
+           (:i32 :u32) (do (check-value t v) (guarded data (.set seg ^ValueLayout$OfInt ValueLayout/JAVA_INT off (unchecked-int v))))
+           :i64 (do (check-value t v) (guarded data (.set seg ^ValueLayout$OfLong ValueLayout/JAVA_LONG off (long v))))
+           :f32 (do (check-value t v) (guarded data (.set seg ^ValueLayout$OfFloat ValueLayout/JAVA_FLOAT off (float v))))
+           :f64 (do (check-value t v) (guarded data (.set seg ^ValueLayout$OfDouble ValueLayout/JAVA_DOUBLE off (double v))))
+           :ptr (let [p (cond (nil? v) MemorySegment/NULL
+                              (segment? v) v
+                              :else (refuse :not-a-segment {:type t :value v}))]
+                  (guarded data (.set seg ^AddressLayout ValueLayout/ADDRESS off ^MemorySegment p)))
+           (check-value-type t))
+         nil))
+
+     (defn fetch
+       "MemorySegment.get(layout-of t, offset). Unsigned types come back
+       zero-extended as longs; `:ptr` as a zero-length MemorySegment."
+       [^MemorySegment seg t offset]
+       (when-not (segment? seg) (refuse :not-a-segment {:value seg}))
+       (let [off (long offset) data {:op :fetch :type t :offset off}]
+         (case t
+           :i8 (guarded data (.get seg ^ValueLayout$OfByte ValueLayout/JAVA_BYTE off))
+           :u8 (bit-and (long (guarded data (.get seg ^ValueLayout$OfByte ValueLayout/JAVA_BYTE off))) 0xff)
+           :i16 (guarded data (.get seg ^ValueLayout$OfShort ValueLayout/JAVA_SHORT off))
+           :u16 (bit-and (long (guarded data (.get seg ^ValueLayout$OfShort ValueLayout/JAVA_SHORT off))) 0xffff)
+           :i32 (guarded data (.get seg ^ValueLayout$OfInt ValueLayout/JAVA_INT off))
+           :u32 (bit-and (long (guarded data (.get seg ^ValueLayout$OfInt ValueLayout/JAVA_INT off))) 0xffffffff)
+           :i64 (guarded data (.get seg ^ValueLayout$OfLong ValueLayout/JAVA_LONG off))
+           :f32 (guarded data (.get seg ^ValueLayout$OfFloat ValueLayout/JAVA_FLOAT off))
+           :f64 (guarded data (.get seg ^ValueLayout$OfDouble ValueLayout/JAVA_DOUBLE off))
+           :ptr (guarded data (.get seg ^AddressLayout ValueLayout/ADDRESS off))
+           (check-value-type t))))
+
+     (defn byte-size ^long [^MemorySegment seg] (.byteSize seg))
+
+     (defn copy-from!
+       "dst.copyFrom(src). Returns dst."
+       [^MemorySegment dst ^MemorySegment src]
+       (guarded {:op :copy-from!} (.copyFrom dst src)))
+
+     (defn of-array
+       "MemorySegment/ofArray over a byte/short/char/int/long/float/double
+       array (a heap segment, alignment 1 for bytes)."
+       ^MemorySegment [arr]
+       (cond
+         (bytes? arr) (MemorySegment/ofArray ^bytes arr)
+         (instance? (Class/forName "[S") arr) (MemorySegment/ofArray ^shorts arr)
+         (instance? (Class/forName "[C") arr) (MemorySegment/ofArray ^chars arr)
+         (instance? (Class/forName "[I") arr) (MemorySegment/ofArray ^ints arr)
+         (instance? (Class/forName "[J") arr) (MemorySegment/ofArray ^longs arr)
+         (instance? (Class/forName "[F") arr) (MemorySegment/ofArray ^floats arr)
+         (instance? (Class/forName "[D") arr) (MemorySegment/ofArray ^doubles arr)
+         :else (refuse :not-a-primitive-array {:value (type arr)})))
+
+     (defn reinterpret
+       "MemorySegment.reinterpret(n) or, with `arena`, reinterpret(n, arena,
+       null) -- the segment then lives as long as `arena`. Restricted method."
+       (^MemorySegment [^MemorySegment seg n]
+        (check-size n) (.reinterpret seg (long n)))
+       (^MemorySegment [^MemorySegment seg n ^Arena arena]
+        (check-size n) (.reinterpret seg (long n) arena nil)))
+
+     (defn address ^long [^MemorySegment seg] (.address seg))
+     (defn null-segment ^MemorySegment [] MemorySegment/NULL)
+
+     (defn segment-string
+       "MemorySegment.getString(0): the UTF-8 C string starting at offset 0.
+       Refuses `:out-of-bounds` when no NUL lies inside the segment."
+       [^MemorySegment seg]
+       (guarded {:op :segment-string}
+                (clojure.lang.Reflector/invokeInstanceMethod
+                 seg (if jdk22? "getString" "getUtf8String") (object-array [(long 0)]))))
+
+     (defn as-slice
+       ^MemorySegment [^MemorySegment seg offset n]
+       (guarded {:op :as-slice :offset offset :size n} (.asSlice seg (long offset) (long n))))
+
+     (defn map-file
+       "FileChannel.map(READ_ONLY, offset, n, arena): a read-only
+       MemorySegment over `n` bytes of the file at `path`, unmapped when
+       `arena` closes (the channel itself is closed on return)."
+       ^MemorySegment [^Arena arena path offset n]
+       (with-open [ch (FileChannel/open (Path/of (str path) (make-array String 0))
+                                        (into-array OpenOption [StandardOpenOption/READ]))]
+         (.map ch FileChannel$MapMode/READ_ONLY (long offset) (long n) arena)))
+
+     ;; -- declared library binding -----------------------------------------
+
+     (defn bind
+       "Downcall handle for `name` from the declared table `lib`: refuses
+       `:undeclared-symbol` before any native lookup, then `:symbol-not-found`."
+       [lib ^Linker linker lookup name]
+       (let [sig (declared lib name)]
+         (downcall linker (find-symbol! lookup name) sig))))
+
+   :cljs
+   (do
+     (def host :node)
+
+     (defn- unsupported [op]
+       (refuse :unsupported-host {:host :node :op op}))
+
+     (defn segment? [_] false)
+     (defn arena? [_] false)
+
+     (defn layout [t] (check-value-type t) (unsupported :layout))
+     (defn descriptor [_] (unsupported :descriptor))
+     (defn native-linker [] (unsupported :native-linker))
+     (defn default-lookup [_] (unsupported :default-lookup))
+     (defn loader-lookup [] (unsupported :loader-lookup))
+     (defn library-lookup [_ _] (unsupported :library-lookup))
+     (defn load-library! [_] (unsupported :load-library!))
+     (defn find-symbol [_ _] (unsupported :find-symbol))
+     (defn find-symbol! [_ _] (unsupported :find-symbol!))
+     (defn downcall [_ _ _] (unsupported :downcall))
+     (defn method-handle [_] (unsupported :method-handle))
+     (defn invoke-list [_ _] (unsupported :invoke-list))
+     (defn invoke [_ & _] (unsupported :invoke))
+     (defn confined-arena [] (unsupported :confined-arena))
+     (defn shared-arena [] (unsupported :shared-arena))
+     (defn auto-arena [] (unsupported :auto-arena))
+     (defn global-arena [] (unsupported :global-arena))
+     (defn alloc [_ _] (unsupported :alloc))
+     (defn alloc-bytes ([_ _] (unsupported :alloc-bytes)) ([_ _ _] (unsupported :alloc-bytes)))
+     (defn c-string [_ _] (unsupported :c-string))
+     (defn put! [_ _ _ _] (unsupported :put!))
+     (defn fetch [_ _ _] (unsupported :fetch))
+     (defn byte-size [_] (unsupported :byte-size))
+     (defn copy-from! [_ _] (unsupported :copy-from!))
+     (defn of-array [_] (unsupported :of-array))
+     (defn reinterpret ([_ _] (unsupported :reinterpret)) ([_ _ _] (unsupported :reinterpret)))
+     (defn address [_] (unsupported :address))
+     (defn null-segment [] (unsupported :null-segment))
+     (defn segment-string [_] (unsupported :segment-string))
+     (defn as-slice [_ _ _] (unsupported :as-slice))
+     (defn map-file [_ _ _ _] (unsupported :map-file))
+     (defn bind [lib _ _ name] (declared lib name) (unsupported :bind))))
+
+(def host-fns
+  "Every host fn of the contract (for the refusal census on kbb)."
+  '[layout descriptor native-linker default-lookup loader-lookup library-lookup
+    load-library! find-symbol find-symbol! downcall method-handle invoke invoke-list
+    confined-arena shared-arena auto-arena global-arena alloc alloc-bytes c-string
+    put! fetch byte-size copy-from! of-array reinterpret address null-segment
+    segment-string as-slice map-file bind])
