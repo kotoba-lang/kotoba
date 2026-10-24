@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kotobaseEngineContract` | `kotoba.kotobaseEngineContract/src` | `kotobase.engine.archive`, `kotobase.engine.canonical`, `kotobase.engine.completion`, `kotobase.engine.conformance` (Kotoba project library) |
 | `kotoba.kotobaProcedure` | `kotoba.kotobaProcedure/src` | `kotoba.procedure.gate`, `kotoba.procedure.store` (Kotoba project library) |
 | `kotoba.kotobaObject` | `kotoba.kotobaObject/src` | `kotoba.object.elf64`, `kotoba.object.macho64`, `kotoba.object.pe32plus` (Kotoba project library) |
 | `kotoba.kotobaLedger` | `kotoba.kotobaLedger/src` | `kotoba.ledger.core`, `kotoba.ledger.file-git`, `kotoba.ledger.kotobase` (Kotoba project library) |

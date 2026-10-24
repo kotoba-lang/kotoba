@@ -1,0 +1,247 @@
+--- b9a6042b:src/kotobase/datomic.cljc
++++ main:src/kotobase/datomic.cljk
+@@ -4,9 +4,9 @@
+   This namespace deliberately uses Datomic's argument order:
+   `(q query db & inputs)`, `(pull db selector eid)`, and
+   `(datoms db opts)`. `kotobase.core` remains the smaller native facade."
+-  (:require #?(:clj [clojure.edn :as edn]
++  (:require #?(:clj [kotoba.lang.edn :as edn]
+                :cljs [cljs.reader :as edn])
+-            [clojure.string :as str]
++            [kotoba.lang.text :as str]
+             [kotobase.engine :as engine]))
+ 
+ (def ^:private query-sections
+@@ -113,26 +113,61 @@
+      :named? (boolean (some seq ((juxt :keys :strs :syms) query)))}))
+ 
+ (defn q
+-  "Datomic-compatible argument order: `(q query db & inputs)`.
+-
+-  Supports relation, scalar (`.`), collection (`...`), tuple, and
+-  `:keys`/`:strs`/`:syms` result shapes."
+-  [query database & inputs]
+-  (let [{compiled :query shape :shape named? :named?}
+-        (compile-query query)
+-        finish (fn [results]
+-                 (let [results (if named?
+-                                 (named-results compiled results)
+-                                 results)]
+-                   (if named? results (shape-results shape results))))
+-        result (engine/query database compiled (mapv wire-value inputs))]
+-    #?(:clj (finish result)
+-       :cljs (.then result finish))))
++  "Datomic Client API compatible `q`.
++
++  Supports:
++  * `(q query db & inputs)` — classic multi-arity form
++  * `(q {:query … :args […] :limit … :offset …})` — Client API arg-map
++
++  Result shapes: relation, scalar (`.`), collection (`...`), tuple, and
++  `:keys`/`:strs`/`:syms`."
++  ([arg-map]
++   (when-not (map? arg-map)
++     (throw (ex-info "q arity-1 requires an arg-map with :query and :args"
++                     {:type :kotobase.datomic/invalid-query})))
++   (let [query (:query arg-map)
++         args (or (:args arg-map) [])
++         result (apply q query args)
++         limit (:limit arg-map)
++         offset (or (:offset arg-map) 0)
++         window
++         (fn [xs]
++           (let [xs (cond-> (if (set? xs) (vec xs) (vec xs))
++                      (pos? offset) (->> (drop offset) vec)
++                      (and (number? limit) (not= -1 limit) (not (neg? limit)))
++                      (->> (take limit) vec))]
++             (if (set? result) (set xs) xs)))]
++     (if (or (pos? offset) (and (number? limit) (not= -1 limit)))
++       (if (or (set? result) (sequential? result))
++         (window result)
++         result)
++       result)))
++  ([query database & inputs]
++   (let [{compiled :query shape :shape named? :named?}
++         (compile-query query)
++         finish (fn [results]
++                  (let [results (if named?
++                                  (named-results compiled results)
++                                  results)]
++                    (if named? results (shape-results shape results))))
++         result (engine/query database compiled (mapv wire-value inputs))]
++     #?(:clj (finish result)
++        :cljs (.then result finish)))))
+ 
+ (defn pull
+-  "Datomic-compatible argument order: `(pull db selector eid)`."
+-  [database selector eid]
+-  (engine/pull database (wire-value eid) (wire-value selector)))
++  "Datomic Client API compatible `pull`.
++
++  Supports `(pull db selector eid)` and
++  `(pull db {:selector … :eid …})`."
++  ([database arg-map]
++   (if (map? arg-map)
++     (pull database (:selector arg-map) (:eid arg-map))
++     ;; arity-2 historical: treat second arg as selector only when third
++     ;; is supplied by the 3-arity overload below.
++     (throw (ex-info "pull arity-2 map form requires :selector and :eid"
++                     {:type :kotobase.datomic/invalid-pull}))))
++  ([database selector eid]
++   (engine/pull database (wire-value eid) (wire-value selector))))
+ 
+ (defn pull-many [database selector eids]
+   (engine/pull-many database (wire-value selector) (mapv wire-value eids)))
+@@ -163,26 +198,24 @@
+   (datoms database {:index index :components (vec components)}))
+ 
+ (defn index-range
+-  "Return AVET datoms for ATTRIBUTE whose decoded values fall in [START, END)."
++  "Return AVET datoms for ATTRIBUTE whose decoded values fall in [START, END).
++
++  Exclusive hi. Delegates to the hot in-memory `query-range` path
++  (`arrangement.query` / `datalog.query`). HMAC-blinded persisted
++  covering keys are not order-preserving and are not claimed to prune
++  by value."
+   [database attribute start end]
+-  (let [finish
+-        (fn [rows]
+-          (->> rows
+-               (filter
+-                (fn [{:keys [v_edn]}]
+-                  (let [value (edn/read-string v_edn)]
+-                    (and (or (nil? start) (not (neg? (compare value start))))
+-                         (or (nil? end) (neg? (compare value end)))))))
+-               vec))
+-        rows (datoms database {:index :avet
+-                               :components [attribute]})]
+-    #?(:clj (finish rows)
+-       :cljs (.then rows finish))))
++  (engine/index-range database (wire-value attribute) start end))
+ 
+ (defn db
+   "Return an immutable database value pinned to the connection's current CID."
+   [connection]
+   (engine/db connection))
++
++(defn at-cid
++  "Return an immutable database value pinned to an exact commit CID."
++  [database commit-cid]
++  (engine/at-cid database commit-cid))
+ 
+ (defn as-of [database t] (engine/as-of database t))
+ (defn since [database t] (engine/since database t))
+@@ -290,7 +323,7 @@
+ 
+ (defn- fresh-entity-id []
+   (str "kotobase.tempid/"
+-       #?(:clj (java.util.UUID/randomUUID)
++       #?(:clj (random-uuid)
+           :cljs (.randomUUID js/crypto))))
+ 
+ (defn- stored-value [value]
+@@ -944,25 +977,38 @@
+                   (.then #(finish snapshot %)))))))))
+ 
+ (defn transact-prepared
+-  "Persist a transaction returned by `prepare-transaction`."
++  "Persist a transaction returned by `prepare-transaction`. `:novelty-size`
++  in the report is `kotobase-peer.core/novelty-size` on the post-commit
++  chain -- the same signal `kotobase-server`'s `do-transact` (the novelty-
++  append XRPC path) reports as `novelty_size`, computed here off the SAME
++  shared primitive so both paths agree on when a fold is worth invoking.
++  O(1), no extra round trip (the chain was just produced by this commit)."
+   [connection {:keys [request requested-tx-data tempids]}]
+   (let [tx-data (if (map? request) (:tx-data request) request)
+         before (engine/head connection)
+-        report (fn [before after]
++        report (fn [before after novelty-size]
+                  {:db-before before
+                   :db-after after
+                   :tx-data requested-tx-data
+-                  :tempids tempids})]
++                  :tempids tempids
++                  :novelty-size novelty-size})]
+     #?(:clj
+-       (let [after (engine/transact! connection tx-data)]
+-         (engine/notify-listeners! connection (report before after)))
++       (let [after (engine/transact! connection tx-data)
++             novelty-size (engine/novelty-size connection after)]
++         (engine/notify-listeners! connection (report before after novelty-size)))
+        :cljs
+        (-> before
+            (.then
+             (fn [before-cid]
+               (-> (engine/transact! connection tx-data)
+-                  (.then #(engine/notify-listeners!
+-                           connection (report before-cid %))))))))))
++                  (.then
++                   (fn [after-cid]
++                     (-> (engine/novelty-size connection after-cid)
++                         (.then
++                          (fn [novelty-size]
++                            (engine/notify-listeners!
++                             connection
++                             (report before-cid after-cid novelty-size))))))))))))))
+ 
+ (defn transact
+   "Accept Datomic Client's `{:tx-data [...]}` shape or a raw tx-data seq.
+@@ -993,9 +1039,54 @@
+     #?(:clj (finish prepared)
+        :cljs (.then prepared finish))))
+ 
+-(defn with-db [database tx]
+-  (let [report (with database tx)]
+-    #?(:clj (:db-after report)
+-       :cljs (.then report :db-after))))
++(defn with-db
++  "Client API `(with-db conn)` — return a db value suitable for `with`.
++
++  Historical 2-arity `(with-db db tx)` remains as a deprecated alias that
++  returns only `:db-after` of a speculative transaction."
++  ([connection]
++   (db connection))
++  ([database tx]
++   (let [report (with database tx)]
++     #?(:clj (:db-after report)
++        :cljs (.then report :db-after)))))
+ 
+ (def transact-async transact)
++
++(defn- wire-view-spec
++  "A view spec's `\"attrs\"` list holds attribute-shaped values (the same
++  kind `datoms`/`q`/`pull` already wire-encode via `wire-value`) -- callers
++  that pass real Datomic keywords need them translated to the engine's
++  string form the same way; callers that already pass pre-encoded strings
++  (e.g. gftdcojp/aozora-engine's feed_view.cljc) get an unchanged no-op
++  from `wire-value` on an already-string value."
++  [spec]
++  (some-> spec (update "attrs" #(mapv wire-value %))))
++
++(defn fold
++  "Maintenance op, not part of Datomic's client API proper: compact
++  `connection`'s accumulated novelty into a fresh indexed snapshot.
++
++  `opts` (optional): `:max-novelty`/`:threshold`/`:max-retries` plus
++  `:views` -- a map of `{view-name spec-or-nil}` (nil spec removes a
++  view) declaring/updating the graph's materialized views. A non-nil
++  `:views` forces the fold to run even with nothing to compact, so a
++  view declaration is never silently dropped (see `engine/fold!`'s
++  docstring)."
++  ([connection] (fold connection {}))
++  ([connection opts]
++   (engine/fold!
++    connection
++    (cond-> opts
++      (:views opts)
++      (update :views
++              (fn [views]
++                (into {} (map (fn [[view-name spec]] [view-name (wire-view-spec spec)])) views)))))))
++
++(defn view
++  "Rows of a fold-materialized view. Datomic-adjacent, not part of the
++  client API proper (mirrors `datoms`' response shape). nil when the
++  graph has no head yet or the view isn't declared (a prior `fold` with
++  `:views` declares it)."
++  [connection view-name]
++  (engine/view connection view-name))

@@ -1,0 +1,423 @@
+(ns kotobase.engine.merge-adversarial-test
+  "Review reproductions for kotobase-engine#10, each asserting the fixed
+  behavior. Promise facade (`kbb -M:test`)."
+  (:require #?(:clj [kotoba.test :refer [deftest is async]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is async]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is async]])
+            [arrangement.core :as qs]
+            [chain.core :as chain]
+            [ipld.core :as ipld]
+            [kotobase-peer.core :as peer]
+            [kotobase.engine :as engine]
+            [kotobase.engine.logical :as logical]
+            [kotobase.engine.merge :as contract]
+            [kotobase.storage.memory :as memory]))
+
+(def one {":doc/status" {:db/cardinality :db.cardinality/one}})
+(def uniq {":user/email" {:db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/value}})
+(def settings {:database-id "tenant/db" :schema (merge one uniq)})
+
+(defn- open
+  ([store] (open store settings))
+  ([store merge-settings]
+   (engine/open (cond-> {:storage store
+                         :encrypt-fn #(js/Promise.resolve %)
+                         :decrypt-fn #(js/Promise.resolve %)
+                         :blind-fn #(js/Promise.resolve (pr-str %))
+                         :visible? (constantly true)}
+                  merge-settings (assoc :merge merge-settings :trust-scope "adversarial")))))
+
+(defn- exchange! [a b]
+  (let [blocks (merge (:blocks @(:state a)) (:blocks @(:state b)))]
+    (swap! (:state a) assoc :blocks blocks)
+    (swap! (:state b) assoc :blocks blocks)))
+
+(defn- ref-cid [store] (get-in @(:state store) [:refs "main" :cid]))
+
+(defn- all-datoms [conn cid]
+  (-> (engine/q (engine/at-cid conn cid) [nil nil nil])
+      (.then (fn [quads] (set (map logical/quad->datom quads))))))
+
+(defn- problem-of [e]
+  (loop [e e] (when e (or (:problem (ex-data e)) (recur (ex-cause e))))))
+
+(defn- outcome
+  "[:ok value] or [:err problem-or-message]."
+  [p]
+  (-> p
+      (.then (fn [r] [:ok r]))
+      (.catch (fn [e] [:err (or (problem-of e) (ex-message e))]))))
+
+(defn- fail! [done]
+  (fn [e]
+    (is false (str "unexpected: " (ex-message e) " " (pr-str (ex-data e))))
+    (done)))
+
+(defn- forge!
+  "Write a chain commit with an arbitrary indexed snapshot of QUADS (an
+  attacker with write access to the block store)."
+  [store prev causes quads]
+  (let [get-fn (fn [cid] (get (:blocks @(:state store)) cid))
+        put! (fn [cid bytes] (swap! (:state store) assoc-in [:blocks cid] bytes) cid)
+        db (peer/transact (peer/empty-db) quads)]
+    (-> (js/Promise.resolve
+         (qs/commit! put! db nil qs/current-schema-version
+                     #(js/Promise.resolve (pr-str %)) #(js/Promise.resolve %)))
+        (.then (fn [snap]
+                 (chain/commit! put! get-fn
+                                {"indexed" (ipld/link snap)
+                                 "novelty-front" nil "novelty-back" nil
+                                 "novelty-count" 0}
+                                prev
+                                (when (seq causes) {:causes (vec causes)})))))))
+
+(defn- raw-commit!
+  "kotobase-peer's own commit!, bypassing the engine's guards."
+  [store prev tx]
+  (let [get-fn (fn [cid] (get (:blocks @(:state store)) cid))
+        put! (fn [cid bytes] (swap! (:state store) assoc-in [:blocks cid] bytes) cid)]
+    (peer/commit! put! get-fn tx prev #(js/Promise.resolve %))))
+
+(defn- fork
+  "G on A, shipped to B; A and B commit A-TX / B-TX offline on G; blocks
+  exchanged. Commits go through writers without `:merge` settings (which do
+  not check serial validity), as an older or foreign writer would; the
+  returned :a/:b connections carry the settings."
+  [g-tx a-tx b-tx]
+  (let [sa (memory/memory-store) sb (memory/memory-store)
+        a (open sa) b (open sb) raw-a (open sa nil) raw-b (open sb nil)]
+    (-> (engine/commit-at! raw-a nil g-tx)
+        (.then (fn [g]
+                 (exchange! sa sb)
+                 (-> (js/Promise.all #js [(engine/commit-at! raw-a g a-tx)
+                                          (engine/commit-at! raw-b g b-tx)])
+                     (.then (fn [[a1 b1]]
+                              (exchange! sa sb)
+                              {:sa sa :a a :b b :g g :a1 a1 :b1 b1}))))))))
+
+;; MAJOR 4a: a cardinality-one value replaced without an explicit retract
+;; is stored as two values by kotobase-peer; the projection refuses it
+;; instead of verifying something reads disagree with.
+(deftest card-one-linear-history-without-retract-is-refused
+  (async done
+    (let [store (memory/memory-store) conn (open store) raw (open store nil)]
+      (-> (engine/commit-at! raw nil [["doc" ":doc/status" "open"]])
+          (.then (fn [g]
+                   (-> (outcome (engine/commit-at! conn g [["doc" ":doc/status" "closed"]]))
+                       (.then (fn [refused]
+                                (is (= [:err :schema-violation] refused)
+                                    "a writer with :merge settings refuses it up front")
+                                (engine/commit-at! raw g [["doc" ":doc/status" "closed"]]))))))
+          (.then (fn [c]
+                   (js/Promise.all
+                    #js [(outcome (engine/verify-at conn c))
+                         (outcome (engine/verify-at conn c {:schema {}}))])))
+          (.then (fn [[with-one with-many]]
+                   (is (= [:err :schema-violation] with-one))
+                   (is (= :ok (first with-many))
+                       "the same history is valid when the attribute is many")
+                   (is (= 2 (count (:datoms (second with-many)))))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; MAJOR 4b: the merge used to drop one of two physically stored values.
+(deftest merge-refuses-instead-of-dropping-physical-values
+  (async done
+    (-> (fork [["doc" ":doc/title" "t"]]
+              [["doc" ":doc/status" "x"] ["doc" ":doc/status" "y"]]
+              [["doc" ":doc/tag" "b"]])
+        (.then (fn [{:keys [a a1 b1]}]
+                 (outcome (engine/merge-at! a [a1 b1]))))
+        (.then (fn [result]
+                 (is (= [:err :schema-violation] result))
+                 (done)))
+        (.catch (fail! done)))))
+
+;; MAJOR 4c: unique applies to linear history too, matching contract state.
+(deftest unique-violation-in-linear-history-is-refused
+  (async done
+    (let [store (memory/memory-store) conn (open store) raw (open store nil)]
+      (-> (engine/commit-at! raw nil [["u1" ":user/email" "x"]])
+          (.then (fn [g]
+                   (js/Promise.all
+                    #js [(outcome (engine/commit-at! conn g [["u2" ":user/email" "x"]]))
+                         (engine/commit-at! raw g [["u2" ":user/email" "x"]])])))
+          (.then (fn [[refused c]]
+                   (is (= [:err :schema-violation] refused))
+                   (outcome (engine/verify-at conn c))))
+          (.then (fn [result]
+                   (is (= [:err :schema-violation] result))
+                   (done)))
+          (.catch (fail! done))))))
+
+(deftest linear-logical-state-equals-contract-state-with-unique
+  (async done
+    (let [conn (open (memory/memory-store))]
+      (-> (engine/commit-at! conn nil [["u1" ":user/email" "x"]])
+          (.then (fn [g] (engine/commit-at! conn g [[:db/retract "u1" ":user/email" "x"]
+                                                    ["u2" ":user/email" "x"]])))
+          (.then (fn [c]
+                   (-> (js/Promise.all #js [(engine/logical-projection conn [c])
+                                            (engine/verify-at conn c)
+                                            (all-datoms conn c)])
+                       (.then (fn [[{:keys [graph logical]} verified physical]]
+                                (is (= (set (contract/state
+                                             {:graph graph :root (get-in logical [c :root])
+                                              :schema (:schema settings)
+                                              :digest logical/digest}))
+                                       (set (:datoms verified))
+                                       physical))
+                                (done))))))
+          (.catch (fail! done))))))
+
+;; MAJOR 5: settings have no defaults and are validated.
+(deftest merge-settings-are-explicit-and-validated
+  (async done
+    (-> (fork [["doc" ":doc/status" "open"]]
+              [[:db/retract "doc" ":doc/status" "open"] ["doc" ":doc/status" "closed"]
+               ["u3" ":user/email" "y@x"]]
+              [[:db/retract "doc" ":doc/status" "open"] ["doc" ":doc/status" "review"]
+               ["u4" ":user/email" "y@x"]])
+        (.then
+         (fn [{:keys [sa a a1 b1]}]
+           (let [bare (open sa nil)]
+             (js/Promise.all
+              #js [(outcome (engine/merge-at! bare [a1 b1] {}))
+                   (outcome (engine/merge-at! bare [a1 b1] {:schema {}}))
+                   (outcome (engine/merge-at! a [a1 b1]
+                                              {:schema {:doc/status {:db/cardinality :db.cardinality/one}}}))
+                   (outcome (engine/merge-at! a [a1 b1]
+                                              {:schema {":doc/status" {:db/valueType :db.type/string}}}))
+                   (outcome (engine/merge-at! a [a1 b1]
+                                              {:schema {":doc/status" {:db/cardinality :one}}}))
+                   (outcome (engine/merge-at! a [a1 b1]))
+                   (outcome (.then (js/Promise.resolve nil)
+                                   (fn [_]
+                                     (engine/open {:storage sa :encrypt-fn identity
+                                                   :decrypt-fn identity :blind-fn identity
+                                                   :visible? identity
+                                                   :merge {:schema {}}}))))]))))
+        (.then
+         (fn [[none no-id kw-key unknown-key bad-value ok bad-open]]
+           (is (= [:err :invalid-option] none))
+           (is (= [:err :invalid-option] no-id))
+           (is (= [:err :invalid-schema] kw-key))
+           (is (= [:err :invalid-schema] unknown-key))
+           (is (= [:err :invalid-schema] bad-value))
+           (is (= [:err :invalid-option] bad-open) "open validates :merge eagerly")
+           (let [datoms (:datoms (second ok))]
+             (is (= 1 (count (filter #(= ":doc/status" (:a %)) datoms))))
+             (is (= 1 (count (filter #(= ":user/email" (:a %)) datoms)))
+                 "the unique value has one holder"))
+           (done)))
+        (.catch (fail! done)))))
+
+;; MAJOR 7 + BLOCKER 1 (merge variant): a forged merge snapshot is never read
+;; on trust, by q at the merge, by q at its child, or by a fast-forward.
+(deftest forged-merge-snapshot-is-not-read-or-published
+  (async done
+    (-> (fork [["doc" ":doc/title" "t"]] [["doc" ":doc/tag" "a"]] [["doc" ":doc/tag" "b"]])
+        (.then
+         (fn [{:keys [sa a a1 b1]}]
+           ;; The admissible physical order: prev = greatest [seq cid]
+           ;; (both branches are at seq 1, so the greater CID).
+           (let [[p c] (reverse (sort [a1 b1]))]
+             (-> (forge! sa p [c] [["evil" ":admin" "true"]])
+                 (.then (fn [f]
+                          ;; A child an unguarded (older) writer put on it.
+                          (-> (raw-commit! sa f [["doc" ":doc/tag" "child"]])
+                              (.then (fn [child]
+                                       (let [reader (open sa)]
+                                         (js/Promise.all
+                                          #js [(outcome (engine/commit-at! a f [["doc" ":doc/tag" "x"]]))
+                                               (outcome (all-datoms reader f))
+                                               (outcome (all-datoms reader child))
+                                               (outcome (engine/merge-at! a [f a1]))
+                                               (outcome (all-datoms (open sa nil) f))
+                                               (outcome (engine/merge-at! a [a1 b1]))])))))))))))
+        (.then
+         (fn [[write-on at-forged at-child ff no-settings honest]]
+           (is (= [:err :physical-mismatch] write-on)
+               "writers refuse to build on an unverified merge")
+           (is (= [:err :physical-mismatch] at-forged))
+           ;; Residual trust model (README): the forged merge carries no
+           ;; merge marker, so a child an *unguarded* writer put on it is a
+           ;; merge-free snapshot, read like any linear commit -- exactly as
+           ;; if the attacker had forged the child directly. Guarded writers
+           ;; refuse to create it (write-on above).
+           (is (= :ok (first at-child)))
+           (is (= [:err :physical-mismatch] ff)
+               "a fast-forward never lands on an unverified snapshot")
+           (is (= [:err :unverified-merge] no-settings)
+               "a connection without :merge settings refuses to read merges")
+           (is (= :merged (:status (second honest))))
+           (done)))
+        (.catch (fail! done)))))
+
+;; BLOCKER 1: forged carry commit (no causes, logically = X, lower CID).
+(defn- grind [store x n]
+  (-> (forge! store x nil [["evil" ":admin" (str "true" n)]])
+      (.then (fn [c] (if (neg? (compare c x)) c (grind store x (inc n)))))))
+
+(deftest forged-carry-does-not-move-the-ref
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (-> (engine/transact! conn [["doc" ":doc/title" "v0"]])
+          (.then (fn [_] (grind store (ref-cid store) 0)))
+          (.then (fn [forged]
+                   (let [x (ref-cid store)]
+                     (-> (js/Promise.all #js [(engine/merge! conn [forged])
+                                              (outcome (engine/merge-at! conn [forged]))])
+                         (.then (fn [[r alone]]
+                                  (is (= :fast-forward (:status r)))
+                                  (is (= x (:cid r)))
+                                  (is (false? (:ref-advanced? r)))
+                                  (is (= x (ref-cid store)))
+                                  (is (= [:err :physical-mismatch] alone)
+                                      "merge-at! verifies the commit it returns")
+                                  (engine/q conn [nil nil nil])))
+                         (.then (fn [rows]
+                                  (is (= #{["doc" ":doc/title" "v0"]}
+                                         (set (map (juxt :s :p :o) rows))))
+                                  (done)))))))
+          (.catch (fail! done))))))
+
+;; MAJOR 2: merge! with the pre-fold commit keeps the fold. The old code
+;; returned the lowest CID of the logically equal pair, so this searches for
+;; a pre-fold commit that sorts below its fold.
+(deftest merge-with-pre-fold-commit-does-not-rewind
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (letfn [(pair [n]
+                (-> (engine/transact! conn [["doc" ":doc/n" (str n)]])
+                    (.then (fn [x]
+                             (-> (engine/fold! conn {:threshold 1})
+                                 (.then (fn [_]
+                                          (let [f (ref-cid store)]
+                                            (if (or (neg? (compare x f)) (<= 30 n))
+                                              [x f]
+                                              (pair (inc n)))))))))))]
+        (-> (pair 0)
+            (.then (fn [[x f]]
+                     (is (neg? (compare x f)) "found a pre-fold commit sorting first")
+                     (-> (engine/merge! conn [x])
+                         (.then (fn [r]
+                                  (is (= :fast-forward (:status r)))
+                                  (is (false? (:ref-advanced? r)))
+                                  (is (= f (ref-cid store)))
+                                  (done))))))
+            (.catch (fail! done)))))))
+
+;; MAJOR 6: log readers refuse to span a merge; t stays monotonic.
+(deftest log-readers-refuse-to-span-a-merge
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (-> (engine/transact! conn [["doc" ":doc/title" "v0"]])
+          (.then (fn [h0]
+                   (-> (engine/commit-at! conn h0 [["doc" ":doc/tag" "offline"]])
+                       (.then (fn [s]
+                                (-> (engine/transact! conn [["doc" ":doc/tag" "online"]])
+                                    (.then (fn [_] (engine/basis-t conn)))
+                                    (.then (fn [t-before]
+                                             (-> (engine/merge! conn [s])
+                                                 (.then (fn [_] t-before)))))))))))
+          (.then (fn [t-before]
+                   (js/Promise.all
+                    #js [t-before
+                         (engine/basis-t conn)
+                         (outcome (engine/tx-range conn nil nil))
+                         (outcome (-> (engine/history conn) (.then #(engine/q % [nil nil nil]))))
+                         (outcome (-> (engine/since conn 0) (.then #(engine/q % [nil nil nil]))))
+                         (outcome (engine/as-of conn 1))
+                         (outcome (-> (engine/history conn) (.then #(engine/datoms % {:index :eavt}))))])))
+          (.then (fn [[t-before t-after tx-range history since as-of history-datoms]]
+                   (is (< t-before t-after) "the merge's t follows the greater parent")
+                   (doseq [r [tx-range history since as-of history-datoms]]
+                     (is (= [:err :history-spans-merge] r)))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; MAJOR 3: materialized views survive a merge, re-derived over its state.
+(deftest merge-carries-materialized-views
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (-> (engine/transact! conn [["doc" ":doc/tag" "v0"]])
+          (.then (fn [h0]
+                   (-> (engine/fold! conn {:threshold 1
+                                           :views {"tags" {"attrs" [":doc/tag"]}}})
+                       (.then (fn [_]
+                                ;; One branch predates the declaration.
+                                (engine/commit-at! conn h0 [["doc" ":doc/tag" "offline"]]))))))
+          (.then (fn [s]
+                   (-> (engine/transact! conn [["doc" ":doc/tag" "online"]])
+                       (.then (fn [_] (engine/merge! conn [s]))))))
+          (.then (fn [r]
+                   (is (= :merged (:status r)))
+                   (engine/view conn "tags")))
+          (.then (fn [{:keys [rows]}]
+                   (is (= #{"v0" "offline" "online"}
+                          (set (map #(cljs.reader/read-string (:v_edn %)) rows))))
+                   (done)))
+          (.catch (fail! done))))))
+
+(deftest conflicting-view-specs-are-refused
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (-> (engine/transact! conn [["doc" ":doc/tag" "v0"]])
+          (.then (fn [h0]
+                   (-> (engine/commit-at! conn h0 [["doc" ":doc/tag" "offline"]])
+                       (.then (fn [s]
+                                (-> (engine/fold! conn {:threshold 1
+                                                        :views {"tags" {"attrs" [":doc/tag"]}}})
+                                    (.then (fn [_] (engine/transact! conn [["doc" ":doc/tag" "online"]])))
+                                    (.then (fn [_] s))))))))
+          (.then (fn [s]
+                   ;; Give the branch its own, different "tags" view.
+                   (-> (engine/commit-at! conn s [["doc" ":doc/n" "1"]])
+                       (.then (fn [s2]
+                                (let [other (open store)]
+                                  ;; Declare a different spec on a separate ref.
+                                  (swap! (:state store) assoc-in [:refs "side"] {:cid s2 :version 1})
+                                  (-> (engine/fold! (assoc other :ref-name "side")
+                                                    {:threshold 1
+                                                     :views {"tags" {"attrs" [":doc/n"]}}})
+                                      (.then (fn [_] (get-in @(:state store) [:refs "side" :cid]))))))))))
+          (.then (fn [side] (outcome (engine/merge! conn [side]))))
+          (.then (fn [r]
+                   (is (= [:err :incompatible-views] r))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; MINOR 8: one budget across the whole call, inner merges included.
+(deftest one-work-budget-covers-inner-merges
+  (async done
+    (-> (fork [["doc" ":doc/title" "t"]] [["doc" ":doc/tag" "a"]] [["doc" ":doc/tag" "b"]])
+        (.then (fn [{:keys [a a1 b1]}]
+                 (-> (engine/merge-at! a [a1 b1])
+                     (.then (fn [m1]
+                              (js/Promise.all
+                               #js [(engine/commit-at! a (:cid m1) [["doc" ":doc/tag" "c"]])
+                                    (engine/commit-at! a b1 [["doc" ":doc/tag" "d"]])])))
+                     (.then (fn [[c d]]
+                              (-> (engine/merge-at! a [c d])
+                                  (.then (fn [m2]
+                                           (js/Promise.all
+                                            #js [m2
+                                                 (outcome (engine/merge-at! a [c d] (assoc settings :max-work (:work m2))))
+                                                 (outcome (engine/merge-at! a [c d] (assoc settings :max-work (dec (:work m2)))))])))))))))
+        (.then (fn [[m2 exact short]]
+                 (is (= :merged (:status m2)))
+                 (is (= (:cid m2) (:cid (second exact))) "the reported work is enough")
+                 (is (= [:err :work-budget-exceeded] short)
+                     "and one unit less fails: no per-merge budget multiplication")
+                 (done)))
+        (.catch (fail! done)))))
+
+;; Nit: :max-retries nil means the default, garbage fails closed.
+(deftest max-retries-fails-closed
+  (let [base {:storage (memory/memory-store) :encrypt-fn identity
+              :decrypt-fn identity :blind-fn identity :visible? identity}]
+    (is (= 16 (:max-retries (engine/open (assoc base :max-retries nil)))))
+    (is (thrown? js/Error (engine/open (assoc base :max-retries "3"))))
+    (is (thrown? js/Error (engine/open (assoc base :max-retries -1))))))

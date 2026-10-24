@@ -1,0 +1,391 @@
+(ns kotobase.engine.lsm-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [ipld.core :as ipld]
+            [kotobase.engine.conformance :as conformance]
+            [kotobase.engine.contract :as engine]
+            [kotobase.engine.lsm :as lsm]
+            [kotobase.engine.memory :as memory]
+            [kotobase.engine.metadata :as metadata]
+            [kotobase.blockcodec.node :as bcn]))
+
+(def digest-fn #(str "digest:" (hash %)))
+
+(defn- reverse-bytes [payload]
+  (byte-array (reverse (seq payload))))
+
+(defn fixture
+  ([] (fixture {}))
+  ([options]
+  (let [blocks (atom {})]
+    {:blocks blocks
+     :engine (lsm/lsm-engine
+              (merge {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                      :get-fn #(get @blocks %)
+                      :digest-fn digest-fn
+                      :encrypt-fn identity :decrypt-fn identity
+                      :metadata-key-fn #(str "key:" (hash %))}
+                     options))})))
+
+(deftest shared-conformance
+  (is (:passed? (conformance/verify (:engine (fixture))))))
+
+(deftest typed-differential-and-restore
+  (let [{candidate :engine} (fixture)
+        oracle (memory/memory-engine digest-fn)
+        database-id "lsm/differential"
+        requests [{:database-id database-id :request-id "l1"
+                   :tx-data [[:db/add [:e 1] :value {:n 7 :ok true}]]}
+                  {:database-id database-id :request-id "l2"
+                   :tx-data [[:db/retract [:e 1] :value {:n 7 :ok true}]
+                             [:db/add [:e 1] :value #{:new 8}]]}]
+        run (fn [eng]
+              (reduce (fn [state request]
+                        (:state (engine/transact eng state request)))
+                      (engine/empty-state eng database-id) requests))
+        actual (run candidate)
+        expected (run oracle)
+        restored (engine/restore-state candidate (:physical-root actual))]
+    (doseq [selector [{} {:as-of 1} {:history true}]]
+      (is (= (engine/scan oracle (engine/open-snapshot oracle expected selector)
+                          [nil nil nil])
+             (engine/scan candidate
+                          (engine/open-snapshot candidate restored selector)
+                          [nil nil nil]))))
+    (is (= (:logical-checkpoint-root
+            (engine/checkpoint oracle (engine/open-snapshot oracle expected)))
+           (:logical-checkpoint-root
+            (engine/checkpoint candidate
+                               (engine/open-snapshot candidate restored)))))))
+
+(deftest manifest-v3-is-bounded-and-carries-no-plaintext-metadata
+  (let [{candidate :engine blocks :blocks}
+        (fixture {:encrypt-fn reverse-bytes :decrypt-fn reverse-bytes})
+        transact-one
+        (fn [state n]
+          (:state
+           (engine/transact
+            candidate state
+            {:database-id "lsm/bounded"
+             :request-id (str "private-request-" n)
+             :tx-data [[:db/add (str "entity-" n) :private/value
+                        (str "secret-value-" n)]]})))
+        s1 (transact-one (engine/empty-state candidate "lsm/bounded") 1)
+        s2 (transact-one s1 2)
+        s20 (reduce transact-one s2 (range 3 21))
+        root2-bytes (get @blocks (:physical-root s2))
+        root20-bytes (get @blocks (:physical-root s20))
+        root20 (bcn/decode-node root20-bytes)
+        metadata-node (bcn/decode-node (get @blocks (:metadata-root s20)))]
+    (is (= 3 (get root20 "format-version")))
+    (is (= #{"engine" "format-version" "database-id" "basis-t"
+             "safe-epoch" "lsm-manifest" "metadata-format" "metadata-root"
+             "current-request-key" "previous-manifest"}
+           (set (keys root20))))
+    (is (<= (count root20-bytes) (+ 16 (count root2-bytes)))
+        "root manifest size is independent of transaction history")
+    (is (contains? #{"leaf" "internal"} (get metadata-node "kind")))
+    (is (not-any? #(str/includes? (pr-str root20) %)
+                  ["private-request" "secret-value" "history-edn"
+                   "requests-edn" "snapshots-edn"]))))
+
+(deftest transaction-path-compacts-l0-without-losing-snapshots
+  (let [candidate (:engine (fixture {:l0-compaction-threshold 2
+                                     :target-run-rows 64}))
+        database-id "lsm/compaction"
+        states (reductions
+                (fn [state epoch]
+                  (:state
+                   (engine/transact
+                    candidate state
+                    {:database-id database-id
+                     :request-id (str "c" epoch)
+                     :tx-data [[:db/add "counter" :value epoch]]})))
+                (engine/empty-state candidate database-id)
+                (range 1 5))
+        final-state (last states)
+        restored (engine/restore-state candidate (:physical-root final-state))]
+    (is (every? #(<= (count %) 1) (vals (:runs final-state)))
+        "the engine replaces threshold-sized L0 sets with compacted runs")
+    (doseq [epoch (range 1 5)]
+      (is (= (engine/scan candidate
+                          (engine/open-snapshot candidate (nth states epoch)
+                                                {:as-of epoch})
+                          [nil nil nil])
+             (engine/scan candidate
+                          (engine/open-snapshot candidate restored
+                                                {:as-of epoch})
+                          [nil nil nil]))
+          "safe epoch zero preserves every historical snapshot"))))
+
+(deftest physical-maintenance-is-not-a-checkpoint-alias
+  (let [candidate (:engine (fixture {:l0-compaction-threshold 1000
+                                     :target-run-rows 64}))
+        database-id "lsm/maintenance"
+        before (reduce
+                (fn [state epoch]
+                  (:state (engine/transact
+                           candidate state
+                           {:database-id database-id
+                            :request-id (str "m" epoch)
+                            :tx-data [[:db/add "counter" :value epoch]]})))
+                (engine/empty-state candidate database-id)
+                (range 1 4))
+        before-rows (engine/scan candidate (engine/open-snapshot candidate before)
+                                 [nil nil nil])
+        result (engine/maintain candidate before)
+        after (:state result)
+        restored (engine/restore-state candidate (:physical-root after))
+        replay (engine/transact
+                candidate restored
+                {:database-id database-id :request-id "m3"
+                 :tx-data [[:db/add "counter" :value 3]]})
+        next-state
+        (:state
+         (engine/transact candidate after
+                          {:database-id database-id :request-id "m4"
+                           :tx-data [[:db/add "counter" :value 4]]}))
+        restored-next (engine/restore-state candidate (:physical-root next-state))
+        replay-before-maintenance
+        (engine/transact
+         candidate restored-next
+         {:database-id database-id :request-id "m3"
+          :tx-data [[:db/add "counter" :value 3]]})]
+    (is (= :completed (get-in result [:receipt :status])))
+    (is (pos? (get-in result [:receipt :work-units])))
+    (is (not= (:physical-root before) (:physical-root after)))
+    (is (= (:basis-t before) (:basis-t after)) "maintenance is not a transaction")
+    (is (= before-rows
+           (engine/scan candidate (engine/open-snapshot candidate restored)
+                        [nil nil nil])))
+    (is (= :replayed (get-in replay [:receipt :status])))
+    (is (= (get-in before [:requests "m3" :physical-root])
+           (get-in replay [:receipt :physical-root]))
+        "maintenance never rewrites a transaction receipt identity")
+    (is (= (get-in before [:requests "m3" :physical-root])
+           (get-in replay-before-maintenance [:receipt :physical-root]))
+        "a later transaction still preserves the pre-maintenance receipt")))
+
+(deftest reader-pins-advance-and-persist-safe-epoch
+  (let [pins (atom [])
+        candidate (:engine
+                   (fixture {:l0-compaction-threshold 2
+                             :target-run-rows 8
+                             :reader-pins-fn #(deref pins)}))
+        database-id "lsm/pinned"
+        transact-one
+        (fn [state n]
+          (:state
+           (engine/transact
+            candidate state
+            {:database-id database-id :request-id (str "pin-" n)
+             :tx-data (cond-> []
+                        (> n 1) (conj [:db/retract "entity" :value (dec n)])
+                        true (conj [:db/add "entity" :value n]))})))
+        s1 (transact-one (engine/empty-state candidate database-id) 1)
+        s2 (transact-one s1 2)
+        _ (reset! pins [{:manifest-cid (:physical-root s2)
+                         :epoch 1 :epoch-readers [1]}])
+        s3 (transact-one s2 3)
+        restored (engine/restore-state candidate (:physical-root s3))]
+    (is (= 1 (:safe-epoch s3)))
+    (is (= 1 (:safe-epoch restored)) "safe epoch survives engine restore")
+    (is (= 1 (get (ipld/decode
+                   ((:get-fn candidate) (:lsm-root restored)))
+                  "safe-epoch"))
+        "safe epoch is also committed by the LSM manifest")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"outside the database basis"
+         (engine/open-snapshot candidate restored {:as-of 0})))
+    (is (= [2]
+           (mapv :v
+                 (engine/scan candidate
+                              (engine/open-snapshot candidate restored
+                                                    {:as-of 2})
+                              ["entity" :value nil]))))))
+
+(deftest lazy-restore-range-prunes-point-reads
+  (let [{writer :engine blocks :blocks}
+        (fixture {:target-run-rows 8 :l0-compaction-threshold 1000})
+        database-id "lsm/lazy"
+        seeded (:state
+                (engine/transact
+                 writer (engine/empty-state writer database-id)
+                 {:database-id database-id :request-id "seed"
+                  :tx-data (mapv (fn [n]
+                                   [:db/add (str "entity-" n) :value n])
+                                 (range 100))}))
+        gets (atom 0)
+        reader (lsm/lsm-engine
+                {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                 :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+                 :digest-fn digest-fn
+                 :encrypt-fn identity :decrypt-fn identity
+                 :metadata-key-fn #(str "key:" (hash %))
+                 :target-run-rows 8
+                 :l0-compaction-threshold 1000})
+        restored (engine/restore-state reader (:physical-root seeded)
+                                       {:lazy? true})
+        restore-gets @gets
+        rows (engine/scan reader (engine/open-snapshot reader restored)
+                          ["entity-50" :value nil])
+        point-gets (- @gets restore-gets)
+        eavt-runs (count (get (:run-refs restored) :eavt))
+        cold-next (:state
+                   (engine/transact
+                    reader restored
+                    {:database-id database-id :request-id "cold-write"
+                     :tx-data [[:db/retract "entity-50" :value 50]
+                               [:db/add "entity-101" :value 101]]}))]
+    (is (nil? (:runs restored)) "restore retains run refs, not decoded runs")
+    (is (= 3 restore-gets)
+        "restore reads engine, LSM, and one sealed metadata segment")
+    (is (= [50] (mapv :v rows)))
+    (is (<= point-gets 3) "the entity range selects a bounded run subset")
+    (is (< point-gets eavt-runs)
+        "point lookup does not fetch every EAVT run")
+    (is (empty? (engine/scan reader (engine/open-snapshot reader cold-next)
+                             ["entity-50" :value nil])))
+    (is (= [101]
+           (mapv :v (engine/scan reader
+                                 (engine/open-snapshot reader cold-next)
+                                 ["entity-101" :value nil])))
+        "a lazy state can hydrate for a mixed cold transaction")))
+
+(deftest indexed-metadata-restore-and-old-replay-are-not-linear-in-history
+  (let [{writer :engine blocks :blocks}
+        (fixture {:target-run-rows 64 :l0-compaction-threshold 1000})
+        database-id "lsm/indexed-metadata"
+        first-state
+        (:state
+         (engine/transact
+          writer (engine/empty-state writer database-id)
+          {:database-id database-id :request-id "scale-1"
+           :tx-data [[:db/add "entity-1" :value 1]]}))
+        first-root (:physical-root first-state)
+        final-state
+        (reduce
+         (fn [state epoch]
+           (:state
+            (engine/transact
+             writer state
+             {:database-id database-id :request-id (str "scale-" epoch)
+              :tx-data [[:db/add (str "entity-" epoch) :value epoch]]})))
+         first-state
+         (range 2 33))
+        gets (atom 0)
+        reader (lsm/lsm-engine
+                {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                 :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+                 :digest-fn digest-fn
+                 :encrypt-fn identity :decrypt-fn identity
+                 :metadata-key-fn #(str "key:" (hash %))
+                 :target-run-rows 64 :l0-compaction-threshold 1000})
+        restored (engine/restore-state reader (:physical-root final-state)
+                                       {:lazy? true})
+        restore-gets @gets
+        replay (engine/transact
+                reader restored
+                {:database-id database-id :request-id "scale-1"
+                 :tx-data [[:db/add "entity-1" :value 1]]})
+        replay-gets (- @gets restore-gets)]
+    (is (nil? (:history restored)) "cold restore does not hydrate history")
+    (is (< restore-gets 10)
+        (str "32-epoch restore used " restore-gets " block reads"))
+    (is (= :replayed (get-in replay [:receipt :status])))
+    (is (= first-root (get-in replay [:receipt :physical-root])))
+    (is (< replay-gets 10)
+        (str "old request lookup used " replay-gets " block reads"))))
+
+(deftest format-v2-chain-migrates-to-v3-index-on-next-transaction
+  (let [{candidate :engine blocks :blocks} (fixture)
+        database-id "lsm/v2-migration"
+        r1 (engine/transact
+            candidate (engine/empty-state candidate database-id)
+            {:database-id database-id :request-id "old-1"
+             :tx-data [[:db/add "e1" :value 1]]})
+        s1 (:state r1)
+        r2 (engine/transact
+            candidate s1
+            {:database-id database-id :request-id "old-2"
+             :tx-data [[:db/add "e2" :value 2]]})
+        s2 (:state r2)
+        put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+        segment1
+        (metadata/persist-segment!
+         put! identity nil
+         {:epoch 1 :history (filterv #(= 1 (:t %)) (:history s2))
+          :request {:request-id "old-1" :tx-root (get-in r1 [:receipt :tx-root])}
+          :previous-physical-root nil :previous-transaction-root nil})
+        segment2
+        (metadata/persist-segment!
+         put! identity segment1
+         {:epoch 2 :history (filterv #(= 2 (:t %)) (:history s2))
+          :request {:request-id "old-2" :tx-root (get-in r2 [:receipt :tx-root])}
+          :previous-physical-root (:physical-root s1)
+          :previous-transaction-root (:physical-root s1)})
+        v2-root
+        (ipld/put-node!
+         put! {"engine" "kotobase-engine-lsm" "format-version" 2
+               "database-id" database-id "basis-t" 2 "safe-epoch" 0
+               "lsm-manifest" (ipld/link (:lsm-root s2))
+               "metadata-head" (ipld/link segment2)
+               "previous-manifest" (ipld/link (:physical-root s1))})
+        restored-v2 (engine/restore-state candidate v2-root)
+        migrated
+        (:state
+         (engine/transact
+          candidate restored-v2
+          {:database-id database-id :request-id "new-3"
+           :tx-data [[:db/add "e3" :value 3]]}))
+        restored-v3 (engine/restore-state candidate (:physical-root migrated)
+                                          {:lazy? true})
+        replay-old
+        (engine/transact
+         candidate restored-v3
+         {:database-id database-id :request-id "old-1"
+          :tx-data [[:db/add "e1" :value 1]]})]
+    (is (= 3 (get (ipld/decode (get @blocks (:physical-root migrated)))
+                  "format-version")))
+    (is (= :replayed (get-in replay-old [:receipt :status])))
+    (is (= (:physical-root s1) (get-in replay-old [:receipt :physical-root])))))
+
+;; ---------------------------------------------------------------------------
+;; ADR-2608060500 phase 1: this engine can READ a compressed block
+;; ---------------------------------------------------------------------------
+;;
+;; merkle-lsm does not write them yet, and must not until every reader can
+;; handle them — producer and readers here are separate artifacts on separate
+;; deploy cycles, so a writer-first flip is an outage, not a migration.
+
+(deftest reads-blocks-stored-in-the-compressed-representation
+  (let [{:keys [blocks engine]} (fixture)
+        database-id "lsm/compressed"
+        ;; enough rows that the canonical keys have something to repeat
+        state (reduce (fn [st i]
+                        (:state (engine/transact
+                                 engine st
+                                 {:database-id database-id :request-id (str "z" i)
+                                  :tx-data [[:db/add (str "entity-" (mod i 20)) :value
+                                             {:n i :note "lorem ipsum dolor sit amet"}]]})))
+                      (engine/empty-state engine database-id)
+                      (range 40))
+        before (engine/scan engine (engine/open-snapshot engine state) [nil nil nil])]
+
+    ;; Re-encode every stored block through the envelope, in place. The CIDs
+    ;; deliberately keep addressing the same logical nodes: a real compressed
+    ;; store re-addresses everything, which cannot happen before the writer
+    ;; flips. This isolates the one thing that has to be true first — that the
+    ;; read path understands an envelope when it meets one.
+    (swap! blocks (fn [m]
+                    (into {} (map (fn [[cid bytes]]
+                                    [cid (bcn/encode-node (ipld/decode bytes))]))
+                          m)))
+
+    (is (some #(bcn/envelope? (ipld/decode %)) (vals @blocks))
+        "the fixture must actually contain a compressed block, or this proves nothing")
+
+    (let [restored (engine/restore-state engine (:physical-root state))]
+      (is (= before (engine/scan engine (engine/open-snapshot engine restored)
+                                 [nil nil nil]))
+          "same rows, read back out of compressed blocks"))))

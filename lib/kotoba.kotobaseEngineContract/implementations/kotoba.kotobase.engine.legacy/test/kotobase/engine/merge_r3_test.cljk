@@ -1,0 +1,363 @@
+(ns kotobase.engine.merge-r3-test
+  "Round-3 review reproductions for kotobase-engine#10, asserting request
+  counts and outcomes (never wall-clock)."
+  (:require #?(:clj [kotoba.test :refer [deftest is async]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is async]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is async]])
+            [arrangement.core :as qs]
+            [chain.core :as chain]
+            [ipld.core :as ipld]
+            [kotobase-peer.core :as peer]
+            [kotobase.engine :as engine]
+            [kotobase.engine.logical :as logical]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.memory :as memory]))
+
+(def settings {:database-id "tenant/db"
+               :schema {":doc/status" {:db/cardinality :db.cardinality/one}}})
+
+(defrecord Hijack [inner calls on-cas]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks] (storage/-put-blocks! inner blocks))
+  (-get-blocks [_ cids] (swap! calls + 1) (storage/-get-blocks inner cids))
+  storage/IRefStore
+  (-read-ref [_ name] (storage/-read-ref inner name))
+  (-compare-and-set-ref! [_ name e n]
+    (when-let [f @on-cas] (reset! on-cas nil) (f))
+    (storage/-compare-and-set-ref! inner name e n))
+  storage/IBackendCapabilities
+  (-capabilities [_] (storage/-capabilities inner)))
+
+(defn- wrap [inner] (->Hijack inner (atom 0) (atom nil)))
+
+(defn- open
+  ([store] (open store settings))
+  ([store merge-settings]
+   (engine/open (cond-> {:storage store
+                         :encrypt-fn #(js/Promise.resolve %)
+                         :decrypt-fn #(js/Promise.resolve %)
+                         :blind-fn #(js/Promise.resolve (pr-str %))
+                         :visible? (constantly true)}
+                  merge-settings (assoc :merge merge-settings :trust-scope "r3")))))
+
+(defn- ref-cid [store] (get-in @(:state store) [:refs "main" :cid]))
+(defn- set-ref! [store cid] (swap! (:state store) assoc-in [:refs "main"] {:cid cid :version 99}))
+
+(defn- problem-of [e]
+  (loop [e e] (when e (or (:problem (ex-data e)) (recur (ex-cause e))))))
+
+(defn- outcome [p]
+  (-> p
+      (.then (fn [r] [:ok r]))
+      (.catch (fn [e] [:err (or (problem-of e) (ex-message e))]))))
+
+(defn- fail! [done]
+  (fn [e]
+    (is false (str "unexpected: " (ex-message e) " " (pr-str (ex-data e))))
+    (done)))
+
+(defn- ports [store]
+  [(fn [cid] (get (:blocks @(:state store)) cid))
+   (fn [cid bytes] (swap! (:state store) assoc-in [:blocks cid] bytes) cid)])
+
+(defn- forge-merge!
+  "A merge commit (causes + marker) over PARENTS with a forged snapshot."
+  [store [prev & causes] quads]
+  (let [[get-fn put!] (ports store)
+        db (peer/transact (peer/empty-db) quads)]
+    (-> (js/Promise.resolve
+         (qs/commit! put! db nil qs/current-schema-version
+                     #(js/Promise.resolve (pr-str %)) #(js/Promise.resolve %)))
+        (.then (fn [snap]
+                 (chain/commit! put! get-fn
+                                {"indexed" (ipld/link snap)
+                                 "novelty-front" nil "novelty-back" nil
+                                 "novelty-count" 0
+                                 logical/merge-marker {"policy" "x"}}
+                                prev {:causes (vec causes)}))))))
+
+(defn- raw-commit! [store tx basis]
+  (let [[get-fn put!] (ports store)]
+    (peer/commit! put! get-fn tx basis #(js/Promise.resolve %))))
+
+(defn- evil? [rows] (re-find #"evil" (pr-str rows)))
+
+(defn- forged-merge-child
+  "H (honest linear head with novelty 1), M (forged merge), C (marker child of M)."
+  [sa a]
+  (let [st (atom {})]
+    (-> (engine/transact! a [["doc" ":doc/title" "t"]])
+        (.then (fn [_]
+                 (swap! st assoc :h (ref-cid sa))
+                 (js/Promise.all #js [(engine/commit-at! a (ref-cid sa) [["doc" ":doc/tag" "a"]])
+                                      (engine/commit-at! a (ref-cid sa) [["doc" ":doc/tag" "b"]])])))
+        (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+        (.then (fn [m]
+                 (forge-merge! sa (:heads m)
+                               [["doc" ":doc/title" "t"] ["evil" ":admin" "true"]])))
+        (.then (fn [fm] (swap! st assoc :m fm) (raw-commit! sa [["x" ":doc/n" "1"]] fm)))
+        (.then (fn [c] (swap! st assoc :c c) @st)))))
+
+(defn- calls-of [w f]
+  (reset! (:calls w) 0)
+  (-> (outcome (f))
+      (.then (fn [r] {:r (first r) :calls @(:calls w)
+                      :p (when (= :err (first r)) (second r))}))))
+
+;; (1) honest fold!'s internal CAS retry folds an unverified forged merge
+;; descendant into an unmarked (linear-trust) snapshot.
+(deftest r3-fold-retry-launders-forged-merge
+  (async done
+    (let [sa (memory/memory-store) a (open sa) st (atom {})]
+      (-> (forged-merge-child sa a)
+          (.then (fn [{:keys [h m c] :as s}]
+                   (reset! st s)
+                   (-> (outcome (engine/q (open sa) [nil nil nil]))
+                       (.then (fn [before]
+                                (swap! st assoc :before before)
+                                (let [w (wrap sa)
+                                      folder (open w)]
+                                  ;; a concurrent (ref-writing) party moves the ref to C
+                                  ;; while the honest fold of H is in flight
+                                  (reset! (:on-cas w) #(set-ref! sa c))
+                                  (outcome (engine/fold! folder {:threshold 1}))))))))
+          (.then (fn [fold]
+                   (swap! st assoc :fold fold)
+                   (js/Promise.all #js [(outcome (engine/q (engine/at-cid (open sa) (:c @st)) [nil nil nil]))
+                                        (outcome (engine/q (open sa) [nil nil nil]))])))
+          (.then (fn [[at-c after]]
+                   (let [{:keys [fold c]} @st
+                         f (ref-cid sa)
+                         info (chain/commit-info (first (ports sa)) f)]
+                     (println "R3-1 fold" (first fold) (pr-str (select-keys (second fold) [:committed? :attempts]))
+                              "ref prev=C?" (= c (:prev info))
+                              "marker?" (logical/merge-origin? info)
+                              "q@C" (first at-c) (when (= :err (first at-c)) (second at-c))
+                              "q@ref" (first after) "evil?" (boolean (evil? (second after))))
+                     (is (not (and (= :ok (first after)) (evil? (second after))))
+                         "LAUNDERED if true: honest fold! published forged merge content as linear-trust state")
+                     (done))))
+          (.catch (fail! done))))))
+
+;; control: transact!'s own retry loop does guard each attempt
+(deftest r3-transact-retry-guards
+  (async done
+    (let [sa (memory/memory-store) a (open sa) st (atom {})]
+      (-> (forged-merge-child sa a)
+          (.then (fn [{:keys [c]}]
+                   (let [w (wrap sa) writer (open w)]
+                     (reset! (:on-cas w) #(set-ref! sa c))
+                     (outcome (engine/transact! writer [["y" ":doc/n" "2"]])))))
+          (.then (fn [r]
+                   (println "R3-1b transact! retry onto forged C" (pr-str r))
+                   (is (= :err (first r)))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; M1: after a merge, a read at a head k transactions later costs what a
+;; merge-free read with the same novelty costs (plus the one-time snapshot
+;; verification for a fresh process), and the next head costs nothing extra.
+(def k 150)
+
+(defn- post-merge-store []
+  (let [sa (memory/memory-store) a (open sa)]
+    (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+        (.then (fn [g]
+                 (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                      (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+        (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+        (.then (fn [m]
+                 (set-ref! sa (:cid m))
+                 (reduce (fn [p n] (.then p (fn [_] (engine/transact! a [[(str "e" n) ":doc/n" (str n)]]))))
+                         (js/Promise.resolve nil) (range k))))
+        (.then (fn [_] sa)))))
+
+(defn- control-store []
+  (let [sb (memory/memory-store) b (open sb nil)]
+    (-> (engine/transact! b [["doc" ":doc/title" "t"]])
+        (.then (fn [_] (engine/fold! b {:threshold 1})))
+        (.then (fn [_]
+                 (reduce (fn [p n] (.then p (fn [_] (engine/transact! b [[(str "e" n) ":doc/n" (str n)]]))))
+                         (js/Promise.resolve nil) (range k))))
+        (.then (fn [_] sb)))))
+
+(deftest post-merge-heads-cost-what-merge-free-heads-cost
+  (async done
+    (let [st (atom {})
+          ;; Separate decrypt-fn scope: nothing verified by the writer above.
+          fresh (fn [store] (engine/open {:storage store
+                                          :encrypt-fn #(js/Promise.resolve %)
+                                          :decrypt-fn (fn [x] (js/Promise.resolve x))
+                                          :blind-fn #(js/Promise.resolve (pr-str %))
+                                          :visible? (constantly true)
+                                          :merge settings
+                                          :trust-scope "r3-fresh-reader"}))]
+      (-> (js/Promise.all #js [(post-merge-store) (control-store)])
+          (.then (fn [[sa sb]]
+                   (let [w (wrap sa) wb (wrap sb) reader (fresh w)]
+                     (swap! st assoc :w w :wb wb :reader reader :sa sa)
+                     (-> (calls-of wb #(engine/q (open wb nil) [nil nil nil]))
+                         (.then (fn [r] (swap! st assoc :ctl r)
+                                  (calls-of w #(engine/q reader [nil nil nil]))))
+                         (.then (fn [r] (swap! st assoc :first r)
+                                  (engine/transact! (open sa) [["z" ":doc/n" "z"]])))
+                         (.then (fn [_] (calls-of w #(engine/q reader [nil nil nil]))))
+                         (.then (fn [r] (swap! st assoc :next r)
+                                  (calls-of w #(engine/transact! reader [["q" ":doc/n" "q"]]))))
+                         (.then (fn [r] (swap! st assoc :tx r)
+                                  (calls-of wb #(engine/transact! (open wb nil) [["q" ":doc/n" "q"]]))))))))
+          (.then (fn [txctl]
+                   (let [{:keys [ctl first next tx]} @st]
+                     (println "R3 M1 k" k "control q" (:calls ctl) "post-merge first q" (:calls first)
+                              "next head q" (:calls next) "transact!" (:calls tx) "control transact!" (:calls txctl))
+                     (is (= :ok (:r first) (:r next) (:r tx)))
+                     ;; first read: control + verifying the merge snapshot once
+                     ;; (its parents' closure: 3 commits) -- not O(k).
+                     (is (<= (:calls first) (+ (:calls ctl) 20)))
+                     (is (<= (:calls next) (+ (:calls ctl) 2))
+                         "the next head on a verified snapshot costs nothing extra")
+                     (is (<= (:calls tx) (+ (:calls txctl) 2)))
+                     (done))))
+          (.catch (fail! done))))))
+
+;; M1: a small :max-closure no longer bricks a post-merge history.
+(deftest small-max-closure-does-not-brick-post-merge-history
+  (async done
+    (let [sa (memory/memory-store) s5 (assoc settings :max-closure 5) a (open sa s5)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [m]
+                   (set-ref! sa (:cid m))
+                   (reduce (fn [p n] (.then p (fn [_] (outcome (engine/transact! (open sa s5) [[(str "e" n) ":doc/n" (str n)]])))))
+                           (js/Promise.resolve nil) (range 8))))
+          (.then (fn [last-tx]
+                   (js/Promise.all #js [last-tx
+                                        (outcome (engine/q (open sa s5) [nil nil nil]))
+                                        (outcome (engine/fold! (open sa s5) {:threshold 1}))])))
+          (.then (fn [[tx q f]]
+                   (is (= :ok (first tx)))
+                   (is (= :ok (first q)))
+                   (is (= :ok (first f)))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; M2: the serial-validity check reads point lookups (range-pruned
+;; snapshot index plus the novelty backlog), never a full hydrate.
+(defn- seeded [n fold-opts]
+  (let [sa (memory/memory-store) a (open sa nil)]
+    (-> (reduce (fn [p i] (.then p (fn [_] (engine/transact! a [[(str "e" i) ":doc/status" (str i)]]))))
+                (js/Promise.resolve nil) (range n))
+        (.then (fn [_] (engine/fold! a fold-opts)))
+        (.then (fn [_] sa)))))
+
+(defn- serial-costs [sa]
+  (let [w (wrap sa)]
+    (-> (calls-of w #(engine/transact! (open w nil) [["new1" ":doc/status" "x"]]))
+        (.then (fn [plain]
+                 (-> (calls-of w #(engine/q (open w nil) [nil nil nil]))
+                     (.then (fn [read]
+                              (-> (calls-of w #(engine/transact! (open w) [["new2" ":doc/status" "x"]]))
+                                  (.then (fn [checked] {:plain plain :read read :checked checked})))))))))))
+
+(deftest serial-check-uses-point-lookups
+  (async done
+    (-> (js/Promise.all #js [(.then (seeded 300 {:threshold 1}) serial-costs)
+                             (.then (seeded 300 {:threshold 1 :max-novelty 1000}) serial-costs)])
+        (.then (fn [[backlog folded]]
+                 (println "R3 M2 transact! card-one, 300 tx."
+                          "novelty backlog: plain" (:calls (:plain backlog)) "full read" (:calls (:read backlog))
+                          ":merge" (:calls (:checked backlog))
+                          "| folded: plain" (:calls (:plain folded)) "full read" (:calls (:read folded))
+                          ":merge" (:calls (:checked folded)))
+                 (doseq [{:keys [plain checked]} [backlog folded]]
+                   (is (= :ok (:r plain) (:r checked))))
+                 (is (<= (:calls (:checked backlog)) (+ (:calls (:read backlog)) 5))
+                     "with a novelty backlog: the backlog scan, not a hydrate on top of it")
+                 (is (<= (:calls (:checked folded)) (+ (:calls (:plain folded)) 10))
+                     "folded: a range-pruned snapshot lookup")
+                 (done)))
+        (.catch (fail! done)))))
+
+;; m4: an ident and its cardinality written in separate transactions are
+;; still cross-checked against the settings.
+(deftest schema-split-across-transactions-is-checked
+  (async done
+    (let [sa (memory/memory-store) a (open sa {:database-id "tenant/db" :schema {}})]
+      (-> (engine/commit-at! a nil [["s1" ":db/ident" ":doc/x"]])
+          (.then (fn [g] (outcome (engine/commit-at! a g [["s1" ":db/cardinality" ":db.cardinality/one"]]))))
+          (.then (fn [r]
+                   (is (= [:err :schema-mismatch] r))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; m3 + round 4: verification is scoped by the required :trust-scope. Fresh
+;; per-request closures with one scope share it; another scope verifies for
+;; itself; :merge without :trust-scope is refused at open.
+(deftest trust-is-scoped-by-trust-scope
+  (async done
+    (-> (post-merge-store)
+        (.then (fn [sa]
+                 (let [w (wrap sa)
+                       conn (fn [scope]
+                              ;; a fresh decrypt-fn closure per "request"
+                              (engine/open {:storage w
+                                            :encrypt-fn #(js/Promise.resolve %)
+                                            :decrypt-fn (fn [x] (js/Promise.resolve x))
+                                            :blind-fn #(js/Promise.resolve (pr-str %))
+                                            :visible? (constantly true)
+                                            :merge settings
+                                            :trust-scope scope}))
+                       q #(engine/q % [nil nil nil])
+                       steps [#(q (conn "m3-k1")) #(q (conn "m3-k1")) #(q (conn "m3-k1"))
+                              #(q (conn "m3-k2"))]]
+                   (-> (reduce (fn [p f] (.then p (fn [acc] (.then (calls-of w f) #(conj acc %)))))
+                               (js/Promise.resolve []) steps)
+                       (.then (fn [rs]
+                                (-> (outcome (.then (js/Promise.resolve nil)
+                                                    (fn [_] (engine/open {:storage w
+                                                                          :encrypt-fn identity :decrypt-fn identity
+                                                                          :blind-fn identity :visible? identity
+                                                                          :merge settings}))))
+                                    (.then (fn [no-scope] [rs no-scope])))))))))
+        (.then (fn [[[r1 r2 r3 other] no-scope]]
+                 (println "R3/R4 scope: first" (:calls r1) "per-request same scope" (:calls r2) (:calls r3)
+                          "other scope" (:calls other))
+                 (is (< (:calls r2) (:calls r1)))
+                 (is (= (:calls r2) (:calls r3)) "per-request closures do not re-verify")
+                 (is (= (:calls r1) (:calls other)) "another scope verifies for itself")
+                 (is (= :err (first no-scope)))
+                 (is (re-find #"trust-scope" (str (second no-scope))))
+                 (done)))
+        (.catch (fail! done)))))
+
+;; m6: log readers check only the lineage their range reaches.
+(deftest log-readers-above-a-merge-are-served
+  (async done
+    (let [store (memory/memory-store) conn (open store)]
+      (-> (engine/transact! conn [["doc" ":doc/title" "v0"]])
+          (.then (fn [h0]
+                   (-> (engine/commit-at! conn h0 [["doc" ":doc/tag" "offline"]])
+                       (.then (fn [s]
+                                (-> (engine/transact! conn [["doc" ":doc/tag" "online"]])
+                                    (.then (fn [_] (engine/merge! conn [s])))))))))
+          (.then (fn [_] (engine/basis-t conn)))
+          (.then (fn [t-merge]
+                   (-> (engine/transact! conn [["doc" ":doc/n" "1"]])
+                       (.then (fn [_] (engine/transact! conn [["doc" ":doc/n" "2"]])))
+                       (.then (fn [_]
+                                (js/Promise.all
+                                 #js [(outcome (engine/tx-range conn (inc t-merge) nil))
+                                      (outcome (engine/tx-range conn nil nil))
+                                      (outcome (-> (engine/since conn t-merge) (.then #(engine/q % [nil nil nil]))))
+                                      (outcome (engine/as-of conn (inc t-merge)))]))))))
+          (.then (fn [[above all since as-of]]
+                   (is (= :ok (first above)))
+                   (is (= 2 (count (second above))))
+                   (is (= [:err :history-spans-merge] all))
+                   (is (= :ok (first since)))
+                   (is (= :ok (first as-of)))
+                   (done)))
+          (.catch (fail! done))))))
