@@ -1,0 +1,238 @@
+(ns zstd.portable-test
+  "Runtime-agnostic suite: no shell, no reference binary. Runs under
+   `kbb -M:test` and `kbb --backend sci run-tests.cljk`.
+
+   The decoder cannot be meaningfully tested against itself — our writer emits
+   raw blocks, which exercise neither entropy coder — so this suite covers the
+   pieces that *can* be checked in isolation (XXH64 against published vectors,
+   FSE table construction against the RFC's predefined distributions, the
+   framing, the error paths) and `zstd.oracle-test` covers real compressed data."
+  (:require [zstd.bits :as bits]
+            [zstd.core :as zstd]
+            [zstd.fse :as fse]
+            [zstd.huff :as huff]
+            [zstd.xxhash :as xxhash]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- char-code [c] #?(:clj (int c) :cljs (.charCodeAt c 0)))
+(defn- ->bytes [s] (mapv char-code (seq s)))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(defn- lcg [n seed]
+  (loop [i 0 s seed out (transient [])]
+    (if (= i n)
+      (persistent! out)
+      (let [s (mod (+ (* 1664525 s) 1013904223) 4294967296)]
+        (recur (inc i) s (conj! out (bit-and (quot s 65536) 0xff)))))))
+
+(def ^:private samples
+  {:empty     []
+   :tiny      [104 105]
+   :allbytes  (vec (range 256))
+   :runs      (vec (repeat 5000 97))
+   :text      (vec (mapcat (fn [_] (->bytes "the quick brown fox. ")) (range 200)))
+   :random    (lcg 20000 99)
+   :multiblock (lcg 300000 7)})                            ; past the 128 KiB block limit
+
+;; ---------------------------------------------------------------------------
+;; XXH64 — published vectors
+;; ---------------------------------------------------------------------------
+
+(deftest xxh64-pinned-values
+  ;; These are *regression* pins, not independent vectors: their authority is
+  ;; `zstd.oracle-test/xxhash-matches-the-frames-zstd-writes`, which compares our
+  ;; hash against the checksum the reference zstd writes into a frame across six
+  ;; input shapes. Pinning them here means a regression fails fast, and on a
+  ;; runtime where no reference binary exists.
+  (is (= [4014398263 1373170073] (xxhash/xxh64 [])))
+  (is (= [1338915148 3364442840] (xxhash/xxh64 [0x9e])))
+  (is (= [1664406023 421813186] (xxhash/xxh64 (->bytes "Hello World"))))
+  (testing "both halves stay in the unsigned 32-bit domain"
+    (doseq [[_ data] samples]
+      (let [[hi lo] (xxhash/xxh64 data)]
+        (is (and (<= 0 hi) (< hi 4294967296)))
+        (is (and (<= 0 lo) (< lo 4294967296))))))
+  (testing "the low half is what a frame stores"
+    (is (= 421813186 (xxhash/xxh64-low32 (->bytes "Hello World"))))))
+
+(deftest xxh64-crosses-the-32-byte-block-boundary
+  ;; Inputs of 31/32/33 bytes take three different paths through the algorithm.
+  (doseq [n [0 1 4 8 16 31 32 33 63 64 65 200]]
+    (let [h (xxhash/xxh64 (lcg n 3))]
+      (is (and (vector? h) (= 2 (count h))) (str n " bytes")))))
+
+;; ---------------------------------------------------------------------------
+;; Bit readers
+;; ---------------------------------------------------------------------------
+
+(deftest backward-reader-skips-the-padding-marker
+  ;; 0x65 = 0b01100101: bit 6 is the marker, so the first data bit is bit 5.
+  (let [r (bits/rev-reader [0x65] 0 1)]
+    (is (= 2r100101 (bits/rev-bits r 6)))
+    (is (bits/rev-exhausted? r)))
+  (testing "a zero last byte has no marker and is refused"
+    (is (= :bad-bitstream (reason-of #(bits/rev-reader [0x00] 0 1)))))
+  (testing "reads run from the last byte toward the first"
+    ;; 0x81's highest set bit is 7, so it is the marker and the data continues
+    ;; with that byte's remaining seven bits, then the byte before it.
+    (let [r (bits/rev-reader [0xff 0x81] 0 2)]
+      (is (= 1 (bits/rev-bits r 7)))
+      (is (= 0xff (bits/rev-bits r 8))))))
+
+(deftest forward-reader-is-lsb-first
+  (let [r (bits/fwd-reader [2r00000101 0xff] 0)]
+    (is (= 1 (bits/fwd-bits r 1)))
+    (is (= 0 (bits/fwd-bits r 1)))
+    (is (= 1 (bits/fwd-bits r 1)))))
+
+;; ---------------------------------------------------------------------------
+;; FSE tables from the RFC's predefined distributions
+;; ---------------------------------------------------------------------------
+
+(deftest predefined-distributions-are-complete
+  (doseq [[name {:keys [counts accuracy-log]}]
+          {:literal-length fse/literal-length-default
+           :match-length   fse/match-length-default
+           :offset         fse/offset-default}]
+    (testing name
+      ;; Each distribution must account for exactly 2^accuracy-log states, with
+      ;; a -1 ("low probability") counting as one.
+      (is (= (bit-shift-left 1 accuracy-log)
+             (reduce + (map #(if (neg? %) (- %) %) counts))))
+      (let [table (fse/build-table counts accuracy-log)]
+        (is (= (bit-shift-left 1 accuracy-log) (count table)))
+        (is (every? some? (map :symbol table)))
+        (is (every? #(<= 0 % accuracy-log) (map :nb-bits table)))))))
+
+(deftest match-length-table-covers-its-low-probability-tail
+  ;; Codes 46-52 are all low-probability; an off-by-two here still sums to 64,
+  ;; so it builds cleanly and decodes plausible nonsense (it did, once).
+  (let [table (fse/build-table (:counts fse/match-length-default) 6)
+        syms  (set (map :symbol table))]
+    (doseq [s (range 0 53)]
+      (is (contains? syms s) (str "match-length symbol " s " has no state")))))
+
+(deftest code-tables-match-the-rfc
+  (is (= [0 0] (nth fse/literal-length-code 0)))
+  (is (= [15 0] (nth fse/literal-length-code 15)))
+  (is (= [16 1] (nth fse/literal-length-code 16)))
+  (is (= [24 2] (nth fse/literal-length-code 20)))
+  (is (= [65536 16] (nth fse/literal-length-code 35)))
+  (is (= [3 0] (nth fse/match-length-code 0)))
+  (is (= [34 0] (nth fse/match-length-code 31)))
+  (is (= [35 1] (nth fse/match-length-code 32)))
+  (is (= [99 5] (nth fse/match-length-code 42)))
+  (is (= [65539 16] (nth fse/match-length-code 52)))
+  (is (= [1 0] (fse/offset-code 0)))
+  (is (= [2147483648 31] (fse/offset-code 31)) "code 31 must not overflow int32"))
+
+;; ---------------------------------------------------------------------------
+;; Huffman table construction
+;; ---------------------------------------------------------------------------
+
+(deftest huffman-weights-follow-the-rfc-example
+  ;; RFC 8878 §4.2.1.3, Table 24/25: weights 4,3,2,0,1,1 with the last weight
+  ;; implied. Transmitted weights are all but the last, so pass 4,3,2,0,1 and
+  ;; the 1 for literal 5 is derived.
+  (let [t (huff/read-table (into [(+ 127 5)] [0x43 0x20 0x10]) 0)]
+    ;; header 132 = direct representation of five weights: 4,3,2,0,1
+    (is (= [4 3 2 0 1 1] (:weights t)))
+    (is (= 4 (:max-bits t)))
+    (testing "codes are distributed from the lowest weight up"
+      (let [syms (mapv :symbol (:table t))]
+        (is (= 4 (nth syms 0)) "weight 1 → code 0000")
+        (is (= 5 (nth syms 1)) "weight 1 → code 0001")
+        (is (= 2 (nth syms 2)) "weight 2 → code 001x")
+        (is (= 1 (nth syms 4)) "weight 3 → code 01xx")
+        (is (= 0 (nth syms 8)) "weight 4 → code 1xxx")))
+    (testing "bit lengths follow max-bits + 1 - weight"
+      (is (= 4 (:nb-bits (nth (:table t) 0))))
+      (is (= 1 (:nb-bits (nth (:table t) 8)))))))
+
+(deftest huffman-rejects-impossible-weights
+  ;; Five weights of 1 total 5; the next power of two leaves 3, which no single
+  ;; implied weight can supply.
+  (is (= :bad-huffman-table
+         (reason-of #(huff/read-table [(+ 127 5) 0x11 0x11 0x10] 0)))))
+
+;; ---------------------------------------------------------------------------
+;; Frames we write
+;; ---------------------------------------------------------------------------
+
+(deftest raw-frame-round-trip
+  (doseq [checksum [true false]
+          [name data] samples]
+    (testing (str "checksum " checksum " / " name)
+      (let [f (zstd/compress data {:checksum checksum})]
+        (is (= [0x28 0xb5 0x2f 0xfd] (subvec f 0 4)) "magic")
+        (is (= data (zstd/decompress f)))))))
+
+(deftest frame-metadata-is-reported
+  (let [f (zstd/compress (:text samples))
+        [m] (zstd/frames f)]
+    (is (:checksum? m))
+    (is (:single-segment? m))
+    (is (= (count (:text samples)) (:content-size m)))
+    (is (= (count (:text samples)) (:decoded-size m)))))
+
+(deftest output-is-deterministic
+  (is (= (zstd/compress (:text samples)) (zstd/compress (:text samples)))))
+
+(deftest blocks-are-capped-at-128-kib
+  (let [f (zstd/compress (:multiblock samples))]
+    ;; three raw blocks, so three block headers
+    (is (= (:multiblock samples) (zstd/decompress f)))
+    (is (> (count f) 300000))))
+
+(deftest concatenated-frames-are-read
+  (let [a (zstd/compress (:tiny samples))
+        b (zstd/compress (:allbytes samples))]
+    (is (= (into (:tiny samples) (:allbytes samples)) (zstd/decompress (into a b))))
+    (is (= 2 (count (zstd/frames (into a b)))))))
+
+(deftest skippable-frames-are-skipped
+  (let [f  (zstd/compress (:tiny samples))
+        sk (into [0x50 0x2a 0x4d 0x18 0x03 0x00 0x00 0x00] [9 9 9])]
+    (is (= (:tiny samples) (zstd/decompress (into sk f))))
+    (is (= (:tiny samples) (zstd/decompress (into f sk))))))
+
+;; ---------------------------------------------------------------------------
+;; Strictness
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-non-zstd-input
+  (is (= :not-zstd (reason-of #(zstd/decompress (vec (repeat 32 0x41))))))
+  (is (= :truncated (reason-of #(zstd/decompress [0x28 0xb5])))))
+
+(deftest verifies-the-content-checksum
+  (let [f (zstd/compress (->bytes "checksummed"))]
+    (is (= :checksum-mismatch
+           (reason-of #(zstd/decompress (assoc f (dec (count f))
+                                               (bit-xor (peek f) 0xff))))))
+    (is (vector? (zstd/decompress (assoc f (dec (count f)) (bit-xor (peek f) 0xff))
+                                  {:verify-checksum false}))
+        "and it can be skipped for salvage")))
+
+(deftest rejects-reserved-values
+  (let [f (zstd/compress (->bytes "hello"))]
+    (testing "block type 3 is reserved"
+      ;; block header sits right after magic (4) + descriptor (1) + size (4)
+      (is (= :bad-block (reason-of #(zstd/decompress (assoc f 9 (bit-or (nth f 9) 0x06)))))))
+    (testing "a reserved frame header bit"
+      (is (= :bad-frame-header
+             (reason-of #(zstd/decompress (assoc f 4 (bit-or (nth f 4) 0x08)))))))))
+
+(deftest rejects-a-truncated-frame
+  (let [f (zstd/compress (:text samples))]
+    (is (contains? #{:truncated :size-mismatch}
+                   (reason-of #(zstd/decompress (subvec f 0 (- (count f) 6))))))))
+
+(deftest enforces-an-output-ceiling
+  (let [f (zstd/compress (:runs samples))]
+    (is (= 5000 (count (zstd/decompress f))))
+    (is (= :output-limit (reason-of #(zstd/decompress f {:max-output 100}))))))

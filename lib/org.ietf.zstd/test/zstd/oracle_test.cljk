@@ -1,0 +1,202 @@
+(ns zstd.oracle-test
+  "Conformance against the reference zstd, in both directions, via the `zstd` CLI.
+
+   zstd has more independent code paths per block than any other codec here —
+   raw / RLE / compressed blocks; raw / RLE / Huffman / treeless literals; one or
+   four literal bitstreams; predefined / RLE / FSE / repeated sequence tables;
+   repeat offsets — and a decoder can be wrong in any one of them while looking
+   perfectly healthy in the others. So the fixtures sweep compression levels,
+   input shapes and sizes rather than testing one representative file.
+
+   Skipped loudly when `zstd` or python3 is missing rather than passing silently."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [zstd.core :as zstd]
+            [zstd.xxhash :as xxhash])
+  (:import [java.io File]))
+
+(defn- have? [cmd]
+  (try (zero? (:exit (shell/sh cmd "--version"))) (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir "org-ietf-zstd-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+
+(defn- sh! [dir & args]
+  (let [{:keys [exit out err]} (apply shell/sh (concat args [:dir dir]))]
+    (when-not (zero? exit)
+      (throw (ex-info (str "command failed: " (pr-str args) "\n" out err) {})))
+    out))
+
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+(defn- write-bytes [^File f bs]
+  (with-open [o (io/output-stream f)] (.write o (byte-array (map unchecked-byte bs)))))
+
+(def ^:private shapes
+  "name → python expression producing the bytes."
+  {"text"       "(b'the quick brown fox jumps over the lazy dog. ' * 500)"
+   "runs"       "(b'a' * 120000)"
+   "random"     "os.urandom(40000)"
+   "structured" "bytes(bytearray([i % 251 for i in range(60000)]))"
+   "mixed"      "(b'x' * 5000 + os.urandom(5000) + b'x' * 60000)"
+   "lines"      "b''.join(b'line %d of a log with repeated shape\\n' % i for i in range(8000))"
+   "tiny"       "b'hi'"
+   "empty"      "b''"
+   "allbytes"   "(bytes(bytearray(range(256))) * 60)"})
+
+(defn- fixture!
+  "Write `shape` to raw and compress it with the given `zstd` flags."
+  [dir shape flags]
+  (sh! dir "python3" "-c" (str "import os\nopen('f.raw','wb').write(" (get shapes shape) ")"))
+  (apply sh! dir (concat ["zstd" "-q" "-f"] flags ["f.raw" "-o" "f.zst"]))
+  [(read-ubytes (io/file dir "f.raw")) (read-ubytes (io/file dir "f.zst"))])
+
+;; ---------------------------------------------------------------------------
+;; reference → us
+;; ---------------------------------------------------------------------------
+
+(deftest we-read-every-level-and-shape
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (doseq [level ["-1" "-3" "-9" "-19"]
+            shape (keys shapes)]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str level " / " shape)
+            (let [[raw comp] (fixture! dir shape [level])]
+              (is (= raw (zstd/decompress comp)))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-with-and-without-a-checksum
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (doseq [flags [["--check"] ["--no-check"]]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str flags)
+            (let [[raw comp] (fixture! dir "text" (conj flags "-3"))]
+              (is (= raw (zstd/decompress comp)))
+              (when (= flags ["--check"])
+                (testing "and a corrupted payload is caught by it"
+                  (let [broken (assoc comp 20 (bit-xor (nth comp 20) 0xff))]
+                    (is (contains? #{:checksum-mismatch :bad-huffman-table :bad-fse-table
+                                     :bad-offset :size-mismatch :bad-sequences :truncated
+                                     :bad-literals}
+                                   (try (zstd/decompress broken) nil
+                                        (catch Exception e (:reason (ex-data e)))))))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-small-and-large-windows
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (doseq [flags [["--long=20"] ["-3" "--zstd=windowLog=10"] ["-3" "--zstd=windowLog=23"]]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str flags)
+            (let [[raw comp] (fixture! dir "lines" flags)]
+              (is (= raw (zstd/decompress comp)))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-multi-block-and-multi-frame-input
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (testing "a file well past one block, so later blocks reuse tables"
+          (sh! dir "python3" "-c"
+               "open('big.raw','wb').write(b''.join(b'row %d with fairly repetitive content\\n' % i for i in range(40000)))")
+          (sh! dir "zstd" "-q" "-f" "-3" "big.raw" "-o" "big.zst")
+          (is (> (count (read-ubytes (io/file dir "big.raw"))) 1000000))
+          (is (= (read-ubytes (io/file dir "big.raw"))
+                 (zstd/decompress (read-ubytes (io/file dir "big.zst"))))))
+        (testing "two frames concatenated"
+          (sh! dir "python3" "-c" "open('a.raw','wb').write(b'first part ' * 100)")
+          (sh! dir "python3" "-c" "open('b.raw','wb').write(b'second part ' * 100)")
+          (sh! dir "zstd" "-q" "-f" "a.raw" "-o" "a.zst")
+          (sh! dir "zstd" "-q" "-f" "b.raw" "-o" "b.zst")
+          (let [both (into (read-ubytes (io/file dir "a.zst")) (read-ubytes (io/file dir "b.zst")))]
+            (is (= (into (read-ubytes (io/file dir "a.raw")) (read-ubytes (io/file dir "b.raw")))
+                   (zstd/decompress both)))
+            (is (= 2 (count (zstd/frames both))))))
+        (finally (rm-rf dir))))))
+
+(deftest we-skip-skippable-frames
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [[raw comp] (fixture! dir "text" ["-3"])
+              ;; A skippable frame: magic 0x184D2A50, 4-byte size, payload.
+              skippable (into [0x50 0x2a 0x4d 0x18 0x04 0x00 0x00 0x00] [1 2 3 4])]
+          (is (= raw (zstd/decompress (into skippable comp))))
+          (is (= raw (zstd/decompress (into (vec comp) skippable)))))
+        (finally (rm-rf dir))))))
+
+(deftest we-refuse-dictionary-frames-by-name
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (sh! dir "python3" "-c" "
+import os
+os.makedirs('samples', exist_ok=True)
+for i in range(20):
+    open('samples/s%d' % i, 'wb').write((b'sample content %d ' % i) * 40)
+open('f.raw','wb').write(b'sample content 3 ' * 40)")
+        (let [{:keys [exit]} (shell/sh "zstd" "-q" "--train" "-o" "dict" "--maxdict=4096"
+                                       :dir dir)]
+          (if-not (zero? exit)
+            (println "SKIP dictionary case: zstd --train unavailable")
+            (do
+              (sh! dir "zstd" "-q" "-f" "-D" "dict" "f.raw" "-o" "f.zst")
+              (is (= :dictionary-required
+                     (try (zstd/decompress (read-ubytes (io/file dir "f.zst"))) nil
+                          (catch Exception e (:reason (ex-data e)))))))))
+        (finally (rm-rf dir))))))
+
+;; ---------------------------------------------------------------------------
+;; XXH64, against the reference's own checksum
+;; ---------------------------------------------------------------------------
+
+(deftest xxhash-matches-the-frames-zstd-writes
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (doseq [shape ["text" "runs" "random" "tiny" "empty" "allbytes"]]
+      (let [dir (temp-dir)]
+        (try
+          (testing shape
+            ;; The last four bytes of a --check frame are the low 32 bits of the
+            ;; content's XXH64, so the reference is checking our hash for us.
+            (let [[raw comp] (fixture! dir shape ["-3" "--check"])
+                  stored (+ (nth comp (- (count comp) 4))
+                            (* 256 (nth comp (- (count comp) 3)))
+                            (* 65536 (nth comp (- (count comp) 2)))
+                            (* 16777216 (nth comp (- (count comp) 1))))]
+              (is (= stored (xxhash/xxh64-low32 raw)))))
+          (finally (rm-rf dir)))))))
+
+;; ---------------------------------------------------------------------------
+;; us → reference
+;; ---------------------------------------------------------------------------
+
+(deftest our-frames-are-read-by-the-reference
+  (if-not (and (have? "zstd") (have? "python3"))
+    (println "SKIP zstd.oracle-test: zstd or python3 not available")
+    (doseq [checksum [true false]
+            size     [0 1 100 200000]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str "checksum " checksum " / " size " bytes")
+            (let [payload (vec (map #(mod (* 7 %) 256) (range size)))]
+              (write-bytes (io/file dir "ours.zst") (zstd/compress payload {:checksum checksum}))
+              (testing "`zstd -t` accepts it"
+                (is (str/includes? (sh! dir "zstd" "-t" "ours.zst") "")))
+              (testing "`zstd -d` reproduces the input"
+                (sh! dir "zstd" "-q" "-f" "-d" "ours.zst" "-o" "out.raw")
+                (is (= payload (read-ubytes (io/file dir "out.raw")))))
+              (testing "and we read it back ourselves"
+                (is (= payload (zstd/decompress (read-ubytes (io/file dir "ours.zst"))))))))
+          (finally (rm-rf dir)))))))
