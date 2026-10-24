@@ -1,0 +1,263 @@
+(ns avro.binary
+  "Avro's binary encoding — the value grammar, with nothing about files in it,
+  in both directions.
+
+  Its own namespace for the reason `parquet.thrift` is: this is a
+  self-contained byte grammar, and keeping it apart is what lets it be tested
+  against sequences taken from the specification rather than against this
+  repo's idea of an Avro file.
+
+  ## Everything variable-length is a zigzag varint
+
+  Ints, longs, string lengths, byte lengths, array block counts, union
+  branches. One reader, used everywhere, which is why getting its sign
+  handling right matters more here than the small amount of code suggests: a
+  varint read as unsigned turns every negative int into a large positive one
+  and every union branch index into nonsense, and both still decode to
+  *something*.
+
+  ## Ints and longs share an encoding but not a range
+
+  Avro writes both as zigzag varints and distinguishes them only in the
+  schema. So a decoder cannot tell from the bytes whether a value was meant to
+  fit in 32 bits, and this namespace does not try — `long` is what both
+  produce. On ClojureScript a magnitude past 2^53 is refused rather than
+  rounded, the same rule the Parquet and Arrow readers apply.
+
+  ## Opting into exact 64-bit values on ClojureScript
+
+  Refusing is the right default: a rounded 64-bit identifier is worse than
+  no identifier, because it still looks like one. But a file can carry a
+  full-width long in a field the reader does not care about — an Iceberg
+  manifest names its data files in a string and its snapshot in a 64-bit
+  id — and refusing the record loses the string along with the id.
+
+  Binding `*long-mode*` to `:bigint` decodes exactly those values as a
+  **BigInt**, which is exact. Values that fit stay plain numbers, so no
+  caller has to handle two types for small values:
+
+      (binding [avro.binary/*long-mode* :bigint]
+        (avro.file/records manifest-bytes))
+
+  The default is unchanged, and this is additive: nothing that decoded
+  before decodes differently now."
+  (:refer-clojure :exclude [bytes long double])
+  (:require [kotoba.bytes :as kbytes]))
+
+(def ^{:dynamic true
+       :doc "`:exact-or-refuse` (default) throws on a ClojureScript value
+  past 2^53; `:bigint` returns a BigInt for exactly those values. Inert on
+  the JVM, where a long is a long."}
+  *long-mode* :exact-or-refuse)
+
+(defn- u8 [bs i] (nth bs i))
+
+(defn varint
+  "Raw ULEB128 at `i` → `[value next-index]`.
+
+  Bounded at 10 bytes: a longer one cannot be a valid 64-bit value and is a
+  corrupt or hostile file trying to make the decoder loop."
+  [bs i]
+  #?(:clj
+     (loop [i i shift 0 acc 0 n 0]
+       (when (> n 10)
+         (throw (ex-info "varint too long" {:type :avro/malformed :at i})))
+       (let [b (u8 bs i)
+             acc (+ acc (* (bit-and b 0x7f) (bit-shift-left 1 shift)))]
+         (if (zero? (bit-and b 0x80))
+           [acc (inc i)]
+           (recur (inc i) (+ shift 7) acc (inc n)))))
+     :cljs
+     ;; Accumulated as a BigInt whatever the mode. `(Math/pow 2 shift)` is
+     ;; exact only to 2^53, so a full-width varint accumulated as a double
+     ;; is ALREADY wrong before `zigzag` can decide what to do about it --
+     ;; the old code could only refuse a value whose bytes it had already
+     ;; corrupted. Narrowing back to a plain number happens once, in
+     ;; `zigzag`, which is where the mode is known.
+     (loop [i i mult (js/BigInt 1) acc (js/BigInt 0) n 0]
+       (when (> n 10)
+         (throw (ex-info "varint too long" {:type :avro/malformed :at i})))
+       (let [b (u8 bs i)
+             acc (+ acc (* (js/BigInt (bit-and b 0x7f)) mult))]
+         (if (zero? (bit-and b 0x80))
+           [acc (inc i)]
+           (recur (inc i) (* mult (js/BigInt 128)) acc (inc n)))))))
+
+(defn zigzag
+  "Unsigned → signed. Small negatives are small varints, which is the whole
+  reason the encoding exists."
+  [n]
+  #?(:clj (let [n (clojure.core/long n)]
+            (bit-xor (unsigned-bit-shift-right n 1) (- (bit-and n 1))))
+     :cljs
+     ;; `n` arrives as a BigInt from `varint`. The undo is arithmetic rather
+     ;; than bitwise: `>>>` is not defined on BigInt, and BigInt division
+     ;; already truncates toward zero, which is what the shift meant.
+     ;;
+     ;; Every comparison and test below is done on plain numbers derived
+     ;; from the BigInt, not on the BigInt itself: `zero?`, `neg?` and
+     ;; friends are polymorphic in ClojureScript and their behaviour on
+     ;; BigInt is not something this decoder should be betting on.
+     (let [big (fn [x] (js/BigInt x))
+           n (if (number? n) (big n) n)
+           two (big 2)
+           q (/ n two)
+           low (js/Number (- n (* q two)))       ; 0 or 1
+           v (if (zero? low) q (- (- q) (big 1)))
+           neg? (= "-" (subs (str v) 0 1))
+           mag (if neg? (- v) v)
+           safe (big js/Number.MAX_SAFE_INTEGER)]
+       (if (zero? (js/Number (/ mag (+ safe (big 1)))))
+         ;; |v| <= MAX_SAFE_INTEGER: hand back a plain number, so a caller
+         ;; never sees two types for a small value.
+         (js/Number v)
+         (case *long-mode*
+           :bigint v
+           (throw (ex-info "integer exceeds this runtime's exact range"
+                           {:type :avro/precision-unavailable
+                            :exact (str v)
+                            :hint (str "bind avro.binary/*long-mode* to :bigint "
+                                       "to receive a BigInt")})))))))
+
+(defn long-at
+  "Signed long at `i` → `[value next-index]`."
+  [bs i]
+  (let [[v i'] (varint bs i)] [(zigzag v) i']))
+
+(defn bytes-at
+  "Length-prefixed bytes at `i` → `[byte-vector next-index]`."
+  [bs i]
+  (let [[n i'] (long-at bs i)
+        n (clojure.core/long n)]
+    (when (neg? n)
+      (throw (ex-info "negative length" {:type :avro/malformed :at i :length n})))
+    [(subvec (vec bs) i' (+ i' n)) (+ i' n)]))
+
+(defn utf8 [raw]
+  #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte raw)))
+     :cljs (.decode (js/TextDecoder. "utf-8") (js/Uint8Array. (clj->js (vec raw))))))
+
+(defn string-at [bs i]
+  (let [[raw i'] (bytes-at bs i)] [(utf8 raw) i']))
+
+(defn- le-bits
+  "`n` little-endian bytes at `i` as an integer. n is 4 or 8, and the result is
+  a bit pattern rather than a number — the caller reinterprets it as a float."
+  [bs i n]
+  #?(:clj (loop [k 0 acc 0]
+            (if (= k n)
+              acc
+              (recur (inc k) (bit-or acc (bit-shift-left (clojure.core/long (u8 bs (+ i k)))
+                                                         (* 8 k))))))
+     :cljs (let [a (js/Uint8Array. n)]
+             (dotimes [k n] (aset a k (u8 bs (+ i k))))
+             a)))
+
+(defn double-at [bs i]
+  (let [v #?(:clj (Double/longBitsToDouble (le-bits bs i 8))
+             :cljs (.getFloat64 (js/DataView. (.-buffer (le-bits bs i 8))) 0 true))]
+    [v (+ i 8)]))
+
+(defn float-at [bs i]
+  (let [v #?(:clj (Float/intBitsToFloat (unchecked-int (le-bits bs i 4)))
+             :cljs (.getFloat32 (js/DataView. (.-buffer (le-bits bs i 4))) 0 true))]
+    [v (+ i 4)]))
+
+(defn boolean-at [bs i] [(not (zero? (u8 bs i))) (inc i)])
+
+;; ---------------------------------------------------------------------------
+;; Encoding. The mirror of everything above.
+;;
+;; Kept in this namespace rather than a separate `avro.write` for the reason
+;; the namespace exists at all: this is the value grammar, and a grammar
+;; written down twice in two places drifts. `varint-of` and `varint` are the
+;; same rule read forwards and backwards, and they should be read together.
+;;
+;; Every encoder returns a **vector of unsigned bytes** (0-255), the same
+;; shape the decoders consume, so `(decode (encode v)) == v` is a
+;; composition of functions in this file and not an integration test.
+;; ---------------------------------------------------------------------------
+
+(defn varint-of
+  "Non-negative `n` → ULEB128 bytes.
+
+  `n` is the ALREADY-ZIGZAGGED value, i.e. unsigned. On the JVM that unsigned
+  64-bit quantity is carried in a signed long, so the shift has to be
+  `unsigned-bit-shift-right` -- an arithmetic shift would sign-extend and turn
+  a large value into an endless stream of 0xFF."
+  [n]
+  #?(:clj
+     (loop [n (clojure.core/long n) out []]
+       (if (zero? (bit-and n (bit-not 0x7f)))
+         (conj out (unchecked-int n))
+         (recur (unsigned-bit-shift-right n 7)
+                (conj out (unchecked-int (bit-or 0x80 (bit-and n 0x7f)))))))
+     :cljs
+     ;; BigInt throughout: `n` can exceed 2^53 and the loop must not round.
+     ;; `js/BigInt` on a non-integer number throws, which is the right
+     ;; failure -- a fractional value reaching an integer encoder is a bug in
+     ;; the caller, not something to truncate silently.
+     ;;
+     ;; The remainder is taken arithmetically rather than with `mod`, and the
+     ;; BigInt test is `number?`, both for the same reason `zigzag` does it
+     ;; that way: `mod`/`zero?`/`neg?` are polymorphic in ClojureScript and
+     ;; their behaviour on BigInt is not something this grammar should bet on.
+     (loop [n (if (number? n) (js/BigInt n) n) out []]
+       (let [c128 (js/BigInt 128)
+             q (/ n c128)
+             low (js/Number (- n (* q c128)))]
+         (if (zero? (js/Number q))
+           (conj out low)
+           (recur q (conj out (bit-or 0x80 low))))))))
+
+(defn zigzag-of
+  "Signed → unsigned. The inverse of `zigzag`.
+
+  Written arithmetically (`2v` / `-2v-1`) rather than as `(v << 1) ^ (v >> 63)`
+  because the arithmetic form is the same expression on both runtimes and on
+  BigInt, where `<<` and `>>` are not the operators the shift form assumes."
+  [v]
+  #?(:clj (let [v (clojure.core/long v)]
+            (bit-xor (bit-shift-left v 1) (bit-shift-right v 63)))
+     :cljs (let [v (if (number? v) (js/BigInt v) v)
+                 two (js/BigInt 2)]
+             (if (= "-" (subs (str v) 0 1))
+               (- (* (- v) two) (js/BigInt 1))
+               (* v two)))))
+
+(defn long-of "Signed long → zigzag varint bytes." [v] (varint-of (zigzag-of v)))
+
+(defn bytes-of
+  "Raw bytes → length-prefixed bytes."
+  [raw] (into (long-of (count raw)) (map #(bit-and % 0xff)) raw))
+
+(defn utf8-of
+  "String → UTF-8 bytes (no length prefix)."
+  [s]
+  #?(:clj (vec (map #(bit-and % 0xff) (kbytes/utf8-bytes (str s))))
+     :cljs (vec (.encode (js/TextEncoder.) (str s)))))
+
+(defn string-of "String → length-prefixed UTF-8." [s] (bytes-of (utf8-of s)))
+
+#?(:clj
+   (defn- le-of
+     "Integer bit pattern → `n` little-endian bytes. JVM only: ClojureScript
+  reaches the same bytes through a DataView and never calls this."
+     [bits n]
+     (mapv #(unchecked-int (bit-and (unsigned-bit-shift-right
+                                     (clojure.core/long bits) (* 8 %)) 0xff))
+           (range n))))
+
+(defn double-of [v]
+  #?(:clj (le-of (Double/doubleToLongBits (clojure.core/double v)) 8)
+     :cljs (let [dv (js/DataView. (js/ArrayBuffer. 8))]
+             (.setFloat64 dv 0 v true)
+             (vec (js/Uint8Array. (.-buffer dv))))))
+
+(defn float-of [v]
+  #?(:clj (le-of (bit-and (clojure.core/long (Float/floatToIntBits (float v))) 0xffffffff) 4)
+     :cljs (let [dv (js/DataView. (js/ArrayBuffer. 4))]
+             (.setFloat32 dv 0 v true)
+             (vec (js/Uint8Array. (.-buffer dv))))))
+
+(defn boolean-of [v] [(if v 1 0)])
