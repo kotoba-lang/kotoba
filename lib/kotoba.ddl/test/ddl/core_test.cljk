@@ -1,0 +1,277 @@
+(ns ddl.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ddl.model    :as m]
+            [ddl.validate :as v]
+            [ddl.ddl      :as ddlio]
+            [ddl.execute  :as ex]))
+
+;; ---------------------------------------------------------------------------
+;; 1. parse CREATE TABLE → model (columns, types, NOT NULL, PK, DEFAULT)
+;; ---------------------------------------------------------------------------
+
+(deftest parse-basic-table
+  (let [sql    "CREATE TABLE users (
+                  id    INTEGER      NOT NULL PRIMARY KEY DEFAULT 0,
+                  email VARCHAR(255) NOT NULL,
+                  score NUMERIC(10,2)
+                );"
+        schema (ddlio/parse-str sql)
+        tbl    (get-in schema [:ddl/tables "users"])]
+    (testing "table exists and is named correctly"
+      (is (some? tbl))
+      (is (= "users" (:ddl/name tbl))))
+    (testing "column count"
+      (is (= 3 (count (:ddl/columns tbl)))))
+    (testing "id column — type, NOT NULL, PK, DEFAULT"
+      (let [col (first (filter #(= "id" (:ddl/name %)) (:ddl/columns tbl)))]
+        (is (= "INTEGER" (:ddl/type col)))
+        (is (false? (:ddl/nullable col)))
+        (is (true? (:ddl/pk col)))
+        (is (= "0" (:ddl/default col)))))
+    (testing "email column — VARCHAR(255), NOT NULL, no PK"
+      (let [col (first (filter #(= "email" (:ddl/name %)) (:ddl/columns tbl)))]
+        (is (= "VARCHAR(255)" (:ddl/type col)))
+        (is (false? (:ddl/nullable col)))
+        (is (false? (:ddl/pk col)))))
+    (testing "score column — NUMERIC(10,2), nullable"
+      (let [col (first (filter #(= "score" (:ddl/name %)) (:ddl/columns tbl)))]
+        (is (= "NUMERIC(10,2)" (:ddl/type col)))
+        (is (true? (:ddl/nullable col)))))))
+
+;; ---------------------------------------------------------------------------
+;; 2. round-trip: emit → parse gives equal columns
+;; ---------------------------------------------------------------------------
+
+(deftest round-trip-emit-parse
+  (let [sql     (str "CREATE TABLE products (\n"
+                     "  id   INTEGER      NOT NULL PRIMARY KEY,\n"
+                     "  name VARCHAR(100) NOT NULL\n"
+                     ");")
+        schema  (ddlio/parse-str sql)
+        emitted (ddlio/emit-str schema)
+        schema2 (ddlio/parse-str emitted)]
+    (is (= (get-in schema  [:ddl/tables "products" :ddl/columns])
+           (get-in schema2 [:ddl/tables "products" :ddl/columns]))
+        "column maps survive emit→parse round-trip")))
+
+;; ---------------------------------------------------------------------------
+;; 3. FK parsed correctly
+;; ---------------------------------------------------------------------------
+
+(deftest parse-foreign-key
+  (let [sql    "CREATE TABLE orders (
+                  id      INTEGER NOT NULL PRIMARY KEY,
+                  user_id INTEGER NOT NULL,
+                  FOREIGN KEY (user_id) REFERENCES users (id)
+                );"
+        schema (ddlio/parse-str sql)
+        tbl    (get-in schema [:ddl/tables "orders"])
+        fks    (:ddl/foreign-keys tbl)]
+    (is (= 1 (count fks))
+        "exactly one FK constraint")
+    (is (= ["user_id"] (:ddl/columns (first fks)))
+        "FK source columns")
+    (is (= "users" (:ddl/ref-table (first fks)))
+        "FK ref table")
+    (is (= ["id"] (:ddl/ref-columns (first fks)))
+        "FK ref columns")))
+
+;; ---------------------------------------------------------------------------
+;; 4. dangling FK → validate error
+;; ---------------------------------------------------------------------------
+
+(deftest dangling-fk-is-an-error
+  (let [schema {:ddl/tables
+                {"orders" {:ddl/name         "orders"
+                           :ddl/columns      [{:ddl/name "id"      :ddl/type "INTEGER"
+                                               :ddl/nullable false  :ddl/pk true :ddl/default nil}
+                                              {:ddl/name "user_id" :ddl/type "INTEGER"
+                                               :ddl/nullable false  :ddl/pk false :ddl/default nil}]
+                           :ddl/primary-key  ["id"]
+                           :ddl/foreign-keys [{:ddl/columns     ["user_id"]
+                                               :ddl/ref-table   "users"   ; "users" not in schema
+                                               :ddl/ref-columns ["id"]}]}}}
+        probs  (v/problems schema)]
+    (is (not (v/valid? schema))
+        "schema with dangling FK is invalid")
+    (is (some #(and (= :error (:ddl/severity %))
+                    (= :fk/dangling (:ddl/code %)))
+              probs)
+        "dangling FK produces :error / :fk/dangling")))
+
+;; ---------------------------------------------------------------------------
+;; 5. duplicate column → validate error
+;; ---------------------------------------------------------------------------
+
+(deftest duplicate-column-is-an-error
+  (let [schema {:ddl/tables
+                {"t" {:ddl/name         "t"
+                      :ddl/columns      [{:ddl/name "id" :ddl/type "INTEGER"
+                                          :ddl/nullable false :ddl/pk true :ddl/default nil}
+                                         {:ddl/name "id" :ddl/type "VARCHAR(50)"
+                                          :ddl/nullable true  :ddl/pk false :ddl/default nil}]
+                      :ddl/primary-key  ["id"]
+                      :ddl/foreign-keys []}}}
+        probs (v/problems schema)]
+    (is (not (v/valid? schema))
+        "schema with duplicate column is invalid")
+    (is (some #(= :column/duplicate (:ddl/code %)) probs)
+        "duplicate column produces :column/duplicate error")))
+
+;; ---------------------------------------------------------------------------
+;; 6. no PK → validate warning (not an error)
+;; ---------------------------------------------------------------------------
+
+(deftest no-pk-is-a-warning
+  (let [schema {:ddl/tables
+                {"t" {:ddl/name         "t"
+                      :ddl/columns      [{:ddl/name "name" :ddl/type "VARCHAR(50)"
+                                          :ddl/nullable true :ddl/pk false :ddl/default nil}]
+                      :ddl/primary-key  []
+                      :ddl/foreign-keys []}}}
+        probs  (v/problems schema)]
+    (is (v/valid? schema)
+        "missing PK is a warning, not an error — schema is still valid")
+    (is (some #(and (= :warn (:ddl/severity %))
+                    (= :table/no-pk (:ddl/code %)))
+              probs)
+        "missing PK produces :warn / :table/no-pk")))
+
+;; ---------------------------------------------------------------------------
+;; 7. valid table → valid? true
+;; ---------------------------------------------------------------------------
+
+(deftest valid-schema-returns-true
+  (let [schema {:ddl/tables
+                {"users" {:ddl/name         "users"
+                          :ddl/columns      [{:ddl/name "id"    :ddl/type "INTEGER"
+                                              :ddl/nullable false :ddl/pk true  :ddl/default nil}
+                                             {:ddl/name "email" :ddl/type "VARCHAR(255)"
+                                              :ddl/nullable false :ddl/pk false :ddl/default nil}]
+                          :ddl/primary-key  ["id"]
+                          :ddl/foreign-keys []}}}]
+    (is (v/valid? schema))
+    (is (empty? (v/errors schema)))))
+
+;; ---------------------------------------------------------------------------
+;; 8. diff: add column → :add-column op
+;; ---------------------------------------------------------------------------
+
+(deftest diff-add-column
+  (let [base {:ddl/tables
+              {"users" {:ddl/name "users"
+                        :ddl/columns [{:ddl/name "id" :ddl/type "INTEGER"
+                                       :ddl/nullable false :ddl/pk true :ddl/default nil}]
+                        :ddl/primary-key ["id"] :ddl/foreign-keys []}}}
+        next {:ddl/tables
+              {"users" {:ddl/name "users"
+                        :ddl/columns [{:ddl/name "id"    :ddl/type "INTEGER"
+                                       :ddl/nullable false :ddl/pk true :ddl/default nil}
+                                      {:ddl/name "email" :ddl/type "VARCHAR(255)"
+                                       :ddl/nullable false :ddl/pk false :ddl/default nil}]
+                        :ddl/primary-key ["id"] :ddl/foreign-keys []}}}
+        ops  (ex/diff base next)
+        add  (first (filter #(= :add-column (:ddl/op %)) ops))]
+    (is (some? add) ":add-column op present")
+    (is (= "email" (:ddl/name (:ddl/column add)))
+        "added column name is 'email'")))
+
+;; ---------------------------------------------------------------------------
+;; 9. diff: drop table → :drop-table op
+;; ---------------------------------------------------------------------------
+
+(deftest diff-drop-table
+  (let [base {:ddl/tables
+              {"users" {:ddl/name "users"
+                        :ddl/columns [{:ddl/name "id" :ddl/type "INTEGER"
+                                       :ddl/nullable false :ddl/pk true :ddl/default nil}]
+                        :ddl/primary-key ["id"] :ddl/foreign-keys []}
+               "logs"  {:ddl/name "logs"
+                        :ddl/columns [{:ddl/name "id" :ddl/type "INTEGER"
+                                       :ddl/nullable false :ddl/pk true :ddl/default nil}]
+                        :ddl/primary-key ["id"] :ddl/foreign-keys []}}}
+        next {:ddl/tables
+              {"users" {:ddl/name "users"
+                        :ddl/columns [{:ddl/name "id" :ddl/type "INTEGER"
+                                       :ddl/nullable false :ddl/pk true :ddl/default nil}]
+                        :ddl/primary-key ["id"] :ddl/foreign-keys []}}}
+        ops  (ex/diff base next)
+        drop (first (filter #(= :drop-table (:ddl/op %)) ops))]
+    (is (some? drop) ":drop-table op present")
+    (is (= "logs" (:ddl/table drop))
+        "dropped table name is 'logs'")))
+
+;; ---------------------------------------------------------------------------
+;; 10. diff: alter column type → :alter-column op
+;; ---------------------------------------------------------------------------
+
+(deftest diff-alter-column-type
+  (let [base {:ddl/tables
+              {"metrics" {:ddl/name "metrics"
+                          :ddl/columns [{:ddl/name "score" :ddl/type "INTEGER"
+                                         :ddl/nullable true :ddl/pk false :ddl/default nil}]
+                          :ddl/primary-key [] :ddl/foreign-keys []}}}
+        next {:ddl/tables
+              {"metrics" {:ddl/name "metrics"
+                          :ddl/columns [{:ddl/name "score" :ddl/type "NUMERIC(10,2)"
+                                         :ddl/nullable true :ddl/pk false :ddl/default nil}]
+                          :ddl/primary-key [] :ddl/foreign-keys []}}}
+        ops  (ex/diff base next)
+        ac   (first (filter #(= :alter-column (:ddl/op %)) ops))]
+    (is (some? ac) ":alter-column op present")
+    (is (= "INTEGER"      (:ddl/type (:ddl/from ac))) "from type is INTEGER")
+    (is (= "NUMERIC(10,2)" (:ddl/type (:ddl/to ac)))  "to type is NUMERIC(10,2)")))
+
+;; ---------------------------------------------------------------------------
+;; 11. emit-migration: ADD COLUMN SQL
+;; ---------------------------------------------------------------------------
+
+(deftest emit-migration-add-column
+  (let [ops [{:ddl/op     :add-column
+              :ddl/table  "users"
+              :ddl/column {:ddl/name "phone" :ddl/type "VARCHAR(20)"
+                           :ddl/nullable true :ddl/pk false :ddl/default nil}}]
+        sql (ex/emit-migration ops)]
+    (is (string? sql)
+        "emit-migration returns a string")
+    (is (re-find #"(?i)ALTER TABLE users ADD COLUMN phone VARCHAR\(20\)" sql)
+        "emits ALTER TABLE ... ADD COLUMN")))
+
+;; ---------------------------------------------------------------------------
+;; 12. emit-migration: DROP TABLE SQL
+;; ---------------------------------------------------------------------------
+
+(deftest emit-migration-drop-table
+  (let [ops [{:ddl/op :drop-table :ddl/table "tmp_cache"}]
+        sql (ex/emit-migration ops)]
+    (is (re-find #"(?i)DROP TABLE tmp_cache" sql)
+        "emits DROP TABLE")))
+
+;; ---------------------------------------------------------------------------
+;; 13. IF NOT EXISTS is handled by parser
+;; ---------------------------------------------------------------------------
+
+(deftest parse-if-not-exists
+  (let [sql    "CREATE TABLE IF NOT EXISTS tags (id INTEGER NOT NULL PRIMARY KEY);"
+        schema (ddlio/parse-str sql)]
+    (is (some? (get-in schema [:ddl/tables "tags"]))
+        "CREATE TABLE IF NOT EXISTS is parsed correctly")
+    (is (= ["id"] (get-in schema [:ddl/tables "tags" :ddl/primary-key]))
+        "primary key detected")))
+
+;; ---------------------------------------------------------------------------
+;; 14. multi-statement parse
+;; ---------------------------------------------------------------------------
+
+(deftest parse-multiple-statements
+  (let [sql (str "CREATE TABLE orgs (id INTEGER NOT NULL PRIMARY KEY);\n"
+                 "CREATE TABLE members (\n"
+                 "  id     INTEGER NOT NULL PRIMARY KEY,\n"
+                 "  org_id INTEGER NOT NULL,\n"
+                 "  FOREIGN KEY (org_id) REFERENCES orgs (id)\n"
+                 ");")
+        schema (ddlio/parse-str sql)]
+    (is (= #{"orgs" "members"} (m/table-names schema))
+        "both tables parsed")
+    (is (v/valid? schema)
+        "schema with resolved FK is valid")))
