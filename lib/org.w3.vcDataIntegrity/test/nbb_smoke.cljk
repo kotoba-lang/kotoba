@@ -1,0 +1,162 @@
+;; nbb smoke test — proves the :cljs branch of this library is real.
+;;
+;; The JVM suite cannot cover it. Every dependency here has a reader-conditional
+;; split, and each split has already produced a silent divergence once:
+;; `jcs.core` refused a valid 1e20 on :cljs because `Number.isInteger` is not the
+;; analogue of `integer?`; `multiformats.core/base58btc-decode` returns a
+;; byte-array on :clj and a VECTOR OF INTS on :cljs. A signature is over exact
+;; bytes, so a host that assembles them differently produces a credential the
+;; other host cannot verify — and nothing would say so.
+;;
+;; The vector below is W3C vc-di-eddsa Appendix B.3, the same one the JVM suite
+;; pins. Ed25519 is deterministic, so this is an equality on both hosts: if the
+;; two ever disagree, one of them is wrong and this test names which.
+;;
+;;   npm install
+;;   kbb --backend sci --classpath src:<sibling src dirs> test/nbb_smoke.cljk
+;;
+;; See package.json: `@noble/hashes` is required at runtime because
+;; `multiformats.core` reaches for it on :cljs for SHA-256.
+(ns nbb-smoke
+  (:require [data-integrity.bytes :as b]
+            [data-integrity.core :as di]
+            [data-integrity.eddsa :as eddsa]
+            [jcs.core :as jcs]
+            [multiformats.core :as mf]))
+
+(def ^:private failures (atom 0))
+
+(defn- check [label expected actual]
+  (if (= expected actual)
+    (println "  ok  " label)
+    (do (swap! failures inc)
+        (println "  FAIL" label "\n        expected:" (pr-str expected)
+                 "\n        actual:  " (pr-str actual)))))
+
+(defn- hex [bs]
+  (apply str (map (fn [i] (let [s (.toString i 16)]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  (b/->ints bs))))
+
+(def public-multibase "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2")
+(def private-multibase "z3u2en7t5LR2WtQH5PfFqMqwVHBeXouLzo6haApm8XHqvjxq")
+(def verification-method (str "did:key:" public-multibase "#" public-multibase))
+
+(def unsecured
+  {"@context" ["https://www.w3.org/ns/credentials/v2"
+               "https://www.w3.org/ns/credentials/examples/v2"]
+   "id" "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33"
+   "type" ["VerifiableCredential" "AlumniCredential"]
+   "name" "Alumni Credential"
+   "description" "A minimum viable example of an Alumni Credential."
+   "issuer" "https://vc.example/issuers/5678"
+   "validFrom" "2023-01-01T00:00:00Z"
+   "credentialSubject" {"id" "did:example:abcdefgh"
+                        "alumniOf" "The School of Examples"}})
+
+(def proof-options
+  {"type" "DataIntegrityProof"
+   "cryptosuite" "eddsa-jcs-2022"
+   "created" "2023-02-24T23:36:38Z"
+   "verificationMethod" verification-method
+   "proofPurpose" "assertionMethod"
+   "@context" ["https://www.w3.org/ns/credentials/v2"
+               "https://www.w3.org/ns/credentials/examples/v2"]})
+
+(def transformed-document-hash
+  "59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19")
+(def proof-config-hash
+  "66ab154f5c2890a140cb8388a22a160454f80575f6eae09e5a097cabe539a1db")
+(def expected-proof-value
+  "z2HnFSSPPBzR36zdDgK8PbEHeXbR56YF24jwMpt3R1eHXQzJDMWS93FCzpvJpwTWd3GAVFuUfjoJdcnTMuVor51aX")
+
+(def secured (assoc unsecured "proof" (assoc proof-options
+                                             "proofValue" expected-proof-value)))
+
+;; Multibase base58-btc + multicodec ed25519-priv (0x1300, varint 0x80 0x26).
+(def seed
+  (let [bs (b/->ints (mf/base58btc-decode (subs private-multibase 1)))]
+    (b/ints->bytes (subvec bs 2))))
+
+(println "data-integrity :cljs smoke")
+
+(check "ed25519-priv multicodec prefix" [0x80 0x26]
+       (subvec (b/->ints (mf/base58btc-decode (subs private-multibase 1))) 0 2))
+
+;; JCS + SHA-256 must agree with the W3C vector on this host too. This is the
+;; assertion that catches a :cljs-only canonicalization or byte-assembly bug.
+(check "transformedDocumentHash" transformed-document-hash
+       (hex (mf/sha256 (jcs/canonicalize-bytes unsecured))))
+(check "proofConfigHash" proof-config-hash
+       (hex (mf/sha256 (eddsa/proof-configuration proof-options))))
+(check "hashData is proofConfig || document"
+       (str proof-config-hash transformed-document-hash)
+       (hex (eddsa/hash-data (jcs/canonicalize-bytes unsecured)
+                             (eddsa/proof-configuration proof-options))))
+
+;; Signing: Ed25519 is deterministic, so :cljs must produce the byte-identical
+;; proofValue that :clj and the specification produce.
+(check "signing reproduces the W3C proofValue exactly"
+       expected-proof-value
+       (get-in (di/issue-credential unsecured
+                                    {:seed seed
+                                     :verification-method verification-method
+                                     :created "2023-02-24T23:36:38Z"})
+               ["proof" "proofValue"]))
+(check "the whole secured document matches" secured
+       (di/issue-credential unsecured {:seed seed
+                                       :verification-method verification-method
+                                       :created "2023-02-24T23:36:38Z"}))
+
+;; Verification.
+(check "the W3C vector verifies" true
+       (:verified (di/verify-credential secured)))
+(check "tampering is detected" false
+       (:verified (di/verify-credential
+                   (assoc-in secured ["credentialSubject" "alumniOf"] "Elsewhere"))))
+(check "proof purpose confusion is refused" :data-integrity/proof-purpose-mismatch
+       (:reason (di/verify secured {:expected-proof-purpose "authentication"})))
+(check "appending a context keeps the signature valid" true
+       (:verified (di/verify-credential
+                   (assoc secured "@context"
+                          ["https://www.w3.org/ns/credentials/v2"
+                           "https://www.w3.org/ns/credentials/examples/v2"
+                           "https://holder.example/ctx/v1"]))))
+(check "prepending a context is rejected" :data-integrity/context-not-prefix
+       (:reason (di/verify-credential
+                 (assoc secured "@context"
+                        ["https://evil.example/ctx/v1"
+                         "https://www.w3.org/ns/credentials/v2"
+                         "https://www.w3.org/ns/credentials/examples/v2"]))))
+
+;; Fail-closed paths must behave identically to :clj, or the hosts accept
+;; different documents.
+(check "missing :expected-proof-purpose throws" :threw
+       (try (di/verify secured {}) :no-throw (catch :default _ :threw)))
+(check "a presentation without a challenge throws" :threw
+       (try (di/issue-presentation {"type" ["VerifiablePresentation"]}
+                                   {:seed seed
+                                    :verification-method verification-method
+                                    :created "2026-07-30T00:00:00Z"})
+            :no-throw (catch :default _ :threw)))
+
+;; Presentation round trip, including the replay guard.
+(let [vp (di/issue-presentation
+          {"@context" ["https://www.w3.org/ns/credentials/v2"]
+           "type" ["VerifiablePresentation"]
+           "verifiableCredential" [secured]}
+          {:seed seed :verification-method verification-method
+           :created "2026-07-30T00:00:00Z" :challenge "n-1"
+           :domain "https://verifier.example"})]
+  (check "presentation verifies with its challenge" true
+         (:verified (di/verify-presentation vp {:challenge "n-1"
+                                                :domain "https://verifier.example"})))
+  (check "a replay answering another challenge is rejected"
+         :data-integrity/challenge-mismatch
+         (:reason (di/verify-presentation vp {:challenge "n-2"}))))
+
+(println (if (zero? @failures)
+           "all data-integrity :cljs checks passed"
+           (str @failures " data-integrity :cljs check(s) FAILED")))
+(when (pos? @failures)
+  (throw (js/Error. (str @failures " failure(s)"))))

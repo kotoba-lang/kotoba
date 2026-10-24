@@ -1,0 +1,149 @@
+(ns data-integrity.suite-dispatch-test
+  "Verifying a corpus that contains more than one cryptosuite.
+
+  `:suite` names exactly one, and a proof naming a different one is treated as
+  malformed — it throws. That is right for a caller who knows what it expects, and
+  it makes a MIXED corpus unverifiable: one unrecognised proof stops the batch. A
+  mixed corpus is precisely what any change of cryptosuite produces, so without
+  dispatch there is no way to migrate.
+
+  `:accept-suites` fixes that, and is an ALLOWLIST rather than \"use whatever the
+  proof names\". `cryptosuite` is a field of the proof, chosen by whoever produced
+  the document. Selecting from it unconditionally would let an attacker pick the
+  weakest suite a verifier supports — a downgrade with no forgery required. That
+  attempt is tested below, not merely described."
+  (:require [kotoba.lang.error :as kerror] [kotoba.json :as json]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [data-integrity.core :as di]
+            [data-integrity.eddsa :as eddsa]
+            [data-integrity.eddsa-rdfc :as rdfc]
+            [ed25519.core :as ed]))
+
+(def ^:private contexts
+  (delay {"https://www.w3.org/ns/credentials/v2"
+          (json/read-str (slurp (io/resource "fixtures/credentials-v2.jsonld")))
+          "https://www.w3.org/ns/credentials/examples/v2"
+          (json/read-str (slurp (io/resource "fixtures/credentials-examples-v2.jsonld")))}))
+
+(def ^:private seed (byte-array (repeat 32 (byte 23))))
+(def ^:private did (delay (ed/did-key-from-seed seed)))
+(def ^:private vm (delay (str @did "#" (subs @did (count "did:key:")))))
+
+(def ^:private credential
+  {"@context" ["https://www.w3.org/ns/credentials/v2"
+               "https://www.w3.org/ns/credentials/examples/v2"]
+   "id" "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+   "type" ["VerifiableCredential" "AlumniCredential"]
+   "issuer" "https://vc.example/issuers/5678"
+   "validFrom" "2026-07-31T00:00:00Z"
+   "credentialSubject" {"id" "did:example:abcdefgh"
+                        "alumniOf" "The School of Examples"}})
+
+(defn- issue-with [suite extra]
+  (di/issue-credential credential
+                       (merge {:suite suite :seed seed :verification-method @vm
+                               :created "2026-07-31T00:00:00Z"} extra)))
+
+(def ^:private jcs-cred (delay (issue-with eddsa/suite {})))
+(def ^:private rdfc-cred (delay (issue-with rdfc/suite {:suite-opts {:contexts @contexts}})))
+
+;; ── the registry ─────────────────────────────────────────────────────────────
+
+(deftest the-registry-is-keyed-by-what-a-proof-declares
+  (testing "so an allowlist can be built by name without importing each namespace"
+    (is (= #{"eddsa-jcs-2022" "ecdsa-jcs-2019" "eddsa-rdfc-2022"}
+           (set (keys di/built-in-suites))))
+    (is (= eddsa/suite (get di/built-in-suites "eddsa-jcs-2022")))
+    (is (= rdfc/suite (get di/built-in-suites "eddsa-rdfc-2022")))))
+
+;; ── the thing that was impossible before ─────────────────────────────────────
+
+(deftest a-mixed-corpus-verifies-with-one-call-shape
+  (testing "this is what makes a migration possible: both credentials verify under
+            the same options, each against the suite its own proof declares"
+    (let [opts {:accept-suites [eddsa/suite rdfc/suite]
+                :suite-opts {:contexts @contexts}}]
+      (is (= "eddsa-jcs-2022" (get-in @jcs-cred ["proof" "cryptosuite"])))
+      (is (= "eddsa-rdfc-2022" (get-in @rdfc-cred ["proof" "cryptosuite"])))
+      (is (:verified (di/verify-credential @jcs-cred opts)))
+      (is (:verified (di/verify-credential @rdfc-cred opts))))))
+
+(deftest without-dispatch-the-mixed-corpus-throws
+  (testing "the limitation, pinned. `:suite` naming one cryptosuite treats the other
+            as malformed — so a batch stops rather than skipping. This asserts the
+            problem is real and that the test above is not restating the obvious."
+    (is (= :data-integrity/bad-cryptosuite
+           (:data-integrity/error
+            (ex-data (try (di/verify-credential @rdfc-cred {:suite eddsa/suite})
+                          (catch kerror/ExceptionInfo e e))))))))
+
+(deftest an-allowlist-may-be-a-map-or-a-collection
+  (let [as-map {:accept-suites {"eddsa-rdfc-2022" rdfc/suite}
+                :suite-opts {:contexts @contexts}}
+        as-coll {:accept-suites [rdfc/suite] :suite-opts {:contexts @contexts}}]
+    (is (:verified (di/verify-credential @rdfc-cred as-map)))
+    (is (:verified (di/verify-credential @rdfc-cred as-coll)))))
+
+;; ── the downgrade attempt ────────────────────────────────────────────────────
+
+(deftest a-suite-outside-the-allowlist-is-refused-without-crashing
+  (testing "an unlisted suite is a verification RESULT, not an exception — one
+            unrecognised proof in a batch must not stop the batch"
+    (let [r (di/verify-credential @rdfc-cred {:accept-suites [eddsa/suite]})]
+      (is (false? (:verified r)))
+      (is (= :data-integrity/unacceptable-cryptosuite (:reason r)))
+      (testing "and the result names both what was offered and what is accepted, so
+                an operator can see whether this is an attack or a missing entry"
+        (is (= "eddsa-rdfc-2022" (:cryptosuite r)))
+        (is (= ["eddsa-jcs-2022"] (:accepted r)))))))
+
+(deftest an-empty-allowlist-accepts-nothing
+  (testing "deny-by-default: an allowlist that lists nothing is not 'no restriction'"
+    (doseq [empty-allow [{} []]]
+      (let [r (di/verify-credential @jcs-cred {:accept-suites empty-allow})]
+        (is (false? (:verified r)) (pr-str empty-allow))
+        (is (= :data-integrity/unacceptable-cryptosuite (:reason r)))))))
+
+(deftest relabelling-a-proof-to-a-weaker-suite-does-not-verify
+  (testing "the downgrade attempt itself. An attacker who cannot forge a signature
+            can still edit the `cryptosuite` field, hoping the verifier picks a suite
+            that happens to accept the bytes. Rewriting a rdfc proof's label to
+            eddsa-jcs-2022 puts it INSIDE the allowlist — and it still fails, because
+            the suite it now names hashes different bytes."
+    (let [downgraded (assoc-in @rdfc-cred ["proof" "cryptosuite"] "eddsa-jcs-2022")
+          r (di/verify-credential downgraded {:accept-suites [eddsa/suite rdfc/suite]
+                                              :suite-opts {:contexts @contexts}})]
+      (is (false? (:verified r)))
+      (is (= :data-integrity/bad-signature (:reason r))
+          "reaches the signature check and fails there, rather than being accepted"))))
+
+(deftest a-proof-with-no-cryptosuite-field-is-refused
+  (testing "a missing label cannot select anything, and must not fall through to a
+            default when an allowlist was given"
+    (let [stripped (update @jcs-cred "proof" dissoc "cryptosuite")
+          r (di/verify-credential stripped {:accept-suites [eddsa/suite rdfc/suite]})]
+      (is (false? (:verified r)))
+      (is (= :data-integrity/unacceptable-cryptosuite (:reason r)))
+      (is (nil? (:cryptosuite r))))))
+
+;; ── backwards compatibility ──────────────────────────────────────────────────
+
+(deftest the-default-still-applies-when-neither-option-is-given
+  (testing "removing the long-standing default would break every existing caller.
+            A compatibility default is a different thing from letting a proof pick
+            its own verifier, and only the latter is refused."
+    (is (:verified (di/verify-credential @jcs-cred {})))
+    (testing "and :suite alone behaves exactly as before"
+      (is (:verified (di/verify-credential @jcs-cred {:suite eddsa/suite}))))))
+
+(deftest an-explicit-suite-wins-over-an-allowlist
+  (testing "a caller that names a suite has stated an expectation, and that is
+            stronger than letting the document choose"
+    (is (= :data-integrity/bad-cryptosuite
+           (:data-integrity/error
+            (ex-data (try (di/verify-credential @rdfc-cred
+                                                {:suite eddsa/suite
+                                                 :accept-suites [rdfc/suite]
+                                                 :suite-opts {:contexts @contexts}})
+                          (catch kerror/ExceptionInfo e e))))))))
