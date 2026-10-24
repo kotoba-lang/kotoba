@@ -1,0 +1,123 @@
+(ns nagare.solver-test
+  "Lid-driven cavity at Re=100: the PISO loop must reproduce the qualitative Ghia
+  centreline signature. We use a coarse grid and a loose band — first-order upwind
+  on a coarse mesh is diffusive, so the dip is shallower than the fine-mesh Ghia
+  value of -0.21, but the *shape* (a negative underflow in the lower half, rising
+  to the lid) is the physics under test."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [nagare.demo :as demo]
+            [nagare.fvm :as fvm]
+            [nagare.diagnostics :as diag]
+            [nagare.solver :as solver]))
+
+(defn- max-continuity-defect [mesh state]
+  (reduce max 0.0 (map #(Math/abs %) (fvm/continuity-defect mesh (:phi state)))))
+
+(deftest cavity-centreline-shape
+  (let [{:keys [profile min-u converged steps-run]}
+        (demo/run {:n 16 :re 100 :steps 600 :steady-tol 3e-5})
+        ;; topmost interior cell (just below the lid) — drops the bracketing [1 1]
+        near-lid-u (second (nth profile (- (count profile) 2)))]
+    (testing "the run reaches a near-steady state in a bounded number of steps"
+      (is converged)
+      (is (<= steps-run 600)))
+    (testing "min centreline u is negative and in the loose Ghia band"
+      (is (neg? min-u))
+      (is (<= -0.30 min-u -0.10) (str "min-u out of band: " min-u)))
+    (testing "u at the lid is ~1 and the shear has driven the near-lid cells positive"
+      (is (< (Math/abs (- 1.0 (second (last profile)))) 1e-9))   ; lid BC value
+      (is (> near-lid-u 0.55) (str "near-lid u too weak: " near-lid-u)))))
+
+(deftest cavity-is-stable-and-physical
+  (let [{:keys [state profile]} (demo/run {:n 16 :re 100 :steps 600 :steady-tol 3e-5})]
+    (testing "the field stays bounded — no cell exceeds the lid speed by more than a hair"
+      (let [max-speed (reduce max
+                              (map (fn [[ux uy]] (Math/sqrt (+ (* ux ux) (* uy uy))))
+                                   (:values (:U state))))]
+        (is (< max-speed 1.10) (str "velocity blew up / overshot: " max-speed))))
+    (testing "the centreline crosses zero exactly once — a single primary vortex"
+      (let [us (map second profile)
+            crossings (count (filter neg? (map * us (rest us))))]
+        (is (= 1 crossings) (str "expected one sign change, got " crossings))))
+    (testing "the steady-state residual history decays well below its start"
+      (let [hist (:history state)]
+        (is (seq hist))
+        (is (< (last hist) (* 0.1 (first hist))) "residual did not decay an order of magnitude")
+        (is (< (last hist) 3e-5) "did not reach the steady tolerance")))))
+
+(deftest simple-steady-cavity-matches-piso
+  (testing "steady SIMPLE converges to the same Ghia-band centreline as transient PISO"
+    (let [{:keys [mesh init params]} (demo/cavity-case {:n 16 :re 100})
+          st (solver/advance-simple mesh (assoc params :alpha-u 0.7 :alpha-p 0.3)
+                                    init {:steps 2000 :steady-tol 1e-5})
+          prof (demo/centreline-u mesh (:U st))
+          min-u (reduce min (map second prof))]
+      (testing "SIMPLE reaches a steady fixed point in a bounded number of iterations"
+        (is (:converged st))
+        (is (<= (:steps-run st) 2000)))
+      (testing "the steady centreline lands in the same loose Ghia band as PISO"
+        (is (neg? min-u))
+        (is (<= -0.30 min-u -0.10) (str "SIMPLE min-u out of band: " min-u)))
+      (testing "no blow-up: the field stays bounded near the lid speed"
+        (let [max-speed (reduce max (map (fn [[ux uy]] (Math/sqrt (+ (* ux ux) (* uy uy))))
+                                         (:values (:U st))))]
+          (is (< max-speed 1.10) (str "SIMPLE velocity overshoot: " max-speed)))))))
+
+(deftest linear-upwind-momentum-deepens-cavity-dip
+  (testing "lifting linear-upwind into the momentum div sharpens the centreline dip
+            toward the Ghia value (less false diffusion than first-order upwind)"
+    (let [{:keys [mesh init params]} (demo/cavity-case {:n 20 :re 100})
+          run-scheme (fn [scheme]
+                       (let [st (solver/advance mesh (assoc params :div-scheme scheme)
+                                                init {:steps 2000 :steady-tol 1e-5})]
+                         {:converged (:converged st)
+                          :defect (max-continuity-defect mesh st)
+                          :min-u (reduce min (map second (demo/centreline-u mesh (:U st))))}))
+          up  (run-scheme :upwind)
+          lud (run-scheme :linear-upwind)]
+      (is (:converged up))
+      (is (:converged lud) "linear-upwind momentum still reaches steady state")
+      (is (< (:min-u lud) (:min-u up))
+          (str "expected a deeper dip; upwind " (:min-u up) " lud " (:min-u lud)))
+      (is (<= -0.30 (:min-u lud) -0.15) (str "lud min-u out of band: " (:min-u lud)))
+      (testing "the deferred HO correction does not break mass conservation"
+        (is (< (:defect lud) 1e-6) (str "linear-upwind continuity defect: " (:defect lud)))))))
+
+(deftest diagnostics-reflect-the-converged-cavity
+  (testing "Courant/Péclet computed from the converged cavity flux are in a sane range"
+    (let [{:keys [mesh init params]} (demo/cavity-case {:n 16 :re 100})
+          st (solver/advance mesh params init {:steps 600 :steady-tol 3e-5})
+          co (diag/max-courant mesh (:phi st) (:dt params))
+          pe (diag/max-peclet mesh (:phi st) (:nu params))]
+      (is (pos? co))
+      (is (< co 5.0) (str "Courant out of a sane PISO range: " co))
+      (is (pos? pe) "cell Péclet is positive where the flow moves"))))
+
+(deftest piso-is-deterministic-and-restartable
+  (testing "advancing N+M steps equals advancing N then restarting for M — the state
+            is a pure value, so a run is checkpointable/replayable (the design claim)"
+    (let [{:keys [mesh init params]} (demo/cavity-case {:n 8 :re 100})
+          opts (fn [n] {:steps n :steady-tol 0.0})        ; tol 0 ⇒ run all n steps
+          all   (solver/advance mesh params init (opts 10))
+          mid   (solver/advance mesh params init (opts 4))
+          split (solver/advance mesh params mid (opts 6))]
+      (is (= 10 (:steps-run all)))
+      (doseq [c (range (:n-cells mesh))]
+        (let [[ua va] (nth (:values (:U all)) c)
+              [us vs] (nth (:values (:U split)) c)]
+          (is (< (Math/abs (- ua us)) 1e-9) (str "u mismatch at cell " c))
+          (is (< (Math/abs (- va vs)) 1e-9) (str "v mismatch at cell " c)))))))
+
+(deftest converged-cavity-is-divergence-free
+  (testing "the discrete continuity defect ∇·U ≈ 0 in every cell at convergence —
+            the core correctness guarantee of the pressure correction"
+    (testing "transient PISO"
+      (let [{:keys [mesh state]} (demo/run {:n 16 :re 100 :steps 600 :steady-tol 3e-5})]
+        (is (< (max-continuity-defect mesh state) 1e-6)
+            (str "PISO continuity defect too large: " (max-continuity-defect mesh state)))))
+    (testing "steady SIMPLE"
+      (let [{:keys [mesh init params]} (demo/cavity-case {:n 16 :re 100})
+            st (solver/advance-simple mesh (assoc params :alpha-u 0.7 :alpha-p 0.3)
+                                      init {:steps 2000 :steady-tol 1e-5})]
+        (is (< (max-continuity-defect mesh st) 1e-6)
+            (str "SIMPLE continuity defect too large: " (max-continuity-defect mesh st)))))))
