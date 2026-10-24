@@ -86,6 +86,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.avro` | `org.apache.avro/src` | `avro.binary`, `avro.datum`, `avro.file`, `avro.schema` (an external specification, publisher apache.org) |
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
+| `kotoba.canvaskit` | `kotoba.canvaskit/src` | `canvaskit.gesture`, `canvaskit.hit-test`, `canvaskit.scroll-view`, `canvaskit.viewport` (Kotoba project library) |
 | `kotoba.cam` | `kotoba.cam/src` | `cam`, `cam.follow`, `cam.look-constraint`, `cam.shake` (Kotoba project library) |
 | `kotoba.btcMining` | `kotoba.btcMining/src` | `btc-mining.core` (Kotoba project library) |
 | `kotoba.btcCrypto` | `kotoba.btcCrypto/src` | `btc-crypto.base58`, `btc-crypto.bech32`, `btc-crypto.bip32`, `btc-crypto.bip39` (Kotoba project library) |
