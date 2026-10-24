@@ -1,0 +1,326 @@
+(ns states.core-test
+  (:require [kotoba.test :refer [deftest is testing run-tests]]
+            [states.model    :as m]
+            [states.json     :as j]
+            [states.validate :as v]
+            [states.execute  :as e]
+            [states.ports    :as p]))
+
+;; ---------------------------------------------------------------------------
+;; Fixtures
+;; ---------------------------------------------------------------------------
+
+(def linear-machine
+  "A->B->C task chain."
+  {:states/start-at "A"
+   :states/states
+   {"A" {:states/type :task :states/resource "arn:fn:A" :states/next "B"}
+    "B" {:states/type :task :states/resource "arn:fn:B" :states/next "C"}
+    "C" {:states/type :succeed}}})
+
+(def counter-machine
+  "Choice routing: x==1 -> Y, else Z (default)."
+  {:states/start-at "Route"
+   :states/states
+   {"Route" {:states/type    :choice
+             :states/choices [{:states/variable "$.x"
+                               :states/op       :numeric-equals
+                               :states/value    1
+                               :states/next     "Y"}]
+             :states/default "Z"}
+    "Y" {:states/type :succeed}
+    "Z" {:states/type :succeed}}})
+
+(def parallel-machine
+  {:states/start-at "Fork"
+   :states/states
+   {"Fork" {:states/type    :parallel
+            :states/next    "Done"
+            :states/branches
+            [{:states/start-at "B1"
+              :states/states {"B1" {:states/type :pass :states/result {"branch" 1} :states/next "B1End"}
+                              "B1End" {:states/type :succeed}}}
+             {:states/start-at "B2"
+              :states/states {"B2" {:states/type :pass :states/result {"branch" 2} :states/next "B2End"}
+                              "B2End" {:states/type :succeed}}}]}
+    "Done" {:states/type :succeed}}})
+
+(def fail-machine
+  {:states/start-at "Boom"
+   :states/states
+   {"Boom" {:states/type :fail :states/error "BadInput" :states/cause "x was nil"}}})
+
+(def pass-machine
+  {:states/start-at "P"
+   :states/states
+   {"P" {:states/type :pass :states/result {"merged" true} :states/next "End"}
+    "End" {:states/type :succeed}}})
+
+;; ---------------------------------------------------------------------------
+;; Helper: incrementing task ports
+;; ---------------------------------------------------------------------------
+
+(defn inc-ports
+  "ITask that increments the \"count\" key of input data."
+  []
+  (reify p/ITask
+    (run [_ _state data]
+      (update data "count" (fnil inc 0)))))
+
+;; ---------------------------------------------------------------------------
+;; 1. Linear task chain
+;; ---------------------------------------------------------------------------
+
+(deftest test-linear-task-chain
+  (testing "A->B->C: all tasks, verify output and path"
+    (let [result (e/run linear-machine {"count" 0} (inc-ports))]
+      (is (= :succeeded (:states/status result)))
+      (is (= ["A" "B" "C"] (:states/path result)))
+      (is (= {"count" 2} (:states/output result))))))
+
+;; ---------------------------------------------------------------------------
+;; 2. Choice: input matches first rule
+;; ---------------------------------------------------------------------------
+
+(deftest test-choice-matches-first-rule
+  (testing "x=1 routes to Y"
+    (let [result (e/run counter-machine {"x" 1})]
+      (is (= :succeeded (:states/status result)))
+      (is (= ["Route" "Y"] (:states/path result))))))
+
+;; ---------------------------------------------------------------------------
+;; 3. Choice falls to default
+;; ---------------------------------------------------------------------------
+
+(deftest test-choice-falls-to-default
+  (testing "x=99 falls through to default Z"
+    (let [result (e/run counter-machine {"x" 99})]
+      (is (= :succeeded (:states/status result)))
+      (is (= ["Route" "Z"] (:states/path result))))))
+
+;; ---------------------------------------------------------------------------
+;; 4. Nested :and in choice
+;; ---------------------------------------------------------------------------
+
+(deftest test-nested-and-choice
+  (testing ":and requires ALL sub-rules to match"
+    (let [machine {:states/start-at "C"
+                   :states/states
+                   {"C" {:states/type :choice
+                          :states/choices
+                          [{:states/and
+                            [{:states/variable "$.a" :states/op :numeric-equals :states/value 1}
+                             {:states/variable "$.b" :states/op :numeric-equals :states/value 2}]
+                            :states/next "Yes"}]
+                          :states/default "No"}
+                    "Yes" {:states/type :succeed}
+                    "No"  {:states/type :succeed}}}]
+      (is (= ["C" "Yes"] (:states/path (e/run machine {"a" 1 "b" 2}))))
+      (is (= ["C" "No"]  (:states/path (e/run machine {"a" 1 "b" 9})))))))
+
+;; ---------------------------------------------------------------------------
+;; 5. Nested :or in choice
+;; ---------------------------------------------------------------------------
+
+(deftest test-nested-or-choice
+  (testing ":or matches if ANY sub-rule matches"
+    (let [machine {:states/start-at "C"
+                   :states/states
+                   {"C" {:states/type :choice
+                          :states/choices
+                          [{:states/or
+                            [{:states/variable "$.a" :states/op :numeric-equals :states/value 1}
+                             {:states/variable "$.a" :states/op :numeric-equals :states/value 2}]
+                            :states/next "Yes"}]
+                          :states/default "No"}
+                    "Yes" {:states/type :succeed}
+                    "No"  {:states/type :succeed}}}]
+      (is (= ["C" "Yes"] (:states/path (e/run machine {"a" 1}))))
+      (is (= ["C" "Yes"] (:states/path (e/run machine {"a" 2}))))
+      (is (= ["C" "No"]  (:states/path (e/run machine {"a" 9})))))))
+
+;; ---------------------------------------------------------------------------
+;; 6. Nested :not in choice
+;; ---------------------------------------------------------------------------
+
+(deftest test-nested-not-choice
+  (testing ":not inverts the sub-rule"
+    (let [machine {:states/start-at "C"
+                   :states/states
+                   {"C" {:states/type :choice
+                          :states/choices
+                          [{:states/not {:states/variable "$.a"
+                                         :states/op       :string-equals
+                                         :states/value    "skip"}
+                            :states/next "Yes"}]
+                          :states/default "No"}
+                    "Yes" {:states/type :succeed}
+                    "No"  {:states/type :succeed}}}]
+      (is (= ["C" "Yes"] (:states/path (e/run machine {"a" "go"}))))
+      (is (= ["C" "No"]  (:states/path (e/run machine {"a" "skip"})))))))
+
+;; ---------------------------------------------------------------------------
+;; 7. Parallel collects branch outputs as a vector
+;; ---------------------------------------------------------------------------
+
+(deftest test-parallel-branch-outputs
+  (testing "parallel runs each branch and collects outputs"
+    (let [result (e/run parallel-machine {})]
+      (is (= :succeeded (:states/status result)))
+      (is (= ["Fork" "Done"] (:states/path result)))
+      ;; outputs is a vector of branch results
+      (is (vector? (:states/output result)))
+      (is (= 2 (count (:states/output result)))))))
+
+;; ---------------------------------------------------------------------------
+;; 7b. Parallel: any failing branch fails the whole state (ASL semantics)
+;; ---------------------------------------------------------------------------
+
+(def parallel-machine-with-failing-branch
+  {:states/start-at "Fork"
+   :states/states
+   {"Fork" {:states/type    :parallel
+            :states/next    "Done"
+            :states/branches
+            [{:states/start-at "B1"
+              :states/states {"B1" {:states/type :pass :states/result {"branch" 1} :states/next "B1End"}
+                              "B1End" {:states/type :succeed}}}
+             {:states/start-at "B2"
+              :states/states {"B2" {:states/type :fail :states/error "Boom"}}}]}
+    "Done" {:states/type :succeed}}})
+
+(deftest test-parallel-branch-failure-propagates
+  (testing "a single failing branch must fail the whole Parallel state,
+            not be silently absorbed into the collected output while the
+            machine proceeds to :states/next as if nothing happened"
+    (let [result (e/run parallel-machine-with-failing-branch {})]
+      (is (= :failed (:states/status result)))
+      (is (= ["Fork"] (:states/path result)) "must not proceed to Done"))))
+
+;; ---------------------------------------------------------------------------
+;; 7c. Map: any failing iteration fails the whole state (ASL semantics)
+;; ---------------------------------------------------------------------------
+
+(def map-machine-with-failing-iteration
+  {:states/start-at "M"
+   :states/states
+   {"M" {:states/type :map
+         :states/next "Done"
+         :states/iterator {:states/start-at "I"
+                            :states/states {"I" {:states/type :fail :states/error "IterBoom"}}}}
+    "Done" {:states/type :succeed}}})
+
+(deftest test-map-iteration-failure-propagates
+  (testing "a single failing iteration must fail the whole Map state"
+    (let [result (e/run map-machine-with-failing-iteration [{"x" 1} {"x" 2}])]
+      (is (= :failed (:states/status result)))
+      (is (= ["M"] (:states/path result)) "must not proceed to Done"))))
+
+;; ---------------------------------------------------------------------------
+;; 8. Fail state → :failed status
+;; ---------------------------------------------------------------------------
+
+(deftest test-fail-terminal
+  (testing ":fail state produces :failed status"
+    (let [result (e/run fail-machine {})]
+      (is (= :failed (:states/status result)))
+      (is (= ["Boom"] (:states/path result))))))
+
+;; ---------------------------------------------------------------------------
+;; 9. Pass state merges :states/result into data
+;; ---------------------------------------------------------------------------
+
+(deftest test-pass-result-merge
+  (testing ":pass merges :states/result into the data map"
+    (let [result (e/run pass-machine {"original" 42})]
+      (is (= :succeeded (:states/status result)))
+      (is (= true (get (:states/output result) "merged")))
+      (is (= 42   (get (:states/output result) "original"))))))
+
+;; ---------------------------------------------------------------------------
+;; 10. from-data round-trip (from-data → to-data produces equivalent map)
+;; ---------------------------------------------------------------------------
+
+(deftest test-json-roundtrip
+  (testing "from-data then to-data round-trips cleanly"
+    (let [asl {"Comment" "test"
+               "StartAt" "A"
+               "States"
+               {"A" {"Type" "Task" "Resource" "arn:fn:A" "Next" "B"}
+                "B" {"Type"    "Choice"
+                     "Choices" [{"Variable"      "$.x"
+                                 "NumericEquals"  1
+                                 "Next"          "C"}]
+                     "Default" "D"}
+                "C" {"Type" "Succeed"}
+                "D" {"Type" "Fail"}}}
+          edn (j/from-data asl)
+          back (j/to-data edn)]
+      (is (= "test"    (get back "Comment")))
+      (is (= "A"       (get back "StartAt")))
+      (is (= "Task"    (get-in back ["States" "A" "Type"])))
+      (is (= "Choice"  (get-in back ["States" "B" "Type"])))
+      (is (= "Succeed" (get-in back ["States" "C" "Type"])))
+      (is (= "Fail"    (get-in back ["States" "D" "Type"]))))))
+
+;; ---------------------------------------------------------------------------
+;; 11. validate: missing Next → error
+;; ---------------------------------------------------------------------------
+
+(deftest test-validate-missing-next
+  (testing "task state referencing a non-existent Next state is an error"
+    (let [machine {:states/start-at "A"
+                   :states/states
+                   {"A" {:states/type :task :states/next "GHOST"}
+                    ;; no GHOST state, no terminal reachable → two errors
+                    }}
+          errs (v/errors machine)]
+      (is (seq errs))
+      (is (some #(= :states/invalid-next (:states/code %)) errs)))))
+
+;; ---------------------------------------------------------------------------
+;; 12. validate: unreachable state → warn
+;; ---------------------------------------------------------------------------
+
+(deftest test-validate-unreachable-state
+  (testing "states not reachable from StartAt produce :warn :states/unreachable"
+    (let [machine {:states/start-at "A"
+                   :states/states
+                   {"A" {:states/type :succeed}
+                    "B" {:states/type :succeed}}}  ; B is unreachable
+          probs (v/problems machine)]
+      (is (some #(and (= :warn (:states/severity %))
+                      (= :states/unreachable (:states/code %))
+                      (= "B" (:states/id %)))
+                probs)))))
+
+;; ---------------------------------------------------------------------------
+;; 13. validate: choice without default → warn
+;; ---------------------------------------------------------------------------
+
+(deftest test-validate-choice-no-default
+  (testing "choice with no Default produces :warn :states/choice-no-default"
+    (let [machine {:states/start-at "C"
+                   :states/states
+                   {"C" {:states/type    :choice
+                         :states/choices [{:states/variable "$.x"
+                                           :states/op       :numeric-equals
+                                           :states/value    1
+                                           :states/next     "D"}]}
+                    "D" {:states/type :succeed}}}
+          probs (v/problems machine)]
+      (is (some #(and (= :warn (:states/severity %))
+                      (= :states/choice-no-default (:states/code %)))
+                probs)))))
+
+;; ---------------------------------------------------------------------------
+;; 14. valid? true when only warnings
+;; ---------------------------------------------------------------------------
+
+(deftest test-valid-with-warnings-only
+  (testing "valid? is true even when warnings exist"
+    (let [machine {:states/start-at "A"
+                   :states/states
+                   {"A" {:states/type :succeed}
+                    "B" {:states/type :succeed}}}]  ; B unreachable (warn only)
+      (is (true? (v/valid? machine))))))
