@@ -1,0 +1,100 @@
+(ns filecoin-cas-server
+  "Run the Filecoin tier as a loopback HTTP service.
+
+    kbb --backend sci bin/filecoin-cas-server.cljk
+
+  Environment:
+    FILECOIN_CAS_CHAIN          calibration (default) | mainnet
+    FILECOIN_CAS_ALLOW_MAINNET  must be 1 to run against mainnet (real funds)
+    FILECOIN_CAS_KEY_FILE       0x-hex private key file, mode 0600 (required)
+    FILECOIN_CAS_STATE_DIR      default ~/.filecoin-cas/state-<chain>
+    FILECOIN_CAS_HOST / _PORT   default 127.0.0.1 / 8788
+    FILECOIN_CAS_TOKEN_FILE     optional bearer token file, mode 0600
+                                (required for a non-loopback host)
+    FILECOIN_CAS_MAX_OBJECT     bytes, default 536870912
+
+  --memory-network replaces Filecoin with a local directory (<state-dir>/memnet)
+  that stands in for it, streaming files like the real transport. It is for
+  tests and local wiring only: nothing is durable or provable."
+  (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [promesa.core :as p]
+            [filecoin-cas.cid :as cid]
+            [filecoin-cas.engine :as eng]
+            [filecoin-cas.server :as srv]
+            [filecoin-cas.synapse :as fc]))
+
+(defn- env [k] (aget js/process.env k))
+
+(defn- die [msg] (println "filecoin-cas-server:" msg) (js/process.exit 2))
+
+(defn- read-secret-file
+  "Trimmed contents of a secret file, refusing one that group/others can read."
+  [file what]
+  (when-not (.existsSync fs file) (die (str what " file not found: " file)))
+  (when (pos? (bit-and (.-mode (.statSync fs file)) 2r000111111))
+    (die (str what " file must not be group/other accessible (chmod 600 " file ")")))
+  (.trim (.readFileSync fs file "utf8")))
+
+(defn- memory-transport
+  "Stand-in for Filecoin: pieces are files under <dir>/memnet, copied in and
+  out. No Filecoin, no wallet; streams like the real transport."
+  [dir]
+  (let [pdir (.join path dir "memnet")]
+    (.mkdirSync fs pdir #js {:recursive true})
+    {:upload-file! (fn [file size _meta]
+                     (let [pc (str "mem-" (.randomUUID crypto))]
+                       (.copyFileSync fs file (.join path pdir pc))
+                       (p/resolved {:piece-cid pc :size size :complete? true
+                                    :copies [{:provider-id "mem"}]})))
+     :download-file! (fn [entry dest]
+                       (.copyFileSync fs (.join path pdir (:piece-cid entry)) dest)
+                       (p/resolved nil))}))
+
+(defn- synapse-transport [chain key]
+  (let [synapse (fc/make-synapse {:chain chain :private-key key :source "filecoin-cas"})]
+    {:synapse synapse
+     :upload! (fn [b m] (fc/upload! synapse b m))
+     :upload-file! (fn [file size m] (fc/upload-file! synapse file size m))
+     :download (fn [pc] (fc/download synapse pc))
+     :download-file! (fn [entry dest] (fc/download-to-file! synapse entry dest))}))
+
+(defn -main [args]
+  (let [memory? (some #{"--memory-network"} args)
+        chain (keyword (or (env "FILECOIN_CAS_CHAIN") "calibration"))
+        _ (when-not (#{:calibration :mainnet} chain) (die "FILECOIN_CAS_CHAIN must be calibration or mainnet"))
+        _ (when (and (= :mainnet chain) (not memory?) (not= "1" (env "FILECOIN_CAS_ALLOW_MAINNET")))
+            (die "mainnet uses real funds: set FILECOIN_CAS_ALLOW_MAINNET=1 to proceed"))
+        key-file (env "FILECOIN_CAS_KEY_FILE")
+        _ (when (and (not memory?) (not key-file)) (die "FILECOIN_CAS_KEY_FILE is required"))
+        dir (or (env "FILECOIN_CAS_STATE_DIR")
+                (.join path (.homedir os) ".filecoin-cas" (str "state-" (name chain))))
+        transport (if memory?
+                    (memory-transport dir)
+                    (synapse-transport chain (read-secret-file key-file "key")))
+        token (some-> (env "FILECOIN_CAS_TOKEN_FILE") (read-secret-file "token"))
+        host (or (env "FILECOIN_CAS_HOST") "127.0.0.1")
+        port (js/Number (or (env "FILECOIN_CAS_PORT") "8788"))
+        _ (cid/install-fast-sha256!)
+        cas (eng/open (assoc (select-keys transport [:upload! :upload-file! :download :download-file!])
+                             :dir dir))
+        drainer (srv/start-drainer!
+                  cas {:before-drain (when-let [s (:synapse transport)]
+                                       (fn [sizes] (fc/prepare! s sizes)))})]
+    (-> (srv/start! cas {:host host :port port :token token
+                         :max-object-bytes (js/Number (or (env "FILECOIN_CAS_MAX_OBJECT")
+                                                          srv/default-max-object-bytes))
+                         :on-queued (:wake drainer)})
+        (.then (fn [server]
+                 (println (pr-str {:listening (str "http://" host ":" (.-port (.address server)))
+                                   :chain (if memory? :memory chain)
+                                   :state-dir dir
+                                   :token? (some? token)}))
+                 (let [stop (fn [] ((:stop drainer)) (.close server) (js/process.exit 0))]
+                   (.on js/process "SIGINT" stop)
+                   (.on js/process "SIGTERM" stop))))
+        (.catch (fn [e] (die (or (.-message e) (str e))))))))
+
+(-main (vec (drop 1 (seq js/process.argv))))
