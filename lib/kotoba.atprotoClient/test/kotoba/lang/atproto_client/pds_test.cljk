@@ -1,0 +1,299 @@
+(ns kotoba.lang.atproto-client.pds-test
+  "JVM-only: exercises kotoba.lang.atproto-client.{atproto,pds} against a
+  dependency-free mock PDS (JDK com.sun.net.httpserver.HttpServer). The source
+  is pure .cljc that drives a host-injected IHttp; this test supplies an IHttp
+  backed by babashka.http-client pointed at the in-process mock, so the full
+  XRPC wire shape (URLs, headers, JSON bodies, response parsing, error paths)
+  is covered end-to-end while the library itself still does zero direct I/O."
+  (:require [kotoba.lang.error :as kerror] [kotoba.http.form-urlencoded :as form-urlencoded] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.lang.text :as str]
+            [cheshire.core :as json]
+            [babashka.http-client :as http]
+            [kotoba.lang.atproto-client.atproto :as atproto]
+            [kotoba.lang.atproto-client.pds :as pds]
+            [kotoba.lang.atproto-client.http-jdk :as http-jdk])
+  (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
+           [java.net InetSocketAddress]
+           [java.io ByteArrayOutputStream]))
+
+;; ─── babashka-backed IHttp (the host transport under test) ──────────────
+
+(defn- babashka-http []
+  (reify atproto/IHttp
+    (-request [_ {:keys [method url headers body]}]
+      (let [resp (case method
+                   :get  (http/get  url {:headers headers :throw false})
+                   :post (http/post url {:headers headers :body body :throw false}))]
+        {:status (:status resp) :body (str (or (:body resp) ""))}))))
+
+;; ─── Mock PDS server ────────────────────────────────────────────────────
+
+(def ^:private fake-cid "bafyreialr2vrqpzh4ay4r3jqfd76nlpchdfpyrhqbfgsodwxqndvonbymq")
+
+(defn- slurp-bytes [^java.io.InputStream is]
+  (let [out (ByteArrayOutputStream.)] (.transferTo is out) (.toByteArray out)))
+
+(defn- json-response! [^HttpExchange exchange status data]
+  (let [bytes (kbytes/utf8-bytes (json/generate-string data))]
+    (.sendResponseHeaders exchange status (count bytes))
+    (with-open [os (.getResponseBody exchange)] (.write os bytes))))
+
+(defn- read-body [^HttpExchange exchange]
+  (let [raw (kbytes/utf8-string (slurp-bytes (.getRequestBody exchange)))]
+    (when (seq raw) (try (json/parse-string raw true) (catch Exception _ nil)))))
+
+(defn- query-params [^HttpExchange exchange]
+  (let [q (.getQuery (.getRequestURI exchange))]
+    (if (str/blank? q) {}
+        (into {} (map (fn [pair] (let [[k v] (str/split pair #"=" 2)]
+                                   [k (form-urlencoded/form-decode v)]))
+                      (str/split q #"&"))))))
+
+(defn- auth-bearer [^HttpExchange exchange]
+  (let [h (.getFirst (.getRequestHeaders exchange) "Authorization")]
+    (when h (str/replace h #"(?i)^Bearer\s+" ""))))
+
+(defonce ^:private records (atom {}))
+(defonce ^:private sessions (atom {}))
+(defn- new-tid [] (str "t" (Long/toString (System/nanoTime) 36)))
+(def ^:private default-did "did:web:fake.etzhayyim.test")
+(def ^:private default-handle "fake.etzhayyim.test")
+
+(defn- mock-pds-handler [^HttpExchange exchange]
+  (let [method (.getRequestMethod exchange)
+        path (.getPath (.getRequestURI exchange))
+        key (str method " " path)]
+    (try
+      (case key
+        "GET /xrpc/_health" (json-response! exchange 200 {:ok true})
+        "GET /xrpc/_echo-header"
+        (json-response! exchange 200 {:value (.getFirst (.getRequestHeaders exchange) "X-Test-Header")})
+        "GET /xrpc/com.atproto.server.getSession"
+        (let [s (get @sessions (auth-bearer exchange) {:did default-did :handle default-handle})]
+          (json-response! exchange 200 (merge s {:email "fake@etzhayyim.test" :emailConfirmed true :active true})))
+        "POST /xrpc/com.atproto.server.createSession"
+        (let [body (read-body exchange)]
+          (if (and (:identifier body) (= (:password body) "correct-horse"))
+            (let [jwt (str "fake-access-" (new-tid))]
+              (swap! sessions assoc jwt {:did default-did :handle default-handle})
+              (json-response! exchange 200 {:did default-did :handle default-handle
+                                            :accessJwt jwt :refreshJwt (str "fake-refresh-" (new-tid)) :active true}))
+            (json-response! exchange 401 {:error "AuthenticationRequired" :message "Invalid identifier or password"})))
+        "POST /xrpc/com.atproto.server.createAccount"
+        (let [body (read-body exchange)]
+          (if (and (:handle body) (:email body) (:password body))
+            (let [jwt (str "fake-access-" (new-tid)) did (str "did:web:" (:handle body))]
+              (swap! sessions assoc jwt {:did did :handle (:handle body)})
+              (json-response! exchange 200 {:did did :handle (:handle body)
+                                            :accessJwt jwt :refreshJwt (str "fake-refresh-" (new-tid))}))
+            (json-response! exchange 400 {:error "InvalidRequest" :message "handle/email/password required"})))
+        "POST /xrpc/com.atproto.repo.createRecord"
+        (let [body (read-body exchange)]
+          (if (and (:repo body) (:collection body))
+            (let [rkey (or (:rkey body) (new-tid)) uri (str "at://" (:repo body) "/" (:collection body) "/" rkey)]
+              (swap! records assoc uri {:uri uri :cid fake-cid :value (:record body)})
+              (json-response! exchange 200 {:uri uri :cid fake-cid :commit {:cid fake-cid :rev (new-tid)} :validationStatus "valid"}))
+            (json-response! exchange 400 {:error "InvalidRequest" :message "repo + collection required"})))
+        "GET /xrpc/com.atproto.repo.getRecord"
+        (let [q (query-params exchange) uri (str "at://" (get q "repo") "/" (get q "collection") "/" (get q "rkey"))]
+          (if-let [r (get @records uri)] (json-response! exchange 200 r)
+              (json-response! exchange 400 {:error "InvalidRequest" :message "Record not found"})))
+        "GET /xrpc/com.atproto.repo.listRecords"
+        (let [q (query-params exchange) repo (get q "repo") collection (get q "collection")
+              prefix (str "at://" repo "/" collection "/")
+              matched (->> (vals @records) (filter #(str/starts-with? (:uri %) prefix)))
+              matched (if (= "true" (get q "reverse")) (reverse matched) matched)
+              limit (if-let [l (get q "limit")] (Long/parseLong l) 50)]
+          (json-response! exchange 200 {:records (vec (take limit matched))}))
+        "GET /.well-known/did.json"
+        (json-response! exchange 200 {:id default-did
+                                      :service [{:id "#atproto_pds" :type "AtprotoPersonalDataServer"
+                                                 :serviceEndpoint "https://real-pds.etzhayyim.test"}]})
+        (json-response! exchange 404 {:error "MethodNotFound" :message key}))
+      (catch Exception e (json-response! exchange 400 {:error "BadRequest" :message (str e)})))))
+
+(def ^:dynamic *http* nil)
+(def ^:dynamic *base-url* nil)
+
+(defn- with-mock-pds [f]
+  (reset! records {}) (reset! sessions {})
+  (let [s (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.createContext s "/" (reify HttpHandler (handle [_ ex] (mock-pds-handler ex))))
+    (.start s)
+    (try
+      (binding [*http* (babashka-http)
+                *base-url* (str "http://127.0.0.1:" (.getPort (.getAddress s)))]
+        (f))
+      (finally (.stop s 0)))))
+
+(use-fixtures :each with-mock-pds)
+
+(defn- agent-with-defaults [& {:keys [headers service]}]
+  (atproto/create-agent {:service (or service *base-url*) :http *http* :headers headers}))
+
+;; ─── atproto: create-agent + xrpc ───────────────────────────────────────
+
+(deftest create-agent-test
+  (let [agent (atproto/create-agent {:service "https://pds.aozora.app" :http *http*
+                                     :headers {"atproto-proxy" "did:web:yoro.etzhayyim.com#appview"}})]
+    (is (= "https://pds.aozora.app" (:service agent)))
+    (is (identical? *http* (:http agent)))
+    (is (= "did:web:yoro.etzhayyim.com#appview" (get (:headers agent) "atproto-proxy")))))
+
+(deftest create-agent-requires-http-test
+  (is (thrown-with-msg? kerror/ExceptionInfo #"requires :http"
+                        (atproto/create-agent {:service "https://x"}))))
+
+(deftest xrpc-get-test
+  (is (true? (:ok (atproto/xrpc (agent-with-defaults) :get "_health")))))
+
+(deftest xrpc-post-test
+  (let [res (atproto/xrpc (agent-with-defaults) :post "com.atproto.repo.createRecord"
+                           {:repo "did:web:x.test" :collection "com.example.post"
+                            :record {:$type "com.example.post" :text "hi"}})]
+    (is (= fake-cid (:cid res)))
+    (is (str/starts-with? (:uri res) "at://did:web:x.test/com.example.post/"))))
+
+(deftest xrpc-header-injection-test
+  (testing "agent default headers reach the server"
+    (is (= "agent-default" (:value (atproto/xrpc (agent-with-defaults :headers {"X-Test-Header" "agent-default"}) :get "_echo-header")))))
+  (testing "per-call opts override agent defaults"
+    (is (= "call-override" (:value (atproto/xrpc (agent-with-defaults :headers {"X-Test-Header" "agent-default"})
+                                                  :get "_echo-header" nil {:headers {"X-Test-Header" "call-override"}}))))))
+
+(deftest xrpc-string-method-test
+  (is (true? (:ok (atproto/xrpc (agent-with-defaults) "GET" "_health")))))
+
+(deftest xrpc-throws-on-non-2xx-test
+  (is (thrown-with-msg? kerror/ExceptionInfo #"createRecord failed: 400"
+                        (atproto/xrpc (agent-with-defaults) :post "com.atproto.repo.createRecord" {}))))
+
+;; ─── pds: session ───────────────────────────────────────────────────────
+
+(deftest login-test
+  (let [session (pds/login {:http *http* :service *base-url* :identifier default-handle :password "correct-horse"})]
+    (is (= default-did (:did session)))
+    (is (str/starts-with? (:accessJwt session) "fake-access-"))
+    (is (str/starts-with? (:refreshJwt session) "fake-refresh-"))))
+
+(deftest login-failure-test
+  (is (thrown-with-msg? kerror/ExceptionInfo #"createSession failed: 401"
+                        (pds/login {:http *http* :service *base-url* :identifier "x" :password "wrong"}))))
+
+(deftest create-account-test
+  (let [acct (pds/create-account {:http *http* :service *base-url* :handle "newbie.test" :email "newbie@test.com" :password "hunter2"})]
+    (is (= "did:web:newbie.test" (:did acct)))
+    (is (= "newbie.test" (:handle acct)))
+    (is (str/starts-with? (:accessJwt acct) "fake-access-"))))
+
+(defn- authed-agent []
+  (pds/get-agent {:http *http* :service *base-url* :handle default-handle :password "correct-horse"}))
+
+(deftest get-agent-via-handle-password-test
+  (let [agent (authed-agent)]
+    (is (= default-did (get-in agent [:session :did])))
+    (is (some? (get-in agent [:session :accessJwt])))))
+
+(deftest get-agent-via-session-resume-test
+  (let [{:keys [accessJwt refreshJwt]} (pds/login {:http *http* :service *base-url* :identifier default-handle :password "correct-horse"})
+        agent (pds/get-agent {:http *http* :service *base-url*
+                              :session {:did default-did :handle default-handle :accessJwt accessJwt :refreshJwt refreshJwt}})]
+    (is (= default-did (get-in agent [:session :did])))
+    (is (= accessJwt (get-in agent [:session :accessJwt])))))
+
+;; ─── pds: record CRUD ───────────────────────────────────────────────────
+
+(deftest create-get-list-records-test
+  (let [agent (authed-agent) did "did:web:writer.test"
+        {:keys [uri cid]} (pds/create-record agent did "com.example.post" {:text "hello kotoba"})]
+    (is (= fake-cid cid))
+    (is (str/starts-with? uri (str "at://" did "/com.example.post/")))
+    (testing "get-record reads it back"
+      (let [got (pds/get-record agent did "com.example.post" (last (str/split uri #"/")))]
+        (is (= uri (:uri got)))
+        (is (= "hello kotoba" (get-in got [:value :text])))
+        (is (= "com.example.post" (get-in got [:value :$type])))))
+    (testing "get-record nil for missing rkey"
+      (is (nil? (pds/get-record agent did "com.example.post" "does-not-exist"))))
+    (testing "list-records finds it"
+      (is (= 1 (count (:records (pds/list-records agent did "com.example.post"))))))))
+
+(deftest create-record-with-explicit-rkey-test
+  (let [agent (authed-agent) did "did:web:writer2.test"
+        {:keys [uri]} (pds/create-record agent did "com.example.post" {:text "pinned"} "myrkey")]
+    (is (= (str "at://" did "/com.example.post/myrkey") uri))))
+
+(deftest list-records-limit-and-reverse-test
+  (let [agent (authed-agent) did "did:web:writer3.test"]
+    (dotimes [n 3] (pds/create-record agent did "com.example.post" {:text (str "post-" n)} (str "rkey" n)))
+    (is (= 2 (count (:records (pds/list-records agent did "com.example.post" {:limit 2 :reverse true})))))))
+
+;; ─── pds: health ────────────────────────────────────────────────────────
+
+(deftest health-true-test (is (true? (pds/health *http* *base-url*))))
+(deftest health-false-on-unreachable-test (is (false? (pds/health *http* "http://127.0.0.1:1"))))
+
+;; ─── src/kotoba/lang/atproto_client/http_jdk.cljk (the reference `IHttp`
+;;     backed by the JDK's built-in java.net.http, zero extra deps) ───────
+;;
+;; Every other test in this file uses the babashka.http-client-backed
+;; `*http*` fixture; these prove the SECOND, src/-shipped reference
+;; adapter drives the same pure core end-to-end against the same real mock
+;; server -- both XRPC calls (via atproto/xrpc) and the separate
+;; did:web/did.json fetch (via pds/resolve-pds's private fetch-json).
+
+(deftest jdk-http-xrpc-get-test
+  (let [http (http-jdk/jdk-http)
+        agent (atproto/create-agent {:service *base-url* :http http})]
+    (is (true? (:ok (atproto/xrpc agent :get "_health"))))))
+
+(deftest jdk-http-xrpc-post-and-login-test
+  (let [http (http-jdk/jdk-http)]
+    (testing "POST + JSON body round-trip via the jdk-http adapter"
+      (let [res (atproto/xrpc (atproto/create-agent {:service *base-url* :http http})
+                              :post "com.atproto.repo.createRecord"
+                              {:repo "did:web:jdk.test" :collection "com.example.post"
+                               :record {:$type "com.example.post" :text "via jdk-http"}})]
+        (is (= fake-cid (:cid res)))
+        (is (str/starts-with? (:uri res) "at://did:web:jdk.test/com.example.post/"))))
+    (testing "the higher-level pds/login helper also works through jdk-http"
+      (let [session (pds/login {:http http :service *base-url*
+                                :identifier default-handle :password "correct-horse"})]
+        (is (= default-did (:did session)))
+        (is (str/starts-with? (:accessJwt session) "fake-access-"))))))
+
+;; ─── pds: resolve-pds (did:web) ─────────────────────────────────────────
+;; resolve-pds hardcodes https://; the mock serves plain HTTP, so we exercise
+;; resolve-pds's real orchestration by stubbing pds/fetch-json (private) via
+;; alter-var-root on its Var. Stubs take [http url] (the refactored signature).
+
+(defn- with-stubbed-fetch-json [make-stub thunk]
+  (let [v #'pds/fetch-json orig @v]
+    (alter-var-root v (constantly (make-stub orig)))
+    (try (thunk) (finally (alter-var-root v (constantly orig))))))
+
+(deftest resolve-pds-success-test
+  (with-stubbed-fetch-json
+    (fn [orig] (fn [http url] (let [path (str/replace url #"^https://[^/]+" "")] (orig http (str *base-url* path)))))
+    #(is (= "https://real-pds.etzhayyim.test" (pds/resolve-pds *http* default-did)))))
+
+(deftest resolve-pds-no-service-entry-test
+  (with-stubbed-fetch-json
+    (fn [_orig] (fn [_http _url] {:ok true :status 200 :body {:id default-did :service []}}))
+    #(is (thrown-with-msg? kerror/ExceptionInfo #"no AtprotoPersonalDataServer service entry"
+                           (pds/resolve-pds *http* default-did)))))
+
+(deftest resolve-pds-unreachable-test
+  (with-stubbed-fetch-json
+    (fn [_orig] (fn [_http _url] {:ok false :status 404 :body nil}))
+    #(is (thrown-with-msg? kerror/ExceptionInfo #"did\.json not reachable" (pds/resolve-pds *http* default-did)))))
+
+(deftest resolve-pds-unsupported-method-test
+  (is (thrown-with-msg? kerror/ExceptionInfo #"did method not yet supported" (pds/resolve-pds *http* "did:plc:abc123"))))
+
+(deftest jdk-http-resolve-pds-test
+  (testing "resolve-pds's did.json fetch also works via the jdk-http reference adapter"
+    (with-stubbed-fetch-json
+      (fn [orig] (fn [http url] (let [path (str/replace url #"^https://[^/]+" "")]
+                                  (orig http (str *base-url* path)))))
+      #(is (= "https://real-pds.etzhayyim.test" (pds/resolve-pds (http-jdk/jdk-http) default-did))))))
