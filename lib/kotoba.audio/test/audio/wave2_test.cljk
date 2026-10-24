@@ -1,0 +1,191 @@
+(ns audio.wave2-test
+  "Tests for Wave 2 (ADR-2607121400): `audio.synth`, `audio.filter`,
+  `audio.effects`, `audio.mixer`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [audio.synth :as synth]
+            [audio.filter :as filt]
+            [audio.effects :as fx]
+            [audio.mixer :as mixer]))
+
+;; ---------------------------------------------------------------------
+;; synth
+;; ---------------------------------------------------------------------
+
+(defn- zero-crossings [buffer]
+  (count (filter (fn [[a b]] (and (some? a) (not= (pos? a) (pos? b))))
+                  (partition 2 1 buffer))))
+
+(deftest test-sine-wave-frequency
+  (testing "a 100Hz sine at 48kHz over 1 second has ~200 zero crossings (2 per cycle)"
+    (let [sr 48000
+          freq 100.0
+          buf (synth/sine-wave freq sr sr)]
+      (is (= sr (count buf)))
+      ;; exact zero crossings of a sampled sine can be off by a few due
+      ;; to sampling phase at the boundary; allow +/-2.
+      (is (<= (Math/abs (- (zero-crossings buf) (* 2 freq))) 2)))))
+
+(deftest test-sine-wave-matches-math-sin
+  (testing "sample i equals sin(2*pi*freq*i/sr) exactly"
+    (let [sr 48000, freq 440.0, n 10
+          buf (synth/sine-wave freq sr n)]
+      (doseq [i (range n)]
+        (is (< (Math/abs (- (nth buf i) (Math/sin (/ (* 2.0 Math/PI freq i) sr))))
+               1e-12))))))
+
+(deftest test-square-wave-values
+  (testing "square wave is +1.0 for first half period, -1.0 for second"
+    (let [sr 8, freq 1.0 ;; period = 8 samples
+          buf (synth/square-wave freq sr 8)]
+      (is (= [1.0 1.0 1.0 1.0 -1.0 -1.0 -1.0 -1.0] buf)))))
+
+(deftest test-saw-wave-range
+  (testing "saw wave rises monotonically within a period then wraps"
+    (let [sr 8, freq 1.0
+          buf (synth/saw-wave freq sr 8)]
+      (is (apply < buf)) ;; strictly increasing over exactly one period
+      (is (every? #(and (>= % -1.0) (< % 1.0)) buf)))))
+
+(deftest test-triangle-wave-symmetry
+  (testing "triangle wave peaks at 1.0 mid-period and returns to -1.0"
+    (let [sr 4, freq 1.0
+          buf (synth/triangle-wave freq sr 4)]
+      (is (= -1.0 (first buf)))
+      (is (< (Math/abs (- (nth buf 2) 1.0)) 1e-9)))))
+
+(deftest test-adsr-shape
+  (testing "ADSR hits expected gain at each stage boundary"
+    (let [sr 1000
+          env (synth/adsr {:attack 0.01 :decay 0.01 :sustain 0.5
+                            :release 0.01 :gate-off 50 :sample-rate sr}
+                           80)]
+      (is (= 80 (count env)))
+      (is (< (Math/abs (- (nth env 0) 0.0)) 1e-9) "starts at 0")
+      (is (< (Math/abs (- (nth env 9) 0.9)) 1e-6) "90% through attack (10 samples) -> ~0.9")
+      (is (< (Math/abs (- (nth env 20) 0.5)) 1e-6) "past decay -> sustain level 0.5")
+      (is (< (Math/abs (- (nth env 49) 0.5)) 1e-6) "still sustained just before gate-off")
+      (is (< (nth env 60) 0.5) "releasing after gate-off")
+      (is (< (Math/abs (- (nth env 79) 0.0)) 1e-6) "fully released by end")))
+  (testing "apply-envelope elementwise-multiplies"
+    (is (= [2.0 0.0 -3.0] (synth/apply-envelope [1.0 2.0 3.0] [2.0 0.0 -1.0])))))
+
+;; ---------------------------------------------------------------------
+;; filter
+;; ---------------------------------------------------------------------
+
+(defn- rms [buffer]
+  (Math/sqrt (/ (reduce + (map #(* % %) buffer)) (count buffer))))
+
+(deftest test-low-pass-attenuates-high-freq
+  (testing "a 5kHz tone through a 200Hz low-pass loses most of its energy"
+    (let [sr 48000
+          buf (synth/sine-wave 5000.0 sr 4800)
+          filtered (filt/low-pass buf 200.0 sr)]
+      (is (< (rms filtered) (* 0.2 (rms buf)))))))
+
+(deftest test-low-pass-passes-low-freq
+  (testing "a 20Hz tone through a 2kHz low-pass keeps most of its energy"
+    (let [sr 48000
+          buf (synth/sine-wave 20.0 sr 4800)
+          filtered (filt/low-pass buf 2000.0 sr)]
+      (is (> (rms filtered) (* 0.8 (rms buf)))))))
+
+(deftest test-high-pass-attenuates-low-freq
+  (testing "a 20Hz tone through a 2kHz high-pass loses most of its energy"
+    (let [sr 48000
+          buf (synth/sine-wave 20.0 sr 4800)
+          filtered (filt/high-pass buf 2000.0 sr)]
+      (is (< (rms filtered) (* 0.2 (rms buf)))))))
+
+;; ---------------------------------------------------------------------
+;; effects
+;; ---------------------------------------------------------------------
+
+(deftest test-delay-line-impulse-timing
+  (testing "an impulse reappears exactly `delay-samples` later, wet-only, no feedback"
+    (let [n 20, delay 7
+          impulse (vec (concat [1.0] (repeat (dec n) 0.0)))
+          out (fx/delay-line impulse {:delay-samples delay :feedback 0.0 :wet-dry 1.0})]
+      (is (= 1.0 (nth out delay)))
+      (is (every? zero? (concat (subvec out 0 delay) (subvec out (inc delay) n)))))))
+
+(deftest test-delay-line-wet-dry-mix
+  (testing "wet-dry 0.0 returns the dry signal unchanged (no delay contribution)"
+    (let [buf [0.5 0.5 0.5 0.5]
+          out (fx/delay-line buf {:delay-samples 2 :feedback 0.0 :wet-dry 0.0})]
+      (is (= buf out)))))
+
+(deftest test-compressor-reduces-loud-signal
+  (testing "a constant loud signal above threshold is reduced toward the ratio-implied level"
+    (let [sr 48000
+          ;; 0dBFS constant signal, well above -20dB threshold
+          buf (vec (repeat 4800 1.0))
+          out (fx/compressor buf {:threshold-db -20.0 :ratio 4.0
+                                   :attack 0.001 :release 0.05 :sample-rate sr})
+          ;; after the envelope settles (last 100 samples), gain reduction
+          ;; should be close to (0 - -20) * (1 - 1/4) = 15dB -> ~0.1778 linear
+          settled (subvec out (- (count out) 100))
+          avg (/ (reduce + settled) (count settled))]
+      (is (< (Math/abs (- avg 0.1778)) 0.01)))))
+
+(deftest test-compressor-passes-quiet-signal
+  (testing "a signal below threshold is passed through unreduced"
+    (let [sr 48000
+          buf (vec (repeat 4800 0.01)) ;; well below -20dB threshold
+          out (fx/compressor buf {:threshold-db -20.0 :ratio 4.0
+                                   :attack 0.001 :release 0.05 :sample-rate sr})
+          settled (subvec out (- (count out) 100))]
+      (doseq [s settled]
+        (is (< (Math/abs (- s 0.01)) 1e-6))))))
+
+;; ---------------------------------------------------------------------
+;; mixer
+;; ---------------------------------------------------------------------
+
+(deftest test-find-cycle-detects-cycle
+  (testing "a -> b -> a is a cycle"
+    (let [buses {:a {:inputs #{:b}} :b {:inputs #{:a}}}]
+      (is (some? (mixer/find-cycle buses)))))
+  (testing "a -> b (acyclic, b has no bus inputs) is not a cycle"
+    (let [buses {:a {:inputs #{:b}} :b {:inputs #{}}}]
+      (is (nil? (mixer/find-cycle buses))))))
+
+(deftest test-render-bus-graph-sums-tracks
+  (testing "two tracks summed through a bus at unity gain/center pan == equal-power sum"
+    (let [tracks {:t1 {:buffer [1.0 1.0] :gain 1.0 :pan 0.0}
+                  :t2 {:buffer [1.0 1.0] :gain 1.0 :pan 0.0}}
+          buses {:master {:inputs #{:t1 :t2} :gain 1.0}}
+          out (mixer/render-bus-graph {:tracks tracks :buses buses :master :master})
+          [l r] (first out)
+          expected (* 2.0 (Math/cos (/ Math/PI 4.0)))]
+      (is (< (Math/abs (- l expected)) 1e-9))
+      (is (< (Math/abs (- r expected)) 1e-9)))))
+
+(deftest test-render-bus-graph-applies-bus-gain
+  (testing "bus gain scales the summed output"
+    (let [tracks {:t1 {:buffer [1.0] :gain 1.0 :pan 0.0}}
+          buses {:master {:inputs #{:t1} :gain 0.5}}
+          out (mixer/render-bus-graph {:tracks tracks :buses buses :master :master})
+          [l r] (first out)
+          unity (Math/cos (/ Math/PI 4.0))]
+      (is (< (Math/abs (- l (* 0.5 unity))) 1e-9))
+      (is (< (Math/abs (- r (* 0.5 unity))) 1e-9)))))
+
+(deftest test-render-bus-graph-nested-bus
+  (testing "a bus can receive from another bus (nested bus-to-bus routing)"
+    (let [tracks {:t1 {:buffer [1.0] :gain 1.0 :pan 0.0}}
+          buses {:sub {:inputs #{:t1} :gain 2.0}
+                 :master {:inputs #{:sub} :gain 0.5}}
+          [[l r]] (mixer/render-bus-graph {:tracks tracks :buses buses :master :master})
+          unity (Math/cos (/ Math/PI 4.0))
+          expected (* unity 2.0 0.5)]
+      (is (< (Math/abs (- l expected)) 1e-9))
+      (is (< (Math/abs (- r expected)) 1e-9)))))
+
+(deftest test-render-bus-graph-hard-pan
+  (testing "pan -1.0 is hard left (right channel ~0), pan 1.0 is hard right (left channel ~0)"
+    (let [tracks {:t1 {:buffer [1.0] :gain 1.0 :pan -1.0}}
+          buses {:master {:inputs #{:t1} :gain 1.0}}
+          [[l r]] (mixer/render-bus-graph {:tracks tracks :buses buses :master :master})]
+      (is (< (Math/abs (- l 1.0)) 1e-9))
+      (is (< (Math/abs r) 1e-9)))))
