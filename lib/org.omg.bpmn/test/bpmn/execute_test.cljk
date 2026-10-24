@@ -1,0 +1,140 @@
+(ns bpmn.execute-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [bpmn.model :as m]
+            [bpmn.ports :as p]
+            [bpmn.execute :as e]))
+
+;; --- exclusive gateway: condition routes the single token ---
+
+(defn approval-model []
+  (-> (m/process "Order")
+      (m/add :start-event "S")
+      (m/add :exclusive-gateway "G" {:default "Freject"})
+      (m/add :end-event "Eok") (m/add :end-event "Eno")
+      (m/connect "S" "G")
+      (m/connect "G" "Eok" {:id "Fapprove" :condition "${approved}"})
+      (m/connect "G" "Eno" {:id "Freject"})))
+
+(deftest exclusive-routes-on-condition
+  (let [model (approval-model)]
+    (testing "approved → the conditioned branch"
+      (let [end (e/run (e/default-ports) model (e/start model {:approved true}))]
+        (is (e/completed? end))
+        (is (some #(= "Eok" (:bpmn/at %))
+                  (filter #(= :end (:bpmn/event %)) (:bpmn/trace end))))))
+    (testing "not approved → the default branch"
+      (let [end (e/run (e/default-ports) model (e/start model {:approved false}))]
+        (is (some #(= "Eno" (:bpmn/at %))
+                  (filter #(= :end (:bpmn/event %)) (:bpmn/trace end))))))))
+
+;; --- parallel gateway: AND-split then AND-join, with a side-effecting activity ---
+
+(defrecord RecordingActivity [seen]
+  p/IActivity
+  (perform [_ node vars]
+    (swap! seen conj (:bpmn/id node))
+    (cond-> vars (= :service-task (:bpmn/type node))
+            (update :visited (fnil conj #{}) (:bpmn/id node)))))
+
+(defn fork-join-model []
+  (-> (m/process "Fan")
+      (m/add :start-event "S")
+      (m/add :parallel-gateway "Split")
+      (m/add :service-task "A") (m/add :service-task "B")
+      (m/add :parallel-gateway "Join")
+      (m/add :end-event "E")
+      (m/connect "S" "Split")
+      (m/connect "Split" "A") (m/connect "Split" "B")
+      (m/connect "A" "Join") (m/connect "B" "Join")
+      (m/connect "Join" "E")))
+
+(deftest parallel-forks-and-joins-once
+  (let [model (fork-join-model)
+        seen  (atom [])
+        ports {:activity (->RecordingActivity seen)
+               :condition (reify p/ICondition (truthy? [_ _ _] true))}
+        end   (e/run ports model)]
+    (testing "both branches ran"
+      (is (e/completed? end))
+      (is (= #{"A" "B"} (:visited (:bpmn/vars end)))))
+    (testing "the join fires exactly once (one end event)"
+      (is (= 1 (count (filter #(= :end (:bpmn/event %)) (:bpmn/trace end))))))
+    (testing "the join waited before firing"
+      (is (some #(= :parallel-wait (:bpmn/event %)) (:bpmn/trace end)))
+      (is (some #(= :parallel-fire (:bpmn/event %)) (:bpmn/trace end))))))
+
+;; --- inclusive gateway: OR-split on truthy conditions ---
+
+(defn inclusive-model []
+  (-> (m/process "Ship")
+      (m/add :start-event "S")
+      (m/add :inclusive-gateway "G")
+      (m/add :end-event "Ea") (m/add :end-event "Eb")
+      (m/connect "S" "G")
+      (m/connect "G" "Ea" {:id "Fa" :condition "${a}"})
+      (m/connect "G" "Eb" {:id "Fb" :condition "${b}"})))
+
+(deftest inclusive-routes-on-each-truthy-condition
+  (testing "only the truthy branch fires"
+    (let [end (e/run (e/default-ports) (inclusive-model) (e/start (inclusive-model) {:a true}))]
+      (is (= ["Ea"] (mapv :bpmn/at (filter #(= :end (:bpmn/event %)) (:bpmn/trace end)))))))
+  (testing "both branches fire when both conditions are truthy"
+    (let [end (e/run (e/default-ports) (inclusive-model) (e/start (inclusive-model) {:a true :b true}))]
+      (is (= #{"Ea" "Eb"} (set (mapv :bpmn/at (filter #(= :end (:bpmn/event %)) (:bpmn/trace end)))))))))
+
+(deftest inclusive-gateway-never-annihilates-the-token
+  ;; With no condition truthy and no :bpmn/default, the gateway must not
+  ;; silently drop the token -- it must still complete via SOME end event,
+  ;; the same never-lose-a-token guarantee exclusive-gateway provides.
+  (let [model (inclusive-model)
+        end   (e/run (e/default-ports) model (e/start model {}))]
+    (is (e/completed? end))
+    (is (seq (filter #(= :end (:bpmn/event %)) (:bpmn/trace end))))))
+
+;; --- event-based gateway: exactly one competing branch proceeds, never a fan-out ---
+
+(deftest event-based-gateway-takes-exactly-one-branch
+  (let [model (-> (m/process "Race")
+                  (m/add :start-event "S")
+                  (m/add :event-based-gateway "EBG")
+                  (m/add :intermediate-catch-event "MSG")
+                  (m/add :intermediate-catch-event "TMR")
+                  (m/add :end-event "EndA") (m/add :end-event "EndB")
+                  (m/connect "S" "EBG")
+                  (m/connect "EBG" "MSG" {:id "F2"})
+                  (m/connect "EBG" "TMR" {:id "F3"})
+                  (m/connect "MSG" "EndA" {:id "F4"})
+                  (m/connect "TMR" "EndB" {:id "F5"}))
+        end (e/run (e/default-ports) model)]
+    (is (e/completed? end))
+    (is (= 1 (count (filter #(= :end (:bpmn/event %)) (:bpmn/trace end)))))))
+
+;; --- complex gateway: same truthy-condition/default/never-drop semantics as inclusive ---
+
+(defn complex-model []
+  (-> (m/process "Cx")
+      (m/add :start-event "S")
+      (m/add :complex-gateway "CG")
+      (m/add :end-event "Ea") (m/add :end-event "Eb")
+      (m/connect "S" "CG")
+      (m/connect "CG" "Ea" {:id "Fa" :condition "${a}"})
+      (m/connect "CG" "Eb" {:id "Fb" :condition "${b}"})))
+
+(deftest complex-gateway-routes-on-truthy-condition
+  (let [end (e/run (e/default-ports) (complex-model) (e/start (complex-model) {:a true}))]
+    (is (= ["Ea"] (mapv :bpmn/at (filter #(= :end (:bpmn/event %)) (:bpmn/trace end)))))))
+
+(deftest complex-gateway-never-annihilates-the-token
+  (let [model (complex-model)
+        end   (e/run (e/default-ports) model (e/start model {}))]
+    (is (e/completed? end))
+    (is (seq (filter #(= :end (:bpmn/event %)) (:bpmn/trace end))))))
+
+;; --- runaway guard ---
+
+(deftest step-limit-guards-loops
+  (let [model (-> (m/process "Loop")
+                  (m/add :start-event "S") (m/add :task "T")
+                  (m/connect "S" "T") (m/connect "T" "T"))   ; self-loop, never ends
+        end (e/run (e/default-ports) model (e/start model) 50)]
+    (is (= :step-limit (:bpmn/error end)))))
