@@ -1,0 +1,121 @@
+(ns kotobase.lake.rdf
+  "N-Triples and N-Quads as lake rows.
+
+  Every other format in the lake is decoded into the datom shape. This one
+  **already is** it: RDF statements are subject-predicate-object, which is
+  `{:s :p :o}`. So there is no column model, no schema inference and no type
+  unification here — the reader is a term-to-value mapping and little else,
+  which makes it the cheapest decoder in the system.
+
+  That closeness is also what makes the three places it does NOT line up worth
+  writing down, because each is silent when got wrong.
+
+  ## 1. A named graph has nowhere to go, so it is refused
+
+  N-**Quads** carries a fourth component. `datom.source` scans `[s p o]` and a
+  lake row is `{:s :p :o}` — a **triple**, despite the name `quads` used
+  throughout this repo for a collection of them. There is no slot.
+
+  Dropping the graph would silently merge statements that RDF holds apart:
+  `<a> <b> <c>` in graph G1 and in G2 are different statements, and flattening
+  them makes one. So a statement with a graph is **refused by name** and the
+  document fails, rather than being quietly reduced.
+
+  This reader therefore accepts the **N-Triples subset** of N-Quads. That is a
+  real limit and it belongs to the datom shape rather than to RDF.
+
+  ## 2. Blank node labels are document-scoped, so they are prefixed
+
+  `_:b0` in one file and `_:b0` in another are **different nodes**. The labels
+  are local to their document, exactly like row numbers. Materialising them
+  verbatim into a shared plane merges unrelated nodes — and it merges them
+  into something that still answers queries, which is the worst kind of wrong.
+
+  So a blank node becomes `<object-id>#_:<label>`, the same shape
+  `kotobase.lake.table` uses for row subjects and for the same reason.
+
+  ## 3. An IRI object and a string literal collapse together
+
+  `<urn:x>` as an object and `\"urn:x\"` as a literal are different RDF terms.
+  Flattened into `:o` they are the same value, and nothing downstream can tell
+  them apart.
+
+  This is **not** fixed here. Fixing it would mean either wrapping objects in
+  a term record — which would stop them joining against every other value in
+  the plane, defeating the point of materialising into it — or encoding the
+  type into the string, which invents a syntax the rest of the lake does not
+  read. Stated instead: a caller that needs the distinction should not flatten
+  RDF into the datom plane, and one that is querying values does not."
+  (:require [kotoba.bytes :as kbytes] [nquads.core :as nq]))
+
+
+(defn- coerce
+  "A literal's lexical form as a native value, where its datatype names one.
+
+  Only the datatypes whose lexical space maps onto a value this plane already
+  compares: integers and booleans. `xsd:double` is deliberately absent —
+  parsing it would introduce a second numeric tower into a plane whose
+  ordering `columnar.stats` does with `compare`, and a mixed column of longs
+  and doubles compares in ways a caller does not expect.
+
+  An unparseable lexical form keeps its string rather than throwing: RDF
+  permits `\"abc\"^^xsd:integer` (it is simply an ill-typed literal), and a
+  document is not corrupt for containing one."
+  [value datatype]
+  (case datatype
+    "http://www.w3.org/2001/XMLSchema#integer"
+    (or (try #?(:clj (Long/parseLong value)
+                :cljs (let [n (js/parseInt value 10)]
+                        (when (and (not (js/isNaN n)) (re-matches #"[+-]?\d+" value)) n)))
+             (catch #?(:clj Exception :cljs :default) _ nil))
+        value)
+    "http://www.w3.org/2001/XMLSchema#boolean"
+    (case value "true" true "false" false value)
+    value))
+
+(defn term->value
+  "One RDF term as a datom component.
+
+  `object-id` scopes blank node labels; see the namespace docstring."
+  [object-id {:keys [type value datatype]}]
+  (case type
+    :iri value
+    :blank (str object-id "#_:" value)
+    :literal (coerce value datatype)
+    value))
+
+(defn statements->quads
+  "Parsed N-Triples statements as lake rows."
+  [object-id statements]
+  (mapv (fn [{:keys [subject predicate object graph] :as st}]
+          (when graph
+            (throw (ex-info (str "a named graph has no slot in a lake row: "
+                                 "datom.source scans [s p o] and dropping the "
+                                 "graph would merge statements RDF holds apart")
+                            {:type :kotobase.lake/named-graph-unrepresentable
+                             :graph (:value graph)
+                             :statement (select-keys st [:subject :predicate :object])})))
+          {:s (term->value object-id subject)
+           :p (term->value object-id predicate)
+           :o (term->value object-id object)})
+        statements))
+
+(defn decoder
+  "A `kotobase.lake.reader` materializing decoder for N-Triples.
+
+  Register under `application/n-triples` and `application/n-quads` — the
+  second because that is what a producer of the triples subset commonly
+  declares, and refusing it on the name rather than on a graph actually being
+  present would reject documents this reader handles fine."
+  []
+  (fn [bytes {:keys [object-id]}]
+    (statements->quads object-id
+                       (nq/parse (if (string? bytes)
+                                   bytes
+                                   #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte bytes)))
+                                      :cljs (.decode (js/TextDecoder. "utf-8")
+                                                     (js/Uint8Array. (clj->js (vec bytes))))))))))
+
+(def media-types
+  "What to register `decoder` under."
+  ["application/n-triples" "application/n-quads"])
