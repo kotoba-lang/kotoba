@@ -1,0 +1,138 @@
+(ns diameter.message-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [diameter.bytes :as b]
+            [diameter.types :as t]
+            [diameter.avp :as avp]
+            [diameter.message :as msg]))
+
+(def ^:private a-message
+  {:diameter.message/command-code 257    ; RFC 6733 §5.3.1, CER
+   :diameter.message/application-id 0    ; base protocol
+   :diameter.message/request? true
+   :diameter.message/hop-by-hop 0x11223344
+   :diameter.message/end-to-end 0x55667788
+   :diameter.message/avps
+   [{:diameter.avp/code 264 :diameter.avp/m? true
+     :diameter.avp/data (t/encode-utf8 "example.com")}]}) ; Origin-Host, RFC 6733 §6.3
+
+(deftest message-round-trip
+  (let [encoded (msg/encode-message a-message)
+        [status decoded next-pos] (msg/decode-message encoded)]
+    (is (= :ok status))
+    (is (= (count encoded) next-pos))
+    (is (true? (:diameter.message/request? decoded)))
+    (is (= 257 (:diameter.message/command-code decoded)))
+    (is (= 0 (:diameter.message/application-id decoded)))
+    (is (= 0x11223344 (:diameter.message/hop-by-hop decoded)))
+    (is (= 0x55667788 (:diameter.message/end-to-end decoded)))
+    (is (= 1 (count (:diameter.message/avps decoded))))
+    (is (= 264 (:diameter.avp/code (first (:diameter.message/avps decoded)))))))
+
+;; Version octet (RFC 6733 §3): 20-octet fixed header, and the Message
+;; Length field is checked byte-for-byte against the header layout in the
+;; RFC's own ASCII-art diagram, not just round-tripped through this
+;; codec's own encoder.
+(deftest header-layout-matches-rfc-diagram
+  (let [encoded (msg/encode-message a-message)]
+    (is (= 1 (first encoded)))                                    ; Version = 1
+    (let [avp-bytes (avp/encode-avps (:diameter.message/avps a-message))
+          expected-length (+ 20 (count avp-bytes))]
+      (is (= expected-length (b/bytes->uint24 (subvec (vec encoded) 1 4)))))
+    ;; Command Flags byte: R bit set, P/E/T clear, reserved nibble 0.
+    (is (= 2r10000000 (nth encoded 4)))
+    (is (= 257 (b/bytes->uint24 (subvec (vec encoded) 5 8))))      ; Command Code
+    (is (= 0 (b/bytes->uint32 (subvec (vec encoded) 8 12))))       ; Application-ID
+    (is (= 0x11223344 (b/bytes->uint32 (subvec (vec encoded) 12 16))))
+    (is (= 0x55667788 (b/bytes->uint32 (subvec (vec encoded) 16 20))))))
+
+(deftest command-flags-round-trip-all-combinations
+  (doseq [request? [false true] proxiable? [false true]
+          error? [false true] retransmitted? [false true]]
+    (let [m (assoc a-message
+                   :diameter.message/request? request?
+                   :diameter.message/proxiable? proxiable?
+                   :diameter.message/error? error?
+                   :diameter.message/retransmitted? retransmitted?)
+          [status decoded] (msg/decode-message (msg/encode-message m))]
+      (is (= :ok status))
+      (is (= request? (:diameter.message/request? decoded)))
+      (is (= proxiable? (:diameter.message/proxiable? decoded)))
+      (is (= error? (:diameter.message/error? decoded)))
+      (is (= retransmitted? (:diameter.message/retransmitted? decoded))))))
+
+;; RFC 6733 §3: reserved Command Flags bits "MUST be set to zero and
+;; ignored by the receiver" — a receiver decodes past them rather than
+;; rejecting the message, but the value is still surfaced.
+(deftest reserved-command-flags-do-not-fail-decode-but-are-surfaced
+  (let [encoded (vec (msg/encode-message a-message))
+        with-reserved-set (assoc encoded 4 (bit-or (nth encoded 4) 2r00001111))
+        [status decoded] (msg/decode-message with-reserved-set)]
+    (is (= :ok status))
+    (is (= 2r1111 (:diameter.message/reserved-flags decoded)))
+    (is (true? (:diameter.message/request? decoded)))))
+
+;; Stream framing (RFC 6733 §2.1 runs over SCTP/TCP, not a single UDP
+;; datagram) — decode-message must return where the message ended so a
+;; caller can find the next one, and must not choke on trailing bytes
+;; that are the start of a second message rather than padding.
+(deftest decode-returns-consumed-length-for-stream-framing
+  (let [m1 (msg/encode-message a-message)
+        m2 (msg/encode-message (assoc a-message :diameter.message/hop-by-hop 0xaabbccdd))
+        stream (into (vec m1) m2)
+        [status1 decoded1 next-pos] (msg/decode-message stream)]
+    (is (= :ok status1))
+    (is (= 0x11223344 (:diameter.message/hop-by-hop decoded1)))
+    (is (= (count m1) next-pos))
+    (let [[status2 decoded2 next-pos2] (msg/decode-message (subvec stream next-pos))]
+      (is (= :ok status2))
+      (is (= 0xaabbccdd (:diameter.message/hop-by-hop decoded2)))
+      (is (= (count m2) next-pos2)))))
+
+;; ── negative tests, specific reason keywords ─────────────────────────
+
+(deftest decode-rejects-truncated-header
+  (let [[status reason] (msg/decode-message (vec (repeat 10 0)))] ; < 20 octets
+    (is (= :error status))
+    (is (= :diameter/truncated-header reason))))
+
+(deftest decode-rejects-unsupported-version
+  (let [encoded (vec (msg/encode-message a-message))
+        wrong-version (assoc encoded 0 2)
+        [status reason] (msg/decode-message wrong-version)]
+    (is (= :error status))
+    (is (= :diameter/unsupported-version reason))))
+
+(deftest decode-rejects-length-not-aligned
+  ;; Message Length must be a multiple of 4 (RFC 6733 §3). 21 is not.
+  (let [encoded (vec (msg/encode-message a-message))
+        corrupted (into (subvec encoded 0 1) (into (b/uint24->bytes 21) (subvec encoded 4)))]
+    (let [[status reason] (msg/decode-message corrupted)]
+      (is (= :error status))
+      (is (= :diameter/message-length-not-aligned reason)))))
+
+(deftest decode-rejects-truncated-message
+  (let [encoded (vec (msg/encode-message a-message))
+        truncated (subvec encoded 0 (- (count encoded) 4))] ; Length still claims the full size
+    (let [[status reason] (msg/decode-message truncated)]
+      (is (= :error status))
+      (is (= :diameter/truncated-message reason)))))
+
+(deftest decode-rejects-length-too-short
+  (let [encoded (vec (msg/encode-message a-message))
+        corrupted (into (subvec encoded 0 1) (into (b/uint24->bytes 16) (subvec encoded 4)))]
+    (let [[status reason] (msg/decode-message corrupted)]
+      (is (= :error status))
+      (is (= :diameter/message-length-too-short reason)))))
+
+;; A malformed AVP inside the message must bubble up as the AVP's own
+;; specific reason, not get papered over as a generic message-level error.
+(deftest decode-bubbles-up-avp-error
+  (let [bad-avp (into [0 0 0 1 0x00] (b/uint24->bytes 999)) ; AVP claims 999 octets, has 8
+        header (into [1] (into (b/uint24->bytes (+ 20 (count bad-avp)))
+                                (into [2r10000000] (into (b/uint24->bytes 257)
+                                                          (into (b/uint32->bytes 0)
+                                                                (into (b/uint32->bytes 1) (b/uint32->bytes 1)))))))
+        encoded (into header bad-avp)
+        [status reason] (msg/decode-message encoded)]
+    (is (= :error status))
+    (is (= :diameter/avp-truncated-data reason))))

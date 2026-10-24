@@ -1,0 +1,158 @@
+(ns diameter.bytes
+  "Byte-vector conventions shared across this repo — a vector of 0-255 ints
+  is the working representation (the same `->ints` convention
+  `org-ietf-radius` and `org-ietf-asn1` use in this workspace, so moving
+  between this and either sibling library doesn't mean learning a third
+  byte convention), converted to/from platform-native bytes only at the
+  edges.
+
+  Diameter (RFC 6733) is a flat header + TLV wire format, not ASN.1 — see
+  this repo's `deps.edn` for why there is no dependency on `org-ietf-asn1`
+  here. What it does need, repeatedly, is real multi-byte big-endian
+  integers: the header's 3-octet Message Length (RFC 6733 §3), the AVP
+  header's 3-octet AVP Length (§4.1) — 24 bits, not 16 or 32, which is the
+  field every hand-rolled Diameter codec gets wrong first — and 4-octet
+  Application-ID / Hop-by-Hop / End-to-End / AVP Code / Vendor-ID fields.
+  Those are `bit-and`/`bit-or`/`bit-shift-left`/`unsigned-bit-shift-right`
+  work, done here."
+  (:require [kotoba.lang.text :as str]))
+
+(defn ->ints
+  "Anything byte-like as a vector of 0-255 ints."
+  [data]
+  (cond
+    (vector? data) data
+    (nil? data) []
+    :else (mapv #(bit-and (int %) 0xff) (seq data))))
+
+(defn ints->bytes
+  "A vector of 0-255 ints as platform-native bytes."
+  [ints]
+  #?(:clj (byte-array (map unchecked-byte ints))
+     :cljs (js/Uint8Array.from (clj->js (vec ints)))))
+
+(defn hex [data]
+  (apply str (map (fn [b]
+                     (let [s #?(:clj (Integer/toHexString (bit-and (int b) 0xff))
+                                :cljs (.toString (bit-and b 0xff) 16))]
+                       (if (= 1 (count s)) (str "0" s) s)))
+                   (->ints data))))
+
+(defn unhex [s]
+  (let [clean (str/replace (str s) #"[\s:]" "")]
+    (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) % 16)
+          (map (partial apply str) (partition 2 clean)))))
+
+;; ── big-endian fixed-width integers ─────────────────────────────────────
+;;
+;; All of these extract/place bytes with `bit-and`/`unsigned-bit-shift-right`
+;; at shift amounts of 0/8/16/24, never more. That keeps every one of them
+;; correct for BOTH an unsigned reading and Integer32's signed two's
+;; complement reading of the same 32-bit pattern: in both Clojure (64-bit
+;; `long` arithmetic) and ClojureScript (32-bit JS bitwise operators,
+;; `ToInt32`/`ToUint32` coercion), shifting right by at most 24 and masking
+;; with 0xff only ever reads bits 0..31 of the value, so it never touches
+;; sign-extended bits above bit 31 and never needs a separate signed-vs-
+;; unsigned code path for the *encode* direction. (`bytes->int32` below
+;; still needs an explicit two's-complement reconstruction on *decode*,
+;; because reading four bytes back only ever gives you an unsigned
+;; magnitude.)
+
+(defn uint16->bytes [n]
+  [(bit-and (unsigned-bit-shift-right n 8) 0xff)
+   (bit-and n 0xff)])
+
+(defn bytes->uint16 [[hi lo]]
+  (bit-or (bit-shift-left (bit-and hi 0xff) 8) (bit-and lo 0xff)))
+
+(defn uint24->bytes
+  "The 24-bit form: Message Length (RFC 6733 §3), Command Code (§3), AVP
+  Length (§4.1). All three fields in the spec that are neither 2 nor 4
+  octets, and all three are this same function."
+  [n]
+  [(bit-and (unsigned-bit-shift-right n 16) 0xff)
+   (bit-and (unsigned-bit-shift-right n 8) 0xff)
+   (bit-and n 0xff)])
+
+(defn bytes->uint24 [[b0 b1 b2]]
+  (bit-or (bit-shift-left (bit-and b0 0xff) 16)
+          (bit-shift-left (bit-and b1 0xff) 8)
+          (bit-and b2 0xff)))
+
+(defn uint32->bytes [n]
+  [(bit-and (unsigned-bit-shift-right n 24) 0xff)
+   (bit-and (unsigned-bit-shift-right n 16) 0xff)
+   (bit-and (unsigned-bit-shift-right n 8) 0xff)
+   (bit-and n 0xff)])
+
+(defn bytes->uint32
+  "The 4 bytes as an *unsigned* 32-bit value, identically on both runtimes.
+
+  The trailing fold is not decoration. `bit-or` is 64-bit on the JVM (where
+  the OR of these four masked, shifted bytes is already the unsigned value
+  and the fold is a no-op) but 32-bit and **signed** in ClojureScript,
+  where JS's `|` coerces its result with `ToInt32` — so any 4 bytes with
+  the high bit set come back negative there: `[0xff 0xff 0xff 0xff]`
+  decodes as -1 rather than 4294967295, and an Application-ID or
+  Hop-by-Hop Identifier above 0x7fffffff silently becomes a different
+  number on one platform and not the other.
+
+  This was found by actually running the suite under nbb
+  (`scripts/verify-cljs.cljk`), not by reasoning about it — the JVM side
+  was green the whole time. Ten assertions across four namespaces failed
+  on the ClojureScript path before this fold existed."
+  [[b0 b1 b2 b3]]
+  (let [n (bit-or (bit-shift-left (bit-and b0 0xff) 24)
+                  (bit-shift-left (bit-and b1 0xff) 16)
+                  (bit-shift-left (bit-and b2 0xff) 8)
+                  (bit-and b3 0xff))]
+    (if (neg? n) (+ n 0x100000000) n)))
+
+(defn int32->bytes
+  "Same 4-byte encode as `uint32->bytes` — see the namespace docstring on
+  why the encode direction doesn't need a separate signed path."
+  [n]
+  (uint32->bytes n))
+
+(defn bytes->int32
+  "The 4 bytes as a *signed* 32-bit two's complement value: read them as
+  unsigned first (`bytes->uint32`, always in-range and exact — 2^32 is well
+  under 2^53, so this is safe in ClojureScript's double-precision numbers
+  too), then fold the top half of the range back to negative by plain
+  subtraction. No bitwise op does this step: `unsigned-bit-shift-right`
+  would defeat the point (it produces the unsigned reading we're trying to
+  reinterpret), and ClojureScript's `bit-or`/`bit-and` return a *signed*
+  32-bit result on their own — which looks like it would do this for free,
+  except that path silently disagrees with Clojure's own `bit-and` (64-bit,
+  never negative for these inputs) on the same bytes, so it is not used
+  here; the arithmetic fold below gives one identical answer on both."
+  [bs]
+  (let [u (bytes->uint32 bs)]
+    (if (>= u 0x80000000)
+      (- u 0x100000000)
+      u)))
+
+;; ── 64-bit values, as an {:hi u32 :lo u32} pair ─────────────────────────
+;;
+;; Integer64/Unsigned64 (RFC 6733 §4.2) are not represented here as a
+;; single scalar number. Clojure's `long` is a real 64-bit integer, but
+;; ClojureScript numbers are IEEE-754 doubles — exact only up to 2^53 — and
+;; JS's native 64-bit escape hatch, `BigInt`, does not mix with the
+;; `bit-and`/`unsigned-bit-shift-right` functions above (they compile to
+;; JS's 32-bit `&`/`>>>`, which throw on a `BigInt` operand), so a single
+;; portable 64-bit codec would need a second, `BigInt`-shaped implementation
+;; that could silently drift from the 32-bit one it's supposed to agree
+;; with. RFC 6733 §8.8 (Session-Id) already splits a 64-bit monotonic value
+;; into `<high 32 bits>;<low 32 bits>` for exactly this reason —
+;; "rendered in two parts to simplify formatting by 32-bit processors" —
+;; so `{:hi u32 :lo u32}` here is the same move, applied to the wire form
+;; instead of the text form, and it reuses `uint32->bytes`/`bytes->uint32`
+;; verbatim rather than inventing new 64-bit-wide bit twiddling to
+;; cross-check.
+
+(defn hilo->bytes [{:keys [hi lo]}]
+  (into (uint32->bytes hi) (uint32->bytes lo)))
+
+(defn bytes->hilo [bs]
+  {:hi (bytes->uint32 (subvec (vec bs) 0 4))
+   :lo (bytes->uint32 (subvec (vec bs) 4 8))})

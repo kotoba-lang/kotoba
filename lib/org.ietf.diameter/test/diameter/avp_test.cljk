@@ -1,0 +1,174 @@
+(ns diameter.avp-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [diameter.bytes :as b]
+            [diameter.types :as t]
+            [diameter.avp :as avp]))
+
+;; ── RFC 6733 §4.4.1 worked example, the AVP-length arithmetic ──────────
+;;
+;; The Example-AVP grouped-value walkthrough is the only place in RFC 6733
+;; where real AVP bytes are written out with header, code, length AND
+;; content all given together. Origin-Host (AVP Code 264, §6.3) and
+;; Session-Id (AVP Code 263, §8.8) with the RFC's own literal string
+;; values, and the AVP Length the RFC states for each, are reproduced
+;; here verbatim — the byte lengths below (19, 49, 50) are RFC 6733
+;; §4.4.1's own stated Length field values for these exact AVPs, not
+;; independently recomputed and not guessed.
+
+(deftest rfc-example-origin-host-avp
+  (let [origin-host "example.com" ; RFC 6733 §4.4.1
+        data (t/encode-utf8 origin-host)
+        encoded (avp/encode-avp {:diameter.avp/code 264 :diameter.avp/data data})]
+    ;; RFC 6733 §4.4.1: "Origin-Host AVP Header (AVP Code = 264), Length = 19"
+    (is (= 19 (b/bytes->uint24 (subvec encoded 5 8))))
+    ;; 8-octet header + 11-octet "example.com" = 19, padded to 20 (1 pad byte)
+    ;; so the next AVP lands on a 4-octet boundary — RFC 6733 §4.4.1's own
+    ;; diagram shows exactly one Padding byte after "...com".
+    (is (= 20 (count encoded)))
+    (is (= 0 (last encoded)))
+    (let [[status decoded next-pos] (avp/decode-avp-at encoded 0)]
+      (is (= :ok status))
+      (is (= data (:diameter.avp/data decoded)))
+      (is (= 20 next-pos)))))
+
+(deftest rfc-example-session-id-avps
+  ;; RFC 6733 §4.4.1, verbatim.
+  (let [sid1 "grump.example.com:33041;23432;893;0AF3B81"
+        sid2 "grump.example.com:33054;23561;2358;0AF3B82"
+        enc1 (avp/encode-avp {:diameter.avp/code 263 :diameter.avp/data (t/encode-utf8 sid1)})
+        enc2 (avp/encode-avp {:diameter.avp/code 263 :diameter.avp/data (t/encode-utf8 sid2)})]
+    ;; RFC 6733 §4.4.1: "(AVP Code = 263), Length = 49" / "Length = 50"
+    (is (= 49 (b/bytes->uint24 (subvec enc1 5 8))))
+    (is (= 50 (b/bytes->uint24 (subvec enc2 5 8))))
+    ;; 8 + 41 = 49, padded to 52 (3 pad bytes); 8 + 42 = 50, padded to 52
+    ;; (2 pad bytes) — both land on the next 4-octet boundary.
+    (is (= 52 (count enc1)))
+    (is (= 52 (count enc2)))))
+
+;; ── A grouped AVP built from the same RFC-cited AVPs above ──────────────
+;;
+;; constructed, not a published spec vector: RFC 6733 §4.4.1's own
+;; Example-AVP additionally carries two large opaque AVPs (Recovery-Policy,
+;; Futuristic-Acct-Record) not reproduced here, so the RFC's stated total
+;; length (496) does not apply to this narrower composition — only the
+;; Origin-Host/Session-Id sub-lengths above are the RFC's own numbers. The
+;; grouping/nesting itself, and the composite length below, are this
+;; test's own arithmetic over those RFC-cited sub-AVPs.
+(deftest constructed-grouped-avp-subset-of-rfc-example
+  (let [origin-host (avp/encode-avp {:diameter.avp/code 264 :diameter.avp/data (t/encode-utf8 "example.com")})
+        sid1 (avp/encode-avp {:diameter.avp/code 263 :diameter.avp/data (t/encode-utf8 "grump.example.com:33041;23432;893;0AF3B81")})
+        sid2 (avp/encode-avp {:diameter.avp/code 263 :diameter.avp/data (t/encode-utf8 "grump.example.com:33054;23561;2358;0AF3B82")})
+        group-data (into (into [] origin-host) (into sid1 sid2))
+        grouped (avp/encode-avp {:diameter.avp/code 999999 :diameter.avp/data group-data})]
+    ;; Member AVPs total 20 (Origin-Host) + 52 (Session-Id) + 52
+    ;; (Session-Id) = 124 octets; the outer Grouped AVP's own 8-octet
+    ;; header (no Vendor-ID) is added on top per RFC 6733 §4.4: "The AVP
+    ;; Length field is set to 8 ... plus the total length of all included
+    ;; AVPs, including their headers and padding" -> 8 + 124 = 132, and
+    ;; it's already a multiple of 4 (§4.4: "the AVP Length field of an AVP
+    ;; of type Grouped is always a multiple of 4").
+    (is (= 132 (b/bytes->uint24 (subvec grouped 5 8))))
+    (is (zero? (mod (b/bytes->uint24 (subvec grouped 5 8)) 4)))
+    (let [[status decoded] (avp/decode-avp-at grouped 0)]
+      (is (= :ok status))
+      (let [[gstatus members] (avp/decode-avps (:diameter.avp/data decoded))]
+        (is (= :ok gstatus))
+        (is (= 3 (count members)))
+        (is (= [264 263 263] (mapv :diameter.avp/code members)))
+        ;; decode via the library's own UTF8String codec rather than
+        ;; `(map char ...)`, which is not portable between the two
+        ;; runtimes (it silently produced 11 spaces under nbb).
+        (is (= "example.com" (t/decode-utf8 (:diameter.avp/data (first members)))))))))
+
+;; ── flags ────────────────────────────────────────────────────────────
+
+(deftest flags-round-trip-all-eight-combinations
+  (doseq [v? [false true] m? [false true] p? [false true]]
+    (let [avp {:diameter.avp/code 1
+               :diameter.avp/vendor-id (when v? 10415)
+               :diameter.avp/m? m? :diameter.avp/p? p?
+               :diameter.avp/data [1 2 3]}
+          encoded (avp/encode-avp avp)
+          [status decoded] (avp/decode-avp-at encoded 0)]
+      (testing (str "V=" v? " M=" m? " P=" p?)
+        (is (= :ok status))
+        (is (= m? (:diameter.avp/m? decoded)))
+        (is (= p? (:diameter.avp/p? decoded)))
+        (is (= (when v? 10415) (:diameter.avp/vendor-id decoded)))
+        (is (= [1 2 3] (:diameter.avp/data decoded)))))))
+
+;; ── padding, on and off the 4-byte boundary ─────────────────────────
+
+(deftest padding-round-trip-sweep
+  (doseq [data-len (range 0 12)]
+    (let [data (vec (range data-len))
+          expected-pad (mod (- 4 (mod (+ 8 data-len) 4)) 4)
+          encoded (avp/encode-avp {:diameter.avp/code 42 :diameter.avp/data data})]
+      (testing (str "data-len=" data-len)
+        (is (= (+ 8 data-len expected-pad) (count encoded)))
+        (is (every? zero? (take-last expected-pad encoded)))
+        (let [[status decoded next-pos] (avp/decode-avp-at encoded 0)]
+          (is (= :ok status))
+          (is (= data (:diameter.avp/data decoded)))
+          (is (= (count encoded) next-pos)))))))
+
+(deftest two-avps-back-to-back-decode-independently
+  ;; The real test of padding correctness isn't round-tripping one AVP —
+  ;; it's that a second AVP placed right after a first one whose data
+  ;; length isn't a multiple of 4 still decodes at the right offset.
+  (let [a1 (avp/encode-avp {:diameter.avp/code 1 :diameter.avp/data [1 2 3]})   ; len 11, pad 1
+        a2 (avp/encode-avp {:diameter.avp/code 2 :diameter.avp/data [9 9 9 9]}) ; len 12, pad 0
+        combined (into (vec a1) a2)
+        [status avps] (avp/decode-avps combined)]
+    (is (= :ok status))
+    (is (= 2 (count avps)))
+    (is (= 1 (:diameter.avp/code (first avps))))
+    (is (= [1 2 3] (:diameter.avp/data (first avps))))
+    (is (= 2 (:diameter.avp/code (second avps))))
+    (is (= [9 9 9 9] (:diameter.avp/data (second avps))))))
+
+;; ── negative decode: specific reason keywords, not just "some error" ──
+
+(deftest decode-rejects-short-avp-length
+  ;; AVP Length below the minimum header size (8, or 12 with V set) is
+  ;; structurally invalid regardless of what bytes follow — RFC 6733 §4.1:
+  ;; AVP Length "indicat[es] the number of octets in this AVP including
+  ;; the AVP Code field, AVP Length field, AVP Flags field ... and the AVP
+  ;; Data field", so it can never be less than 8.
+  (let [bs (into [0 0 0 1                 ; AVP Code
+                  0x00 0x00 0x00 0x05]    ; Flags=0, Length=5 (< 8)
+                 (repeat 4 0))            ; padding-shaped filler, irrelevant
+        [status reason] (avp/decode-avp-at bs 0)]
+    (is (= :error status))
+    (is (= :diameter/avp-length-too-short reason))))
+
+(deftest decode-rejects-truncated-header
+  (let [[status reason] (avp/decode-avp-at [0 0 0 1 0x00] 0)] ; only 5 of 8 header bytes
+    (is (= :error status))
+    (is (= :diameter/avp-truncated-header reason))))
+
+(deftest decode-rejects-truncated-data
+  ;; AVP Length claims more data than is actually present.
+  (let [bs (into [0 0 0 1 0x00] (b/uint24->bytes 20)) ; says 20 octets total, only 8 present
+        [status reason] (avp/decode-avp-at bs 0)]
+    (is (= :error status))
+    (is (= :diameter/avp-truncated-data reason))))
+
+(deftest decode-rejects-truncated-padding
+  ;; AVP Length is satisfied, but the buffer ends before the 4-byte
+  ;; alignment padding that Length's own value implies is required.
+  (let [avp (avp/encode-avp {:diameter.avp/code 1 :diameter.avp/data [1 2 3]}) ; needs 1 pad byte
+        truncated (vec (butlast avp))                                          ; drop that pad byte
+        [status reason] (avp/decode-avp-at truncated 0)]
+    (is (= :error status))
+    (is (= :diameter/avp-padding-truncated reason))))
+
+(deftest decode-rejects-nonzero-padding
+  ;; RFC 6733 §4: padding is "a number of zero-valued bytes". A decoder
+  ;; that accepts nonzero padding is accepting a message shape the sender
+  ;; never legitimately produces.
+  (let [original (vec (avp/encode-avp {:diameter.avp/code 1 :diameter.avp/data [1 2 3]}))
+        corrupted (assoc original (dec (count original)) 0xff) ; the one pad byte -> nonzero
+        [status reason] (avp/decode-avp-at corrupted 0)]
+    (is (= :error status))
+    (is (= :diameter/avp-padding-invalid reason))))
