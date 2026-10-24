@@ -1,0 +1,107 @@
+(ns ed25519.core-test
+  "Correctness of the pure-Clojure Ed25519 public-key derivation.
+
+   Two independent oracles, neither relying on a memorized RFC table:
+   1. JCA-oracle — generate keypairs with the JVM's own RFC-8032 Ed25519 provider,
+      extract the seed (PKCS8 tail) + pubkey (SPKI tail), and assert our derivation
+      reproduces the provider's pubkey byte-for-byte. This pins us to the platform's
+      conformant implementation across many random keys.
+   2. Fixed regression vector — one (seed → pubkey) pair, itself JCA-verified, so a
+      future refactor that breaks determinism fails even if the oracle were skipped."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ed25519.core :as ed])
+  (:import (java.security KeyPairGenerator)))
+
+;; ── 1. JCA oracle (the authoritative check) ───────────────────────────────────
+(deftest derivation-matches-jca-provider
+  (let [g (KeyPairGenerator/getInstance "Ed25519")]
+    (dotimes [_ 16]
+      (let [kp    (.generateKeyPair g)
+            seed  (byte-array (take-last 32 (seq (.getEncoded (.getPrivate kp)))))
+            jca   (byte-array (take-last 32 (seq (.getEncoded (.getPublic kp)))))
+            ours  (ed/pubkey-from-seed seed)]
+        (is (= (ed/hexify jca) (ed/hexify ours))
+            "derived pubkey must equal the JCA provider's pubkey for the same seed")))))
+
+(deftest jca-self-check-passes
+  (let [g (KeyPairGenerator/getInstance "Ed25519")]
+    (dotimes [_ 8]
+      (let [seed (byte-array (take-last 32 (seq (.getEncoded (.getPrivate (.generateKeyPair g))))))]
+        (is (true? (ed/verify-derivation seed)))))))
+
+;; ── 2. Fixed regression vector (JCA-verified pair) ────────────────────────────
+(def ^:private vec-seed "9d61b19deffeebc52cd2c8f4d2b2f8c3127bf48abf57df622da6a55f6e2e2a3a")
+(def ^:private vec-pub  "4bafa3904f4d71a6be4b76d3ba01a3e71e27df9242624a157c22edbe81bfef5b")
+
+(deftest fixed-vector
+  (is (= vec-pub (ed/seed-hex->pubkey-hex vec-seed)))
+  ;; and the pair is self-consistent under JCA (this is HOW the vector was minted)
+  (is (true? (ed/verify-derivation (ed/unhex vec-seed)))))
+
+;; ── did:key shape ─────────────────────────────────────────────────────────────
+(deftest did-key-shape
+  (let [did (ed/did-key-from-seed-hex vec-seed)]
+    (is (str/starts-with? did "did:key:z6Mk"))
+    ;; multicodec 0xed01 + 32-byte ed25519 pubkey → 48-char base58 body (z + 47..48)
+    (is (<= 55 (count did) 58))))
+
+;; ── input validation ──────────────────────────────────────────────────────────
+(deftest seed-must-be-32-bytes
+  (is (thrown? kerror/ExceptionInfo (ed/pubkey-from-seed (byte-array 31))))
+  (is (thrown? kerror/ExceptionInfo (ed/pubkey-from-seed (byte-array 33)))))
+
+(deftest unhex-rejects-odd-length-hex-instead-of-silently-truncating
+  (is (thrown? kerror/ExceptionInfo (ed/unhex "abc")))
+  (testing "the concretely dangerous case: a 65-char (one-too-many) seed-hex
+            would otherwise silently truncate to exactly 32 bytes -- the
+            RIGHT length, the WRONG bytes -- evading pubkey-from-seed's
+            own 32-byte length guard entirely"
+    (is (thrown? kerror/ExceptionInfo
+                 (ed/unhex (str vec-seed "0"))))))
+
+;; ── encodings round-trip ──────────────────────────────────────────────────────
+(deftest hex-roundtrip
+  (let [b (byte-array (map unchecked-byte (range -128 0)))]
+    (is (= (seq b) (seq (ed/unhex (ed/hexify b)))))))
+
+;; ── sign / verify / did:key parse (added) ─────────────────────────────────────
+(deftest sign-verify-roundtrip
+  (let [g (java.security.KeyPairGenerator/getInstance "Ed25519")]
+    (dotimes [_ 8]
+      (let [seed (byte-array (take-last 32 (seq (.getEncoded (.getPrivate (.generateKeyPair g))))))
+            pub  (ed/pubkey-from-seed seed)
+            msg  (kbytes/utf8-bytes "sign me")
+            sig  (ed/sign seed msg)]
+        (is (= 64 (count sig)))
+        (is (true? (ed/verify pub msg sig)))
+        (is (true? (ed/verify-did (ed/did-key-from-seed seed) msg sig)))
+        (is (false? (ed/verify pub (kbytes/utf8-bytes "tampered") sig)))))))
+
+(deftest did-key-parse-roundtrip
+  (let [seed (ed/unhex vec-seed)
+        pub  (ed/pubkey-from-seed seed)
+        did  (ed/did-key-from-pub pub)]
+    (is (= (seq pub) (seq (ed/did-key->pubkey did))) "did:key → pubkey is the inverse of pubkey → did:key")
+    (is (thrown? kerror/ExceptionInfo (ed/did-key->pubkey "did:key:zNotEd25519")))
+    (is (thrown? kerror/ExceptionInfo (ed/did-key->pubkey "not-a-did")))))
+
+(deftest did-key-rejects-wrong-length-multicodec-payload
+  ;; An Ed25519 did:key multicodec payload is always exactly 34 bytes
+  ;; (2-byte 0xed01 prefix + 32-byte pubkey). did-key->pubkey must reject
+  ;; a correctly-prefixed payload of any other length -- not silently
+  ;; return whatever bytes happen to follow the prefix.
+  (testing "prefix with zero bytes of key material must not be accepted"
+    (let [truncated-did (str "did:key:z" (ed/b58 (byte-array [(unchecked-byte 0xed) (unchecked-byte 0x01)])))]
+      (is (thrown? kerror/ExceptionInfo (ed/did-key->pubkey truncated-did)))))
+  (testing "a valid payload with trailing garbage bytes must not be accepted"
+    (let [pub (ed/pubkey-from-seed (ed/unhex vec-seed))
+          oversized (byte-array (concat [(unchecked-byte 0xed) (unchecked-byte 0x01)]
+                                        (seq pub)
+                                        [(unchecked-byte 0xaa) (unchecked-byte 0xbb)]))
+          oversized-did (str "did:key:z" (ed/b58 oversized))]
+      (is (thrown? kerror/ExceptionInfo (ed/did-key->pubkey oversized-did))))))
+
+(deftest base58-encode-decode-inverse
+  (let [b (byte-array (map unchecked-byte [0 0 1 2 3 250 255]))]
+    (is (= (seq b) (seq (ed/b58-decode (ed/b58 b)))))))
