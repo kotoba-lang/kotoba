@@ -87,6 +87,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.iceberg` | `org.apache.iceberg/src` | `iceberg.manifest`, `iceberg.metadata`, `iceberg.rest`, `iceberg.schema` (an external specification, publisher apache.org) |
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
+| `kotoba.fare` | `kotoba.fare/src` | `kotoba.fare` (Kotoba project library) |
 | `kotoba.expr` | `kotoba.expr/src` | `expr.core`, `kotoba.expr` (Kotoba project library) |
 | `kotoba.examlaw` | `kotoba.examlaw/src` | `kotoba.examlaw` (Kotoba project library) |
 | `kotoba.esim` | `kotoba.esim/src` | `kotoba.esim`, `kotoba.esim.export`, `kotoba.esim.lifecycle`, `kotoba.esim.ports` (Kotoba project library) |

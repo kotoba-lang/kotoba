@@ -1,0 +1,399 @@
+(ns kotoba.fare-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.fare :as f]))
+
+;; Legs are written as plain data here rather than built with
+;; `kotoba.itinerary`. That is the point: this library is zero-dep and
+;; consumes the leg shape as a contract, so the test documents exactly
+;; which keys it reads and nothing more.
+
+(defn- leg [carrier number origin destination & {:keys [classes miles depart-min]}]
+  (cond-> {:leg/carrier carrier :leg/number number
+           :leg/origin origin :leg/destination destination
+           :leg/depart-min (or depart-min 0)}
+    classes (assoc :leg/classes classes)
+    miles   (assoc :leg/miles miles)))
+
+(def ^:private hnd-sin (leg "NH" "841" "HND" "SIN" :classes {"Y" 9 "B" 4} :miles 3312 :depart-min 100))
+(def ^:private hnd-tpe (leg "NH" "853" "HND" "TPE" :classes {"Y" 9} :miles 1330 :depart-min 10))
+(def ^:private tpe-sin (leg "BR" "225" "TPE" "SIN" :classes {"Y" 7} :miles 2005 :depart-min 200))
+
+(def ^:private nonstop {:itin/legs [hnd-sin] :itin/depart-min 100})
+(def ^:private via-tpe {:itin/legs [hnd-tpe tpe-sin] :itin/depart-min 10})
+
+;; ---------------------------------------------------------------------------
+;; Money
+;; ---------------------------------------------------------------------------
+
+(deftest nuc-conversion-is-integer-and-truncates
+  (is (= 187912 (f/nuc->minor 123456 1522100)) "NUC 1234.56 at 152.2100 => 187,912.3776, truncated")
+  (testing "truncation can only move a fare down, never up"
+    ;; 100 (NUC 1.00) at 152.2199 = 152.2199 -> 152
+    (is (= 152 (f/nuc->minor 100 1522199))))
+  (testing "a missing rate of exchange is not a free fare"
+    (is (nil? (f/nuc->minor 123456 nil)))
+    (is (nil? (f/nuc->minor nil 1522100)))))
+
+(deftest percent-arithmetic-is-basis-points
+  (is (= 800 (f/apply-bp 10000 800)) "8%")
+  (is (= 0 (f/apply-bp 10000 nil)) "an absent rate is no tax, not a full one")
+  (is (= 12 (f/apply-bp 125 1000)) "12.5 truncates to 12"))
+
+;; ---------------------------------------------------------------------------
+;; Filed fares
+;; ---------------------------------------------------------------------------
+
+(def ^:private through-y
+  (f/fare "YOWSIN" "NH" "HND" "SIN" "Y" :amount 98000 :currency "JPY" :miles 3312))
+
+(def ^:private through-cheap-restricted
+  (f/fare "VLXAP21" "NH" "HND" "SIN" "Y" :amount 61000 :currency "JPY"
+          :rules (f/rules :advance-days 21 :min-stay-days 3 :blackout #{"2026-12-29"})))
+
+(def ^:private hnd-tpe-fare
+  (f/fare "YOWTPE" "NH" "HND" "TPE" "Y" :amount 44000 :currency "JPY"))
+
+(def ^:private tpe-sin-fare
+  (f/fare "YOWSGN" "BR" "TPE" "SIN" "Y" :amount 39000 :currency "JPY"))
+
+(deftest fare-refuses-to-construct-something-unpriceable-or-nonsensical
+  (is (some? through-y))
+  (is (nil? (f/fare "X" "NH" "HND" "SIN" "Y")) "no amount at all")
+  (is (nil? (f/fare "X" "NH" "HND" "SIN" "Y" :amount 98000)) "an amount with no currency")
+  (is (nil? (f/fare "X" "NH" "HND" "HND" "Y" :amount 1 :currency "JPY")) "a market that goes nowhere")
+  (is (nil? (f/fare "X" "NH" "HND" "SIN" "Y" :amount -1 :currency "JPY")) "a negative fare")
+  (testing "a NUC-filed fare needs no currency at filing time"
+    (is (some? (f/fare "YOWNUC" "NH" "HND" "SIN" "Y" :amount-nuc 123456))))
+  (testing "the filing carrier is the default permitted carrier"
+    (is (= #{"NH"} (:fare/carriers through-y)))))
+
+;; ---------------------------------------------------------------------------
+;; Rules
+;; ---------------------------------------------------------------------------
+
+(def ^:private ctx-ok
+  {:travel-date "2026-09-01" :weekday 2 :advance-days 21 :stay-days 7
+   :sale-date "2026-08-11" :point-of-sale "JP"})
+
+(deftest an-unrestricted-fare-applies-with-no-context-at-all
+  (is (:fare/ok? (f/fare-applies? through-y {})))
+  (is (= [] (:fare/violations (f/fare-applies? through-y {})))))
+
+(deftest each-filed-rule-is-actually-checked
+  (testing "advance purchase (cat 5)"
+    (is (:fare/ok? (f/fare-applies? through-cheap-restricted ctx-ok)))
+    (is (= [:inside-advance-purchase-window]
+           (:fare/violations (f/fare-applies? through-cheap-restricted
+                                              (assoc ctx-ok :advance-days 20))))))
+  (testing "minimum stay (cat 6)"
+    (is (= [:below-minimum-stay]
+           (:fare/violations (f/fare-applies? through-cheap-restricted
+                                              (assoc ctx-ok :stay-days 2))))))
+  (testing "blackout (cat 11)"
+    (is (= [:blackout-date]
+           (:fare/violations (f/fare-applies? through-cheap-restricted
+                                              (assoc ctx-ok :travel-date "2026-12-29"))))))
+  (testing "seasonality (cat 3)"
+    (let [seasonal (f/fare "HLXSEA" "NH" "HND" "SIN" "Y" :amount 55000 :currency "JPY"
+                           :rules (f/rules :travel-from "2026-10-01" :travel-to "2026-11-30"))]
+      (is (= [:before-season] (:fare/violations (f/fare-applies? seasonal ctx-ok))))
+      (is (:fare/ok? (f/fare-applies? seasonal (assoc ctx-ok :travel-date "2026-10-15"))))
+      (is (= [:after-season] (:fare/violations (f/fare-applies? seasonal (assoc ctx-ok :travel-date "2026-12-01")))))))
+  (testing "day of week (cat 2)"
+    (let [midweek (f/fare "WLXMID" "NH" "HND" "SIN" "Y" :amount 52000 :currency "JPY"
+                          :rules (f/rules :dow #{2 3}))]
+      (is (:fare/ok? (f/fare-applies? midweek ctx-ok)) "Tuesday is permitted")
+      (is (= [:day-of-week-not-permitted]
+             (:fare/violations (f/fare-applies? midweek (assoc ctx-ok :weekday 6)))))))
+  (testing "maximum stay (cat 7)"
+    (let [short-stay (f/fare "ELX7D" "NH" "HND" "SIN" "Y" :amount 48000 :currency "JPY"
+                             :rules (f/rules :max-stay-days 7))]
+      (is (:fare/ok? (f/fare-applies? short-stay ctx-ok)))
+      (is (= [:above-maximum-stay]
+             (:fare/violations (f/fare-applies? short-stay (assoc ctx-ok :stay-days 30)))))))
+  (testing "sales restrictions (cat 15)"
+    (let [promo (f/fare "PROMO" "NH" "HND" "SIN" "Y" :amount 39000 :currency "JPY"
+                        :rules (f/rules :sale-from "2026-08-01" :sale-to "2026-08-10"
+                                        :point-of-sale #{"JP"}))]
+      (is (= [:after-sale-window] (:fare/violations (f/fare-applies? promo ctx-ok))))
+      (is (:fare/ok? (f/fare-applies? promo (assoc ctx-ok :sale-date "2026-08-05"))))
+      (is (= [:point-of-sale-not-permitted]
+             (:fare/violations (f/fare-applies? promo (assoc ctx-ok :sale-date "2026-08-05"
+                                                             :point-of-sale "SG"))))))))
+
+(deftest a-rule-whose-fact-is-missing-does-not-quietly-pass
+  ;; This is the property that separates this from a fare engine that
+  ;; sells tickets nobody is entitled to.
+  (testing "no sale interval means the advance-purchase fare is not available"
+    (let [v (:fare/violations (f/fare-applies? through-cheap-restricted
+                                               (dissoc ctx-ok :advance-days)))]
+      (is (some #{:advance-purchase-unverifiable} v))
+      (is (not (:fare/ok? (f/fare-applies? through-cheap-restricted
+                                           (dissoc ctx-ok :advance-days)))))))
+  (testing "no travel date means neither the blackout nor the season can be checked"
+    (let [v (:fare/violations (f/fare-applies? through-cheap-restricted
+                                               (dissoc ctx-ok :travel-date)))]
+      (is (some #{:travel-date-unverifiable} v))))
+  (testing "an empty context makes every restricted fare unavailable, not free"
+    (is (not (:fare/ok? (f/fare-applies? through-cheap-restricted {})))))
+  (testing "the unverifiable violation is reported once, not once per rule that needed it"
+    (let [v (:fare/violations (f/fare-applies? through-cheap-restricted {}))]
+      (is (= 1 (count (filter #{:travel-date-unverifiable} v)))))))
+
+(deftest penalties-are-carried-but-never-priced
+  (let [pen (f/fare "VLX" "NH" "HND" "SIN" "Y" :amount 61000 :currency "JPY"
+                    :rules (f/rules :penalty {:change 22000 :refund :none}))
+        c (f/component [hnd-sin])
+        pc (f/price-component pen c {:currency "JPY"})]
+    (is (:pc/ok? pc))
+    (is (= 61000 (:pc/amount pc)) "a change fee is charged when a change happens, not when shopping")
+    (is (= 22000 (get-in pen [:fare/rules :rule/penalty :change])) "and it is still on record")))
+
+;; ---------------------------------------------------------------------------
+;; Components
+;; ---------------------------------------------------------------------------
+
+(deftest component-derives-structure-and-nothing-else
+  (let [c (f/component [hnd-tpe tpe-sin])]
+    (is (= "HND" (:comp/origin c)))
+    (is (= "SIN" (:comp/destination c)))
+    (is (= ["TPE"] (:comp/intermediate c)))
+    (is (= #{"NH" "BR"} (:comp/carriers c)))
+    (is (= 3335 (:comp/miles c))))
+  (is (nil? (f/component []))))
+
+(deftest fare-matches-component-checks-the-structural-filings
+  (let [c1 (f/component [hnd-sin])
+        c2 (f/component [hnd-tpe tpe-sin])]
+    (is (:fare/ok? (f/fare-matches-component? through-y c1)))
+
+    (testing "market endpoints"
+      (is (= [:market-destination-mismatch]
+             (:fare/violations (f/fare-matches-component? hnd-tpe-fare c1)))))
+
+    (testing "carrier (cat 4) -- a through fare filed by NH cannot cover a BR leg"
+      (is (some #{:carrier-not-permitted}
+                (:fare/violations (f/fare-matches-component? through-y c2)))))
+
+    (testing "booking class shown open on every leg"
+      (let [b-fare (f/fare "BOWSIN" "NH" "HND" "SIN" "B" :amount 150000 :currency "JPY")
+            f-fare (f/fare "FOWSIN" "NH" "HND" "SIN" "F" :amount 480000 :currency "JPY")]
+        (is (:fare/ok? (f/fare-matches-component? b-fare c1)))
+        (is (= [:class-not-available] (:fare/violations (f/fare-matches-component? f-fare c1))))))
+
+    (testing "routing (cat 25, as a permitted-point subsequence)"
+      (let [via-hkg (f/fare "YOWSIN" "NH" "HND" "SIN" "Y" :amount 90000 :currency "JPY"
+                            :routing ["HKG"] :carriers #{"NH" "BR"})
+            via-any (f/fare "YOWSIN" "NH" "HND" "SIN" "Y" :amount 90000 :currency "JPY"
+                            :routing ["TPE" "HKG"] :carriers #{"NH" "BR"})]
+        (is (= [:routing-not-permitted] (:fare/violations (f/fare-matches-component? via-hkg c2))))
+        (is (:fare/ok? (f/fare-matches-component? via-any c2)))
+        (is (:fare/ok? (f/fare-matches-component? via-hkg c1))
+            "a nonstop has no intermediate points to restrict")))
+
+    (testing "maximum permitted mileage"
+      (let [tight (f/fare "YOWSIN" "NH" "HND" "SIN" "Y" :amount 90000 :currency "JPY"
+                          :mpm 3000 :carriers #{"NH" "BR"})
+            roomy (f/fare "YOWSIN" "NH" "HND" "SIN" "Y" :amount 90000 :currency "JPY"
+                          :mpm 4000 :carriers #{"NH" "BR"})]
+        (is (= [:exceeds-maximum-permitted-mileage] (:fare/violations (f/fare-matches-component? tight c2))))
+        (is (:fare/ok? (f/fare-matches-component? roomy c2)))
+        (testing "a component with no mileage cannot clear a mileage cap"
+          (let [nomiles (f/component [(leg "NH" "1" "HND" "SIN")])]
+            (is (= [:mileage-unverifiable]
+                   (:fare/violations (f/fare-matches-component? roomy nomiles))))))))))
+
+(deftest a-fare-in-another-currency-is-refused-rather-than-guessed
+  (let [usd (f/fare "YOWSIN" "NH" "HND" "SIN" "Y" :amount 890 :currency "USD")
+        pc (f/price-component usd (f/component [hnd-sin]) {:currency "JPY"})]
+    (is (not (:pc/ok? pc)))
+    (is (= [:not-priceable-in-requested-currency] (:pc/violations pc)))
+    (is (nil? (:pc/amount pc)) "nil is a refusal to state a price; 0 would be a price")))
+
+(deftest a-nuc-fare-converts-and-a-round-trip-fare-halves
+  (let [nuc (f/fare "YOWNUC" "NH" "HND" "SIN" "Y" :amount-nuc 123456)
+        rt (f/fare "YRTSIN" "NH" "HND" "SIN" "Y" :amount 180000 :currency "JPY" :direction :round-trip)
+        c (f/component [hnd-sin])]
+    (is (= 187912 (:pc/amount (f/price-component nuc c {:currency "JPY" :roe 1522100}))))
+    (is (nil? (:pc/amount (f/price-component nuc c {:currency "JPY"})))
+        "no rate of exchange, no price")
+    (is (= 90000 (:pc/amount (f/price-component rt c {:currency "JPY"}))))))
+
+;; ---------------------------------------------------------------------------
+;; Fare construction
+;; ---------------------------------------------------------------------------
+
+(deftest partitions-of-enumerates-every-contiguous-cut
+  (is (= 1 (count (f/partitions-of [:a]))))
+  (is (= 2 (count (f/partitions-of [:a :b]))))
+  (is (= 4 (count (f/partitions-of [:a :b :c]))))
+  (is (= 128 (count (f/partitions-of (vec (range 8))))) "2^(n-1)")
+  (is (= [] (f/partitions-of [])))
+  (testing "every partition puts every leg back, in order"
+    (doseq [p (f/partitions-of [:a :b :c])]
+      (is (= [:a :b :c] (vec (apply concat p))))))
+  (testing "the through fare and the fully split one are both offered"
+    (let [ps (set (f/partitions-of [:a :b]))]
+      (is (contains? ps [[:a :b]]))
+      (is (contains? ps [[:a] [:b]])))))
+
+;; ---------------------------------------------------------------------------
+;; Pricing
+;; ---------------------------------------------------------------------------
+
+(def ^:private yq (f/surcharge "YQ" 7300 :per :segment))
+(def ^:private jp-tax (f/tax "SW" :flat 520 :per :itinerary))
+(def ^:private pct-tax (f/tax "XT" :percent 800 :per :itinerary))
+
+(deftest price-states-its-order-of-operations-and-follows-it
+  (let [c (f/component [hnd-sin])
+        pc (f/price-component through-y c {:currency "JPY"})
+        p (f/price [pc] {:currency "JPY" :surcharges [yq] :taxes [pct-tax jp-tax]})]
+    (is (= 98000 (:price/base p)))
+    (is (= 7300 (:price/surcharges p)) "one segment, one YQ")
+    ;; percent applies to base + surcharges: 8% of 105300 = 8424
+    (is (= (+ 8424 520) (:price/tax p)))
+    (is (= (+ 98000 7300 8424 520) (:price/total p)))
+    (is (= "JPY" (:price/currency p)))))
+
+(deftest per-segment-charges-multiply-by-segments
+  (let [pcs [(f/price-component hnd-tpe-fare (f/component [hnd-tpe]) {:currency "JPY"})
+             (f/price-component tpe-sin-fare (f/component [tpe-sin]) {:currency "JPY"})]
+        p (f/price pcs {:currency "JPY" :surcharges [yq]})]
+    (is (= (* 2 7300) (:price/surcharges p)) "two segments, two YQ"))
+  (let [pc (f/price-component through-y (f/component [hnd-sin]) {:currency "JPY"})
+        p (f/price [pc] {:currency "JPY" :taxes [(f/tax "OI" :flat 300 :per :component)]})]
+    (is (= 300 (:price/tax p)) "one component, one charge")))
+
+(deftest price-refuses-a-partial-total
+  (let [good (f/price-component through-y (f/component [hnd-sin]) {:currency "JPY"})
+        bad (f/price-component hnd-tpe-fare (f/component [hnd-sin]) {:currency "JPY"})]
+    (is (nil? (f/price [good bad] {:currency "JPY"}))
+        "a total that silently dropped a component would look like a fare")
+    (is (nil? (f/price [] {:currency "JPY"})))))
+
+;; ---------------------------------------------------------------------------
+;; Lowest-fare search
+;; ---------------------------------------------------------------------------
+
+;; An interline through fare: filed by BR for HND-SIN, usable on either
+;; carrier, with TPE as a permitted (not required) intermediate point.
+(def ^:private interline-through
+  (f/fare "YOWSIN2" "BR" "HND" "SIN" "Y" :amount 87000 :currency "JPY"
+          :carriers #{"NH" "BR"} :routing ["TPE"]))
+
+(def ^:private all-fares
+  [through-y through-cheap-restricted hnd-tpe-fare tpe-sin-fare interline-through])
+
+(def ^:private base-opts {:currency "JPY" :ctx ctx-ok})
+
+(deftest search-finds-the-cheapest-applicable-fare-not-the-first-one
+  (let [r (f/search [nonstop] all-fares base-opts)
+        best (f/cheapest r)]
+    (is (= 61000 (:price/total best)) "the restricted fare wins when its rules are met")
+    (is (= "VLXAP21" (get-in best [:price/components 0 :pc/fare :fare/basis])))))
+
+(deftest a-rule-violation-changes-which-fare-wins
+  (let [inside (assoc-in base-opts [:ctx :advance-days] 3)
+        best (f/cheapest (f/search [nonstop] all-fares inside))]
+    (testing "booked three days out, the 21-day advance fare is simply not available"
+      (is (not= "VLXAP21" (get-in best [:price/components 0 :pc/fare :fare/basis])))
+      (is (= [:inside-advance-purchase-window]
+             (:pc/violations (f/price-component through-cheap-restricted
+                                                (f/component [hnd-sin])
+                                                (assoc inside :ctx (:ctx inside)))))))
+    (testing "so the search falls through to the cheapest fare that IS applicable"
+      (is (= 87000 (:price/total best)) "the interline through fare, not the unrestricted Y")
+      (is (= "YOWSIN2" (get-in best [:price/components 0 :pc/fare :fare/basis]))))))
+
+(deftest search-compares-a-through-fare-against-splitting-the-journey
+  (let [r (f/search [via-tpe] all-fares base-opts)
+        best (f/cheapest r)]
+    ;; through fare on NH/BR = 87,000; split = 44,000 + 39,000 = 83,000
+    (is (= 83000 (:price/total best)) "splitting the journey is cheaper here")
+    (is (= 2 (count (:price/components best))) "and the search actually found the split")
+    (is (= ["YOWTPE" "YOWSGN"] (mapv #(get-in % [:pc/fare :fare/basis]) (:price/components best))))))
+
+(deftest search-ranks-across-itineraries-and-keeps-one-price-per-journey
+  (let [r (f/search [nonstop via-tpe] all-fares base-opts)]
+    (is (= 2 (:search/found r)) "two journeys, one price each -- not one row per partition")
+    (is (= [61000 83000] (mapv :price/total (:search/solutions r))) "sorted cheapest first")))
+
+(deftest search-reports-what-it-left-out
+  (testing "a cap on solutions is announced, not passed off as the market"
+    (let [r (f/search [nonstop via-tpe] all-fares (assoc base-opts :max-solutions 1))]
+      (is (= 1 (count (:search/solutions r))))
+      (is (= 2 (:search/found r)))
+      (is (true? (:search/truncated? r)))))
+  (testing "an itinerary too long to partition is named, not dropped"
+    (let [long-itin {:itin/legs (vec (repeat 9 hnd-sin)) :itin/depart-min 0}
+          r (f/search [long-itin] all-fares base-opts)]
+      (is (= 1 (count (:search/skipped r))))
+      (is (= :too-many-legs-to-partition (:skip/reason (first (:search/skipped r)))))))
+  (testing "an itinerary nothing prices is counted"
+    (let [kul {:itin/legs [(leg "MH" "89" "HND" "KUL" :classes {"Y" 9})] :itin/depart-min 0}
+          r (f/search [kul] all-fares base-opts)]
+      (is (= 0 (:search/found r)))
+      (is (= 1 (:search/unpriceable r))))))
+
+;; ---------------------------------------------------------------------------
+;; The governor seam
+;; ---------------------------------------------------------------------------
+
+(deftest price-matches-claim-verifies-arithmetic-rather-than-restating-it
+  (let [pc (f/price-component through-y (f/component [hnd-sin]) {:currency "JPY"})
+        opts {:currency "JPY" :surcharges [yq] :taxes [jp-tax]}]
+    (is (f/price-matches-claim? [pc] opts (+ 98000 7300 520)))
+    (is (not (f/price-matches-claim? [pc] opts 98000)) "surcharges and taxes are part of the total")
+    (is (not (f/price-matches-claim? [pc] opts nil)))
+    (testing "an unpriceable set never matches, including a claim of nothing owed"
+      (let [bad (f/price-component hnd-tpe-fare (f/component [hnd-sin]) {:currency "JPY"})]
+        (is (not (f/price-matches-claim? [bad] opts 0)))))))
+
+(deftest no-cheaper-than-is-a-statement-about-the-fares-that-were-not-chosen
+  (testing "an advisor quoting the true minimum survives"
+    (is (f/no-cheaper-than? [nonstop via-tpe] all-fares base-opts 61000)))
+  (testing "an advisor quoting above the minimum also survives -- nothing beat its own quote"
+    (is (f/no-cheaper-than? [nonstop via-tpe] all-fares base-opts 98000)))
+  (testing "an advisor claiming a price no filed fare supports is caught"
+    (is (not (f/no-cheaper-than? [nonstop via-tpe] all-fares base-opts 42000)))))
+
+(deftest cheapest-matches-claim-catches-the-overcharge-that-no-cheaper-than-lets-through
+  ;; The distinction is the whole reason both exist.
+  (is (f/cheapest-matches-claim? [nonstop via-tpe] all-fares base-opts 61000))
+  (is (not (f/cheapest-matches-claim? [nonstop via-tpe] all-fares base-opts 98000))
+      "quoting 98,000 when 61,000 was available is an overcharge, even though nothing beat 98,000"))
+
+(deftest the-verification-seams-fail-closed
+  (testing "an empty universe cannot verify anything"
+    (is (not (f/no-cheaper-than? [] all-fares base-opts 61000)))
+    (is (not (f/no-cheaper-than? [nonstop] [] base-opts 61000)))
+    (is (not (f/cheapest-matches-claim? [] [] base-opts 0))))
+  (testing "a universe where nothing is applicable cannot verify anything either"
+    ;; Booked three days out with only advance-purchase fares filed.
+    (let [inside (assoc-in base-opts [:ctx :advance-days] 3)]
+      (is (not (f/no-cheaper-than? [nonstop] [through-cheap-restricted] inside 61000)))))
+  (testing "a non-numeric claim never passes"
+    (is (not (f/no-cheaper-than? [nonstop] all-fares base-opts nil)))
+    (is (not (f/cheapest-matches-claim? [nonstop] all-fares base-opts "61000")))))
+
+(deftest a-plausible-fabricated-quote-is-rejected
+  ;; The concrete failure this library exists to catch: a confident,
+  ;; correctly-formatted, entirely made-up cheapest fare.
+  (let [fabricated 54800]
+    (is (not (f/no-cheaper-than? [nonstop via-tpe] all-fares base-opts fabricated)))
+    (is (not (f/cheapest-matches-claim? [nonstop via-tpe] all-fares base-opts fabricated)))))
+
+(deftest every-violation-has-a-human-label
+  (doseq [k [:market-origin-mismatch :market-destination-mismatch :carrier-not-permitted
+             :class-not-available :routing-not-permitted :mileage-unverifiable
+             :exceeds-maximum-permitted-mileage :not-priceable-in-requested-currency
+             :before-season :after-season :blackout-date :day-of-week-not-permitted
+             :inside-advance-purchase-window :below-minimum-stay :above-maximum-stay
+             :before-sale-window :after-sale-window :point-of-sale-not-permitted
+             :travel-date-unverifiable :day-of-week-unverifiable
+             :advance-purchase-unverifiable :stay-unverifiable
+             :sale-date-unverifiable :point-of-sale-unverifiable]]
+    (is (string? (f/describe-violation k)))
+    (is (not= (name k) (f/describe-violation k)) "the label says more than the keyword"))
+  (is (= "something else entirely" (f/describe-violation :something-else-entirely))))
