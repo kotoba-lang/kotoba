@@ -1,0 +1,190 @@
+(ns uml.validate
+  "Structural validation for uml.model models, returning
+  kotoba.dsl.problem-shaped problems (:uml/severity :error|:warn).
+
+  :error means the model is not structurally valid UML (dangling type
+  reference, illegal Generalization cycle, duplicate member name, too few
+  Association ends, an AssociationClass violating its disjoint-names
+  constraint). :warn means the model IS structurally legal per the
+  metamodel but this validator flags it as unusual/out of v1 scope (an
+  Interface owning an attribute -- see interface-attribute-problems).
+
+  Known v1 simplifications (see README Follow-ups for the full list):
+  - Reference checks confirm a name resolves to SOME known Classifier (or
+    a `uml.model/primitive-types` name), not that it resolves to the
+    RIGHT KIND (e.g. an InterfaceRealization's contract should be an
+    Interface specifically).
+  - Duplicate-member-name checking treats any two Operations sharing a
+    name on one Classifier as illegal, even though real UML permits
+    Operation overloading distinguished by parameter-list signature (sec
+    9.4.3) -- v1 does not compare signatures."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.coll :as set]
+            [kotoba.dsl.problem :as problem]
+            [uml.model :as m]))
+
+(def domain :uml)
+
+(defn- err  [code subject msg] (problem/problem domain :error code subject msg))
+(defn- warn [code subject msg] (problem/problem domain :warn code subject msg))
+
+;; --- dangling type/classifier references ---
+;;
+;; A Property's type (sec 9.9.17), an Operation Parameter's type (sec
+;; 9.9.13), a Generalization's general (sec 9.9.7), an Association
+;; memberEnd's type (sec 11.8.1.6), an InterfaceRealization's contract
+;; (sec 10.5.6), and a Dependency's client/supplier (sec 7.8.4) must all
+;; resolve to a known Classifier.
+
+(defn- known-names [pkg]
+  (into (set (keys (m/all-elements pkg))) m/primitive-types))
+
+(defn- unknown-ref [known nm] (when-not (contains? known nm) true))
+
+(defn dangling-type-problems [pkg]
+  (let [known (known-names pkg)]
+    (vec
+     (concat
+      (mapcat
+       (fn [c]
+         (let [cn (:uml/name c)]
+           (concat
+            (keep (fn [p] (when (unknown-ref known (:uml/type p))
+                            (err :uml/dangling-type-ref [cn (:uml/name p)]
+                                 (str cn "'s attribute " (:uml/name p) " has unknown type " (:uml/type p)))))
+                  (:uml/owned-attribute c []))
+            (keep (fn [e] (when (unknown-ref known (:uml/type e))
+                            (err :uml/dangling-type-ref [cn (:uml/name e)]
+                                 (str cn "'s association end " (:uml/name e) " has unknown type " (:uml/type e)))))
+                  (:uml/member-end c []))
+            (mapcat (fn [op]
+                      (keep (fn [p] (when (unknown-ref known (:uml/type p))
+                                      (err :uml/dangling-type-ref [cn (:uml/name op) (:uml/name p)]
+                                           (str cn "'s operation " (:uml/name op) " parameter " (:uml/name p)
+                                                " has unknown type " (:uml/type p)))))
+                            (:uml/owned-parameter op [])))
+                    (:uml/owned-operation c []))
+            (keep (fn [g] (when (unknown-ref known (:uml/general g))
+                            (err :uml/dangling-type-ref [cn (:uml/general g)]
+                                 (str cn "'s generalization references unknown general classifier " (:uml/general g)))))
+                  (:uml/generalization c []))
+            (keep (fn [iname] (when (unknown-ref known iname)
+                                 (err :uml/dangling-type-ref [cn iname]
+                                      (str cn " realizes unknown interface " iname))))
+                  (:uml/interface-realization c [])))))
+       (m/classifiers pkg))
+      (mapcat
+       (fn [d]
+         (let [dn (:uml/name d)]
+           (cond-> []
+             (unknown-ref known (:uml/client d))
+             (conj (err :uml/dangling-type-ref [dn (:uml/client d)]
+                        (str dn "'s client " (:uml/client d) " is unknown")))
+             (unknown-ref known (:uml/supplier d))
+             (conj (err :uml/dangling-type-ref [dn (:uml/supplier d)]
+                        (str dn "'s supplier " (:uml/supplier d) " is unknown"))))))
+       (m/dependencies pkg))))))
+
+;; --- generalization cycle (sec 9.9.7) ---
+;;
+;; A directly analogous check to xmile.validate/algebraic-loop-problems:
+;; same white/gray/black DFS cycle-detection technique, applied here to
+;; the Generalization graph (specific -> general edges) instead of the
+;; flow/aux equation-dependency graph.
+
+(defn- generalization-edges [pkg]
+  (into {} (for [c (m/classifiers pkg)]
+             [(:uml/name c) (mapv :uml/general (:uml/generalization c []))])))
+
+(defn generalization-cycle-problems [pkg]
+  (let [edges (generalization-edges pkg)
+        color (atom {})
+        cycle (atom nil)]
+    (letfn [(visit [n path]
+              (when-not @cycle
+                (case (get @color n :white)
+                  :black nil
+                  :gray (reset! cycle (conj path n))
+                  :white (do (swap! color assoc n :gray)
+                             (doseq [g (get edges n)] (visit g (conj path n)))
+                             (swap! color assoc n :black)))))]
+      (doseq [n (keys edges)] (visit n []))
+      (if @cycle
+        [(err :uml/generalization-cycle @cycle
+              (str "illegal generalization cycle (a classifier cannot directly or indirectly generalize itself): "
+                   (str/join " -> " @cycle)))]
+        []))))
+
+;; --- duplicate member names within one Classifier's own namespace ---
+
+(defn duplicate-member-problems [pkg]
+  (mapcat
+   (fn [c]
+     (let [names (concat (map :uml/name (:uml/owned-attribute c []))
+                          (map :uml/name (:uml/owned-operation c []))
+                          (map :uml/name (:uml/owned-literal c [])))
+           dupes (->> names frequencies (keep (fn [[n cnt]] (when (> cnt 1) n))) distinct)]
+       (map (fn [n]
+              (err :uml/duplicate-member [(:uml/name c) n]
+                   (str (:uml/name c) " declares more than one member named " n
+                        " (v1 does not distinguish Operations by parameter-list signature)")))
+            dupes)))
+   (m/classifiers pkg)))
+
+;; --- Interface owning an attribute (sec 10.4.3, sec 10.5.5.4) ---
+;;
+;; The real metamodel permits Interface::ownedAttribute (sec 10.5.5.4 lists
+;; it as an association end, and sec 10.4.3 explicitly discusses what it
+;; means semantically for a realizing BehavioredClassifier) -- so this is
+;; NOT a structural error per the spec. v1 flags it as a :warn anyway
+;; because the common class-diagram convention (and most UML tool
+;; palettes) treats Interfaces as operation-only contracts; this validator
+;; surfaces the deviation without calling it illegal.
+
+(defn interface-attribute-problems [pkg]
+  (keep (fn [i]
+          (when (seq (:uml/owned-attribute i []))
+            (warn :uml/interface-owns-attribute (:uml/name i)
+                  (str (:uml/name i) " (an Interface) owns " (count (:uml/owned-attribute i))
+                       " attribute(s) -- legal per sec 10.4.3/10.5.5.4, but unusual for a class-diagram "
+                       "contract that is conventionally operations-only"))))
+        (m/interfaces pkg)))
+
+;; --- Association structural sanity (sec 11.8.1.6 / 11.8.2.4) ---
+
+(defn association-end-count-problems [pkg]
+  (keep (fn [a]
+          (let [n (count (:uml/member-end a []))]
+            (when (< n 2)
+              (err :uml/too-few-association-ends (:uml/name a)
+                   (str (:uml/name a) " has " n " member end(s); sec 11.8.1.6 requires memberEnd [2..*]")))))
+        (m/associations pkg)))
+
+(defn association-class-disjoint-problems
+  "sec 11.8.2.4 disjoint_attributes_ends: an AssociationClass's owned
+  attributes and owned ends must not share names."
+  [pkg]
+  (keep (fn [ac]
+          (when (= :association-class (:uml/kind ac))
+            (let [attr-names (set (map :uml/name (:uml/owned-attribute ac [])))
+                  end-names (set (map :uml/name (:uml/member-end ac [])))
+                  overlap (set/intersection attr-names end-names)]
+              (when (seq overlap)
+                (err :uml/association-class-overlap (:uml/name ac)
+                     (str (:uml/name ac) "'s owned attributes and association ends share name(s) " overlap
+                          " -- sec 11.8.2.4 disjoint_attributes_ends requires them disjoint"))))))
+        (m/classifiers pkg)))
+
+(defn validate
+  "All problems for `pkg` (a uml.model Package, structural checks first)."
+  [pkg]
+  (vec (concat (dangling-type-problems pkg)
+               (generalization-cycle-problems pkg)
+               (duplicate-member-problems pkg)
+               (interface-attribute-problems pkg)
+               (association-end-count-problems pkg)
+               (association-class-disjoint-problems pkg))))
+
+(defn errors   [problems] (problem/errors domain problems))
+(defn warnings [problems] (problem/warnings domain problems))
+(defn valid?   [problems] (problem/valid? domain problems))
