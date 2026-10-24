@@ -1,0 +1,155 @@
+(ns websocket.frame-test
+  "The vectors are RFC 6455 §5.7 verbatim. They are the only frames in the
+  specification with both sides written out, so they are the only ones that
+  can tell an encoder that agrees with its own decoder from one that agrees
+  with the RFC."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [websocket.frame :as f]))
+
+(def hello (f/string->bytes "Hello"))
+
+;; ---------------------------------------------------------------- §5.7
+
+(deftest single-frame-unmasked-text
+  (let [bs (f/encode! {:opcode :text :payload hello})]
+    (is (= [0x81 0x05 0x48 0x65 0x6c 0x6c 0x6f] bs))
+    (let [r (f/decode bs)]
+      (is (= :ok (:status r)))
+      (is (= :text (get-in r [:frame :kind])))
+      (is (:fin? (:frame r)))
+      (is (false? (:masked? (:frame r))))
+      (is (= "Hello" (f/bytes->string (get-in r [:frame :payload])))))))
+
+(deftest single-frame-masked-text
+  ;; The mask key 0x37fa213d is the RFC's, so the ciphertext below is too.
+  (let [bs (f/encode! {:opcode :text :payload hello :mask-key [0x37 0xfa 0x21 0x3d]})]
+    (is (= [0x81 0x85 0x37 0xfa 0x21 0x3d 0x7f 0x9f 0x4d 0x51 0x58] bs))
+    (let [r (f/decode bs)]
+      (is (= :ok (:status r)))
+      (is (:masked? (:frame r)))
+      (is (= "Hello" (f/bytes->string (get-in r [:frame :payload])))
+          "decode must unmask; a caller should never see the masked bytes"))))
+
+(deftest fragmented-unmasked-text
+  (let [a (f/encode! {:opcode :text :fin? false :payload (f/string->bytes "Hel")})
+        b (f/encode! {:opcode :continuation :fin? true :payload (f/string->bytes "lo")})]
+    (is (= [0x01 0x03 0x48 0x65 0x6c] a))
+    (is (= [0x80 0x02 0x6c 0x6f] b))
+    (let [{:keys [frames rest]} (f/decode-all (into a b))]
+      (is (= [] rest))
+      (is (= [false true] (mapv :fin? frames)))
+      (is (= [:text :continuation] (mapv :kind frames)))
+      (is (= "Hello" (f/bytes->string (mapcat :payload frames)))))))
+
+(deftest unmasked-ping-and-masked-pong
+  (is (= [0x89 0x05 0x48 0x65 0x6c 0x6c 0x6f]
+         (f/encode! {:opcode :ping :payload hello})))
+  (is (= [0x8a 0x85 0x37 0xfa 0x21 0x3d 0x7f 0x9f 0x4d 0x51 0x58]
+         (f/encode! {:opcode :pong :payload hello :mask-key [0x37 0xfa 0x21 0x3d]}))))
+
+(deftest extended-lengths
+  (testing "256 bytes selects the 16-bit field (§5.7)"
+    (let [bs (f/encode! {:opcode :binary :payload (repeat 256 0)})]
+      (is (= [0x82 0x7E 0x01 0x00] (subvec bs 0 4)))
+      (is (= 256 (count (get-in (f/decode bs) [:frame :payload]))))))
+  (testing "64 KiB selects the 64-bit field (§5.7)"
+    (let [bs (f/encode! {:opcode :binary :payload (repeat 65536 0)})]
+      (is (= [0x82 0x7F 0x00 0x00 0x00 0x00 0x00 0x01 0x00 0x00] (subvec bs 0 10)))
+      (is (= 65536 (count (get-in (f/decode bs) [:frame :payload]))))))
+  (testing "125 is the last length that fits the 7-bit field"
+    (is (= [0x82 0x7D] (subvec (f/encode! {:opcode :binary :payload (repeat 125 0)}) 0 2))))
+  (testing "126 is the first that does not"
+    (is (= [0x82 0x7E 0x00 0x7E] (subvec (f/encode! {:opcode :binary :payload (repeat 126 0)}) 0 4)))))
+
+;; ------------------------------------------------------- streaming behaviour
+
+(deftest incomplete-input-is-not-an-error
+  (let [bs (f/encode! {:opcode :text :payload hello})]
+    (doseq [n (range 0 (count bs))]
+      (let [r (f/decode (subvec bs 0 n))]
+        (is (= :incomplete (:status r))
+            (str "a " n "-byte prefix of a 7-byte frame must be :incomplete, not :error"))
+        (is (pos? (:need r)))))
+    (is (= :ok (:status (f/decode bs))))))
+
+(deftest decode-all-keeps-the-tail
+  (let [a (f/encode! {:opcode :text :payload hello})
+        partial (subvec a 0 3)
+        {:keys [frames rest]} (f/decode-all (into a partial))]
+    (is (= 1 (count frames)))
+    (is (= partial rest) "the partial frame must survive for the next read")))
+
+;; --------------------------------------------------------------- rejections
+
+(deftest control-frames-are-bounded
+  (testing "encode refuses to build one"
+    (is (= :control-frame-too-long
+           (:reason (f/encode {:opcode :ping :payload (repeat 126 0)}))))
+    (is (= :fragmented-control-frame
+           (:reason (f/encode {:opcode :ping :fin? false})))))
+  (testing "decode refuses to accept one"
+    ;; Hand-built: ping, FIN, length 126. encode cannot produce this.
+    (is (= :control-frame-too-long (:reason (f/decode [0x89 0x7E 0x00 0x7E]))))
+    (is (= :fragmented-control-frame (:reason (f/decode [0x09 0x00]))))))
+
+(deftest reserved-opcodes-are-rejected
+  (doseq [op [0x3 0x4 0x5 0x6 0x7 0xB 0xC 0xD 0xE 0xF]]
+    (is (= :reserved-opcode (:reason (f/decode [(bit-or 0x80 op) 0x00])))
+        (str "opcode " op " is reserved by §5.2"))))
+
+(deftest non-minimal-lengths-are-rejected
+  (testing "a 16-bit field carrying a length that fit in 7 bits"
+    (is (= :non-minimal-length (:reason (f/decode (into [0x82 0x7E 0x00 0x05] (repeat 5 0)))))))
+  (testing "a 64-bit field carrying a length that fit in 16"
+    (is (= :non-minimal-length
+           (:reason (f/decode (into [0x82 0x7F 0 0 0 0 0 0 0x01 0x00] (repeat 256 0))))))))
+
+(deftest mask-is-its-own-inverse
+  (let [k [0x37 0xfa 0x21 0x3d]
+        p (vec (range 256))]
+    (is (= p (f/mask-payload k (f/mask-payload k p))))))
+
+;; -------------------------------------------------------------------- close
+
+(deftest close-payloads
+  (is (= {:code 1000 :reason ""} (f/parse-close (f/close-payload 1000))))
+  (is (= {:code 1002 :reason "protocol error"}
+         (f/parse-close (f/close-payload 1002 "protocol error"))))
+  (testing "an empty body is 1005, the code that may not appear on the wire"
+    (is (= {:code 1005 :reason ""} (f/parse-close []))))
+  (testing "a one-byte body is malformed (§5.5.1)"
+    (is (= :truncated-close-payload (:reason (f/parse-close [0x03])))))
+  (testing "a multi-byte UTF-8 reason survives the round trip"
+    (is (= "さようなら" (:reason (f/parse-close (f/close-payload 1000 "さようなら")))))))
+
+(deftest utf8-payload-round-trip
+  (doseq [s ["" "a" "Hello" "さようなら" "🌏 emoji" "mixed かな and ASCII"]]
+    (is (= s (f/bytes->string (f/string->bytes s))))
+    (let [bs (f/encode! {:opcode :text :payload (f/string->bytes s)})]
+      (is (= s (f/bytes->string (get-in (f/decode bs) [:frame :payload])))))))
+
+(deftest oversized-lengths-are-refused-not-guessed
+  (testing "the 64-bit MSB set is rejected on the byte, before any folding"
+    (is (= :length-msb-set
+           (:reason (f/decode [0x82 0x7F 0x80 0 0 0 0 0 0 0])))))
+  (testing "a length past 2^53 is refused rather than answered wrongly"
+    ;; 2^53 exactly: the first integer a ClojureScript number cannot
+    ;; distinguish from its successor.
+    (is (= :length-unrepresentable
+           (:reason (f/decode [0x82 0x7F 0x00 0x20 0x00 0x00 0x00 0x00 0x00 0x00])))))
+  (testing "a large but representable length is still just :incomplete"
+    (is (= :incomplete (:status (f/decode [0x82 0x7F 0 0 0 1 0 0 0 0]))))))
+
+(deftest sixty-four-bit-lengths-do-not-wrap
+  ;; The regression this library was nearly shipped with: ClojureScript takes
+  ;; a shift count mod 32, so a payload length of 65536 encoded with `>>> 48`
+  ;; came back as `>>> 16`, setting the third length byte to 1. The JVM
+  ;; computed it correctly, so a one-runtime suite called this green.
+  (doseq [n [65536 70000 131072]]
+    (let [header (subvec (f/encode! {:opcode :binary :payload (repeat n 0)}) 0 10)]
+      (is (= [0x82 0x7F 0x00 0x00 0x00 0x00] (subvec header 0 6))
+          (str "the four high length bytes of a " n "-byte frame must be zero"))
+      (is (= n (+ (* 65536 (nth header 7)) (* 256 (nth header 8)) (nth header 9)))
+          "and the low bytes must spell the length back")
+      (is (= n (count (get-in (f/decode (f/encode! {:opcode :binary :payload (repeat n 0)}))
+                              [:frame :payload])))))))
