@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.session` | `kotoba.session/src` | `session.adapters.datomic-kotoba`, `session.adapters.datomic-kotoba-cluster`, `session.adapters.edn-file`, `session.adapters.store` (Kotoba project library) |
 | `kotoba.senkyo` | `kotoba.senkyo/src` | `senkyo.authority`, `senkyo.datoms`, `senkyo.facts`, `senkyo.medium` (Kotoba project library) |
 | `kotoba.tetsuzuki` | `kotoba.tetsuzuki/src` | `tetsuzuki.catalog`, `tetsuzuki.coverage`, `tetsuzuki.deadline`, `tetsuzuki.ooyake` (Kotoba project library) |
 | `kotoba.sekisho` | `kotoba.sekisho/src` | `sekisho.account`, `sekisho.assurance`, `sekisho.browser`, `sekisho.didkey` (Kotoba project library) |
