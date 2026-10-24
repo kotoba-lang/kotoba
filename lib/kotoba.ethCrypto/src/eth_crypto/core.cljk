@@ -1,0 +1,861 @@
+(ns eth-crypto.core
+  "Standalone, dependency-free Ethereum crypto primitives: Keccak-256, EIP-55,
+  EIP-712 typed data, secp256k1 (sign / recover), RLP, and EIP-155 legacy +
+  EIP-1559 (type-2) transaction signing. No third-party dependencies on either
+  platform — only clojure.* + java.math.BigInteger under :clj, and js/BigInt
+  under :cljs.
+
+  PORTABILITY: the ENTIRE public API now works on BOTH :clj and :cljs. It did
+  not always — this file was :clj-only for its whole crypto half, with throwing
+  :cljs stubs, and the reasons were real rather than lazy. Recording what they
+  were and how each was closed, because the same traps apply to anyone porting
+  comparable code:
+
+      keccak256              Keccak-f[1600] needs REAL 64-bit lane ops (θ/ρ/π/χ/ι
+                             over 25×64-bit words), and cljs's bit-xor/bit-and/
+                             bit-shift-left compile to native JS bitwise
+                             operators, which ECMAScript defines on 32-BIT
+                             integers. Running the permutation with them would
+                             not fail to compile — it would silently truncate
+                             every lane and return a WRONG hash (wrong address,
+                             wrong selector, wrong signing digest, no error).
+                             CLOSED by eth-crypto.keccak, which carries lanes as
+                             js/BigInt (JS bitwise ops are defined on BigInt too).
+
+      secp256k1, RFC 6979    Needed java.math.BigInteger's modInverse/modPow for
+                             the EC point math, plus javax.crypto for HMAC.
+                             js/BigInt has arbitrary precision but NEITHER modular
+                             operation, and the browser's SubtleCrypto is async
+                             (which would make signing return a Promise and infect
+                             every caller). CLOSED by eth-crypto.secp256k1
+                             (extended Euclid + square-and-multiply) and
+                             eth-crypto.sha256 (pure-cljs SHA-256/HMAC — SHA-256
+                             is defined on 32-bit words, so unlike Keccak it is a
+                             natural fit for cljs).
+
+      EIP-712 values, RLP    Needed the above, plus a type-level distinction
+                             between a byte string and a list that vectors cannot
+                             express. CLOSED by eth-crypto.js-core; see its ns
+                             docstring for the byte-string representation and why
+                             RLP forces the question.
+
+  The two halves are held together by shared vectors, not by hope: the same
+  external references (the EIP-712 'Ether Mail' spec digest and signature, the
+  EIP-155 canonical worked example, viem's EIP-1559 vectors) gate both, so a
+  divergence turns one of the two suites red. Run the cljs side with
+  `kbb --backend sci --classpath src:test bin/run_tests.cljk`.
+
+  NOT CONSTANT-TIME, on either platform: BigInteger and BigInt arithmetic are
+  variable-time and `pt-mul` is a plain double-and-add. Fine for signing with a
+  key its owner controls; NOT suitable for a shared process signing for others.
+
+  KECCAK-256 IS NOT SHA3-256: this is Keccak-256 (the original Keccak
+  submission's pad10*1 padding — first pad byte 0x01, last byte |= 0x80), NOT the
+  NIST-finalized SHA3-256 (FIPS 202 padding, 0x06 domain-separated). Ethereum
+  uses the former. java.security's SHA3-256 provider (JDK 9+) implements the
+  LATTER and is NOT interchangeable, which is why Keccak-f[1600] is implemented
+  here directly rather than delegated to java.security.MessageDigest.
+
+  IMPLEMENTATION NOTE — why pure Clojure, not BouncyCastle (:clj side):
+  babashka is a GraalVM *native image*. It can only use Java classes baked into
+  the bb binary; arbitrary jars on the classpath are NOT loadable at runtime
+  (`java.security` exposes SHA3-256 but NOT Keccak-256, and any
+  `org.bouncycastle.*` import throws ClassNotFoundException). So Keccak-256 is
+  implemented here as the Keccak-f[1600] permutation, and secp256k1 ecrecover via
+  `java.math.BigInteger` (which IS available). Verified against the canonical
+  EIP-712 'Ether Mail' spec vector — see test/eth_crypto/test_eth_crypto.cljk.
+
+  Public API (all of it dual-platform):
+    keccak256           bytes -> 32 bytes (Keccak-256, NOT SHA3-256)
+    eip55-checksum      20-byte addr (or hex) -> EIP-55 mixed-case 0x string
+    encode-type / type-hash   EIP-712 canonical type string + its keccak
+    encode-data         types primary data -> ABI-encoded struct bytes
+    hash-struct         types primary data -> 32-byte hashStruct
+    domain-separator    domain-map -> 32-byte EIP712Domain hashStruct
+    eip712-digest       domain types primary message -> 32-byte signing digest
+    ecrecover           32-byte digest + 65-byte sig{r,s,v} -> 20-byte address
+    ecrecover-checksum  as above -> EIP-55 0x… string
+    private->public     32-byte privkey -> 64-byte uncompressed pubkey (no 0x04)
+    address-of-privkey  32-byte privkey -> EIP-55 0x… address
+    secp256k1-sign      privkey + digest -> {:r :s :recovery-id} (RFC 6979, low-s)
+    signature->bytes    {:r :s :recovery-id} -> 65-byte r‖s‖v
+    rlp-encode          byte-string / nested list -> canonical Ethereum RLP bytes
+    legacy-digest       tx -> 32-byte digest keccak(rlp(legacy payload))
+    sign-tx-legacy      tx + privkey -> 0x… raw signed EIP-155 legacy transaction
+    eip1559-digest      tx -> 32-byte digest keccak(0x02 || rlp(payload))
+    eip1559-raw         tx + {:r :s :recovery-id} -> 0x… raw signed type-2 tx
+    sign-tx-eip1559     tx + privkey -> 0x… raw signed EIP-1559 (type-2) transaction
+    raw-tx-hash         raw signed tx (hex/bytes) -> 0x… tx hash, pre-broadcast"
+  (:require [kotoba.lang.text :as str]
+            ;; cljs-only: the three namespaces that close the gaps which made
+            ;; this file's crypto half :clj-only (BigInt Keccak lanes, pure-cljs
+            ;; HMAC-SHA256 for RFC 6979, and modInverse/modPow for secp256k1).
+            #?@(:cljs [[eth-crypto.keccak :as kc]
+                       [eth-crypto.secp256k1 :as secp]
+                       [eth-crypto.js-core :as js-core]])))
+
+;; ─── hex / byte helpers — PORTABLE (:clj + :cljs) ─────────────────────
+;; NOTE: ClojureScript has no `byte-array` (confirmed absent from cljs.core —
+;; unlike int-array/long-array/double-array/object-array, which ARE defined
+;; there), so :clj keeps a real byte-array/aset-byte representation and :cljs
+;; uses a plain vector of 0..255 ints. bytes->hex is representation-agnostic
+;; (works over either via `seq`+`bit-and`, no #?() needed).
+
+(defn strip0x ^String [^String s]
+  (if (str/starts-with? s "0x") (subs s 2) s))
+
+(defn hex->bytes
+  "0x-prefixed (or bare) hex string -> bytes. Returns a real byte-array under
+  :clj; returns a vector of 0..255 ints under :cljs (no byte-array there).
+  Throws on an odd-length hex string -- an odd number of hex digits is
+  never valid encoded byte data, and `(quot (count s) 2)` would otherwise
+  silently drop the trailing nibble instead of erroring."
+  [s]
+  (let [s (strip0x s)]
+    (when (odd? (count s))
+      (throw (ex-info "eth-crypto: odd-length hex string" {:s s})))
+    (let [n (quot (count s) 2)]
+      #?(:clj
+         (let [out (byte-array n)]
+           (dotimes [i n]
+             (aset-byte out i (unchecked-byte (Integer/parseInt (subs s (* 2 i) (+ 2 (* 2 i))) 16))))
+           out)
+         :cljs
+         (mapv #(js/parseInt (subs s (* 2 %) (+ 2 (* 2 %))) 16) (range n))))))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn bytes->hex
+  "bytes (a :clj byte-array, or the :cljs vector-of-ints hex->bytes returns —
+  anything seq-able of 0..255/-128..127 ints works) -> lowercase hex string."
+  ^String [b]
+  (apply str
+         (mapcat (fn [x]
+                   (let [v (bit-and x 0xff)]
+                     [(nth hex-digits (bit-shift-right v 4))
+                      (nth hex-digits (bit-and v 0xf))]))
+                 (seq b))))
+
+(defn utf8
+  "UTF-8 bytes of a string. Real byte-array under :clj; vector of 0..255 ints
+  (via js/TextEncoder) under :cljs — same representation hex->bytes uses."
+  [^String s]
+  #?(:clj (.getBytes s "UTF-8")
+     :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+
+;; ─── Keccak-256 (Keccak-f[1600], Ethereum padding — NOT SHA3) ─────────
+;; :clj-only — see ns docstring (64-bit lane ops; cljs bitwise ops are 32-bit
+;; and would silently corrupt the hash rather than fail to compile).
+
+#?(:clj
+(do
+
+(def ^:private ^"[J" RC
+  (long-array
+   [0x0000000000000001 0x0000000000008082 (unchecked-long 0x800000000000808A)
+    (unchecked-long 0x8000000080008000) 0x000000000000808B 0x0000000080000001
+    (unchecked-long 0x8000000080008081) (unchecked-long 0x8000000000008009)
+    0x000000000000008A 0x0000000000000088 0x0000000080008009 0x000000008000000A
+    0x000000008000808B (unchecked-long 0x800000000000008B) (unchecked-long 0x8000000000008089)
+    (unchecked-long 0x8000000000008003) (unchecked-long 0x8000000000008002)
+    (unchecked-long 0x8000000000000080) 0x000000000000800A (unchecked-long 0x800000008000000A)
+    (unchecked-long 0x8000000080008081) (unchecked-long 0x8000000000008080)
+    0x0000000080000001 (unchecked-long 0x8000000080008008)]))
+
+;; rotation offsets r[x][y] at flat index x+5y
+(def ^:private ^"[I" ROT
+  (int-array
+   [0 1 62 28 27
+    36 44 6 55 20
+    3 10 43 25 39
+    41 45 15 21 8
+    18 2 61 56 14]))
+
+(defn- rotl64 [^long x ^long n]
+  (if (zero? n) x
+      (bit-or (bit-shift-left x n) (unsigned-bit-shift-right x (- 64 n)))))
+
+(defn- keccak-f! [^"[J" a]
+  (let [bc (long-array 5)
+        tmp (long-array 25)]
+    (dotimes [round 24]
+      ;; θ
+      (dotimes [x 5]
+        (aset bc x (bit-xor (aget a x) (aget a (+ x 5)) (aget a (+ x 10))
+                            (aget a (+ x 15)) (aget a (+ x 20)))))
+      (dotimes [x 5]
+        (let [d (bit-xor (aget bc (mod (+ x 4) 5))
+                         (rotl64 (aget bc (mod (+ x 1) 5)) 1))]
+          (dotimes [y 5]
+            (aset a (+ x (* 5 y)) (bit-xor (aget a (+ x (* 5 y))) d)))))
+      ;; ρ + π : tmp[y, 2x+3y] = rot(a[x,y], r[x,y])
+      (dotimes [x 5]
+        (dotimes [y 5]
+          (let [i (+ x (* 5 y))
+                j (+ y (* 5 (mod (+ (* 2 x) (* 3 y)) 5)))]
+            (aset tmp j (rotl64 (aget a i) (aget ROT i))))))
+      ;; χ
+      (dotimes [y 5]
+        (dotimes [x 5]
+          (aset a (+ x (* 5 y))
+                (bit-xor (aget tmp (+ x (* 5 y)))
+                         (bit-and (bit-not (aget tmp (+ (mod (+ x 1) 5) (* 5 y))))
+                                  (aget tmp (+ (mod (+ x 2) 5) (* 5 y))))))))
+      ;; ι
+      (aset a 0 (bit-xor (aget a 0) (aget RC round))))
+    a))
+
+(defn keccak256 ^"[B" [^"[B" input]
+  (let [rate 136                          ; 1088 bits = 256-bit output
+        a (long-array 25)
+        len (alength input)
+        padlen (- rate (mod len rate))
+        total (+ len padlen)
+        msg (byte-array total)]
+    (System/arraycopy input 0 msg 0 len)
+    ;; original-Keccak pad10*1: first pad byte 0x01, last byte |= 0x80
+    (aset-byte msg len (unchecked-byte 0x01))
+    (aset-byte msg (dec total)
+               (unchecked-byte (bit-or (bit-and (aget msg (dec total)) 0xff) 0x80)))
+    (loop [off 0]
+      (when (< off total)
+        (dotimes [i (quot rate 8)]
+          (let [base (+ off (* i 8))
+                lane (loop [k 0 acc 0]
+                       (if (< k 8)
+                         (recur (inc k)
+                                (bit-or acc (bit-shift-left
+                                             (bit-and (aget msg (+ base k)) 0xff) (* 8 k))))
+                         acc))]
+            (aset a i (bit-xor (aget a i) lane))))
+        (keccak-f! a)
+        (recur (+ off rate))))
+    (let [out (byte-array 32)]
+      (dotimes [i 4]
+        (let [lane (aget a i)]
+          (dotimes [k 8]
+            (aset-byte out (+ (* i 8) k)
+                       (unchecked-byte (bit-and (unsigned-bit-shift-right lane (* 8 k)) 0xff))))))
+      out)))
+
+)) ;; end #?(:clj (do …)) — Keccak-256
+
+;; ClojureScript Keccak-256: 64-bit lanes on js/BigInt, in eth-crypto.keccak.
+;; The hazard the earlier stub warned about is real and is why that namespace
+;; exists rather than a naive port: cljs bit-and/bit-shift-left compile to native
+;; JS bitwise operators, which ECMAScript defines on 32-BIT integers, so running
+;; Keccak-f[1600]'s 64-bit permutation with them would not fail to compile — it
+;; would silently truncate every lane and return a wrong hash (a wrong address, a
+;; wrong selector, a wrong signing digest, no error anywhere).
+#?(:cljs
+   (defn keccak256
+     "Keccak-256 (Ethereum's, NOT SHA3-256). Returns a vector of 32 ints."
+     [input]
+     (kc/keccak256 input)))
+
+;; ─── EIP-55 checksum address — PORTABLE (pure string/hex logic) ──────
+;; Calls keccak256 (above), so on :cljs this compiles fine but throws at call
+;; time via keccak256's stub — only the HASH COMPUTATION is :clj-only, not
+;; this formatting logic.
+
+(def ^:private hex-val (zipmap (seq "0123456789abcdef") (range 16)))
+(def ^:private hex-upper (zipmap (seq "abcdef") (seq "ABCDEF")))
+
+(defn eip55-checksum
+  "EIP-55 mixed-case checksum of a 20-byte address (bytes, or a 0x/bare hex
+  string). Uppercases each hex letter of the lowercase address whose
+  corresponding keccak256(lowercase-address-string) hex nibble is >= 8."
+  ^String [addr]
+  (let [b (if (string? addr) (hex->bytes addr) addr)
+        lower (bytes->hex b)                          ; 40 lowercase hex chars
+        hash (bytes->hex (keccak256 (utf8 lower)))]
+    (apply str "0x"
+           (map (fn [i]
+                  (let [c (nth lower i)
+                        h (get hex-val (nth hash i))]
+                    (if (and (>= h 8) (contains? hex-upper c))
+                      (get hex-upper c)
+                      c)))
+                (range (count lower))))))
+
+;; ─── EIP-712 typed-data encoder ──────────────────────────────────────
+;; types : {typeName(str) [{:name str :type str} ...]}
+;; data  : {fieldName(str) value}
+;;
+;; encode-type/find-deps/type-hash (canonical type-string + its keccak) are
+;; PORTABLE (encode-type/find-deps are pure clojure.string; type-hash just
+;; calls the already-defined keccak256, :clj-only per above). Everything that
+;; encodes struct VALUES (uint->32, encode-field, encode-data, hash-struct,
+;; domain-separator, eip712-digest) needs java.math.BigInteger and is
+;; :clj-only, wrapped below.
+
+(defn- find-deps [types primary]
+  (let [seen (atom #{})]
+    (letfn [(go [t]
+              (when (and (contains? types t) (not (@seen t)))
+                (swap! seen conj t)
+                (doseq [{:keys [type]} (get types t)]
+                  (go (str/replace type #"\[.*\]" "")))))]
+      (go primary)
+      @seen)))
+
+(defn encode-type ^String [types primary]
+  (let [deps (disj (find-deps types primary) primary)
+        ordered (cons primary (sort deps))]
+    (apply str
+           (map (fn [t]
+                  (str t "("
+                       (str/join "," (map #(str (:type %) " " (:name %)) (get types t)))
+                       ")"))
+                ordered))))
+
+(defn type-hash [types primary]
+  (keccak256 (utf8 (encode-type types primary))))
+
+#?(:clj
+(do
+
+(defn- ^"[B" pad-left-32 [^"[B" b]
+  (let [n (alength b) out (byte-array 32)]
+    (System/arraycopy b 0 out (- 32 n) n)
+    out))
+
+(defn- ^"[B" concat-bytes [arrays]
+  (let [total (reduce (fn [^long n ^"[B" a] (+ n (alength a))) 0 arrays)
+        out (byte-array total)]
+    (loop [off 0 ps arrays]
+      (if (seq ps)
+        (let [^"[B" p (first ps)]
+          (System/arraycopy p 0 out off (alength p))
+          (recur (+ off (alength p)) (rest ps)))
+        out))))
+
+(declare encode-data)
+
+(defn- ^"[B" uint->32 [v]
+  (let [^"[B" ba (.toByteArray (biginteger v))   ; big-endian, two's-complement
+        n (alength ba)]
+    (cond
+      (= n 32) ba
+      (< n 32) (pad-left-32 ba)
+      :else (let [out (byte-array 32)]              ; n=33 leading sign byte
+              (System/arraycopy ba (- n 32) out 0 32) out))))
+
+(defn- ^"[B" encode-field [types type value]
+  (cond
+    (contains? types type) (keccak256 (encode-data types type value))   ; nested struct
+    (= type "string")  (keccak256 (utf8 value))
+    (= type "bytes")   (keccak256 (if (string? value) (hex->bytes value) value))
+    (= type "bytes32") (pad-left-32 (if (string? value) (hex->bytes value) value))
+    (= type "address") (pad-left-32 (if (string? value) (hex->bytes value) value))
+    (= type "bool")    (uint->32 (if value 1 0))
+    (str/starts-with? type "uint") (uint->32 value)
+    (str/starts-with? type "int")  (uint->32 value)
+    :else (throw (ex-info (str "unsupported EIP-712 type: " type) {:type type}))))
+
+(defn encode-data ^"[B" [types primary data]
+  (concat-bytes
+   (cons (type-hash types primary)
+         (map (fn [{:keys [name type]}] (encode-field types type (get data name)))
+              (get types primary)))))
+
+(defn hash-struct ^"[B" [types primary data]
+  (keccak256 (encode-data types primary data)))
+
+(def ^:private EIP712-DOMAIN-TYPE
+  {"EIP712Domain" [{:name "name" :type "string"}
+                   {:name "version" :type "string"}
+                   {:name "chainId" :type "uint256"}
+                   {:name "verifyingContract" :type "address"}]})
+
+(defn domain-separator ^"[B" [domain]
+  (hash-struct EIP712-DOMAIN-TYPE "EIP712Domain" domain))
+
+(defn eip712-digest ^"[B" [domain types primary message]
+  (let [ds (domain-separator domain)
+        hs (hash-struct types primary message)
+        pre (byte-array 66)]
+    (aset-byte pre 0 (unchecked-byte 0x19))
+    (aset-byte pre 1 (unchecked-byte 0x01))
+    (System/arraycopy ds 0 pre 2 32)
+    (System/arraycopy hs 0 pre 34 32)
+    (keccak256 pre)))
+
+;; ─── secp256k1 ecrecover (via BigInteger) ────────────────────────────
+
+(def ^:private ^BigInteger SECP-P
+  (BigInteger. "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F" 16))
+(def ^:private ^BigInteger SECP-N
+  (BigInteger. "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141" 16))
+(def ^:private ^BigInteger SECP-N-HALF (.shiftRight SECP-N 1))
+(def ^:private ^BigInteger SECP-B (BigInteger/valueOf 7))
+(def ^:private ^BigInteger SECP-GX
+  (BigInteger. "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798" 16))
+(def ^:private ^BigInteger SECP-GY
+  (BigInteger. "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8" 16))
+(def ^:private G [SECP-GX SECP-GY])
+
+;; affine point [x y] (BigInteger), nil = point at infinity. y² = x³ + 7 over Fp.
+(defn- pt-add [p1 p2]
+  (cond
+    (nil? p1) p2
+    (nil? p2) p1
+    :else
+    (let [[x1 y1] p1 [x2 y2] p2]
+      (if (and (= x1 x2) (= (.mod (.add ^BigInteger y1 ^BigInteger y2) SECP-P) BigInteger/ZERO))
+        nil                                          ; P + (−P) = ∞
+        (let [m (if (and (= x1 x2) (= y1 y2))
+                  (.mod (.multiply (.multiply (BigInteger/valueOf 3) (.multiply x1 x1))
+                                   (.modInverse (.multiply (BigInteger/valueOf 2) y1) SECP-P)) SECP-P)
+                  (.mod (.multiply (.subtract y2 y1)
+                                   (.modInverse (.subtract x2 x1) SECP-P)) SECP-P))
+              x3 (.mod (.subtract (.subtract (.multiply m m) x1) x2) SECP-P)
+              y3 (.mod (.subtract (.multiply m (.subtract x1 x3)) y1) SECP-P)]
+          [x3 y3])))))
+
+(defn- pt-mul [^BigInteger k pt]
+  (loop [k k acc nil base pt]
+    (if (= k BigInteger/ZERO)
+      acc
+      (recur (.shiftRight k 1)
+             (if (.testBit k 0) (pt-add acc base) acc)
+             (pt-add base base)))))
+
+(defn- ^BigInteger mod-sqrt
+  "√a mod p for p ≡ 3 (mod 4) (secp256k1 prime)."
+  [^BigInteger a]
+  (.modPow a (.divide (.add SECP-P BigInteger/ONE) (BigInteger/valueOf 4)) SECP-P))
+
+(defn- decompress [^BigInteger x y-odd?]
+  (let [y2 (.mod (.add (.modPow x (BigInteger/valueOf 3) SECP-P) SECP-B) SECP-P)
+        y (mod-sqrt y2)
+        y (if (= (.testBit y 0) (boolean y-odd?)) y (.subtract SECP-P y))]
+    [x y]))
+
+(defn ecrecover-pubkey
+  "Recover the signer's **public key** from a 32-byte `digest` and a 65-byte
+  `sig` (r‖s‖v). Returns the 64-byte uncompressed point X‖Y, without the
+  `0x04` prefix — the same shape `private->public` returns.
+
+  Ethereum hashes this with keccak and keeps the last 20 bytes, which is what
+  `ecrecover` does. Other chains do not: a Filecoin `f1` address is
+  BLAKE2b-160 of the **65-byte** form, `0x04` ‖ this. So recovery and address
+  derivation are separate steps, and only the first is the curve's business."
+  ^"[B" [^"[B" digest ^"[B" sig]
+  (let [r (BigInteger. 1 (java.util.Arrays/copyOfRange sig 0 32))
+        s (BigInteger. 1 (java.util.Arrays/copyOfRange sig 32 64))
+        v (bit-and (aget sig 64) 0xff)
+        rec-id (if (>= v 27) (- v 27) v)
+        e (BigInteger. 1 digest)
+        x (.add r (.multiply SECP-N (BigInteger/valueOf (long (bit-shift-right rec-id 1)))))
+        R (decompress x (odd? (bit-and rec-id 1)))
+        r-inv (.modInverse r SECP-N)
+        ;; Q = r⁻¹ (sR − eG)
+        sR (pt-mul s R)
+        eG (pt-mul e G)
+        neg-eG [(first eG) (.mod (.negate ^BigInteger (second eG)) SECP-P)]
+        Q (pt-mul r-inv (pt-add sR neg-eG))
+        [qx qy] Q
+        pub (byte-array 64)]
+    (System/arraycopy (pad-left-32 (let [^"[B" b (.toByteArray ^BigInteger qx)]
+                                     (if (> (alength b) 32)
+                                       (java.util.Arrays/copyOfRange b (- (alength b) 32) (alength b)) b)))
+                      0 pub 0 32)
+    (System/arraycopy (pad-left-32 (let [^"[B" b (.toByteArray ^BigInteger qy)]
+                                     (if (> (alength b) 32)
+                                       (java.util.Arrays/copyOfRange b (- (alength b) 32) (alength b)) b)))
+                      0 pub 32 32)
+    pub))
+
+(defn ecrecover
+  "Recover the signer's 20-byte address from a 32-byte EIP-712 `digest` and a
+  65-byte `sig` (r‖s‖v). v ∈ {27,28} (or {0,1}); recovery id = v mod 27."
+  ^"[B" [^"[B" digest ^"[B" sig]
+  (java.util.Arrays/copyOfRange (keccak256 (ecrecover-pubkey digest sig)) 12 32))
+
+(defn ecrecover-checksum
+  "ecrecover then EIP-55 checksum the recovered address."
+  ^String [^"[B" digest ^"[B" sig]
+  (eip55-checksum (ecrecover digest sig)))
+
+;; ─── public key / address from private key ───────────────────────────
+
+(defn private->public
+  "secp256k1 public key from a 32-byte private key. Returns the 64-byte
+  uncompressed point X‖Y (WITHOUT the 0x04 prefix), i.e. keccak256 of this is
+  the address preimage."
+  ^"[B" [^"[B" privkey]
+  (let [d (BigInteger. 1 privkey)
+        [qx qy] (pt-mul d G)
+        pub (byte-array 64)]
+    (System/arraycopy (uint->32 qx) 0 pub 0 32)
+    (System/arraycopy (uint->32 qy) 0 pub 32 32)
+    pub))
+
+(defn- valid-secp256k1-point? [[x y]]
+  (and x y
+       (pos? (.signum ^BigInteger x))
+       (pos? (.signum ^BigInteger y))
+       (< (.compareTo ^BigInteger x SECP-P) 0)
+       (< (.compareTo ^BigInteger y SECP-P) 0)
+       (= (.mod (.multiply ^BigInteger y y) SECP-P)
+          (.mod (.add (.modPow ^BigInteger x
+                               (BigInteger/valueOf 3) SECP-P)
+                      SECP-B)
+                SECP-P))))
+
+(defn- decode-secp256k1-public-key [pubkey]
+  (try
+    (let [length (alength ^bytes pubkey)
+          prefix (when (pos? length) (bit-and (aget ^bytes pubkey 0) 0xff))
+          point
+          (cond
+            (and (= length 33) (contains? #{2 3} prefix))
+            (let [x (BigInteger. 1
+                                 (java.util.Arrays/copyOfRange
+                                  ^bytes pubkey 1 33))]
+              (when (< (.compareTo x SECP-P) 0)
+                (decompress x (= prefix 3))))
+
+            (and (= length 65) (= prefix 4))
+            [(BigInteger. 1
+                          (java.util.Arrays/copyOfRange ^bytes pubkey 1 33))
+             (BigInteger. 1
+                          (java.util.Arrays/copyOfRange ^bytes pubkey 33 65))]
+
+            :else nil)]
+      (when (and point (valid-secp256k1-point? point)) point))
+    (catch Exception _ nil)))
+
+(defn secp256k1-low-s?
+  "Whether an ECDSA `s` scalar is in Bitcoin/Ethereum's lower half order."
+  [s]
+  (let [s (if (instance? BigInteger s) s (biginteger s))]
+    (and (pos? (.signum ^BigInteger s))
+         (<= (.compareTo ^BigInteger s SECP-N-HALF) 0))))
+
+(defn secp256k1-verify
+  "Verify an ECDSA signature map `{:r :s}` over a 32-byte digest.
+
+  Accepts SEC compressed (33-byte) and uncompressed (65-byte, 0x04-prefixed)
+  public keys. Encoding policy such as strict DER or low-S belongs to the
+  calling protocol and is intentionally separate from curve verification."
+  [^bytes digest {:keys [r s]} ^bytes pubkey]
+  (try
+    (boolean
+     (let [r (if (instance? BigInteger r) r (biginteger r))
+           s (if (instance? BigInteger s) s (biginteger s))
+           q (decode-secp256k1-public-key pubkey)]
+       (and (= 32 (alength digest))
+            q
+            (pos? (.signum ^BigInteger r))
+            (pos? (.signum ^BigInteger s))
+            (< (.compareTo ^BigInteger r SECP-N) 0)
+            (< (.compareTo ^BigInteger s SECP-N) 0)
+            (let [z (BigInteger. 1 digest)
+                  w (.modInverse ^BigInteger s SECP-N)
+                  u1 (.mod (.multiply z w) SECP-N)
+                  u2 (.mod (.multiply ^BigInteger r w) SECP-N)
+                  result (pt-add (pt-mul u1 G) (pt-mul u2 q))]
+              (and result
+                   (= r (.mod ^BigInteger (first result) SECP-N)))))))
+    (catch Exception _ false)))
+
+(defn address-of-privkey
+  "EIP-55 checksummed 0x… address controlled by a 32-byte private key:
+  last 20 bytes of keccak256(uncompressed-pubkey-without-04-prefix)."
+  ^String [^"[B" privkey]
+  (eip55-checksum
+   (java.util.Arrays/copyOfRange (keccak256 (private->public privkey)) 12 32)))
+
+;; ─── deterministic ECDSA signing (RFC 6979 + EIP-2 low-s) ────────────
+
+(defn- ^"[B" hmac-sha256 [^"[B" key ^"[B" data]
+  (let [mac (javax.crypto.Mac/getInstance "HmacSHA256")]
+    (.init mac (javax.crypto.spec.SecretKeySpec. key "HmacSHA256"))
+    (.doFinal mac data)))
+
+(defn secp256k1-sign
+  "Deterministic ECDSA signature over secp256k1 of a 32-byte `digest` with a
+  32-byte `privkey`, using an RFC 6979 (HMAC-SHA256) nonce and EIP-2 low-s
+  normalization (s ≤ n/2). Returns {:r BigInteger :s BigInteger :recovery-id 0|1}.
+  Pure java.math.BigInteger + javax.crypto HMAC (both available in babashka)."
+  [^"[B" privkey ^"[B" digest]
+  (let [n SECP-N
+        z (BigInteger. 1 digest)               ; bits2int(h1), 256-bit
+        d (BigInteger. 1 privkey)
+        hsize 32
+        x-oct (uint->32 d)                     ; int2octets(x)
+        h-oct (uint->32 (.mod z n))            ; bits2octets(h1)
+        b00 (byte-array 1)                     ; single 0x00
+        b01 (byte-array [(unchecked-byte 1)])  ; single 0x01
+        ;; RFC 6979 3.2 steps b–g
+        V0 (byte-array hsize (unchecked-byte 1))
+        K0 (byte-array hsize (unchecked-byte 0))
+        K1 (hmac-sha256 K0 (concat-bytes [V0 b00 x-oct h-oct]))
+        V1 (hmac-sha256 K1 V0)
+        K2 (hmac-sha256 K1 (concat-bytes [V1 b01 x-oct h-oct]))
+        V2 (hmac-sha256 K2 V1)]
+    ;; step h: HMAC-SHA256 output is 32 bytes = qlen/8, so one block == T
+    (loop [K K2 V V2]
+      (let [T (hmac-sha256 K V)
+            k (BigInteger. 1 T)
+            result
+            (when (and (>= (.signum k) 1) (< (.compareTo k n) 0))
+              (let [[rx ry] (pt-mul k G)
+                    r (.mod rx n)]
+                (when-not (= r BigInteger/ZERO)
+                  (let [s (.mod (.multiply (.modInverse k n)
+                                           (.add z (.multiply r d))) n)]
+                    (when-not (= s BigInteger/ZERO)
+                      (let [rec (bit-or (if (.testBit ^BigInteger ry 0) 1 0)
+                                        (if (>= (.compareTo rx n) 0) 2 0))]
+                        (if (> (.compareTo s SECP-N-HALF) 0)
+                          {:r r :s (.subtract n s) :recovery-id (bit-xor rec 1)}
+                          {:r r :s s :recovery-id rec})))))))]
+        (or result
+            (let [K' (hmac-sha256 K (concat-bytes [T b00]))
+                  V' (hmac-sha256 K' T)]
+              (recur K' V')))))))
+
+;; ─── RLP encoding (canonical Ethereum) ───────────────────────────────
+
+(defn- ^"[B" uint->minimal
+  "Minimal big-endian byte-string of a non-negative integer (0 → empty)."
+  [v]
+  (let [bi (biginteger v)]
+    (if (= bi BigInteger/ZERO)
+      (byte-array 0)
+      (let [^"[B" b (.toByteArray bi)]
+        (if (and (> (alength b) 1) (zero? (aget b 0)))
+          (java.util.Arrays/copyOfRange b 1 (alength b))   ; strip sign byte
+          b)))))
+
+(defn- ^"[B" rlp-prefix
+  "RLP length prefix. `offset` is 0x80 (byte-string) or 0xc0 (list)."
+  [^long offset ^long len]
+  (if (< len 56)
+    (byte-array [(unchecked-byte (+ offset len))])
+    (let [len-bytes (uint->minimal len)]
+      (concat-bytes [(byte-array [(unchecked-byte (+ offset 55 (alength len-bytes)))])
+                     len-bytes]))))
+
+(defn rlp-encode
+  "Canonical recursive RLP. `item` is a byte-array (byte-string) or a sequential
+  collection of items (list). Returns the RLP bytes."
+  ^"[B" [item]
+  (if (sequential? item)
+    (let [payload (concat-bytes (map rlp-encode item))]
+      (concat-bytes [(rlp-prefix 0xc0 (alength payload)) payload]))
+    (let [^"[B" b item
+          n (alength b)]
+      (if (and (= n 1) (< (bit-and (aget b 0) 0xff) 0x80))
+        b                                              ; single byte < 0x80 → itself
+        (concat-bytes [(rlp-prefix 0x80 n) b])))))
+
+;; ─── EIP-155 legacy transaction signing ──────────────────────────────
+
+(defn- ^"[B" ->num-bytes
+  "Coerce an int / 0x-hex string / bytes numeric field to its minimal RLP
+  big-endian byte-string."
+  [v]
+  (uint->minimal
+   (cond
+     (nil? v)     BigInteger/ZERO
+     (number? v)  (biginteger v)
+     (string? v)  (let [s (strip0x v)] (if (empty? s) BigInteger/ZERO (BigInteger. s 16)))
+     :else        (BigInteger. 1 ^"[B" v))))
+
+(defn- ^"[B" ->byte-str
+  "Coerce a 0x-hex string / bytes / nil opaque field (address, data) to bytes."
+  [v]
+  (cond
+    (nil? v)    (byte-array 0)
+    (string? v) (hex->bytes v)
+    :else       v))
+
+(defn legacy-digest
+  "The 32-byte digest an EIP-155 legacy transaction is signed over:
+  keccak256(rlp([nonce, gasPrice, gas, to, value, data, chainId, 0, 0])).
+
+  The legacy counterpart of `eip1559-digest`, and exposed for the same reason: a
+  signer that does not hold the key in this process (hardware wallet, passkey,
+  remote KMS) needs the digest, not the key."
+  ^"[B" [tx]
+  (let [{:keys [nonce gas-price gas to value data chain-id]} tx
+        empty-b (byte-array 0)]
+    (keccak256
+     (rlp-encode [(->num-bytes nonce) (->num-bytes gas-price) (->num-bytes gas)
+                  (->byte-str to) (->num-bytes value) (->byte-str data)
+                  (->num-bytes chain-id) empty-b empty-b]))))
+
+(defn sign-tx-legacy
+  "Sign an EIP-155 legacy transaction. `tx` is a map with keys
+  :nonce :gas-price :gas :to :value :data :chain-id (each an int, 0x-hex string,
+  or bytes; :to/:data are opaque byte-strings, the rest are numbers). Returns the
+  0x… RLP-encoded raw signed transaction hex ready for eth_sendRawTransaction."
+  ^String [tx ^"[B" privkey]
+  (let [{:keys [nonce gas-price gas to value data chain-id]} tx
+        nonce-b (->num-bytes nonce)
+        gp-b    (->num-bytes gas-price)
+        gas-b   (->num-bytes gas)
+        to-b    (->byte-str to)
+        value-b (->num-bytes value)
+        data-b  (->byte-str data)
+        chain-b (->num-bytes chain-id)
+        {:keys [r s recovery-id]} (secp256k1-sign privkey (legacy-digest tx))
+        cid (BigInteger. 1 (let [b chain-b] (if (zero? (alength b)) (byte-array 1) b)))
+        v (.add (.add (BigInteger/valueOf recovery-id)
+                      (.multiply (BigInteger/valueOf 2) cid))
+                (BigInteger/valueOf 35))
+        raw (rlp-encode [nonce-b gp-b gas-b to-b value-b data-b
+                         (->num-bytes v) (->num-bytes r) (->num-bytes s)])]
+    (str "0x" (bytes->hex raw))))
+
+;; ─── EIP-1559 (type-2) transaction signing ───────────────────────────
+;; EIP-2718 typed envelope: TransactionType 0x02 || rlp(payload). Unlike a
+;; legacy tx, the chain id is a FIRST-CLASS payload field (not folded into v),
+;; and the signature's parity is a plain yParity 0/1 — the EIP-155
+;; v = recovery-id + chainId*2 + 35 arithmetic does NOT apply here.
+
+(def eip1559-tx-type
+  "EIP-2718 TransactionType byte for an EIP-1559 tx."
+  0x02)
+
+(defn- access-list-items
+  "Access list -> RLP item structure [[address20 [slot32 …]] …]. Accepts
+  {:address … :storage-keys […]} (also tolerates the JSON-ish :storageKeys /
+  string keys an RPC response hands back). nil / empty -> empty RLP list (0xc0)."
+  [access-list]
+  (mapv (fn [entry]
+          (let [address (or (:address entry) (get entry "address"))
+                slots (or (:storage-keys entry) (:storageKeys entry)
+                          (get entry "storageKeys") (get entry "storage-keys") [])]
+            [(->byte-str address) (mapv ->byte-str slots)]))
+        (or access-list [])))
+
+(defn- eip1559-payload-items
+  "The 9 signed payload fields of an EIP-1559 tx, in EIP-1559 order."
+  [tx]
+  (let [{:keys [chain-id nonce max-priority-fee-per-gas max-fee-per-gas
+                gas to value data access-list]} tx]
+    [(->num-bytes chain-id)
+     (->num-bytes nonce)
+     (->num-bytes max-priority-fee-per-gas)
+     (->num-bytes max-fee-per-gas)
+     (->num-bytes gas)
+     (->byte-str to)
+     (->num-bytes value)
+     (->byte-str data)
+     (access-list-items access-list)]))
+
+(defn eip1559-digest
+  "The 32-byte digest an EIP-1559 tx is signed over:
+  keccak256(0x02 || rlp([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas,
+  gas, to, value, data, accessList])). Exposed separately from
+  `sign-tx-eip1559` so a signer that does NOT hold the key in this process
+  (hardware wallet, passkey/WebAuthn, remote KMS) can be handed the digest."
+  ^"[B" [tx]
+  (keccak256 (concat-bytes [(byte-array [(unchecked-byte eip1559-tx-type)])
+                            (rlp-encode (eip1559-payload-items tx))])))
+
+(defn eip1559-raw
+  "Assemble the raw signed EIP-1559 tx from `tx` and an already-computed
+  signature {:r :s :recovery-id} (recovery-id IS the yParity here — 0 or 1).
+  Split out from `sign-tx-eip1559` so an out-of-process signer's r/s/parity can
+  be assembled into a broadcastable tx without re-signing."
+  ^String [tx {:keys [r s recovery-id]}]
+  (let [raw (concat-bytes
+             [(byte-array [(unchecked-byte eip1559-tx-type)])
+              (rlp-encode (conj (eip1559-payload-items tx)
+                                (->num-bytes recovery-id)
+                                (->num-bytes r)
+                                (->num-bytes s)))])]
+    (str "0x" (bytes->hex raw))))
+
+(defn sign-tx-eip1559
+  "Sign an EIP-1559 (type-2) transaction. `tx` is a map with keys :chain-id
+  :nonce :max-priority-fee-per-gas :max-fee-per-gas :gas :to :value :data
+  :access-list (numbers may be ints / 0x-hex / bytes; :to and :data are opaque
+  byte-strings; :access-list is a seq of {:address … :storage-keys […]} and may
+  be omitted). Returns the 0x… EIP-2718-enveloped raw signed transaction hex,
+  ready for eth_sendRawTransaction."
+  ^String [tx ^"[B" privkey]
+  (eip1559-raw tx (secp256k1-sign privkey (eip1559-digest tx))))
+
+(defn signature->bytes
+  "`{:r :s :recovery-id}` (what `secp256k1-sign` returns) -> the 65-byte
+  `r‖s‖v` signature, `v = recovery-id + 27`.
+
+  Exists because every consumer of a signature needs this exact layout —
+  `ecrecover`, an EIP-2612 `permit` call, an `eth_signTypedData` response — and
+  assembling it by hand at each call site is 3 lines of byte copying that is
+  wrong in a way nothing catches until a signature fails to verify."
+  ^"[B" [{:keys [r s recovery-id]}]
+  (let [out (byte-array 65)]
+    (System/arraycopy (uint->32 r) 0 out 0 32)
+    (System/arraycopy (uint->32 s) 0 out 32 32)
+    (aset-byte out 64 (unchecked-byte (+ recovery-id 27)))
+    out))
+
+(defn raw-tx-hash
+  "keccak256 of a raw (already signed) transaction — i.e. the transaction hash
+  a node will report, computable BEFORE broadcasting. Works for both legacy and
+  EIP-2718-typed raw txs (the typed envelope is hashed including its type byte).
+  Accepts the 0x… hex string `sign-tx-legacy`/`sign-tx-eip1559` return, or bytes."
+  ^String [raw]
+  (str "0x" (bytes->hex (keccak256 (->byte-str raw)))))
+
+)) ;; end #?(:clj (do …)) — EIP-712 values / secp256k1 / RLP / tx signing
+
+;; ClojureScript: the same public API, REAL (no longer throwing stubs).
+;;
+;; Implemented in three cljs-only namespaces this branch delegates to, because
+;; the two gaps that made this half :clj-only were specific and are now closed:
+;;   eth-crypto.keccak     — Keccak-f[1600] with 64-bit lanes on js/BigInt
+;;                           (JS bitwise ops are 32-bit and would have silently
+;;                           computed a WRONG hash — see the ns docstring above)
+;;   eth-crypto.sha256     — pure-cljs SHA-256 + HMAC-SHA256 for RFC 6979
+;;                           (javax.crypto has no cljs equivalent, and the
+;;                           browser's SubtleCrypto is async, which would make
+;;                           signing return a Promise and infect every caller)
+;;   eth-crypto.secp256k1  — point arithmetic + RFC 6979 + recovery, with
+;;                           modInverse/modPow implemented (BigInt has neither)
+;; plus eth-crypto.js-core for EIP-712 value encoding, RLP and tx assembly.
+;;
+;; Byte strings on this side are vectors of ints 0..255 at the public boundary
+;; (matching hex->bytes above), converted at the edge for the internals; see
+;; js-core's ns docstring for why RLP in particular needs a type-level
+;; distinction between a byte string and a list.
+;;
+;; Both halves are verified against the SAME external vectors — the EIP-712
+;; 'Ether Mail' spec digest and signature, the EIP-155 canonical worked example,
+;; and viem's EIP-1559 vectors — so a divergence turns one of the two suites red.
+#?(:cljs
+(do
+  (defn encode-data [types primary data]
+    (vec (js-core/encode-data types primary data encode-type)))
+  (defn hash-struct [types primary data]
+    (vec (js-core/hash-struct types primary data encode-type)))
+  (defn domain-separator [domain]
+    (vec (js-core/domain-separator domain encode-type)))
+  (defn eip712-digest [domain types primary message]
+    (vec (js-core/eip712-digest domain types primary message encode-type)))
+  (defn ecrecover-pubkey [digest sig] (secp/ecrecover-pubkey digest sig))
+  (defn ecrecover [digest sig] (secp/ecrecover digest sig))
+  (defn ecrecover-checksum [digest sig] (eip55-checksum (secp/ecrecover digest sig)))
+  (defn private->public [privkey] (secp/private->public privkey))
+  (defn secp256k1-low-s? [s] (secp/low-s? s))
+  (defn secp256k1-verify [digest signature pubkey]
+    (secp/verify digest signature pubkey))
+  (defn address-of-privkey [privkey] (eip55-checksum (secp/address-bytes privkey)))
+  (defn secp256k1-sign [privkey digest] (secp/sign privkey digest))
+  (defn rlp-encode [item] (vec (js-core/rlp-encode item)))
+  (defn legacy-digest [tx] (vec (js-core/legacy-digest tx)))
+  (defn sign-tx-legacy [tx privkey] (js-core/sign-tx-legacy tx privkey))
+  (def eip1559-tx-type js-core/eip1559-tx-type)
+  (defn eip1559-digest [tx] (vec (js-core/eip1559-digest tx)))
+  (defn eip1559-raw [tx sig] (js-core/eip1559-raw tx sig))
+  (defn sign-tx-eip1559 [tx privkey] (js-core/sign-tx-eip1559 tx privkey))
+  (defn signature->bytes [sig] (js-core/signature->bytes sig))
+  (defn raw-tx-hash [raw] (js-core/raw-tx-hash raw))))
