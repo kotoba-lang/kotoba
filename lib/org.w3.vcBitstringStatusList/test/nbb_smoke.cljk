@@ -1,0 +1,144 @@
+;; nbb smoke test — proves the :cljs branch of this library is real.
+;;
+;; The JVM suite cannot cover it, and this library has already been bitten once by
+;; exactly the divergence it is checking: `multiformats.core/base64url-decode`
+;; returns a byte-array on :clj whose bytes are SIGNED, so the gzip magic 0x8b
+;; arrived as -117 and a perfectly good member was rejected as "bad magic". On
+;; :cljs it returns unsigned ints and the same code path was fine. A status list
+;; that one host can write and the other cannot read is a revocation that silently
+;; stops working.
+;;
+;; The encodedList is also a SIGNED value (it sits inside a
+;; BitstringStatusListCredential), so a host that gzips differently produces a
+;; credential the other host's verifier rejects.
+;;
+;;   npm install
+;;   npm run smoke
+(ns nbb-smoke
+  (:require [deflate.core :as deflate]
+            [multiformats.core :as mf]
+            [status-list.core :as sl]))
+
+(def ^:private failures (atom 0))
+
+(defn- check [label expected actual]
+  (if (= expected actual)
+    (println "  ok  " label)
+    (do (swap! failures inc)
+        (println "  FAIL" label "\n        expected:" (pr-str expected)
+                 "\n        actual:  " (pr-str actual)))))
+
+(def list-url "https://issuer.example/status/1")
+
+(defn- entry-for
+  ([index] (entry-for index {}))
+  ([index opts]
+   (sl/entry (merge {:index index :status-list-credential list-url} opts))))
+
+(defn- list-cred
+  ([encoded] (list-cred encoded {}))
+  ([encoded opts]
+   (sl/status-list-credential
+    (merge {:id list-url :issuer "did:example:issuer" :encoded-list encoded} opts))))
+
+(println "status-list :cljs smoke")
+
+;; §3.2 step 2 — the 16 KiB / 131,072-entry floor.
+(let [bits (sl/expand (sl/generate {}))]
+  (check "empty list is 16 KiB" 16384 (count bits))
+  (check "…which is 131072 bits" 131072 (* 8 (count bits)))
+  (check "…and all zeros" true (every? zero? bits)))
+
+;; §3.1 — bit 0 is the MOST significant bit of byte 0. Read as the least
+;; significant bit the list still decodes and reports the WRONG credentials as
+;; revoked, so this is pinned directly rather than inferred from a round trip.
+(check "index 0 sets 0x80" 0x80 (first (sl/expand (sl/generate #{0}))))
+(check "index 7 sets 0x01" 0x01 (first (sl/expand (sl/generate #{7}))))
+(check "index 8 lands in byte 1" [0x00 0x80]
+       (vec (take 2 (sl/expand (sl/generate #{8})))))
+
+;; The gzip/base64url round trip — the exact path where the signed-byte bug lived.
+(let [encoded (sl/generate #{0 1 7 8 9 4095 131071})
+      cred (list-cred encoded)]
+  (check "encodedList is multibase base64url" "u" (subs encoded 0 1))
+  (check "no base64 padding" false (boolean (re-find #"=" encoded)))
+  (check "url alphabet, not standard base64" false
+         (boolean (re-find #"[+/]" encoded)))
+  (check "payload is a real gzip member" [0x1f 0x8b]
+         (vec (take 2 (map #(bit-and % 0xff)
+                           (mf/base64url-decode (subs encoded 1))))))
+  (check "set indices read back as revoked"
+         [1 1 1 1 1 1 1]
+         (mapv #(:status (sl/check-status (entry-for %) cred))
+               [0 1 7 8 9 4095 131071]))
+  (check "clear indices read back as valid"
+         [0 0 0 0 0]
+         (mapv #(:status (sl/check-status (entry-for %) cred))
+               [2 3 6 10 4096])))
+
+;; The cross-host invariant. Pinned identically in test/status_list/core_test.cljk:
+;; the encodedList sits inside a SIGNED credential, so if the two hosts ever gzip
+;; or base64url differently, one issues a status list the other's verifier
+;; rejects — and both suites would still pass on their own.
+(check "matches the value :clj produces, byte for byte"
+       "uH4sIAAAAAAAA_-3BAQ0AAAgDoNtcm1vDTWA6_FUBAAAAAAAAAAAAAAAAAADghAUtkbYtAEAAAA"
+       (sl/generate #{0 7 8 4095}))
+
+;; Determinism: the encodedList sits inside a signed credential, so an unchanged
+;; list must re-encode identically or the issuer's signature changes for nothing.
+(check "generate is deterministic" true
+       (= (sl/generate #{1 2 3}) (sl/generate #{3 2 1})))
+(check "…and a map form agrees with a set form" true
+       (= (sl/generate {4 1}) (sl/generate #{4})))
+
+;; A mostly-empty 16 KiB list has to compress, or the privacy floor would cost
+;; ~22 KB per fetch.
+(check "a one-revocation list stays small" true
+       (< (count (sl/generate #{7})) 1000))
+
+;; Multi-bit status: §3.2 step 9's index * statusSize.
+(let [messages [{"status" "0x0" "message" "valid"}
+                {"status" "0x1" "message" "invalid"}
+                {"status" "0x2" "message" "pending_review"}
+                {"status" "0x3" "message" "revoked_for_cause"}]
+      encoded (sl/generate {0 3, 1 1, 2 0, 3 2} {:status-size 2})
+      cred (list-cred encoded {:status-size 2 :purpose "message"})
+      at (fn [i] (sl/check-status (entry-for i {:purpose "message" :status-size 2
+                                                :status-message messages})
+                                  cred))]
+  (check "multi-bit values" [3 1 0 2] (mapv #(:status (at %)) [0 1 2 3]))
+  (check "statusMessage names the value" "revoked_for_cause" (:message (at 0)))
+  (check "only status 0 is valid" [false false true false]
+         (mapv #(:valid? (at %)) [0 1 2 3])))
+
+;; Fail-closed paths must match :clj, or the hosts accept different lists.
+(check "a short list is refused at generation" :threw
+       (try (sl/generate #{1} {:entries 1024}) :no-throw (catch :default _ :threw)))
+(check "a short list is refused at validation" :threw
+       (try (sl/check-status
+             (entry-for 1)
+             (list-cred (str "u" (mf/base64url (deflate/gzip (vec (repeat 1024 0)))))))
+            :no-throw (catch :default _ :threw)))
+(check "a purpose mismatch is refused" :threw
+       (try (sl/check-status (entry-for 1 {:purpose "revocation"})
+                             (list-cred (sl/generate #{1}) {:purpose "suspension"}))
+            :no-throw (catch :default _ :threw)))
+(check "a non-multibase encodedList is refused" :threw
+       (try (sl/expand (subs (sl/generate #{1}) 1)) :no-throw
+            (catch :default _ :threw)))
+(check "an index past the list is refused" :threw
+       (try (sl/generate {131072 1}) :no-throw (catch :default _ :threw)))
+(check "a value too large for statusSize is refused" :threw
+       (try (sl/generate {1 2}) :no-throw (catch :default _ :threw)))
+
+;; statusListIndex is a base-10 STRING per spec — it is an arbitrary-size integer
+;; and a JSON number cannot carry one faithfully. cljs would happily hand back a
+;; number here if `entry` used one.
+(check "statusListIndex is a string" true (string? (get (entry-for 94567) "statusListIndex")))
+(check "…with the right value" "94567" (get (entry-for 94567) "statusListIndex"))
+
+(println (if (zero? @failures)
+           "all status-list :cljs checks passed"
+           (str @failures " status-list :cljs check(s) FAILED")))
+(when (pos? @failures)
+  (throw (js/Error. (str @failures " failure(s)"))))
