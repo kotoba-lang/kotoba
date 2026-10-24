@@ -88,6 +88,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.musicxml` | `kotoba.musicxml/src` | `kotoba.musicxml`, `musicxml.core` (Kotoba project library) |
 | `kotoba.mstProjector` | `kotoba.mstProjector/src` | `kotoba.lang.mst-projector.cli`, `kotoba.lang.mst-projector.indexer`, `kotoba.lang.mst-projector.mem-index`, `kotoba.lang.mst-projector.query-api` (Kotoba project library) |
 | `kotoba.mokuroku` | `kotoba.mokuroku/src` | `mokuroku.catalog`, `mokuroku.command`, `mokuroku.inspector`, `mokuroku.item` (Kotoba project library) |
 | `kotoba.modelChecking` | `kotoba.modelChecking/src` | `model-checking`, `model-checking.assertion`, `model-checking.coverage`, `model-checking.equivalence` (Kotoba project library) |
