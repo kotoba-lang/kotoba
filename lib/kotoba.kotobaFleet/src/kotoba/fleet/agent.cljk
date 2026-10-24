@@ -1,0 +1,83 @@
+(ns kotoba.fleet.agent
+  "Agent-side claim loop — the other half of the fleet from the governor.
+
+  A coding agent uses this to: pull an OPEN work-unit, optimistically lease it,
+  run the injected `run` fn (its actual coding work), and submit the result as a
+  `:proposal/*` for the governor to materialize. It never writes to git and never
+  takes a lock: if it loses the lease race it just backs off. The lease is HELD
+  through the proposal so no other agent touches the same unit while the governor
+  decides; it is released after a no-op or once a receipt lands (see `complete!`).
+
+  `run` is the injection seam: a mock in tests, and in production the **nbb**
+  sandbox agent (`hosts/nbb/fleet/sandbox_agent.cljk`), run on a murakumo fleet
+  node. It was the JVM `kotoba-code` session until 2026-07-25; the nbb host is
+  canonical now (owner decision), which also puts the fleet on the runtime the
+  repo prefers — kotoba-code remains a JVM-side implementation of the same
+  durable-loop design (ADR-2606280001), not the fleet's runtime."
+  (:require [kotoba.fleet.governor :as gov]
+            [kotoba.fleet.lease :as lease]
+            [kotoba.fleet.schema :as schema]
+            [kotoba.fleet.store :as store]))
+
+(defn- work-entities
+  [db]
+  (->> (store/datoms db)
+       (keep (fn [[e a]] (when (= "work" (namespace a)) e)))
+       distinct
+       (mapv #(store/entity db %))))
+
+(defn enqueue!
+  "Append an OPEN work-unit (a repo / module / file-set to be done). Returns id."
+  [db {:keys [unit created-by]}]
+  (let [{:keys [t]} (store/transact-with-t!
+                     db
+                     (fn [t]
+                       (schema/entity->datoms
+                        {:work/id (str "work|" unit "|" t) :work/unit unit
+                         :work/state :open :work/created-by created-by :work/t t}
+                        t)))]
+    (str "work|" unit "|" t)))
+
+(defn open-work
+  "Open work-units with no active lease at `now` — free for an agent to claim."
+  [db now]
+  (->> (work-entities db)
+       (filter #(= :open (:work/state %)))
+       (remove #(lease/holder db (:work/unit %) now))
+       (sort-by :work/t)))
+
+(defn claim-and-propose!
+  "Lease `unit` for `agent`, run `(run unit)` → payload, and submit that payload
+  as a proposal. Returns:
+    {:status :proposed  :proposal-id id}  — won the lease and proposed a write
+    {:status :contended :holder h}        — lost the lease race; backed off
+    {:status :no-op}                      — won, but `run` produced nothing (released)
+  The lease is kept on :proposed (governor decides next); released on :no-op."
+  [db {:keys [unit agent ttl-ms now run]}]
+  (let [c (lease/claim! db {:work unit :agent agent :ttl-ms ttl-ms :now now})]
+    (if-not (:ok c)
+      {:status :contended :holder (:holder c)}
+      (let [payload (run unit)]
+        (if (nil? payload)
+          (do (lease/release! db {:work unit :agent agent :now now})
+              {:status :no-op})
+          {:status :proposed
+           :proposal-id (gov/submit-proposal! db {:work unit :agent agent :payload payload})})))))
+
+(defn complete!
+  "Release `agent`'s lease on `unit` once the governor has receipted its proposal
+  (materialized or held) — frees the unit for the next round."
+  [db {:keys [unit agent now]}]
+  (lease/release! db {:work unit :agent agent :now now}))
+
+(defn close-work!
+  "Mark a work-unit `:done` (append-only) so it drops out of `open-work` — called
+  once its proposal has materialized. Without this a durable driver would re-pick
+  the same unit every round. Returns {:closed work-id} or nil if unknown."
+  [db unit]
+  (when-let [wid (->> (work-entities db)
+                      (filter #(= unit (:work/unit %)))
+                      first
+                      :work/id)]
+    (store/transact-with-t! db (fn [t] [[wid :work/state :done t]]))
+    {:closed wid}))

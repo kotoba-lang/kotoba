@@ -1,0 +1,97 @@
+(ns kiss.core
+  "KISS framing (the TNC protocol of Chepponis & Karn, 1987) — how a host
+  talks to a radio modem over a serial line, USB or BLE UART.
+
+      frame = FEND ++ command ++ escaped data ++ FEND
+      FEND 0xC0   FESC 0xDB   TFEND 0xDC   TFESC 0xDD
+      command = port (high nibble) ++ type (low nibble); type 0 = data
+
+  The decoder is a byte-at-a-time state machine, because serial reads split
+  frames anywhere. Garbage between frames, empty frames and a dangling escape
+  are dropped, not raised: a radio line is noisy by nature.
+
+  ## Radio commands
+
+  Beyond data (type 0) and the classic TXDELAY..FULLDUPLEX (1–5), this
+  library defines the radio-parameter commands a LoRa modem needs, on types
+  8–14, each carrying a big-endian integer. They are *this project's* modem
+  protocol, documented here; they make no claim of compatibility with any
+  other firmware.
+
+      8 frequency Hz (u32)   9 bandwidth Hz (u32)   10 spreading factor (u8)
+      11 coding rate 5..8 (u8)   12 tx power dBm (u8)   13 radio on/off (u8)
+      14 status report (modem → host): rssi, snr, airtime used (u16 each)")
+
+(def FEND 0xC0)
+(def FESC 0xDB)
+(def TFEND 0xDC)
+(def TFESC 0xDD)
+
+(def commands
+  {:data 0 :txdelay 1 :persistence 2 :slottime 3 :txtail 4 :fullduplex 5
+   :frequency 8 :bandwidth 9 :spreading-factor 10 :coding-rate 11 :tx-power 12
+   :radio 13 :status 14 :return 15})
+
+(def command-of (into {} (map (fn [[k v]] [v k])) commands))
+
+(defn escape [data]
+  (into [] (mapcat (fn [b] (cond (= b FEND) [FESC TFEND]
+                                 (= b FESC) [FESC TFESC]
+                                 :else [b])))
+        data))
+
+(defn frame
+  "One KISS frame for `data` on `port` (0–15) with command `cmd`."
+  ([data] (frame 0 :data data))
+  ([port cmd data]
+   (let [c (if (keyword? cmd) (get commands cmd) cmd)]
+     (into (into [FEND (+ (* 16 port) c)] (escape data)) [FEND]))))
+
+(defn- be [n width] (vec (for [i (range (dec width) -1 -1)] (bit-and (quot n (Math/pow 256 i)) 0xff))))
+
+(defn radio-command
+  "A frame setting one radio parameter."
+  [port param value]
+  (frame port param (case param
+                      (:frequency :bandwidth) (be value 4)
+                      (:spreading-factor :coding-rate :tx-power :radio
+                       :txdelay :persistence :slottime :txtail :fullduplex) [value])))
+
+;; ---------------------------------------------------------------------------
+;; Streaming decoder
+
+(defn decoder [] {:state :idle :buf [] :escaped? false})
+
+(defn- finish [d frames]
+  (let [[cmd & data] (:buf d)]
+    [(assoc d :buf [] :escaped? false :state :in-frame)
+     (if cmd
+       (conj frames {:port (quot cmd 16) :command (command-of (rem cmd 16) (rem cmd 16))
+                     :data (vec data)})
+       frames)]))
+
+(defn feed
+  "Consume bytes. Answers `[decoder frames]`."
+  [d bs]
+  (reduce
+   (fn [[d frames] b]
+     (case (:state d)
+       :idle (if (= b FEND) [(assoc d :state :in-frame :buf []) frames] [d frames])
+       :in-frame
+       (cond
+         (= b FEND) (finish d frames)
+         (:escaped? d) (let [v (cond (= b TFEND) FEND (= b TFESC) FESC :else nil)]
+                         (if v
+                           [(-> d (update :buf conj v) (assoc :escaped? false)) frames]
+                           ;; protocol violation: drop the frame
+                           [(assoc d :state :idle :buf [] :escaped? false) frames]))
+         (= b FESC) [(assoc d :escaped? true) frames]
+         :else [(update d :buf conj b) frames])))
+   [d []]
+   bs))
+
+(defn parse-status [data]
+  (when (= 6 (count data))
+    (let [u16 (fn [i] (+ (* 256 (nth data i)) (nth data (inc i))))
+          s16 (fn [v] (if (>= v 32768) (- v 65536) v))]
+      {:rssi (s16 (u16 0)) :snr (/ (s16 (u16 2)) 4) :airtime-ms (u16 4)})))

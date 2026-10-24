@@ -1,0 +1,251 @@
+;; Target-independent GMIR input/refusal data. Collections and long text do
+;; not pass through bounded generic documents. Reader/caller integration is
+;; explicit remaining work; this module is not a parser or validator.
+(ns kotoba.gmir.node
+  {:kotoba/export [text string-text empty-text text-chunks text-count text-at text-equal? text-slice text-valid? text-compare-utf16
+                   empty-children chunk node kind number namespace-of name-of pages child-count child
+                   nil-value bool-value i64-value integer-value f64-bits-value string-value bytes-value
+                   keyword-parts symbol-parts keyword-literal keyword-is? same-name? has-namespace?
+                   empty-vector empty-list empty-set empty-map append key has-key? put-key]}
+  (:schemas
+   {:gmir.node/text [:record :gmir.node/text [[:chunks [:list :bytes]]]]
+    :gmir.node/chunk [:record :gmir.node/chunk [[:items [:list [:ref :gmir.node/value]]]]]
+    :gmir.node/value [:record :gmir.node/value
+      [[:kind :keyword] [:number :i64] [:namespace [:option [:ref :gmir.node/text]]]
+       [:name [:ref :gmir.node/text]] [:children [:list [:ref :gmir.node/chunk]]]]]}))
+
+(defn text [chunks [:list :bytes]] [:ref :gmir.node/text]
+  (record-new [:ref :gmir.node/text] chunks))
+(defn empty-text [] [:ref :gmir.node/text] (text (typed-list-new [:list :bytes])))
+(defn string-text [value :string] [:ref :gmir.node/text]
+  (text (typed-list-conj [:list :bytes] (typed-list-new [:list :bytes]) (string-to-utf8 value))))
+(defn text-chunks [value [:ref :gmir.node/text]] [:list :bytes]
+  (record-get [:ref :gmir.node/text] value :chunks))
+(defn text-count [value [:ref :gmir.node/text]] :i64
+  (arena-scope (let [all (text-chunks value)]
+    (loop [index 0 count 0]
+      (if (>= index (vector-count all)) count
+        (recur (+ index 1) (+ count (bytes-count (typed-list-nth [:list :bytes] all index)))))))))
+
+;; -1 is outside the text, never a byte. No unchecked access or zero fallback.
+(defn text-at [value [:ref :gmir.node/text] index :i64] :i64
+  (arena-scope (if (< index 0) -1
+    (let [all (text-chunks value)]
+      (loop [chunk 0 left index]
+        (if (>= chunk (vector-count all)) -1
+          (let [payload (typed-list-nth [:list :bytes] all chunk) n (bytes-count payload)]
+            (if (< left n) (bytes-at payload left) (recur (+ chunk 1) (- left n))))))))))
+(defn text-equal? [left [:ref :gmir.node/text] right [:ref :gmir.node/text]] :bool
+  (arena-scope (let [a (text-chunks left) b (text-chunks right)]
+    (loop [ac 0 ao 0 bc 0 bo 0]
+      (if (>= ac (vector-count a))
+        (if (>= bc (vector-count b)) true
+          (let [payload (typed-list-nth [:list :bytes] b bc)]
+            (if (>= bo (bytes-count payload)) (recur ac ao (+ bc 1) 0) false)))
+        (let [ap (typed-list-nth [:list :bytes] a ac)]
+          (if (>= ao (bytes-count ap)) (recur (+ ac 1) 0 bc bo)
+            (if (>= bc (vector-count b)) false
+              (let [bp (typed-list-nth [:list :bytes] b bc)]
+                (if (>= bo (bytes-count bp)) (recur ac ao (+ bc 1) 0)
+                  (if (= (bytes-at ap ao) (bytes-at bp bo))
+                    (recur ac (+ ao 1) bc (+ bo 1)) false)))))))))))
+(defn text-slice [value [:ref :gmir.node/text] start :i64 end :i64] [:option [:ref :gmir.node/text]]
+  (if (or (< start 0) (< end start) (> end (text-count value)))
+    (option-none-of [:option [:ref :gmir.node/text]])
+    (let [all (text-chunks value)]
+      (loop [index 0 position 0 out (typed-list-new [:list :bytes])]
+        (if (or (>= index (vector-count all)) (>= position end))
+          (option-some-of [:option [:ref :gmir.node/text]] (text out))
+          (let [payload (typed-list-nth [:list :bytes] all index) n (bytes-count payload)
+                left (if (> start position) (- start position) 0)
+                right (if (< end (+ position n)) (- end position) n)]
+            (recur (+ index 1) (+ position n)
+              (if (< left right) (typed-list-conj [:list :bytes] out (bytes-slice payload left right)) out))))))))
+
+(defn- continuation? [value :i64] :bool (arena-scope (and (>= value 128) (<= value 191))))
+;; A scalar and its width packed into one positive word; -1 is malformed.
+;; Text bytes may cross any source-chunk boundary, including empty chunks.
+(defn- scalar-at [value [:ref :gmir.node/text] index :i64] :i64
+  (arena-scope (let [a (text-at value index) b (text-at value (+ index 1))
+        c (text-at value (+ index 2)) d (text-at value (+ index 3))]
+    (cond
+      (and (>= a 0) (< a 128)) (+ (* a 8) 1)
+      (and (>= a 194) (<= a 223) (continuation? b))
+      (+ (* (+ (* (bit-and a 31) 64) (bit-and b 63)) 8) 2)
+      (and (>= a 224) (<= a 239) (continuation? b) (continuation? c))
+      (let [code (+ (* (bit-and a 15) 4096) (* (bit-and b 63) 64) (bit-and c 63))]
+        (if (and (>= code 2048) (or (< code 55296) (> code 57343))) (+ (* code 8) 3) -1))
+      (and (>= a 240) (<= a 244) (continuation? b) (continuation? c) (continuation? d))
+      (let [code (+ (* (bit-and a 7) 262144) (* (bit-and b 63) 4096)
+                    (* (bit-and c 63) 64) (bit-and d 63))]
+        (if (and (>= code 65536) (<= code 1114111)) (+ (* code 8) 4) -1))
+      :else -1))))
+(defn text-valid? [value [:ref :gmir.node/text]] :bool
+  (arena-scope (let [length (text-count value)]
+    (loop [index 0]
+      (if (>= index length) true
+        (let [scalar (scalar-at value index)]
+          (if (< scalar 0) false (recur (+ index (bit-and scalar 7))))))))))
+(defn- first-utf16-unit [scalar :i64] :i64
+  (arena-scope (if (< scalar 65536) scalar (+ 55296 (quot (- scalar 65536) 1024)))))
+;; UTF-16 code-unit order for the reference's Named/String comparison.
+;; This is deliberately different from UTF-8 byte order for astral vs BMP.
+;; Canonical UTF-8 excludes lone surrogate scalars; two astral scalars with
+;; the same high surrogate are ordered by their scalar/low-surrogate value.
+(defn text-compare-utf16 [left [:ref :gmir.node/text] right [:ref :gmir.node/text]] [:option :i64]
+  (if (not (and (text-valid? left) (text-valid? right))) (option-none-of [:option :i64])
+    (let [a-length (text-count left) b-length (text-count right)]
+      (loop [a 0 b 0]
+        (cond
+          (>= a a-length) (option-some-of [:option :i64] (if (>= b b-length) 0 -1))
+          (>= b b-length) (option-some-of [:option :i64] 1)
+          :else
+          (let [ap (scalar-at left a) bp (scalar-at right b)
+                ac (quot ap 8) bc (quot bp 8)
+                au (first-utf16-unit ac) bu (first-utf16-unit bc)]
+            (cond
+              (not= au bu) (option-some-of [:option :i64] (if (< au bu) -1 1))
+              (not= ac bc) (option-some-of [:option :i64] (if (< ac bc) -1 1))
+              :else (recur (+ a (bit-and ap 7)) (+ b (bit-and bp 7))))))))))
+
+(defn empty-children [] [:list [:ref :gmir.node/chunk]]
+  (typed-list-new [:list [:ref :gmir.node/chunk]]))
+(defn chunk [items [:list [:ref :gmir.node/value]]] [:ref :gmir.node/chunk]
+  (record-new [:ref :gmir.node/chunk] items))
+(defn node [tag :keyword bits :i64 ns [:option [:ref :gmir.node/text]] name [:ref :gmir.node/text]
+            children [:list [:ref :gmir.node/chunk]]] [:ref :gmir.node/value]
+  (record-new [:ref :gmir.node/value] tag bits ns name children))
+(defn kind [value [:ref :gmir.node/value]] :keyword (record-get [:ref :gmir.node/value] value :kind))
+(defn number [value [:ref :gmir.node/value]] :i64 (arena-scope (record-get [:ref :gmir.node/value] value :number)))
+(defn namespace-of [value [:ref :gmir.node/value]] [:option [:ref :gmir.node/text]]
+  (record-get [:ref :gmir.node/value] value :namespace))
+(defn has-namespace? [value [:ref :gmir.node/value]] :bool
+  (arena-scope (option-some?-of [:option [:ref :gmir.node/text]] (namespace-of value))))
+(defn name-of [value [:ref :gmir.node/value]] [:ref :gmir.node/text]
+  (record-get [:ref :gmir.node/value] value :name))
+(defn pages [value [:ref :gmir.node/value]] [:list [:ref :gmir.node/chunk]]
+  (record-get [:ref :gmir.node/value] value :children))
+(defn child-count [value [:ref :gmir.node/value]] :i64
+  (arena-scope (let [all (pages value)]
+    (loop [index 0 count 0]
+      (if (>= index (vector-count all)) count
+        (let [page (typed-list-nth [:list [:ref :gmir.node/chunk]] all index)]
+          (recur (+ index 1) (+ count (vector-count (record-get [:ref :gmir.node/chunk] page :items))))))))))
+(defn- atom-value [tag :keyword bits :i64 name [:ref :gmir.node/text]] [:ref :gmir.node/value]
+  (node tag bits (option-none-of [:option [:ref :gmir.node/text]]) name (empty-children)))
+(defn nil-value [] [:ref :gmir.node/value] (atom-value :nil 0 (empty-text)))
+(defn bool-value [value :bool] [:ref :gmir.node/value] (atom-value :bool (if value 1 0) (empty-text)))
+(defn i64-value [value :i64] [:ref :gmir.node/value] (atom-value :i64 value (empty-text)))
+(defn integer-value [decimal [:ref :gmir.node/text]] [:ref :gmir.node/value]
+  (atom-value :integer 0 decimal))
+(defn f64-bits-value [bits :i64] [:ref :gmir.node/value] (atom-value :f64 bits (empty-text)))
+(defn string-value [value [:ref :gmir.node/text]] [:ref :gmir.node/value] (atom-value :string 0 value))
+(defn bytes-value [value [:ref :gmir.node/text]] [:ref :gmir.node/value] (atom-value :bytes 0 value))
+(defn keyword-parts [ns [:option [:ref :gmir.node/text]] name [:ref :gmir.node/text]] [:ref :gmir.node/value]
+  (node :keyword 0 ns name (empty-children)))
+(defn symbol-parts [ns [:option [:ref :gmir.node/text]] name [:ref :gmir.node/text]] [:ref :gmir.node/value]
+  (node :symbol 0 ns name (empty-children)))
+
+;; A convenience for reader-canonical native keyword literals. Arbitrary
+;; host interning with an embedded slash in a *name* must use keyword-parts
+;; with its actual namespace/name, not this printed-spelling adapter.
+;; Only the bounded atom enters a generic document, never a program/text body.
+(defn keyword-literal [value :keyword] [:ref :gmir.node/value]
+  (let [spelling (document-edn-print (document-keyword value))
+        end (string-byte-length spelling) slash (string-index-of spelling "/")]
+    (if (or (< slash 0) (string=? spelling ":/"))
+      (keyword-parts (option-none-of [:option [:ref :gmir.node/text]])
+        (string-text (string-substring spelling 1 end)))
+      (keyword-parts (option-some-of [:option [:ref :gmir.node/text]]
+                       (string-text (string-substring spelling 1 slash)))
+        (string-text (string-substring spelling (+ slash 1) end))))))
+(defn same-name? [left [:ref :gmir.node/value] right [:ref :gmir.node/value]] :bool
+  (arena-scope (let [a (namespace-of left) b (namespace-of right)]
+    (and (or (= (kind left) :keyword) (= (kind left) :symbol))
+         (= (kind left) (kind right))
+         (= (has-namespace? left) (has-namespace? right))
+         (option-match [:option [:ref :gmir.node/text]] a (not (has-namespace? right))
+           left-ns (option-match [:option [:ref :gmir.node/text]] b false
+                     right-ns (text-equal? left-ns right-ns)))
+         (text-equal? (name-of left) (name-of right))))))
+
+;; Compare to the same exact printed-literal domain as keyword-literal without
+;; allocating a nominal node, empty children, text records and absent fallbacks
+;; for every map-key/operation comparison. Namespace presence stays distinct.
+(defn- text-byte-span? [value [:ref :gmir.node/text] bytes :bytes start :i64 end :i64] :bool
+  (arena-scope (and (= (text-count value) (- end start))
+       (loop [index 0]
+         (if (>= (+ start index) end) true
+           (if (= (text-at value index) (bytes-at bytes (+ start index))) (recur (+ index 1)) false))))))
+(defn- keyword-bytes-is? [value [:ref :gmir.node/value] bytes :bytes slash :i64] :bool
+  (arena-scope (if (not= (kind value) :keyword) false
+    (let [end (bytes-count bytes)]
+      (if (< slash 0)
+        (and (not (has-namespace? value)) (text-byte-span? (name-of value) bytes 1 end))
+        (and (has-namespace? value) (text-byte-span? (name-of value) bytes (+ slash 1) end)
+             (option-match [:option [:ref :gmir.node/text]] (namespace-of value) false
+               ns (text-byte-span? ns bytes 1 slash))))))))
+(defn keyword-is? [value [:ref :gmir.node/value] expected :keyword] :bool
+  (arena-scope (if (not= (kind value) :keyword) false
+    (let [spelling (document-edn-print (document-keyword expected))]
+      (keyword-bytes-is? value (string-to-utf8 spelling) (if (string=? spelling ":/") -1 (string-index-of spelling "/")))))))
+(defn child [value [:ref :gmir.node/value] index :i64] [:option [:ref :gmir.node/value]]
+  (if (< index 0) (option-none-of [:option [:ref :gmir.node/value]])
+    (let [all (pages value)]
+      (loop [page 0 left index]
+        (if (>= page (vector-count all)) (option-none-of [:option [:ref :gmir.node/value]])
+          (let [items (record-get [:ref :gmir.node/chunk]
+                        (typed-list-nth [:list [:ref :gmir.node/chunk]] all page) :items)
+                count (vector-count items)]
+            (if (< left count) (option-some-of [:option [:ref :gmir.node/value]]
+                                (typed-list-nth [:list [:ref :gmir.node/value]] items left))
+              (recur (+ page 1) (- left count)))))))))
+(defn- collection [tag :keyword] [:ref :gmir.node/value] (atom-value tag 0 (empty-text)))
+(defn empty-vector [] [:ref :gmir.node/value] (collection :vector))
+(defn empty-list [] [:ref :gmir.node/value] (collection :list))
+(defn empty-set [] [:ref :gmir.node/value] (collection :set))
+(defn empty-map [] [:ref :gmir.node/value] (collection :map))
+
+;; The existing canonical per-list bound remains 16,384. A collection may
+;; contain multiple pages, so this is not a new logical 16,384-child limit.
+(defn append [parent [:ref :gmir.node/value] value [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [all (pages parent) count (vector-count all)
+        last (if (= count 0) (typed-list-new [:list [:ref :gmir.node/value]])
+               (record-get [:ref :gmir.node/chunk]
+                 (typed-list-nth [:list [:ref :gmir.node/chunk]] all (- count 1)) :items))
+        full (>= (vector-count last) 16384)
+        target (if full (typed-list-new [:list [:ref :gmir.node/value]]) last)
+        extended (chunk (typed-list-conj [:list [:ref :gmir.node/value]] target value))
+        updated (if (or (= count 0) full)
+                  (typed-list-conj [:list [:ref :gmir.node/chunk]] all extended)
+                  (loop [index 0 out (empty-children)]
+                    (if (>= index count) out
+                      (recur (+ index 1) (typed-list-conj [:list [:ref :gmir.node/chunk]] out
+                        (if (= index (- count 1)) extended
+                          (typed-list-nth [:list [:ref :gmir.node/chunk]] all index)))))))]
+    (node (kind parent) (number parent) (namespace-of parent) (name-of parent) updated)))
+(defn- at-or-nil [value [:ref :gmir.node/value] index :i64] [:ref :gmir.node/value]
+  (option-match [:option [:ref :gmir.node/value]] (child value index) (nil-value) item item))
+(defn- key-index [value [:ref :gmir.node/value] name :keyword] :i64
+  (arena-scope ;; The lookup result is an index into caller-owned input. Reclaim printed
+  ;; keyword bytes and child Options before returning that scalar index.
+  (arena-scope (if (not= (kind value) :map) -1
+    (let [spelling (document-edn-print (document-keyword name)) bytes (string-to-utf8 spelling)
+          slash (if (string=? spelling ":/") -1 (string-index-of spelling "/")) count (child-count value)]
+      (loop [index 0]
+        (if (>= (+ index 1) count) -1
+          (if (keyword-bytes-is? (at-or-nil value index) bytes slash) (+ index 1)
+            (recur (+ index 2))))))))))
+(defn key [value [:ref :gmir.node/value] name :keyword] [:ref :gmir.node/value]
+  (let [index (key-index value name)]
+    (if (< index 0) (nil-value) (at-or-nil value index))))
+(defn has-key? [value [:ref :gmir.node/value] name :keyword] :bool
+  (arena-scope (>= (key-index value name) 0)))
+(defn put-key [value [:ref :gmir.node/value] name :keyword item [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [expected (keyword-literal name)]
+    (if (not (has-key? value name)) (append (append value expected) item)
+      (loop [index 0 out (empty-map)]
+        (if (>= (+ index 1) (child-count value)) out
+          (let [k (at-or-nil value index)]
+            (recur (+ index 2) (append (append out k)
+              (if (same-name? k expected) item (at-or-nil value (+ index 1)))))))))))

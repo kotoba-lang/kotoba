@@ -1,0 +1,78 @@
+(ns kotoba.fleet.kotoba-store
+  "Back the fleet store contract with a langchain db-api map — so the SAME
+  lease/governor/agent logic runs on a real Datomic / kotobase.net Datom log, not
+  only the in-memory MemStore.
+
+  langchain exposes a uniform db-api map `{:q :transact! :db :pull :entid}` with
+  two interchangeable implementations: `langchain.db/api` (in-process) and
+  `langchain.kotoba-db/kotoba-api` (kotobase.net XRPC, CACAO-authed). This ns
+  adapts that map to the fleet store's `{:transact! :datoms :by :entity}` (which
+  the lease / governor / agent / view code speaks) — proving MemStore ≡ a real
+  Datom backend (the actor-pattern contract).
+
+  Each fleet datom `[e a v t]` is reified as one append-only backend entity
+  `{:fd/e :fd/a :fd/v :fd/t}`, values `pr-str`-encoded so keywords / maps / strings
+  round-trip. `:datoms` and `:by` become datalog `:q`; `:entity` a per-e `:q` fold.
+  This ns takes the api map as data (no compile-time langchain dep); wire the
+  concrete backend where you construct it:
+
+    ;; in-process (contract tests):
+    (db-api-store {:api langchain.db/api :conn (langchain.db/create-conn {})})
+    ;; kotobase.net (self-minted CACAO, :cap/transact scope = key-derived graph):
+    (db-api-store {:api  (langchain.kotoba-db/kotoba-api host-caps)
+                   :conn (langchain.kotoba-db/kotoba-conn url graph {:cacao b64 :did did})})"
+  (:require #?(:clj [kotoba.lang.edn :as edn] :cljs [cljs.reader :as edn])))
+
+(defn- enc [x] (pr-str x))
+(defn- dec* [s] (edn/read-string s))
+
+(defn db-api-store
+  "Adapt a langchain `{:api {:q :transact! :db :pull :entid} :conn conn}` into a
+  fleet store `{:transact! :datoms :by :entity}` over reified `:fd/*` datoms."
+  [{:keys [api conn]}]
+  (let [dbv (fn [] ((:db api) conn))
+        cur-t-count (fn [] (count ((:q api) '[:find [?x ...] :where [?x :fd/t _]] (dbv))))]
+    {:transact!
+     (fn [datoms]
+       ((:transact! api) conn
+        (mapv (fn [[e a v t]] {:fd/e (enc e) :fd/a (enc a) :fd/v (enc v) :fd/t t})
+              datoms))
+       {:added (count datoms)})
+
+     ;; best-effort: the abstract langchain :db-api has no compare-and-swap
+     ;; primitive to build this atomically the way MemStore's swap! does, so
+     ;; a genuine race between two db-api-store-backed callers can still
+     ;; collide on t (same residual limitation already documented for
+     ;; kagi.store's KotobaStore append-chained-ledger! -- closes the race
+     ;; for the default, always-available MemStore backend).
+     :transact-with-t!
+     (fn [build-fn]
+       (let [t (cur-t-count)
+             ds (vec (build-fn t))]
+         ((:transact! api) conn
+          (mapv (fn [[e a v dt]] {:fd/e (enc e) :fd/a (enc a) :fd/v (enc v) :fd/t dt})
+                ds))
+         {:t t :added (count ds)}))
+
+     :datoms
+     (fn []
+       (->> ((:q api) '[:find ?e ?a ?v ?t
+                        :where [?x :fd/e ?e] [?x :fd/a ?a] [?x :fd/v ?v] [?x :fd/t ?t]]
+             (dbv))
+            (mapv (fn [[e a v t]] [(dec* e) (dec* a) (dec* v) t]))))
+
+     :by
+     (fn [a v]
+       (->> ((:q api) '[:find ?e ?a ?v ?t
+                        :in $ ?ae ?ve
+                        :where [?x :fd/a ?ae] [?x :fd/v ?ve] [?x :fd/e ?e]
+                               [?x :fd/a ?a] [?x :fd/v ?v] [?x :fd/t ?t]]
+             (dbv) (enc a) (enc v))
+            (mapv (fn [[e aa vv t]] [(dec* e) (dec* aa) (dec* vv) t]))))
+
+     :entity
+     (fn [e]
+       (->> ((:q api) '[:find ?a ?v :in $ ?ee
+                        :where [?x :fd/e ?ee] [?x :fd/a ?a] [?x :fd/v ?v]]
+             (dbv) (enc e))
+            (reduce (fn [m [a v]] (assoc m (dec* a) (dec* v))) {:db/id e})))}))

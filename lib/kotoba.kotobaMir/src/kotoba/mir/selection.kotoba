@@ -1,0 +1,159 @@
+;; Complete reference target selection source candidate. Scheduling remains at
+;; its owning post-allocation boundary; it is not run by select-target.
+(ns kotoba.mir.selection
+  {:kotoba/export [select-target]}
+  (:require [kotoba.gmir :as gmir] [kotoba.gmir.node :as node]
+            [kotoba.gmir.identity :as identity] [kotoba.gmir.outcome :as gmir-outcome]
+            [kotoba.mir.catalog :as catalog] [kotoba.mir.operands :as operands]
+            [kotoba.mir.table :as table] [kotoba.mir.outcome :as outcome]
+            [kotoba.mir.validation :as validation])
+  (:schemas
+   {:mir.selection/fold [:record :mir.selection/fold
+      [[:instructions [:ref :gmir.node/value]] [:divisors [:ref :mir.table/tree]]]]}))
+
+(defn- at [value [:ref :gmir.node/value] index :i64] [:ref :gmir.node/value]
+  (option-match [:option [:ref :gmir.node/value]] (node/child value index) (node/nil-value) item item))
+(defn- named? [value [:ref :gmir.node/value] key :keyword] :bool (arena-scope (node/keyword-is? value key)))
+(defn- op? [value [:ref :gmir.node/value] key :keyword] :bool (arena-scope (named? (node/key value :mir/op) key)))
+(defn- gmir-op? [value [:ref :gmir.node/value] key :keyword] :bool (arena-scope (named? (node/key value :gmir/op) key)))
+(defn- same-identity? [a [:ref :gmir.node/value] b [:ref :gmir.node/value]] :bool
+  (arena-scope (or (node/same-name? a b) (and (= (node/kind a) :nil) (= (node/kind b) :nil)))))
+(defn- rename-key [value [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (node/keyword-parts (option-some-of [:option [:ref :gmir.node/text]] (node/string-text "mir")) (node/name-of value)))
+(defn- offset [values [:list [:ref :mir.catalog/offset]] key [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0]
+    (if (>= index (vector-count values)) (node/nil-value)
+      (let [entry (typed-list-nth [:list [:ref :mir.catalog/offset]] values index)]
+        (if (named? key (catalog/offset-name entry)) (node/i64-value (catalog/offset-value entry)) (recur (+ index 1)))))))
+(defn- select-incomings [values [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-vector)]
+    (if (>= index (node/child-count values)) out
+      (let [value (at values index)]
+        (recur (+ index 1) (node/append out (-> (node/empty-map)
+          (node/put-key :mir/predecessor (node/key value :gmir/predecessor)) (node/put-key :mir/value (node/key value :gmir/value)))))))))
+(defn- select-instruction [instruction [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  ;; The public entry has already applied GMIR's exact keysets. Every closed
+  ;; field keeps its value; only operation and incoming-map keys are renamed.
+  (let [start (cond (gmir-op? instruction :gmir/runtime-call)
+                   (node/put-key (node/empty-map) :mir/context-offset (offset (catalog/runtime-context-offsets) (node/key instruction :gmir/runtime)))
+                   (gmir-op? instruction :gmir/capability-call)
+                   (node/put-key (node/empty-map) :mir/context-offset (offset (catalog/capability-context-offsets) (node/key instruction :gmir/kind)))
+                   :else (node/empty-map))]
+    (loop [index 0 out start]
+      (if (>= index (node/child-count instruction)) out
+        (let [key (at instruction index) value (at instruction (+ index 1))]
+          (recur (+ index 2) (node/append (node/append out (rename-key key))
+            (cond (named? key :gmir/op) (rename-key value) (named? key :gmir/incomings) (select-incomings value) :else value))))))))
+(defn- drop-key [value [:ref :gmir.node/value] key :keyword] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-map)]
+    (if (>= index (node/child-count value)) out
+      (recur (+ index 2) (if (named? (at value index) key) out (node/append (node/append out (at value index)) (at value (+ index 1))))))))
+(defn- zero? [value [:ref :gmir.node/value]] :bool
+  (arena-scope ;; Exact admitted i64 comparison replaces bounded host-number conversion.
+  (let [number (identity/integer-i64 value)]
+    (and (option-some?-of [:option :i64] number) (= (option-match [:option :i64] number 1 found-value found-value) 0)))))
+(defn- fuse-zero-branches [target :keyword instructions [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (if (not= target :aarch64) instructions
+    (let [uses (operands/counts target false instructions)]
+      (loop [index 0 out (node/empty-vector)]
+        (if (>= index (node/child-count instructions)) out
+          (let [constant (at instructions index) equal (at instructions (+ index 1)) branch (at instructions (+ index 2))
+                zero (node/key constant :mir/dst) result (node/key equal :mir/dst)
+                left (node/key equal :mir/left) right (node/key equal :mir/right)
+                operand (cond (same-identity? zero left) right (same-identity? zero right) left :else (node/nil-value))
+                fuse (and (op? constant :mir/constant) (zero? (node/key constant :mir/value))
+                          (op? equal :mir/equal) (op? branch :mir/branch-zero) (same-identity? result (node/key branch :mir/test))
+                          (identity/vreg? operand) (not (same-identity? zero result)) (not (same-identity? zero operand)) (not (same-identity? result operand))
+                          (= (operands/count-of uses zero) 1) (= (operands/count-of uses result) 1))]
+            (if fuse (recur (+ index 3) (node/append out (-> (node/empty-map) (node/put-key :mir/op (node/keyword-literal :mir/branch-nonzero))
+                        (node/put-key :mir/test operand) (node/put-key :mir/target (node/key branch :mir/target)))))
+              (recur (+ index 1) (node/append out constant)))))))))
+(defn- select-fold [instructions [:ref :gmir.node/value]] [:ref :mir.selection/fold]
+  (loop [index 0 constants (table/empty) specialized (table/empty) out (node/empty-vector)]
+          (if (>= index (node/child-count instructions))
+            (record-new [:ref :mir.selection/fold] out specialized)
+            (let [instruction (at instructions index) right (node/key instruction :gmir/right)
+                  divisor (table/get constants (operands/key-of right))
+                  specialize (and (gmir-op? instruction :gmir/quotient) (option-some?-of [:option [:ref :mir.table/value]] divisor))
+                  original (select-instruction instruction)
+                  value (if specialize (drop-key (-> original (node/put-key :mir/op (node/keyword-literal :mir/quotient-constant))
+                                                  (node/put-key :mir/divisor (table/data (option-match [:option [:ref :mir.table/value]] divisor (table/scalar (node/nil-value)) found-value found-value)))) :mir/right) original)
+                  updated (if (gmir-op? instruction :gmir/constant)
+                            (table/put constants (operands/key-of (node/key instruction :gmir/dst)) (table/scalar (node/key instruction :gmir/value))) constants)]
+              (recur (+ index 1) updated (if specialize (table/put specialized (operands/key-of right) (table/scalar right)) specialized)
+                (node/append out value))))))
+(defn- select-function-instructions [target :keyword instructions [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [fold (select-fold instructions) selected (record-get [:ref :mir.selection/fold] fold :instructions)
+        divisors (record-get [:ref :mir.selection/fold] fold :divisors)
+        fused (fuse-zero-branches target selected) live (operands/counts target false fused)]
+    (loop [index 0 out (node/empty-vector)]
+      (if (>= index (node/child-count fused)) out
+        (let [value (at fused index) dst (node/key value :mir/dst)
+              discard (and (op? value :mir/constant)
+                           (option-some?-of [:option [:ref :mir.table/value]] (table/get divisors (operands/key-of dst)))
+                           (= (operands/count-of live dst) 0))]
+          (recur (+ index 1) (if discard out (node/append out value))))))))
+(defn- member? [values [:list :keyword] value [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (vector-count values)) false
+      (if (named? value (typed-list-nth [:list :keyword] values index)) true (recur (+ index 1)))))))
+(defn- excluded-operations [program [:ref :gmir.node/value] privileged :bool] [:ref :gmir.node/value]
+  (let [version (option-match [:option :i64] (identity/integer-i64 (node/key program :gmir/version)) 0 found-value found-value)
+        functions (node/key program :gmir/functions) module (= version 3)
+        groups (if module (node/child-count functions) 1)
+        dequant (if privileged (typed-list-new [:list :keyword]) (gmir/kernel-dequant-dot-operations))]
+    ;; Walk every function in source order; preserve repeated privileged
+    ;; actions and the first occurrence order of distinct refused dequants.
+    (loop [group 0 index 0 seen (table/empty) out (node/empty-vector)]
+      (if (>= group groups) out
+        (let [code (if module (node/key (at functions group) :gmir/instructions) (node/key program :gmir/instructions))]
+          (if (>= index (node/child-count code)) (recur (+ group 1) 0 seen out)
+            (let [instruction (at code index) op (node/key instruction :gmir/op)
+                  matches (if privileged (gmir-op? instruction :gmir/x86-privileged)
+                            (and (member? dequant op) (not (named? op :gmir/kernel-dequant-dot-q8-0))))
+                  include (and matches (or privileged (not (option-some?-of [:option [:ref :mir.table/value]] (table/get seen (operands/key-of op))))))
+                  value (if privileged (node/key instruction :gmir/action) op)]
+              (recur group (+ index 1) (if (and include (not privileged)) (table/put seen (operands/key-of op) (table/scalar op)) seen)
+                (if include (node/append out value) out)))))))))
+(defn- target-error [target [:ref :gmir.node/value] program [:ref :gmir.node/value]] [:option [:ref :mir/refusal]]
+  (if (named? target :x86-64) (option-none-of [:option [:ref :mir/refusal]])
+    (let [actions (excluded-operations program true)]
+      (if (> (node/child-count actions) 0)
+        (option-some-of [:option [:ref :mir/refusal]] (outcome/refusal :x86-privileged-target-mismatch
+          (-> (node/empty-map) (node/put-key :target target) (node/put-key :actions actions))))
+        (let [operations (excluded-operations program false)]
+          (if (= (node/child-count operations) 0) (option-none-of [:option [:ref :mir/refusal]])
+            (option-some-of [:option [:ref :mir/refusal]] (outcome/refusal :x86-simd-target-mismatch
+              (-> (node/empty-map) (node/put-key :target target) (node/put-key :operations operations))))))))))
+(defn- selected-program [target [:ref :gmir.node/value] program [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [version (node/key program :gmir/version) number (option-match [:option :i64] (identity/integer-i64 version) 0 found-value found-value)
+        target-key (if (named? target :x86-64) :x86-64 :aarch64)
+        base (-> (node/empty-map) (node/put-key :mir/version (if (= number 3) (node/i64-value 3) version))
+                 (node/put-key :mir/target target) (node/put-key :mir/registers (node/keyword-literal :virtual)))]
+    (if (= number 3)
+      (let [functions (node/key program :gmir/functions)
+            selected (loop [index 0 out (node/empty-vector)]
+                       (if (>= index (node/child-count functions)) out
+                         (let [function (at functions index)]
+                           (recur (+ index 1) (node/append out (-> (node/empty-map)
+                             (node/put-key :mir/name (node/key function :gmir/name)) (node/put-key :mir/arity (node/key function :gmir/arity))
+                             (node/put-key :mir/instructions (select-function-instructions target-key (node/key function :gmir/instructions)))))))))]
+        (-> base (node/put-key :mir/entry (node/key program :gmir/entry)) (node/put-key :mir/functions selected)))
+      (let [instructions (node/key program :gmir/instructions)
+            selected (loop [index 0 out (node/empty-vector)]
+                       (if (>= index (node/child-count instructions)) out
+                         (recur (+ index 1) (node/append out (select-instruction (at instructions index))))))]
+        (node/put-key base :mir/instructions selected)))))
+(defn select-target [target [:ref :gmir.node/value] program [:ref :gmir.node/value]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (if (not (member? (catalog/targets) target))
+    (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+      (outcome/refusal :unsupported-target (node/put-key (node/empty-map) :target target)))
+    (let [validated (gmir/validate! program)]
+      (if (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :gmir/refusal]] validated))
+        (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] (outcome/from-gmir
+          (result-error-of [:result [:ref :gmir.node/value] [:ref :gmir/refusal]] validated (gmir-outcome/refusal :non-canonical-program program))))
+        (let [error (target-error target program)]
+          (if (option-some?-of [:option [:ref :mir/refusal]] error)
+            (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+              (option-match [:option [:ref :mir/refusal]] error (outcome/refusal :unsupported-target target) found-value found-value))
+            (validation/validate! (selected-program target program))))))))

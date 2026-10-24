@@ -1,0 +1,206 @@
+;; Owning canonical literal decoder. Generic documents do not carry byte arrays:
+;; their 32-item bound is intentionally unchanged. Input and output use typed
+;; byte chunks so long literals and decoder expansion are never truncated.
+(ns kotoba.gmir.rodata
+  {:kotoba/export [rodata-alignment rodata-encodings rodata-bytes rodata-content?
+                   string-input chunks-input keyword-input invalid-input
+                   decoded-byte-count decoded-chunks decoded-byte-at]}
+  (:schemas
+   {:gmir.rodata/input [:record :gmir.rodata/input
+      [[:kind :keyword] [:value :keyword] [:chunks [:list :bytes]]]]
+    :gmir.rodata/read [:record :gmir.rodata/read
+      [[:value :i64] [:chunk :i64] [:offset :i64] [:position :i64]]]
+    :gmir.rodata/piece [:record :gmir.rodata/piece
+      [[:payload :bytes] [:chunk :i64] [:offset :i64] [:position :i64]
+       [:valid :bool] [:done :bool]]]
+    :gmir.rodata/decoded [:record :gmir.rodata/decoded
+      [[:chunks [:list :bytes]] [:size :i64]]]}))
+
+(defn- empty-chunks [] [:list :bytes] (typed-list-new [:list :bytes]))
+(defn- add-chunk [out [:list :bytes] value :bytes] [:list :bytes]
+  (typed-list-conj [:list :bytes] out value))
+(defn string-input [text :string] [:ref :gmir.rodata/input]
+  (record-new [:ref :gmir.rodata/input] :string :none
+    (add-chunk (empty-chunks) (string-to-utf8 text))))
+(defn chunks-input [chunks [:list :bytes]] [:ref :gmir.rodata/input]
+  (record-new [:ref :gmir.rodata/input] :string :none chunks))
+(defn keyword-input [value :keyword] [:ref :gmir.rodata/input]
+  (record-new [:ref :gmir.rodata/input] :keyword value (empty-chunks)))
+(defn invalid-input [] [:ref :gmir.rodata/input]
+  (record-new [:ref :gmir.rodata/input] :other :none (empty-chunks)))
+(defn rodata-alignment [] :i64 (arena-scope 8))
+(defn rodata-encodings [] :document
+  (document-set (document-keyword :utf-16le-nul)
+                (document-keyword :guid-mixed-endian) (document-keyword :hex-bytes)))
+
+(defn- none [] [:option [:ref :gmir.rodata/decoded]]
+  (option-none-of [:option [:ref :gmir.rodata/decoded]]))
+(defn- accepted [chunks [:list :bytes] size :i64] [:option [:ref :gmir.rodata/decoded]]
+  (option-some-of [:option [:ref :gmir.rodata/decoded]]
+    (record-new [:ref :gmir.rodata/decoded] chunks size)))
+(defn decoded-byte-count [value [:ref :gmir.rodata/decoded]] :i64
+  (arena-scope (record-get [:ref :gmir.rodata/decoded] value :size)))
+(defn decoded-chunks [value [:ref :gmir.rodata/decoded]] [:list :bytes]
+  (record-get [:ref :gmir.rodata/decoded] value :chunks))
+(defn decoded-byte-at [value [:ref :gmir.rodata/decoded] index :i64] [:option :i64]
+  (if (or (< index 0) (>= index (decoded-byte-count value))) (option-none-of [:option :i64])
+    (let [chunks (decoded-chunks value)]
+      (loop [chunk 0 offset index]
+        (if (>= chunk (vector-count chunks)) (option-none-of [:option :i64])
+          (let [payload (typed-list-nth [:list :bytes] chunks chunk)]
+            (if (< offset (bytes-count payload))
+              (option-some-of [:option :i64] (bytes-at payload offset))
+              (recur (+ chunk 1) (- offset (bytes-count payload))))))))))
+
+(defn- total-bytes [chunks [:list :bytes]] :i64
+  (arena-scope (loop [index 0 total 0]
+    (if (>= index (vector-count chunks)) total
+      (recur (+ index 1) (+ total (bytes-count (typed-list-nth [:list :bytes] chunks index))))))))
+
+;; Empty chunks are skipped. Each payload access is checked against its own
+;; bytes-count; no flattened string or document is constructed.
+(defn- read-byte [chunks [:list :bytes] chunk :i64 offset :i64 position :i64] [:ref :gmir.rodata/read]
+  (loop [c chunk o offset]
+    (if (>= c (vector-count chunks)) (record-new [:ref :gmir.rodata/read] -1 c o position)
+      (let [payload (typed-list-nth [:list :bytes] chunks c)]
+        (if (>= o (bytes-count payload)) (recur (+ c 1) 0)
+          (record-new [:ref :gmir.rodata/read] (bytes-at payload o) c (+ o 1) (+ position 1)))))))
+(defn- read-value [value [:ref :gmir.rodata/read]] :i64
+  (arena-scope (record-get [:ref :gmir.rodata/read] value :value)))
+(defn- continuation? [value :i64] :bool (arena-scope (and (>= value 128) (<= value 191))))
+(defn- hex-digit [code :i64] :i64
+  (arena-scope (cond
+    (and (>= code 48) (<= code 57)) (- code 48)
+    (and (>= code 97) (<= code 102)) (- code 87)
+    (and (>= code 65) (<= code 70)) (- code 55)
+    :else -1)))
+
+;; The three-word cursor is allocated privately for one output piece. It holds
+;; only scalar chunk/offset/position fields and never escapes. Advancing it does
+;; not retain a new nominal record per input byte. Input chunks stay immutable.
+(defn- stream-byte [chunks [:list :bytes] cursor :vector-i64] :i64
+  (loop [c (vector-at cursor 0) o (vector-at cursor 1)]
+    (if (>= c (vector-count chunks))
+      (let [w (vector-assoc! cursor 0 c) w2 (vector-assoc! w 1 o)] -1)
+      (let [payload (typed-list-nth [:list :bytes] chunks c)]
+        (if (>= o (bytes-count payload)) (recur (+ c 1) 0)
+          (let [byte (bytes-at payload o) position (+ (vector-at cursor 2) 1)
+                w (vector-assoc! cursor 0 c) w2 (vector-assoc! w 1 (+ o 1))
+                w3 (vector-assoc! w2 2 position)] byte))))))
+(defn- stream-mark [cursor :vector-i64] [:ref :gmir.rodata/read]
+  (record-new [:ref :gmir.rodata/read] -1 (vector-at cursor 0) (vector-at cursor 1) (vector-at cursor 2)))
+;; -1 is EOF, -2 is malformed/non-UCS-2. Astral scalars and surrogate code
+;; points are refused. A code unit may cross any number of source chunks.
+(defn- stream-unit [chunks [:list :bytes] cursor :vector-i64] :i64
+  (let [lead (stream-byte chunks cursor)]
+    (cond
+      (< lead 128) lead
+      (and (>= lead 194) (<= lead 223))
+      (let [tail (stream-byte chunks cursor)]
+        (if (continuation? tail)
+          (+ (i64-shift-left (bit-and lead 31) 6) (bit-and tail 63)) -2))
+      (and (>= lead 224) (<= lead 239))
+      (let [b1 (stream-byte chunks cursor) b2 (stream-byte chunks cursor)
+            code (+ (i64-shift-left (bit-and lead 15) 12)
+                    (i64-shift-left (bit-and b1 63) 6) (bit-and b2 63))]
+        (if (and (continuation? b1) (continuation? b2) (>= code 2048)
+                 (or (< code 55296) (> code 57343)))
+          code -2))
+      :else -2)))
+
+(defn- piece [payload :bytes cursor [:ref :gmir.rodata/read] valid :bool done :bool]
+  [:ref :gmir.rodata/piece]
+  (record-new [:ref :gmir.rodata/piece]
+    payload
+    (record-get [:ref :gmir.rodata/read] cursor :chunk)
+    (record-get [:ref :gmir.rodata/read] cursor :offset)
+    (record-get [:ref :gmir.rodata/read] cursor :position) valid done))
+
+;; The private vector never escapes: only copied bytes leave this function.
+;; vector-assoc! requires the owning compiler's usual uniqueness admission.
+;; A 16 KiB piece is an allocation strategy, never a logical input/output cap.
+(defn- make-piece [kind :keyword chunks [:list :bytes] chunk :i64 offset :i64 position :i64 total :i64]
+  [:ref :gmir.rodata/piece]
+  (let [remaining (- total position)
+        wanted (if (= kind :hex) (quot remaining 2) (+ (* remaining 2) 2))
+        capacity (if (> wanted 16384) 16384 wanted)
+        cursor (vector-assoc! (vector-assoc! (vector-assoc! (vector-alloc 3) 0 chunk) 1 offset) 2 position)]
+    (loop [used 0 values (vector-alloc capacity)]
+        (if (>= used capacity)
+          (piece (bytes-slice (bytes-from-vector-i64 values) 0 used) (stream-mark cursor) true
+            (and (= kind :hex) (>= (vector-at cursor 2) total)))
+          (if (= kind :hex)
+            (let [a (stream-byte chunks cursor)]
+              (if (< a 0) (piece (bytes-slice (bytes-from-vector-i64 values) 0 used) (stream-mark cursor) true true)
+                (let [b (stream-byte chunks cursor) high (hex-digit a) low (hex-digit b)]
+                  (if (or (< high 0) (< low 0)) (piece (bytes-empty) (stream-mark cursor) false false)
+                    (recur (+ used 1) (vector-assoc! values used (+ (* high 16) low)))))))
+            (let [code (stream-unit chunks cursor)]
+              (cond
+                (= code -1)
+                (let [low (vector-assoc! values used 0)
+                      high (vector-assoc! low (+ used 1) 0)]
+                  (piece (bytes-slice (bytes-from-vector-i64 high) 0 (+ used 2)) (stream-mark cursor) true true))
+                (< code 0) (piece (bytes-empty) (stream-mark cursor) false false)
+                :else
+                (let [updated (vector-assoc! (vector-assoc! values used (bit-and code 255))
+                                             (+ used 1) (quot code 256))]
+                  (recur (+ used 2) updated)))))))))
+
+(defn- decode-linear [kind :keyword chunks [:list :bytes]] [:option [:ref :gmir.rodata/decoded]]
+  (let [total (total-bytes chunks)]
+    (if (and (= kind :hex) (not= (bit-and total 1) 0)) (none)
+      (loop [c 0 o 0 p 0 out (empty-chunks) size 0]
+        (let [next (make-piece kind chunks c o p total)]
+          (if (not (record-get [:ref :gmir.rodata/piece] next :valid)) (none)
+            (let [payload (record-get [:ref :gmir.rodata/piece] next :payload)
+                  count (bytes-count payload)
+                  extended (if (= count 0) out (add-chunk out payload))
+                  length (+ size count)]
+              (if (record-get [:ref :gmir.rodata/piece] next :done) (accepted extended length)
+                (recur (record-get [:ref :gmir.rodata/piece] next :chunk)
+                  (record-get [:ref :gmir.rodata/piece] next :offset)
+                  (record-get [:ref :gmir.rodata/piece] next :position) extended length)))))))))
+
+(defn- guid-source [chunks [:list :bytes]] [:option :bytes]
+  (loop [index 0 c 0 o 0 p 0 values (vector-alloc 36)]
+    (let [next (read-byte chunks c o p) byte (read-value next)]
+      (if (= index 36)
+        (if (= byte -1) (option-some-of [:option :bytes] (bytes-from-vector-i64 values))
+          (option-none-of [:option :bytes]))
+        (if (< byte 0) (option-none-of [:option :bytes])
+          (recur (+ index 1) (record-get [:ref :gmir.rodata/read] next :chunk)
+            (record-get [:ref :gmir.rodata/read] next :offset)
+            (record-get [:ref :gmir.rodata/read] next :position)
+            (vector-assoc! values index byte)))))))
+(defn- guid-offset [index :i64] :i64
+  (arena-scope (case index 0 6 1 4 2 2 3 0 4 11 5 9 6 16 7 14
+              8 19 9 21 10 24 11 26 12 28 13 30 14 32 15 34 -1)))
+(defn- decode-guid [chunks [:list :bytes]] [:option [:ref :gmir.rodata/decoded]]
+  (let [input (guid-source chunks)]
+    (if (not (option-some?-of [:option :bytes] input)) (none)
+      (let [source (option-match [:option :bytes] input (bytes-empty) found-value found-value)]
+        (if (not (and (= (bytes-at source 8) 45) (= (bytes-at source 13) 45)
+                      (= (bytes-at source 18) 45) (= (bytes-at source 23) 45))) (none)
+          (loop [index 0 values (vector-alloc 16)]
+            (if (= index 16) (accepted (add-chunk (empty-chunks) (bytes-from-vector-i64 values)) 16)
+              (let [offset (guid-offset index) high (hex-digit (bytes-at source offset))
+                    low (hex-digit (bytes-at source (+ offset 1)))]
+                (if (or (< high 0) (< low 0)) (none)
+                  (recur (+ index 1) (vector-assoc! values index (+ (* high 16) low))))))))))))
+
+;; Nominal input kinds retain non-string/non-keyword refusals without packing
+;; long text into bounded generic documents. Invalid is None; empty hex is Some
+;; with zero bytes. Allocation/value/uniqueness refusals are never caught here.
+(defn rodata-bytes [encoding [:ref :gmir.rodata/input] content [:ref :gmir.rodata/input]]
+  [:option [:ref :gmir.rodata/decoded]]
+  (if (or (not= (record-get [:ref :gmir.rodata/input] encoding :kind) :keyword)
+          (not= (record-get [:ref :gmir.rodata/input] content :kind) :string)) (none)
+    (let [chunks (record-get [:ref :gmir.rodata/input] content :chunks)]
+      (case (record-get [:ref :gmir.rodata/input] encoding :value)
+        :utf-16le-nul (decode-linear :ucs2 chunks)
+        :hex-bytes (decode-linear :hex chunks)
+        :guid-mixed-endian (decode-guid chunks)
+        (none)))))
+(defn rodata-content? [encoding [:ref :gmir.rodata/input] content [:ref :gmir.rodata/input]] :bool
+  (arena-scope (option-some?-of [:option [:ref :gmir.rodata/decoded]] (rodata-bytes encoding content))))

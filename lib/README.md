@@ -88,6 +88,25 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.kotobaseBlockCodec` | `kotoba.kotobaseBlockCodec/src` | `kotobase.blockcodec.core`, `kotobase.blockcodec.node`, `kotobase.blockcodec.statemix` (Kotoba project library) |
+| `kotoba.kotobaseAnchorFevm` | `kotoba.kotobaseAnchorFevm/src` | `kotobase.anchor.checkpoint`, `kotobase.anchor.fevm`, `kotobase.anchor.fevm.queue` (Kotoba project library) |
+| `kotoba.kotobaseEngineContract` | `kotoba.kotobaseEngineContract/src` | `kotobase.engine.archive`, `kotobase.engine.canonical`, `kotobase.engine.completion`, `kotobase.engine.conformance` (Kotoba project library) |
+| `kotoba.kotobaProcedure` | `kotoba.kotobaProcedure/src` | `kotoba.procedure.gate`, `kotoba.procedure.store` (Kotoba project library) |
+| `kotoba.kotobaObject` | `kotoba.kotobaObject/src` | `kotoba.object.elf64`, `kotoba.object.macho64`, `kotoba.object.pe32plus` (Kotoba project library) |
+| `kotoba.kotobaLedger` | `kotoba.kotobaLedger/src` | `kotoba.ledger.core`, `kotoba.ledger.file-git`, `kotoba.ledger.kotobase` (Kotoba project library) |
+| `kotoba.kotobaHir` | `kotoba.kotobaHir/src` | `kotoba.hir` (Kotoba project library) |
+| `kotoba.kotobaFleet` | `kotoba.kotobaFleet/src` | `kotoba.fleet.agent`, `kotoba.fleet.core`, `kotoba.fleet.evolution`, `kotoba.fleet.governor` (Kotoba project library) |
+| `kotoba.kotobaDocumentContracts` | `kotoba.kotobaDocumentContracts/src` | `kotoba.document.artifact-graph`, `kotoba.document.change`, `kotoba.document.collaboration`, `kotoba.document.dom` (Kotoba project library) |
+| `kotoba.kotobaCodegen` | `kotoba.kotobaCodegen/src` | `kotoba.codegen.layout`, `kotoba.codegen.mc`, `kotoba.codegen.relocation` (Kotoba project library) |
+| `kotoba.kotobaMir` | `kotoba.kotobaMir/src` | `kotoba.mir` (Kotoba project library) |
+| `kotoba.kotobaGmir` | `kotoba.kotobaGmir/src` | `kotoba.gmir` (Kotoba project library) |
+| `kotoba.kotobaClient` | `kotoba.kotobaClient/src` | `kotoba-client.core`, `kotoba-client.ipld-hydrate`, `kotoba-client.prolly-hydrate` (Kotoba project library) |
+| `kotoba.kotobaCaptcha` | `kotoba.kotobaCaptcha/src` | `kotoba.captcha.api`, `kotoba.captcha.audit`, `kotoba.captcha.domain`, `kotoba.captcha.http` (Kotoba project library) |
+| `kotoba.knp` | `kotoba.knp/src` | `knp`, `knp.channel`, `knp.packet`, `knp.session` (Kotoba project library) |
+| `kotoba.kiss` | `kotoba.kiss/src` | `kiss.airtime`, `kiss.core` (Kotoba project library) |
+| `kotoba.kip` | `kotoba.kip/src` | `kotoba.kip.core`, `kotoba.kip.quorum`, `kotoba.kip.registry` (Kotoba project library) |
+| `kotoba.kgraph` | `kotoba.kgraph/src` | `kotoba.kgraph` (Kotoba project library) |
+| `kotoba.kamiWebvr` | `kotoba.kamiWebvr/src` | `kami.webvr.cine-bridge`, `kami.webvr.engine`, `kami.webvr.incident-pregel`, `kami.webvr.types` (Kotoba project library) |
 | `kotoba.kamiUsdNative` | `kotoba.kamiUsdNative/src` | `usd-native` (Kotoba project library) |
 | `kotoba.kamiStudio` | `kotoba.kamiStudio/src` | `kami.studio.ui` (Kotoba project library) |
 | `kotoba.kamiOngakuSampler` | `kotoba.kamiOngakuSampler/src` | `kami.ongaku.sampler` (Kotoba project library) |

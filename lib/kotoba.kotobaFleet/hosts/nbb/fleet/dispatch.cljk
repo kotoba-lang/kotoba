@@ -1,0 +1,343 @@
+(ns fleet.dispatch
+  "One work-unit, end to end: lease → sandboxed run on a fleet node → proposal
+  → gate → sign-off → materialize → signed receipt → published ledger.
+
+  This used to live inside the dispatcher script, which meant the standing tick
+  would have had to reimplement it. It is a function now, so `bin/fleet-tick`
+  and `bin/fleet-sandbox-dispatch` run the SAME flow — a tick that drifts from
+  the interactive path is a tick nobody can reason about."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]
+            [fleet.cli :as cli]
+            [fleet.gate :as gate]
+            [fleet.github :as gh]
+            [fleet.identity :as fid]
+            [fleet.kcm :as kcm]
+            [fleet.kotobase-store :as kbs]
+            [fleet.filestore :as filestore]
+            [fleet.node :as node]
+            [fleet.receipt :as receipt]
+            [kotoba.fleet.agent :as agent]
+            [kotoba.fleet.governor :as gov]
+            [kotoba.fleet.lease :as lease]
+            [kotoba.fleet.store :as store]))
+
+(def alias-url "https://api.murakumo.cloud/infer/models/murakumo-main")
+(def default-protected [".github/" ".git/" "manifest/" "90-docs/adr/"])
+(def default-signoff [])
+
+(defn- now [] (js/Date.now))
+(defn- git [args & [opts]]
+  (cli/sh "git" (concat ["-c" "core.fsmonitor=false"] args) opts))
+
+;; ── credentials: explicit, never ambient ────────────────────────────────────
+
+(defn- env [k] (some-> (aget js/process.env k) str/trim not-empty))
+(def source-token (env "FLEET_SOURCE_TOKEN"))
+(def push-token (env "FLEET_PUSH_TOKEN"))
+(def ledger-token (env "FLEET_LEDGER_TOKEN"))
+
+;; ── model ───────────────────────────────────────────────────────────────────
+
+(defn resolve-model
+  "ADR-2607173100: resolve the alias, never bake a model id. A failed lookup
+  keeps only the ENDPOINT, so a fleet model switch still propagates."
+  []
+  (let [{:keys [status json]} (cli/json-http {:url alias-url :timeout-sec 20})]
+    (if (= 200 status)
+      {:model "murakumo-main" :endpoint (or (:endpoint json) "https://infer.murakumo.cloud/v1/chat/completions")
+       :alias-for (get json (keyword "alias-for")) :resolved :alias}
+      {:model "murakumo-main" :endpoint "https://infer.murakumo.cloud/v1/chat/completions"
+       :resolved :endpoint-only})))
+
+;; ── source ──────────────────────────────────────────────────────────────────
+
+(defn extract-pinned!
+  "Extract a pinned tarball, detecting GitHub's `<owner>-<repo>-<sha7>/`
+  wrapper from the actual listing instead of assuming it (assuming cost
+  ADR-2607178000 a silent false-pass CI receipt)."
+  [tarball dest]
+  (cli/sh "rm" ["-rf" dest])
+  (fs/mkdirSync dest #js {:recursive true})
+  (let [entries (->> (cli/sh "tar" ["tzf" tarball]) str/split-lines (remove str/blank?) (take 40))
+        segs (distinct (map #(first (str/split % #"/")) entries))
+        wrapped? (and (= 1 (count segs)) (str/includes? (first entries) "/"))]
+    (cli/sh "tar" (concat ["xzf" tarball "-C" dest] (when wrapped? ["--strip-components=1"]))))
+  dest)
+
+;; ── the sandboxed run ───────────────────────────────────────────────────────
+
+(defn run-on-node!
+  "Ship the pinned tarball + the sandbox agent to `node`, run ONE bounded agent
+  session there, bring back its patch. nil when it produced no diff."
+  [{:keys [spec node-name agent-name state-dir tarball agent-src]}]
+  (let [{:keys [model endpoint] :as resolved} (resolve-model)
+        remote-root (str "/tmp/fleet-sandbox-" (:work-id spec))
+        provider (:kcm/provider spec)
+        remote-provider (when (kcm/kcm? spec)
+                          (assoc provider
+                                 :archive (str remote-root "/kotoba-provider.tar")
+                                 :manifest (str remote-root "/kotoba-provider.manifest.edn")))
+        remote-spec (merge
+                     (select-keys spec [:machine :kcm/identity :kcm/capabilities
+                                        :kcm/checks :kcm/builds :kcm/cache-root])
+                     (when remote-provider {:kcm/provider remote-provider})
+                     {:work-id (:work-id spec) :root remote-root
+                      :tarball (str remote-root "/repo.tgz")
+                      :prompt (:prompt spec) :test-cmd (:test-cmd spec)
+                      :endpoint endpoint :model model :budget (:budget spec)
+                      :exec-backing (get spec :exec-backing :sandbox-exec)})
+        local-spec (path/join state-dir (str (:work-id spec) "-spec.edn"))
+        kcm-src (path/join (path/dirname agent-src) "kcm.cljk")
+        provider-src (path/join (path/dirname agent-src) "kcm_provider.cljk")
+        started (now)]
+    (cli/say (str "  model: " model
+                  (when (:alias-for resolved) (str " → " (:alias-for resolved)))
+                  " (" (name (:resolved resolved)) ")"))
+    (fs/writeFileSync local-spec (pr-str remote-spec))
+    (node/ssh node-name (str "rm -rf " remote-root " && mkdir -p " remote-root "/fleet"))
+    (node/scp! node-name tarball (str remote-root "/repo.tgz"))
+    (node/scp! node-name agent-src (str remote-root "/"))
+    (node/scp! node-name kcm-src (str remote-root "/fleet/kcm.cljk"))
+    (node/scp! node-name provider-src (str remote-root "/fleet/kcm_provider.cljk"))
+    (when remote-provider
+      (node/scp! node-name (:archive provider) (:archive remote-provider))
+      (node/scp! node-name (:manifest provider) (:manifest remote-provider)))
+    (node/scp! node-name local-spec (str remote-root "/"))
+    (cli/say (str "  running sandbox on " node-name ":" remote-root " …"))
+    (let [{:keys [exit out]} (node/ssh node-name
+                                       (str "cd " remote-root " && kbb --backend sci sandbox_agent.cljk --spec "
+                                            remote-root "/" (path/basename local-spec))
+                                       {:timeout-sec 1800})
+          body (some-> out (str/split #"===FLEET-RESULT-BEGIN===") second
+                       (str/split #"===FLEET-RESULT-END===") first)
+          result (when body (reader/read-string (str/trim body)))]
+      (node/ssh node-name (str "rm -rf " remote-root))   ; ephemeral: nothing survives a run
+      (when-not result
+        (throw (ex-info (str "sandbox produced no result (exit " exit ")") {:out out})))
+      (cli/say (str "  sandbox: backing=" (name (or (:exec-backing result) :?))
+                    " machine=" (name (or (:machine result) :?))
+                    " blocked=" (count (get-in result [:exec-probe :blocked]))
+                    "/" (+ (count (get-in result [:exec-probe :blocked]))
+                           (count (get-in result [:exec-probe :leaked])))
+                    "\n  sandbox: stop=" (name (or (:stop result) :?))
+                    " turns=" (:turns result) " tools=" (:tool-calls result)
+                    " tests-exit=" (get-in result [:tests :final-exit])
+                    " diff=" (count (:diff result)) "B in "
+                    (quot (- (now) started) 1000) "s"))
+      (when-not (str/blank? (:diff result))
+        (assoc result :pin (:pin spec) :repo (:repo spec) :node node-name
+               :agent agent-name :source-auth (if source-token :token :none)
+               :wall-ms (- (now) started))))))
+
+;; ── materialize (C1) ────────────────────────────────────────────────────────
+
+(defn- materialize-dry-run!
+  "Land the patch as a real commit in a local scratch repo — inspectable with
+  `git log -p`, pushed nowhere."
+  [{:keys [spec state-dir tarball payload]}]
+  (let [dir (path/join state-dir "materialize" (:work-id spec))
+        g (fn [& args] (git (concat ["-C" dir] args)))]
+    (extract-pinned! tarball dir)
+    (g "init" "-q")
+    (g "-c" "user.email=fleet@local" "-c" "user.name=fleet-governor" "add" "-A")
+    (g "-c" "user.email=fleet@local" "-c" "user.name=fleet-governor"
+       "commit" "-q" "-m" (str (:repo spec) " @ " (subs (:pin spec) 0 12) " (pinned base)"))
+    (git ["-C" dir "apply" "-"] {:input (:diff payload)})
+    (g "add" "-A")
+    (g "-c" "user.email=fleet@local" "-c" "user.name=fleet-governor"
+       "commit" "-q" "-m" (str "fleet-agent: " (:unit spec) "\n\n" (str/trim (or (:summary payload) ""))))
+    (cli/say (str "  materialize: " dir " (2 commits; git -C " dir " log -p)"))
+    {:mode :dry-run :dir dir}))
+
+(defn- materialize-push!
+  "Land the patch as a BRANCH on the real repo, plus a PR.
+
+  Deliberately not a push to main: the fleet's own rule is that a pin advance
+  is a separate, verified act, and an agent patch arriving as a reviewable
+  branch keeps that true. Requires an explicit FLEET_PUSH_TOKEN and a
+  work-unit that opted in — a push is the one step that cannot be undone by
+  deleting a scratch directory."
+  [{:keys [spec payload signer]}]
+  (when-not (:allow-push spec)
+    (throw (ex-info "work-unit did not opt in to push (:allow-push true)" {})))
+  (when-not push-token
+    (throw (ex-info "FLEET_PUSH_TOKEN is required for --materialize push" {})))
+  (let [dir (fs/mkdtempSync "/tmp/fleet-push-")
+        files (gate/diff-files (:diff payload))
+        branch (str "fleet-agent/" (:work-id spec))]
+    ;; apply the patch to the pinned tree so the blobs we upload are exactly
+    ;; what the gate verified, not a re-read of anything mutable
+    (extract-pinned! (:tarball payload) dir)
+    (git ["-C" dir "apply" "-"] {:input (:diff payload)})
+    (let [contents (into {} (map (fn [f] [f (fs/readFileSync (path/join dir f) "utf8")]) files))
+          sha (gh/commit-tree!
+               {:token push-token :repo (:repo spec) :base-sha (:pin spec) :branch branch
+                :files contents
+                :message (str "fleet-agent: " (:unit spec) "\n\n"
+                              (str/trim (or (:summary payload) "")) "\n\n"
+                              "agent: " (:agent payload) "\nnode: " (:node payload)
+                              "\nmodel: " (:model payload)
+                              "\nexec-backing: " (:exec-backing payload)
+                              "\nsigned-by: " signer)})
+          pr (gh/open-pr! {:token push-token :repo (:repo spec) :head branch
+                           :title (str "fleet-agent: " (:work-id spec))
+                           :body (str "Produced by a sandboxed agent on `" (:node payload)
+                                      "` from pinned `" (subs (:pin spec) 0 12) "`.\n\n"
+                                      "- exec backing: `" (:exec-backing payload) "`, "
+                                      (count (get-in payload [:exec-probe :blocked])) " escapes blocked\n"
+                                      "- tests on node: exit " (get-in payload [:tests :final-exit]) "\n"
+                                      "- receipt signed by `" signer "`\n")})]
+      (cli/sh "rm" ["-rf" dir])
+      (cli/say (str "  materialize: pushed " branch " (" (subs sha 0 12) ")"
+                    (when (:url pr) (str " → " (:url pr)))))
+      {:mode :push :branch branch :commit sha :pr (:url pr)})))
+
+(defn- materialize! [mode ctx]
+  (case mode
+    :none (do (cli/say "  materialize: skipped") {:mode :none})
+    :dry-run (materialize-dry-run! ctx)
+    :push (materialize-push! ctx)
+    (throw (ex-info (str "unknown materialize mode " mode) {}))))
+
+;; ── store ───────────────────────────────────────────────────────────────────
+
+(defn open-store! [{:keys [store log-path db-name identity]}]
+  (case store
+    :file (do (cli/say (str "  store: file " log-path))
+              (filestore/file-store (path/resolve log-path)))
+    :kotobase (let [db (kbs/kotobase-store {:identity identity :db-name db-name})]
+                (cli/say (str "  store: kotobase.net db=" db-name
+                              "\n         graph=" (:fleet/graph db)))
+                db)
+    (throw (ex-info (str "unknown store " store) {}))))
+
+;; ── the flow ────────────────────────────────────────────────────────────────
+
+
+(defn decide!
+  "The governor half: sign-off, gate, materialize, sign, publish. Split out of
+  `dispatch!` because an approved proposal must be able to land WITHOUT running
+  the agent again — re-running would spend a sandbox session to reproduce a
+  patch a human already approved, and might not reproduce it at all."
+  [{:keys [spec agent-name identity db state-dir materialize publish? node-name
+           signoff-dids pristine tarball protected signoff-paths]}]
+  (let [unit (:unit spec)
+        pending (gov/pending-proposals db)
+        held (filterv (fn [p]
+                        (and (receipt/needs-signoff?
+                              (gate/diff-files (:diff (:proposal/payload p))) signoff-paths)
+                             (not (receipt/approved? (store/datoms db) (:proposal/id p) signoff-dids))))
+                      pending)]
+    (doseq [p held]
+      (cli/say (str "  HELD for sign-off: " (:proposal/id p)
+                    " (touches " (str/join ", " (gate/diff-files (:diff (:proposal/payload p)))) ")"
+                    "\n    approve with: --approve " (:proposal/id p))))
+    (if (seq held)
+      {:status :held :unit unit :proposals (mapv :proposal/id held)}
+      (let [receipts (gov/drain!
+                      db {:gate (fn [proposal]
+                                  (let [p (:proposal/payload proposal)
+                                        applies? (try (git ["-C" pristine "apply" "--check" "-"]
+                                                           {:input (:diff p)}) true
+                                                      (catch :default _ false))
+                                        rs (gate/reasons
+                                            {:payload p :agent (:proposal/agent proposal)
+                                             :holder (lease/holder db (:proposal/work proposal) (now))
+                                             :pin (:pin spec) :protected-paths protected
+                                             :kcm-spec spec
+                                             :allow-unsandboxed? (:allow-unsandboxed-exec spec)
+                                             :patch-applies? applies?})]
+                                    (if (seq rs)
+                                      (do (cli/say (str "  gate: REJECT — " (str/join "; " rs))) false)
+                                      (do (cli/say (str "  gate: accept ("
+                                                        (str/join ", " (gate/diff-files (:diff p))) ")"))
+                                          true))))
+                          :materialize (fn [proposal]
+                                         (materialize! materialize
+                                                       {:spec spec :state-dir state-dir
+                                                        :tarball tarball
+                                                        :payload (:proposal/payload proposal)
+                                                        :signer (:did identity)}))})
+            verdicts (mapv :receipt/verdict receipts)
+            payload (:proposal/payload (first pending))
+            signed (mapv (fn [r]
+                           (let [s (receipt/sign identity
+                                                 (receipt/body {:receipt r :payload payload
+                                                                :work-id (:work-id spec)
+                                                                :node node-name
+                                                                :at (.toISOString (js/Date.))}))]
+                             (store/transact-with-t!
+                              db (fn [t]
+                                   (let [e (str "sig|" (:receipt/id r))]
+                                     [[e :sigreceipt/receipt (:receipt/id r) t]
+                                      [e :sigreceipt/cid (:cid s) t]
+                                      [e :sigreceipt/signature (:signature s) t]
+                                      [e :sigreceipt/signer (:signer s) t]])))
+                             s))
+                         receipts)]
+        (agent/complete! db {:unit unit :agent agent-name :now (now)})
+        (when (some #{:accepted} verdicts) (agent/close-work! db unit))
+        (fs/mkdirSync (path/join state-dir "receipts") #js {:recursive true})
+        (fs/writeFileSync (path/join state-dir "receipts" (str (:work-id spec) ".edn"))
+                          (str/join "\n" (map pr-str signed)))
+        (cli/say (str "  receipts: " (str/join ", " (map name verdicts))
+                      " (signed by " (:did identity) ")"))
+        (when publish?
+          (if-not ledger-token
+            (cli/warn "  ledger: FLEET_LEDGER_TOKEN not set — receipt NOT published")
+            (doseq [s signed]
+              (let [{:keys [commit lines]} (receipt/append-to-ledger! {:token ledger-token :signed s})]
+                (cli/say (str "  ledger: " receipt/ledger-path " line " lines
+                              " (" (subs commit 0 12) ")"))))))
+        {:status :decided :unit unit :verdicts verdicts :receipts signed}))))
+
+(defn dispatch!
+  "Run one work-unit. Returns a summary map (never throws for ordinary fleet
+  weather: a lost race, a node that is down, a rejected patch are all values)."
+  [{:keys [spec agent-name identity db state-dir materialize publish? node-name
+           settle-ms signoff-dids] :as opts}]
+  (when (kcm/kcm? spec) (kcm/validate! spec))
+  (let [unit (:unit spec)
+        protected (get spec :protected-paths default-protected)
+        signoff-paths (get spec :signoff-paths default-signoff)
+        agent-src (:agent-src opts)]
+    (when-not (some #(and (= :work/unit (second %)) (= unit (nth % 2))) (store/datoms db))
+      (agent/enqueue! db {:unit unit :created-by agent-name})
+      (cli/say "  enqueued work-unit"))
+    (let [tarball (path/join state-dir (str (:work-id spec) ".tgz"))
+          _ (cli/say (str "  fetching " (:repo spec) " @ " (subs (:pin spec) 0 12) " …"))
+          fetched (gh/fetch-tarball! {:repo (:repo spec) :sha (:pin spec)
+                                      :dest tarball :token source-token})
+          pristine (extract-pinned! tarball (path/join state-dir "pristine" (:work-id spec)))
+          outcome (agent/claim-and-propose!
+                   db {:unit unit :agent agent-name :ttl-ms (get spec :ttl-ms 1800000) :now (now)
+                       :run (fn [_]
+                              (try
+                                (if-not (kbs/confirmed-holder? db unit agent-name settle-ms)
+                                  (do (cli/say "  claim lost after settle — backing off") nil)
+                                  (some-> (run-on-node! {:spec spec :node-name node-name
+                                                         :agent-name agent-name
+                                                         :state-dir state-dir :tarball tarball
+                                                         :agent-src agent-src})
+                                          (assoc :tarball tarball :source-auth (:auth fetched))))
+                                (catch :default e
+                                  (cli/say (str "  run FAILED: " (ex-message e))) nil)))})]
+      (cli/say (str "  claim: " (name (:status outcome))
+                    (when (:holder outcome) (str " (holder=" (:holder outcome) ")"))))
+      (if-not (= :proposed (:status outcome))
+        {:status (:status outcome) :unit unit}
+        (decide! (assoc opts :pristine pristine :tarball tarball :protected protected
+                        :signoff-paths signoff-paths))))))
+
+(defn prepare
+  "Fetch + extract the pinned tree without running anything. `--drain` needs it
+  because the gate still re-verifies that an approved patch applies to the
+  exact pin it was produced from."
+  [{:keys [spec state-dir]}]
+  (let [tarball (path/join state-dir (str (:work-id spec) ".tgz"))]
+    (gh/fetch-tarball! {:repo (:repo spec) :sha (:pin spec) :dest tarball :token source-token})
+    {:tarball tarball
+     :pristine (extract-pinned! tarball (path/join state-dir "pristine" (:work-id spec)))}))

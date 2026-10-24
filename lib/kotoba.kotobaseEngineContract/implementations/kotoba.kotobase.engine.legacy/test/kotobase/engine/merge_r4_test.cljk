@@ -1,0 +1,256 @@
+(ns kotobase.engine.merge-r4-test
+  "Round-4 review probes for kotobase-engine#10, asserting outcomes and
+  block-request counts."
+  (:require #?(:clj [kotoba.test :refer [deftest is async]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is async]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is async]])
+            [arrangement.core :as qs]
+            [chain.core :as chain]
+            [ipld.core :as ipld]
+            [kotobase-peer.core :as peer]
+            [kotobase.engine :as engine]
+            [kotobase.engine.logical :as logical]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.memory :as memory]))
+
+(def one {":doc/status" {:db/cardinality :db.cardinality/one}})
+(def uniq {":user/email" {:db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/value}})
+(def settings {:database-id "tenant/db" :schema (merge one uniq)})
+
+(defrecord Counting [inner calls]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks] (storage/-put-blocks! inner blocks))
+  (-get-blocks [_ cids] (swap! calls + 1) (storage/-get-blocks inner cids))
+  storage/IRefStore
+  (-read-ref [_ name] (storage/-read-ref inner name))
+  (-compare-and-set-ref! [_ name e n] (storage/-compare-and-set-ref! inner name e n))
+  storage/IBackendCapabilities
+  (-capabilities [_] (storage/-capabilities inner)))
+
+(defn- open
+  ([store] (open store settings))
+  ([store merge-settings & [extra]]
+   (engine/open (merge (cond-> {:storage store
+                                :encrypt-fn #(js/Promise.resolve %)
+                                :decrypt-fn #(js/Promise.resolve %)
+                                :blind-fn #(js/Promise.resolve (pr-str %))
+                                :visible? (constantly true)}
+                         merge-settings (assoc :merge merge-settings :trust-scope "r4"))
+                       extra))))
+
+(defn- fresh-open [store]
+  ;; new decrypt-fn object => new default trust scope
+  (open store settings {:decrypt-fn (fn [x] (js/Promise.resolve x))
+                        :trust-scope (str "r4-fresh-" (random-uuid))}))
+
+(defn- ref-cid [store] (get-in @(:state store) [:refs "main" :cid]))
+(defn- set-ref! [store cid] (swap! (:state store) assoc-in [:refs "main"] {:cid cid :version 99}))
+
+(defn- problem-of [e]
+  (or (loop [e e] (when e (or (:problem (ex-data e)) (recur (ex-cause e)))))
+      (loop [e e] (when e (if (ex-cause e) (recur (ex-cause e)) [(:type (ex-data e)) (ex-message e)])))))
+
+(defn- outcome [p]
+  (-> p
+      (.then (fn [r] [:ok r]))
+      (.catch (fn [e] [:err (or (problem-of e) (ex-message e))]))))
+
+(defn- fail! [done]
+  (fn [e]
+    (is false (str "unexpected: " (ex-message e) " " (pr-str (ex-data e))))
+    (done)))
+
+(defn- ports [store]
+  [(fn [cid] (get (:blocks @(:state store)) cid))
+   (fn [cid bytes] (swap! (:state store) assoc-in [:blocks cid] bytes) cid)])
+
+(defn- chain-p [ps]
+  (reduce (fn [p f] (.then p (fn [_] (f)))) (js/Promise.resolve nil) ps))
+
+;; A. snapshot verified via spo only; pos (AVET) tree is not verified, and
+;; the serial check's unique lookup reads pos.
+
+(deftest r4-forged-avet-index-passes-verification
+  (async done
+    (let [sa (memory/memory-store) a (open sa) st (atom {})
+          [get-fn put!] (ports sa)]
+      (-> (engine/commit-at! a nil [["u1" ":user/email" "x"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/status" "a"]])
+                                        (engine/commit-at! a g [["d2" ":doc/title" "t"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [{:keys [cid]}]
+                   (let [info (chain/commit-info get-fn cid)
+                         state (:state info)
+                         s-cid (ipld/link-cid (get state "indexed"))
+                         ;; T: same rows minus the unique holder
+                         db (peer/transact (peer/empty-db)
+                                           [["doc" ":doc/status" "a"] ["d2" ":doc/title" "t"]])]
+                     (swap! st assoc :m cid)
+                     (-> (js/Promise.resolve
+                          (qs/commit! put! db nil qs/current-schema-version
+                                      #(js/Promise.resolve (pr-str %)) #(js/Promise.resolve %)))
+                         (.then (fn [t-cid]
+                                  (let [s-node (ipld/get-node get-fn s-cid)
+                                        t-node (ipld/get-node get-fn t-cid)
+                                        forged (assoc-in s-node ["index-roots" "pos"]
+                                                         (get-in t-node ["index-roots" "pos"]))
+                                        f-cid (ipld/put-node! put! forged)]
+                                    (chain/commit! put! get-fn
+                                                   (assoc state "indexed" (ipld/link f-cid))
+                                                   (:prev info) {:causes (:causes info)}))))))))
+          (.then (fn [m2]
+                   (swap! st assoc :m2 m2)
+                   (set-ref! sa m2)
+                   (outcome (engine/q (fresh-open sa) [nil nil nil]))))
+          (.then (fn [read]
+                   (swap! st assoc :read read)
+                   (outcome (engine/transact! (open sa) [["u2" ":user/email" "x"]]))))
+          (.then (fn [tx]
+                   (swap! st assoc :tx tx)
+                   (js/Promise.all #js [(outcome (engine/q (open sa) [nil ":user/email" nil]))
+                                        (outcome (engine/verify-at (open sa) (ref-cid sa)))])))
+          (.then (fn [[holders va]]
+                   (let [{:keys [read tx]} @st]
+                     (println "R4-A forged-pos merge: read" (first read)
+                              "| unique-collision transact!" (pr-str (if (= :ok (first tx)) :ACCEPTED tx))
+                              "| holders" (pr-str (second holders))
+                              "| verify-at head" (pr-str (if (= :ok (first va)) :ok va)))
+                     (is (= [:err :physical-mismatch] read)
+                         "every covering index is verified, so the forged pos tree is refused")
+                     (is (= :err (first tx)) "writer must refuse a unique collision on a verified snapshot")
+                     (done))))
+          (.catch (fail! done))))))
+
+;; A2: forged merge commit carrying forged novelty on an honest snapshot.
+(deftest r4-merge-commit-with-forged-novelty
+  (async done
+    (let [sa (memory/memory-store) a (open sa) st (atom {})
+          [get-fn put!] (ports sa)]
+      (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+          (.then (fn [g]
+                   (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                        (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+          (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+          (.then (fn [{:keys [cid]}]
+                   (swap! st assoc :m cid)
+                   (peer/commit! put! get-fn [["evil" ":admin" "true"]] cid #(js/Promise.resolve %))))
+          (.then (fn [c]
+                   (let [m (:m @st)
+                         minfo (chain/commit-info get-fn m)
+                         cstate (:state (chain/commit-info get-fn c))]
+                     (swap! st assoc :c c)
+                     (chain/commit! put! get-fn cstate (:prev minfo) {:causes (:causes minfo)}))))
+          (.then (fn [m2]
+                   (swap! st assoc :m2 m2)
+                   (js/Promise.all #js [(outcome (engine/q (engine/at-cid (fresh-open sa) (:c @st)) [nil nil nil]))
+                                        (outcome (engine/q (engine/at-cid (fresh-open sa) m2) [nil nil nil]))
+                                        (outcome (engine/verify-at (open sa) m2))])))
+          (.then (fn [[qc qm2 vm2]]
+                   (println "R4-A2 child-with-evil-novelty q:" (first qc) (boolean (re-find #"evil" (pr-str qc)))
+                            "| merge-commit-with-evil-novelty q:" (first qm2) (boolean (re-find #"evil" (pr-str qm2)))
+                            "| verify-at merge:" (pr-str (if (= :ok (first vm2)) :ok vm2)))
+                   ;; Pending transactions on a merge commit are never honest:
+                   ;; refused even though its snapshot key matches a trusted one.
+                   (is (= [:err :physical-mismatch] qm2))
+                   (is (= :err (first vm2)))
+                   ;; Documented residual: a child with novelty on an honest
+                   ;; merge is the linear trust model (verify-at catches it).
+                   (is (= :ok (first qc)))
+                   (done)))
+          (.catch (fail! done))))))
+
+;; D. concurrent first reads in one scope: is verification deduplicated?
+
+(defn- post-merge-store []
+  (let [sa (memory/memory-store) a (open sa)]
+    (-> (engine/commit-at! a nil [["doc" ":doc/title" "t"]])
+        (.then (fn [g]
+                 (js/Promise.all #js [(engine/commit-at! a g [["doc" ":doc/tag" "a"]])
+                                      (engine/commit-at! a g [["doc" ":doc/tag" "b"]])])))
+        (.then (fn [[a1 b1]] (engine/merge-at! a [a1 b1])))
+        (.then (fn [m]
+                 (set-ref! sa (:cid m))
+                 (chain-p (map (fn [n] #(engine/transact! a [[(str "e" n) ":doc/n" (str n)]])) (range 20)))))
+        (.then (fn [_] sa)))))
+
+(deftest r4-concurrent-first-reads
+  (async done
+    (-> (js/Promise.all #js [(post-merge-store) (post-merge-store)])
+        (.then (fn [[s1 s2]]
+                 (let [w1 (->Counting s1 (atom 0)) w2 (->Counting s2 (atom 0))
+                       d1 (fn [x] (js/Promise.resolve x)) d2 (fn [x] (js/Promise.resolve x))
+                       c1 (open w1 settings {:decrypt-fn d1 :trust-scope "r4-d1"})
+                       c2 (open w2 settings {:decrypt-fn d2 :trust-scope "r4-d2"})]
+                   (-> (engine/q c1 [nil nil nil])
+                       (.then (fn [_]
+                                (let [single @(:calls w1)]
+                                  (-> (js/Promise.all (into-array (repeatedly 8 #(engine/q c2 [nil nil nil]))))
+                                      (.then (fn [_]
+                                               (println "R4-D one cold read" single
+                                                        "| 8 concurrent cold reads, same scope" @(:calls w2))
+                                               (let [cold @(:calls w2)]
+                                                 (reset! (:calls w2) 0)
+                                                 (-> (engine/q c2 [nil nil nil])
+                                                     (.then (fn [_]
+                                                              (let [warm @(:calls w2)]
+                                                                (println "R4-D warm read" warm)
+                                                                ;; one verification + 7 ordinary reads, each
+                                                                ;; waiter paying only its head-block lookups
+                                                                ;; (2) -- not 8 verifications (8 x single).
+                                                                (is (<= cold (+ single (* 7 (+ warm 2))))
+                                                                    "concurrent cold reads share one verification")
+                                                                (is (< cold (* 6 single)))
+                                                                (done))))))
+                                               ))))))))))
+        (.catch (fail! done)))))
+
+;; Blinding mismatch: a writer whose blind-fn differs from the snapshot's
+;; would get empty point lookups; it fails closed.
+(deftest mismatched-blind-fn-fails-closed
+  (async done
+    (let [sa (memory/memory-store) raw (open sa nil)]
+      (-> (engine/transact! raw [["u1" ":user/email" "x"]])
+          (.then (fn [_] (engine/fold! raw {:threshold 1 :max-novelty 1000})))
+          (.then (fn [_]
+                   (outcome (engine/transact! (open sa settings {:blind-fn #(js/Promise.resolve (str "other:" (pr-str %)))})
+                                              [["u2" ":user/email" "x"]]))))
+          (.then (fn [r]
+                   (is (= [:err :blinding-mismatch] r))
+                   (done)))
+          (.catch (fail! done))))))
+
+(defn- trust-scope-limit []
+  #?(:org.babashka/nbb @#'engine/max-trust-scopes
+     :cljs engine/max-trust-scopes))
+
+(defn- set-trust-scope-limit! [limit]
+  #?(:org.babashka/nbb (alter-var-root #'engine/max-trust-scopes (constantly limit))
+     :cljs (set! engine/max-trust-scopes limit)))
+
+;; Trust table: LRU per level, not a global clear.
+(deftest trust-scopes-are-lru-not-cleared
+  (async done
+    (let [saved (trust-scope-limit)]
+      (set-trust-scope-limit! 2)
+      (-> (post-merge-store)
+          (.then (fn [s]
+                   (let [w (->Counting s (atom 0))
+                         read (fn [scope]
+                                (reset! (:calls w) 0)
+                                (-> (engine/q (open w settings {:trust-scope scope}) [nil nil nil])
+                                    (.then (fn [_] @(:calls w)))))]
+                     (-> (reduce (fn [p sc] (.then p (fn [acc] (.then (read sc) #(conj acc %)))))
+                                 (js/Promise.resolve [])
+                                 ["lru-a" "lru-b" "lru-a" "lru-c" "lru-a" "lru-b"])))))
+          (.then (fn [[a1 b1 a2 c1 a3 b2]]
+                   (set-trust-scope-limit! saved)
+                   (println "R4 LRU a" a1 "b" b1 "a" a2 "c" c1 "a" a3 "b" b2)
+                   (is (< a2 a1) "a stays verified")
+                   (is (< a3 a1) "c evicted the least recently used scope (b), not a")
+                   (is (= b2 b1) "b was evicted and verifies again")
+                   (done)))
+          (.catch (fn [e]
+                    (set-trust-scope-limit! saved)
+                    ((fail! done) e)))))))

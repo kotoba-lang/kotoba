@@ -1,0 +1,156 @@
+(ns kotoba.kip.quorum-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.kip.quorum :as q]))
+
+;; A fake signature scheme: a signature is "<pubkey>|<payload>". It is not
+;; cryptography and does not pretend to be — what these tests check is the
+;; admission logic around a verifier, which is where the decisions are. The
+;; real ed25519 path is exercised end-to-end by the superproject's
+;; scripts/verify-kip-quorum.cljs against node:crypto.
+
+(defn- fake-hash [s] (str "h" (hash s)))
+(defn- did->pub [did] (str "pub-" (last (str/split did #":"))))
+(defn- fake-sign [pub payload] (str pub "|" payload))
+(defn- fake-verify [pub payload sig] (= sig (fake-sign pub payload)))
+
+(def alice "did:key:zAlice")
+(def bob "did:key:zBob")
+(def mallory "did:key:zMallory")
+
+(def policy {:allow #{alice bob} :threshold 2})
+
+(defn- ctx [] {:policy policy :verify-fn fake-verify
+               :did->pubkey-hex did->pub :hash-fn fake-hash})
+
+(def kip
+  {:kip/id "kip-0001" :kip/number 1 :kip/track :standards
+   :kip/title "t" :kip/surfaces [:value-codec :version-policy]
+   :kip/specification "the spec"})
+
+(defn- sig-by [did k]
+  {:signer did :signature (fake-sign (did->pub did) (q/canonical-str fake-hash k)) :at "2026-08-16"})
+
+;; ------------------------------------------------------------------ payload
+(deftest the-payload-excludes-the-signatures
+  (testing "otherwise the first signature changes what the second one signs"
+    (let [a (q/canonical-str fake-hash kip)
+          b (q/canonical-str fake-hash (assoc kip :kip/quorum [(sig-by alice kip)]))]
+      (is (= a b)))))
+
+(deftest the-payload-excludes-the-status
+  (testing "a quorum signature is what MOVES a KIP to :final, so it is made
+            while the document still says :last-call — if status were covered,
+            admitting the KIP would void the signatures that admitted it"
+    (is (= (q/canonical-str fake-hash (assoc kip :kip/status :last-call))
+           (q/canonical-str fake-hash (assoc kip :kip/status :final)))))
+  (testing "and the signatures survive the admission end to end"
+    (let [at-lc (assoc kip :kip/status :last-call)
+          signed [(sig-by alice at-lc) (sig-by bob at-lc)]
+          admitted (assoc kip :kip/status :final)]
+      (is (= :admit (:verdict (q/admit admitted signed (ctx))))))))
+
+(deftest the-payload-still-covers-the-clock
+  (testing "backdating last-call after signing must void the quorum"
+    (let [a (assoc kip :kip/last-call-started "2026-08-16")
+          b (assoc kip :kip/last-call-started "2026-07-01")]
+      (is (not= (q/canonical-str fake-hash a) (q/canonical-str fake-hash b))))))
+
+(deftest the-payload-covers-everything-else
+  (doseq [[label mutated]
+          [["the specification" (assoc kip :kip/specification "something else")]
+           ["a surface"         (assoc kip :kip/surfaces [:value-codec])]
+           ["the track"         (assoc kip :kip/track :process)]
+           ["the number"        (assoc kip :kip/number 2)]
+           ["the title"         (assoc kip :kip/title "t2")]
+           ["a new field"       (assoc kip :kip/migration "none")]]]
+    (testing (str "changing " label " changes the payload")
+      (is (not= (q/canonical-str fake-hash kip) (q/canonical-str fake-hash mutated))))))
+
+(deftest the-payload-does-not-depend-on-map-order
+  (let [reordered (into {} (reverse (seq kip)))]
+    (is (= (q/canonical-str fake-hash kip) (q/canonical-str fake-hash reordered)))))
+
+(deftest surfaces-are-order-insensitive-but-content-sensitive
+  (is (= (q/canonical-str fake-hash kip)
+         (q/canonical-str fake-hash (assoc kip :kip/surfaces [:version-policy :value-codec]))))
+  (is (not= (q/canonical-str fake-hash kip)
+            (q/canonical-str fake-hash (assoc kip :kip/surfaces [:version-policy])))))
+
+;; ---------------------------------------------------------------- admission
+(deftest two-valid-signatures-admit
+  (let [r (q/admit kip [(sig-by alice kip) (sig-by bob kip)] (ctx))]
+    (is (= :admit (:verdict r)))
+    (is (= #{alice bob} (:valid-signers r)))
+    (is (empty? (:reasons r)))))
+
+(deftest one-signature-does-not
+  (let [r (q/admit kip [(sig-by alice kip)] (ctx))]
+    (is (= :reject (:verdict r)))
+    (is (= [:quorum-not-met] (:reasons r)))))
+
+(deftest the-same-signer-twice-is-one-signer
+  (let [r (q/admit kip [(sig-by alice kip) (sig-by alice kip)] (ctx))]
+    (is (= :reject (:verdict r)))
+    (is (= 1 (count (:valid-signers r))))
+    (testing "and the claim count still shows both, so the report can say so"
+      (is (= 2 (:claimed r))))))
+
+(deftest a-signer-outside-the-allow-list-does-not-count-and-is-not-an-error
+  (let [r (q/admit kip [(sig-by alice kip) (sig-by mallory kip)] (ctx))]
+    (is (= [:quorum-not-met] (:reasons r)) "not an invalid-signature reason")
+    (is (= #{alice} (:valid-signers r)))))
+
+(deftest an-allowed-did-with-a-bad-signature-is-an-error
+  (testing "tampering, or a payload disagreement — either way it must be said"
+    (let [r (q/admit kip [(sig-by alice kip)
+                          {:signer bob :signature "garbage"}]
+                     (ctx))]
+      (is (= :reject (:verdict r)))
+      (is (some #{:invalid-signature-from-allowed-did} (:reasons r)))
+      (is (= [bob] (:invalid-from-allowed r))))))
+
+(deftest editing-a-final-kip-invalidates-its-quorum
+  (testing "this is the property the whole mechanism exists for"
+    (let [signed [(sig-by alice kip) (sig-by bob kip)]
+          edited (assoc kip :kip/specification "quietly changed after admission")]
+      (is (= :admit (:verdict (q/admit kip signed (ctx)))))
+      (is (= :reject (:verdict (q/admit edited signed (ctx)))))
+      (is (= [alice bob] (sort (:invalid-from-allowed (q/admit edited signed (ctx)))))))))
+
+(deftest missing-signature-material-is-not-a-pass
+  (is (= :reject (:verdict (q/admit kip [] (ctx)))))
+  (is (= :reject (:verdict (q/admit kip nil (ctx)))))
+  (is (= :reject (:verdict (q/admit kip [{:signer alice}] (ctx)))))
+  (is (= :reject (:verdict (q/admit kip ["not a map"] (ctx))))))
+
+(deftest a-degenerate-policy-is-rejected-loudly
+  (testing "an empty allow-list would otherwise make threshold 0 admit anything"
+    (let [r (q/admit kip [] (assoc-in (ctx) [:policy :allow] #{}))]
+      (is (some #{:empty-allow-list} (:reasons r)))))
+  (let [r (q/admit kip [(sig-by alice kip) (sig-by bob kip)]
+                   (update (ctx) :policy dissoc :threshold))]
+    (is (some #{:no-threshold} (:reasons r)))))
+
+(deftest a-verifier-that-throws-is-a-failed-signature-not-a-crash
+  (let [boom (assoc (ctx) :verify-fn (fn [& _] (throw (ex-info "nope" {}))))
+        r (q/admit kip [(sig-by alice kip) (sig-by bob kip)] boom)]
+    (is (= :reject (:verdict r)))
+    (is (empty? (:valid-signers r)))))
+
+;; ------------------------------------------------------------------ wiring
+(deftest verifier-plugs-into-core-quorum-signers
+  (let [k (assoc kip :kip/quorum [(sig-by alice kip) (sig-by mallory kip)])
+        pred (q/verifier k (ctx))]
+    (is (true? (pred {:signer alice})))
+    (is (false? (pred {:signer mallory})))))
+
+(deftest explain-separates-not-counted-from-failed
+  (let [lines (q/explain kip [(sig-by alice kip)
+                              (sig-by mallory kip)
+                              {:signer bob :signature "garbage"}]
+                         (ctx))]
+    (is (= 3 (count lines)))
+    (is (str/includes? (first lines) "valid"))
+    (is (str/includes? (second lines) "not in allow-list"))
+    (is (str/includes? (nth lines 2) "ALLOWED BUT SIGNATURE INVALID"))))

@@ -1,0 +1,524 @@
+--- cf62e124:src/kotobase/datomic/client.cljc
++++ main:src/kotobase/datomic/client.cljk
+@@ -26,12 +26,16 @@
+ 
+   See ADR-2607265000 (grammar) and ADR-2607279000 (client API maturity)."
+   (:refer-clojure :exclude [sync])
+-  (:require #?(:clj [clojure.edn :as edn]
++  (:require #?(:clj [kotoba.lang.edn :as edn]
+                :cljs [cljs.reader :as edn])
+-            [clojure.string :as str]
++            [kotoba.lang.text :as str]
+             [kotobase.datomic :as d]
+             [kotobase.engine :as engine]
+-            [kotobase.storage.memory :as memory]))
++            [kotobase.storage.memory :as memory])
++  #?(:clj (:import [java.net URI]
++                   [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
++                    HttpResponse$BodyHandlers]
++                   [java.time Duration])))
+ 
+ ;; ---------------------------------------------------------------------------
+ ;; Anomalies (cognitect.anomalies-shaped)
+@@ -141,6 +145,12 @@
+ (defrecord LocalClient [system storage dbs])
+ (defrecord LocalConnection [client db-name database])
+ (defrecord LocalDb [connection database t as-of-t since-t history?])
++(defrecord RemoteConnection [client db-name])
++(defrecord RemoteDb [connection db-name graph t as-of-t since-t history? with? with-tx-data])
++
++(defn- remote-client? [x] (boolean (::remote x)))
++(defn- remote-connection? [x] (instance? RemoteConnection x))
++(defn- remote-db? [x] (instance? RemoteDb x))
+ 
+ (defn- ensure-local-client! [client]
+   (when-not (instance? LocalClient client)
+@@ -148,8 +158,8 @@
+                 {:client (type client)})))
+ 
+ (defn- ensure-connection! [conn]
+-  (when-not (instance? LocalConnection conn)
+-    (incorrect! "Expected a Kotobase connection"
++  (when-not (or (instance? LocalConnection conn) (remote-connection? conn))
++    (incorrect! "Expected a Kotobase local or remote connection"
+                 {:conn (type conn)})))
+ 
+ (defn- unwrap-db [db]
+@@ -162,6 +172,87 @@
+             (d/basis-t database)
+             (catch #?(:clj Exception :cljs :default) _ nil))]
+     (->LocalDb connection database t nil nil false)))
++
++(defn- token-value [client]
++  (let [token (:token client)]
++    (if (ifn? token) (token) token)))
++
++(defn- authorization-value [client]
++  (when-let [token (token-value client)]
++    (cond
++      (str/starts-with? token "Bearer ") token
++      (str/starts-with? token "CACAO ") token
++      :else (str "Bearer " token))))
++
++(defn- default-request
++  [{:keys [url headers body timeout]}]
++  #?(:clj
++     (let [builder (HttpRequest/newBuilder (URI/create url))
++           _ (.timeout builder (Duration/ofMillis (long (or timeout 60000))))
++           _ (doseq [[k v] headers] (.header builder k v))
++           request (-> builder
++                       (.POST (HttpRequest$BodyPublishers/ofString body))
++                       (.build))
++           response (.send (HttpClient/newHttpClient) request
++                           (HttpResponse$BodyHandlers/ofString))]
++       {:status (.statusCode response) :body (.body response)})
++     :cljs
++     (unsupported! "Remote synchronous Client API requires :request-fn in ClojureScript")))
++
++(defn- response-value [response]
++  (cond
++    (and (map? response) (integer? (:status response)))
++    (let [status (:status response)
++          body (:body response)
++          value (if (string? body)
++                  (try (edn/read-string body)
++                       (catch #?(:clj Exception :cljs :default) _ body))
++                  body)]
++      (if (<= 200 status 299)
++        value
++        (anomaly! (cond
++                    (#{400 404 405 409 422} status) :cognitect.anomalies/incorrect
++                    (#{401 403} status) :cognitect.anomalies/forbidden
++                    (#{408 504} status) :cognitect.anomalies/interrupted
++                    (#{429 503} status) :cognitect.anomalies/busy
++                    :else :cognitect.anomalies/fault)
++                  (str "Kotobase Client API HTTP " status)
++                  {:http/status status :http/body value})))
++    :else response))
++
++(defn- remote-post
++  ([client path body] (remote-post client path body nil))
++  ([client path body db-name]
++   (let [endpoint (str/replace (:endpoint client) #"/+$" "")
++         auth (authorization-value client)
++         headers (cond-> {"content-type" "application/edn"
++                          "accept" "application/edn"}
++                   auth (assoc "authorization" auth)
++                   db-name (assoc "x-datomic-db-name" db-name))
++         request {:method :post :url (str endpoint path) :headers headers
++                  :body (pr-str body) :timeout (or (:timeout client) 60000)}
++         request-fn (or (:request-fn client) default-request)]
++     (response-value (request-fn request)))))
++
++(defn- db->wire [db]
++  (cond-> {:kotobase/db-value true
++           :db-name (:db-name db)
++           :graph (:graph db)
++           :basis-t (:t db)}
++    (some? (:as-of-t db)) (assoc :as-of (:as-of-t db))
++    (some? (:since-t db)) (assoc :since (:since-t db))
++    (:history? db) (assoc :history true)
++    (:with? db) (assoc :with true)
++    (some? (:with-tx-data db)) (assoc :with-tx-data (:with-tx-data db))))
++
++(defn- wire->remote-db [connection value]
++  (let [db-name (or (:db-name value) (:db-name connection))]
++    (->RemoteDb connection db-name (:graph value) (:basis-t value)
++                (:as-of value) (:since value) (boolean (:history value))
++                (boolean (:with value)) (:with-tx-data value))))
++
++(defn- remote-db-post [db path body]
++  (remote-post (:client (:connection db)) path body (:db-name db)))
+ 
+ ;; ---------------------------------------------------------------------------
+ ;; Lifecycle — client / connect / databases
+@@ -207,8 +298,8 @@
+   (let [db-name (:db-name arg-map)]
+     (when-not (and (string? db-name) (seq db-name))
+       (incorrect! ":db-name must be a non-empty string"))
+-    (if (::remote client)
+-      (unsupported! "Use remote HTTP /api/create-database for :kotobase clients")
++    (if (remote-client? client)
++      (true? (remote-post client "/api/create-database" {:db-name db-name} db-name))
+       (do
+         (ensure-local-client! client)
+         (let [dbs (:dbs client)]
+@@ -224,15 +315,21 @@
+   (when-not (map? arg-map)
+     (incorrect! "delete-database requires an arg-map with :db-name"))
+   (let [db-name (:db-name arg-map)]
+-    (ensure-local-client! client)
+-    (swap! (:dbs client) dissoc db-name)
+-    true))
++    (if (remote-client? client)
++      (true? (remote-post client "/api/delete-database" {:db-name db-name} db-name))
++      (do
++        (ensure-local-client! client)
++        (swap! (:dbs client) dissoc db-name)
++        true))))
+ 
+ (defn list-databases
+   "Returns a collection of database names."
+   [client _arg-map]
+-  (ensure-local-client! client)
+-  (vec (sort (keys @(:dbs client)))))
++  (if (remote-client? client)
++    (vec (remote-post client "/api/list-databases" {}))
++    (do
++      (ensure-local-client! client)
++      (vec (sort (keys @(:dbs client)))))))
+ 
+ (defn connect
+   "Connects to `:db-name`. Auto-creates the local database if missing."
+@@ -242,13 +339,18 @@
+   (let [db-name (:db-name arg-map)]
+     (when-not (and (string? db-name) (seq db-name))
+       (incorrect! ":db-name must be a non-empty string"))
+-    (ensure-local-client! client)
+-    (let [dbs (:dbs client)
+-          database (or (get @dbs db-name)
+-                       (let [opened (open-database (:storage client))]
+-                         (swap! dbs assoc db-name opened)
+-                         opened))]
+-      (->LocalConnection client db-name database))))
++    (if (remote-client? client)
++      (do
++        (remote-post client "/api/connect" {:db-name db-name} db-name)
++        (->RemoteConnection client db-name))
++      (do
++        (ensure-local-client! client)
++        (let [dbs (:dbs client)
++              database (or (get @dbs db-name)
++                           (let [opened (open-database (:storage client))]
++                             (swap! dbs assoc db-name opened)
++                             opened))]
++          (->LocalConnection client db-name database))))))
+ 
+ ;; ---------------------------------------------------------------------------
+ ;; Database values
+@@ -258,42 +360,60 @@
+   "Returns the current database value for a connection."
+   [conn]
+   (ensure-connection! conn)
+-  (wrap-db conn (d/db (:database conn))))
++  (if (remote-connection? conn)
++    (wire->remote-db conn
++                     (remote-post (:client conn) "/api/db" {}
++                                  (:db-name conn)))
++    (wrap-db conn (d/db (:database conn)))))
+ 
+ (defn as-of
+   "Returns the value of the database as of time-point."
+   [db time-point]
+-  (let [connection (:connection db)
+-        base (unwrap-db db)
+-        filtered (d/as-of base time-point)]
+-    (->LocalDb connection filtered (or time-point (:t db)) time-point nil false)))
++  (if (remote-db? db)
++    (assoc db :as-of-t time-point :since-t nil :history? false)
++    (let [connection (:connection db)
++          base (unwrap-db db)
++          filtered (d/as-of base time-point)]
++      (->LocalDb connection filtered (or time-point (:t db)) time-point nil false))))
+ 
+ (defn since
+   "Returns the value of the database since time-point."
+   [db time-point]
+-  (let [connection (:connection db)
+-        base (unwrap-db db)
+-        filtered (d/since base time-point)]
+-    (->LocalDb connection filtered (:t db) nil time-point false)))
++  (if (remote-db? db)
++    (assoc db :as-of-t nil :since-t time-point :history? false)
++    (let [connection (:connection db)
++          base (unwrap-db db)
++          filtered (d/since base time-point)]
++      (->LocalDb connection filtered (:t db) nil time-point false))))
+ 
+ (defn history
+   "Returns a history database value."
+   [db]
+-  (let [connection (:connection db)
+-        base (unwrap-db db)
+-        filtered (d/history base)]
+-    (->LocalDb connection filtered (:t db) nil nil true)))
++  (if (remote-db? db)
++    (assoc db :as-of-t nil :since-t nil :history? true)
++    (let [connection (:connection db)
++          base (unwrap-db db)
++          filtered (d/history base)]
++      (->LocalDb connection filtered (:t db) nil nil true))))
+ 
+ (defn sync
+   "Coordinate with other clients. Returns a database value with basis
+   `:t` >= t. Local implementation returns the current head."
+-  [conn _t]
+-  (db conn))
++  [conn t]
++  (if (remote-connection? conn)
++    (wire->remote-db conn
++                     (remote-post (:client conn) "/api/sync" {:t t}
++                                  (:db-name conn)))
++    (db conn)))
+ 
+ (defn with-db
+   "Returns a with-db value suitable for passing to `with`."
+   [conn]
+-  (db conn))
++  (if (remote-connection? conn)
++    (wire->remote-db conn
++                     (remote-post (:client conn) "/api/with-db" {}
++                                  (:db-name conn)))
++    (db conn)))
+ 
+ ;; ---------------------------------------------------------------------------
+ ;; Reads
+@@ -326,18 +446,32 @@
+        {:ret windowed :query-stats {}}
+        :else windowed)))
+   ([query & args]
+-   (let [database (unwrap-db (first args))
++   (let [db-value (first args)
+          inputs (rest args)]
+-     (when-not database
++     (when-not db-value
+        (incorrect! "q requires a database as the first input"))
+-     (apply d/q query database inputs))))
++     (if (remote-db? db-value)
++       (remote-db-post db-value "/api/q"
++                       {:query query :args (into [(db->wire db-value)] inputs)})
++       (apply d/q query (unwrap-db db-value) inputs)))))
+ 
+ (defn qseq
+   "Like `q`, returning a seq."
+   ([arg-map]
+-   (seq (q arg-map)))
++   (let [db-value (first (:args arg-map))]
++     (if (remote-db? db-value)
++       (let [base (-> arg-map
++                      (update :args #(into [(db->wire db-value)] (rest %)))
++                      (assoc :chunk (or (:chunk arg-map) 1000)))]
++         (loop [cursor nil out []]
++           (let [page (remote-db-post db-value "/api/qseq"
++                                      (cond-> base cursor (assoc :cursor cursor)))
++                 next-out (into out (:items page))]
++             (if (:done page) (seq next-out)
++                 (recur (:cursor page) next-out)))))
++       (seq (q arg-map)))))
+   ([query & args]
+-   (seq (apply q query args))))
++   (qseq {:query query :args (vec args)})))
+ 
+ (defn pull
+   "Client API `pull`. Supports map and multi-arity forms."
+@@ -353,53 +487,66 @@
+                    :reads {}}}
+        result)))
+   ([db selector eid]
+-   (keywordize-pull (d/pull (unwrap-db db) selector eid))))
++   (if (remote-db? db)
++     (remote-db-post db "/api/pull"
++                     {:db (db->wire db) :selector selector :eid eid})
++     (keywordize-pull (d/pull (unwrap-db db) selector eid)))))
+ 
+ (defn datoms
+   "Client API `datoms`. arg-map: `:index`, `:components`, optional window."
+   [db arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "datoms requires an arg-map with :index"))
+-  (let [rows (d/datoms (unwrap-db db)
+-                       (cond-> {:index (:index arg-map)}
+-                         (contains? arg-map :components)
+-                         (assoc :components (:components arg-map))
+-                         (contains? arg-map :limit)
+-                         (assoc :limit (:limit arg-map))))
+-        shaped (client-datoms rows)]
+-    (apply-window shaped (select-keys arg-map [:offset :limit]))))
++  (if (remote-db? db)
++    (remote-db-post db "/api/datoms" (assoc arg-map :db (db->wire db)))
++    (let [rows (d/datoms (unwrap-db db)
++                         (cond-> {:index (:index arg-map)}
++                           (contains? arg-map :components)
++                           (assoc :components (:components arg-map))
++                           (contains? arg-map :limit)
++                           (assoc :limit (:limit arg-map))))
++          shaped (client-datoms rows)]
++      (apply-window shaped (select-keys arg-map [:offset :limit])))))
+ 
+ (defn seek-datoms
+   "Client API `seek-datoms` (arg-map form)."
+   [db arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "seek-datoms requires an arg-map with :index"))
+-  (let [components (or (:components arg-map) [])
+-        rows (apply d/seek-datoms (unwrap-db db) (:index arg-map) components)]
+-    (apply-window (client-datoms rows) (select-keys arg-map [:offset :limit]))))
++  (if (remote-db? db)
++    (remote-db-post db "/api/seek-datoms" (assoc arg-map :db (db->wire db)))
++    (let [components (or (:components arg-map) [])
++          rows (apply d/seek-datoms (unwrap-db db) (:index arg-map) components)]
++      (apply-window (client-datoms rows) (select-keys arg-map [:offset :limit])))))
+ 
+ (defn rseek-datoms
+   "Reverse seek. Local implementation reverses a seek-datoms result."
+   [db arg-map]
+-  (vec (rseq (vec (seek-datoms db arg-map)))))
++  (if (remote-db? db)
++    (remote-db-post db "/api/rseek-datoms" (assoc arg-map :db (db->wire db)))
++    (vec (rseq (vec (seek-datoms db arg-map))))))
+ 
+ (defn index-range
+   "Client API `index-range`. arg-map: `:attrid`, optional `:start`/`:end`."
+   [db arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "index-range requires an arg-map with :attrid"))
+-  (let [attr (:attrid arg-map)
+-        start (:start arg-map)
+-        end (:end arg-map)
+-        rows (d/index-range (unwrap-db db) attr start end)]
+-    (apply-window (client-datoms rows) (select-keys arg-map [:offset :limit]))))
++  (if (remote-db? db)
++    (remote-db-post db "/api/index-range" (assoc arg-map :db (db->wire db)))
++    (let [attr (:attrid arg-map)
++          start (:start arg-map)
++          end (:end arg-map)
++          rows (d/index-range (unwrap-db db) attr start end)]
++      (apply-window (client-datoms rows) (select-keys arg-map [:offset :limit])))))
+ 
+ (defn index-pull
+   "Walks an index, pulling entities. Supports `:avet` and `:aevt`."
+   [db arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "index-pull requires an arg-map"))
+-  (let [index (:index arg-map)
++  (if (remote-db? db)
++    (remote-db-post db "/api/index-pull" (assoc arg-map :db (db->wire db)))
++    (let [index (:index arg-map)
+         selector (:selector arg-map)
+         start (or (:start arg-map) [])
+         reverse? (:reverse arg-map)
+@@ -419,22 +566,26 @@
+                         (conj acc eid))))
+                 []
+                 eids)]
+-    (mapv #(pull db selector %) unique)))
++      (mapv #(pull db selector %) unique))))
+ 
+ (defn db-stats
+   "Returns at least `{:datoms n}`."
+   [db]
+-  (let [stats (d/db-stats (unwrap-db db))]
+-    (if (map? stats) stats {:datoms stats})))
++  (if (remote-db? db)
++    (remote-db-post db "/api/db-stats" {:db (db->wire db)})
++    (let [stats (d/db-stats (unwrap-db db))]
++      (if (map? stats) stats {:datoms stats}))))
+ 
+ (defn tx-range
+   "Client API `tx-range` on a connection."
+   [conn arg-map]
+   (ensure-connection! conn)
+-  (let [start (:start arg-map)
+-        end (:end arg-map)
+-        txs (d/tx-range (:database conn) start end)]
+-    (apply-window (vec txs) (select-keys arg-map [:offset :limit]))))
++  (if (remote-connection? conn)
++    (remote-post (:client conn) "/api/tx-range" arg-map (:db-name conn))
++    (let [start (:start arg-map)
++          end (:end arg-map)
++          txs (d/tx-range (:database conn) start end)]
++      (apply-window (vec txs) (select-keys arg-map [:offset :limit])))))
+ 
+ ;; ---------------------------------------------------------------------------
+ ;; Writes
+@@ -469,32 +620,69 @@
+     (incorrect! "transact requires an arg-map with :tx-data"))
+   (when-not (contains? arg-map :tx-data)
+     (incorrect! "transact requires :tx-data"))
+-  (let [report (d/transact (:database conn) (select-keys arg-map [:tx-data]))
+-        shaped (client-tx-report report conn)]
+-    (if (:io-context arg-map)
+-      (assoc shaped
+-             :io-stats {:io-context (:io-context arg-map)
+-                        :api :tx-with
+-                        :api-ms 0
+-                        :reads {}})
+-      shaped)))
++  (if (remote-connection? conn)
++    (let [value (remote-post (:client conn) "/api/transact" arg-map (:db-name conn))
++          shaped (-> value
++                     (update :db-before #(wire->remote-db conn %))
++                     (update :db-after #(wire->remote-db conn %)))]
++      (if (:io-context arg-map)
++        (assoc shaped :io-stats {:io-context (:io-context arg-map)
++                                 :api :tx-with :api-ms 0 :reads {}})
++        shaped))
++    (let [report (d/transact (:database conn) (select-keys arg-map [:tx-data]))
++          shaped (client-tx-report report conn)]
++      (if (:io-context arg-map)
++        (assoc shaped
++               :io-stats {:io-context (:io-context arg-map)
++                          :api :tx-with
++                          :api-ms 0
++                          :reads {}})
++        shaped))))
+ 
+ (defn with
+   "Speculative transaction against a with-db value."
+   [db arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "with requires an arg-map with :tx-data"))
+-  (let [report (d/with (unwrap-db db) (select-keys arg-map [:tx-data]))
+-        connection (:connection db)]
+-    (client-tx-report
+-     (assoc report
+-            :db-before db
+-            :db-after (wrap-db connection
+-                               (or (:db-after report) (unwrap-db db))))
+-     connection)))
++  (if (remote-db? db)
++    (let [connection (:connection db)
++          value (remote-db-post db "/api/with"
++                                (assoc arg-map :db (db->wire db)))]
++      (-> value
++          (update :db-before #(wire->remote-db connection %))
++          (update :db-after #(wire->remote-db connection %))))
++    (let [report (d/with (unwrap-db db) (select-keys arg-map [:tx-data]))
++          connection (:connection db)]
++      (client-tx-report
++       (assoc report
++              :db-before db
++              :db-after (wrap-db connection
++                                 (or (:db-after report) (unwrap-db db))))
++       connection))))
+ 
+ (defn administer-system
+-  "Cloud-only control plane. Intentionally unsupported on Kotobase."
+-  [_client _arg-map]
+-  (unsupported!
+-   "administer-system is not part of the Kotobase Client API surface"))
++  "Run the public Client API administration action. Datomic currently
++  documents only `:upgrade-schema`; Kotobase's intrinsic base schema has no
++  out-of-band catalog migration, so a current database returns a diagnostic
++  no-op result rather than pretending to expose Cognitect's private control
++  plane."
++  [client arg-map]
++  (when-not (map? arg-map)
++    (incorrect! "administer-system requires an arg-map"))
++  (let [{:keys [action db-name]} arg-map]
++    (when-not (= :upgrade-schema action)
++      (unsupported! "administer-system supports only :upgrade-schema"
++                    {:action action}))
++    (when-not (and (string? db-name) (seq db-name))
++      (incorrect! "administer-system :upgrade-schema requires :db-name"))
++    (if (remote-client? client)
++      (remote-post client "/api/administer-system" arg-map db-name)
++      (do
++        (ensure-local-client! client)
++        (when-not (contains? @(:dbs client) db-name)
++          (incorrect! (str "Database does not exist: " db-name)
++                      {:db-name db-name}))
++        {:action :upgrade-schema
++         :db-name db-name
++         :status :current
++         :base-schema :kotobase/v1}))))

@@ -1,0 +1,344 @@
+;; Flat validation in the whole canonical MIR native candidate.
+;; See docs/canonical-native-migration.md for exact execution and open gates.
+(ns kotoba.mir.flat
+  {:kotoba/export [validate! representation-error]}
+  (:require [kotoba.gmir :as gmir] [kotoba.gmir.node :as node]
+            [kotoba.gmir.identity :as identity] [kotoba.gmir.catalog :as gmir-catalog]
+            [kotoba.gmir.rodata :as rodata] [kotoba.gmir.outcome :as gmir-outcome]
+            [kotoba.mir.catalog :as catalog]
+            [kotoba.mir.registers :as registers] [kotoba.mir.outcome :as outcome]))
+
+(defn- at [value [:ref :gmir.node/value] index :i64] [:ref :gmir.node/value]
+  (option-match [:option [:ref :gmir.node/value]] (node/child value index) (node/nil-value) item item))
+(defn- named? [value [:ref :gmir.node/value] expected :keyword] :bool
+  (arena-scope (node/keyword-is? value expected)))
+(defn- kw [values [:list :keyword] key :keyword] [:list :keyword]
+  (typed-list-conj [:list :keyword] values key))
+(defn- clean [] [:option [:ref :mir/refusal]] (option-none-of [:option [:ref :mir/refusal]]))
+(defn- failure [problem :keyword data [:ref :gmir.node/value]] [:option [:ref :mir/refusal]]
+  (option-some-of [:option [:ref :mir/refusal]] (outcome/refusal problem data)))
+(defn- failed? [value [:option [:ref :mir/refusal]]] :bool
+  (arena-scope (option-some?-of [:option [:ref :mir/refusal]] value)))
+(defn- member? [values [:list :keyword] value [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (vector-count values)) false
+      (if (named? value (typed-list-nth [:list :keyword] values index)) true (recur (+ index 1)))))))
+(defn- fields? [value [:ref :gmir.node/value] expected [:list :keyword]] :bool
+  (arena-scope (and (= (node/kind value) :map) (= (node/child-count value) (* 2 (vector-count expected)))
+       (loop [index 0]
+         (if (>= index (node/child-count value)) true
+           (let [key (at value index)]
+             (if (and (member? expected key)
+                      (loop [previous 0]
+                        (if (>= previous index) true
+                          (if (node/same-name? key (at value previous)) false (recur (+ previous 2))))))
+               (recur (+ index 2)) false)))))))
+(defn- integer=? [value [:ref :gmir.node/value] expected :i64] :bool
+  (arena-scope (let [n (identity/integer-i64 value)]
+    (and (option-some?-of [:option :i64] n) (= (option-match [:option :i64] n 0 found-value found-value) expected)))))
+(defn- bounded? [value [:ref :gmir.node/value] low :i64 high :i64] :bool
+  (arena-scope (let [n (identity/integer-i64 value)]
+    (and (option-some?-of [:option :i64] n) (>= (option-match [:option :i64] n 0 found-value found-value) low)
+         (<= (option-match [:option :i64] n 0 found-value found-value) high)))))
+(defn- target-of [program [:ref :gmir.node/value]] :keyword
+  (if (named? (node/key program :mir/target) :x86-64) :x86-64 :aarch64))
+(defn- bank [table [:list [:ref :mir.catalog/bank]] target :keyword kind :keyword] [:list :keyword]
+  (option-match [:option [:list :keyword]] (catalog/registers-for table target kind) (typed-list-new [:list :keyword]) found-value found-value))
+(defn- register? [target :keyword virtual :bool value [:ref :gmir.node/value]] :bool
+  (arena-scope (if virtual (identity/vreg? value) (registers/physical-register? target value))))
+(defn- vector-registers? [target :keyword virtual :bool value [:ref :gmir.node/value]] :bool
+  (arena-scope ;; The owning generic scan visits argument/parameter elements only in vectors.
+  ;; Runtime/capability list arguments are checked by their own ABI rules below.
+  (or (not= (node/kind value) :vector)
+      (loop [index 0]
+        (if (>= index (node/child-count value)) true
+          (if (register? target virtual (at value index)) (recur (+ index 1)) false))))))
+(defn- general-registers? [target :keyword virtual :bool instruction [:ref :gmir.node/value]] :bool
+  (arena-scope (let [keys (-> (typed-list-new [:list :keyword])
+                (kw :mir/dst) (kw :mir/src) (kw :mir/input) (kw :mir/left) (kw :mir/right)
+                (kw :mir/addend) (kw :mir/test) (kw :mir/base) (kw :mir/length)
+                (kw :mir/second-base) (kw :mir/second-length) (kw :mir/count)
+                (kw :mir/stored) (kw :mir/offset) (kw :mir/size))]
+    (and (loop [index 0]
+           (if (>= index (vector-count keys)) true
+             (let [value (node/key instruction (typed-list-nth [:list :keyword] keys index))]
+               ;; Reference keep skips an explicitly present nil as well.
+               (if (or (= (node/kind value) :nil) (register? target virtual value)) (recur (+ index 1)) false))))
+         (vector-registers? target virtual (node/key instruction :mir/arguments))
+         (vector-registers? target virtual (node/key instruction :mir/parameters))))))
+(defn- operation [table [:list :keyword] value [:ref :gmir.node/value]] [:option :keyword]
+  (loop [index 0]
+    (if (>= index (vector-count table)) (option-none-of [:option :keyword])
+      (let [entry (typed-list-nth [:list :keyword] table index)]
+        (if (named? value entry) (option-some-of [:option :keyword] entry)
+          (recur (+ index 1)))))))
+(defn- operation-fields [table [:list :keyword] op :keyword] [:list :keyword] (catalog/instruction-keys op))
+(defn- allowed? [version :i64 op :keyword] :bool
+  (arena-scope (cond (= version 3) true
+        (or (= op :mir/call) (= op :mir/tail-call) (= op :mir/quotient-constant)
+            (= op :mir/branch-nonzero) (= op :mir/reentry) (= op :mir/recur)) false
+        (and (= version 1) (= op :mir/phi)) false
+        :else (or (= version 1) (= version 2)))))
+(defn- indexed? [op :keyword] :bool
+  (arena-scope (or (gmir-catalog/keyword-member? (catalog/kernel-window-operations) op)
+      (gmir-catalog/keyword-member? (catalog/slice-operations) op)
+      (gmir-catalog/keyword-member? (catalog/kernel-atomic-ops) op)
+      (= op :mir/kernel-try-lock-u32) (= op :mir/kernel-unlock-u32))))
+(defn- maximum? [op :keyword value [:ref :gmir.node/value]] :bool
+  (arena-scope (cond
+    (gmir-catalog/keyword-member? (catalog/kernel-window-operations) op)
+    (let [n (identity/integer-i64 value)]
+      (and (option-some?-of [:option :i64] n)
+           (gmir-catalog/i64-member? (catalog/kernel-window-maxima) (option-match [:option :i64] n 0 found-value found-value))))
+    (gmir-catalog/keyword-member? (catalog/slice-operations) op) (integer=? value (catalog/slice-item-limit))
+    (or (= op :mir/kernel-try-lock-u32) (= op :mir/kernel-unlock-u32)
+        (gmir-catalog/keyword-member? (catalog/kernel-atomic-ops) op)) (integer=? value 4096)
+    (= op :mir/kernel-dot-f32) (integer=? value (catalog/kernel-dot-f32-maximum))
+    (gmir-catalog/keyword-member? (catalog/kernel-dequant-dot-operations) op) (integer=? value (catalog/kernel-dequant-dot-maximum))
+    :else true)))
+(defn- incoming-vector? [target :keyword virtual :bool value [:ref :gmir.node/value]] :bool
+  (arena-scope (and (= (node/kind value) :vector)
+       (loop [index 0]
+         (if (>= index (node/child-count value)) true
+           (let [entry (at value index)]
+             (if (and (fields? entry (-> (typed-list-new [:list :keyword]) (kw :mir/predecessor) (kw :mir/value)))
+                      (identity/label? (node/key entry :mir/predecessor)) (register? target virtual (node/key entry :mir/value)))
+               (recur (+ index 1)) false)))))))
+(defn- arity [table [:list [:ref :gmir.catalog/arity]] name [:ref :gmir.node/value]] [:option :i64]
+  (loop [index 0]
+    (if (>= index (vector-count table)) (option-none-of [:option :i64])
+      (let [entry (typed-list-nth [:list [:ref :gmir.catalog/arity]] table index)]
+        (if (named? name (gmir-catalog/arity-name entry)) (option-some-of [:option :i64] (gmir-catalog/arity-value entry))
+          (recur (+ index 1)))))))
+(defn- offset? [table [:list [:ref :mir.catalog/offset]] name [:ref :gmir.node/value] value [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (vector-count table)) false
+      (let [entry (typed-list-nth [:list [:ref :mir.catalog/offset]] table index)]
+        (if (named? name (catalog/offset-name entry)) (integer=? value (catalog/offset-value entry)) (recur (+ index 1))))))))
+(defn- collection-count [value [:ref :gmir.node/value]] [:option :i64]
+  ;; Clojure count accepts nil, strings, byte arrays, and all four collection
+  ;; kinds. Preserve that domain instead of silently requiring vector arguments.
+  ;; Invalid scalar arguments become a typed refusal, not a fake count of zero.
+  (let [kind (node/kind value)]
+    (cond
+      (= kind :nil) (option-some-of [:option :i64] 0)
+      (= kind :bytes) (option-some-of [:option :i64] (node/text-count (node/name-of value)))
+      (= kind :string)
+      (let [text (node/name-of value)]
+        (if (not (node/text-valid? text)) (option-none-of [:option :i64])
+          (option-some-of [:option :i64]
+            (loop [index 0 count 0]
+              (if (>= index (node/text-count text)) count
+                (let [byte (node/text-at text index)]
+                  (recur (+ index 1) (+ count (cond (>= byte 240) 2 (or (< byte 128) (>= byte 192)) 1 :else 0)))))))))
+      (= kind :map) (option-some-of [:option :i64] (quot (node/child-count value) 2))
+      (or (= kind :vector) (= kind :list) (= kind :set)) (option-some-of [:option :i64] (node/child-count value))
+      :else (option-none-of [:option :i64]))))
+(defn- sequence-prefix? [value [:ref :gmir.node/value] expected [:list :keyword] count :i64] :bool
+  (arena-scope ;; Sequential equality in the reference equates lists and vectors; sets,
+  ;; strings and maps are not sequential even when their counts happen to match.
+  (and (or (= (node/kind value) :vector) (= (node/kind value) :list))
+       (>= count 0) (<= count (vector-count expected)) (= (node/child-count value) count)
+       (loop [index 0]
+         (if (>= index count) true
+           (if (named? (at value index) (typed-list-nth [:list :keyword] expected index)) (recur (+ index 1)) false))))))
+(defn- returns? [target :keyword instruction [:ref :gmir.node/value]] :bool
+  (arena-scope (let [values (bank (catalog/return-registers) target :all)]
+    (and (= (vector-count values) 1) (named? (node/key instruction :mir/dst) (typed-list-nth [:list :keyword] values 0))))))
+(defn- capability-bank [target :keyword kind [:ref :gmir.node/value]] [:list :keyword]
+  (let [table (catalog/capability-argument-registers)]
+    (loop [index 0]
+      (if (>= index (vector-count table)) (typed-list-new [:list :keyword])
+        (let [entry (typed-list-nth [:list [:ref :mir.catalog/bank]] table index)]
+          (if (and (= (catalog/bank-target entry) target) (named? kind (catalog/bank-kind entry)))
+            (catalog/bank-registers entry) (recur (+ index 1))))))))
+(defn- literal? [instruction [:ref :gmir.node/value]] :bool
+  (arena-scope (let [encoding (node/key instruction :mir/rodata-encoding) content (node/key instruction :mir/content)
+        kind (cond (named? encoding :utf-16le-nul) :utf-16le-nul (named? encoding :guid-mixed-endian) :guid-mixed-endian
+                   (named? encoding :hex-bytes) :hex-bytes :else :unknown)]
+    (and (= (node/kind content) :string)
+         (rodata/rodata-content? (rodata/keyword-input kind) (rodata/chunks-input (node/text-chunks (node/name-of content))))))))
+(defn- instruction-error [version :i64 target :keyword virtual :bool frame [:ref :gmir.node/value]
+                          instruction [:ref :gmir.node/value] table [:list :keyword]
+                          runtimes [:list [:ref :gmir.catalog/arity]] actions [:list [:ref :gmir.catalog/arity]]]
+  [:option [:ref :mir/refusal]]
+  (let [found (operation table (node/key instruction :mir/op)) op (option-match [:option :keyword] found :unknown found-value found-value)
+        arguments (node/key instruction :mir/arguments) count (collection-count arguments)
+        n (option-match [:option :i64] count -1 found-value found-value) parameters (node/key instruction :mir/parameters)
+        runtime-arity (arity runtimes (node/key instruction :mir/runtime))
+        action-arity (arity actions (node/key instruction :mir/action))]
+    (cond
+      (not (and (option-some?-of [:option :keyword] found) (allowed? version op)
+                (fields? instruction (operation-fields table op)))) (failure :non-canonical-instruction instruction)
+      (and virtual (or (= op :mir/spill-load) (= op :mir/spill-store) (= op :mir/move)))
+      (failure :physical-operation-in-virtual-program instruction)
+      (and (or (= op :mir/reentry) (= op :mir/recur)) (or virtual (not= version 3)))
+      (failure :direct-reentry-profile-violation instruction)
+      (and virtual (or (= op :mir/multiply-add) (= op :mir/multiply-subtract)))
+      (failure :target-selected-operation-in-virtual-program instruction)
+      (and (= op :mir/branch-nonzero) (not= target :aarch64)) (failure :target-selected-operation-target-mismatch instruction)
+      (not (general-registers? target virtual instruction)) (failure :register-profile-violation instruction)
+      (and (indexed? op) (not (register? target virtual (node/key instruction :mir/index)))) (failure :register-profile-violation instruction)
+      (not (maximum? op (node/key instruction :mir/maximum))) (failure :invalid-kernel-memory-maximum instruction)
+      (and (= op :mir/return) (not (register? target virtual (node/key instruction :mir/value)))) (failure :register-profile-violation instruction)
+      (and (= op :mir/phi) (not virtual)) (failure :phi-in-physical-program instruction)
+      (and (= op :mir/phi) (not (incoming-vector? target virtual (node/key instruction :mir/incomings)))) (failure :invalid-phi-incomings instruction)
+      (and (or (= op :mir/call) (= op :mir/tail-call))
+           (not (and (= version 3) (identity/function-id? (node/key instruction :mir/callee))
+                     (= (node/kind arguments) :vector) (<= n (gmir/max-arity))))) (failure :invalid-call instruction)
+      (and (or (= op :mir/call) (= op :mir/tail-call)) (not virtual)
+           (not (and (or (= op :mir/tail-call) (returns? target instruction))
+                     (sequence-prefix? arguments (bank (catalog/call-argument-registers) target :all) n))))
+      (failure :physical-call-profile-violation instruction)
+      (and (= op :mir/reentry) (not (and (= (node/kind parameters) :vector) (<= (node/child-count parameters) (gmir/max-arity)))))
+      (failure :invalid-direct-reentry instruction)
+      (and (= op :mir/recur) (not (and (= (node/kind arguments) :vector) (<= n (gmir/max-arity))))) (failure :invalid-direct-recur instruction)
+      (and (= op :mir/runtime-call)
+           (not (and (option-some?-of [:option :i64] count) (option-some?-of [:option :i64] runtime-arity)
+                     (= n (option-match [:option :i64] runtime-arity -2 found-value found-value))
+                     (offset? (catalog/runtime-context-offsets) (node/key instruction :mir/runtime) (node/key instruction :mir/context-offset)))))
+      (failure :invalid-runtime-call instruction)
+      (and (= op :mir/runtime-call) (not virtual)
+           (not (and (returns? target instruction) (sequence-prefix? arguments (bank (catalog/runtime-argument-registers) target :all) n))))
+      (failure :physical-runtime-call-profile-violation instruction)
+      (and (= op :mir/x86-privileged)
+           (not (and (= target :x86-64) (option-some?-of [:option :i64] count) (option-some?-of [:option :i64] action-arity)
+                     (= n (option-match [:option :i64] action-arity -2 found-value found-value))))) (failure :invalid-x86-privileged instruction)
+      (and (= op :mir/capability-call)
+           (not (and (option-some?-of [:option :i64] (arity (gmir-catalog/capability-kinds) (node/key instruction :mir/kind)))
+                     (bounded? (node/key instruction :mir/capability) 0 255) (= n 1)
+                     (offset? (catalog/capability-context-offsets) (node/key instruction :mir/kind) (node/key instruction :mir/context-offset)))))
+      (failure :invalid-capability-call instruction)
+      (and (= op :mir/capability-call) (not virtual)
+           (not (and (returns? target instruction) (sequence-prefix? arguments (capability-bank target (node/key instruction :mir/kind)) 1))))
+      (failure :physical-capability-call-profile-violation instruction)
+      (and (= op :mir/constant) (not (identity/i64-value? (node/key instruction :mir/value)))) (failure :constant-not-i64 instruction)
+      (and (= op :mir/quotient-constant) (not (identity/i64-value? (node/key instruction :mir/divisor)))) (failure :constant-divisor-not-i64 instruction)
+      (and (= op :mir/data-address) (not= (node/kind (node/key instruction :mir/content)) :string)) (failure :invalid-data-content instruction)
+      (and (= op :mir/rodata-address) (not (literal? instruction))) (failure :invalid-rodata-content instruction)
+      (and (= op :mir/function-address) (not (identity/function-id? (node/key instruction :mir/function)))) (failure :invalid-function-address instruction)
+      (and (= op :mir/argument) (not (identity/nonnegative-integer? (node/key instruction :mir/index)))) (failure :argument-index-invalid instruction)
+      (and (or (= op :mir/spill-load) (= op :mir/spill-store))
+           (not (and (not= (node/kind frame) :nil) (bounded? (node/key instruction :mir/slot) 0 4094)
+                     (< (option-match [:option :i64] (identity/integer-i64 (node/key instruction :mir/slot)) -1 found-value found-value)
+                        (option-match [:option :i64] (identity/integer-i64 frame) -1 found-value found-value))))) (failure :spill-slot-invalid instruction)
+      (and (or (= op :mir/incoming-load) (= op :mir/outgoing-argument) (= op :mir/incoming-argument-store))
+           (not (bounded? (node/key instruction :mir/index) (vector-count (bank (catalog/call-argument-registers) target :all)) (- (gmir/max-arity) 1))))
+      (failure :stack-argument-index-invalid instruction)
+      (and (or (= op :mir/label) (= op :mir/branch-zero) (= op :mir/branch-nonzero) (= op :mir/jump))
+           (not (identity/label? (node/key instruction (if (= op :mir/label) :mir/id :mir/target))))) (failure :invalid-label instruction)
+      :else (clean))))
+
+(defn- named-member? [values [:ref :gmir.node/value] value [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (node/child-count values)) false
+      (if (node/same-name? value (at values index)) true (recur (+ index 1)))))))
+(defn- labels [instructions [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-list)]
+    (if (>= index (node/child-count instructions)) out
+      (let [instruction (at instructions index)]
+        (recur (+ index 1) (if (named? (node/key instruction :mir/op) :mir/label) (node/append out (node/key instruction :mir/id)) out))))))
+(defn- label-error [instructions [:ref :gmir.node/value]] [:option [:ref :mir/refusal]]
+  (let [all (labels instructions)
+        unique (loop [index 0 seen (node/empty-set)]
+                 (if (>= index (node/child-count all)) true
+                   (let [value (at all index)]
+                     (if (named-member? seen value) false (recur (+ index 1) (node/append seen value))))))]
+    (if (not unique) (failure :duplicate-label (node/put-key (node/empty-map) :labels all))
+      (loop [index 0]
+        (if (>= index (node/child-count instructions)) (clean)
+          (let [target (node/key (at instructions index) :mir/target)]
+            (if (and (not= (node/kind target) :nil) (not (named-member? all target)))
+              (failure :unresolved-target (node/put-key (node/empty-map) :target target)) (recur (+ index 1)))))))))
+(defn- rename-key [value [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (node/keyword-parts (option-some-of [:option [:ref :gmir.node/text]] (node/string-text "gmir")) (node/name-of value)))
+(defn- project-incomings [values [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-vector)]
+    (if (>= index (node/child-count values)) out
+      (let [entry (at values index)]
+        (recur (+ index 1) (node/append out (-> (node/empty-map)
+          (node/put-key :gmir/predecessor (node/key entry :mir/predecessor)) (node/put-key :gmir/value (node/key entry :mir/value)))))))))
+(defn- project-instruction [instruction [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  ;; Fix the stale owning adapter's partial key case: all closed MIR keys are
+  ;; renamed; only the MIR-specific context-offset is omitted. Current input
+  ;; has already passed exact instruction fields. New operation keys therefore
+  ;; reach GMIR's full validator rather than a host "No matching clause".
+  (loop [index 0 out (node/empty-map)]
+    (if (>= index (node/child-count instruction)) out
+      (let [key (at instruction index) value (at instruction (+ index 1))]
+        (recur (+ index 2)
+          (if (named? key :mir/context-offset) out
+            (node/append (node/append out (rename-key key))
+              (cond (named? key :mir/op) (rename-key value) (named? key :mir/incomings) (project-incomings value) :else value))))))))
+(defn- projection-error [instructions [:ref :gmir.node/value]] [:option [:ref :mir/refusal]]
+  (let [projected (loop [index 0 out (node/empty-vector)]
+                    (if (>= index (node/child-count instructions)) out
+                      (recur (+ index 1) (node/append out (project-instruction (at instructions index))))))
+        result (gmir/validate! (-> (node/empty-map) (node/put-key :gmir/version (node/i64-value 2)) (node/put-key :gmir/instructions projected)))]
+    (if (result-ok?-of [:result [:ref :gmir.node/value] [:ref :gmir/refusal]] result) (clean)
+      (option-some-of [:option [:ref :mir/refusal]] (outcome/from-gmir
+        (result-error-of [:result [:ref :gmir.node/value] [:ref :gmir/refusal]] result
+          (gmir-outcome/refusal :non-canonical-program projected)))))))
+(defn- program-error [program [:ref :gmir.node/value]] [:option [:ref :mir/refusal]]
+  (let [version (identity/integer-i64 (node/key program :mir/version)) n (option-match [:option :i64] version 0 found-value found-value)
+        target (node/key program :mir/target) registers (node/key program :mir/registers)
+        frame (node/key program :mir/frame-slots)
+        keys (-> (typed-list-new [:list :keyword]) (kw :mir/version) (kw :mir/target) (kw :mir/registers) (kw :mir/instructions))]
+    (if (and (or (fields? program keys) (fields? program (kw keys :mir/frame-slots)))
+             (option-some?-of [:option :i64] version) (gmir-catalog/i64-member? (catalog/supported-versions) n)
+             (member? (catalog/targets) target) (or (named? registers :virtual) (named? registers :physical))
+             (= (node/kind (node/key program :mir/instructions)) :vector)
+             (or (= (node/kind frame) :nil) (and (named? registers :physical) (bounded? frame 0 4095))))
+      (clean) (failure :non-canonical-program program))))
+(defn- atom-shape? [value [:ref :gmir.node/value]] :bool
+  (arena-scope (and (not (node/has-namespace? value)) (= (vector-count (node/pages value)) 0))))
+(defn- empty-name? [value [:ref :gmir.node/value]] :bool (arena-scope (= (node/text-count (node/name-of value)) 0)))
+(defn- representation-shallow? [value [:ref :gmir.node/value]] :bool
+  (arena-scope (let [tag (node/kind value) n (node/number value)]
+    (case tag
+      :nil (and (atom-shape? value) (= n 0) (empty-name? value))
+      :bool (and (atom-shape? value) (or (= n 0) (= n 1)) (empty-name? value))
+      :i64 (and (atom-shape? value) (empty-name? value))
+      :integer (and (atom-shape? value) (= n 0) (identity/integer-form? value))
+      :f64 (and (atom-shape? value) (empty-name? value))
+      :bytes (and (atom-shape? value) (= n 0))
+      :string (and (atom-shape? value) (= n 0) (node/text-valid? (node/name-of value)))
+      :keyword (and (= n 0) (= (vector-count (node/pages value)) 0) (node/text-valid? (node/name-of value))
+                    (or (not (node/has-namespace? value))
+                        (node/text-valid? (option-match [:option [:ref :gmir.node/text]] (node/namespace-of value) (node/empty-text) found-value found-value))))
+      :symbol (and (= n 0) (= (vector-count (node/pages value)) 0) (node/text-valid? (node/name-of value))
+                   (or (not (node/has-namespace? value))
+                       (node/text-valid? (option-match [:option [:ref :gmir.node/text]] (node/namespace-of value) (node/empty-text) found-value found-value))))
+      :vector (and (= n 0) (not (node/has-namespace? value)) (empty-name? value))
+      :list (and (= n 0) (not (node/has-namespace? value)) (empty-name? value))
+      :set (and (= n 0) (not (node/has-namespace? value)) (empty-name? value))
+      :map (and (= n 0) (not (node/has-namespace? value)) (empty-name? value) (= (bit-and (node/child-count value) 1) 0))
+      false))))
+(defn representation-error [value [:ref :gmir.node/value]] [:option [:ref :mir/refusal]]
+  ;; Reader invariants are explicit at this nominal API boundary. Run after
+  ;; semantic checks to retain their first refusal for canonical reader values.
+  (if (not (representation-shallow? value)) (failure :non-canonical-value value)
+    (loop [index 0]
+      (if (>= index (node/child-count value)) (clean)
+        (let [error (representation-error (at value index))]
+          (if (failed? error) error (recur (+ index 1))))))))
+(defn validate! [program [:ref :gmir.node/value]] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [header (program-error program)
+        error (if (failed? header) header
+                (let [version (option-match [:option :i64] (identity/integer-i64 (node/key program :mir/version)) 0 found-value found-value)
+                      target (target-of program) virtual (named? (node/key program :mir/registers) :virtual)
+                      frame (node/key program :mir/frame-slots) instructions (node/key program :mir/instructions)
+                      table (catalog/instruction-operations) runtimes (gmir-catalog/runtime-operation-arities)
+                      actions (gmir-catalog/x86-privileged-action-arities)
+                      code (loop [index 0]
+                             (if (>= index (node/child-count instructions)) (clean)
+                               (let [problem (instruction-error version target virtual frame (at instructions index) table runtimes actions)]
+                                 (if (failed? problem) problem (recur (+ index 1))))))]
+                  (if (failed? code) code
+                    (let [names (label-error instructions)]
+                      (if (failed? names) names (if (and (= version 2) virtual) (projection-error instructions) (clean)))))))
+        complete (if (failed? error) error (representation-error program))]
+    (if (failed? complete)
+      (result-err-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+        (option-match [:option [:ref :mir/refusal]] complete (outcome/refusal :non-canonical-program program) found-value found-value))
+      (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] program))))

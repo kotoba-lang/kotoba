@@ -1,0 +1,139 @@
+#!/usr/bin/env kbb
+(ns kcm-evaluate
+  "Evaluate a source tree under an explicit KCM policy and emit an auditable
+  EDN report. This is the local, no-model customer entrypoint."
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [fleet.kcm-evaluate :as evaluate]
+            [fleet.kcm-receipt :as receipt]))
+
+(def args (vec *command-line-args*))
+(def temp-root (atom nil))
+(defn opt [flag default] (or (second (drop-while #(not= flag %) args)) default))
+(defn required [flag]
+  (or (opt flag nil) (throw (ex-info (str "missing " flag) {:usage true}))))
+
+(defn run [cmd argv opts]
+  (cp/execFileSync cmd (clj->js argv)
+                   (clj->js (merge {:encoding "utf8" :maxBuffer 33554432} opts))))
+
+(defn emit! [report out]
+  (let [s (str (pr-str report) "\n")]
+    (when out
+      (fs/mkdirSync (path/dirname (path/resolve out)) #js {:recursive true})
+      (fs/writeFileSync (path/resolve out) s))
+    (print s)))
+
+(defn emit-share! [report out private-key]
+  (when out
+    (let [p (path/resolve out)
+          body (receipt/sign (evaluate/pilot-share-report report) private-key)]
+      (fs/mkdirSync (path/dirname p) #js {:recursive true})
+      (fs/writeFileSync p (str (pr-str body) "\n")))))
+
+(defn installed-provider [filename]
+  (let [p (path/resolve filename)
+        raw (js->clj (js/JSON.parse (fs/readFileSync p "utf8")) :keywordize-keys true)
+        provider (:provider raw)
+        runtime-root (:runtime-root raw)
+        receipt-key (:receipt-key raw)]
+    (when-not (and (= "kotoba-kcm-provider-install/v1" (:format raw))
+                   (string? runtime-root)
+                   (string? receipt-key)
+                   (every? string? (map provider
+                                        [:archive :manifest :archive-sha256
+                                         :provider-closure-sha256 :compiler-cid
+                                         :module-lock-cid :runtime-sha256])))
+      (throw (ex-info (str "invalid installed KCM provider metadata: " p) {})))
+    {:provider-build provider
+     :receipt-key receipt-key
+     :runner {:node js/process.execPath
+              :nbb-cli (path/join runtime-root "node_modules/nbb/cli.js")
+              :classpath (path/join runtime-root "runner/hosts/nbb")
+              :sandbox-agent (path/join runtime-root
+                                        "runner/hosts/nbb/fleet/sandbox_agent.cljk")}}))
+
+(defn run-sandbox-agent [runner spec-path]
+  (if runner
+    (run (:node runner)
+         ["--stack-size=4096" (:nbb-cli runner) "--classpath" (:classpath runner)
+          (:sandbox-agent runner) "--spec" spec-path "--kcm-probe"] {})
+    (run "nbb" ["--classpath" "hosts/nbb"
+                "hosts/nbb/fleet/sandbox_agent.cljk"
+                "--spec" spec-path "--kcm-probe"] {})))
+
+(defn main []
+  (when (some #{"--help" "-h"} args)
+    (println "usage: kcm-evaluate --repo DIR (--auto [--entry FILE] | --policy POLICY.edn) (--provider INSTALL.json | --compiler COMPILER_DIR) [--receipt-key KEY.pem] [--out REPORT.edn] [--share-out SIGNED.edn] [--cache DIR]")
+    (js/process.exit 0))
+  (let [repo (path/resolve (required "--repo"))
+        compiler-arg (opt "--compiler" nil)
+        installed-arg (opt "--provider" nil)
+        _ (when (= (boolean compiler-arg) (boolean installed-arg))
+            (throw (ex-info "choose exactly one of --provider or --compiler" {:usage true})))
+        compiler (some-> compiler-arg path/resolve)
+        installed (some-> installed-arg installed-provider)
+        auto? (some #{"--auto"} args)
+        policy-arg (opt "--policy" nil)
+        _ (when (= (boolean auto?) (boolean policy-arg))
+            (throw (ex-info "choose exactly one of --auto or --policy" {:usage true})))
+        out (opt "--out" nil)
+        share-out (opt "--share-out" nil)
+        receipt-key (or (:receipt-key installed) (opt "--receipt-key" nil))
+        _ (when (and share-out (not receipt-key))
+            (throw (ex-info "--share-out requires the installed provider receipt key or --receipt-key" {:usage true})))
+        tmp (fs/mkdtempSync (path/join (os/tmpdir) "kcm-evaluate-"))
+        _ (reset! temp-root tmp)
+        source-stage (path/join tmp "source")
+        tarball (path/join tmp "source.tgz")
+        provider-prefix (path/join tmp "provider")
+        spec-path (path/join tmp "spec.edn")
+        policy (-> (if auto?
+                     (evaluate/auto-policy repo (opt "--entry" nil))
+                     (-> (path/resolve policy-arg) (fs/readFileSync "utf8")
+                         reader/read-string))
+                   evaluate/validate-policy!)
+        closure (evaluate/source-closure repo)]
+    (evaluate/copy-closure! closure source-stage)
+    (run "tar" ["czf" tarball "-C" tmp "source"] {})
+    (let [provider-build
+          (or (:provider-build installed)
+              (-> (run "nbb" ["--classpath" "hosts/nbb"
+                               "scripts/build-kcm-provider.cljk"
+                               "--compiler" compiler "--out" provider-prefix] {})
+                  str/split-lines last reader/read-string))
+          spec (evaluate/complete-spec
+                 {:policy policy :closure closure :provider-build provider-build
+                 :root (path/join tmp "sandbox") :tarball tarball
+                 :cache-root (path/resolve
+                              (opt "--cache"
+                                   (path/join (or (.-XDG_CACHE_HOME js/process.env)
+                                                 (path/join (os/homedir) ".cache"))
+                                              "kotoba-kcm")))})
+          _ (fs/writeFileSync spec-path (pr-str spec))
+          raw (run-sandbox-agent (:runner installed) spec-path)
+          result (reader/read-string (last (str/split-lines raw)))
+          report (evaluate/evaluation-report
+                  {:policy policy :closure closure
+                   :provider-build provider-build :result result})]
+      (emit! report out)
+      (emit-share! report share-out receipt-key)
+      (when-not (= :accepted (:decision report)) (set! (.-exitCode js/process) 2)))))
+
+(try
+  (main)
+  (catch :default e
+    (let [report (evaluate/with-report-cid
+                  {:format evaluate/report-format :decision :rejected
+                   :reason (.-message e) :reasons (some-> (ex-data e) :reasons)})]
+      (emit! report (opt "--out" nil)))
+    ;; A rejected startup must not overwrite a prior signed pilot receipt with
+    ;; an unsigned or partially bound artifact.
+    (set! (.-exitCode js/process) (if (:usage (ex-data e)) 64 2)))
+  (finally
+    (when @temp-root
+      (fs/rmSync @temp-root #js {:recursive true :force true}))))
