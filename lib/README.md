@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.yakuwariView` | `kotoba.yakuwariView/src` | `yakuwari-view.hiccup`, `yakuwari-view.model` (Kotoba project library) |
 | `kotoba.yakuwari` | `kotoba.yakuwari/src` | `yakuwari.policy`, `yakuwari.reconcile`, `yakuwari.spec` (Kotoba project library) |
 | `kotoba.xyzUcan` | `kotoba.xyzUcan/src` | `ucan.core` (Kotoba project library) |
 | `kotoba.x402Directory` | `kotoba.x402Directory/src` | `x402.directory` (Kotoba project library) |

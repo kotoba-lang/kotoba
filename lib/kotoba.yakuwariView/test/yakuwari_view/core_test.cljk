@@ -1,0 +1,334 @@
+(ns yakuwari-view.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [yakuwari-view.model :as model]
+            [yakuwari-view.hiccup :as h]))
+
+(def t0 1785000000000)
+
+(defn role-of
+  [id group & {:as extra}]
+  (merge {:yakuwari/id id
+          :yakuwari/group group
+          :yakuwari/project (str "network-awai/" (name group))
+          :yakuwari/objective (str "run the " (name id) " function for " (name group))
+          :yakuwari/scale {:min 0 :desired 1 :max 2}
+          :yakuwari/runners [{:runner :claude :weight 1}]
+          :yakuwari/capabilities
+          [{:capability :issue.triage :decision :autonomous}
+           {:capability :external.send :decision :approval-required}]}
+         extra))
+
+(defn run-of [id role status & [at]]
+  {:agent.run/id id
+   :agent.run/yakuwari role
+   :agent.run/status status
+   :agent.run/created-at (or at t0)
+   :agent.run/updated-at (or at t0)})
+
+(def groups
+  [{:group/id :network-isekai :group/name "network isekai"
+    :group/domain "isekai.network"}
+   {:group/id :nexus-x402 :group/name "nexus x402"
+    :group/domain "x402.nexus"}])
+
+;; ---------------------------------------------------------------------------
+;; Grouping
+;; ---------------------------------------------------------------------------
+
+(deftest roles-are-grouped-under-the-thing-they-serve
+  (let [p (model/project {:roles [(role-of :director :network-isekai)
+                                  (role-of :engineer :network-isekai)
+                                  (role-of :sales :nexus-x402)]
+                          :runs [] :groups groups :now-ms t0})]
+    (is (= [:network-isekai :nexus-x402] (mapv :group/id (:fleet/groups p))))
+    (is (= [:director :engineer]
+           (mapv :role/id (:group/roles (first (:fleet/groups p))))))
+    (is (= 3 (:roles (:fleet/totals p))))))
+
+(deftest a-group-with-no-roles-still-appears
+  (testing "a business whose roles were all deleted is a fact worth showing"
+    (let [p (model/project {:roles [(role-of :director :network-isekai)]
+                            :runs [] :groups groups :now-ms t0})
+          empty-group (second (:fleet/groups p))]
+      (is (= :nexus-x402 (:group/id empty-group)))
+      (is (empty? (:group/roles empty-group)))
+      (is (= 0 (:roles (:group/totals empty-group)))))))
+
+(deftest a-role-pointing-at-an-undeclared-group-is-surfaced-not-dropped
+  (let [p (model/project {:roles [(role-of :director :network-isekai)
+                                  (role-of :sales :typo-business)]
+                          :runs [] :groups groups :now-ms t0})]
+    (is (= [{:role/id :sales :role/group :typo-business}]
+           (:fleet/orphan-roles p)))
+    (testing "it is still counted, so totals do not quietly shrink"
+      (is (= 2 (:roles (:fleet/totals p)))))))
+
+;; ---------------------------------------------------------------------------
+;; Capacity agrees with reconcile
+;; ---------------------------------------------------------------------------
+
+(deftest capacity-counts-only-a-roles-own-runs
+  (let [p (model/project
+           {:roles [(role-of :director :network-isekai)
+                    (role-of :engineer :network-isekai)]
+            :runs [(run-of "a" :director :running)
+                   (run-of "b" :engineer :running)
+                   (run-of "c" :engineer :queued)]
+            :groups groups :now-ms t0})
+        [director engineer] (:group/roles (first (:fleet/groups p)))]
+    (is (= 1 (:role/running director)))
+    (is (= 0 (:role/queued director)))
+    (is (= 1 (:role/running engineer)))
+    (is (= 1 (:role/queued engineer)))))
+
+(deftest totals-are-summed-from-the-rows-so-they-cannot-disagree
+  (let [p (model/project
+           {:roles [(role-of :director :network-isekai)
+                    (role-of :sales :nexus-x402)]
+            :runs [(run-of "a" :director :running)
+                   (run-of "b" :director :held)
+                   (run-of "c" :sales :queued)]
+            :groups groups :now-ms t0})
+        cards (mapcat :group/roles (:fleet/groups p))]
+    (is (= (reduce + (map :role/running cards)) (:running (:fleet/totals p))))
+    (is (= (reduce + (map :role/blocked cards)) (:blocked (:fleet/totals p))))
+    (is (= 1 (:blocked (:fleet/totals p))))))
+
+;; ---------------------------------------------------------------------------
+;; Health
+;; ---------------------------------------------------------------------------
+
+(deftest stalled-outranks-starved-because-the-fixes-differ
+  (testing "both look like 'nothing running'; one needs an approval, the other a dispatcher"
+    (is (= :stalled (model/health {:valid? true :desired 2 :running 0
+                                   :queued 0 :blocked 1 :at-max? false})))
+    (is (= :starved (model/health {:valid? true :desired 2 :running 0
+                                   :queued 0 :blocked 0 :at-max? false})))))
+
+(deftest an-invalid-role-outranks-every-other-health-state
+  (is (= :invalid (model/health {:valid? false :desired 0 :running 0
+                                 :queued 0 :blocked 0 :at-max? true}))))
+
+(deftest a-deliberately-dormant-role-is-idle-not-starved
+  (testing "scale min 0 desired 0 is a choice, not a failure"
+    (is (= :idle (model/health {:valid? true :desired 0 :running 0
+                                :queued 0 :blocked 0 :at-max? false})))))
+
+(deftest health-labels-appear-on-the-projection
+  (let [p (model/project
+           {:roles [(role-of :director :network-isekai)
+                    (role-of :engineer :network-isekai
+                             :yakuwari/scale {:min 0 :desired 0 :max 1})]
+            :runs [(run-of "a" :director :held)]
+            :groups groups :now-ms t0})
+        by-id (into {} (map (juxt :role/id :role/health)
+                            (:group/roles (first (:fleet/groups p)))))]
+    (is (= :stalled (:director by-id)))
+    (is (= :idle (:engineer by-id)))))
+
+;; ---------------------------------------------------------------------------
+;; An invalid role is displayed, never dropped
+;; ---------------------------------------------------------------------------
+
+(def broken
+  "No objective and no runners: a role nobody can state the purpose of and
+  nobody can fill."
+  {:yakuwari/id :ghost
+   :yakuwari/group :network-isekai
+   :yakuwari/project "network-awai/network-isekai"})
+
+(deftest an-invalid-role-is-rendered-as-invalid-rather-than-omitted
+  (let [p (model/project {:roles [(role-of :director :network-isekai) broken]
+                          :runs [] :groups groups :now-ms t0})
+        cards (:group/roles (first (:fleet/groups p)))
+        ghost (first (filter #(= :ghost (:role/id %)) cards))]
+    (testing "reconcile/plan throws on this spec; the page must not"
+      (is (= 2 (count cards))))
+    (is (false? (:role/valid? ghost)))
+    (is (= :invalid (:role/health ghost)))
+    (is (some #(= :missing-objective (:problem %)) (:role/problems ghost)))
+    (is (= 1 (:invalid (:fleet/totals p))))))
+
+(deftest fleet-problems-name-the-role-they-came-from
+  (let [p (model/project {:roles [broken] :runs [] :groups groups :now-ms t0})]
+    (is (seq (:fleet/problems p)))
+    (is (every? #(= :ghost (:role/id %)) (:fleet/problems p)))))
+
+(deftest an-invalid-role-still-shows-the-runs-it-already-spawned
+  (testing "an unreviewable spec does not make its live executions invisible"
+    (let [p (model/project {:roles [broken]
+                            :runs [(run-of "x" :ghost :running)
+                                   (run-of "y" :ghost :held)]
+                            :groups groups :now-ms t0})
+          ghost (first (:group/roles (first (:fleet/groups p))))]
+      (is (= 1 (:role/running ghost)))
+      (is (= 1 (:role/blocked ghost))))))
+
+;; ---------------------------------------------------------------------------
+;; needs-human describes the role, not its queue
+;; ---------------------------------------------------------------------------
+
+(deftest capabilities-needing-a-human-come-from-policy-not-from-live-runs
+  (let [p (model/project {:roles [(role-of :director :network-isekai)]
+                          :runs [] :groups groups :now-ms t0})
+        card (first (:group/roles (first (:fleet/groups p))))]
+    (testing "an empty queue must not make a gated role look ungated"
+      (is (= 0 (:role/blocked card)))
+      (is (= [{:capability :external.send :decision :approval-required}]
+             (:role/needs-human card))))))
+
+(deftest the-authored-capability-form-reaches-the-projection
+  (testing "regression against the yakuwari bug where every capability read :blocked"
+    (let [p (model/project {:roles [(role-of :director :network-isekai)]
+                            :runs [] :groups groups :now-ms t0})
+          card (first (:group/roles (first (:fleet/groups p))))]
+      (testing ":issue.triage is :autonomous, so it must NOT be listed"
+        (is (not-any? #(= :issue.triage (:capability %))
+                      (:role/needs-human card)))))))
+
+(deftest a-blocked-capability-also-needs-a-human
+  (let [r (role-of :director :network-isekai
+                   :yakuwari/capabilities [{:capability :account.create
+                                            :decision :blocked}])
+        p (model/project {:roles [r] :runs [] :groups groups :now-ms t0})
+        card (first (:group/roles (first (:fleet/groups p))))]
+    (is (= [{:capability :account.create :decision :blocked}]
+           (:role/needs-human card)))))
+
+;; ---------------------------------------------------------------------------
+;; outward is declared, not guessed
+;; ---------------------------------------------------------------------------
+
+(deftest outward-is-read-from-the-role-not-inferred-from-its-name
+  (let [p (model/project
+           {:roles [(role-of :sales :nexus-x402
+                             :yakuwari/outward? true
+                             :yakuwari/identity "network-awai/person-x402-sales")
+                    (role-of :engineer :nexus-x402)]
+            :runs [] :groups groups :now-ms t0})
+        by-id (into {} (map (juxt :role/id identity)
+                            (:group/roles (second (:fleet/groups p)))))]
+    (is (true? (:role/outward? (:sales by-id))))
+    (is (= "network-awai/person-x402-sales" (:role/identity (:sales by-id))))
+    (is (false? (:role/outward? (:engineer by-id))))
+    (is (= 1 (:outward (:fleet/totals p))))))
+
+;; ---------------------------------------------------------------------------
+;; Derived views
+;; ---------------------------------------------------------------------------
+
+(deftest the-hil-queue-is-newest-first-across-all-groups
+  (let [runs [(run-of "old" :director :held t0)
+              (run-of "new" :sales :held (+ t0 5000))
+              (run-of "mid" :director :held (+ t0 1000))
+              (run-of "not-held" :director :running t0)]
+        p (model/project {:roles [(role-of :director :network-isekai)
+                                  (role-of :sales :nexus-x402)]
+                          :runs runs :groups groups :now-ms (+ t0 9999)})
+        q (model/hil-queue p runs)]
+    (is (= ["new" "mid" "old"] (mapv :run/id q)))
+    (testing "rows carry the group so a flat queue is still attributable"
+      (is (= :nexus-x402 (:role/group (first q)))))))
+
+(deftest needs-attention-lists-only-what-an-operator-must-act-on
+  (let [p (model/project
+           {:roles [(role-of :director :network-isekai)          ; healthy-ish
+                    (role-of :engineer :network-isekai
+                             :yakuwari/scale {:min 0 :desired 0 :max 1}) ; idle
+                    broken]                                       ; invalid
+            :runs [(run-of "a" :director :running)]
+            :groups groups :now-ms t0})
+        attention (model/needs-attention p)]
+    (testing "a cockpit that lists everything lists nothing"
+      (is (= [:ghost] (mapv :role/id attention))))
+    (is (= :network-isekai (:role/group (first attention))))))
+
+(deftest needs-attention-orders-invalid-before-stalled-before-starved
+  (let [p (model/project
+           {:roles [broken
+                    (role-of :starved-one :network-isekai)
+                    (role-of :stalled-one :network-isekai)]
+            :runs [(run-of "h" :stalled-one :held)]
+            :groups groups :now-ms t0})]
+    (is (= [:ghost :stalled-one :starved-one]
+           (mapv :role/id (model/needs-attention p))))))
+
+;; ---------------------------------------------------------------------------
+;; Hiccup — structure and vocabulary, not styling
+;; ---------------------------------------------------------------------------
+
+(defn- flatten-hiccup [x]
+  (cond
+    (vector? x) (cons x (mapcat flatten-hiccup x))
+    (seq? x) (mapcat flatten-hiccup x)
+    :else nil))
+
+(defn- tags [tree]
+  (into #{} (keep #(when (and (vector? %) (keyword? (first %))) (first %))
+                  (flatten-hiccup tree))))
+
+(defn- text-of [tree]
+  (str/join " " (keep #(when (string? %) %) (tree-seq coll? seq tree))))
+
+(deftest the-fleet-renders-the-documented-class-vocabulary
+  (let [p (model/project {:roles [(role-of :director :network-isekai)]
+                          :runs [] :groups groups :now-ms t0})
+        t (tags (h/fleet p))]
+    (is (contains? t :div.yakuwari-fleet))
+    (is (contains? t :section.yakuwari-group))
+    (is (contains? t :article.yakuwari-role))
+    (is (contains? t :div.yakuwari-capacity))))
+
+(deftest no-design-system-component-is-reachable-from-the-hiccup
+  (testing "every element is a plain tag, so neither surface leaves its paved road"
+    (let [p (model/project {:roles [(role-of :director :network-isekai)]
+                            :runs [(run-of "a" :director :held)]
+                            :groups groups :now-ms t0})]
+      (is (every? #(and (keyword? %)
+                        (contains? #{"div" "section" "article" "header" "span"
+                                     "p" "ul" "li" "h3"}
+                                   (first (str/split (name %) #"\."))))
+                  (tags (h/fleet p)))))))
+
+(deftest health-travels-as-a-data-attribute-so-one-selector-per-state-suffices
+  (let [card (h/role {:role/id :director :role/health :stalled
+                      :role/running 0 :role/queued 0 :role/blocked 2
+                      :role/desired 2 :role/outward? false})
+        attrs (second card)]
+    (is (= "stalled" (:data-health attrs)))
+    (is (= "false" (:data-outward attrs)))))
+
+(deftest desired-is-shown-even-when-zero
+  (testing "a role scaled to zero and a role nobody configured must not look alike"
+    (is (str/includes? (text-of (h/capacity {:role/running 0 :role/queued 0
+                                             :role/blocked 0 :role/desired 0}))
+                       "desired 0"))))
+
+(deftest an-empty-group-says-so-rather-than-rendering-a-gap
+  (is (str/includes? (text-of (h/group {:group/id :nexus-x402 :group/roles []
+                                        :group/totals {:roles 0}}))
+                     "no roles defined")))
+
+(deftest an-empty-hil-queue-says-so
+  (is (str/includes? (text-of (h/hil-queue [])) "nothing is waiting on you")))
+
+(deftest a-hil-row-falls-back-to-the-role-objective-when-the-run-has-no-goal
+  (let [txt (text-of (h/hil-queue [{:run/id "r1" :role/id :director
+                                    :role/group :network-isekai
+                                    :role/objective "keep the thing shipping"}]))]
+    (is (str/includes? txt "keep the thing shipping"))))
+
+(deftest orphan-roles-are-rendered-when-present-and-absent-otherwise
+  (is (nil? (h/orphans {:fleet/orphan-roles []})))
+  (is (str/includes? (text-of (h/orphans {:fleet/orphan-roles
+                                          [{:role/id :sales
+                                            :role/group :typo-business}]}))
+                     "typo-business")))
+
+(deftest a-role-id-is-shown-without-its-namespace
+  (testing "an operator reads `director`, not `:network-isekai/director`"
+    (let [card (h/role {:role/id :network-isekai/director :role/health :healthy
+                        :role/running 1 :role/queued 0 :role/blocked 0
+                        :role/desired 1 :role/outward? false})]
+      (is (str/includes? (text-of card) "director")))))
