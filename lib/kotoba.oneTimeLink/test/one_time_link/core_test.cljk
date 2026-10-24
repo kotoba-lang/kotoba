@@ -1,0 +1,139 @@
+(ns one-time-link.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [one-time-link.core :as otl]))
+
+(def now 1785000000000)
+(def minute 60000)
+
+(defn- plan [& {:as over}]
+  (otl/issue-plan (merge {:digest "sha256-of-token"
+                          :kind :session
+                          :subject "acme/ops:alice@acme.example"
+                          :now now}
+                         over)))
+
+(defn- record [& {:as over}]
+  (merge (:one-time-link/record (plan)) over))
+
+;; ---------------------------------------------------------------------------
+;; 発行
+;; ---------------------------------------------------------------------------
+
+(deftest a-plan-carries-its-own-expiry
+  (let [r (:one-time-link/record (plan))]
+    (is (= now (:one-time-link/issued-at r)))
+    (is (= (+ now (* 10 minute)) (:one-time-link/expires-at r))
+        "期限の正本は record。保管側の TTL を当てにしない")
+    (is (= :session (:one-time-link/kind r)))))
+
+(deftest the-plan-never-contains-a-token
+  ;; 平文を保存する経路が書けないこと。record の値を全部走査して
+  ;; 「token」らしきものが入り込む余地が無いことを、キーの集合で固定する。
+  (is (= #{:one-time-link/schema :one-time-link/digest :one-time-link/kind
+           :one-time-link/subject :one-time-link/target
+           :one-time-link/issued-at :one-time-link/expires-at}
+         (set (keys (:one-time-link/record (plan)))))))
+
+(deftest cooling-down-refuses-and-says-how-long
+  (let [r (plan :last-issued-at (- now 10000))]
+    (is (false? (:one-time-link/issue? r)))
+    (is (= :cooling-down (:one-time-link/refused r)))
+    (is (= 50000 (:one-time-link/retry-after-ms r))))
+  (testing "冷却が明ければ出せる"
+    (is (:one-time-link/issue? (plan :last-issued-at (- now (* 2 minute))))))
+  (testing "初回は冷却していない"
+    (is (:one-time-link/issue? (plan :last-issued-at nil)))))
+
+(deftest a-plan-without-what-it-needs-refuses
+  (is (= :no-digest (:one-time-link/refused (plan :digest ""))))
+  (is (= :no-digest (:one-time-link/refused (plan :digest nil))))
+  (is (= :no-kind (:one-time-link/refused (plan :kind nil))))
+  (is (= :no-clock (:one-time-link/refused (plan :now nil)))))
+
+(deftest policy-can-be-tightened-per-deployment
+  (let [p {:one-time-link/ttl-ms (* 2 minute) :one-time-link/cooldown-ms 5000}
+        r (:one-time-link/record (plan :policy p))]
+    (is (= (+ now (* 2 minute)) (:one-time-link/expires-at r)))
+    (is (:one-time-link/issue? (plan :policy p :last-issued-at (- now 6000))))
+    (is (not (:one-time-link/issue? (plan :policy p :last-issued-at (- now 4000))))))
+  (testing "部分上書きは残りを既定のまま残す"
+    (is (= (:one-time-link/cooldown-ms otl/default-policy)
+           (:one-time-link/cooldown-ms
+            (otl/policy {:one-time-link/ttl-ms 1}))))))
+
+;; ---------------------------------------------------------------------------
+;; 消費
+;; ---------------------------------------------------------------------------
+
+(deftest a-good-link-redeems-once
+  (let [r (record)
+        ok (otl/redeem r "sha256-of-token" (+ now 1000))]
+    (is (:one-time-link/redeemed? ok))
+    (is (= :session (:one-time-link/kind ok)))
+    (is (= "acme/ops:alice@acme.example" (:one-time-link/subject ok))))
+  (testing "使い切った印が付いたら二度目は通らない"
+    (let [used (otl/consume (record) now)]
+      (is (= :consumed (:one-time-link/refused
+                        (otl/redeem used "sha256-of-token" (+ now 1000))))))))
+
+(deftest every-refusal-is-distinct-for-the-operator
+  (is (= :not-found (:one-time-link/refused (otl/redeem nil "x" now))))
+  (is (= :expired (:one-time-link/refused
+                   (otl/redeem (record) "sha256-of-token" (+ now (* 11 minute))))))
+  (is (= :digest-mismatch (:one-time-link/refused
+                           (otl/redeem (record) "different" (+ now 1000)))))
+  (is (= :no-clock (:one-time-link/refused
+                    (otl/redeem (record) "sha256-of-token" nil))))
+  (testing "全部 refusals に載っている"
+    (is (every? otl/refusals
+                [:not-found :expired :consumed :digest-mismatch :wrong-kind
+                 :no-clock]))))
+
+(deftest expiry-is-exclusive-at-the-boundary
+  (let [r (record)]
+    (is (:one-time-link/redeemed? (otl/redeem r "sha256-of-token"
+                                              (dec (:one-time-link/expires-at r)))))
+    (is (= :expired (:one-time-link/refused
+                     (otl/redeem r "sha256-of-token"
+                                 (:one-time-link/expires-at r))))
+        "期限ちょうどは切れている側")))
+
+(deftest the-stored-kind-decides-not-the-caller
+  ;; リンクが飛んでいる間に状態が変わっても、送ったつもりのものしか通らない。
+  (let [enrollment (record :one-time-link/kind :enrollment)]
+    (is (= :wrong-kind (:one-time-link/refused
+                        (otl/redeem enrollment "sha256-of-token" (+ now 1000)
+                                    :expect-kind :session))))
+    (is (:one-time-link/redeemed?
+         (otl/redeem enrollment "sha256-of-token" (+ now 1000)
+                     :expect-kind :enrollment)))
+    (testing "expect-kind を渡さなければ種類は問わないが、種類は返る"
+      (is (= :enrollment (:one-time-link/kind
+                          (otl/redeem enrollment "sha256-of-token"
+                                      (+ now 1000))))))))
+
+;; ---------------------------------------------------------------------------
+;; digest 比較
+;; ---------------------------------------------------------------------------
+
+(deftest digest-comparison-does-not-short-circuit-on-content
+  (is (otl/digest=? "abc" "abc"))
+  (is (not (otl/digest=? "abc" "abd")))
+  (is (not (otl/digest=? "abc" "ab")))
+  (is (not (otl/digest=? "abc" "abcd")))
+  (testing "空は常に false —— 記録が無い状態を『一致』にしない"
+    (is (not (otl/digest=? "" "")))
+    (is (not (otl/digest=? nil nil)))
+    (is (not (otl/digest=? "abc" nil)))))
+
+;; ---------------------------------------------------------------------------
+;; 外に見せる形
+;; ---------------------------------------------------------------------------
+
+(deftest the-public-outcome-does-not-depend-on-what-happened
+  ;; 発行できた / 冷却中 / そんな口座は無い —— どれも同じ形。
+  (let [message "このアドレスで手続きできる場合、リンクを送りました。"]
+    (is (= (otl/public-outcome message) (otl/public-outcome message)))
+    (is (= #{:one-time-link/accepted :one-time-link/message}
+           (set (keys (otl/public-outcome message)))))
+    (is (true? (:one-time-link/accepted (otl/public-outcome message))))))

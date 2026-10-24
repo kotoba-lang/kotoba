@@ -88,6 +88,32 @@ The bundled standard libraries live in this repository:
 | `org.w3.owl2` | `org.w3.owl2/src` | `owl.functional`, `owl.model`, `owl.reason`, `owl.rl` (an external specification, publisher w3.org) |
 | `org.ietf.turn` | `org.ietf.turn/src` | `kotoba.turn.allocation`, `kotoba.turn.channeldata`, `kotoba.turn.credential`, `kotoba.turn.demux` (an external specification, publisher ietf.org) |
 | `org.w3.webgpu` | `org.w3.webgpu/src` | `w3.webgpu` (an external specification, publisher w3.org) |
+| `kotoba.optimalTransport` | `kotoba.optimalTransport/src` | `optimal-transport.mesh-morph`, `optimal-transport.sinkhorn` (Kotoba project library) |
+| `kotoba.openapi` | `kotoba.openapi/src` | `openapi.execute`, `openapi.json`, `openapi.model`, `openapi.ports` (Kotoba project library) |
+| `kotoba.ooyake` | `kotoba.ooyake/src` | `ooyake.cells.reconcile.cell`, `ooyake.cells.reconcile.state-machine`, `ooyake.cells.social-post.state-machine`, `ooyake.cells.world-model.cell` (Kotoba project library) |
+| `kotoba.ontology` | `kotoba.ontology/src` | `kotoba.ontology`, `kotoba.ontology.connector` (Kotoba project library) |
+| `kotoba.ongaku` | `kotoba.ongaku/src` | `ongaku.catalog`, `ongaku.commission`, `ongaku.compose`, `ongaku.holdings` (Kotoba project library) |
+| `kotoba.oneTimeLink` | `kotoba.oneTimeLink/src` | `one-time-link.core` (Kotoba project library) |
+| `kotoba.ocio` | `kotoba.ocio/src` | `kotoba.ocio`, `ocio.core`, `ocio.transform` (Kotoba project library) |
+| `kotoba.yaml` | `kotoba.yaml/src` | `kotoba.yaml` (Kotoba project library) |
+| `kotoba.oak` | `kotoba.oak/src` | `oak.semantic` (Kotoba project library) |
+| `kotoba.nuno` | `kotoba.nuno/src` | `nuno.core` (Kotoba project library) |
+| `kotoba.nio` | `kotoba.nio/src` | `kotoba.nio.bytebuffer` (Kotoba project library) |
+| `kotoba.netcap` | `kotoba.netcap/src` | `kotoba.lang.netcap`, `kotoba.netcap`, `kotoba.netcap.call`, `kotoba.netcap.denied` (Kotoba project library) |
+| `kotoba.nerf` | `kotoba.nerf/src` | `nerf` (Kotoba project library) |
+| `kotoba.musicxml` | `kotoba.musicxml/src` | `kotoba.musicxml`, `musicxml.core` (Kotoba project library) |
+| `kotoba.mstProjector` | `kotoba.mstProjector/src` | `kotoba.lang.mst-projector.cli`, `kotoba.lang.mst-projector.indexer`, `kotoba.lang.mst-projector.mem-index`, `kotoba.lang.mst-projector.query-api` (Kotoba project library) |
+| `kotoba.mokuroku` | `kotoba.mokuroku/src` | `mokuroku.catalog`, `mokuroku.command`, `mokuroku.inspector`, `mokuroku.item` (Kotoba project library) |
+| `kotoba.modelChecking` | `kotoba.modelChecking/src` | `model-checking`, `model-checking.assertion`, `model-checking.coverage`, `model-checking.equivalence` (Kotoba project library) |
+| `kotoba.miningPool` | `kotoba.miningPool/src` | `mining-pool.ledger`, `mining-pool.protocol`, `mining-pool.share`, `mining-pool.vardiff` (Kotoba project library) |
+| `kotoba.minePds` | `kotoba.minePds/src` | `mine-pds` (Kotoba project library) |
+| `kotoba.mineAi` | `kotoba.mineAi/src` | `mine-ai` (Kotoba project library) |
+| `kotoba.mfa` | `kotoba.mfa/src` | `mfa.adapters.live-risk`, `mfa.adapters.orchestrator`, `mfa.adapters.planner`, `mfa.adapters.risk-planner` (Kotoba project library) |
+| `kotoba.mathml` | `kotoba.mathml/src` | `kotoba.mathml`, `mathml.core` (Kotoba project library) |
+| `kotoba.manimaniExperienceUi` | `kotoba.manimaniExperienceUi/src` | `manimani.build`, `manimani.ui` (Kotoba project library) |
+| `kotoba.manifestReality` | `kotoba.manifestReality/src` | `manifest-reality.checks`, `manifest-reality.parse` (Kotoba project library) |
+| `kotoba.mailer` | `kotoba.mailer/src` | `mailer.core` (Kotoba project library) |
+| `kotoba.mailA2a` | `kotoba.mailA2a/src` | `mail-a2a.core` (Kotoba project library) |
 | `kotoba.mail` | `kotoba.mail/src` | `mail.draft`, `mail.inbound`, `mail.mailbox`, `mail.message` (Kotoba project library) |
 | `kotoba.macosInventory` | `kotoba.macosInventory/src` | `macos-inventory.cli`, `macos-inventory.core`, `macos-inventory.host` (Kotoba project library) |
 | `kotoba.loopUxKaizen` | `kotoba.loopUxKaizen/src` | `loop.ux-kaizen` (Kotoba project library) |

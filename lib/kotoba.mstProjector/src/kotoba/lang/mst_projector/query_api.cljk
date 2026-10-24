@@ -1,0 +1,335 @@
+(ns kotoba.lang.mst-projector.query-api
+  "mst-projector query API (XRPC) -- ported from `mst_projector/query_api.py`.
+
+  Exposes the same 4 NSIDs + /healthz that
+  `etzhayyim_sdk.mst-projector` (the already-written, already-tested cljc
+  XRPC CLIENT at `etzhayyim/root:20-actors/etzhayyim-sdk-py/src/
+  etzhayyim_sdk/mst_projector.cljc`) calls, over the same wire shapes, so
+  this server is a byte-for-byte wire-compatible drop-in for that client:
+
+    GET  /healthz
+    POST /xrpc/com.etzhayyim.mstProjector.queryByCollection
+    POST /xrpc/com.etzhayyim.mstProjector.queryByDid
+    POST /xrpc/com.etzhayyim.mstProjector.queryByField
+    POST /xrpc/com.etzhayyim.mstProjector.countByCollection
+
+  Transport: `com.sun.net.httpserver.HttpServer` -- part of the JDK, zero
+  extra dependency, the same class this session used successfully (as a
+  test mock) in `kotoba-lang/checkpointer`'s `http_jdk_test.clj`; here it is
+  the REAL server, not a test mock, matching the minimal-deps convention
+  over pulling in Jetty/http-kit/etc.
+
+  Every handler talks ONLY to the injected
+  `kotoba.lang.mst-projector.indexer/IIndex` (via the `indexer` namespace's
+  orchestration functions) -- this namespace has no storage-backend
+  knowledge at all, matching `indexer.py`+`query_api.py`'s original
+  layering (query_api called `get_indexer()` which returned a
+  LanceDB-backed singleton; here the caller supplies whichever `IIndex` it
+  likes, e.g. `kotoba.lang.mst-projector.mem-index`).
+
+  Status-code semantics matter for wire compatibility: the client
+  classifies `>=500` as a server error, `>=400` as a client error
+  (attempting to parse the JSON body either way), else parses the 2xx JSON
+  body -- so every error path here returns a REAL 4xx/5xx status, never a
+  200 with an error payload."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.mst-projector.indexer :as indexer])
+  (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
+           (java.net InetSocketAddress)))
+
+;; ---------------------------------------------------------------------------
+;; Wire helpers
+;; ---------------------------------------------------------------------------
+
+(def ^:private safe-field-re
+  "Field names accepted by queryByField: alphanumeric + underscore, must
+  start with a letter or underscore. This is SQL-injection-shaped defence
+  inherited from the python original (there `field_name` became part of a
+  literal SQL where-clause); `kotoba.lang.mst-projector.mem-index`'s
+  reference store never builds SQL at all (filtering is a plain-data
+  equality match), but the validation -- and its wire-visible 400 response
+  -- is preserved unconditionally so any `IIndex` that DOES compile to SQL
+  (a hypothetical LanceDB-backed one, say) inherits the same defence, and
+  so the client-visible contract does not change per backend."
+  #"^[A-Za-z_][A-Za-z0-9_]*$")
+
+(defn- falsy?
+  "Python-`if not x`-shaped falsiness for wire values coming out of a
+  JSON-decoded body: nil, false, \"\", or 0 all fail a `collection`/`did`
+  presence check exactly as they would in the python original."
+  [v]
+  (or (nil? v) (false? v) (= v "") (= v 0) (= v 0.0)))
+
+(defn- read-request-body
+  ^String [^HttpExchange ex]
+  (kbytes/utf8-string (.readAllBytes (.getRequestBody ex))))
+
+(defn- write-json!
+  [^HttpExchange ex status body-map]
+  (let [^bytes body (kbytes/utf8-bytes (json/write-str body-map))]
+    (.set (.getResponseHeaders ex) "Content-Type" "application/json; charset=utf-8")
+    (.sendResponseHeaders ex status (alength body))
+    (with-open [os (.getResponseBody ex)]
+      (.write os body))))
+
+(defn- error!
+  [ex status error-code message]
+  (write-json! ex status {"error" error-code "message" message}))
+
+(defn- parse-json-body
+  "Returns the parsed body map, or ::invalid-json on any parse failure
+  (empty body, malformed JSON, non-object JSON) -- mirrors the python
+  `except Exception: return 400 body-must-be-JSON` catch-all."
+  [^HttpExchange ex]
+  (try
+    (let [parsed (json/read-str (read-request-body ex))]
+      (if (map? parsed) parsed ::invalid-json))
+    (catch Exception _ ::invalid-json)))
+
+(defn- ->long
+  [v]
+  (cond
+    (integer? v) (long v)
+    (number? v) (long v)
+    (string? v) (Long/parseLong (str/trim v))
+    :else (throw (ex-info "not a number" {:v v}))))
+
+(defn- parse-limit
+  "1-1000 inclusive, default 50. ::invalid on any violation (mirrors
+  python's `int(body.get(\"limit\", 50))` + range check, both wrapped in
+  the same ValueError/TypeError catch)."
+  [body]
+  (try
+    (let [n (->long (get body "limit" 50))]
+      (if (<= 1 n 1000) n (throw (ex-info "out of range" {}))))
+    (catch Exception _ ::invalid)))
+
+(defn- parse-cursor
+  "Opaque offset cursor: absent/nil -> 0; else a non-negative integer.
+  ::invalid on any violation."
+  [body]
+  (try
+    (let [raw (get body "cursor")]
+      (if (nil? raw)
+        0
+        (let [n (->long raw)]
+          (if (neg? n) (throw (ex-info "negative cursor" {})) n))))
+    (catch Exception _ ::invalid)))
+
+(defn- paginate
+  "Given `all-records` already fetched with limit `offset+limit+1` (or, for
+  the queryByDid cross-collection slow path, already truncated to that same
+  bound), slice out the requested page for `offset`/`limit` and compute the
+  opaque next-cursor. Mirrors python's identical slicing in both
+  `_query_by_collection` and `_query_by_did`."
+  [all-records offset limit]
+  (let [page (vec (take (inc limit) (drop offset all-records)))]
+    (if (> (count page) limit)
+      {"records" (subvec page 0 limit) "cursor" (str (+ offset limit))}
+      {"records" page "cursor" nil})))
+
+;; ---------------------------------------------------------------------------
+;; NSID handlers
+;; ---------------------------------------------------------------------------
+
+(defn- handle-query-by-collection
+  [index ^HttpExchange ex]
+  (let [body (parse-json-body ex)]
+    (cond
+      (= body ::invalid-json)
+      (error! ex 400 "InvalidRequest" "body must be JSON")
+
+      (falsy? (get body "collection"))
+      (error! ex 400 "InvalidRequest" "collection required")
+
+      :else
+      (let [collection (get body "collection")
+            limit (parse-limit body)]
+        (if (= limit ::invalid)
+          (error! ex 400 "InvalidRequest" "limit must be 1–1000")
+          (let [offset (parse-cursor body)]
+            (if (= offset ::invalid)
+              (error! ex 400 "InvalidRequest" "invalid cursor")
+              (let [all-records (indexer/query index collection nil (+ offset limit 1))]
+                (write-json! ex 200 (paginate all-records offset limit))))))))))
+
+(defn- handle-query-by-did
+  [index ^HttpExchange ex]
+  (let [body (parse-json-body ex)]
+    (cond
+      (= body ::invalid-json)
+      (error! ex 400 "InvalidRequest" "body must be JSON")
+
+      (falsy? (get body "did"))
+      (error! ex 400 "InvalidRequest" "did required")
+
+      :else
+      (let [did (get body "did")
+            collection (get body "collection")
+            limit (parse-limit body)]
+        (if (= limit ::invalid)
+          (error! ex 400 "InvalidRequest" "limit must be 1–1000")
+          (let [offset (parse-cursor body)]
+            (if (= offset ::invalid)
+              (error! ex 400 "InvalidRequest" "invalid cursor")
+              (let [filter-map {:field "did" :value did}
+                    all-records
+                    (if-not (falsy? collection)
+                      (indexer/query index collection filter-map (+ offset limit 1))
+                      ;; Cross-collection slow path: enumerate every indexed
+                      ;; collection, gather matches bounded by `limit` per
+                      ;; collection, then re-slice by the requested
+                      ;; offset+limit -- mirrors python's `_query_by_did`.
+                      (let [collections (indexer/list-collections index)]
+                        (vec (take (+ offset limit 1)
+                                   (mapcat #(indexer/query index % filter-map limit)
+                                           collections)))))]
+                (write-json! ex 200 (paginate all-records offset limit))))))))))
+
+(defn- handle-query-by-field
+  [index ^HttpExchange ex]
+  (let [body (parse-json-body ex)]
+    (if (= body ::invalid-json)
+      (error! ex 400 "InvalidRequest" "body must be JSON")
+      (let [collection (get body "collection")
+            ;; Accept both camelCase (wire) and snake_case (internal) aliases,
+            ;; matching python's `body.get("fieldName") or body.get("field_name")`.
+            field-name (let [v (get body "fieldName")] (if (falsy? v) (get body "field_name") v))
+            field-value (if (contains? body "fieldValue") (get body "fieldValue") (get body "field_value"))]
+        (cond
+          (or (falsy? collection) (falsy? field-name) (nil? field-value))
+          (error! ex 400 "InvalidRequest" "collection, fieldName, fieldValue required")
+
+          (not (re-matches safe-field-re (str field-name)))
+          (error! ex 400 "InvalidRequest"
+                  (str "fieldName must start with a letter or underscore and "
+                       "contain only alphanumeric characters and underscores"))
+
+          :else
+          (let [limit (parse-limit body)]
+            (if (= limit ::invalid)
+              (error! ex 400 "InvalidRequest" "limit must be 1–1000")
+              (try
+                (let [records (indexer/query index collection
+                                              {:field field-name :value field-value}
+                                              limit)]
+                  (write-json! ex 200 {"records" records}))
+                ;; `mem-index` never throws here (schema-less: an unindexed
+                ;; field just yields no matches), but the path is preserved
+                ;; for an `IIndex` backend that DOES enforce a schema (e.g. a
+                ;; hypothetical LanceDB-backed one, matching python's own
+                ;; `except Exception -> 400 UnindexedField`).
+                (catch Exception e
+                  (error! ex 400 "UnindexedField" (or (ex-message e) "query failed")))))))))))
+
+(defn- handle-count-by-collection
+  [index ^HttpExchange ex]
+  (let [body (parse-json-body ex)]
+    (cond
+      (= body ::invalid-json)
+      (error! ex 400 "InvalidRequest" "body must be JSON")
+
+      (falsy? (get body "collection"))
+      (error! ex 400 "InvalidRequest" "collection required")
+
+      :else
+      (let [collection (get body "collection")
+            count (indexer/count-rows index collection)]
+        (write-json! ex 200 {"count" count "asOf" (indexer/now-iso)})))))
+
+(defn- handle-healthz
+  [index ^HttpExchange ex]
+  (try
+    (let [collections (indexer/list-collections index)]
+      (write-json! ex 200
+                    {"ok" true
+                     "service" "mst-projector"
+                     "indexed_collections" (count collections)
+                     ;; NB: python's own `_healthz` referenced a nonexistent
+                     ;; `indexer.data_dir` attribute (the LanceDB `Indexer`
+                     ;; class never set that field) -- a latent bug that
+                     ;; would make every real healthz call fall into the
+                     ;; except-503 branch. Fixed here rather than ported
+                     ;; faithfully: the wire key stays "data_dir" for
+                     ;; response-shape compatibility, but its value is now
+                     ;; `IIndex/-describe`'s short backend descriptor (NOT a
+                     ;; dump of the index's data) rather than a
+                     ;; LanceDB-specific path.
+                     "data_dir" (indexer/describe index)}))
+    (catch Exception e
+      (write-json! ex 503
+                    {"ok" false "service" "mst-projector" "error" (or (ex-message e) "error")}))))
+
+;; ---------------------------------------------------------------------------
+;; Router + server bootstrap
+;; ---------------------------------------------------------------------------
+
+(def ^:private routes
+  {"/xrpc/com.etzhayyim.mstProjector.queryByCollection" #'handle-query-by-collection
+   "/xrpc/com.etzhayyim.mstProjector.queryByDid" #'handle-query-by-did
+   "/xrpc/com.etzhayyim.mstProjector.queryByField" #'handle-query-by-field
+   "/xrpc/com.etzhayyim.mstProjector.countByCollection" #'handle-count-by-collection})
+
+(defn- dispatch!
+  [index ^HttpExchange ex]
+  (let [path (.getPath (.getRequestURI ex))
+        method (.getRequestMethod ex)]
+    (cond
+      (and (= path "/healthz") (= method "GET"))
+      (handle-healthz index ex)
+
+      (= path "/healthz")
+      (error! ex 405 "MethodNotAllowed" (str method " not allowed for " path))
+
+      (contains? routes path)
+      (if (= method "POST")
+        ((get routes path) index ex)
+        (error! ex 405 "MethodNotAllowed" (str method " not allowed for " path)))
+
+      :else
+      (error! ex 404 "NotFound" (str "no such route: " path)))))
+
+(defn- handler
+  ^HttpHandler [index]
+  (reify HttpHandler
+    (handle [_ ex]
+      (try
+        (dispatch! index ex)
+        (catch Exception e
+          (try
+            (error! ex 500 "InternalError" (or (ex-message e) "internal error"))
+            (catch Exception _ nil)))
+        (finally
+          (.close ^HttpExchange ex))))))
+
+(defn build-server
+  "Construct (but do not start) an HttpServer bound to `host`:`port`, with
+  all 4 XRPC routes + /healthz wired to `index` (an IIndex)."
+  ^HttpServer [index {:keys [host port] :or {host "127.0.0.1" port 8765}}]
+  (let [server (HttpServer/create (InetSocketAddress. ^String host (int port)) 0)]
+    (.createContext server "/" (handler index))
+    (.setExecutor server nil)
+    server))
+
+(defn start!
+  "Build + start the query-api server. Returns the running HttpServer (pass
+  to `stop!`). Mirrors python's `serve(host, port)` bootstrap (default
+  127.0.0.1:8765 per ADR-2605215500)."
+  ([index] (start! index {}))
+  ([index opts]
+   (doto (build-server index opts)
+     (.start))))
+
+(defn port
+  "The actual bound TCP port of a started server (useful when `:port 0` was
+  requested for an OS-assigned ephemeral port, e.g. in tests)."
+  [^HttpServer server]
+  (.getPort (.getAddress server)))
+
+(defn stop!
+  "Stop a server started via `start!`. `delay-seconds` (default 0) is
+  forwarded to `HttpServer.stop`."
+  ([^HttpServer server] (stop! server 0))
+  ([^HttpServer server delay-seconds]
+   (.stop server delay-seconds)))

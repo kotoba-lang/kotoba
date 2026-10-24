@@ -1,0 +1,265 @@
+(ns semantic-conformance
+  (:require [clojure.string :as str]
+            [oak.semantic :as semantic]
+            ["node:child_process" :as child]
+            ["node:fs" :as fs]))
+
+(def env (.-env js/process))
+(def failures (atom 0))
+
+(defn- check [label ok? detail]
+  (if ok?
+    (println "PASS" label)
+    (do (println "FAIL" label (pr-str detail)) (swap! failures inc))))
+
+(defn- host-doc->edn [node]
+  (let [tag (aget node 0) payload (aget node 1)]
+    (case tag
+      ("vector" "list") (mapv host-doc->edn payload)
+      "set" (set (map host-doc->edn payload))
+      "map" (into {} (map (fn [entry]
+                            [(host-doc->edn (aget entry 0))
+                             (host-doc->edn (aget entry 1))]) payload))
+      "keyword" (keyword (subs payload 1))
+      "symbol" (symbol payload)
+      "i64" (js/Number payload)
+      "f64" payload
+      "string" payload
+      "bool" payload
+      "null" nil)))
+
+(defn- edn->raw-doc [value]
+  (cond
+    (keyword? value) #js ["keyword" (str value)]
+    (symbol? value) #js ["symbol" (str value)]
+    (string? value) #js ["string" value]
+    (integer? value) #js ["i64" (js/BigInt value)]
+    (boolean? value) #js ["bool" value]
+    (nil? value) #js ["null"]
+    (vector? value) #js ["vector" (clj->js (mapv edn->raw-doc value))]
+    (map? value) #js ["map" (clj->js
+                              (mapv (fn [[k v]] #js [(edn->raw-doc k) (edn->raw-doc v)])
+                                    (sort-by (comp str key) value)))]
+    :else (throw (ex-info "cannot encode semantic input as a Kotoba document"
+                          {:value value}))))
+
+(defn- outcome [value]
+  (let [tag (aget value 1) payload (aget value 2)]
+    (if (= tag ":ok")
+      [:ok (aget payload 1) (aget payload 2)]
+      [:rejected (keyword (subs (aget payload 1) 1)) (aget payload 2)])))
+
+(def instructions
+  {:reasoner "Which reasoner derives OWL 2 RL entailments to a least fixpoint?"
+   :shape "Which shape validates a tender submission?"
+   :query "Which query lists open tenders?"
+   :view "Which view renders the tender input?"
+   :action "Which action declares a tender?"
+   :effect "Which effect authorizes persistence in the application dataspace?"
+   :implementation "Which implementation executes tender declaration?"})
+
+(def roles [:reasoner :shape :query :view :action :effect :implementation])
+
+(defn- model-forward [ontology discovered]
+  (let [state (str "Goal: build a tender intake application. The ontology permits an OWL 2 RL "
+                   "reasoner, a tender input shape, an open tenders query, a tender form view, "
+                   "a declare tender action, a dataspace transact effect, and the OaK declare "
+                   "implementation. Every selected component must satisfy requires, implements, "
+                   "dispatch, and permits relations.")
+        questions (mapv (fn [role]
+                          (let [id (:id (first (get discovered role)))]
+                            {:type "choice"
+                             :instructions (get instructions role)
+                             :options [(subs (str id) 1) (str (name role) "/none")]}))
+                        roles)
+        request (.stringify js/JSON (clj->js {:state state :questions questions}))
+        args (cond-> ["-m" "typed_decisions.open_jev"
+                      "--model" (aget env "OPEN_JEV_MODEL")
+                      "--revision" (aget env "OPEN_JEV_REVISION")
+                      "--device" "cpu"]
+               true clj->js)
+        run (.spawnSync child (aget env "OPEN_JEV_PYTHON") args
+                        #js {:cwd (aget env "OPEN_JEV_SRC")
+                             :input request :encoding "utf8"
+                             :env (js/Object.assign
+                                   #js {} js/process.env
+                                   #js {"PYTHONPATH" (aget env "OPEN_JEV_PYTHONPATH")})})]
+    (when-not (zero? (or (.-status run) 1))
+      (throw (ex-info "trained OpenJev forward failed"
+                      {:status (.-status run) :stderr (.-stderr run)})))
+    (when (str/blank? (.-stdout run))
+      (throw (ex-info "trained OpenJev forward produced no JSON"
+                      {:status (.-status run) :stderr (.-stderr run)})))
+    (js->clj (.parse js/JSON (str/trim (.-stdout run))) :keywordize-keys true)))
+
+(defn- decision-rows [result]
+  (mapv (fn [role decision]
+          [:choice role (keyword (:choice decision))
+           (js/Math.round (* 10000 (:confidence decision)))])
+        roles (:decisions result)))
+
+(-> (js/import (aget env "OAK_BROWSER_HOST"))
+    (.then
+     (fn [host]
+       (let [wasm (.readFileSync fs (aget env "OAK_WASM"))
+             instantiate (fn []
+                           ((.-instantiateKotoba host) wasm
+                            #js {:allowCapabilities #js [24]
+                                 :typedCapCall (fn [& _]
+                                                 (throw (js/Error. "unexpected effect during semantic compilation"))) }))]
+         (-> (instantiate)
+             (.then
+              (fn [runtime]
+                (let [exports (.-exports (.-instance runtime))
+                      ontology (host-doc->edn ((aget exports "app-ontology")))
+                      ontology-digest ((aget exports "app-ontology-digest"))
+                      discovered (into {}
+                                       (map (fn [role]
+                                              [role (semantic/candidates-for-role
+                                                     ontology :goal/tender-intake role)]))
+                                       roles)]
+                  (doseq [role roles]
+                    (check (str "OWL2+SPARQL discovers permitted " (name role))
+                           (= 1 (count (filter :permitted? (get discovered role))))
+                           (get discovered role)))
+                  {:ontology ontology
+                   :ontology-digest ontology-digest
+                   :discovered discovered
+                   :model-result (model-forward ontology discovered)})))
+             (.then
+              (fn [{:keys [discovered model-result] :as state}]
+                (check "trained decision runtime emits no text"
+                       (false? (:generated_text model-result)) model-result)
+                (check "the pinned model artifact answered every ontology role"
+                       (= (count roles) (count (:decisions model-result))) model-result)
+                (doseq [[role decision] (map vector roles (:decisions model-result))]
+                  (check (str "trained model selects ontology candidate for " (name role))
+                         (= (subs (str (:id (first (get discovered role)))) 1)
+                            (:choice decision))
+                         decision))
+                (assoc state :decision-rows (decision-rows model-result))))
+             (.then
+              (fn [{:keys [decision-rows ontology-digest] :as state}]
+                (-> (js/Promise.all #js [(instantiate) (instantiate) (instantiate)])
+                    (.then
+                     (fn [runtimes]
+                       (let [runtime (aget runtimes 0)
+                             invalid-runtime (aget runtimes 1)
+                             tamper-runtime (aget runtimes 2)
+                             exports (.-exports (.-instance runtime))
+                             invalid-exports (.-exports (.-instance invalid-runtime))
+                             tamper-exports (.-exports (.-instance tamper-runtime))
+                             transaction-value [:oak.transaction/v1
+                                                :goal/tender-intake
+                                                ontology-digest
+                                                decision-rows]
+                             transaction ((.-document (.-typedValues runtime))
+                                          (edn->raw-doc transaction-value))
+                             invalid-transaction ((.-document (.-typedValues invalid-runtime))
+                                                  (edn->raw-doc
+                                                   [:oak.transaction/v1
+                                                    :goal/tender-intake
+                                                    "wrong-ontology-digest"
+                                                    decision-rows]))
+                             invalid (outcome ((aget invalid-exports "compile-app-transaction")
+                                               invalid-transaction))
+                             compiled (outcome ((aget exports "compile-app-transaction")
+                                                transaction))]
+                         (check "a typed transaction for another ontology is refused"
+                                (= [:rejected :oak/invalid-app-transaction]
+                                   (subvec invalid 0 2))
+                                invalid)
+                         (check "trained choices compile as a typed ontology transaction"
+                                (= :ok (first compiled))
+                                {:compiled compiled :transaction transaction-value})
+                         (when (= :ok (first compiled))
+                           (let [manifest-edn (host-doc->edn (second compiled))
+                                 tampered-manifest
+                                 (mapv (fn [row]
+                                         (if (= :app/execution (first row))
+                                           [(first row) (second row)
+                                            (mapv (fn [ir-row]
+                                                    (if (= :execution/effect (first ir-row))
+                                                      [:execution/effect :op/relate :tender]
+                                                      ir-row))
+                                                  (nth row 2))]
+                                           row))
+                                       manifest-edn)
+                                 tampered ((.-document (.-typedValues tamper-runtime))
+                                           (edn->raw-doc tampered-manifest))
+                                 tampered-result
+                                 (outcome ((aget tamper-exports "query-app") tampered))
+                                 queried (outcome ((aget exports "query-app") (second compiled)))]
+                             (check "a manifest with a rewritten Execution IR is refused"
+                                    (= [:rejected :oak/invalid-app-manifest]
+                                       (subvec tampered-result 0 2))
+                                    tampered-result)
+                             (check "Kotoba runtime exposes semantics plus typed Execution IR"
+                                    (= :ok (first queried)) queried)
+                             (assoc state :semantic-plan
+                                    (host-doc->edn (second queried)))))))))))
+             (.then
+              (fn [{:keys [semantic-plan]}]
+                (when semantic-plan
+                  (let [[reasoner shape-plan plan execution] semantic-plan
+                        profile (second reasoner)
+                        triples [(semantic/triple :procurement :rdfs/subClassOf :tender)
+                                 (semantic/triple :t-open :rdf/type :procurement)
+                                 (semantic/triple :t-open :status :open)
+                                 (semantic/triple :t-closed :rdf/type :tender)
+                                 (semantic/triple :t-closed :status :closed)]
+                        rows (semantic/execute profile plan triples)
+                        {:keys [target shape]} (semantic/shape-plan->shacl shape-plan)
+                        valid-node {:id "t-live" :status :open}
+                        invalid-node {:id "t-bad" :status :unknown}
+                        shacl-wasm (.readFileSync fs (aget env "OAK_SHACL_WASM"))]
+                    (check "selected OWL2 reasoner plus selected SPARQL returns the inferred open tender"
+                           (= [{'?t :t-open}] rows) rows)
+                    (check "selected SHACL plan targets the dispatched ontology type"
+                           (= :tender target) target)
+                    (check "Execution IR carries state, transaction, capability, causal link, effect and implementation"
+                           (= [[:execution/version :oak.execution/v1]
+                               [:execution/state :shape/tender-input]
+                               [:execution/transaction :action/declare-tender :event/submit]
+                               [:execution/capability :effect/dataspace-transact :dataspace/transact]
+                               [:execution/causal-link :event/submit :op/declare]
+                               [:execution/effect :op/declare :tender]
+                               [:execution/implementation
+                                :impl/oak-declare
+                                "bafyreiggpt55m7ke7qy7f2fxscdo4zq3pnq7gbssvrlqcwp6ofngp66xka"]]
+                              execution)
+                           execution)
+                    (-> ((.-instantiateKotoba host) shacl-wasm #js {})
+                        (.then
+                         (fn [shacl-runtime]
+                           (let [exports (.-exports (.-instance shacl-runtime))
+                                 document (.-document (.-typedValues shacl-runtime))
+                                 validate (aget exports "validate")
+                                 encoded-shape (document (edn->raw-doc shape))
+                                 valid-result (host-doc->edn
+                                               (validate encoded-shape
+                                                         (document (edn->raw-doc valid-node))))
+                                 invalid-result (host-doc->edn
+                                                 (validate encoded-shape
+                                                           (document (edn->raw-doc invalid-node))))]
+                             (check "actual SHACL Wasm accepts the ontology-valid input"
+                                    (true? (:valid? valid-result)) valid-result)
+                             (check "actual SHACL Wasm rejects the ontology-invalid enum"
+                                    (and (false? (:valid? invalid-result))
+                                         (= [:shacl/in]
+                                            (mapv :error (:errors invalid-result))))
+                                    invalid-result)))))))))
+             (.then
+              (fn [_]
+                (println (str "\noak semantic path: "
+                              (if (zero? @failures) "all checks passed"
+                                  (str @failures " failed"))))
+                (set! (.-exitCode js/process) (if (zero? @failures) 0 1))))
+             (.catch
+              (fn [error]
+                (println "FAIL semantic integration did not complete:" (.-message error))
+                (set! (.-exitCode js/process) 1)))))))
+    (.catch
+     (fn [error]
+       (println "FAIL browser host could not load:" (.-message error))
+       (set! (.-exitCode js/process) 1))))

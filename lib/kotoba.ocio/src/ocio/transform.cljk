@@ -1,0 +1,236 @@
+(ns ocio.transform
+  "Colour space conversion as arithmetic, not as configuration.
+
+  `ocio.core` emits an .ocio config: YAML that NAMES colorspaces and the
+  transforms between them. A renderer reading that config still has to do the
+  arithmetic, and nothing here did it — so a pipeline could declare `ACEScg`
+  and hand a downstream tool sRGB values with an ACES label on them, which is
+  the failure colour management exists to prevent.
+
+  This namespace is the arithmetic. Every matrix is DERIVED from published
+  chromaticities rather than transcribed, because a transcribed matrix is a
+  number that no longer knows where it came from: if the primaries are wrong
+  the derivation is wrong in a way the tests can see, whereas a typo in a
+  copied matrix looks exactly like the matrix. The derived values are then
+  checked against the published ones in `ocio.transform-test`.
+
+  Nothing here is an approximation of a look or a tone map. It is the
+  colorimetry: primaries, white point, chromatic adaptation, transfer
+  function."
+  (:require [kotoba.lang.text :as string]))
+
+;; ---------------------------------------------------------------------------
+;; 3x3 linear algebra, as vectors of rows.
+;; ---------------------------------------------------------------------------
+
+(defn mat*vec [m v]
+  (mapv (fn [row] (reduce + (map * row v))) m))
+
+(defn mat*mat [a b]
+  (mapv (fn [row]
+          (mapv (fn [j] (reduce + (map-indexed (fn [k x] (* x (get-in b [k j]))) row)))
+                (range 3)))
+        a))
+
+(defn- det3 [[[a b c] [d e f] [g h i]]]
+  (+ (* a (- (* e i) (* f h)))
+     (- (* b (- (* d i) (* f g))))
+     (* c (- (* d h) (* e g)))))
+
+(defn invert
+  "Inverse of a 3x3 matrix. Throws on a singular one rather than returning
+  something that looks like a colour transform."
+  [[[a b c] [d e f] [g h i] :as m]]
+  (let [dt (det3 m)]
+    (when (< (Math/abs (double dt)) 1.0e-12)
+      (throw (ex-info "singular colour matrix — the primaries are degenerate" {:matrix m})))
+    (mapv (fn [row] (mapv #(/ % dt) row))
+          [[(- (* e i) (* f h)) (- (* c h) (* b i)) (- (* b f) (* c e))]
+           [(- (* f g) (* d i)) (- (* a i) (* c g)) (- (* c d) (* a f))]
+           [(- (* d h) (* e g)) (- (* b g) (* a h)) (- (* a e) (* b d))]])))
+
+(defn white->XYZ
+  "A white point as XYZ, normalised to Y = 1. Accepts  chromaticities or
+   tristimulus values.
+
+  Both forms are needed, and the reason is measurable: the sRGB matrix every
+  reference quotes has column sums 0.95047 / 1.0 / 1.08883 — the TABULATED D65
+  tristimulus values — and deriving it from the rounded chromaticities
+  (0.3127, 0.3290) instead reproduces it only to about 7e-5. That is not a
+  rounding nicety in a colour pipeline; it is the difference between agreeing
+  with everyone else's matrix and almost agreeing with it. ACES white is
+  specified AS chromaticities (0.32168, 0.33767), and deriving AP1 from those
+  reproduces the published ACES matrix to every digit it publishes, so the two
+  forms are not interchangeable and the data says which one each space uses."
+  [w]
+  (if (= 3 (count w))
+    (let [[X Y Z] w] [(/ X Y) 1.0 (/ Z Y)])
+    (let [[x y] w] [(/ x y) 1.0 (/ (- 1.0 x y) y)])))
+
+(defn primaries->matrix
+  "RGB -> CIE XYZ for a set of chromaticities, by the standard derivation:
+  scale each primary's XYZ so that RGB (1,1,1) lands exactly on the white
+  point. `red` `green` `blue` `white` is [x y] or [X Y Z] (see `white->XYZ`)."
+  [{:keys [red green blue white]}]
+  (let [cols (mapv white->XYZ [red green blue])
+        m (mapv (fn [i] (mapv #(nth % i) cols)) (range 3))
+        s (mat*vec (invert m) (white->XYZ white))]
+    (mapv (fn [row] (mapv * row s)) m)))
+
+;; ---------------------------------------------------------------------------
+;; Chromatic adaptation. ACES white is D60 and sRGB white is D65; without this
+;; step a "white" frame changes colour on the way between them.
+;; ---------------------------------------------------------------------------
+
+(def bradford
+  [[0.8951 0.2664 -0.1614]
+   [-0.7502 1.7135 0.0367]
+   [0.0389 -0.0685 1.0296]])
+
+(defn adaptation-matrix
+  "Von Kries adaptation in the Bradford cone space, from white `src` to `dst`
+  (each either [x y] or [X Y Z])."
+  [src dst]
+  (let [cone (fn [w] (mat*vec bradford (white->XYZ w)))
+        [sr sg sb] (cone src) [dr dg db] (cone dst)
+        scale [[(/ dr sr) 0.0 0.0] [0.0 (/ dg sg) 0.0] [0.0 0.0 (/ db sb)]]]
+    (mat*mat (invert bradford) (mat*mat scale bradford))))
+
+;; ---------------------------------------------------------------------------
+;; Transfer functions. `:to-linear` decodes an encoded value; `:from-linear`
+;; encodes one. They are inverses and the tests hold them to it.
+;; ---------------------------------------------------------------------------
+
+(defn- signed
+  "Mirror `f` through the origin: f(-x) = -f(x).
+
+  Negative RGB is not a mistake here. A colour inside AP1 is routinely OUTSIDE
+  sRGB, and converting it gives a negative linear coefficient — that is the
+  correct representation of a colour the display cannot make, and it is what
+  makes wide-gamut round-trips exact. `Math/pow` of a negative base returns
+  NaN, so an unmirrored curve turns those values into NaN silently: measured,
+  five of the space pairs here failed to round-trip that way before this
+  wrapper existed. OCIO mirrors the same curves for the same reason."
+  [f]
+  (fn [v] (if (neg? v) (- (f (- v))) (f v))))
+
+(defn- srgb-to-linear [v]
+  (if (<= v 0.04045) (/ v 12.92) (Math/pow (/ (+ v 0.055) 1.055) 2.4)))
+
+(defn- srgb-from-linear [v]
+  (if (<= v 0.0031308) (* 12.92 v) (- (* 1.055 (Math/pow v (/ 1.0 2.4))) 0.055)))
+
+(def ^:private acescct-break 0.0078125)
+
+(defn- acescct-from-linear [v]
+  (if (<= v acescct-break)
+    (+ (* 10.5402377416545 v) 0.0729055341958355)
+    (/ (+ (/ (Math/log v) (Math/log 2.0)) 9.72) 17.52)))
+
+(defn- acescct-to-linear [v]
+  (if (<= v 0.155251141552511)
+    (/ (- v 0.0729055341958355) 10.5402377416545)
+    (Math/pow 2.0 (- (* v 17.52) 9.72))))
+
+(def transfer-functions
+  "Encoded <-> linear, by name. Registering one here IS the claim that this
+  library can decode that encoding; there is no second list of supported
+  encodings to drift out of step with it."
+  {:linear  {:to-linear identity :from-linear identity}
+   :srgb    {:to-linear (signed srgb-to-linear) :from-linear (signed srgb-from-linear)}
+   :gamma22 {:to-linear (signed #(Math/pow % 2.2)) :from-linear (signed #(Math/pow % (/ 1.0 2.2)))}
+   :gamma24 {:to-linear (signed #(Math/pow % 2.4)) :from-linear (signed #(Math/pow % (/ 1.0 2.4)))}
+   :acescct {:to-linear acescct-to-linear :from-linear acescct-from-linear}})
+
+;; ---------------------------------------------------------------------------
+;; The colour spaces themselves.
+;; ---------------------------------------------------------------------------
+
+(def d65
+  "CIE D65 as tristimulus values — see `white->XYZ` for why not chromaticities."
+  [0.95047 1.0 1.08883])
+(def d60 [0.32168 0.33767])   ; ACES white
+
+(def colour-spaces
+  "Chromaticities and encoding per space. Registering a space here IS the claim
+  that `convert` handles it — `known-spaces` reads this map rather than
+  restating it."
+  {:srgb        {:red [0.6400 0.3300] :green [0.3000 0.6000] :blue [0.1500 0.0600]
+                 :white d65 :transfer :srgb
+                 :doc "IEC 61966-2-1. Rec.709 primaries with the sRGB piecewise curve."}
+   :linear-srgb {:red [0.6400 0.3300] :green [0.3000 0.6000] :blue [0.1500 0.0600]
+                 :white d65 :transfer :linear
+                 :doc "sRGB/Rec.709 primaries, linear light — what a renderer works in."}
+   :rec709      {:red [0.6400 0.3300] :green [0.3000 0.6000] :blue [0.1500 0.0600]
+                 :white d65 :transfer :gamma24
+                 :doc "ITU-R BT.709."}
+   :rec2020     {:red [0.7080 0.2920] :green [0.1700 0.7970] :blue [0.1310 0.0460]
+                 :white d65 :transfer :linear
+                 :doc "ITU-R BT.2020 primaries, linear."}
+   :display-p3  {:red [0.6800 0.3200] :green [0.2650 0.6900] :blue [0.1500 0.0600]
+                 :white d65 :transfer :srgb
+                 :doc "P3 primaries with the sRGB curve, as Apple ships it."}
+   :aces2065-1  {:red [0.7347 0.2653] :green [0.0000 1.0000] :blue [0.0001 -0.0770]
+                 :white d60 :transfer :linear
+                 :doc "AP0 — the ACES interchange space. SMPTE ST 2065-1."}
+   :acescg      {:red [0.7130 0.2930] :green [0.1650 0.8300] :blue [0.1280 0.0440]
+                 :white d60 :transfer :linear
+                 :doc "AP1 linear — the ACES working space for rendering."}
+   :acescct     {:red [0.7130 0.2930] :green [0.1650 0.8300] :blue [0.1280 0.0440]
+                 :white d60 :transfer :acescct
+                 :doc "AP1 with the ACEScct log curve, for grading."}})
+
+(defn known-spaces [] (set (keys colour-spaces)))
+
+(defn to-xyz-matrix
+  "RGB (linear, in `space`) -> CIE XYZ under that space's own white point."
+  [space]
+  (if-let [s (get colour-spaces space)]
+    (primaries->matrix s)
+    (throw (ex-info (str "unknown colour space " space ". Known: "
+                         (string/join ", " (sort (map name (known-spaces)))))
+                    {:space space :known (known-spaces)}))))
+
+(defn transform-matrix
+  "The linear 3x3 taking linear `from` values to linear `to` values, including
+  chromatic adaptation when the white points differ."
+  [from to]
+  (let [a (to-xyz-matrix from) b (to-xyz-matrix to)
+        wa (:white (get colour-spaces from)) wb (:white (get colour-spaces to))
+        adapt (if (= wa wb) [[1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]]
+                  (adaptation-matrix wa wb))]
+    (mat*mat (invert b) (mat*mat adapt a))))
+
+(defn- transfer-of [space]
+  (let [t (:transfer (get colour-spaces space))]
+    (or (get transfer-functions t)
+        (throw (ex-info (str "colour space " space " names transfer function " t
+                             ", which is not registered. Registered: "
+                             (string/join ", " (sort (map name (keys transfer-functions)))))
+                        {:space space :transfer t})))))
+
+(defn decode
+  "Encoded triple in `space` -> linear values in that space's primaries."
+  [space rgb]
+  (let [f (:to-linear (transfer-of space))] (mapv #(f (double %)) rgb)))
+
+(defn encode
+  "Linear triple in `space`'s primaries -> that space's encoding."
+  [space rgb]
+  (let [f (:from-linear (transfer-of space))] (mapv #(f (double %)) rgb)))
+
+(defn convert
+  "An RGB triple from one colour space to another: decode, matrix (with
+  chromatic adaptation), encode.
+
+  This is the operation an .ocio config describes and does not perform."
+  [from to rgb]
+  (encode to (mat*vec (transform-matrix from to) (decode from rgb))))
+
+(defn matrix-transform
+  "The 3x3 as OCIO writes it: 16 row-major numbers of a 4x4. Feed it to
+  `ocio.core/xf` so the config a pipeline reads carries THE SAME matrix this
+  namespace computes, rather than a second copy someone pasted in."
+  [from to]
+  (let [[[a b c] [d e f] [g h i]] (transform-matrix from to)]
+    [a b c 0.0, d e f 0.0, g h i 0.0, 0.0 0.0 0.0 1.0]))

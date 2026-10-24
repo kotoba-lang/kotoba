@@ -1,0 +1,144 @@
+(ns manifest-reality.checks
+  "west manifest が宣言することと実態の乖離を検出する。**すべて純関数**。
+
+   実態 (GitHub の repo 一覧・redirect 解決結果・repo の file 一覧) は
+   呼び出し側が集めて data で渡す。この ns は HTTP も fs も触らない —
+   同じ検査を GitHub Actions と murakumo fleet の両方から呼べるようにするため
+   (片方だけ通る状態を作らない)。
+
+   finding は文字列でなく data:
+     {:check :west/stray-block :severity :error :subject <s> :detail {..}}"
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [manifest-reality.parse :as p]))
+
+(defn- finding [check severity subject detail]
+  {:check check :severity severity :subject subject :detail detail})
+
+;; ── 1. 構造: projects: セクション外の project ブロック ────────────────────
+;; west の remotes 要素は {name, url-base}。path:/revision: を持つブロックが
+;; 混ざると west が remote として誤解釈しうる。生成器は必ず projects: に置く。
+
+(defn stray-blocks [west]
+  (for [b (p/projects west)
+        :when (not= :projects (:section b))]
+    (finding :west/stray-block :error (:path b)
+             {:section (:section b) :line (:line b) :name (:name b)})))
+
+;; ── 2. org 整合: remote:/groups: は path の org と一致する ───────────────
+
+(defn org-consistency [west]
+  (concat
+   (for [b (p/projects west)
+         :let [org (p/path->org (:path b))]
+         :when (and org (:remote b) (not= (:remote b) org))]
+     (finding :west/remote-org-mismatch :error (:path b)
+              {:remote (:remote b) :expected org}))
+   (for [b (p/projects west)
+         :let [org (p/path->org (:path b))
+               g (:groups b)]
+         :when (and org g
+                    (not (contains? #{"[archived]" "[datalad]"} g))
+                    (not= g (str "[" org "]")))]
+     (finding :west/groups-org-mismatch :error (:path b)
+              {:groups g :expected (str "[" org "]")}))))
+
+;; ── 3. repos.edn の path キー staleness ─────────────────────────────────
+;; 生成器は canonical path で :rad-rids / :datalad / :archived を引く。
+;; org 移送でキーが取り残されると永久にヒットしない dead key になり、
+;; その repo の userdata (Radicle RID / datalad 指定) が静かに落ちる。
+
+(defn stale-path-keys
+  "keyed-maps: {:rad-rids {path rid} :datalad {path m} :archived {path m} ...}
+   live-paths: west.yml に実在する path の set"
+  [keyed-maps live-paths]
+  (for [[k m] keyed-maps
+        key (keys m)
+        :when (and (string? key)
+                   (str/starts-with? key "orgs/")
+                   (not (contains? live-paths key)))]
+    (finding :repos-edn/stale-path-key :warn key {:map k})))
+
+;; ── 4/5. GitHub との突合 ───────────────────────────────────────────────
+;; gh-repos: #{[org name] ...} — 対象 org に実在する repo
+;; archived?: (fn [[org name]] boolean)
+
+(defn orphan-entries
+  "west にあるが GitHub に無い entry。fetch できないので west update を壊す。"
+  [west gh-repos]
+  (for [b (p/projects west)
+        :let [org (p/path->org (:path b)) nm (p/path->name (:path b))]
+        :when (and org nm (not (contains? gh-repos [org nm])))]
+    (finding :west/orphan-entry :error (:path b) {:org org :name nm})))
+
+(defn unregistered
+  "GitHub にあるが west に無い repo。archived / org-meta は既定で除外する
+   (登録対象ではない)。ignore は呼び出し側が渡す判定関数。"
+  [west gh-repos {:keys [ignore?] :or {ignore? (constantly false)}}]
+  (let [registered (set (for [b (p/projects west)]
+                          [(p/path->org (:path b)) (p/path->name (:path b))]))]
+    (for [k (sort gh-repos)
+          :when (and (not (contains? registered k)) (not (ignore? k)))]
+      (finding :west/unregistered :warn (str "orgs/" (first k) "/" (second k)) {}))))
+
+(defn duplicate-entries
+  "2 つの west path が同じ GitHub repo を指している状態。
+   resolve: path -> 実体 id (redirect 解決済み)。nil は判定不能で無視。"
+  [west resolve]
+  (let [by-id (->> (p/projects west)
+                   (keep (fn [b] (when-let [id (resolve (:path b))] [id (:path b)])))
+                   (reduce (fn [m [id p]] (update m id (fnil conj []) p)) {}))]
+    (for [[id paths] by-id
+          :when (> (count paths) 1)]
+      (finding :west/duplicate-entry :error (str/join " | " (sort paths))
+               {:repo-id id :paths (vec (sort paths))}))))
+
+;; ── 6. credential 形の repo ────────────────────────────────────────────
+;; west に登録すると既定の `west update` で全 clone に鍵が展開される。
+;; 実例: fastlane match の certs repo (certs/**/*.p12 + *.mobileprovision)。
+
+(def credential-patterns
+  [#"(?i)\.p12$" #"(?i)\.pfx$" #"(?i)\.jks$" #"(?i)\.keystore$"
+   #"(?i)\.mobileprovision$" #"(?i)(^|/)id_(rsa|ed25519|ecdsa)$"
+   #"(?i)(^|/)\.env$" #"(?i)(^|/)secrets?\.(edn|json|ya?ml)$"])
+
+(defn credential-shaped?
+  "repo の file path 一覧が credential store の形をしているか。
+   `.pem` / `.key` は公開鍵・テスト fixture でも普通に出るので単体では採らない。"
+  [paths]
+  (boolean (some (fn [p] (some #(re-find % p) credential-patterns)) paths)))
+
+(defn credential-shaped
+  "repo-files: {[org name] [path ...]} — 登録候補についてのみ渡せばよい。"
+  [repo-files]
+  (for [[k paths] repo-files
+        :when (credential-shaped? paths)]
+    (finding :west/credential-shaped :error (str "orgs/" (first k) "/" (second k))
+             {:matched (vec (filter (fn [p] (some #(re-find % p) credential-patterns)) paths))})))
+
+;; ── まとめ ─────────────────────────────────────────────────────────────
+
+(defn audit
+  "inputs:
+     :west        west.yml の文字列 (必須)
+     :keyed-maps  repos.edn の path キー付き map (任意)
+     :gh-repos    #{[org name]} (任意 — 無ければ突合系は走らない)
+     :resolve     path -> repo id (任意)
+     :repo-files  {[org name] [path ...]} (任意)
+     :ignore?     [org name] -> boolean (任意)
+   戻り値: findings の vector。空なら pass。"
+  [{:keys [west keyed-maps gh-repos resolve repo-files ignore?]}]
+  (let [w (p/parse-west west)
+        live (set (keep :path (p/projects w)))]
+    (vec
+     (concat
+      (stray-blocks w)
+      (org-consistency w)
+      (when keyed-maps (stale-path-keys keyed-maps live))
+      (when gh-repos (orphan-entries w gh-repos))
+      (when gh-repos (unregistered w gh-repos {:ignore? (or ignore? (constantly false))}))
+      (when resolve (duplicate-entries w resolve))
+      (when repo-files (credential-shaped repo-files))))))
+
+(defn errors [findings] (filterv #(= :error (:severity %)) findings))
+(defn summary [findings] (frequencies (map (juxt :check :severity) findings)))

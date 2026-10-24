@@ -1,0 +1,347 @@
+(ns kotoba.lang.mst-projector.query-api-test
+  "Full HTTP-surface tests for kotoba.lang.mst-projector.query-api: starts a
+  REAL server (via `query-api/start!`, backed by a fresh `mem-index` per
+  test) on an OS-assigned ephemeral port (`:port 0`) and drives it over
+  real loopback HTTP -- covers all 4 NSIDs + /healthz, cursor pagination,
+  the queryByDid cross-collection slow path, the fieldName SQL-injection-
+  defence regex, and 4xx/5xx status-code correctness.
+
+  WIRE-COMPATIBILITY VERIFICATION. `reference-client` below drives the
+  server exactly as `etzhayyim_sdk.mst-projector` (the real, already-tested
+  cljc XRPC client this server must be wire-compatible with; 17 tests / 47
+  assertions green at `etzhayyim/root:20-actors/etzhayyim-sdk-py/src/
+  etzhayyim_sdk/mst_projector.cljc`) does: same NSIDs, same request-map
+  shape/keys (camelCase fieldName/fieldValue), same status-code
+  classification (>=500 -> server error, >=400 -> client error with parsed
+  JSON body, else parse the 2xx JSON body).
+
+  This is NOT that file `require`d directly: `mst_projector.cljc` lives in
+  a private monorepo (`etzhayyim/root`, not a standalone deps.edn-having
+  package -- it is a babashka/bb.edn project, not a `kbb -M` one), so
+  adding it as a git dependency from this PUBLIC kotoba-lang repo would be
+  both impractical (kbb -M:project layout, no independent SHA-pinnable
+  artifact) and undesirable (a public repo should not depend on a private
+  one). `reference-client` is instead a deliberate, side-by-side-readable
+  reimplementation of that file's `call*`/`query-by-collection`/
+  `query-by-did`/`query-by-field`/`count-by-collection` -- same bodies, same
+  NSIDs, same status classification -- swapping only the transport
+  (`java.net.http.HttpClient`, JDK-native, vs. babashka's
+  `babashka.http-client`) and the error signal (plain `ex-info` vs. this
+  repo's own `etzhayyim-sdk.errors`). Read the two side by side to confirm:
+  compare this namespace's `call*` to `mst_projector.cljc`'s `call*`."
+  (:require [kotoba.lang.error :as kerror] [json.data-json :as json]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.mst-projector.indexer :as indexer]
+            [kotoba.lang.mst-projector.mem-index :as mem-index]
+            [kotoba.lang.mst-projector.query-api :as query-api])
+  (:import (java.net URI)
+           (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers)))
+
+;; ---------------------------------------------------------------------------
+;; Real loopback HTTP fixture
+;; ---------------------------------------------------------------------------
+
+(def ^:dynamic *base-url* nil)
+
+(defn- with-server
+  "Starts a real query-api server backed by `index` (default: a fresh
+  mem-index) on an ephemeral port, binds *base-url*, runs `f`, always stops
+  the server."
+  ([f] (with-server (mem-index/make-mem-index) f))
+  ([index f]
+   (let [server (query-api/start! index {:host "127.0.0.1" :port 0})]
+     (try
+       (binding [*base-url* (str "http://127.0.0.1:" (query-api/port server))]
+         (f index))
+       (finally (query-api/stop! server))))))
+
+;; ---------------------------------------------------------------------------
+;; Raw HTTP helpers (no status-code interpretation -- used to assert the
+;; ACTUAL wire status code, independent of any client-side classification)
+;; ---------------------------------------------------------------------------
+
+(defn- http-client ^HttpClient [] (HttpClient/newHttpClient))
+
+(defn- raw-post [path body-str content-type?]
+  (let [builder (HttpRequest/newBuilder (URI/create (str *base-url* path)))]
+    (when content-type? (.header builder "content-type" "application/json"))
+    (.POST builder (HttpRequest$BodyPublishers/ofString ^String body-str))
+    (let [resp (.send (http-client) (.build builder) (HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp) :body (.body resp)})))
+
+(defn- raw-get [path]
+  (let [req (.build (.GET (HttpRequest/newBuilder (URI/create (str *base-url* path)))))
+        resp (.send (http-client) req (HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp) :body (.body resp)}))
+
+;; ---------------------------------------------------------------------------
+;; reference-client -- see namespace docstring
+;; ---------------------------------------------------------------------------
+
+(defn- post-json [nsid body]
+  (raw-post (str "/xrpc/" nsid) (json/write-str body) true))
+
+(defn- call*
+  [nsid body]
+  (let [{:keys [status body]} (post-json nsid body)]
+    (cond
+      (>= status 500)
+      (throw (ex-info (str nsid " server error") {:type ::server-error :status status :body body}))
+
+      (>= status 400)
+      (throw (ex-info (str nsid " client error")
+                       {:type ::client-error :status status :body (json/read-str body :key-fn keyword)}))
+
+      :else
+      (json/read-str body :key-fn keyword))))
+
+(defn- query-by-collection
+  [collection & {:keys [limit cursor] :or {limit 50}}]
+  (call* "com.etzhayyim.mstProjector.queryByCollection"
+         (cond-> {"collection" collection "limit" limit}
+           (some? cursor) (assoc "cursor" cursor))))
+
+(defn- query-by-did
+  [did & {:keys [collection limit cursor] :or {limit 50}}]
+  (call* "com.etzhayyim.mstProjector.queryByDid"
+         (cond-> {"did" did "limit" limit}
+           (and collection (not= "" collection)) (assoc "collection" collection)
+           (some? cursor) (assoc "cursor" cursor))))
+
+(defn- query-by-field
+  [collection field-name field-value & {:keys [limit] :or {limit 50}}]
+  (call* "com.etzhayyim.mstProjector.queryByField"
+         {"collection" collection "fieldName" field-name "fieldValue" field-value "limit" limit}))
+
+(defn- count-by-collection
+  [collection]
+  (call* "com.etzhayyim.mstProjector.countByCollection" {"collection" collection}))
+
+;; ---------------------------------------------------------------------------
+;; healthz
+;; ---------------------------------------------------------------------------
+
+(deftest healthz-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (let [{:keys [status body]} (raw-get "/healthz")
+            parsed (json/read-str body :key-fn keyword)]
+        (is (= 200 status))
+        (is (true? (:ok parsed)))
+        (is (= "mst-projector" (:service parsed)))
+        (is (= 1 (:indexed_collections parsed)))
+        (is (string? (:data_dir parsed)))))))
+
+(deftest healthz-503-on-backend-failure-test
+  (let [failing (reify indexer/IIndex
+                  (-upsert! [_ _ _] (throw (ex-info "boom" {})))
+                  (-delete! [_ _ _ _] (throw (ex-info "boom" {})))
+                  (-query [_ _ _ _] (throw (ex-info "boom" {})))
+                  (-count-rows [_ _] (throw (ex-info "boom" {})))
+                  (-list-collections [_] (throw (ex-info "boom" {})))
+                  (-describe [_] "failing"))]
+    (with-server failing
+      (fn [_]
+        (let [{:keys [status body]} (raw-get "/healthz")
+              parsed (json/read-str body :key-fn keyword)]
+          (is (= 503 status))
+          (is (false? (:ok parsed))))))))
+
+;; ---------------------------------------------------------------------------
+;; queryByCollection
+;; ---------------------------------------------------------------------------
+
+(deftest query-by-collection-basic-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey2" "cid2" {"text" "b"})
+      (let [resp (query-by-collection "app.bsky.feed.post")]
+        (is (= 2 (count (:records resp))))
+        (is (nil? (:cursor resp)))))))
+
+(deftest query-by-collection-pagination-test
+  (with-server
+    (fn [index]
+      (dotimes [i 5]
+        (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" (str "rkey" i) (str "cid" i) {"n" i}))
+      (testing "first page of 2 has a cursor"
+        (let [resp (query-by-collection "app.bsky.feed.post" :limit 2)]
+          (is (= 2 (count (:records resp))))
+          (is (= "2" (:cursor resp)))))
+      (testing "walking the cursor visits every record exactly once, in order"
+        (loop [cursor nil seen []]
+          (let [resp (query-by-collection "app.bsky.feed.post" :limit 2 :cursor cursor)
+                seen (into seen (map :n (:records resp)))]
+            (if (:cursor resp)
+              (recur (:cursor resp) seen)
+              (is (= [0 1 2 3 4] seen))))))
+      (testing "final page has no cursor"
+        (let [resp (query-by-collection "app.bsky.feed.post" :limit 2 :cursor "4")]
+          (is (= 1 (count (:records resp))))
+          (is (nil? (:cursor resp))))))))
+
+(deftest query-by-collection-validation-errors-test
+  (with-server
+    (fn [_]
+      (testing "missing collection -> 400 InvalidRequest (both via raw HTTP and the reference-client's exception classification)"
+        (is (thrown? kerror/ExceptionInfo (query-by-collection nil)))
+        (let [{:keys [status body]} (post-json "com.etzhayyim.mstProjector.queryByCollection" {})]
+          (is (= 400 status))
+          (is (= "InvalidRequest" (:error (json/read-str body :key-fn keyword))))))
+      (testing "limit out of range -> 400"
+        (let [{:keys [status]} (post-json "com.etzhayyim.mstProjector.queryByCollection"
+                                           {"collection" "app.bsky.feed.post" "limit" 0})]
+          (is (= 400 status)))
+        (let [{:keys [status]} (post-json "com.etzhayyim.mstProjector.queryByCollection"
+                                           {"collection" "app.bsky.feed.post" "limit" 1001})]
+          (is (= 400 status))))
+      (testing "invalid cursor -> 400"
+        (let [{:keys [status]} (post-json "com.etzhayyim.mstProjector.queryByCollection"
+                                           {"collection" "app.bsky.feed.post" "cursor" "not-a-number"})]
+          (is (= 400 status)))
+        (let [{:keys [status]} (post-json "com.etzhayyim.mstProjector.queryByCollection"
+                                           {"collection" "app.bsky.feed.post" "cursor" "-1"})]
+          (is (= 400 status))))
+      (testing "malformed JSON body -> 400 InvalidRequest \"body must be JSON\""
+        (let [{:keys [status body]} (raw-post "/xrpc/com.etzhayyim.mstProjector.queryByCollection" "not json" true)]
+          (is (= 400 status))
+          (is (= "InvalidRequest" (:error (json/read-str body :key-fn keyword)))))))))
+
+;; ---------------------------------------------------------------------------
+;; queryByDid (with collection + the cross-collection slow path)
+;; ---------------------------------------------------------------------------
+
+(deftest query-by-did-with-collection-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:y" "rkey2" "cid2" {"text" "b"})
+      (let [resp (query-by-did "did:plc:x" :collection "app.bsky.feed.post")]
+        (is (= 1 (count (:records resp))))
+        (is (= "did:plc:x" (:did (first (:records resp)))))))))
+
+(deftest query-by-did-cross-collection-slow-path-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/index-op! index "app.bsky.feed.like" "did:plc:x" "rkey2" "cid2" {"subject" "s"})
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:y" "rkey3" "cid3" {"text" "c"})
+      (testing "omitting collection enumerates every indexed collection for the did"
+        (let [resp (query-by-did "did:plc:x")]
+          (is (= 2 (count (:records resp))))
+          (is (every? #(= "did:plc:x" (:did %)) (:records resp))))))))
+
+(deftest query-by-did-missing-did-test
+  (with-server
+    (fn [_]
+      (let [{:keys [status body]} (post-json "com.etzhayyim.mstProjector.queryByDid" {})]
+        (is (= 400 status))
+        (is (= "InvalidRequest" (:error (json/read-str body :key-fn keyword))))))))
+
+;; ---------------------------------------------------------------------------
+;; queryByField (incl. fieldName SQL-injection-defence regex + aliases)
+;; ---------------------------------------------------------------------------
+
+(deftest query-by-field-basic-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "hello"})
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:y" "rkey2" "cid2" {"text" "world"})
+      (let [resp (query-by-field "app.bsky.feed.post" "text" "hello")]
+        (is (= 1 (count (:records resp))))
+        (is (= "hello" (:text (first (:records resp)))))))))
+
+(deftest query-by-field-snake-case-aliases-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "hello"})
+      (testing "field_name/field_value snake_case aliases are accepted"
+        (let [{:keys [status body]} (post-json "com.etzhayyim.mstProjector.queryByField"
+                                                {"collection" "app.bsky.feed.post"
+                                                 "field_name" "text"
+                                                 "field_value" "hello"})
+              parsed (json/read-str body :key-fn keyword)]
+          (is (= 200 status))
+          (is (= 1 (count (:records parsed)))))))))
+
+(deftest query-by-field-invalid-field-name-test
+  (with-server
+    (fn [_]
+      (doseq [bad ["bad name" "1leading-digit" "has;semicolon" "has'quote" "a.b"]]
+        (testing (str "rejects fieldName " (pr-str bad))
+          (let [{:keys [status body]} (post-json "com.etzhayyim.mstProjector.queryByField"
+                                                  {"collection" "app.bsky.feed.post"
+                                                   "fieldName" bad
+                                                   "fieldValue" "x"})]
+            (is (= 400 status))
+            (is (= "InvalidRequest" (:error (json/read-str body :key-fn keyword)))))))
+      (testing "accepts a valid field name with underscores/digits"
+        (let [{:keys [status]} (post-json "com.etzhayyim.mstProjector.queryByField"
+                                           {"collection" "app.bsky.feed.post"
+                                            "fieldName" "_valid_Name123"
+                                            "fieldValue" "x"})]
+          (is (= 200 status)))))))
+
+(deftest query-by-field-missing-params-test
+  (with-server
+    (fn [_]
+      (let [{:keys [status body]} (post-json "com.etzhayyim.mstProjector.queryByField" {"collection" "c"})]
+        (is (= 400 status))
+        (is (= "InvalidRequest" (:error (json/read-str body :key-fn keyword))))))))
+
+;; ---------------------------------------------------------------------------
+;; countByCollection
+;; ---------------------------------------------------------------------------
+
+(deftest count-by-collection-test
+  (with-server
+    (fn [index]
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/index-op! index "app.bsky.feed.post" "did:plc:x" "rkey2" "cid2" {"text" "b"})
+      (let [resp (count-by-collection "app.bsky.feed.post")]
+        (is (= 2 (:count resp)))
+        (is (string? (:asOf resp)))))))
+
+(deftest count-by-collection-unindexed-test
+  (with-server
+    (fn [_]
+      (let [resp (count-by-collection "never.indexed")]
+        (is (= 0 (:count resp)))))))
+
+;; ---------------------------------------------------------------------------
+;; 4xx/5xx status-code correctness (the core wire-compatibility contract:
+;; the client classifies by *status code*, not by body shape alone)
+;; ---------------------------------------------------------------------------
+
+(deftest server-error-5xx-classification-test
+  (let [failing (reify indexer/IIndex
+                  (-upsert! [_ _ _] (throw (ex-info "boom" {})))
+                  (-delete! [_ _ _ _] (throw (ex-info "boom" {})))
+                  (-query [_ _ _ _] (throw (ex-info "boom" {})))
+                  (-count-rows [_ _] (throw (ex-info "boom" {})))
+                  (-list-collections [_] (throw (ex-info "boom" {})))
+                  (-describe [_] "failing"))]
+    (with-server failing
+      (fn [_]
+        (let [ex (try (query-by-collection "any.collection") nil (catch kerror/ExceptionInfo e e))]
+          (is (some? ex))
+          (is (= ::server-error (:type (ex-data ex))))
+          (is (>= (:status (ex-data ex)) 500)))))))
+
+(deftest unknown-route-404-test
+  (with-server
+    (fn [_]
+      (let [{:keys [status]} (raw-get "/no-such-route")]
+        (is (= 404 status))))))
+
+(deftest wrong-method-405-test
+  (with-server
+    (fn [_]
+      (testing "GET on a POST-only xrpc route"
+        (let [{:keys [status]} (raw-get "/xrpc/com.etzhayyim.mstProjector.queryByCollection")]
+          (is (= 405 status))))
+      (testing "POST on the GET-only healthz route"
+        (let [{:keys [status]} (raw-post "/healthz" "{}" true)]
+          (is (= 405 status)))))))

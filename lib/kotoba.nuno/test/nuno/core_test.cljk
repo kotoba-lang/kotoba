@@ -1,0 +1,189 @@
+(ns nuno.core-test
+  "布の主張は ADR-2610082200 P4 の合否条件をそのまま小さくしたもの:
+  **糸の分岐の warrant が全台に届き、その網で作者が拒否される。**
+
+  網は偽物（同じプロセスの中の待ち行列）だが、ノードの判断は本物の
+  `nuno.core` が下す。糸も偽物で、head は entry id のベクタ、分岐は
+  『どちらも他方の接頭辞でない』こと。"
+  (:require [kotoba.test :refer [deftest is testing]]
+            [nuno.core :as nuno]
+            [sha2.core :as sha2]))
+
+(defn- sha256 [b]
+  #?(:clj (byte-array (map unchecked-byte (sha2/sha256 (map #(bit-and % 0xff) b))))
+     :cljs (js/Uint8Array.from (clj->js (sha2/sha256 (array-seq b))))))
+
+;; ------------------------------------------------------------ 偽の紋の規則
+
+(defn- prefix? [a b] (= a (vec (take (count a) b))))
+
+(defn- judge-head
+  "保持中の head と比べる。伸びていれば保持、同じか古ければ無視、どちらも
+  他方の接頭辞でなければ分岐 —— 証拠の 2 つを入れた warrant を作る。"
+  [held o]
+  (let [a (:nuno/payload held) b (:nuno/payload o)]
+    (cond
+      (nil? held) {:verdict :hold}
+      (prefix? a b) (if (= a b) {:verdict :ignore} {:verdict :hold})
+      (prefix? b a) {:verdict :ignore}
+      :else {:verdict :conflict
+             :warrant (nuno/op :warrant (:nuno/basis o)
+                               (str "w:" (:nuno/basis o))
+                               {:a a :b b})})))
+
+(defn- judge-warrant
+  "証拠の 2 つが本当に分岐しているか、自分で確かめる。"
+  [o]
+  (let [{:keys [a b]} (:nuno/payload o)]
+    (if (and a b (not (prefix? a b)) (not (prefix? b a)))
+      {:verdict :valid}
+      {:verdict :invalid})))
+
+;; ------------------------------------------------------------------ 偽の網
+
+(defn- net [ids k]
+  {:nodes (into {} (map (fn [id] [id (nuno/node {:id id :peers ids :k k :sha256 sha256})])) ids)
+   :queue []
+   :delivered 0})
+
+(defn- enqueue [w from out]
+  (update w :queue into (map (fn [[to o]] {:from from :to to :op o}) out)))
+
+(defn- publish [w at o]
+  (let [{:nuno/keys [node out]} (nuno/publish (get-in w [:nodes at]) o)]
+    (-> w (assoc-in [:nodes at] node) (enqueue at out))))
+
+(defn- deliver-one [w {:keys [from to op]}]
+  (let [n (get-in w [:nodes to])
+        i (nuno/inspect n op)
+        v (case (:nuno/action i)
+            :ignore nil
+            :judge-head (judge-head (:nuno/held i) op)
+            :judge-warrant (judge-warrant op))]
+    (if-not v
+      w
+      (let [{:nuno/keys [node out]} (nuno/settle n op from v)]
+        (-> w (assoc-in [:nodes to] node) (enqueue to out))))))
+
+(defn- drain
+  "待ち行列が空になるまで配る。止まらなければ失敗（洪水が収まらない）。"
+  [w]
+  (loop [w w steps 0]
+    (cond
+      (empty? (:queue w)) w
+      (> steps 1000) (throw (ex-info "flood did not settle" {:steps steps}))
+      :else (let [[m & more] (:queue w)]
+              (recur (-> (assoc w :queue (vec more)) (update :delivered inc) (deliver-one m))
+                     (inc steps))))))
+
+(defn- head [basis entries] (nuno/op :head basis (str basis "@" (pr-str entries)) entries))
+
+(def ids ["https://r1.test" "https://r2.test" "https://r3.test"
+          "https://r4.test" "https://r5.test"])
+
+;; ------------------------------------------------------------------ 主張
+
+(deftest everyone-agrees-on-the-authorities
+  (let [w (net ids 3)
+        basis "did:key:z6MkAlice"
+        answers (set (map #(nuno/authorities % basis) (vals (:nodes w))))]
+    (testing "全ノードが同じ 3 台を選ぶ"
+      (is (= 1 (count answers)))
+      (is (= 3 (count (first answers))))
+      (is (every? (set ids) (first answers))))
+    (testing "basis が違えば選ばれる台も変わりうる（全部が同じ 3 台に集まらない）"
+      (is (< 1 (count (set (map #(nuno/authorities (get-in w [:nodes (first ids)]) %)
+                                (map #(str "did:key:z6Mk" %) (range 40))))))))))
+
+(deftest a-fork-shown-to-two-relays-reaches-every-node
+  ;; ADR-2610082200 P4: 不正 action と糸の分岐の warrant が全台に届き拒否される
+  (let [basis "did:key:z6MkAlice"
+        [a b] (remove (set (nuno/authorities (get-in (net ids 3) [:nodes (first ids)]) basis)) ids)
+        w (-> (net ids 3)
+              ;; 同じ糸を、authority でない 2 台に別々の分かれ方で見せる
+              (publish (or a (first ids)) (head basis [1 2]))
+              (publish (or b (second ids)) (head basis [1 3]))
+              drain)]
+    (testing "全ノードが warrant を持つ"
+      (is (every? #(some? (nuno/warrant % basis)) (vals (:nodes w)))))
+    (testing "warrant のある basis の head は、どのノードでも判定に回らない"
+      (is (every? #(= :nuno/warranted
+                      (:nuno/why (nuno/inspect % (head basis [1 2 4]))))
+                  (vals (:nodes w)))))
+    (testing "洪水は収まる —— 1 ノードが同じ warrant を 2 回流さない"
+      (is (<= (:delivered w) (* (count ids) (count ids)))))))
+
+(deftest an-honest-chain-is-held-and-never-warranted
+  (let [basis "did:key:z6MkBob"
+        w (-> (net ids 3)
+              (publish (first ids) (head basis [1]))
+              (publish (second ids) (head basis [1 2]))
+              (publish (nth ids 2) (head basis [1 2 3]))
+              drain)
+        auth (nuno/authorities (get-in w [:nodes (first ids)]) basis)]
+    (testing "authority は最新の head を持つ"
+      (is (every? #(= [1 2 3] (:nuno/payload (nuno/held (get-in w [:nodes %]) basis))) auth)))
+    (testing "誰も warrant を持たない"
+      (is (not-any? #(nuno/warrant % basis) (vals (:nodes w)))))
+    (testing "古い head を後から出しても置き換わらない"
+      (let [w2 (drain (publish w (nth ids 3) (head basis [1])))]
+        (is (every? #(= [1 2 3] (:nuno/payload (nuno/held (get-in w2 [:nodes %]) basis))) auth))
+        (is (not-any? #(nuno/warrant % basis) (vals (:nodes w2))))))))
+
+(deftest a-forged-warrant-is-not-spread
+  ;; 偽の証拠で他人の糸を止めさせない。受け取った全ノードが自分で確かめる。
+  (let [basis "did:key:z6MkCarol"
+        forged (nuno/op :warrant basis "w:forged" {:a [1 2] :b [1 2 3]})
+        w (-> (net ids 3)
+              (enqueue nil [[(first ids) forged]])
+              drain)]
+    (is (not-any? #(nuno/warrant % basis) (vals (:nodes w))))
+    (is (= 1 (:delivered w)) "偽の warrant は最初の 1 台で止まり、流れない")))
+
+(deftest a-node-that-joins-later-learns-of-the-warrant-from-the-next-flood
+  (let [basis "did:key:z6MkDave"
+        three (take 3 ids)
+        w (-> (net three 3)
+              (publish (first three) (head basis [1 2]))
+              (publish (second three) (head basis [1 3]))
+              drain)
+        newcomer (nuno/node {:id "https://r9.test" :peers three :sha256 sha256})
+        ;; 既存ノードが新しいノードを知り、warrant をもう一度流す
+        w2 (-> w
+               (assoc-in [:nodes "https://r9.test"] newcomer)
+               (update :nodes (fn [ns] (into {} (map (fn [[id n]] [id (nuno/add-peer n "https://r9.test")])) ns)))
+               (enqueue (first three) [["https://r9.test" (nuno/warrant (get-in w [:nodes (first three)]) basis)]])
+               drain)]
+    (is (some? (nuno/warrant (get-in w2 [:nodes "https://r9.test"]) basis)))))
+
+(deftest a-warrant-is-passed-on-by-nodes-that-know-more-peers
+  ;; 見つけたノードが網の一部しか知らなくても、受け取ったノードが自分の
+  ;; 知る相手へ流し直すので、warrant は全台に届く。
+  (let [basis "did:key:z6MkErin"
+        edge "https://edge.test"
+        hub "https://hub.test"
+        rest-ids (take 3 ids)
+        w {:nodes (into {edge (nuno/node {:id edge :peers [hub] :k 1 :sha256 sha256})
+                         hub (nuno/node {:id hub :peers (cons edge rest-ids) :sha256 sha256})}
+                        (map (fn [id] [id (nuno/node {:id id :peers (cons hub rest-ids) :sha256 sha256})]))
+                        rest-ids)
+           :queue [] :delivered 0}
+        ;; edge は自分しか知らない網（k=1 で自分か hub が authority）で分岐を見る
+        w (-> w
+              (enqueue nil [[edge (head basis [1 2])]])
+              drain
+              (enqueue nil [[edge (head basis [1 3])]])
+              drain)]
+    (is (some? (nuno/warrant (get-in w [:nodes edge]) basis)) "edge が見つける")
+    (is (every? #(some? (nuno/warrant (get-in w [:nodes %]) basis)) (cons hub rest-ids))
+        "edge の知らないノードにも hub が流し直して届く")))
+
+(deftest the-same-op-is-not-judged-twice
+  ;; 正しさのためではなく費用のため: host の判定は署名の検証を伴い高い。
+  ;; warrant の重複は basis ごとの保持で、head の重複は『同じ』判定で、
+  ;; どちらもこれが無くても止まる。
+  (let [n (nuno/node {:id (first ids) :peers ids :sha256 sha256})
+        o (head "did:key:z6MkFrank" [1])
+        n' (:nuno/node (nuno/settle n o nil {:verdict :hold}))]
+    (is (= :judge-head (:nuno/action (nuno/inspect n o))))
+    (is (= :nuno/seen (:nuno/why (nuno/inspect n' o))))))

@@ -1,0 +1,166 @@
+(ns kotoba.netcap.tls-jvm-test
+  "JVM ORACLE for kotoba.netcap.tls-host: real handshakes on loopback against
+  a JSSE server holding the test PKI (kotoba.netcap.tls-fixtures), each case
+  run through kotoba AND through the raw JSSE path it replaces, both answers
+  pinned. The raw path is what the fleet's call sites did:
+
+    (.createSocket (javax.net.ssl.SSLSocketFactory/getDefault) host port)
+
+  with the same SSLContext where the case needs custom trust. JVM only; kbb
+  runs the node:tls driver through scripts/live_node.cljk."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.netcap.tls :as tls])
+            #?(:clj [kotoba.netcap.tls-host :as host])
+            #?(:clj [kotoba.netcap.tls-fixtures :as fx]))
+  #?(:clj (:import [java.io InputStream OutputStream]
+                   [java.net InetAddress]
+                   [javax.net.ssl SSLContext SSLServerSocket SSLSocket SSLHandshakeException])))
+
+#?(:clj
+   (do
+     (defn- server!
+       "A one-connection-at-a-time echo server on 127.0.0.1 holding `identity`
+       (fixture PEMs); `client-auth?` requires a client certificate issued by
+       the test CA. Returns {:port :close}."
+       [cert key client-auth?]
+       (let [ctx (host/ssl-context (cond-> {:identity {:cert-chain-pem cert :key-pem key}}
+                                     client-auth? (assoc :trust {:anchors-pem fx/ca-pem})))
+             ^SSLServerSocket ss (.createServerSocket (.getServerSocketFactory ^SSLContext ctx) 0 16
+                                                      (InetAddress/getByName "127.0.0.1"))]
+         (when client-auth? (.setNeedClientAuth ss true))
+         (future
+           (loop []
+             (when-not (.isClosed ss)
+               (try
+                 (with-open [^SSLSocket s (.accept ss)]
+                   (.setSoTimeout s 5000)
+                   (let [in (.getInputStream s) out (.getOutputStream s)
+                         b (.read in)]
+                     (when (>= b 0) (.write out (int b)) (.flush out))))
+                 (catch Exception _ nil))
+               (recur))))
+         {:port (.getLocalPort ss) :close #(.close ss)}))
+
+     (defn- echo!
+       "Write one byte on a connected socket and read it back."
+       [^SSLSocket s]
+       (let [^OutputStream out (.getOutputStream s) ^InputStream in (.getInputStream s)]
+         (.write out 42) (.flush out)
+         (.read in)))
+
+     (defn- outcome
+       "Run f; :ok with its value, or [:refused <exception class simple name> <message>]."
+       [f]
+       (try [:ok (f)]
+            (catch Exception e [:refused (.getSimpleName (class e)) (str (.getMessage e))])))
+
+     (defn- raw-default-socket
+       "The replaced call site, verbatim in effect: the default factory of
+       `ctx` (SSLSocketFactory/getDefault when ctx is nil), createSocket
+       host port, no endpoint identification."
+       [^SSLContext ctx host port]
+       (let [f (if ctx (.getSocketFactory ctx) (javax.net.ssl.SSLSocketFactory/getDefault))
+             ^SSLSocket s (.createSocket ^javax.net.ssl.SSLSocketFactory f ^String host (int port))]
+         (.setSoTimeout s 5000)
+         s))
+
+     (defn- anchors-ctx [] (host/ssl-context {:trust {:anchors-pem fx/ca-pem}}))))
+
+(deftest trusted-name-matches-both-accept
+  #?(:clj
+     (let [{:keys [port close]} (server! fx/server-pem fx/server-key-pem false)]
+       (try
+         (let [k (outcome #(with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                         :trust {:anchors-pem fx/ca-pem}})]
+                             [(echo! s) (:peer-spki-sha256 (host/session-info s))]))
+               r (outcome #(with-open [s (raw-default-socket (anchors-ctx) "localhost" port)] [(echo! s)]))]
+           (is (= [:ok [42 fx/server-spki-sha256]] k))
+           (is (= [:ok [42]] r)))
+         (finally (close))))))
+
+(deftest name-mismatch-kotoba-refuses-raw-accepts
+  ;; THE behaviour change the codemod names: the certificate says localhost,
+  ;; the socket was opened to 127.0.0.1. Raw JSSE (no endpoint
+  ;; identification on a bare socket) talks to it; kotoba refuses.
+  #?(:clj
+     (let [{:keys [port close]} (server! fx/server-pem fx/server-key-pem false)]
+       (try
+         (let [k (outcome #(with-open [s (host/connect {:host "127.0.0.1" :port port :timeout-ms 5000
+                                                         :trust {:anchors-pem fx/ca-pem}})]
+                             (echo! s)))
+               r (outcome #(with-open [s (raw-default-socket (anchors-ctx) "127.0.0.1" port)] (echo! s)))]
+           (is (= :refused (first k)))
+           (is (= "SSLHandshakeException" (second k)))
+           (is (re-find #"No subject alternative names matching IP address 127\.0\.0\.1" (nth k 2)))
+           (is (= [:ok 42] r) "the raw default socket does not check the name"))
+         (finally (close))))))
+
+(deftest untrusted-issuer-both-refuse
+  #?(:clj
+     (let [{:keys [port close]} (server! fx/other-pem fx/other-key-pem false)]
+       (try
+         (let [k (outcome #(with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                         :trust {:anchors-pem fx/ca-pem}})]
+                             (echo! s)))
+               r (outcome #(with-open [s (raw-default-socket (anchors-ctx) "localhost" port)] (echo! s)))
+               sys (outcome #(with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000})] (echo! s)))
+               sys-raw (outcome #(with-open [s (raw-default-socket nil "localhost" port)] (echo! s)))]
+           (is (= [:refused "SSLHandshakeException"] (take 2 k)))
+           (is (re-find #"PKIX path building failed" (nth k 2)))
+           (is (= [:refused "SSLHandshakeException"] (take 2 r)))
+           (is (= [:refused "SSLHandshakeException"] (take 2 sys)) ":system trust does not know the test issuer")
+           (is (= [:refused "SSLHandshakeException"] (take 2 sys-raw))))
+         (finally (close))))))
+
+(deftest spki-pin-is-the-identity
+  #?(:clj
+     (let [{:keys [port close]} (server! fx/other-pem fx/other-key-pem false)]
+       (try
+         (testing "the right pin: no chain, no name -- even to an address"
+           (is (= [:ok 42] (outcome #(with-open [s (host/connect {:host "127.0.0.1" :port port :timeout-ms 5000
+                                                                   :trust {:pin-spki-sha256 #{fx/other-spki-sha256}}})]
+                                        (echo! s))))))
+         (testing "the wrong pin refuses, and says which key it saw"
+           (let [k (outcome #(with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                           :trust {:pin-spki-sha256 #{fx/server-spki-sha256}}})]
+                               (echo! s)))]
+             (is (= [:refused "SSLHandshakeException"] (take 2 k)))
+             (is (re-find (re-pattern (str "spki-pin-mismatch: " fx/other-spki-sha256)) (nth k 2)))))
+         (finally (close))))))
+
+(deftest mutual-tls-identity
+  #?(:clj
+     (let [{:keys [port close]} (server! fx/server-pem fx/server-key-pem true)]
+       (try
+         (is (= [:ok 42] (outcome #(with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                                 :trust {:anchors-pem fx/ca-pem}
+                                                                 :identity {:cert-chain-pem fx/client-pem
+                                                                            :key-pem fx/client-key-pem}})]
+                                      (echo! s)))))
+         (testing "without the client certificate the server ends it"
+           (let [k (outcome #(with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                           :trust {:anchors-pem fx/ca-pem}})]
+                               (echo! s)))]
+             ;; TLS 1.3: the client's handshake completes before the server's
+             ;; certificate_required alert arrives, so the failure surfaces on
+             ;; the first read -- as it does on the raw path.
+             (is (= :refused (first k)))
+             (is (re-find #"(?i)certificate" (nth k 2)))))
+         (finally (close))))))
+
+(deftest protocols-are-applied
+  #?(:clj
+     (let [{:keys [port close]} (server! fx/server-pem fx/server-key-pem false)]
+       (try
+         (is (= "TLSv1.2" (with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                        :trust {:anchors-pem fx/ca-pem} :protocols #{"TLSv1.2"}})]
+                            (:protocol (host/session-info s)))))
+         (is (= "TLSv1.3" (with-open [s (host/connect {:host "localhost" :port port :timeout-ms 5000
+                                                        :trust {:anchors-pem fx/ca-pem}})]
+                            (:protocol (host/session-info s)))))
+         (finally (close))))))
+
+(deftest connect-timeout-and-refused-port-are-host-exceptions
+  #?(:clj
+     (let [k (outcome #(host/connect {:host "127.0.0.1" :port 1 :timeout-ms 2000 :server-name "localhost"}))]
+       (is (= [:refused "ConnectException"] (take 2 k)) "the JDK's own exception, not ex-info"))))

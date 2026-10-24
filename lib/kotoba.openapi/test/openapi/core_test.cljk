@@ -1,0 +1,198 @@
+(ns openapi.core-test
+  (:require [kotoba.test :refer [deftest is testing run-tests]]
+            [openapi.model   :as m]
+            [openapi.validate :as v]
+            [openapi.json    :as j]
+            [openapi.ports   :as p]
+            [openapi.execute :as e]))
+
+;; ---------------------------------------------------------------------------
+;; Fixtures
+;; ---------------------------------------------------------------------------
+
+(def sample-data
+  "A small but complete OpenAPI 3 spec with string keys (as returned by a JSON parser)."
+  {"openapi" "3.0.0"
+   "info"    {"title" "Pets" "version" "1.0"}
+   "paths"   {"/pets/{id}" {"get" {"operationId" "getPet"
+                                    "parameters"   [{"name" "id"      "in" "path"  "required" true "schema" {"type" "string"}}
+                                                    {"name" "verbose" "in" "query"             "schema" {"type" "boolean"}}]
+                                    "responses"    {"200" {"description" "ok"}}}}}
+   "components" {}})
+
+(def sample-model (j/from-data sample-data))
+
+;; ---------------------------------------------------------------------------
+;; 1. from-data: string-keyed map → EDN model
+;; ---------------------------------------------------------------------------
+
+(deftest test-from-data
+  (testing "from-data extracts :openapi/info fields"
+    (is (= "Pets" (get-in sample-model [:openapi/info :openapi/title])))
+    (is (= "1.0"  (get-in sample-model [:openapi/info :openapi/version]))))
+  (testing "from-data maps method string to keyword"
+    (is (contains? (get-in sample-model [:openapi/paths "/pets/{id}"]) :get)))
+  (testing "from-data converts parameter :in to keyword"
+    (let [params (get-in sample-model [:openapi/paths "/pets/{id}" :get :openapi/parameters])]
+      (is (= :path  (:openapi/in (first params))))
+      (is (= :query (:openapi/in (second params)))))))
+
+;; ---------------------------------------------------------------------------
+;; 2. operations + operation-by-id
+;; ---------------------------------------------------------------------------
+
+(deftest test-operations
+  (testing "operations returns every path × method combination"
+    (is (= 1 (count (m/operations sample-model)))))
+  (testing "each entry has :path :method :op"
+    (let [{:keys [path method op]} (first (m/operations sample-model))]
+      (is (= "/pets/{id}" path))
+      (is (= :get method))
+      (is (map? op))))
+  (testing "operation-by-id finds by :openapi/operation-id"
+    (is (= "getPet"
+           (get-in (m/operation-by-id sample-model "getPet") [:op :openapi/operation-id]))))
+  (testing "operation-by-id returns nil for unknown id"
+    (is (nil? (m/operation-by-id sample-model "nope")))))
+
+;; ---------------------------------------------------------------------------
+;; 3. request-for: path substitution + query params
+;; ---------------------------------------------------------------------------
+
+(deftest test-request-for-path
+  (testing "request-for substitutes path param"
+    (let [req (e/request-for sample-model "getPet" {"id" "123"})]
+      (is (= "/pets/123" (:url req)))
+      (is (= :get (:method req)))))
+  (testing "request-for includes query param when supplied"
+    (let [req (e/request-for sample-model "getPet" {"id" "42" "verbose" true})]
+      (is (= "/pets/42" (:url req)))
+      (is (= {"verbose" true} (:query req)))))
+  (testing "request-for omits :query when no query params supplied"
+    (let [req (e/request-for sample-model "getPet" {"id" "0"})]
+      (is (not (contains? req :query))))))
+
+;; ---------------------------------------------------------------------------
+;; 4. Missing required param → error data (no throw)
+;; ---------------------------------------------------------------------------
+
+(deftest test-missing-required-param
+  (testing "missing required path param returns error map"
+    (let [result (e/request-for sample-model "getPet" {})]
+      (is (= :missing-required-params (:openapi/error result)))
+      (is (contains? (set (:openapi/missing result)) "id"))))
+  (testing "unknown operationId returns operation-not-found error"
+    (let [result (e/request-for sample-model "noSuchOp" {})]
+      (is (= :operation-not-found (:openapi/error result))))))
+
+;; ---------------------------------------------------------------------------
+;; 5. Duplicate operationId → validate :error
+;; ---------------------------------------------------------------------------
+
+(deftest test-duplicate-operation-id
+  (testing "duplicate operationId produces :op/duplicate-id error"
+    (let [dup {:openapi/paths
+               {"/a" {:get  {:openapi/operation-id "op1"
+                              :openapi/parameters   []
+                              :openapi/responses    {"200" {:openapi/description "ok"}}}}
+                "/b" {:post {:openapi/operation-id "op1"
+                              :openapi/parameters   []
+                              :openapi/responses    {"201" {:openapi/description "created"}}}}}}]
+      (is (not (v/valid? dup)))
+      (is (some #(= :op/duplicate-id (:openapi/code %)) (v/problems dup))))))
+
+;; ---------------------------------------------------------------------------
+;; 6. Undeclared path param → validate :error
+;; ---------------------------------------------------------------------------
+
+(deftest test-undeclared-path-param
+  (testing "path template param not declared as in:path parameter produces :error"
+    (let [bad {:openapi/paths
+               {"/things/{thingId}" {:get {:openapi/operation-id "getThing"
+                                            :openapi/parameters   []
+                                            :openapi/responses    {"200" {:openapi/description "ok"}}}}}}]
+      (is (not (v/valid? bad)))
+      (is (some #(= :param/undeclared-path-param (:openapi/code %)) (v/problems bad))))))
+
+;; ---------------------------------------------------------------------------
+;; 7. to-data round-trip
+;; ---------------------------------------------------------------------------
+
+(deftest test-round-trip
+  (testing "to-data → from-data is identity on modelled fields"
+    (let [rt (j/from-data (j/to-data sample-model))]
+      (is (= (get-in sample-model [:openapi/info :openapi/title])
+             (get-in rt [:openapi/info :openapi/title])))
+      (is (= (get-in sample-model [:openapi/paths "/pets/{id}" :get :openapi/operation-id])
+             (get-in rt [:openapi/paths "/pets/{id}" :get :openapi/operation-id])))))
+  (testing "to-data converts keyword method back to string"
+    (let [data (j/to-data sample-model)]
+      (is (contains? (get-in data ["paths" "/pets/{id}"]) "get"))
+      (is (= "getPet" (get-in data ["paths" "/pets/{id}" "get" "operationId"]))))))
+
+;; ---------------------------------------------------------------------------
+;; 8. invoke via fixture IHttp (default-ports)
+;; ---------------------------------------------------------------------------
+
+(deftest test-invoke
+  (testing "invoke via default-ports echoes the request"
+    (let [result (e/invoke p/default-ports sample-model "getPet" {"id" "7"})]
+      (is (= 0 (:status result)))
+      (is (= "/pets/7" (get-in result [:echo :url])))))
+  (testing "invoke passes method through"
+    (let [result (e/invoke p/default-ports sample-model "getPet" {"id" "1"})]
+      (is (= :get (get-in result [:echo :method]))))))
+
+;; ---------------------------------------------------------------------------
+;; 9. valid? — true for valid spec, false for invalid
+;; ---------------------------------------------------------------------------
+
+(deftest test-valid?
+  (testing "valid? true for a well-formed spec"
+    (is (v/valid? sample-model)))
+  (testing "valid? false for spec with no responses"
+    (let [bad {:openapi/paths {"/x" {:get {:openapi/operation-id "x"
+                                            :openapi/parameters   []
+                                            :openapi/responses    {}}}}}]
+      (is (not (v/valid? bad))))))
+
+;; ---------------------------------------------------------------------------
+;; 10. path-params parsing
+;; ---------------------------------------------------------------------------
+
+(deftest test-path-params
+  (testing "path-params extracts param names in order"
+    (is (= ["x" "y"] (m/path-params "/a/{x}/{y}"))))
+  (testing "path-params returns [] for paths with no templates"
+    (is (= [] (m/path-params "/no/params"))))
+  (testing "path-params handles single param"
+    (is (= ["id"] (m/path-params "/pets/{id}")))))
+
+;; ---------------------------------------------------------------------------
+;; 11. parameters-for
+;; ---------------------------------------------------------------------------
+
+(deftest test-parameters-for
+  (testing "parameters-for returns the parameter vector"
+    (let [op (get-in sample-model [:openapi/paths "/pets/{id}" :get])]
+      (is (= 2 (count (m/parameters-for op))))
+      (is (= "id" (:openapi/name (first (m/parameters-for op)))))))
+  (testing "parameters-for defaults to [] for an op with no :openapi/parameters key"
+    (is (= [] (m/parameters-for {:openapi/operation-id "bare"})))))
+
+;; ---------------------------------------------------------------------------
+;; 12. Operation with no responses → validate :error
+;; ---------------------------------------------------------------------------
+
+(deftest test-no-responses
+  (testing "operation with empty :openapi/responses map produces :op/no-responses error"
+    (let [bad {:openapi/paths {"/foo" {:get {:openapi/operation-id "getFoo"
+                                              :openapi/parameters   []
+                                              :openapi/responses    {}}}}}]
+      (is (not (v/valid? bad)))
+      (is (some #(= :op/no-responses (:openapi/code %)) (v/problems bad)))))
+  (testing "operation with nil :openapi/responses also produces :op/no-responses error"
+    (let [bad {:openapi/paths {"/bar" {:post {:openapi/operation-id "createBar"
+                                               :openapi/parameters   []}}}}]
+      (is (not (v/valid? bad)))
+      (is (some #(= :op/no-responses (:openapi/code %)) (v/problems bad))))))

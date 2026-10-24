@@ -1,0 +1,315 @@
+(ns wasm-conformance
+  "The same semantic checks as `conformance.cljs`, run against the COMPILED
+  module on `amu/runtime/browser-host.mjs` instead of the reference
+  interpreter.
+
+  Two things had to exist for this to be possible at all.
+
+  A call cannot arrive from outside. `browser-host.mjs` admits a compound
+  argument only if the host itself minted it, and the constructors it hands
+  out are vector-i64, vector-f64, string-index, disjoint-set-i64, document and
+  bytes -- no record, no variant. So the kernel carries `call-*` entries that
+  take scalars and assemble the call value in the guest. Admission is still
+  reached in one place; only the door is new.
+
+  A result CAN be returned: that direction goes through `admitHostResult`,
+  which mints from plain frozen arrays. So the dataspace here is real --
+  `provider.dataspace`, the same one the interpreter run uses -- with a bridge
+  either side of it. The bridge is structural and small because the host's
+  document form IS the KIR document form; the only difference is that a
+  keyword is the string \":is-a\" on one side and the keyword :is-a on the
+  other.
+
+  ONE CALL, ONE INSTANCE. A module's fuel is spent over the instance's life,
+  not per call, so a run that reuses an instance traps `unreachable` partway
+  through -- measured here after four checks. The dataspace outlives the
+  instances because the provider is the host's, not the guest's, which is the
+  same shape `amu/runtime/dom-driver.mjs` uses for the same reason."
+  (:require [provider.dataspace :as ds]
+            ["node:fs" :as fs]))
+
+(def env (.-env js/process))
+
+;; -- documents ------------------------------------------------------------
+
+(defn- host->kir-doc [node]
+  (let [tag (aget node 0) payload (aget node 1)]
+    (case tag
+      ("vector" "list" "set") [tag (mapv host->kir-doc payload)]
+      "map" [tag (mapv (fn [e] [(host->kir-doc (aget e 0)) (host->kir-doc (aget e 1))])
+                       payload)]
+      "keyword" [tag (keyword (subs payload 1))]
+      "symbol" [tag (symbol payload)]
+      "null" [tag]
+      [tag payload])))
+
+(defn- kir->host-doc [node]
+  (let [tag (first node) payload (second node)]
+    (case tag
+      ("vector" "list" "set") #js [tag (clj->js (mapv kir->host-doc payload))]
+      "map" #js [tag (clj->js (mapv (fn [[k v]] #js [(kir->host-doc k) (kir->host-doc v)])
+                                    payload))]
+      "keyword" #js [tag (str payload)]
+      "symbol" #js [tag (str payload)]
+      "null" #js [tag]
+      #js [tag payload])))
+
+;; -- the capability bridge -------------------------------------------------
+
+(defn- member-descriptor [descriptor tag]
+  (second (first (filter #(= tag (aget % 0)) (aget descriptor 2)))))
+
+(defn- host->kir-request
+  "Rebuilt case by case rather than walked generically: the kit has five of
+  them, and naming each one keeps a shape change loud."
+  [request]
+  (let [tag (aget request 1) payload (aget request 2)]
+    (case tag
+      ":assert"  [ds/request-type :assert
+                  [ds/assert-type (host->kir-doc (aget payload 1)) (aget payload 2)]]
+      ":retract" [ds/request-type :retract
+                  [ds/retract-type (host->kir-doc (aget payload 1)) (aget payload 2)]]
+      ":observe" [ds/request-type :observe
+                  [ds/observe-type (host->kir-doc (aget payload 1)) (aget payload 2)]]
+      ":facet-enter" [ds/request-type :facet-enter payload]
+      ":facet-leave" [ds/request-type :facet-leave payload])))
+
+(defn- kir->host-result [descriptor result]
+  (let [tag (str (second result))
+        payload (nth result 2)
+        member (member-descriptor descriptor tag)]
+    (js/Object.freeze
+     #js [descriptor tag
+          (js/Object.freeze
+           (case tag
+             ":asserted"  #js [member (nth payload 1) (kir->host-doc (nth payload 2))]
+             ":retracted" #js [member (nth payload 1)]
+             ":matches"   #js [member (kir->host-doc (nth payload 1))
+                               (kir->host-doc (nth payload 2))]
+             ":facet"     #js [member (nth payload 1)]
+             ":error"     #js [member (str (nth payload 1)) (nth payload 2)]))])))
+
+;; -- the run ---------------------------------------------------------------
+
+(def failures (atom 0))
+
+(defn- check [label ok? detail]
+  (if ok?
+    (println "PASS" label)
+    (do (println "FAIL" label (pr-str detail)) (swap! failures inc))))
+
+(defn- outcome
+  "`[:ok value evidence]` or `[:rejected code detail]` from a host-returned
+  outcome variant, which external JavaScript may READ even though it may not
+  construct one."
+  [v]
+  (let [payload (aget v 2)]
+    (if (= ":ok" (aget v 1))
+      [:ok (aget payload 1) (aget payload 2)]
+      [:rejected (keyword (subs (aget payload 1) 1)) (aget payload 2)])))
+
+(defn- doc-items [d] (vec (aget d 1)))
+(defn- doc-i64 [d] (str (aget d 1)))
+
+(defn- world
+  "One dataspace, and a way to spend one fresh instance against it."
+  [host wasm]
+  (let [provider (ds/provider)]
+    (fn [f & args]
+      (-> ((.-instantiateKotoba host) wasm
+           #js {:allowCapabilities #js [24]
+                :typedCapCall
+                (fn [_id request contract]
+                  (kir->host-result (.-result contract)
+                                    ((:invoke provider) (host->kir-request request))))})
+          (.then (fn [i]
+                   (let [ex (.-exports (.-instance i))]
+                     (if (contains? #{"schema-digest" "app-ontology-digest"} f)
+                       ((aget ex f))
+                       (outcome (apply (aget ex f) args))))))))))
+
+(defn- steps
+  "Run FS, a vector of one-argument functions of the accumulated results,
+  sequentially -- each spends its own instance."
+  [call fns]
+  (reduce (fn [p f] (.then p (fn [acc] (.then (f acc) #(conj acc %)))))
+          (js/Promise.resolve []) fns))
+
+(defn- admission-run [call]
+  (steps call
+         [(fn [_] (call "call-declare" "t-1" ":tender"))
+          (fn [_] (call "call-declare" "x-1" ":spaceship"))
+          (fn [_] (call "call-declare" "s-9" ":supplier"))
+          (fn [_] (call "call-declare" "a-4" ":agency"))
+          (fn [_] (call "call-relate" "t-1" ":awarded-to" "s-9"))
+          (fn [_] (call "call-relate" "s-9" ":awarded-to" "t-1"))
+          (fn [_] (call "call-relate" "t-1" ":awarded-to" "a-4"))
+          (fn [_] (call "call-relate" "t-1" ":sponsors" "s-9"))
+          (fn [_] (call "call-relate" "t-1" ":awarded-to" "ghost"))
+          (fn [_] (call "call-related" "t-1" ":awarded-to"))
+          (fn [_] (call "call-census" ":tender"))
+          (fn [_] (call "schema-digest"))]))
+
+(defn- report-admission [r]
+  (let [[good bad _ _ ok dom rng unk untyped related census digest] r]
+    (check "an entity of a declared type is admitted" (= :ok (first good)) good)
+    (check "an entity of an undeclared type is refused"
+           (= :oak/unknown-entity-type (second bad)) bad)
+    (check "a fact matching domain and range is admitted" (= :ok (first ok)) ok)
+    (check "a subject of the wrong type is a domain violation"
+           (= :oak/domain-violation (second dom)) dom)
+    (check "an object of the wrong type is a range violation"
+           (= :oak/range-violation (second rng)) rng)
+    (check "a relation absent from S is refused by name"
+           (= :oak/unknown-relation (second unk)) unk)
+    (check "an endpoint the graph has no type for is refused as untyped"
+           (= :oak/untyped-object (second untyped)) untyped)
+    (check "a read returns exactly the objects the admitted facts named"
+           (= [["string" "s-9"]] (mapv vec (doc-items (second related))))
+           (mapv vec (doc-items (second related))))
+    (check "a count is over the type the caller named, not over everything"
+           (= "1" (doc-i64 (second census))) census)
+    (check "every result carries the digest of the schema that admitted it"
+           (= digest (aget (first (doc-items (nth census 2))) 1))
+           {:digest digest :evidence (mapv vec (doc-items (nth census 2)))})))
+
+(defn- tagged-vector-items [d]
+  (when (= "vector" (first d)) (second d)))
+
+(defn- tagged-row [manifest head]
+  (first
+   (filter (fn [row]
+             (let [items (tagged-vector-items row)]
+               (= ["keyword" head] (first items))))
+           (tagged-vector-items manifest))))
+
+(defn- synthesis-run [call]
+  (steps call
+         [(fn [_] (println "PROBE compile-tender-app")
+            (call "compile-tender-app"))
+          (fn [_] (println "PROBE confidence below boundary")
+            (call "compile-tender-app-at" (js/BigInt 7999)))
+          (fn [_] (println "PROBE confidence at boundary")
+            (call "compile-tender-app-at" (js/BigInt 8000)))
+          (fn [_] (println "PROBE confidence above valid range")
+            (call "compile-tender-app-at" (js/BigInt 10001)))
+          (fn [_] (println "PROBE ontology effect floor below boundary")
+            (call "compile-tender-app-effect-at" (js/BigInt 5999)))
+          (fn [_] (println "PROBE ontology effect floor at boundary")
+            (call "compile-tender-app-effect-at" (js/BigInt 6000)))
+          (fn [_] (println "PROBE unknown ontology event")
+            (call "run-tender-app-event" ":event/delete" "t-unknown" ":open"))
+          (fn [_] (println "PROBE invalid SHACL enum")
+            (call "run-tender-app" "t-invalid" ":unknown"))
+          (fn [_] (println "PROBE census after invalid input")
+            (call "call-census" ":tender"))
+          (fn [_] (println "PROBE run-tender-app")
+            (call "run-tender-app" "t-generated" ":open"))
+          (fn [_] (println "PROBE generated census")
+            (call "call-census" ":tender"))
+          (fn [_] (println "PROBE app ontology digest")
+            (call "app-ontology-digest"))]))
+
+(defn- report-synthesis [r]
+  (let [[compiled below at-boundary above effect-below effect-boundary
+         unknown invalid before executed census ontology-digest] r
+        manifest-host (second compiled)
+        manifest (host->kir-doc manifest-host)
+        ontology-row (tagged-row manifest :app/ontology)
+        implementation-row (tagged-row manifest :app/implementation)
+        ontology-in-manifest (second (second (tagged-vector-items ontology-row)))
+        implementation-binding (second (nth (tagged-vector-items implementation-row) 3))]
+    (check "ontology-only decisions compile to an eleven-row typed app manifest"
+           (and (= :ok (first compiled))
+                (= 11 (count (tagged-vector-items manifest))))
+           manifest)
+    (let [transaction-row (tagged-row manifest :app/transaction)
+          execution-row (tagged-row manifest :app/execution)
+          transaction (nth (tagged-vector-items transaction-row) 2)
+          execution (nth (tagged-vector-items execution-row) 2)]
+      (check "the manifest carries the typed Jev ontology transaction"
+             (= ["keyword" :oak.transaction/v1]
+                (first (tagged-vector-items transaction)))
+             transaction)
+      (check "the compiler emits all six canonical Execution IR planes"
+             (= #{:execution/version :execution/state :execution/transaction
+                  :execution/capability :execution/causal-link
+                  :execution/effect :execution/implementation}
+                (set (map (fn [row]
+                            (second (first (tagged-vector-items row))))
+                          (tagged-vector-items execution))))
+             execution))
+    (check "the manifest pins the ontology digest used by the compiler"
+           (= ontology-digest ontology-in-manifest)
+           {:ontology ontology-digest :manifest ontology-in-manifest})
+    (check "the manifest pins the implementation definition CID"
+           (= "bafyreiggpt55m7ke7qy7f2fxscdo4zq3pnq7gbssvrlqcwp6ofngp66xka"
+              implementation-binding)
+           implementation-binding)
+    (check "a Jev choice below the 0.80 confidence boundary is refused by name"
+           (= [:rejected :oak/incomplete-app-decision]
+              (subvec below 0 2))
+           below)
+    (check "the exact 0.80 confidence boundary is admitted"
+           (= :ok (first at-boundary))
+           at-boundary)
+    (check "confidence above 1.00 is refused"
+           (= [:rejected :oak/incomplete-app-decision]
+              (subvec above 0 2))
+           above)
+    (check "a trained choice below the ontology's 0.60 effect floor is refused"
+           (= [:rejected :oak/incomplete-app-decision]
+              (subvec effect-below 0 2))
+           effect-below)
+    (check "the ontology's exact 0.60 effect floor is admitted"
+           (= :ok (first effect-boundary))
+           effect-boundary)
+    (check "an event without ontology dispatch semantics is refused by name"
+           (= [:rejected :oak/unknown-app-event]
+              (subvec unknown 0 2))
+           unknown)
+    (check "the selected SHACL enum rejects an unknown status by name"
+           (= [:rejected :oak/shape-violation]
+              (subvec invalid 0 2))
+           invalid)
+    (check "a SHACL-refused input produces no dataspace write"
+           (= "0" (doc-i64 (second before)))
+           before)
+    (check "the generated app executes ontology dispatch through the capability"
+           (= :ok (first executed))
+           executed)
+    (check "the executed app changed the graph, not just the compiler output"
+           (= "1" (doc-i64 (second census)))
+           census)))
+
+(defn- refusal-leaves-nothing [call]
+  (-> (steps call
+             [(fn [_] (call "call-declare" "t-1" ":tender"))
+              (fn [_] (call "call-declare" "a-4" ":agency"))
+              (fn [_] (call "call-relate" "t-1" ":awarded-to" "a-4"))
+              (fn [_] (call "call-related" "t-1" ":awarded-to"))])
+      (.then (fn [r]
+               (let [after (nth r 3)]
+                 (check "a refused call writes nothing the graph will answer with"
+                        (and (= :ok (first after)) (empty? (doc-items (second after))))
+                        after))))))
+
+(-> (js/import (aget env "OAK_BROWSER_HOST"))
+    (.then
+     (fn [host]
+       (let [wasm (.readFileSync fs (aget env "OAK_WASM"))]
+         (-> (admission-run (world host wasm))
+             (.then report-admission)
+             (.then (fn [_] (refusal-leaves-nothing (world host wasm))))
+             (.then (fn [_] (synthesis-run (world host wasm))))
+             (.then report-synthesis)
+             (.then (fn [_]
+                      (println (str "\noak on wasm: "
+                                    (if (zero? @failures) "all checks passed"
+                                        (str @failures " failed"))))
+                      (set! (.-exitCode js/process) (if (zero? @failures) 0 1))))
+             (.catch (fn [e]
+                       (println "FAIL the run did not complete:" (.-message e))
+                       (set! (.-exitCode js/process) 1)))))))
+    (.catch (fn [e] (println "FAIL could not load the browser host" (.-message e))
+              (set! (.-exitCode js/process) 1))))
