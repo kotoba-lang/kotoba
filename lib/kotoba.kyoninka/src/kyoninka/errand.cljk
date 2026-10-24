@@ -1,0 +1,126 @@
+(ns kyoninka.errand
+  "errand(お使い) — human gate step の『agent が準備し、人間が外界に触れ、
+  その証拠で台帳が進む』を定型化する。ADR-2607141654。
+
+  step data の :step/errand = {:kind ... :draft-via ... :evidence-schema ...}。
+  この ns はその状態機械と evidence 検証の純関数のみ(起案・チャット・I/O は
+  orchestrator = cloud-itonami license-loop の責務)。
+
+  品質の要: チャット返信のパース結果を無検証で信じない。evidence-schema に
+  不合格なら :ask-back(不足フィールドの聞き返し文)を返し、step は進まない。"
+  (:require [kotoba.lang.text :as str]))
+
+(def kinds
+  "初期 4 種(ADR-2607141654 の表)。:draft-via は既存 control plane への委譲先。"
+  #{:consult-professional :book-course :collect-documents :verify-authority-info})
+
+;; --- 状態機械 -------------------------------------------------------------------
+
+(def statuses [:proposed :sent :awaiting-evidence :evidence-received :validated :done :stale :declined])
+
+(def transitions
+  ";; :sent 以降(人間へ実際に届ける・人間の返信を記録する)は human gate。"
+  {:proposed          {:sent :human :declined :human}
+   :sent              {:awaiting-evidence :auto :declined :human}
+   :awaiting-evidence {:evidence-received :human :stale :auto :declined :human}
+   :stale             {:awaiting-evidence :auto :declined :human}
+   :evidence-received {:validated :auto      ; 検証は純関数(通れば auto)
+                       :awaiting-evidence :auto} ; 不合格 → 聞き返しへ戻る
+   :validated         {:done :auto}})
+
+(defn transition-kind [from to] (get-in transitions [from to]))
+
+(defn advance
+  [errand {:keys [to human-approved]}]
+  (let [from (:errand/status errand)
+        kind (transition-kind from to)]
+    (cond
+      (nil? kind) {:ok? false :reason (str "invalid transition " from " -> " to)}
+      (and (= kind :human) (not human-approved))
+      {:ok? false :reason (str "transition " from " -> " to " requires human approval")}
+      :else {:ok? true :errand (assoc errand :errand/status to)})))
+
+(defn stale?
+  "awaiting-evidence のまま threshold-days を超えたか。日付は ISO8601 の日付部で比較
+  (純関数を保つため now は呼び出し側が渡す)。"
+  [{:errand/keys [status sent-at]} now-iso threshold-days]
+  (and (= status :awaiting-evidence)
+       (string? sent-at)
+       (let [d (fn [s] (let [[y m dd] (map #?(:cljs js/parseInt :clj #(Long/parseLong %))
+                                           (str/split (subs s 0 10) #"-"))]
+                         (+ (* y 365) (* m 30) dd)))] ; 停滞検知用の粗い日数換算で十分
+         (>= (- (d now-iso) (d sent-at)) threshold-days))))
+
+;; --- evidence 検証 ---------------------------------------------------------------
+
+(defn- valid-type? [type v]
+  (case type
+    :string   (and (string? v) (not (str/blank? v)))
+    :keyword  (keyword? v)
+    :int      (int? v)
+    :iso-date (and (string? v) (some? (re-matches #"\d{4}-\d{2}-\d{2}" v)))
+    :map      (and (map? v) (seq v))
+    false))
+
+(defn validate-evidence
+  "evidence(パース済み map)を :step/errand の :evidence-schema に照合。
+  opts の :procedure があれば kind 固有の意味検証も行う:
+  - :consult-professional → :resolutions のキーが procedure の open な
+    legal-question id の部分集合であること
+  - :collect-documents → :doc が procedure の document id であること
+  返り値 {:ok? bool :missing [field...] :invalid [field...] :notes [...]}"
+  ([errand-def evidence] (validate-evidence errand-def evidence {}))
+  ([{:keys [kind evidence-schema]} evidence {:keys [procedure]}]
+   (let [missing (vec (for [[f _] evidence-schema
+                            :when (not (contains? evidence f))] f))
+         invalid (vec (for [[f t] evidence-schema
+                            :let [v (get evidence f)]
+                            :when (and (contains? evidence f) (not (valid-type? t v)))] f))
+         notes
+         (cond-> []
+           (and procedure (= kind :consult-professional) (map? (:resolutions evidence)))
+           (into (let [known (set (map :question/id (:procedure/legal-questions procedure)))]
+                   (for [q (keys (:resolutions evidence))
+                         :when (not (contains? known q))]
+                     (str "unknown legal question: " q))))
+           (and procedure (= kind :collect-documents) (contains? evidence :doc))
+           (into (let [known (set (map :document/id (:procedure/documents procedure)))]
+                   (when-not (contains? known (:doc evidence))
+                     [(str "unknown document: " (:doc evidence))]))))]
+     {:ok? (and (empty? missing) (empty? invalid) (empty? notes))
+      :missing missing :invalid invalid :notes notes})))
+
+(defn ask-back
+  "検証不合格時の聞き返し文(日本語)。orchestrator がそのままチャットに出せる形。"
+  [{:keys [missing invalid notes]}]
+  (str "ありがとうございます — 台帳に記録するため、あと少しだけ教えてください。"
+       (when (seq missing)
+         (str " 不足: " (str/join "・" (map name missing)) "。"))
+       (when (seq invalid)
+         (str " 形式が確認できませんでした: " (str/join "・" (map name invalid))
+              "（日付は YYYY-MM-DD でお願いします）。"))
+       (when (seq notes)
+         (str " 確認: " (str/join " / " notes)))))
+
+;; --- 台帳イベント -----------------------------------------------------------------
+
+(def event-types
+  #{:errand/proposed :errand/sent :errand/evidence-received
+    :errand/validated :errand/stale :errand/declined})
+
+(defn event
+  [type at case-id step-id data]
+  {:pre [(contains? event-types type) (string? at)]}
+  (assoc data :event/type type :event/at at :case/id case-id :step/id step-id))
+
+;; --- 抽出 -------------------------------------------------------------------------
+
+(defn errands-of
+  "procedure の :step/errand 付き step を [{:step/id ... :errand {...}} ...] で返す。"
+  [procedure]
+  (into []
+        (keep (fn [{:step/keys [id order title requires-human errand]}]
+                (when errand
+                  {:step/id id :step/order order :step/title title
+                   :step/requires-human requires-human :errand errand})))
+        (sort-by :step/order (:procedure/steps procedure))))
