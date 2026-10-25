@@ -1,0 +1,225 @@
+(ns sevenz.oracle-test
+  "Conformance against the real 7-Zip, in both directions, via the `7z` CLI.
+
+   .7z has more ways to be right than any other archive format here: the header
+   may be plain or itself LZMA-compressed, members may be solid (many substreams
+   cut out of one decoded folder) or one folder each, and the coder may be Copy,
+   LZMA1 or LZMA2. Every one of those combinations is a different code path in
+   the reader, so every one gets a fixture from 7-Zip itself.
+
+   Skipped loudly when `7z` or python3 is missing rather than passing silently."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [sevenz.core :as sevenz])
+  (:import [java.io File]))
+
+(defn- have-7z? []
+  (try (let [{:keys [exit out]} (shell/sh "7z")]
+         (or (zero? exit) (str/includes? (str out) "7-Zip")))
+       (catch Exception _ false)))
+
+(defn- have-python? []
+  (try (zero? (:exit (shell/sh "python3" "--version"))) (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir "org-7-zip-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+(defn- write-bytes [^File f bs]
+  (with-open [o (io/output-stream f)] (.write o (byte-array (map unchecked-byte bs)))))
+
+(defn- sh! [dir & args]
+  (let [{:keys [exit out err]} (apply shell/sh (concat args [:dir dir]))]
+    (when-not (zero? exit)
+      (throw (ex-info (str "command failed: " (pr-str args) "\n" out err) {})))
+    out))
+
+(defn- make-tree!
+  "Create the files 7z will archive. Content shapes matter: a compressible file
+   exercises matches, a random one literals, a tiny one the short-rep path."
+  [dir]
+  (sh! dir "python3" "-c" "
+import os
+os.makedirs('tree/sub', exist_ok=True)
+open('tree/text.txt','w').write('the quick brown fox jumps over the lazy dog. ' * 400)
+open('tree/sub/nested.txt','w').write('nested content\\n' * 50)
+open('tree/random.bin','wb').write(os.urandom(20000))
+open('tree/tiny.txt','w').write('hi')
+open('tree/empty.txt','w').write('')
+open('tree/unicode-日本語.txt','w').write('日本語の中身')
+")
+  {"tree/text.txt" (slurp (io/file dir "tree/text.txt"))
+   "tree/sub/nested.txt" (slurp (io/file dir "tree/sub/nested.txt"))
+   "tree/tiny.txt" "hi"
+   "tree/empty.txt" ""
+   "tree/unicode-日本語.txt" "日本語の中身"})
+
+(defn- entry-text [parsed name]
+  (let [e (sevenz/entry parsed name)]
+    (kbytes/utf8-string (byte-array (map unchecked-byte (:bytes e))))))
+
+;; ---------------------------------------------------------------------------
+;; 7-Zip → us
+;; ---------------------------------------------------------------------------
+
+(deftest we-read-every-coder-and-layout
+  (if-not (and (have-7z?) (have-python?))
+    (println "SKIP sevenz.oracle-test: 7z or python3 not available")
+    (doseq [[label & flags] [["copy, one folder per file" "-m0=copy" "-ms=off"]
+                             ["lzma1 solid" "-m0=lzma" "-ms=on"]
+                             ["lzma2 solid" "-m0=lzma2" "-ms=on"]
+                             ["lzma2 non-solid" "-m0=lzma2" "-ms=off"]
+                             ["default (lzma2, compressed header)"]
+                             ["plain header" "-mhc=off"]
+                             ["compressed header" "-mhc=on"]]]
+      (let [dir (temp-dir)]
+        (try
+          (testing label
+            (let [expected (make-tree! dir)]
+              (apply sh! dir (concat ["7z" "a" "-bd" "-y"] flags ["out.7z" "tree"]))
+              (let [archive (read-ubytes (io/file dir "out.7z"))
+                    parsed  (sevenz/parse archive)]
+                (doseq [[n c] expected]
+                  (is (= c (entry-text parsed n)) (str label " / " n)))
+                (testing "the random file survives byte-for-byte"
+                  (is (= (read-ubytes (io/file dir "tree/random.bin"))
+                         (:bytes (sevenz/entry parsed "tree/random.bin")))))
+                (testing "directories are entries with no data"
+                  (is (:dir? (sevenz/entry parsed "tree")))
+                  (is (:dir? (sevenz/entry parsed "tree/sub"))))
+                (testing "an empty file is a file, not a directory"
+                  (let [e (sevenz/entry parsed "tree/empty.txt")]
+                    (is (not (:dir? e)))
+                    (is (= [] (:bytes e))))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-verify-member-crcs
+  (if-not (and (have-7z?) (have-python?))
+    (println "SKIP sevenz.oracle-test: 7z or python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (make-tree! dir)
+        (sh! dir "7z" "a" "-bd" "-y" "-m0=copy" "out.7z" "tree/text.txt")
+        (let [archive (read-ubytes (io/file dir "out.7z"))
+              parsed  (sevenz/entries archive)]
+          (is (every? :crc32 (remove :dir? parsed)) "7-Zip always records CRCs")
+          (testing "flipping a payload byte is caught"
+            ;; member data starts right after the 32-byte signature header
+            (let [broken (assoc archive 40 (bit-xor (nth archive 40) 0xff))]
+              (is (= :checksum-mismatch
+                     (try (sevenz/parse broken) nil
+                          (catch Exception e (:reason (ex-data e))))))
+              (is (vector? (sevenz/parse broken {:verify-crc false}))
+                  "…and skippable for salvage"))))
+        (finally (rm-rf dir))))))
+
+(deftest we-read-bzip2-folders
+  ;; BZip2 was refused by name until org-sourceware-bzip2 existed. 7-Zip picks it
+  ;; for some text profiles, and it is the one coder here whose stream is a
+  ;; complete file format in its own right.
+  (if-not (and (have-7z?) (have-python?))
+    (println "SKIP sevenz.oracle-test: 7z or python3 not available")
+    (doseq [[label extra] [["non-solid" ["-ms=off"]] ["solid" ["-ms=on"]]
+                           ["compressed header" ["-mhc=on"]]]]
+      (let [dir (temp-dir)]
+        (try
+          (testing label
+            (let [expected (make-tree! dir)]
+              (apply sh! dir (concat ["7z" "a" "-bd" "-y" "-m0=BZip2"] extra
+                                     ["out.7z" "tree"]))
+              (let [archive (read-ubytes (io/file dir "out.7z"))
+                    parsed (into {} (for [e (sevenz/parse archive)
+                                          :when (not (:dir? e))]
+                                      [(:name e) e]))]
+                (testing "every member decodes to what 7z was given"
+                  (doseq [[name content] expected
+                          :let [e (get parsed name)]]
+                    (is (some? e) (str name " missing from the archive"))
+                    (when e
+                      ;; `.getBytes` is signed; this API is unsigned 0-255
+                      (is (= (mapv #(bit-and (int %) 0xff)
+                                   (kbytes/utf8-bytes ^String content))
+                             (:bytes e))
+                          name))))
+                (testing "and the recorded CRCs verify (they are checked on parse)"
+                  ;; 7-Zip records no CRC for an empty member — there is nothing
+                  ;; to checksum — so only non-empty ones carry one
+                  (is (every? :crc32 (remove :empty? (vals parsed))))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-refuse-coders-we-do-not-implement
+  (if-not (and (have-7z?) (have-python?))
+    (println "SKIP sevenz.oracle-test: 7z or python3 not available")
+    (doseq [[coder expected] [["ppmd" :ppmd] ["bcj" :bcj-x86]]]
+      (let [dir (temp-dir)]
+        (try
+          (testing coder
+            (make-tree! dir)
+            (apply sh! dir ["7z" "a" "-bd" "-y" (str "-m0=" coder) "out.7z" "tree/text.txt"])
+            (let [archive (read-ubytes (io/file dir "out.7z"))]
+              (is (= :unsupported-coder
+                     (try (sevenz/parse archive) nil
+                          (catch Exception e (:reason (ex-data e))))))
+              (is (= expected
+                     (try (sevenz/parse archive) nil
+                          (catch Exception e (:coder (ex-data e))))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-a-megabyte-solid-archive
+  (if-not (and (have-7z?) (have-python?))
+    (println "SKIP sevenz.oracle-test: 7z or python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (sh! dir "python3" "-c" "
+open('big1.log','w').write(''.join('line %d of a log file with repeated shape\\n' % i for i in range(15000)))
+open('big2.log','w').write(''.join('another shape, row %d\\n' % i for i in range(15000)))
+")
+        (sh! dir "7z" "a" "-bd" "-y" "-ms=on" "out.7z" "big1.log" "big2.log")
+        (let [parsed (sevenz/parse (read-ubytes (io/file dir "out.7z")))]
+          (is (= (slurp (io/file dir "big1.log")) (entry-text parsed "big1.log")))
+          (is (= (slurp (io/file dir "big2.log")) (entry-text parsed "big2.log")))
+          (testing "both members really did come out of one folder"
+            (is (= 1 (count (distinct (map :folder (remove :dir? parsed))))))))
+        (finally (rm-rf dir))))))
+
+;; ---------------------------------------------------------------------------
+;; us → 7-Zip
+;; ---------------------------------------------------------------------------
+
+(deftest our-archives-are-read-by-7-zip
+  (if-not (and (have-7z?) (have-python?))
+    (println "SKIP sevenz.oracle-test: 7z or python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [members {"a.txt" "hello from cljc"
+                       "dir/b.json" (apply str (repeat 40 "{\"k\":\"v\"}"))
+                       "unicode-日本語.txt" "日本語の中身"
+                       "empty.txt" ""}
+              archive (sevenz/build
+                       (into [{:name "dir" :dir? true}]
+                             (mapv (fn [[n c]]
+                                     {:name n
+                                      :bytes (mapv #(bit-and (int %) 0xff)
+                                                   (kbytes/utf8-bytes ^String c))})
+                                   members)))]
+          (write-bytes (io/file dir "ours.7z") archive)
+          (testing "`7z t` verifies it"
+            (let [out (sh! dir "7z" "t" "ours.7z")]
+              (is (str/includes? out "Everything is Ok") out)))
+          (testing "`7z l` lists every member"
+            (let [out (sh! dir "7z" "l" "ours.7z")]
+              (doseq [n (keys members)]
+                (is (str/includes? out n) n))))
+          (testing "`7z x` extracts the right bytes"
+            (sh! dir "7z" "x" "-bd" "-y" "-oout" "ours.7z")
+            (doseq [[n c] members]
+              (is (= c (slurp (io/file dir "out" n))) n)))
+          (testing "and we read our own archive back"
+            (let [parsed (sevenz/parse archive)]
+              (doseq [[n c] members]
+                (is (= c (entry-text parsed n)) n)))))
+        (finally (rm-rf dir))))))
