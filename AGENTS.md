@@ -28,3 +28,24 @@ remain open until ported and qualified. A green request-parser or controller
 job must not mark these acceptance criteria Done. Legacy JVM/JS lint, Q9,
 runtime-values, SDK packaging, library and package admission jobs no longer
 run in CI; preserve their fixtures while porting their checks to native code.
+
+## JUN-93 shared native text
+
+The canonical text owner is lib/kotoba.text; kotoba-lang/text is archived.
+Maintain the immutable imports and explicit local-changes source/addition
+hashes. Extend the existing loaderless native CI; retain its CLI request and
+controller gates. Shared component goldens do not qualify the whole library
+catalog, public CLI execution or the P4 desktop.
+
+Native text keeps Unicode whitespace excluding U+00A0/U+2007/U+202F, ASCII
+lower preserving non-ASCII, and an empty needle matching every string.
+Do not alias the differently named ASCII whitespace/UTF-8 byte-index kernels
+to full text APIs. Native index-of retains UTF-16/option semantics and both arities; join takes
+typed string lists and preserves empty fields. CSSOM capture regex and full
+Unicode case remain distinct qualification requirements. Preserve all graph declarations.
+
+The native-shared workflow now executes the current owner fixture on both native
+ARM and x86 Linux using an immutable Amu commit and pinned shared dependencies.
+It hashes the actual compiler image, locks all discovered source bytes and
+preserves Kotoba verdicts/refusals as artifacts. Its bounded result does not
+restore the uncovered legacy full host suite or qualify the P4 desktop.
