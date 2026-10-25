@@ -223,6 +223,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.vitePluginSafeBuilder` | `kotoba.vitePluginSafeBuilder/src` | `` (Kotoba project library) |
 | `kotoba.vectorEmbedding` | `kotoba.vectorEmbedding/src` | `` (Kotoba project library) |
 | `kotoba.svelteDesignSystem` | `kotoba.svelteDesignSystem/src` | `` (Kotoba project library) |
 | `kotoba.svelteAuth` | `kotoba.svelteAuth/src` | `` (Kotoba project library) |
