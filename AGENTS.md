@@ -43,3 +43,9 @@ Do not alias the differently named ASCII whitespace/UTF-8 byte-index kernels
 to full text APIs. Native index-of retains UTF-16/option semantics and both arities; join takes
 typed string lists and preserves empty fields. CSSOM capture regex and full
 Unicode case remain distinct qualification requirements. Preserve all graph declarations.
+
+The native-shared workflow now executes the current owner fixture on both native
+ARM and x86 Linux using an immutable Amu commit and pinned shared dependencies.
+It hashes the actual compiler image, locks all discovered source bytes and
+preserves Kotoba verdicts/refusals as artifacts. Its bounded result does not
+restore the uncovered legacy full host suite or qualify the P4 desktop.
