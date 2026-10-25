@@ -175,6 +175,7 @@ The bundled standard libraries live in this repository:
 | `org.ashrae.bacnet` | `org.ashrae.bacnet/src` | `bacnet.apdu`, `bacnet.bvlc`, `bacnet.npdu`, `bacnet.services` (an external specification, publisher ashrae.org) |
 | `org.ansi.iges` | `org.ansi.iges/src` | `iges.core` (an external specification, publisher ansi.org) |
 | `org.si2.lef` | `org.si2.lef/src` | `lef.core` (an external specification, publisher si2.org) |
+| `org.openehr.adl` | `org.openehr.adl/src` | `adl.archetype`, `adl.cadl`, `adl.dadl`, `adl.lexer` (an external specification, publisher openehr.org) |
 | `com.synopsys.liberty` | `com.synopsys.liberty/src` | `liberty.core` (Kotoba project library) |
 | `io.toml.core` | `io.toml.core/src` | `toml.reader` (Kotoba project library) |
 | `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
