@@ -1,0 +1,134 @@
+(ns karakuri.methods.datom
+  "karakuri (絡繰) kotoba Datom audit projector — every ServiceOp is a Datom (G7).
+
+  1:1 Clojure port of `methods/datom.py`.
+
+  Projects a planned (or, post-activation, executed) ServiceOp / CommandPlan / ExportArtifact
+  into kotoba EAVT entity maps that mirror kotoba/schema.edn (and seed.edn shape), and assembles
+  a `kg.ingest_batch` body. This is the G7 audit trail: as-of, replayable, 非終末論 — a member can
+  audit exactly what touched their account. Two safety rules:
+
+    - G3 no-secret-leak: only flag KEYS are serialized into :op/args (never values, which could
+      carry a token); the encrypted session-grant lives elsewhere as an encref, never here.
+    - G6 dry-run: :op/dry-run is True at R0; live ingest into kotoba is operator-gated (refused).
+
+  `planned-at` is supplied by the caller (a runtime stamps it; tests pass a fixed value) — this
+  module performs no clock reads, so its output is deterministic.
+
+  Entities are string-keyed maps keyed by ':ns/name' strings (kept verbatim, the seed.edn
+  spelling). sha-256 + the live env read are behind #?(:clj …). Self-contained sha-256 (no
+  sibling provides it). clojure.core only; portable .cljc."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text] [karakuri.methods.command :as command]))
+
+;; ── sha-256 (self-contained; copied from the danjo budget_ledger exemplar) ────────────
+(defn- sha256-hex
+  "String → lowercase hex sha-256 digest (UTF-8)."
+  ^String [^String s]
+  #?(:clj (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") (kbytes/utf8-bytes s))]
+            (apply str (map #(format "%02x" (bit-and % 0xff)) d)))
+     :default (throw (ex-info "bind a sha-256 impl on this host" {}))))
+
+(def AUDIT-GRAPH "karakuri-audit-v1")
+(def LIVE-INGEST-FLAG "KARAKURI_ALLOW_LIVE_INGEST")
+
+;; EDN keyword → :db keyword string mapping for op safety / gates (kept as the seed.edn spelling).
+(def ^:private SAFETY-KW
+  {"read" ":read", "create" ":create", "update" ":update", "delete" ":delete"})
+(def ^:private TIER-KW
+  {"t1-official-api" ":t1-official-api"
+   "t2-headless-browser" ":t2-headless-browser"
+   "t3-structured-export" ":t3-structured-export"
+   "" nil})
+(def ^:private TOS-KW
+  {"ok" ":ok", "refused-automation-prohibited" ":refused-automation-prohibited"})
+(def ^:private MUTATE-KW
+  {"read-allowed" ":read-allowed", "awaiting-member-sig" ":awaiting-member-sig",
+   "authorized" ":authorized"})
+
+(defn- live-ingest-refused
+  "ex-info marked as a live-ingest refusal (default-deny; G6)."
+  [msg]
+  (ex-info msg {:type :live-ingest-refused}))
+
+(defn op-id
+  "Deterministic, content-derived op id: op:<service>:<noun>.<verb>:<8-hex>."
+  [op planned-at]
+  (let [h (subs (sha256-hex (str (:service op) "|" (:noun op) "|" (:verb op) "|" planned-at)) 0 8)]
+    (str "op:" (:service op) ":" (:noun op) "." (:verb op) ":" h)))
+
+(defn- args-keys
+  "G3: serialize only the flag KEYS (sorted), never values (a value could be a secret/token)."
+  [op]
+  (kotoba.lang.text/join "," (sort (keys (:args op)))))
+
+(defn- require-kw
+  "G7: map a gate value to its EDN keyword, REFUSING an unknown value rather than fail-open.
+
+  A silent default on a security-relevant audit field (tos-gate / mutate-gate) could record a
+  refused/mutating op as permitted/read-allowed; the audit must never misreport, so drift raises."
+  [mapping value field]
+  (when-not (contains? mapping value)
+    (throw (ex-info (str "G7 audit: unknown " field " value " (pr-str value)
+                         "; refuse to project a misleading datom")
+                    {:field field :value value})))
+  (get mapping value))
+
+(defn op-to-entity
+  "Project one ServiceOp into a kotoba :op/* entity map (mirrors seed.edn; G7)."
+  [op planned-at & {:keys [oid] :or {oid nil}}]
+  (let [tier (get TIER-KW (:adapter-tier op))
+        keys-str (args-keys op)
+        ent (cond-> {":op/id" (or oid (op-id op planned-at))
+                     ":op/noun" (:noun op)
+                     ":op/verb" (:verb op)
+                     ;; safety defaults conservatively to :update (fail-CLOSED — an unknown verb is mutating).
+                     ":op/safety" (get SAFETY-KW (:safety op) ":update")
+                     ":op/destructive" (:destructive op)
+                     ":op/dry-run" true                              ; G6 invariant at R0
+                     ;; gate fields are strict (no fail-open default): an unknown value refuses (G7).
+                     ":op/tos-gate" (require-kw TOS-KW (:tos-gate op) "tos-gate")
+                     ":op/mutate-gate" (require-kw MUTATE-KW (:mutate-gate op) "mutate-gate")
+                     ":op/planned-at" planned-at}                    ; as-of audit history (G7)
+              (some? tier) (assoc ":op/adapter-tier" tier)
+              (seq (:t2-engine op)) (assoc ":op/t2-engine" (str ":" (:t2-engine op))))]  ; :browser-use
+    (if (seq keys-str)
+      (assoc ent ":op/args" keys-str)                               ; G3 — keys only
+      ent)))
+
+(defn plan-to-entities
+  "Project a CommandPlan (brief + ops) into a :plan/* entity + its :op/* entities (G7)."
+  [command-plan planned-at]
+  (let [op-entities (mapv #(op-to-entity % planned-at) (:ops command-plan))
+        plan-ent {":plan/id" (str "plan:" (subs (sha256-hex (str (:brief command-plan) "|" planned-at)) 0 8))
+                  ":plan/brief" (:brief command-plan)
+                  ":plan/op" (mapv #(get % ":op/id") op-entities)    ; ref-by-id (G7 join)
+                  ":plan/charter-clean" (:charter-clean command-plan)}]  ; N6
+    (into [plan-ent] op-entities)))
+
+(defn export-to-entity
+  "Project an ExportArtifact into a kotoba :export/* entity map (G7/G9)."
+  [artifact & {:keys [eid] :or {eid nil}}]
+  (cond-> {":export/id" (or eid (str "export:" (:service artifact) ":" (:fmt artifact)))
+           ":export/service" (:service artifact)  ; schema :export/service ref — audit which service (G7)
+           ":export/format" (str ":" (:fmt artifact))
+           ":export/owner" ":member"              ; G9
+           ":export/encrypted" true}              ; G9
+    (seq (:cid artifact)) (assoc ":export/cid" (:cid artifact))))
+
+(defn to-ingest-batch
+  "Assemble a kotoba `kg.ingest_batch` body from entity maps (offline; G6 dry-run)."
+  [entities & {:keys [graph] :or {graph AUDIT-GRAPH}}]
+  {"op" "kg.ingest_batch" "graph" graph "entities" entities})
+
+(defn ingest-live
+  "G6: live ingest into the kotoba Datom log is operator-gated — refused by default at R0."
+  [_batch & {:keys [operator-attestation env] :or {operator-attestation nil env nil}}]
+  (let [flag (if env
+               (get env LIVE-INGEST-FLAG)
+               #?(:clj (System/getenv LIVE-INGEST-FLAG)
+                  :default nil))]
+    (when (or (not= flag "1") (not operator-attestation))
+      (throw (live-ingest-refused
+              (str "G6: live kotoba ingest is operator-gated (" LIVE-INGEST-FLAG "=1 + operator attestation); "
+                   "R0 emits the batch but never writes"))))
+    (throw (live-ingest-refused "live kotoba ingest client not wired at R0 (Council activation pending)"))))
