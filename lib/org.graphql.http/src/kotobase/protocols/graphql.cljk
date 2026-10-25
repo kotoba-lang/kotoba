@@ -1,0 +1,325 @@
+(ns kotobase.protocols.graphql
+  "graphql.kotobase.net -- a GraphQL over HTTP (graphql.github.io/graphql-over-http/)
+  query surface over kotobase, wiring the pure `kotoba-lang/graphql` SDL/executor
+  library to the shared `kotobase.query.bridge` (ADR-2607172300 in
+  `com-junkawasaki/root`), per ADR-2607172500.
+
+  ## Division of labour (read this before touching parsing/execution code)
+
+  `kotoba-lang/graphql` (`graphql.sdl`/`graphql.query`/`graphql.validate`/
+  `graphql.execute`) does ALL of: SDL -> schema EDN, query string -> selection
+  AST, schema structural validation, and field-resolution execution over
+  host-injected resolvers. This namespace does NOT reimplement any of that --
+  it is the HTTP transport + a small amount of GraphQL-over-HTTP-shaped glue
+  the library deliberately leaves to its host:
+
+  1. decode the request body per the GraphQL-over-HTTP `POST` shape
+     (`{\"query\" \"...\" \"variables\" {...} \"operationName\" \"...\"}`),
+  2. reject the two things explicitly out of v0.1 scope (mutations/
+     subscriptions -- ADR-2607172500's \"query-only\" boundary; `$variable`
+     references -- `graphql.query/parse-query` does not bind variables, see
+     its own README, so silently accepting them would silently misexecute),
+  3. run `graphql.query/parse-query` + a small QUERY-level field-existence
+     check against the schema (`graphql.validate` only checks the SCHEMA's
+     own structural well-formedness, e.g. \"does every field type exist\" --
+     it does not check that a REQUEST's selected fields exist on the schema,
+     which is this namespace's own job, same division of labour any GraphQL
+     HTTP host has),
+  4. run `graphql.execute/execute-query` with resolvers that call into
+     `kotobase.query.bridge` (materialize + `arrangement.datalog` query),
+     threading the REQUIRED `:visible?` predicate through every resolver,
+  5. shape the result as `{\"data\" ... \"errors\" [...]}` per the GraphQL
+     over HTTP spec.
+
+  ## Wire shape: `POST /graphql`
+
+  Request body (JSON):
+  ```json
+  {\"query\": \"{ user(id: \\\"u1\\\") { name department { name budget } } }\"}
+  ```
+  Response body (JSON):
+  ```json
+  {\"data\": {\"user\": {\"name\": \"Alice\",
+                        \"department\": {\"name\": \"Engineering\" \"budget\" 900000}}}}
+  ```
+
+  Per the GraphQL over HTTP spec's request-error vs field-error split:
+  - malformed JSON body, missing/non-string `\"query\"`, unsupported
+    mutation/subscription operations, `$variable` references, or a query
+    that fails this namespace's schema field-existence check -- these are
+    REQUEST errors: no execution is attempted, HTTP 400, body is
+    `{\"errors\" [...]}` with **no** `\"data\"` key.
+  - a resolver throwing during execution (this repo's own resolver code,
+    e.g. a bad argument coercion) is an EXECUTION error: HTTP 200 (per
+    spec, since execution began), body is `{\"data\" null \"errors\" [...]}`.
+    `graphql.execute` is a pure, single-pass, whole-query executor with no
+    per-field error tracking (see its own docstring: \"IResolver/resolve is
+    called ... assuming pure functions\") -- so v0.1 cannot offer partial
+    `data` alongside `errors` the way a full GraphQL server would; a
+    thrown resolver error aborts the whole request's data, mirroring how
+    the sibling `org-opencypher-cypher` surface aborts its whole
+    transaction on the first failing statement rather than fabricate a
+    partial result.
+  - otherwise: HTTP 200, `{\"data\" {...}}` (no `\"errors\"` key when there
+    are none).
+
+  ## v0.1 scope boundary (ADR-2607172500) -- explicit rejection, not silent misbehaviour
+
+  - **query-only**: `mutation { ... }` / `subscription { ... }` operations
+    are rejected with a named error, never silently executed as if they
+    were queries.
+  - **no `$variable` substitution**: `graphql.query/parse-query`'s own
+    README states variable binding is unsupported; a query containing a
+    `$name` token would otherwise be silently mis-tokenized (the raw
+    identifier becomes an enum-shaped string literal) rather than bound to
+    the request's `\"variables\"` value -- this namespace detects `$name`
+    tokens up front and rejects the request with a clear message instead
+    of executing that silent misinterpretation. Use inline literal
+    argument values instead.
+  - **no schema-from-IStore-collections auto-derivation**: the ADR
+    explicitly rejects this as v0.1 scope creep. The schema (a
+    `graphql.model` EDN map, typically built via `graphql.sdl/parse-schema`)
+    and the field-resolver registry are supplied by the deploy shell / test
+    fixtures via `ctx` -- see `resolver` below and
+    `test/kotobase/protocols/graphql_test.cljk` for a full worked example
+    (SDL schema + resolvers backed by two `kotobase.store` collections,
+    including one cross-collection-join resolver).
+
+  ## `visible?` -- required, injectable, never defaulted
+
+  `ctx` passed to `handle` MUST include `:visible?`, a predicate over
+  materialized datoms (`(fn [{:keys [s p o]}] boolean?)`) -- the same
+  discipline `kotobase.query.bridge`/`arrangement.datalog` enforce
+  (ADR-2607050500, \"Query as first-class effect\"). `handle` throws
+  immediately (a ctx-construction bug, not a wire-protocol error) if
+  `:visible?` is missing. Resolvers built via `resolver` receive `ctx` as
+  `{:store IStore :visible? (fn [datom] boolean?)}` (the same map every
+  resolver fn in the registry is called with, as `graphql.execute`'s third
+  positional `ctx` argument) -- there is no silent `(constantly true)`
+  fallback baked into this namespace; every fixture/deploy resolver must
+  itself pass `visible?` on to `kotobase.query.bridge/query`.
+
+  ## Audit choice
+
+  Same read-only-surface audit discipline as `org-opencypher-cypher`
+  (ADR-2607050500's \"query as first-class effect\"): every processed
+  request is appended to the shared `:kotobase.protocols/audit` stream --
+  `{:surface :graphql :op :query :query <raw query text> :now ...}` on
+  success, `{:surface :graphql :op :query-error :query <raw query text>
+  :error ... :now ...}` on failure. Resolved DATA is never audited, only
+  the caller's own raw query text (there are no `$variable` values to leak
+  in v0.1, since those are rejected outright)."
+  (:require [kotoba.lang.text :as str]
+            [graphql.execute :as exec]
+            [graphql.model :as m]
+            [graphql.ports :as p]
+            [graphql.query :as gq]
+            [kotobase.protocols.graphql.http :as http]
+            [kotobase.protocols.graphql.json :as json]
+            [kotobase.store :as st]))
+
+;; ------------------------------------------------------------- resolvers
+
+(defn resolver
+  "Build a `graphql.ports/IResolver` from `resolver-map`, `{[type-name
+  field-name] (fn [parent args ctx] value)}` (string keys, matching
+  `graphql.execute`'s own `type-name`/`field-name` string arguments
+  exactly -- e.g. `{[\"Query\" \"user\"] (fn [_ args ctx] ...)}`).
+
+  Any `[type-name field-name]` pair NOT present in `resolver-map` falls
+  back to `graphql.execute/default-ports`'s plain-map field access
+  (`(get parent (keyword field-name))`, string-key fallback) -- so scalar
+  passthrough fields on an already-resolved object (e.g. `User.name` once
+  a parent resolver has returned `{:name \"Alice\" ...}`) don't need their
+  own registry entry, only fields that must themselves query
+  `kotobase.query.bridge` do."
+  [resolver-map]
+  (reify p/IResolver
+    (resolve [_ type-name field-name parent args ctx]
+      (if-let [f (get resolver-map [type-name field-name])]
+        (f parent args ctx)
+        (or (get parent (keyword field-name))
+            (get parent field-name))))))
+
+;; ------------------------------------------------------------- errors
+
+(defn- gql-error
+  ([msg] {"message" msg})
+  ([msg extra] (merge {"message" msg} extra)))
+
+(defn- variables-unsupported?
+  "`graphql.query/parse-query` does not bind `$name` variable references
+  (see the library's own README) -- detect them up front so we reject
+  loudly instead of silently mis-tokenizing them as enum-shaped string
+  literals. A `$` followed by an identifier char is unambiguous inside a
+  GraphQL document (no other legal use of `$`)."
+  [query-str]
+  (boolean (re-find #"\$[A-Za-z_]" query-str)))
+
+(defn- operation-kind
+  "`{ ... }` / `query ...` -> :query, `mutation ...` -> :mutation,
+  `subscription ...` -> :subscription, anything else -> :unknown.
+  Comments (`# ...` to end of line, same syntax `graphql.query/tokenize`
+  strips) are removed before inspecting the leading keyword, so a query
+  that merely starts with a comment is still classified correctly."
+  [query-str]
+  (let [trimmed (str/trim (str/replace query-str #"#[^\n]*" ""))]
+    (cond
+      (str/starts-with? trimmed "{") :query
+      (re-find #"(?i)^mutation\b" trimmed) :mutation
+      (re-find #"(?i)^subscription\b" trimmed) :subscription
+      (re-find #"(?i)^query\b" trimmed) :query
+      :else :unknown)))
+
+;; --------------------------------------------------------- query validation
+
+(defn- validate-selections
+  "Recursively check that every field in `selections` exists on
+  `type-name` in `schema`, and that a field with sub-selections resolves
+  to an object/interface/union type that itself has fields to select
+  (never a scalar). Returns a vector of GraphQL-shaped error maps
+  (`{\"message\" ...}`), empty when the selection set is valid.
+
+  This is the query-level check `graphql.validate` deliberately does not
+  do (that namespace validates the SCHEMA's own structural well-formedness
+  only, not a particular request's selections against it) -- see ns
+  docstring's \"Division of labour\" section."
+  [schema type-name selections]
+  (let [type-def (m/get-type schema type-name)]
+    (if (nil? type-def)
+      [(gql-error (str "Unknown type \"" type-name "\"."))]
+      (reduce
+       (fn [errs sel]
+         (let [fname (:graphql/field sel)
+               field (m/field-by-name type-def fname)]
+           (cond
+             (nil? field)
+             (conj errs (gql-error (str "Cannot query field \"" fname
+                                        "\" on type \"" type-name "\".")))
+
+             (and (seq (:graphql/selections sel))
+                  (nil? (m/get-type schema (:graphql/type field))))
+             (conj errs (gql-error (str "Field \"" fname "\" must not have a selection"
+                                        " since type \"" (:graphql/type field)
+                                        "\" has no subfields.")))
+
+             (seq (:graphql/selections sel))
+             (into errs (validate-selections schema (:graphql/type field)
+                                             (:graphql/selections sel)))
+
+             :else errs)))
+       []
+       selections))))
+
+;; ---------------------------------------------------------------- audit
+
+(defn- audit! [store op query-text now extra]
+  (st/-append store :kotobase.protocols/audit
+              (merge {:surface :graphql :op op :query query-text :now now} extra)))
+
+;; --------------------------------------------------------------- execute
+
+(defn- run-request
+  "Decode+validate+execute one GraphQL-over-HTTP request body (already
+  JSON-parsed, string keys). Returns `{:ok bool :status int :data v
+  :errors [...]}` -- never throws (every failure inside the GraphQL
+  pipeline is caught here, per the ns docstring's request-error/
+  execution-error split)."
+  [{:keys [store visible? schema resolvers now]} body]
+  (let [query-text (get body "query")]
+    (cond
+      (not (string? query-text))
+      {:ok false :status 400 :errors [(gql-error "must provide a \"query\" string")]}
+
+      (variables-unsupported? query-text)
+      {:ok false :status 400
+       :errors [(gql-error (str "$variable references are not supported by graphql-clj's"
+                                " query parser in v0.1 -- inline literal argument values"
+                                " instead (see ns docstring)"))]}
+
+      (contains? #{:mutation :subscription} (operation-kind query-text))
+      {:ok false :status 400
+       :errors [(gql-error (str (name (operation-kind query-text))
+                                " operations are not supported -- org-graphql-http v0.1 is a"
+                                " query-only surface (ADR-2607172500)"))]}
+
+      :else
+      (let [ast (gq/parse-query query-text)]
+        (cond
+          (empty? ast)
+          {:ok false :status 400
+           :errors [(gql-error "Syntax Error: query does not contain a valid selection set")]}
+
+          :else
+          (let [root (m/query-root schema)]
+            (if (nil? root)
+              {:ok false :status 400
+               :errors [(gql-error "schema has no query root type defined")]}
+              (let [verrs (validate-selections schema root ast)]
+                (if (seq verrs)
+                  {:ok false :status 400 :errors verrs}
+                  (try
+                    (let [ports {:resolver (resolver resolvers)}
+                          data (exec/execute-query ports schema ast nil
+                                                    {:store store :visible? visible?})]
+                      (audit! store :query query-text now {})
+                      {:ok true :status 200 :data data})
+                    (catch #?(:clj Exception :cljs :default) e
+                      (let [msg (or #?(:clj (.getMessage ^Exception e) :cljs (.-message e)) (str e))]
+                        (audit! store :query-error query-text now {:error msg})
+                        {:ok false :status 200 :data nil :errors [(gql-error msg)]}))))))))))))
+
+;; ----------------------------------------------------------------- HTTP
+
+(defn- json-response [status m]
+  (http/response status {"content-type" "application/json"} (json/encode m)))
+
+(defn handle
+  "`POST /graphql` handler -- GraphQL over HTTP shaped (see ns docstring
+  for the exact request/response JSON and the v0.1 scope boundary). `ctx`
+  is `{:store IStore :visible? (fn [datom] boolean?) :schema
+  graphql.model-schema :resolvers {[type field] resolver-fn ...} :now
+  optional-ISO-string}`.
+
+  `:visible?` and `:schema` are REQUIRED -- throws immediately (a ctx bug,
+  not a wire error) if either is missing; no permissive default
+  (ADR-2607050500)."
+  [{:keys [store visible? schema resolvers] :as ctx} req]
+  (when-not (fn? visible?)
+    (throw (ex-info
+            (str "kotobase.protocols.graphql/handle requires ctx :visible? -- a REQUIRED"
+                 " predicate fn over materialized datoms, no permissive default"
+                 " (ADR-2607050500). Pass (constantly true) to see everything.")
+            {:graphql/ctx-error true})))
+  (when-not (map? schema)
+    (throw (ex-info
+            (str "kotobase.protocols.graphql/handle requires ctx :schema -- a graphql.model"
+                 " EDN schema map (e.g. from graphql.sdl/parse-schema); this repo does not"
+                 " auto-derive one (ADR-2607172500, rejected as v0.1 scope creep)")
+            {:graphql/ctx-error true})))
+  (cond
+    (not= ["graphql"] (http/segments (:path req)))
+    (http/not-found)
+
+    (not= :post (:method req))
+    (http/method-not-allowed)
+
+    :else
+    (let [parsed (try (json/parse (or (:body req) "{}"))
+                       (catch #?(:clj Exception :cljs :default) _ ::malformed))]
+      (if (= parsed ::malformed)
+        (json-response 400 {"errors" [(gql-error "malformed JSON body")]})
+        (let [{:keys [ok status data errors]} (run-request (assoc ctx :resolvers (or resolvers {}))
+                                                             parsed)]
+          (cond
+            ok
+            (json-response status (cond-> {"data" data} (seq errors) (assoc "errors" errors)))
+
+            ;; execution began (a resolver threw) -- spec: HTTP 200, "data" key
+            ;; present (null), alongside "errors".
+            (= 200 status)
+            (json-response status {"data" data "errors" errors})
+
+            ;; request error -- no execution attempted, no "data" key at all.
+            :else
+            (json-response status {"errors" errors})))))))
