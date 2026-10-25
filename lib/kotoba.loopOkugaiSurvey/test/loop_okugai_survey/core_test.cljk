@@ -1,0 +1,128 @@
+(ns loop-okugai-survey.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [denchu.enrich :as denchu-enrich]
+            [loop-okugai-survey.core :as survey]
+            [okugai.medium :as medium]
+            [okugai.route :as route]))
+
+(defn- obs [source id lat lon med & [tags]]
+  {:obs/source source :obs/source-id id :obs/lat lat :obs/lon lon
+   :obs/medium med :obs/tags (or tags {})})
+
+(def areas [(survey/area {:id "test-area" :jurisdiction "JP-13"
+                          :bbox {:south 35.68 :west 139.76 :north 35.69 :east 139.77}})])
+
+(def observations
+  [(obs :osm "node/1" 35.6812 139.7671 :utility-pole {"operator" "東京電力パワーグリッド"})
+   (obs :mapillary "mly-1" 35.681205 139.767105 :utility-pole)
+   (obs :osm "node/2" 35.6850 139.7680 :utility-pole)
+   (obs :osm "node/3" 35.6860 139.7690 :billboard {"operator" "株式会社アトレ"})
+   (obs :osm "way/4" 35.6870 139.7660 :board)])
+
+(def enrich (comp denchu-enrich/site route/stamp))
+
+(deftest default-media-are-only-the-observable-ones
+  (is (= (vec (sort medium/observable-media)) survey/default-media))
+  (testing "観測タグを持たない媒体を既定に入れない（空振りが『無かった』に化ける）"
+    (is (not (some #{:rooftop} survey/default-media)))))
+
+(deftest evaluate-counts-per-medium-and-per-source
+  (let [{:keys [sites measurements]} (survey/evaluate observations {:areas areas})]
+    (is (= 4 (count sites)))
+    (is (= {"billboard" 1 "board" 1 "utility-pole" 2} (:sites-by-medium measurements)))
+    (is (= {:osm 4 :mapillary 1} (:observations-by-source measurements)))
+    (is (= 1 (:sites-multi-source measurements)))
+    (testing "高さは観測から埋まらない"
+      (is (zero? (:sites-with-known-height measurements))))))
+
+(deftest jurisdiction-is-stamped-from-the-declared-area
+  (let [{:keys [sites]} (survey/evaluate observations {:areas areas})]
+    (is (every? #(= "JP-13" (:site/jurisdiction %)) sites))
+    (is (every? #(= "test-area" (:site/survey-area %)) sites))))
+
+(deftest sites-outside-every-area-get-no-jurisdiction
+  (let [{:keys [sites]} (survey/evaluate [(obs :osm "node/9" 10.0 10.0 :board)] {:areas areas})]
+    (is (nil? (:site/jurisdiction (first sites))))))
+
+(deftest route-status-comes-from-general-rule-then-medium-repo
+  (let [{:keys [sites measurements]} (survey/evaluate
+                                      observations
+                                      {:areas areas :enrich enrich
+                                       :operator-resolver denchu-enrich/operator-resolver})
+        by-id (into {} (map (juxt :site/id identity)) sites)]
+    (testing "operator 付きの広告物は観測から照会先の手がかりが立つ"
+      (let [b (first (filter #(= :billboard (:site/medium %)) sites))]
+        (is (= :operator-known (:site/route-status b)))
+        (is (= "株式会社アトレ" (:site/operator b)))))
+    (testing "operator の無い広告物は unresolved（掲出不可ではなく未調査）"
+      (let [b (first (filter #(= :board (:site/medium %)) sites))]
+        (is (= :unresolved (:site/route-status b)))))
+    (testing "電柱は媒体 repo が上書きする —— operator があれば routable"
+      (let [p (first (filter #(and (= :utility-pole (:site/medium %))
+                                   (= :tepco-pg (:site/operator %))) sites))]
+        (is (= :routable (:site/route-status p)))))
+    (testing "operator の無い電柱でも供給区域から候補が立つ"
+      (let [p (first (filter #(and (= :utility-pole (:site/medium %))
+                                   (= :unknown (:site/operator %))) sites))]
+        (is (= :candidate-by-area (:site/route-status p)))
+        (is (seq (:site/owner-candidates p)))))
+    (is (= 4 (count by-id)))
+    (is (= {:routable 1 :candidate-by-area 1 :operator-known 1 :unresolved 1}
+           (:sites-by-route-status measurements)))))
+
+(deftest decide-keeps-below-threshold-ids
+  (let [{:keys [sites]} (survey/evaluate observations {:areas areas})
+        d (survey/decide sites {:min-confidence 0.9})]
+    (is (= 1 (count (:accepted d))))
+    (is (= 3 (count (:below-threshold d))))
+    (let [e (survey/evidence {:areas areas :sources #{:osm} :measurements {}
+                              :decision d :generated-at "2026-08-04" :radius-m 8.0
+                              :media-requested [:billboard]})]
+      (is (= 3 (count (:survey/below-threshold-ids e))))
+      (is (seq (:survey/media-unobservable e))))))
+
+(deftest run-produces-a-shard-with-coverage
+  (let [{:keys [shard evidence]} (survey/run {:areas areas :observations observations
+                                              :sources #{:osm :mapillary}
+                                              :media-requested [:utility-pole :billboard :board]
+                                              :enrich enrich
+                                              :operator-resolver denchu-enrich/operator-resolver
+                                              :generated-at "2026-08-04T00:00:00Z"})
+        cov (first (filter :okugai.coverage/sites shard))]
+    (is (= 4 (:okugai.coverage/sites cov)))
+    (is (= ["billboard" "board" "utility-pole"] (:okugai.coverage/media-requested cov)))
+    (is (= 3 (:okugai.coverage/sites-reachable cov)))
+    (is (seq (:okugai.coverage/media-unobservable cov)))
+    (is (re-find #"屋上看板" (:survey/honesty evidence)))
+    (testing "掲出可否は全件 unknown"
+      (is (every? #(= "unknown" (:site/ad-eligible %)) (filter :site/id shard))))))
+
+(deftest run-is-deterministic
+  (let [opts {:areas areas :observations observations :sources #{:osm}
+              :media-requested [:billboard] :enrich enrich
+              :generated-at "2026-08-04T00:00:00Z"}]
+    (is (= (:shard (survey/run opts)) (:shard (survey/run opts))))))
+
+(deftest a-failed-source-must-not-produce-a-zero-count-shard
+  (testing "全 source が落ちたら shard を出さない — 0 件の台帳は『調べて無かった』と読まれる"
+    (let [r (survey/run {:areas areas :observations [] :sources #{:osm}
+                         :source-errors [{:source :osm :error "overpass request failed"}]
+                         :media-requested [:billboard]
+                         :generated-at "2026-08-04T00:00:00Z"})]
+      (is (nil? (:shard r)))
+      (is (true? (:all-sources-failed r)))
+      (is (true? (:survey/partial (:evidence r))))
+      (is (= 1 (count (:survey/source-errors (:evidence r)))))))
+  (testing "一部だけ落ちたら shard は出すが coverage に失敗を刻む"
+    (let [r (survey/run {:areas areas :observations observations
+                         :sources #{:osm :mapillary}
+                         :source-errors [{:source :mapillary :error "no token"}]
+                         :media-requested [:billboard]
+                         :enrich enrich
+                         :generated-at "2026-08-04T00:00:00Z"})
+          cov (first (filter :okugai.coverage/sites (:shard r)))]
+      (is (some? (:shard r)))
+      (is (false? (:all-sources-failed r)))
+      (is (= 1 (:okugai.coverage/source-errors cov)))
+      (is (= ["mapillary"] (:okugai.coverage/sources-failed cov)))
+      (is (true? (:okugai.coverage/partial cov))))))
