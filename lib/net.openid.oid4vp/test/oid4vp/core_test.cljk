@@ -1,0 +1,264 @@
+(ns oid4vp.core-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [oid4vp.core :as oid4vp]))
+
+;; 22 characters: 128 bits of base64url, the floor §5.3 sets for `state`.
+(def a-nonce "kZ3rQ9vXbN2mLp7sT4wYh1")
+(def a-state "Rj8nW2qK5vZ7cM1xB4tG6y")
+
+(defn- request [& {:as overrides}]
+  (oid4vp/authorization-request
+   (merge {:client-id "redirect_uri:https://verifier.example/cb"
+           :response-mode "direct_post"
+           :response-uri "https://verifier.example/cb"
+           :nonce a-nonce
+           :state a-state
+           :dcql-query (oid4vp/dcql-query
+                        [(oid4vp/credential-query
+                          {:id "membership" :format "ldp_vc"
+                           :claims [["credentialSubject" "role"]]})])}
+          overrides)))
+
+(defn- error-of [f]
+  (:oid4vp/error (ex-data (try (f) nil (catch clojure.lang.ExceptionInfo e e)))))
+
+;; ── Authorization Request (§5) ────────────────────────────────────────────────
+
+(deftest a-well-formed-request
+  (let [r (request)]
+    (is (= "vp_token" (get r "response_type")))
+    (is (= "direct_post" (get r "response_mode")))
+    (is (= a-nonce (get r "nonce")))
+    (is (= a-state (get r "state")))
+    (is (= "redirect_uri:https://verifier.example/cb" (get r "client_id")))
+    (is (some? (get r "dcql_query")))))
+
+(deftest required-parameters-are-required
+  (is (= :oid4vp/missing-client-id (error-of #(request :client-id nil))))
+  (is (= :oid4vp/missing-client-id (error-of #(request :client-id "   "))))
+  (is (= :oid4vp/bad-response-mode (error-of #(request :response-mode "query"))))
+  (is (= :oid4vp/bad-response-mode (error-of #(request :response-mode nil))))
+  (is (= :oid4vp/missing-nonce (error-of #(request :nonce nil)))))
+
+(deftest the-nonce-must-be-able-to-carry-entropy
+  (testing "§5 wants sufficient entropy for every request; a short string cannot
+            carry 128 bits in any common encoding, whatever the caller intended"
+    (is (= :oid4vp/weak-nonce (error-of #(request :nonce "abc"))))
+    (is (= :oid4vp/weak-nonce (error-of #(request :nonce (apply str (repeat 21 "a"))))))
+    (is (map? (request :nonce (apply str (repeat 22 "a")))))))
+
+(deftest dcql-query-xor-scope
+  (is (= :oid4vp/both-query-and-scope
+         (error-of #(request :scope "membership"))))
+  (is (= :oid4vp/no-query
+         (error-of #(request :dcql-query nil :scope nil))))
+  (testing "scope alone is legitimate"
+    (let [r (request :dcql-query nil :scope "membership")]
+      (is (= "membership" (get r "scope")))
+      (is (nil? (get r "dcql_query"))))))
+
+;; ── §5.3: the invariant this library exists for ───────────────────────────────
+
+(deftest state-is-required-when-presentations-carry-no-key-binding
+  (testing "with no key binding the nonce is not echoed back, so state is the only
+            thing binding the response to the session. Without it the response is
+            replayable by anyone who observes it once."
+    (is (= :oid4vp/state-required-without-holder-binding
+           (error-of #(request :state nil))))
+    (is (= :oid4vp/state-required-without-holder-binding
+           (error-of #(request :state "" :holder-binding? false)))))
+
+  (testing "state must carry 128 bits"
+    (is (= :oid4vp/weak-state (error-of #(request :state "short"))))
+    (is (= :oid4vp/weak-state
+           (error-of #(request :state (apply str (repeat 21 "a")))))))
+
+  (testing "with a key binding, state becomes optional — the nonce is in the proof"
+    (is (map? (request :state nil :holder-binding? true)))))
+
+(deftest holder-binding-defaults-to-false
+  (testing "the weaker assumption is the default on purpose: a caller who has not
+            thought about binding gets the strict state requirement rather than a
+            silently replayable exchange"
+    (is (= :oid4vp/state-required-without-holder-binding
+           (error-of #(oid4vp/authorization-request
+                       {:client-id "https://verifier.example"
+                        :response-mode "direct_post"
+                        :response-uri "https://verifier.example/cb"
+                        :nonce a-nonce
+                        :scope "membership"}))))))
+
+;; ── response modes ───────────────────────────────────────────────────────────
+
+(deftest response-mode-companion-parameters
+  (is (= :oid4vp/missing-response-uri
+         (error-of #(request :response-uri nil))))
+  (is (= :oid4vp/missing-response-uri
+         (error-of #(request :response-mode "direct_post.jwt" :response-uri nil))))
+  (is (= :oid4vp/missing-redirect-uri
+         (error-of #(request :response-mode "fragment" :response-uri nil
+                             :redirect-uri nil))))
+  (testing "fragment with a redirect_uri is fine"
+    (is (= "https://verifier.example/cb"
+           (get (request :response-mode "fragment" :response-uri nil
+                         :redirect-uri "https://verifier.example/cb")
+                "redirect_uri")))))
+
+;; ── client_id prefixes (§5.9) ────────────────────────────────────────────────
+
+(deftest client-id-prefixes-are-recognised
+  (doseq [prefix oid4vp/client-id-prefixes]
+    (is (= {:prefix prefix :value "x"}
+           (oid4vp/parse-client-id (str prefix ":x")))
+        (str "prefix " prefix))))
+
+(deftest an-unprefixed-client-id-is-pre-registered-not-an-error
+  (testing "§5.9 allows it; it just carries no information about who the Verifier
+            is, which is why the parse result says so explicitly"
+    (is (= {:prefix nil :value "https://verifier.example"}
+           (oid4vp/parse-client-id "https://verifier.example")))
+    (testing "and not every colon is a prefix separator"
+      (is (= {:prefix nil :value "https://verifier.example:8443/cb"}
+             (oid4vp/parse-client-id "https://verifier.example:8443/cb")))
+      (is (= {:prefix nil :value "urn:example:verifier"}
+             (oid4vp/parse-client-id "urn:example:verifier"))))))
+
+;; ── DCQL (§6) ────────────────────────────────────────────────────────────────
+
+(deftest dcql-shape
+  (testing "§6.1: credentials is a REQUIRED non-empty array"
+    (is (= :oid4vp/dcql-credentials-empty
+           (error-of #(oid4vp/validate-dcql-query {"credentials" []}))))
+    (is (= :oid4vp/dcql-credentials-empty
+           (error-of #(oid4vp/validate-dcql-query {}))))
+    (is (= :oid4vp/dcql-not-an-object
+           (error-of #(oid4vp/validate-dcql-query "nope")))))
+
+  (testing "each Credential Query needs an id and a format"
+    (is (= :oid4vp/dcql-credential-id-missing
+           (error-of #(oid4vp/validate-dcql-query
+                       {"credentials" [{"format" "ldp_vc"}]}))))
+    (is (= :oid4vp/dcql-credential-format-missing
+           (error-of #(oid4vp/validate-dcql-query
+                       {"credentials" [{"id" "a"}]})))))
+
+  (testing "a claim needs a non-empty path array"
+    (is (= :oid4vp/dcql-claim-path-empty
+           (error-of #(oid4vp/validate-dcql-query
+                       {"credentials" [{"id" "a" "format" "ldp_vc"
+                                        "claims" [{"path" []}]}]}))))
+    (is (= :oid4vp/dcql-claim-path-empty
+           (error-of #(oid4vp/validate-dcql-query
+                       {"credentials" [{"id" "a" "format" "ldp_vc"
+                                        "claims" [{}]}]})))))
+
+  (testing "duplicate ids would make a response ambiguous about what it answers"
+    (is (= :oid4vp/dcql-duplicate-credential-id
+           (error-of #(oid4vp/validate-dcql-query
+                       {"credentials" [{"id" "a" "format" "ldp_vc"}
+                                       {"id" "a" "format" "dc+sd-jwt"}]}))))))
+
+(deftest credential-query-builder
+  (let [q (oid4vp/credential-query
+           {:id "membership" :format "ldp_vc"
+            :claims [["credentialSubject" "role"] ["issuer"]]})]
+    (is (= "membership" (get q "id")))
+    (is (= "ldp_vc" (get q "format")))
+    (is (= [{"path" ["credentialSubject" "role"]} {"path" ["issuer"]}]
+           (get q "claims")))
+    (testing "`multiple` is omitted unless asked for"
+      (is (not (contains? q "multiple")))
+      (is (true? (get (oid4vp/credential-query
+                       {:id "a" :format "ldp_vc" :multiple true})
+                      "multiple"))))))
+
+;; ── Authorization Response (§8) ──────────────────────────────────────────────
+
+(def session {:state a-state :nonce a-nonce :holder-binding? false})
+
+(deftest a-matching-response-validates
+  (let [r (oid4vp/validate-response {"vp_token" "eyJ..." "state" a-state} session)]
+    (is (:valid? r))
+    (is (= "eyJ..." (:vp-token r)))
+    (is (= a-state (:state r)))
+    (testing "and says out loud that it checked only the envelope"
+      (is (true? (:envelope-only? r))))))
+
+(deftest a-response-for-another-session-is-rejected
+  (testing "this is the whole purpose of state when there is no key binding"
+    (let [r (oid4vp/validate-response
+             {"vp_token" "eyJ..." "state" "Xj8nW2qK5vZ7cM1xB4tG6y"} session)]
+      (is (false? (:valid? r)))
+      (is (= :oid4vp/state-mismatch (:reason r))))))
+
+(deftest a-response-missing-state-is-rejected
+  (let [r (oid4vp/validate-response {"vp_token" "eyJ..."} session)]
+    (is (false? (:valid? r)))
+    (is (= :oid4vp/state-mismatch (:reason r)))))
+
+(deftest a-response-without-a-vp-token-is-rejected
+  (doseq [response [{"state" a-state} {"vp_token" "" "state" a-state}]]
+    (let [r (oid4vp/validate-response response session)]
+      (is (false? (:valid? r)))
+      (is (= :oid4vp/missing-vp-token (:reason r))))))
+
+(deftest a-malformed-response-is-an-answer-not-an-exception
+  (doseq [response ["nope" nil 42 []]]
+    (let [r (oid4vp/validate-response response session)]
+      (is (false? (:valid? r)) (str (pr-str response)))
+      (is (some? (:reason r))))))
+
+(deftest a-state-we-never-issued-is-rejected
+  (testing "a bound session has no state, so a response carrying one is not ours"
+    (let [bound {:nonce a-nonce :holder-binding? true}
+          r (oid4vp/validate-response {"vp_token" "eyJ..." "state" "whatever"} bound)]
+      (is (false? (:valid? r)))
+      (is (= :oid4vp/unexpected-state (:reason r))))))
+
+(deftest a-bound-session-needs-no-state
+  (let [bound {:nonce a-nonce :holder-binding? true}
+        r (oid4vp/validate-response {"vp_token" "eyJ..."} bound)]
+    (is (:valid? r))
+    (is (= "eyJ..." (:vp-token r)))))
+
+(deftest an-unbound-session-without-state-is-the-callers-bug
+  (testing "the request should have been refused when it was built, so there is
+            nothing to check against and throwing is the only safe answer"
+    (is (= :oid4vp/session-without-state
+           (error-of #(oid4vp/validate-response
+                       {"vp_token" "eyJ..."} {:holder-binding? false}))))
+    (is (= :oid4vp/no-session
+           (error-of #(oid4vp/validate-response {"vp_token" "eyJ..."} nil))))))
+
+;; ── encoding ─────────────────────────────────────────────────────────────────
+
+(defn- fake-json [v]
+  ;; Deliberately not real JSON. These tests are about which parameters get
+  ;; encoded as objects, not about an encoder this library does not own.
+  (str "<json:" (pr-str v) ">"))
+
+(deftest request-encoding
+  (let [r (request)
+        pairs (into {} (oid4vp/request->query-params r fake-json))]
+    (testing "object-valued parameters go through the injected encoder"
+      (is (str/starts-with? (get pairs "dcql_query") "<json:")))
+    (testing "scalars do not"
+      (is (= a-nonce (get pairs "nonce")))
+      (is (= "vp_token" (get pairs "response_type")))))
+
+  (testing "the URL is form-encoded and keeps an existing query string"
+    (let [url (oid4vp/request->url "openid4vp://" (request) fake-json)]
+      (is (str/starts-with? url "openid4vp://?"))
+      (is (str/includes? url "response_type=vp_token"))
+      (is (str/includes? url (str "nonce=" a-nonce)))
+      ;; the client_id contains `:` and `/`, which must be escaped
+      (is (str/includes? url "client_id=redirect_uri%3Ahttps%3A%2F%2F"))
+      (is (not (str/includes? url "client_id=redirect_uri:https://"))))
+    (let [url (oid4vp/request->url "https://wallet.example/authorize?x=1"
+                                   (request) fake-json)]
+      (is (str/includes? url "?x=1&"))))
+
+  (testing "parameters are ordered, so the same request encodes identically"
+    (is (= (oid4vp/request->url "openid4vp://" (request) fake-json)
+           (oid4vp/request->url "openid4vp://" (request) fake-json)))))

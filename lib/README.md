@@ -149,6 +149,7 @@ The bundled standard libraries live in this repository:
 | `org.si2.def` | `org.si2.def/src` | `def-format.component`, `def-format.design`, `def-format.net`, `def-format.parser` (an external specification, publisher si2.org) |
 | `org.etsi.pades` | `org.etsi.pades/src` | `pades.core` (an external specification, publisher etsi.org) |
 | `org.ros.urdf` | `org.ros.urdf/src` | `articulated_scene` (an external specification, publisher ros.org) |
+| `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
 | `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |
