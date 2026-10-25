@@ -1,0 +1,194 @@
+(ns nekko.push-gate-test
+  (:require [kotoba.test :refer [deftest is testing]]
+  [nekko.bytes :as nb]
+            [ed25519.core :as ed]
+            [nekko.identity :as identity]
+            [nekko.delegate :as delegate]
+            [nekko.sigref :as sigref]
+            [nekko.biscuit-delegate :as bd]
+            [nekko.push-gate :as push-gate]))
+
+(defn- new-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))}))
+
+(def owner-seed (nb/->ba (range 32)))
+(def delegate-seed (nb/->ba (map #(mod (+ % 1) 256) (range 32))))
+(def outsider-seed (nb/->ba (map #(mod (+ % 3) 256) (range 32))))
+
+(deftest owner-signed-push-is-authorized
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        sr (sigref/sign owner-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (true? (push-gate/authorize-push? get-fn nil owner-did rid "refs/heads/main" "commit-1" sr)))))
+
+(deftest delegate-signed-push-is-authorized-once-added
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        delegate-did (ed/did-key-from-seed delegate-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        head (delegate/add-delegate! put! get-fn nil owner-did owner-seed delegate-did 1001)
+        sr (sigref/sign delegate-seed rid "refs/heads/main" "commit-1" 1002)]
+    (is (true? (push-gate/authorize-push? get-fn head owner-did rid "refs/heads/main" "commit-1" sr)))))
+
+(deftest outsider-signed-push-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        sr (sigref/sign outsider-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (false? (push-gate/authorize-push? get-fn nil owner-did rid "refs/heads/main" "commit-1" sr)))))
+
+(deftest mismatched-ref-target-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        sr (sigref/sign owner-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (false? (push-gate/authorize-push? get-fn nil owner-did rid "refs/heads/main" "commit-DIFFERENT" sr)))))
+
+(deftest revoked-delegate-push-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        delegate-did (ed/did-key-from-seed delegate-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        head1 (delegate/add-delegate! put! get-fn nil owner-did owner-seed delegate-did 1001)
+        head2 (delegate/remove-delegate! put! get-fn head1 owner-did owner-seed delegate-did 1002)
+        sr (sigref/sign delegate-seed rid "refs/heads/main" "commit-1" 1003)]
+    (is (true? (push-gate/authorize-push? get-fn head1 owner-did rid "refs/heads/main" "commit-1" sr)))
+    (is (false? (push-gate/authorize-push? get-fn head2 owner-did rid "refs/heads/main" "commit-1" sr)))))
+
+(deftest mismatched-ref-name-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        sr (sigref/sign owner-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (false? (push-gate/authorize-push? get-fn nil owner-did rid "refs/heads/other" "commit-1" sr)))))
+
+(deftest mismatched-rid-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        owner-did (ed/did-key-from-seed owner-seed)
+        rid (identity/genesis! put! owner-did 1000)
+        other-rid (identity/genesis! put! owner-did 2000)
+        sr (sigref/sign owner-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (false? (push-gate/authorize-push? get-fn nil owner-did other-rid "refs/heads/main" "commit-1" sr)))))
+
+;; ── authorize-push-biscuit (journal-free, a Biscuit rooted at the owner) ──
+
+(def rid "rid-1")
+(def now "2026-09-24T00:00:00Z")
+
+(defn- token-for [seed]
+  (let [did (ed/did-key-from-seed seed)]
+    (bd/grant owner-seed {:resources [(bd/push-resource-wildcard rid)]
+                          :next-did did :holder did :expires "2099-01-01T00:00:00Z"})))
+
+(deftest biscuit-authorizes-a-push-without-any-journal
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        sr (sigref/sign delegate-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (= {:allowed? true :holder (ed/did-key-from-seed delegate-seed)}
+           (push-gate/authorize-push-biscuit (token-for delegate-seed) owner-did rid
+                                             "refs/heads/main" "commit-1" sr {:now now})))))
+
+(deftest biscuit-rejects-an-outsiders-signature-even-with-a-valid-token
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        sr (sigref/sign outsider-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (= :wrong-holder
+           (:reason (push-gate/authorize-push-biscuit (token-for delegate-seed) owner-did rid
+                                                      "refs/heads/main" "commit-1" sr
+                                                      {:now now}))))))
+
+(deftest biscuit-mismatched-commit-is-rejected
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        sr (sigref/sign delegate-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (= {:allowed? false :reason :sigref-mismatch}
+           (push-gate/authorize-push-biscuit (token-for delegate-seed) owner-did rid
+                                             "refs/heads/main" "commit-DIFFERENT" sr
+                                             {:now now})))))
+
+(deftest a-cacao-chain-is-refused-by-name-at-the-gate
+  (testing "superproject adr-2609241800: CACAO is an Authn exchange credential, not a grant"
+    (let [owner-did (ed/did-key-from-seed owner-seed)
+          sr (sigref/sign delegate-seed rid "refs/heads/main" "commit-1" 1001)]
+      (is (= {:allowed? false :reason :cacao-not-accepted}
+             (push-gate/authorize-push-biscuit ["o2FoomF0Z2VpcDQzNjE"] owner-did rid
+                                               "refs/heads/main" "commit-1" sr
+                                               {:now now}))))))
+
+(deftest biscuit-expiry-and-the-clock
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        did (ed/did-key-from-seed delegate-seed)
+        expired (bd/grant owner-seed {:resources [(bd/push-resource-wildcard rid)]
+                                      :next-did did :holder did
+                                      :expires "2020-06-01T00:00:00Z"})
+        sr (sigref/sign delegate-seed rid "refs/heads/main" "commit-1" 1001)]
+    (is (= :expired-or-no-trusted-time
+           (:reason (push-gate/authorize-push-biscuit expired owner-did rid "refs/heads/main"
+                                                      "commit-1" sr {:now now}))))
+    (is (= :expired-or-no-trusted-time
+           (:reason (push-gate/authorize-push-biscuit (token-for delegate-seed) owner-did rid
+                                                      "refs/heads/main" "commit-1" sr {})))
+        "no clock is a denial, not a skipped check")))
+
+;; ---------- authorize-push-multi-biscuit? (quorum / separation of duties) ----------
+
+(def second-delegate-seed (nb/->ba (map #(mod (+ % 5) 256) (range 32))))
+
+(defn- approval [seed]
+  {:sigref (sigref/sign seed rid "refs/heads/main" "commit-1" 1001)
+   :token (token-for seed)})
+
+(deftest multi-two-distinct-authorized-signers-satisfy-a-2-quorum
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        approvals [(approval delegate-seed) (approval second-delegate-seed)]]
+    (is (true? (push-gate/authorize-push-multi-biscuit?
+                approvals 2 owner-did rid "refs/heads/main" "commit-1" {:now now})))
+    (is (= #{(ed/did-key-from-seed delegate-seed)
+             (ed/did-key-from-seed second-delegate-seed)}
+           (push-gate/authorized-signers-biscuit
+            approvals owner-did rid "refs/heads/main" "commit-1" {:now now})))))
+
+(deftest multi-the-same-signer-twice-counts-once
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        approvals [(approval delegate-seed) (approval delegate-seed)]]
+    (is (false? (push-gate/authorize-push-multi-biscuit?
+                 approvals 2 owner-did rid "refs/heads/main" "commit-1" {:now now})))
+    (is (true? (push-gate/authorize-push-multi-biscuit?
+                approvals 1 owner-did rid "refs/heads/main" "commit-1" {:now now})))))
+
+(deftest multi-excluded-did-never-counts-toward-the-quorum
+  (testing "separation of duties: the proposer's own approval is inert"
+    (let [owner-did (ed/did-key-from-seed owner-seed)
+          proposer-did (ed/did-key-from-seed delegate-seed)
+          approvals [(approval delegate-seed) (approval second-delegate-seed)]]
+      (is (false? (push-gate/authorize-push-multi-biscuit?
+                   approvals 2 owner-did rid "refs/heads/main" "commit-1"
+                   {:now now :exclude-dids #{proposer-did}})))
+      (is (true? (push-gate/authorize-push-multi-biscuit?
+                  approvals 1 owner-did rid "refs/heads/main" "commit-1"
+                  {:now now :exclude-dids #{proposer-did}}))))))
+
+(deftest multi-an-unauthorized-approval-does-not-count
+  (testing "an outsider's approval (valid sigref, token rooted at the outsider) is ignored"
+    (let [owner-did (ed/did-key-from-seed owner-seed)
+          outsider-did (ed/did-key-from-seed outsider-seed)
+          bogus {:sigref (sigref/sign outsider-seed rid "refs/heads/main" "commit-1" 1001)
+                 :token (bd/grant outsider-seed {:resources [(bd/push-resource-wildcard rid)]
+                                                 :next-did outsider-did :holder outsider-did
+                                                 :expires "2099-01-01T00:00:00Z"})}
+          approvals [(approval delegate-seed) bogus]]
+      (is (false? (push-gate/authorize-push-multi-biscuit?
+                   approvals 2 owner-did rid "refs/heads/main" "commit-1" {:now now}))))))
+
+(deftest multi-a-sigref-for-a-different-commit-does-not-count
+  (let [owner-did (ed/did-key-from-seed owner-seed)
+        stale {:sigref (sigref/sign second-delegate-seed rid "refs/heads/main" "commit-OLD" 1001)
+               :token (token-for second-delegate-seed)}
+        approvals [(approval delegate-seed) stale]]
+    (is (false? (push-gate/authorize-push-multi-biscuit?
+                 approvals 2 owner-did rid "refs/heads/main" "commit-1" {:now now})))))
+
+(deftest multi-zero-quorum-is-the-auto-merge-tier
+  (let [owner-did (ed/did-key-from-seed owner-seed)]
+    (is (true? (push-gate/authorize-push-multi-biscuit?
+                [] 0 owner-did rid "refs/heads/main" "commit-1" {:now now})))))

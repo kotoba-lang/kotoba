@@ -1,0 +1,86 @@
+(ns nekko.ref-event-test
+  (:require [arrangement.core :as arr]
+            [kotoba.test :refer [deftest is testing]]
+            [nekko.bytes :as nb]
+            [ed25519.core :as ed]
+            [nekko.canonical-projection :as canonical]
+            [nekko.ref-event :as event]))
+
+(def alice-seed (nb/->ba (repeat 32 1)))
+(def bob-seed (nb/->ba (repeat 32 2)))
+(def carol-seed (nb/->ba (repeat 32 3)))
+(def alice (ed/did-key-from-seed alice-seed))
+(def bob (ed/did-key-from-seed bob-seed))
+(def carol (ed/did-key-from-seed carol-seed))
+(def delegates #{alice bob carol})
+
+(defn signed-event
+  ([seed new] (signed-event seed nil new nil 1))
+  ([seed old new prev seq]
+   (event/sign seed {:rid "rid-1" :ref "refs/heads/main" :old old :new new
+                     :manifest (str "manifest-" new) :prev prev :seq seq})))
+
+(deftest admission-is-causal-idempotent-and-namespaced
+  (let [db0 (arr/empty-db)
+        a1 (signed-event alice-seed "commit-a")
+        [db1 a1-cid] (event/admit db0 delegates (constantly true) a1)
+        b1 (signed-event bob-seed "commit-b")
+        [db2 _] (event/admit db1 delegates (constantly true) b1)
+        a2 (signed-event alice-seed "commit-a" "commit-c" a1-cid 2)
+        [db3 a2-cid] (event/admit db2 delegates (constantly true) a2)
+        [same same-cid] (event/admit db3 delegates (constantly false) a2)]
+    (is (= a2-cid same-cid))
+    (is (= db3 same))
+    (is (= "commit-c" (get (event/current-event db3 "rid-1" alice "refs/heads/main") "new")))
+    (is (= "commit-b" (get (event/current-event db3 "rid-1" bob "refs/heads/main") "new")))
+    (testing "a divergent event cannot overwrite the current namespace"
+      (let [bad (signed-event alice-seed "commit-a" "commit-x" a1-cid 2)]
+        (is (= :prev-mismatch
+               (try (event/admit db3 delegates (constantly true) bad)
+                    nil
+                    (catch #?(:clj Exception :cljs js/Error) e (:reason (ex-data e))))))))))
+
+(deftest admission-fails-closed
+  (let [db (arr/empty-db)
+        outsider (signed-event (nb/->ba (repeat 32 9)) "commit-x")
+        valid (signed-event alice-seed "commit-a")]
+    (is (= :unauthorized
+           (try (event/admit db delegates (constantly true) outsider)
+                nil (catch #?(:clj Exception :cljs js/Error) e (:reason (ex-data e))))))
+    (is (= :invalid-closure
+           (try (event/admit db delegates (constantly false) valid)
+                nil (catch #?(:clj Exception :cljs js/Error) e (:reason (ex-data e))))))))
+
+(deftest canonical-projection-is-order-independent-and-explicit
+  (let [events [(signed-event alice-seed "commit-a")
+                (signed-event bob-seed "commit-a")
+                (signed-event carol-seed "commit-b")]
+        build (fn [xs]
+                (reduce (fn [db e] (first (event/admit db delegates (constantly true) e)))
+                        (arr/empty-db) xs))
+        policy {:rid "rid-1" :ref "refs/heads/main" :delegates delegates
+                :threshold 2 :identity-revision "identity-7"}
+        [db-a result-a] (canonical/materialize (build events) policy)
+        [_ result-b] (canonical/materialize (build (reverse events)) policy)]
+    (is (= :canonical (:status result-a)))
+    (is (= "commit-a" (:commit result-a)))
+    (is (= (:receipt-cid result-a) (:receipt-cid result-b)))
+    (is (= (select-keys result-a [:status :commit :receipt-cid])
+           (canonical/current db-a "rid-1" "refs/heads/main")))
+    (is (= "canonical" (get (canonical/receipt db-a (:receipt-cid result-a)) "status")))))
+
+(deftest split-quorum-clears-stale-canonical-target
+  (let [four-seeds [alice-seed bob-seed carol-seed (nb/->ba (repeat 32 4))]
+        four-dids (set (map ed/did-key-from-seed four-seeds))
+        db (reduce (fn [db [seed commit]]
+                     (first (event/admit db four-dids (constantly true)
+                                         (signed-event seed commit))))
+                   (arr/empty-db)
+                   (map vector four-seeds ["a" "a" "b" "b"]))
+        [db result] (canonical/materialize
+                     db {:rid "rid-1" :ref "refs/heads/main"
+                         :delegates four-dids :threshold 2
+                         :identity-revision "identity-8"})]
+    (is (= :split-quorum (:status result)))
+    (is (= ["a" "b"] (:candidates result)))
+    (is (nil? (:commit (canonical/current db "rid-1" "refs/heads/main"))))))

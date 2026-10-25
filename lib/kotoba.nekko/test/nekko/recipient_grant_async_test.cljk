@@ -1,0 +1,145 @@
+(ns nekko.recipient-grant-async-test
+  "Cross-backend contract test: a grant is a grant regardless of which host
+  sealed it. Runs under nbb, the one runtime where BOTH backends work -- node
+  exposes node:crypto (the sync .cljc branch) and WebCrypto (the async .cljs
+  namespace) at the same time, so both directions can be proven in-process
+  rather than by eyeballing hex.
+
+  This is the first test of any kind over `nekko.recipient-grant`'s :cljs
+  branch: `package.json`'s `test` script is `kbb -M:test`, which only ever
+  compiled the :clj side.
+
+  Run: npm run test:async"
+  (:require [cljs.test :refer [deftest is testing async run-tests]]
+            [nekko.bytes :as b]
+            [nekko.recipient-grant :as sync]
+            [nekko.recipient-grant-async :as a]))
+
+(defn- rejects?
+  "-> Promise<boolean> did `p` reject? A tampered grant must not open, and a
+  test that treats 'resolved with garbage' as success would be worthless."
+  [p]
+  (-> p (.then (fn [_] false)) (.catch (fn [_] true))))
+
+(deftest async-roundtrip
+  (async done
+    (let [key-hex (a/new-epoch-key)]
+      (-> (a/gen-recipient-keypair)
+          (.then (fn [{:keys [priv pub]}]
+                   (is (= 64 (count priv)) "raw 32-byte private key as hex")
+                   (is (= 64 (count pub)) "raw 32-byte public key as hex")
+                   (-> (a/grant 1 pub (a/unhex key-hex))
+                       (.then (fn [g]
+                                (is (= 1 (:v g)))
+                                (is (= pub (:recipient g)))
+                                (is (= (apply str (repeat 24 "0")) (:iv g))
+                                    "12-byte zero iv, as the sync namespace writes")
+                                (is (= 96 (count (:ct g)))
+                                    "32B epoch key + 16B GCM tag = 48B = 96 hex")
+                                (a/open g priv)))
+                       (.then (fn [opened]
+                                (is (= key-hex (a/hexify opened))
+                                    "async seal -> async open")
+                                (done))))))
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(deftest async-seal-sync-open
+  (testing "a Worker-sealed grant opens on the node/JVM sync backend"
+    (async done
+      (let [key-hex (a/new-epoch-key)]
+        (-> (a/gen-recipient-keypair)
+            (.then (fn [{:keys [priv pub]}]
+                     (-> (a/grant 7 pub (a/unhex key-hex))
+                         (.then (fn [g]
+                                  ;; the sync namespace is handed the async
+                                  ;; grant map untouched -- if ecdh, the
+                                  ;; SHA-256 wrap-key, or the GCM layout
+                                  ;; differed by one bit, the tag check fails.
+                                  (is (= key-hex (b/hexify (sync/open g priv)))
+                                      "async grant -> sync open")
+                                  (done))))))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest sync-seal-async-open
+  (testing "a JVM/nbb-sealed grant opens in a browser or Worker"
+    (async done
+      (let [{:keys [priv pub]} (sync/gen-recipient-keypair)
+            key-hex (sync/new-epoch-key)
+            g (sync/grant 3 pub (b/unhex key-hex))]
+        (-> (a/open g priv)
+            (.then (fn [opened]
+                     (is (= key-hex (a/hexify opened)) "sync grant -> async open")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest keys-are-interchangeable
+  (testing "a keypair minted on either backend is usable by the other"
+    (async done
+      (-> (a/gen-recipient-keypair)
+          (.then (fn [{web-priv :priv web-pub :pub}]
+                   (let [{node-priv :priv node-pub :pub} (sync/gen-recipient-keypair)
+                         key-hex (a/new-epoch-key)
+                         ;; sync seals to the WEBCRYPTO-minted pubkey
+                         g1 (sync/grant 1 web-pub (b/unhex key-hex))]
+                     (-> (a/open g1 web-priv)
+                         (.then (fn [o1]
+                                  (is (= key-hex (a/hexify o1))
+                                      "WebCrypto-minted key, sealed by node")
+                                  ;; async seals to the NODE-minted pubkey
+                                  (a/grant 1 node-pub (a/unhex key-hex))))
+                         (.then (fn [g2]
+                                  (is (= key-hex (b/hexify (sync/open g2 node-priv)))
+                                      "node-minted key, sealed by WebCrypto")
+                                  (done)))))))
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(deftest tampering-and-wrong-key-are-rejected
+  (async done
+    (let [key-hex (a/new-epoch-key)]
+      (-> (a/gen-recipient-keypair)
+          (.then (fn [{:keys [priv pub]}]
+                   (-> (a/grant 1 pub (a/unhex key-hex))
+                       (.then (fn [g]
+                                (let [flipped (str (subs (:ct g) 0 (- (count (:ct g)) 2))
+                                                   (if (= "00" (subs (:ct g) (- (count (:ct g)) 2)))
+                                                     "01" "00"))
+                                      other (sync/gen-recipient-keypair)]
+                                  (js/Promise.all
+                                   #js [(rejects? (a/open (assoc g :ct flipped) priv))
+                                        (rejects? (a/open g (:priv other)))]))))
+                       (.then (fn [[tampered-rejected wrong-key-rejected]]
+                                (is tampered-rejected "flipped ciphertext must not open")
+                                (is wrong-key-rejected "a foreign key must not open")
+                                (done))))))
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(deftest opens-the-checked-in-fixture
+  (testing "a grant sealed by WebCrypto in 2026-07 still opens (format lock)"
+    (async done
+      ;; TEST VECTOR ONLY -- this private key protects nothing and never did.
+      ;; Its job is to fail loudly if anyone changes the wrap-key digest, the
+      ;; iv convention, or the DER prefixes: those are wire format, not
+      ;; implementation detail.
+      (let [g {:v 1 :epoch 42
+               :recipient "422f2aadee7fe93d2b5cdefad753e97e487c578e8be52f7f3e79b6f8191f9d20"
+               :eph "0b5c044ec7d2b552bb6e7e467853eb94adeff373e8c4ab475dac40992685fa5c"
+               :iv "000000000000000000000000"
+               :ct (str "e25d1b4ce2684e5a69c1400aa2327e6a572d6a4587b23c2b"
+                        "00a8e36ac55b346adbc69cbe7191787967fc498df9798636")}
+            priv "30df693344e826538851f08272e70c3a47a9b5ce63e378c2c0228f3c83df6f43"
+            expected "b68d734647a63bbb9a2372886727c35fde3f842f95f4cde1685697a10099fbc6"]
+        (-> (a/open g priv)
+            (.then (fn [opened]
+                     (is (= expected (a/hexify opened)))
+                     ;; and the sync backend must agree about the same bytes
+                     (is (= expected (b/hexify (sync/open g priv))))
+                     (done)))
+            (.catch (fn [e] (is false (str "fixture failed to open: " e)) (done))))))))
+
+(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]
+  (println (str "\n" (:test m) " tests, " (:pass m) " assertions passed, "
+                (:fail m) " failed, " (:error m) " errored"))
+  (when (pos? (+ (:fail m) (:error m)))
+    (js/process.exit 1)))
+
+(run-tests)
