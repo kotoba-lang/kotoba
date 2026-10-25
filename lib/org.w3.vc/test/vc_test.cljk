@@ -1,0 +1,109 @@
+(ns vc-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def source (slurp "lib/org.w3.vc/src/vc.kotoba"))
+(defn call [kir function & args] (ir/execute kir function (vec args)))
+(defn dnull [] ["null"])
+(defn dbool [value] ["bool" value])
+(defn dstr [value] ["string" value])
+(defn dkw [value] ["keyword" value])
+(defn dvec [& values] ["vector" (vec values)])
+(defn dmap [entries]
+  ["map" (->> entries (sort-by (comp str key))
+              (mapv (fn [[key value]] [(dkw key) value])))])
+(defn dget [document key]
+  (some (fn [[candidate value]] (when (= candidate (dkw key)) value)) (second document)))
+
+(deftest reference-preserves-vc-contract
+  (let [kir (:kir (compiler/compile-source source :js-kotoba-v1))
+        subject (dmap {:id (dstr "did:example:alice") :name (dstr "Alice")})
+        proof (dmap {:type (dstr "DataIntegrityProof")})
+        credential
+        (call kir 'credential
+              (dmap {:id (dstr "urn:vc:1")
+                     :issuer (dstr "did:web:issuer.example")
+                     :subject subject
+                     :type (dkw :EmployeeCredential)
+                     :valid-from (dstr "2026-07-01T00:00:00Z")
+                     :valid-until (dstr "2027-07-01T00:00:00Z")
+                     :proof proof
+                     :status (dmap {:id (dstr "urn:status:1")})
+                     :schema (dmap {:id (dstr "urn:schema:1")})
+                     :context (dstr "https://example.test/context")}))
+        presentation
+        (call kir 'presentation
+              (dmap {:id (dstr "urn:vp:1")
+                     :holder (dstr "did:example:alice")
+                     :credentials credential
+                     :proof proof}))]
+    (is (= (keyword "@context") (call kir 'context-key)))
+    (is (= "https://www.w3.org/ns/credentials/v2" (call kir 'vc-context-v2)))
+    (is (= (dvec (dstr "VerifiableCredential") (dstr "EmployeeCredential"))
+           (dget credential :type)))
+    (is (= (dvec (dstr "https://example.test/context"))
+           (dget credential (keyword "@context"))))
+    (is (= subject (dget credential :credentialSubject)))
+    (is (= proof (dget credential :proof)))
+    (is (= (dstr "2026-07-01T00:00:00Z") (dget credential :validFrom)))
+    (is (= (dstr "2027-07-01T00:00:00Z") (dget credential :validUntil)))
+    (is (= (dvec (dstr "VerifiableCredential") (dstr "EmployeeCredential"))
+           (call kir 'types (dvec (dkw :EmployeeCredential)
+                                  (dkw :EmployeeCredential)))))
+    (is (true? (call kir 'credential? credential)))
+    (is (false? (call kir 'presentation? credential)))
+    (is (true? (call kir 'presentation? presentation)))
+    (is (= (dvec credential) (dget presentation :verifiableCredential)))
+    (is (= (dbool true) (dget (call kir 'validate credential) :valid?)))
+    (is (= (dvec) (call kir 'errors presentation)))
+    (is (= (dvec) (call kir 'ensure-vector (dnull))))
+    (is (= (dvec (dstr "one")) (call kir 'ensure-vector (dstr "one"))))
+    (is (= #{} (set (:effects kir))))
+    (testing "missing fields and unknown documents retain ordered errors"
+      (let [missing (call kir 'credential
+                          (dmap {:issuer (dnull) :subject (dnull)}))]
+        (is (true? (call kir 'credential? missing)))
+        (is (= [:vc/missing-issuer :vc/missing-subject]
+               (mapv #(second (dget % :error))
+                     (second (call kir 'errors missing))))))
+      (is (= (dvec (dmap {:error (dkw :vc/unknown-document-type)}))
+             (call kir 'errors (dmap {})))))
+    (testing "constructor boundaries reject malformed option documents"
+      (is (thrown? kerror/ExceptionInfo
+                   (call kir 'credential (dvec)))))))
+
+(defn compiler-root []
+  (nth (iterate #(.getParent ^java.nio.file.Path %)
+                (java.nio.file.Path/of (.toURI (io/resource "kotoba/compiler/core.clj")))) 4))
+(defn base64 [value] (kbytes/base64-encode value))
+
+(deftest restricted-javascript-and-typed-wasm-conform-semantically
+  (let [javascript (compiler/compile-source source :js-kotoba-v1)
+        wasm (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        js64 (base64 (kbytes/utf8-bytes ^String (:source javascript)))
+        wasm64 (base64 ^bytes (:bytes wasm))
+        probe
+        (shell/sh
+          "node" "--input-type=module" "-e"
+          (str "import(process.argv[1]).then(async host=>{"
+               "const j=await import('data:text/javascript;base64," js64 "');"
+               "const w=await host.instantiateKotoba(Buffer.from(process.argv[2],'base64'));"
+               "const run=(x,doc)=>{const map=e=>doc(['map',e.map(([k,v])=>[['keyword',k],v]).sort((a,b)=>a[0][1]<b[0][1]?-1:a[0][1]>b[0][1]?1:0)]);"
+               "const subject=map([[':id',['string','did:example:alice']]]);"
+               "const opts=map([[':issuer',['string','did:web:issuer']],[':subject',subject],[':type',['keyword',':EmployeeCredential']]]);"
+               "const c=x.credential(opts);if(!x['credential?'](c)||x['presentation?'](c))throw Error('credential');"
+               "const vp=x.presentation(map([[':credentials',c],[':holder',['string','did:example:alice']]]));"
+               "if(!x['presentation?'](vp)||x.validate(c)[1].find(e=>e[0][0]==='keyword'&&e[0][1]===':valid?')[1][1]!==true)throw Error('presentation');"
+               "const missing=x.credential(map([[':issuer',['null']],[':subject',['null']]]));if(x.errors(missing)[1].length!==2)throw Error('errors');"
+               "let rejected=false;try{x.credential({})}catch(e){rejected=true}if(!rejected)throw Error('reject');};"
+               "run(j.instantiateKotoba({}),x=>x);run(w.instance.exports,w.typedValues.document);"
+               "}).catch(e=>{console.error(e);process.exit(99)})")
+          (.toString (.toUri (.resolve (compiler-root) "runtime/browser-host.mjs"))) wasm64)]
+    (is (zero? (:exit probe)) (:err probe))))
+
+(deftest production-source-authority
+  (is (= ["lib/org.w3.vc/src/vc.kotoba"]
+         (->> (file-seq (io/file "src")) (filter #(.isFile %)) (map str) sort vec))))
