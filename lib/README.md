@@ -183,6 +183,7 @@ The bundled standard libraries live in this repository:
 | `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
 | `org.khronos.gltf` | `org.khronos.gltf/src` | `gltf`, `kotoba.gltf.retarget` (an external specification, publisher khronos.org) |
 | `org.accellera.uvm` | `org.accellera.uvm/src` | `uvm.component`, `uvm.factory`, `uvm.phase`, `uvm.rtl-driver` (an external specification, publisher accellera.org) |
+| `kotoba.scene2d` | `kotoba.scene2d/src` | `kami.scene2d`, `kami.text`, `kotoba.scene2d` (Kotoba project library) |
 | `kotoba.renderShaders` | `kotoba.renderShaders/src` | `kami.render-shaders`, `kotoba.render-shaders` (Kotoba project library) |
 | `kotoba.host` | `kotoba.host/src` | `kami.audio`, `kami.backend.browser`, `kami.host`, `kami.input` (Kotoba project library) |
 | `kotoba.physics2d` | `kotoba.physics2d/src` | `physics-2d`, `physics-2d.backend`, `physics-2d.stairs` (Kotoba project library) |
