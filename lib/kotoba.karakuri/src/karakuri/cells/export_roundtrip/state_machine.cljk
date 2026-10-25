@@ -1,0 +1,104 @@
+(ns karakuri.cells.export-roundtrip.state-machine
+  "Phase state machine for the karakuri export_roundtrip (絡繰) cell.
+  1:1 Clojure port of cells/export_roundtrip/state_machine.py (ADR-2606039200 / ADR-2606160842).
+
+  Graph: owner-check -> format-select -> export-plan. Wires the T3 export builder (methods/export)
+  into the manifest graph. G9 own-data-only + encrypted (enforced by construction), G6 dry-run (live
+  pull/push gated), G7 audit-ready output.
+
+  Conventions: the dataclass ExportState → a plain map with the SAME string field keys the Python
+  `cs.__dict__` round-trips; phase enum values stay strings; the export artifact keeps the kebab
+  keyword keys produced by methods/export; OwnerViolation is the {:type :owner-violation} ex-info."
+  (:require [kotoba.lang.error :as kerror] [karakuri.methods.export :as export]))
+
+;; ── ExportPhase (enum — Python value identities preserved) ──
+(def export-phases
+  {:init      "init"
+   :owner-ok  "owner_ok"
+   :format-ok "format_ok"
+   :planned   "planned"
+   :refused   "refused"})
+
+(def phase-init      (:init export-phases))
+(def phase-owner-ok  (:owner-ok export-phases))
+(def phase-format-ok (:format-ok export-phases))
+(def phase-planned   (:planned export-phases))
+(def phase-refused   (:refused export-phases))
+
+;; ── ExportState (dataclass → plain map, string keys + field defaults) ──
+(def state-defaults
+  {"phase"   phase-init
+   "service" ""
+   "fmt"     "kotoba-edn"
+   "owner"   export/MEMBER
+   "payload" {}})
+
+(defn- cell-state [state]
+  (merge state-defaults (get state "cell_state" {})))
+
+(defn- owner-violation?
+  "True when an ex-info carries the {:type :owner-violation} marker (export/OwnerViolation analogue)."
+  [e]
+  (= :owner-violation (:type (ex-data e))))
+
+(defn transition-owner-check
+  "G9: refuse anything but the member's OWN data (no third-party PII)."
+  [state]
+  (let [cs (cell-state state)
+        cs (assoc cs
+                  "service" (get state "service" (get cs "service"))
+                  "owner" (get state "owner" (get cs "owner"))
+                  "fmt" (get state "fmt" (get cs "fmt")))]
+    (if (not= (get cs "owner") export/MEMBER)
+      (let [cs (assoc cs "phase" phase-refused
+                      "payload" (assoc (get cs "payload") "outcome" "g9-non-member-owner-refused"))]
+        {"cell_state" cs "next_node" "end"})
+      (let [cs (assoc cs "phase" phase-owner-ok)]
+        {"cell_state" cs "next_node" "format_select"}))))
+
+(defn transition-format-select
+  "Select a portable export format; an unknown format is refused honestly."
+  [state]
+  (let [cs (cell-state state)]
+    (if-not (some #{(get cs "fmt")} export/EXPORT-FORMATS)
+      (let [cs (assoc cs "phase" phase-refused
+                      "payload" (assoc (get cs "payload") "outcome" (str "unknown-format:" (get cs "fmt"))))]
+        {"cell_state" cs "next_node" "end"})
+      (let [cs (assoc cs "phase" phase-format-ok)]
+        {"cell_state" cs "next_node" "export_plan"}))))
+
+(defn transition-export-plan
+  "G6/G9: build + roundtrip-verify the encrypted, member-owned export plan (no bytes moved at R0)."
+  [state]
+  (let [cs (cell-state state)
+        result (try
+                 {:artifact (export/verify-roundtrip
+                             (export/build-export-plan (get cs "service")
+                                                       :fmt (get cs "fmt")
+                                                       :owner (get cs "owner")))}
+                 (catch kerror/ExceptionInfo e
+                   (if (owner-violation? e)
+                     {:refused true}
+                     (throw e))))]
+    (if (:refused result)
+      (let [cs (assoc cs "phase" phase-refused
+                      "payload" (assoc (get cs "payload") "outcome" "g9-non-member-owner-refused"))]
+        {"cell_state" cs "next_node" "end"})
+      (let [artifact (:artifact result)
+            cs (assoc cs
+                      "phase" phase-planned
+                      "payload" (assoc (get cs "payload")
+                                       "export" {"service" (:service artifact)
+                                                 "format" (:fmt artifact)
+                                                 "owner" (:owner artifact)             ; G9 — member
+                                                 "encrypted" (:encrypted artifact)      ; G9 — true
+                                                 "secretRef" (:secret-ref artifact)     ; encrypted-envelope ref only
+                                                 "dryRun" (:dry-run artifact)           ; G6
+                                                 "roundtripOk" (:roundtrip-ok artifact)}))]
+        {"cell_state" cs "next_node" "end"}))))
+
+(defn solve
+  "R0 scaffold: .solve() raises until Council activation (ADR-2606039200 §Decision)."
+  [_input-state]
+  (throw (ex-info "karakuri R0 scaffold: activate export_roundtrip via Council ADR (post-2606039200 ratification)"
+                  {:scaffold true})))
