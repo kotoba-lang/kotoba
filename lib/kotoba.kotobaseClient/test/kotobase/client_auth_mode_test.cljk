@@ -1,0 +1,127 @@
+(ns kotobase.client-auth-mode-test
+  "`make-client :authn` / `:auth-mode` (superproject ADR-2609241800 step 4).
+
+  Requires only `kotobase.client`, so it runs against a checkout that has no
+  `kotobase.authn` at all — which is how it was shown failing on the base
+  commit: there, `:authn` was an unknown option, a client holding both a
+  `:secret-key` and an exchanger self-minted a CACAO for the data edge, and
+  `store-*` / `:direct-v1` had no Biscuit path at all.
+
+  The exchanger here is a stand-in map with a `:biscuit-fn`, which is all
+  `make-client` reads from it; the real exchange is `kotobase.authn-test`."
+  (:require [cljs.test :refer-macros [deftest is testing async]]
+            ["@noble/curves/ed25519.js" :refer [ed25519]]
+            [kotobase.cid :as cid]
+            [kotobase.client :as kc]))
+
+(def seed (js/Uint8Array.from (clj->js (range 32))))
+(def did (cid/did-key-from-ed25519-pub (.getPublicKey ed25519 seed)))
+
+(defn- capturing-fetch [sink body]
+  (fn [url opts]
+    (swap! sink conj {:url url :opts (or opts #js {})})
+    (js/Promise.resolve
+     #js {:ok true :status 200
+          :text (fn [] (js/Promise.resolve body))})))
+
+(defn- header-of [req k] (aget (.-headers (:opts req)) k))
+(defn- body-text [req] (str (.-body (:opts req))))
+
+(defn- carries-cacao? [req]
+  (or (some-> (header-of req "authorization") (.startsWith "CACAO "))
+      (.includes (body-text req) "cacao_b64")))
+
+(defn- stand-in-authn
+  "What `kotobase.authn/authn` returns, reduced to the one key the client
+  reads. Records every db-name it was asked for."
+  [asked]
+  {:biscuit-fn (fn [db-name]
+                 (swap! asked conj db-name)
+                 (js/Promise.resolve (str "tok-" (count @asked))))})
+
+(defn- fail-and [done]
+  (fn [e] (is (nil? e) (str "unexpected rejection: " (.-message e))) (done)))
+
+(deftest authn-makes-biscuit-the-default-even-with-a-secret-key
+  (async done
+    (let [sink (atom []) asked (atom [])
+          c (kc/make-client {:endpoint "https://kotobase.net" :operator-did "did:web:kotobase.net"
+                             :secret-key seed :authn (stand-in-authn asked)
+                             :fetch-fn (capturing-fetch sink "{\"ok\":true,\"datoms\":[]}")})]
+      (is (= :biscuit (:auth-mode c)))
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then (fn [_]
+                   (let [req (first @sink)]
+                     (is (= "Biscuit tok-1" (header-of req "authorization")))
+                     (is (not (carries-cacao? req)) "no CACAO reaches the data edge")
+                     (is (= ["db1"] @asked) "the exchanger is asked for this db")
+                     (is (nil? (kc/request-cacao c ["datom:read"] "g")) "the legacy minter is off"))
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest store-surface-carries-the-biscuit
+  (async done
+    (let [sink (atom []) asked (atom [])
+          c (kc/make-client {:endpoint "https://kotobase.net" :authn (stand-in-authn asked)
+                             :fetch-fn (capturing-fetch sink "{\"ok\":true,\"val\":null}")})]
+      (-> (kc/store-put c "coll" "k" {:v 1})
+          (.then (fn [_]
+                   (let [req (first @sink)]
+                     (is (= "Biscuit tok-1" (header-of req "authorization")))
+                     (is (not (carries-cacao? req))))
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest direct-v1-surface-carries-the-biscuit
+  (async done
+    (let [sink (atom []) asked (atom [])
+          c (kc/make-client {:endpoint "https://storage.example" :secret-key seed
+                             :transport :direct-v1 :authn (stand-in-authn asked)
+                             :fetch-fn (capturing-fetch sink "[]")})]
+      (-> (kc/datoms c "db2" ":eavt")
+          (.then (fn [_]
+                   (let [req (first @sink)]
+                     (is (= "Biscuit tok-1" (header-of req "authorization")))
+                     (is (not (carries-cacao? req)))
+                     (is (= ["db2"] @asked) "db name recovered from the literal ref"))
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest legacy-default-is-unchanged-without-authn
+  (async done
+    (let [sink (atom [])
+          c (kc/make-client {:endpoint "https://kotobase.net" :operator-did "did:web:kotobase.net"
+                             :secret-key seed
+                             :fetch-fn (capturing-fetch sink "{\"ok\":true,\"datoms\":[]}")})]
+      (is (= :legacy-cacao (:auth-mode c)))
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then (fn [_]
+                   (is (carries-cacao? (first @sink)) "existing callers keep the CACAO path")
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest legacy-path-when-explicitly-chosen-over-authn
+  (async done
+    (let [sink (atom []) asked (atom [])
+          c (kc/make-client {:endpoint "https://kotobase.net" :operator-did "did:web:kotobase.net"
+                             :secret-key seed :authn (stand-in-authn asked)
+                             :auth-mode :legacy-cacao
+                             :fetch-fn (capturing-fetch sink "{\"ok\":true,\"datoms\":[]}")})]
+      (is (= :legacy-cacao (:auth-mode c)))
+      (-> (kc/transact c "db1" "[]")
+          (.then (fn [_]
+                   (let [req (first @sink)]
+                     (is (carries-cacao? req))
+                     (is (.startsWith (header-of req "authorization") "CACAO "))
+                     (is (= did (header-of req "x-kotoba-did")))
+                     (is (= [] @asked) "the exchanger is never called"))
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest biscuit-mode-without-a-token-source-is-refused
+  (is (thrown-with-msg? js/Error #"needs :authn or :biscuit-fn"
+                        (kc/make-client {:endpoint "https://kotobase.net" :secret-key seed
+                                         :auth-mode :biscuit})))
+  (is (thrown-with-msg? js/Error #"must be a kotobase.authn/authn exchanger"
+                        (kc/make-client {:endpoint "https://kotobase.net" :secret-key seed
+                                         :authn {:endpoint "https://auth.kotoba.cloud"}}))))
