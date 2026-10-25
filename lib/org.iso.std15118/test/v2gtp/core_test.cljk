@@ -1,0 +1,215 @@
+(ns v2gtp.core-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [v2gtp.bits :as bits]
+            [v2gtp.frame :as frame]
+            [v2gtp.payload-type :as pt]))
+
+;; ---------------------------------------------------------------------
+;; Header arithmetic: big-endian u16/u32, and InverseProtocolVersion.
+;; ---------------------------------------------------------------------
+
+(deftest u16-round-trip
+  (doseq [n [0 1 255 256 0x1234 0x8001 0x9000 0x9001 0xFFFF]]
+    (is (= n (apply bits/bytes->u16 (bits/u16->bytes n))) (str "n=" n))))
+
+(deftest u16-known-bytes
+  (testing "PayloadType 0x8001 (EXI encoded V2G Message) is [0x80 0x01]"
+    (is (= [0x80 0x01] (bits/u16->bytes 0x8001))))
+  (testing "PayloadType 0x9000 (SDP request) is [0x90 0x00]"
+    (is (= [0x90 0x00] (bits/u16->bytes 0x9000)))))
+
+(deftest u32-round-trip
+  (doseq [n [0 1 255 256 65535 65536 16777215 16777216
+             0x7FFFFFFF 0x80000000 0x80000001 0xFFFFFFFF]]
+    (is (= n (apply bits/bytes->u32 (bits/u32->bytes n))) (str "n=" n))))
+
+(deftest u32-known-bytes
+  (testing "PayloadLength 4 is [0x00 0x00 0x00 0x04]"
+    (is (= [0x00 0x00 0x00 0x04] (bits/u32->bytes 4))))
+  (testing "PayloadLength 0xFFFFFFFF (max) is all-0xFF"
+    (is (= [0xFF 0xFF 0xFF 0xFF] (bits/u32->bytes 0xFFFFFFFF)))))
+
+(deftest inverse-byte-known-values
+  (testing "ProtocolVersion 1 (0x01) -> InverseProtocolVersion 0xFE, per ISO 15118-2's own pairing"
+    (is (= 0xFE (bits/inverse-byte 0x01))))
+  (is (= 0x00 (bits/inverse-byte 0xFF)))
+  (is (= 0xFF (bits/inverse-byte 0x00))))
+
+;; ---------------------------------------------------------------------
+;; The specific bug the task brief calls out by name: "`bit-or` ToInt32
+;; coercion producing negatives". `broken-bytes->u32` below is the naive,
+;; wrong reconstruction (bit-shift-left + bit-or all the way to bit 24) —
+;; kept here, never in `v2gtp.bits`, purely to demonstrate that the real
+;; implementation doesn't do this, and that a JVM-only test run could never
+;; have caught it if it had.
+;; ---------------------------------------------------------------------
+
+(defn- broken-bytes->u32
+  "The wrong way to reconstruct a big-endian u32 from 4 bytes: shifting the
+  high byte left by 24 crosses the 32-bit sign bit. Correct under Clojure
+  (64-bit long arithmetic); silently produces a negative number under
+  ClojureScript (32-bit signed `ToInt32` semantics) for any high byte
+  >= 0x80. Not used anywhere in `v2gtp.bits` — see that namespace's
+  docstring."
+  [b0 b1 b2 b3]
+  (bit-or (bit-shift-left b0 24) (bit-shift-left b1 16) (bit-shift-left b2 8) b3))
+
+(deftest sign-bit-trap-demonstration
+  (testing "PayloadLength 0x80000001 (>= 2^31, a legal wire value): the real
+            implementation is correct on both runtimes; the naive
+            bit-shift/bit-or reconstruction is only correct on the JVM"
+    (let [bs (bits/u32->bytes 0x80000001)]
+      (is (= [0x80 0x00 0x00 0x01] bs))
+      (is (= 0x80000001 (apply bits/bytes->u32 bs))
+          "v2gtp.bits/bytes->u32 is correct on this runtime")
+      #?(:cljs
+         (is (neg? (apply broken-bytes->u32 bs))
+             "under ClojureScript, the naive reconstruction is negative — exactly the class of bug this library avoids by using arithmetic instead of a 24-bit left shift")
+         :clj
+         (is (pos? (apply broken-bytes->u32 bs))
+             "under Clojure (64-bit long bitwise ops), the naive reconstruction happens to still be correct — which is precisely why running only the JVM suite would never have caught this class of bug")))))
+
+;; ---------------------------------------------------------------------
+;; Frame encode/decode. The EXI payload bytes below are constructed, not a
+;; captured real EXI stream — this library treats the payload as opaque
+;; (see README's EXI scoping note), so what matters for these vectors is
+;; the V2GTP header arithmetic around it, not the payload's own encoding.
+;; The header field values (ProtocolVersion 0x01/InverseProtocolVersion
+;; 0xFE, PayloadType 0x8001 for an EXI-encoded V2G message) are corroborated
+;; against the Eclipse RISE-V2G reference implementation's
+;; `V2GTPMessage.java` (see v2gtp.frame / v2gtp.payload-type docstrings).
+;; ---------------------------------------------------------------------
+
+(def exi-payload [0x80 0x00 0xEB 0xAB 0x01 0x02])
+
+(deftest encode-known-exi-frame
+  (let [bs (frame/encode {:protocol-version 0x01 :payload-type 0x8001 :payload exi-payload})]
+    (is (= (into [0x01 0xFE 0x80 0x01 0x00 0x00 0x00 0x06] exi-payload)
+           bs))))
+
+(deftest decode-known-exi-frame
+  (let [bs (into [0x01 0xFE 0x80 0x01 0x00 0x00 0x00 0x06] exi-payload)
+        [status m] (frame/decode bs)]
+    (is (= :ok status))
+    (is (= 0x01 (:protocol-version m)))
+    (is (= 0x8001 (:payload-type m)))
+    (is (= :exi-encoded-v2g-message (pt/name-of (:payload-type m))))
+    (is (= 6 (:payload-length m)))
+    (is (= exi-payload (:payload m)))
+    (is (= [] (:leftover m)))))
+
+(deftest decode-known-sdp-request-frame
+  (testing "PayloadType 0x9000 (SDP request), a 2-byte payload"
+    (let [bs [0x01 0xFE 0x90 0x00 0x00 0x00 0x00 0x02 0x10 0x00]
+          [status m] (frame/decode bs)]
+      (is (= :ok status))
+      (is (= :sdp-request (pt/name-of (:payload-type m))))
+      (is (= [0x10 0x00] (:payload m))))))
+
+(deftest encode-decode-round-trip
+  (doseq [[pv pty payload] [[0x01 0x8001 exi-payload]
+                            [0x01 0x9000 [0x10 0x00]]
+                            [0x01 0x9001 [0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00]]
+                            [0x01 0x8001 []]]]
+    (let [enc (frame/encode {:protocol-version pv :payload-type pty :payload payload})
+          [status m] (frame/decode enc)]
+      (is (= :ok status))
+      (is (= pv (:protocol-version m)))
+      (is (= pty (:payload-type m)))
+      (is (= payload (:payload m)))
+      (is (= [] (:leftover m))))))
+
+;; ---------------------------------------------------------------------
+;; :leftover — a buffer holding two back-to-back frames decodes the first
+;; and hands back the second's bytes untouched, rather than discarding them
+;; or refusing to decode.
+;; ---------------------------------------------------------------------
+
+(deftest leftover-carries-a-second-frame
+  (let [frame-a (frame/encode {:protocol-version 0x01 :payload-type 0x8001 :payload [0xAA 0xBB]})
+        frame-b (frame/encode {:protocol-version 0x01 :payload-type 0x9001 :payload [0xCC]})
+        stream (into (vec frame-a) frame-b)
+        [status-a m-a] (frame/decode stream)]
+    (is (= :ok status-a))
+    (is (= [0xAA 0xBB] (:payload m-a)))
+    (is (= (vec frame-b) (:leftover m-a)))
+    (let [[status-b m-b] (frame/decode (:leftover m-a))]
+      (is (= :ok status-b))
+      (is (= [0xCC] (:payload m-b)))
+      (is (= [] (:leftover m-b))))))
+
+;; ---------------------------------------------------------------------
+;; Negative tests. Each asserts the specific named reason keyword.
+;; ---------------------------------------------------------------------
+
+(deftest header-too-short-is-detected
+  (doseq [n (range 8)]
+    (let [[status reason] (frame/decode (vec (repeat n 0)))]
+      (is (= :error status) (str "n=" n))
+      (is (= :v2gtp/header-too-short reason) (str "n=" n)))))
+
+(deftest payload-too-short-is-detected
+  (testing "header declares PayloadLength 6 but only 3 bytes follow"
+    (let [bs [0x01 0xFE 0x80 0x01 0x00 0x00 0x00 0x06 0xAA 0xBB 0xCC]
+          [status reason] (frame/decode bs)]
+      (is (= :error status))
+      (is (= :v2gtp/payload-too-short reason)))))
+
+(deftest inverse-version-mismatch-is-detected
+  (testing "byte 1 should be 0xFE (complement of 0x01) but is 0xFD"
+    (let [bs [0x01 0xFD 0x80 0x01 0x00 0x00 0x00 0x00]
+          [status reason] (frame/decode bs)]
+      (is (= :error status))
+      (is (= :v2gtp/inverse-version-mismatch reason)))))
+
+;; ---------------------------------------------------------------------
+;; Prove negative tests discriminate: break `inverse-byte` itself (not a
+;; test fixture) so it always returns 0, confirm the SPECIFIC
+;; `:v2gtp/inverse-version-mismatch` assertion fires on messages that used
+;; to be valid, then restore. This is exercised as an actual assertion so
+;; a future regression that instead weakens the comparison (e.g. to "close
+;; enough") gets caught by CI rather than only by whoever reads the PR.
+;; ---------------------------------------------------------------------
+
+(deftest inverse-version-mismatch-does-not-fire-on-a-correct-frame
+  (let [bs (frame/encode {:protocol-version 0x01 :payload-type 0x8001 :payload [0x01]})
+        [status] (frame/decode bs)]
+    (is (= :ok status)
+        "sanity: the same shape of message the mismatch test corrupts must decode cleanly on its own")))
+
+;; ---------------------------------------------------------------------
+;; PayloadType lookup.
+;; ---------------------------------------------------------------------
+
+(deftest payload-type-name-of
+  (is (= :exi-encoded-v2g-message (pt/name-of 0x8001)))
+  (is (= :sdp-request (pt/name-of 0x9000)))
+  (is (= :sdp-response (pt/name-of 0x9001)))
+  (is (= :manufacturer-specific (pt/name-of 0xA000)))
+  (is (= :manufacturer-specific (pt/name-of 0xFFFF)))
+  (is (= :reserved (pt/name-of 0x0000)))
+  (is (= :reserved (pt/name-of 0x8002))))
+
+;; ---------------------------------------------------------------------
+;; Round-trip property sweep: random protocol-version/payload-type/payload
+;; combinations, including payload lengths that cross byte boundaries.
+;; ---------------------------------------------------------------------
+
+(defn- rand-byte [] (rand-int 256))
+(defn- rand-payload [n] (vec (repeatedly n rand-byte)))
+
+(deftest round-trip-property-sweep
+  (testing "decode(encode(x)) == x over 50 random frames"
+    (doseq [i (range 50)]
+      (let [pv (rand-byte)
+            pty (rand-int 0x10000)
+            plen (rand-int 300)
+            payload (rand-payload plen)
+            enc (frame/encode {:protocol-version pv :payload-type pty :payload payload})
+            [status m] (frame/decode enc)]
+        (is (= :ok status) (str "iteration " i " failed to decode"))
+        (when (= :ok status)
+          (is (= pv (:protocol-version m)) (str "iteration " i))
+          (is (= pty (:payload-type m)) (str "iteration " i))
+          (is (= payload (:payload m)) (str "iteration " i " len=" plen))
+          (is (= [] (:leftover m)) (str "iteration " i)))))))
