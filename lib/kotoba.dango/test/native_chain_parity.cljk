@@ -1,0 +1,256 @@
+;; kbb --backend sci --classpath "src:resources:test:<deps>" test/native_chain_parity.cljk [--control]
+;;
+;; Native parity for dango.chain-wire, the chain verifier compiled by amu:
+;; every case below is a real presentation built by dango.chain (and, for the
+;; malformed ones, a block the minting code would refuse, signed by hand), the
+;; oracle's answer is dango.chain/verify, and the native answer is
+;; `verify-presentation` run over the kotoba.value.v1 bytes of
+;; [presentation roots revoked request] -- one granted region, one process per
+;; case, with identity/verify (wire 2) granted.
+;;
+;; Exit 0 all agree / 1 a disagreement (named) / 2 could not answer.
+;; --control compiles the guest WITHOUT its expiry check and exits 0 only if
+;; it then disagrees on exactly the cases whose names start with "expired".
+;;
+;; Needs an amu whose loader has the wire 2 provider (kotoba-lang/amu#1075).
+;; AMU (default ../amu), KBB_ENGINE (default ../org-babashka-nbb/cli.js),
+;; KEXE_LOADER_SOURCE (default $AMU/tools/kexe_loader.c).
+(ns native-chain-parity
+  (:require [clojure.string :as s]
+            [dango.bytes :as b]
+            [dango.chain :as chain]
+            [ed25519.sign :as ed]
+            [ipld.link :as link]
+            [kotoba.value.codec :as codec]
+            [multiformats.core :as mf]))
+
+(def cp (js/require "child_process"))
+(def fs (js/require "fs"))
+(def os (js/require "os"))
+(def path (js/require "path"))
+(def crypto (js/require "crypto"))
+
+(def here (.cwd js/process))
+(def amu-root (or (.. js/process -env -AMU) (.resolve path here "../amu")))
+(def loader-source (or (.. js/process -env -KEXE_LOADER_SOURCE)
+                       (.join path amu-root "tools/kexe_loader.c")))
+(def engine (or (.. js/process -env -KBB_ENGINE) (.resolve path here "../org-babashka-nbb/cli.js")))
+(def control? (some #{"--control"} *command-line-args*))
+(def fuel-budget "10000000")
+
+(def codes
+  {:granted 1 :dango/malformed-block 10 :dango/malformed-caveat 11
+   :dango/unknown-operator 11 :dango/unknown-fact 11 :dango/caveat-too-large 14
+   :dango/empty-chain 15 :dango/chain-too-long 16 :dango/broken-link 17
+   :dango/bad-signature 18 :dango/bad-seal 19 :dango/holder-readdressed 20
+   :dango/revoked 21 :dango/malformed-request 22 :dango/not-covered 23
+   :dango/expired 24 :dango/wrong-holder 25 :dango/caveat-false 26})
+
+;; ── fixtures (the same shapes as test/dango/chain_test.cljk) ────────────────
+
+(defn seed [n] (vec (repeat 32 n)))
+(def issuer (seed 1))
+(def roots [(ed/public-key issuer)])
+(def tenant "did:key:z6MkTenant")
+(def ds (str "kotoba://storage/" tenant "/ds"))
+(def agent "did:key:z6MkAgent")
+
+(def token (chain/root {:issuer-seed issuer
+                        :grant {:caps #{[:data/read (str ds "/*")] [:data/write (str ds "/*")]}
+                                :before 1800000000}
+                        :caveats [] :next-seed (seed 2)}))
+(def narrowed (chain/attenuate token {:grant {:caps #{[:data/read (str ds "/raw/*")]}
+                                              :holder agent :before 1750000000}
+                                      :caveats [[:<= :req/bytes 100]] :next-seed (seed 3)}))
+
+(defn req [& {:as m}]
+  (merge {:req/kind :data/read :req/resource (str ds "/raw/a") :req/now 1700000000
+          :req/path "raw/a" :req/bytes 10} m))
+
+(defn cid-bytes [block-bytes]
+  (let [d (js/Array.from (.digest (.update (.createHash crypto "sha256") block-bytes)))]
+    (b/->bytes (concat [1 0x71 0x12 0x20] d))))
+
+;; a block value signed by hand -- no minting-side validation
+(defn raw-append [{:keys [blocks proof]} blk next-seed]
+  (let [prev (link/link (mf/cidv1-dag-cbor (:bytes (peek blocks))))
+        bs (codec/encode-value (assoc blk :prev prev :next-key (b/->bytes (ed/public-key next-seed))))]
+    {:blocks (conj blocks {:bytes bs :sig (b/->bytes (ed/sign (ed/secret-key! (b/->vec proof)) bs))})
+     :proof (b/->bytes next-seed)}))
+
+(defn raw-block [grant caveats] {:grant grant :caveats caveats})
+
+(defn chain-of [n]
+  (reduce (fn [t k] (chain/attenuate t {:grant {:caps #{[:data/read (str ds "/*")]}}
+                                        :caveats [] :next-seed (seed (+ 10 k))}))
+          token (range (dec n))))
+
+;; [name presentation roots revoked-block-bytes request] -- a revoked entry is
+;; the BYTES of the revoked block: the oracle is given its CID string, the
+;; native verifier its binary CID
+(def cases
+  (let [p chain/present
+        pn (p narrowed)
+        other-tenant (str "kotoba://storage/did:key:zOther/ds/raw/a")]
+    [["granted-read" (p token) roots [] (req)]
+     ["granted-write" (p token) roots [] (req :req/kind :data/write)]
+     ["not-covered-kind" (p token) roots [] (req :req/kind :data/delete)]
+     ["not-covered-tenant" (p token) roots [] (req :req/resource other-tenant)]
+     ["not-covered-namespace-itself" (p token) roots [] (req :req/resource ds)]
+     ["expired-at-boundary" (p token) roots [] (req :req/now 1800000000)]
+     ["live-one-before" (p token) roots [] (req :req/now 1799999999)]
+     ["narrowed-granted" pn roots [] (req :req/holder agent)]
+     ["narrowed-write-dropped" pn roots [] (req :req/kind :data/write :req/holder agent)]
+     ["expired-by-second-block" pn roots [] (req :req/now 1760000000 :req/holder agent)]
+     ["wrong-holder" pn roots [] (req :req/holder "did:key:z6MkMallory")]
+     ["wrong-holder-absent" pn roots [] (req)]
+     ["caveat-false" pn roots [] (req :req/bytes 101 :req/holder agent)]
+     ["wider-block-adds-nothing"
+      (p (chain/attenuate narrowed {:grant {:caps #{[:data/write (str ds "/*")]}} :caveats [] :next-seed (seed 4)}))
+      roots [] (req :req/kind :data/write :req/holder agent)]
+     ["holder-readdressed"
+      (p (chain/attenuate narrowed {:grant {:caps #{[:data/read (str ds "/raw/*")]} :holder "did:key:z6MkMallory"}
+                                    :caveats [] :next-seed (seed 5)}))
+      roots [] (req :req/holder agent)]
+     ["untrusted-root" (p token) [(ed/public-key (seed 9))] [] (req)]
+     ["tampered-block"
+      (p (assoc-in token [:blocks 0 :bytes]
+                   (codec/encode-value (assoc-in (codec/decode-value (:bytes (first (:blocks token))))
+                                                 [:grant :before] 1900000000))))
+      roots [] (req)]
+     ["dropped-block" (p (assoc narrowed :blocks [(first (:blocks narrowed))])) roots [] (req :req/holder agent)]
+     ["swapped-blocks" (p (update narrowed :blocks (comp vec reverse))) roots [] (req :req/holder agent)]
+     ["empty-chain" {:blocks [] :seal (b/->bytes (repeat 64 0))} roots [] (req)]
+     ["revoked-root" (p token) roots [(:bytes (first (:blocks token)))] (req)]
+     ["revoked-second" pn roots [(:bytes (second (:blocks narrowed)))] (req :req/holder agent)]
+     ["not-revoked-other" (p token) roots [(:bytes (second (:blocks narrowed)))] (req)]
+     ["malformed-block-bytes" (p (assoc-in token [:blocks 0 :bytes] (b/->bytes [0x82 0x13]))) roots [] (req)]
+     ["request-no-now" (p token) roots [] (dissoc (req) :req/now)]
+     ["request-bad-resource" (p token) roots [] (req :req/resource "not a resource")]
+     ["request-unqualified-kind" (p token) roots [] (req :req/kind :read)]
+     ["request-now-too-large" (p token) roots [] (req :req/now 1000000000000)]
+     ["wrong-seal-key" (p (assoc narrowed :proof (b/->bytes (seed 7)))) roots [] (req :req/holder agent)]
+     ["seal-of-other-block" (assoc pn :seal (:seal (p token))) roots [] (req :req/holder agent)]
+     ["no-seal" (dissoc (p token) :seal) roots [] (req)]
+     ["kind-a.b/c-granted"
+      (p (chain/root {:issuer-seed issuer :grant {:caps #{[:a.b/c (str ds "/*")]} :before 1800000000}
+                      :caveats [] :next-seed (seed 2)}))
+      roots [] (req :req/kind :a.b/c)]
+     ["kind-a/b.c-not-covered"
+      (p (chain/root {:issuer-seed issuer :grant {:caps #{[:a.b/c (str ds "/*")]} :before 1800000000}
+                      :caveats [] :next-seed (seed 2)}))
+      roots [] (req :req/kind :a/b.c)]
+     ["raw-unknown-operator"
+      (p (raw-append token (raw-block {:caps #{[:data/read (str ds "/*")]}} [[:eval "x"]]) (seed 20)))
+      roots [] (req)]
+     ["raw-unknown-fact"
+      (p (raw-append token (raw-block {:caps #{[:data/read (str ds "/*")]}} [[:= :req/secret 1]]) (seed 21)))
+      roots [] (req)]
+     ["raw-caveat-too-deep"
+      (p (raw-append token (raw-block {:caps #{[:data/read (str ds "/*")]}}
+                                      [(reduce (fn [f _] [:not f]) true (range 20))]) (seed 22)))
+      roots [] (req)]
+     ["raw-negative-before"
+      (p (raw-append token (raw-block {:caps #{[:data/read (str ds "/*")]} :before -1} []) (seed 23)))
+      roots [] (req)]
+     ["raw-star-kind"
+      (p (raw-append token (raw-block {:caps #{[:data/* (str ds "/*")]}} []) (seed 24)))
+      roots [] (req)]
+     ["raw-empty-caps"
+      (p (raw-append token (raw-block {:caps #{}} []) (seed 25)))
+      roots [] (req)]
+     ["raw-empty-segment"
+      (p (raw-append token (raw-block {:caps #{[:data/read "kotoba://storage//ds"]}} []) (seed 26)))
+      roots [] (req)]
+     ["chain-of-16" (p (chain-of 16)) roots [] (req)]
+     ["chain-too-long-17" (p (chain-of 17)) roots [] (req)]]))
+
+(defn oracle [pres rts rev request]
+  (let [d (chain/verify pres {:roots (set (map vec rts))
+                              :revoked (set (map mf/cidv1-dag-cbor rev))
+                              :request request})]
+    (get codes (:dango/reason d) (str "unmapped " (:dango/reason d)))))
+
+;; ── running ──────────────────────────────────────────────────────────────────
+
+(defn- hex [x] (apply str (map #(let [h (.toString % 16)] (if (= 1 (count h)) (str "0" h) h)) (js/Array.from x))))
+(defn- cannot [msg] (throw (ex-info msg {:exit 2})))
+(defn- run [cmd args]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      #js {:encoding "utf8" :maxBuffer (* 64 1024 1024)
+                           :env (js/Object.assign #js {} (.-env js/process)
+                                                  #js {:KBB_ENGINE engine :KEXE_FUEL fuel-budget
+                                                       :KEXE_STRUCTURED_REPORT "1"})})]
+    {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+(defn- target []
+  (case [(.platform os) (.arch os)]
+    ["darwin" "arm64"] ["aarch64-macos" "aarch64"]
+    ["linux" "arm64"] ["aarch64-linux" "aarch64"]
+    ["linux" "x64"] ["x86_64-linux" "x86_64"]
+    ["darwin" "x64"] ["x86_64-macos" "x86_64"]
+    (cannot "no native target for this host")))
+
+(defn main []
+  (doseq [[what p] [["amu" (.join path amu-root "bin/amu")] ["engine" engine]
+                    ["loader source" loader-source]]]
+    (when-not (.existsSync fs p) (cannot (str what " not found at " p))))
+  (when-not (s/includes? (str (.readFileSync fs loader-source)) "identity_verify_provider")
+    (cannot "this amu's loader has no wire 2 provider (kotoba-lang/amu#1075)"))
+  (let [[tgt isa] (target)
+        dir (.mkdtempSync fs (.join path (.tmpdir os) "dango-chain-"))
+        src (.join path dir "src")
+        kexe (.join path dir "chain.kexe")
+        bin (.join path dir "verify.bin")
+        policy (.join path dir "policy.edn")
+        loader (.join path dir "kexe_loader")
+        amu (.join path amu-root "bin/amu")]
+    (.mkdirSync fs (.join path src "dango") #js {:recursive true})
+    (doseq [f ["sha256.kotoba" "caveat_wire.kotoba" "chain_wire.kotoba"]]
+      (let [text (str (.readFileSync fs (.join path "lib/kotoba.dango/src/dango" f)))
+            text (if (and control? (= f "chain_wire.kotoba"))
+                   (let [from "(= 0 (live m blocks 0 n (harg m (payload nf)))) 24"]
+                     (if (s/includes? text from) (s/replace text from "(= 1 0) 24")
+                         (cannot "control mutation did not apply")))
+                   text)]
+        (.writeFileSync fs (.join path src "dango" f) text)))
+    (.writeFileSync fs policy "{:allow #{[:cap/call 2]}}")
+    (let [c (run amu ["compile" (.join path src "dango/chain_wire.kotoba") "--source-path" src
+                      "--jvm-free" "--target" tgt "--policy" policy "--output" kexe])]
+      (when-not (and (zero? (:exit c)) (.existsSync fs kexe))
+        (cannot (str "compile refused (exit " (:exit c) "): " (subs (str (:out c) (:err c)) 0 400)))))
+    (let [l (run "cc" ["-O2" "-o" loader loader-source])]
+      (when-not (zero? (:exit l)) (cannot (str "cc failed: " (:err l)))))
+    (let [x (run amu ["extract-native" kexe "--symbol" "verify-presentation" "--output" bin])
+          off (or (second (re-find #":offset (\d+)" (:out x))) (cannot (str "extract-native: " (:out x) (:err x))))
+          results (vec (for [[nm pres rts rev request] cases]
+                         (let [region (codec/encode-value [pres (mapv b/->bytes rts) (mapv cid-bytes rev) request])
+                               r (run loader [bin off "2" isa "2" (str "g:" (hex region)) "gl:0"])
+                               report (str (:out r) (:err r))
+                               v (second (re-find #":status :ok :result (-?\d+)" report))
+                               [_ fi fr] (re-find #":fuel \{:initial (\d+) :remaining (\d+)\}" report)]
+                           (when-not v
+                             (cannot (str nm ": no answer (loader exit " (:exit r) ") "
+                                          (subs report 0 (min 300 (count report))))))
+                           [nm (oracle pres rts rev request) (js/parseInt v)
+                            (- (js/parseInt fi) (js/parseInt fr))])))
+          disagree (filterv (fn [[_ o v _]] (not= o v)) results)]
+      (println (str "SCANNED\t" (count results)))
+      (println "fuel budget" fuel-budget "max used" (apply max (map #(nth % 3) results))
+               "by" (first (apply max-key #(nth % 3) results)))
+      (println "answers" (s/join " " (map (fn [[nm _ v _]] (str nm "=" v)) results)))
+      (if control?
+        (let [names (set (map first disagree))
+              want (set (filter #(s/starts-with? % "expired") (map first cases)))]
+          (if (= names want)
+            (println "CONTROL OK: without the expiry check it disagrees on exactly" (sort names))
+            (do (println "CONTROL FAILED: expected" (sort want) "got" (sort names))
+                (set! (.-exitCode js/process) 1))))
+        (if (empty? disagree)
+          (println "PARITY OK: all" (count results) "cases agree with the oracle")
+          (do (doseq [[nm o v _] disagree] (println "DISAGREE" nm "oracle" o "native" v))
+              (set! (.-exitCode js/process) 1)))))))
+
+(try (main)
+     (catch :default e
+       (println "CANNOT-ANSWER" (ex-message e))
+       (set! (.-exitCode js/process) 2)))

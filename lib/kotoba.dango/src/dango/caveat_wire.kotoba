@@ -1,0 +1,349 @@
+;; dango.caveat-wire -- decide a caveat straight from its kotoba.value.v1
+;; bytes (ADR adr-2609242100-capability-chain-is-ipld-sexpr-biscuit-is-an-adapter §9).
+;;
+;; The native entry. A host grants ONE byte region holding the caveat's
+;; canonical bytes followed by the request's (a kotoba.value.v1 map of
+;; :req/* facts), and names where the caveat ends:
+;;
+;;   (holds-wire base len split) -> 1 holds, 0 does not hold,
+;;                                  3 malformed, 4 too large
+;;
+;; Nothing is built: the evaluator reads the CBOR in place, so there is no
+;; tree, no ADT node budget, and no ADT at the export boundary (a native
+;; export carries i64 words; a region is the loader's base + length).
+;; Semantics are dango.caveat's (src/dango/caveat.cljk, the oracle): a
+;; validation pass first (vocabulary, arity, depth <= 16, <= 256 nodes --
+;; `problems`), then three-valued evaluation where only a final true holds.
+;;
+;; kotoba.value.v1 in one paragraph: every value is a CBOR array(2)
+;; [code payload] -- 0 nil, 1 boolean, 2 integer, 4 string, 5 keyword
+;; (text without ':'), 9 int64 (8 bytes, two's complement), 16 vector,
+;; 17 list, 18 set, 19 map (payload: array of [key value] arrays).
+;;
+;; An int64-wrapped value (code 9) is NOT an integer here, exactly as in the
+;; oracle, where it decodes to an Int64 wrapper that `integer?` rejects: a
+;; caveat literal of code 9 is malformed, and a request fact of code 9
+;; compares as unknown. Only the codec's safe-integer range is arithmetic.
+;;
+;; One known divergence from the oracle: when a form is BOTH malformed and
+;; over the node budget, the oracle reports too-large (it walks everything
+;; before judging); this pass stops at the first malformed term and answers
+;; 3. Either way the caveat does not hold.
+;;
+;; TEMPORARY CONSTRAINTS (remove when the condition is met):
+;; - `rem` is not a builtin (2026-09-24); `low5` spells it with `quot`.
+;; - Only the caveat and request cross here. The chain around them (CIDs,
+;;   links, signatures) is still dango.chain in .cljk.
+(ns dango.caveat-wire
+  (:export [holds-wire caveat-check caveat-holds])
+  (:schemas {:dango/wv [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]}))
+
+;; value tags: 0 unknown, 1 int, 2 str, 3 kw, 4 bool, 5 set (off = the set's
+;; payload position), 6 nil, 9 malformed
+
+(def max-depth 16)
+(def max-nodes 256)
+;; CBOR nesting `skip` will walk. One caveat level is two CBOR arrays (the
+;; [code payload] form and the vector payload), so 64 covers the oracle's
+;; depth bound of 16 with room: a form nested past 16 is refused as TOO
+;; LARGE by `check`, as the oracle does. Past ~31 caveat levels `skip`
+;; itself gives up first and the answer is 3, not 4 -- a recorded
+;; divergence; either way it does not hold.
+(def max-cbor-depth 64)
+
+;; ── bytes and CBOR heads ─────────────────────────────────────────────────────
+
+(defn at [m [:slice :u8] p :i64] :i64
+  (if (and (>= p 0) (< p (slice-length m))) (slice-get m p) -1))
+
+(defn low5 [b :i64] :i64 (- b (* 32 (quot b 32))))
+(defn major [m [:slice :u8] p :i64] :i64 (let [b (at m p)] (if (< b 0) -1 (quot b 32))))
+
+;; bytes the head at p occupies, or -1
+(defn hlen [m [:slice :u8] p :i64] :i64
+  (let [b (at m p)]
+    (if (< b 0)
+      -1
+      (let [i (low5 b)]
+        (cond (< i 24) 1 (= i 24) 2 (= i 25) 3 (= i 26) 5 (= i 27) 9 :else -1)))))
+
+(defn be [m [:slice :u8] p :i64 k :i64 acc :i64] :i64
+  (if (= k 0) acc (be m (+ p 1) (- k 1) (+ (* acc 256) (at m p)))))
+
+;; the head's argument (length, count or unsigned value), or -1
+(defn harg [m [:slice :u8] p :i64] :i64
+  (let [b (at m p) i (low5 b)]
+    (cond (< b 0) -1
+          (< i 24) i
+          (= i 24) (at m (+ p 1))
+          (= i 25) (be m (+ p 1) 2 0)
+          (= i 26) (be m (+ p 1) 4 0)
+          (and (= i 27) (< (at m (+ p 1)) 128)) (be m (+ p 1) 8 0)
+          :else -1)))
+
+;; the position after the CBOR item at p, or -1
+(defn skip [m [:slice :u8] p :i64 depth :i64] :i64
+  (let [mj (major m p) h (hlen m p) a (harg m p)]
+    (cond
+      (or (< mj 0) (< h 0) (< a 0) (> depth max-cbor-depth)) -1
+      (or (= mj 0) (= mj 1) (= mj 7)) (+ p h)
+      (or (= mj 2) (= mj 3)) (+ p (+ h a))
+      (= mj 4) (skip-n m (+ p h) a (+ depth 1))
+      (= mj 5) (skip-n m (+ p h) (* 2 a) (+ depth 1))
+      (= mj 6) (skip m (+ p h) (+ depth 1))
+      :else -1)))
+
+(defn skip-n [m [:slice :u8] p :i64 n :i64 depth :i64] :i64
+  (cond (< p 0) -1 (= n 0) p :else (skip-n m (skip m p depth) (- n 1) depth)))
+
+;; ── value forms ──────────────────────────────────────────────────────────────
+
+;; the form's type code, or -1 unless p holds array(2) [small-uint payload]
+(defn code [m [:slice :u8] p :i64] :i64
+  (let [c (at m (+ p 1))]
+    (if (and (= (at m p) 130) (>= c 0) (< c 24)) c -1)))
+
+(defn payload [p :i64] :i64 (+ p 2))
+
+;; text payload bounds (major 3); -1 when the payload is not text
+(defn text-off [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (if (= (major m q) 3) (+ q (hlen m q)) -1)))
+(defn text-len [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (if (= (major m q) 3) (harg m q) -1)))
+
+;; array payload: element count and first element
+(defn arr-n [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (if (= (major m q) 4) (harg m q) -1)))
+(defn arr-first [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (+ q (hlen m q))))
+
+;; bytes [off, off+len) of m equal the string literal s
+(defn lit-eq-from [m [:slice :u8] off :i64 s :string i :i64 n :i64] :i64
+  (cond (= i n) 1
+        (= (string-find-byte s (at m (+ off i)) i) i) (lit-eq-from m off s (+ i 1) n)
+        :else 0))
+(defn lit-eq [m [:slice :u8] off :i64 len :i64 s :string] :i64
+  (if (= len (string-length s)) (lit-eq-from m off s 0 len) 0))
+
+;; two ranges of m hold the same bytes
+(defn range-eq-from [m [:slice :u8] a :i64 b :i64 i :i64 n :i64] :i64
+  (cond (= i n) 1
+        (= (at m (+ a i)) (at m (+ b i))) (range-eq-from m a b (+ i 1) n)
+        :else 0))
+(defn range-eq [m [:slice :u8] a :i64 al :i64 b :i64 bl :i64] :i64
+  (if (= al bl) (range-eq-from m a b 0 al) 0))
+
+;; operator id of the keyword form at p: 1 and 2 or 3 not 4 = 5 < 6 <= 7 >
+;; 8 >= 9 prefix? 10 member?; -1 when it is none of them
+(defn op-id [m [:slice :u8] p :i64] :i64
+  (if (not (= 5 (code m p)))
+    -1
+    (let [o (text-off m p) l (text-len m p)]
+      (cond (= 1 (lit-eq m o l "and")) 1
+            (= 1 (lit-eq m o l "or")) 2
+            (= 1 (lit-eq m o l "not")) 3
+            (= 1 (lit-eq m o l "=")) 4
+            (= 1 (lit-eq m o l "<")) 5
+            (= 1 (lit-eq m o l "<=")) 6
+            (= 1 (lit-eq m o l ">")) 7
+            (= 1 (lit-eq m o l ">=")) 8
+            (= 1 (lit-eq m o l "prefix?")) 9
+            (= 1 (lit-eq m o l "member?")) 10
+            :else -1))))
+
+(defn op-arity-ok [op :i64 argc :i64] :i64
+  (cond (or (= op 1) (= op 2)) (if (>= argc 1) 1 0)
+        (= op 3) (if (= argc 1) 1 0)
+        :else (if (= argc 2) 1 0)))
+
+;; keyword form at p: 0 not a fact (a literal), 1..6 a known fact
+;; (path bytes now kind resource holder), -1 an unknown :req/ fact
+(defn fact-id [m [:slice :u8] p :i64] :i64
+  (let [o (text-off m p) l (text-len m p)]
+    (if (and (> l 4) (= 1 (lit-eq m o 4 "req/")))
+      (let [fo (+ o 4) fl (- l 4)]
+        (cond (= 1 (lit-eq m fo fl "path")) 1
+              (= 1 (lit-eq m fo fl "bytes")) 2
+              (= 1 (lit-eq m fo fl "now")) 3
+              (= 1 (lit-eq m fo fl "kind")) 4
+              (= 1 (lit-eq m fo fl "resource")) 5
+              (= 1 (lit-eq m fo fl "holder")) 6
+              :else -1))
+      0)))
+
+;; ── validation: dango.caveat/problems ────────────────────────────────────────
+;; Returns the node budget left (>= 0), -1 malformed, -2 too large. The
+;; budget is threaded through the whole form so it is global, as in the
+;; oracle's walk: one node per term, the operator keyword not counted.
+
+(defn set-literals-ok [m [:slice :u8] p :i64 n :i64] :i64
+  (cond (< p 0) 0
+        (= n 0) 1
+        :else (let [c (code m p)]
+                (if (or (= c 2) (= c 4) (= c 5))
+                  (set-literals-ok m (skip m p 0) (- n 1))
+                  0))))
+
+(defn check [m [:slice :u8] p :i64 depth :i64 budget :i64] :i64
+  (let [left (- budget 1) c (code m p)]
+    (cond
+      (< left 0) -2
+      (> depth max-depth) -2
+      (= c 16) (let [n (arr-n m p) h (arr-first m p) op (op-id m h)]
+                 (cond (< n 1) -1
+                       (< op 0) -1
+                       (= 0 (op-arity-ok op (- n 1))) -1
+                       :else (check-args m (skip m h 0) (- n 1) (+ depth 1) left)))
+      (= c 5) (if (< (fact-id m p) 0) -1 left)
+      (or (= c 0) (= c 1) (= c 2) (= c 4)) left
+      (= c 18) (if (= 1 (set-literals-ok m (arr-first m p) (arr-n m p))) left -1)
+      :else -1)))
+
+(defn check-args [m [:slice :u8] p :i64 n :i64 depth :i64 budget :i64] :i64
+  (cond (< budget 0) budget
+        (< p 0) -1
+        (= n 0) budget
+        :else (let [b (check m p depth budget)]
+                (if (< b 0) b (check-args m (skip m p 0) (- n 1) depth b)))))
+
+;; ── values ───────────────────────────────────────────────────────────────────
+
+(defn wv [tag :i64 n :i64 off :i64 len :i64] [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]
+  (record-new [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] tag n off len))
+(defn unknown [] [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] (wv 0 0 0 0))
+(defn tag-of [v [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (record-get [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] v :tag))
+(defn n-of [v [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (record-get [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] v :n))
+(defn off-of [v [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (record-get [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] v :off))
+(defn len-of [v [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (record-get [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] v :len))
+
+;; a literal value form at p (no facts, no operators)
+(defn literal [m [:slice :u8] p :i64] [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]
+  (let [c (code m p) q (payload p)]
+    (cond
+      (= c 0) (wv 6 0 0 0)
+      (= c 1) (cond (= (at m q) 245) (wv 4 1 0 0) (= (at m q) 244) (wv 4 0 0 0) :else (wv 9 0 0 0))
+      (= c 2) (cond (= (major m q) 0) (wv 1 (harg m q) 0 0)
+                    (= (major m q) 1) (wv 1 (- -1 (harg m q)) 0 0)
+                    :else (wv 9 0 0 0))
+      (= c 4) (wv 2 0 (text-off m p) (text-len m p))
+      (= c 5) (wv 3 0 (text-off m p) (text-len m p))
+      (= c 18) (wv 5 (arr-n m p) (arr-first m p) 0)
+      :else (wv 9 0 0 0))))
+
+;; the request's value for fact key [ko, kl) -- the request is the map form
+;; at r; unknown when absent
+(defn lookup [m [:slice :u8] p :i64 n :i64 ko :i64 kl :i64] [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]
+  (if (or (= n 0) (< p 0))
+    (unknown)
+    (let [k (+ p (hlen m p))
+          v (skip m k 0)]
+      (if (and (= 4 (major m p)) (= 5 (code m k))
+               (= 1 (range-eq m (text-off m k) (text-len m k) ko kl)))
+        (literal m v)
+        (lookup m (skip m p 0) (- n 1) ko kl)))))
+
+(defn term [m [:slice :u8] p :i64 r :i64] [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]
+  (let [c (code m p)]
+    (cond
+      (= c 16) (let [t (tri-app m p r)] (if (= t 2) (unknown) (wv 4 t 0 0)))
+      (and (= c 5) (> (fact-id m p) 0))
+      (if (= 19 (code m r))
+        (lookup m (arr-first m r) (arr-n m r) (text-off m p) (text-len m p))
+        (unknown))
+      :else (literal m p))))
+
+(defn tri [v [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (if (= (tag-of v) 4) (n-of v) 2))
+
+(defn eq3 [m [:slice :u8] a [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]
+           b [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (let [ta (tag-of a) tb (tag-of b)]
+    (cond (not (= ta tb)) 2
+          (or (= ta 1) (= ta 4)) (if (= (n-of a) (n-of b)) 1 0)
+          (or (= ta 2) (= ta 3)) (range-eq m (off-of a) (len-of a) (off-of b) (len-of b))
+          :else 2)))
+
+(defn member3 [m [:slice :u8] a [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]] p :i64 n :i64] :i64
+  (cond (or (= n 0) (< p 0)) 0
+        (= 1 (eq3 m a (literal m p))) 1
+        :else (member3 m a (skip m p 0) (- n 1))))
+
+(defn cmp3 [m [:slice :u8] op :i64 a [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]
+            b [:record :dango/wv [[:tag :i64] [:n :i64] [:off :i64] [:len :i64]]]] :i64
+  (let [ta (tag-of a) tb (tag-of b)]
+    (cond
+      (or (= ta 0) (= tb 0)) 2
+      (= op 4) (eq3 m a b)
+      (and (>= op 5) (<= op 8))
+      (if (and (= ta 1) (= tb 1))
+        (let [x (n-of a) y (n-of b)]
+          (cond (= op 5) (if (< x y) 1 0)
+                (= op 6) (if (<= x y) 1 0)
+                (= op 7) (if (> x y) 1 0)
+                :else (if (>= x y) 1 0)))
+        2)
+      (= op 9) (if (and (= ta 2) (= tb 2))
+                 (if (>= (len-of a) (len-of b))
+                   (range-eq m (off-of a) (len-of b) (off-of b) (len-of b))
+                   0)
+                 2)
+      (= op 10) (if (= tb 5) (member3 m a (off-of b) (n-of b)) 2)
+      :else 2)))
+
+;; and: 0 if any false, 1 if all true, else 2 (acc: 1 all true so far, 2 an unknown seen)
+(defn and3 [m [:slice :u8] p :i64 n :i64 r :i64 acc :i64] :i64
+  (if (= n 0)
+    acc
+    (let [t (tri (term m p r))]
+      (if (= t 0) 0 (and3 m (skip m p 0) (- n 1) r (if (= t 2) 2 acc))))))
+
+;; or: 1 if any true, 0 if all false, else 2 (acc: 0 all false so far, 2 an unknown seen)
+(defn or3 [m [:slice :u8] p :i64 n :i64 r :i64 acc :i64] :i64
+  (if (= n 0)
+    acc
+    (let [t (tri (term m p r))]
+      (if (= t 1) 1 (or3 m (skip m p 0) (- n 1) r (if (= t 2) 2 acc))))))
+
+(defn tri-app [m [:slice :u8] p :i64 r :i64] :i64
+  (let [h (arr-first m p)
+        op (op-id m h)
+        a0 (skip m h 0)
+        argc (- (arr-n m p) 1)]
+    (cond
+      (= op 1) (and3 m a0 argc r 1)
+      (= op 2) (or3 m a0 argc r 0)
+      (= op 3) (let [t (tri (term m a0 r))] (cond (= t 0) 1 (= t 1) 0 :else 2))
+      :else (cmp3 m op (term m a0 r) (term m (skip m a0 0) r)))))
+
+;; ── entry ────────────────────────────────────────────────────────────────────
+
+(defn holds-wire [base :i64 len :i64 split :i64] :i64
+  (let [m (slice-of-u8 base len)]
+    (cond
+      (not (= split (skip m 0 0))) 3
+      (not (= len (skip m split 0))) 3
+      (not (= 19 (code m split))) 3
+      :else (let [b (check m 0 0 max-nodes)]
+              (cond (= b -2) 4
+                    (< b 0) 3
+                    (= 1 (tri (term m 0 split))) 1
+                    :else 0)))))
+
+;; ── region interface for dango.chain-wire ────────────────────────────────────
+;; A slice cannot cross a module boundary ("two machine words per slice and
+;; its callers spell one"), so another module hands the region's base and
+;; length and a POSITION, and the slice is rebuilt here from parameters.
+
+;; validation of the caveat form at p: budget left (>= 0), -1 malformed,
+;; -2 too large
+(defn caveat-check [base :i64 len :i64 p :i64] :i64
+  (check (slice-of-u8 base len) p 0 max-nodes))
+
+;; the caveat at p holds against the request map at r (1) or not (0); call
+;; only after caveat-check accepted it
+(defn caveat-holds [base :i64 len :i64 p :i64 r :i64] :i64
+  (if (= 1 (tri (term (slice-of-u8 base len) p r))) 1 0))
