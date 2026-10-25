@@ -1,0 +1,166 @@
+(ns zip.jvm-interop-test
+  "Conformance against `java.util.zip`, in both directions. The library never
+   uses it; this file does, as an oracle.
+
+   `us → reference` is the direction that matters most for a writer: a header
+   field written at the wrong offset, a CRC over the wrong bytes, or an EOCD
+   pointing at the wrong place all round-trip perfectly through our own reader
+   and fail in every other tool. `ZipFile` is used rather than `ZipInputStream`
+   where possible because it reads the *central directory*, which is what real
+   consumers (and `unzip`) do."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [zip.bytes :as b]
+            [zip.core :as zip])
+  (:import [java.io ByteArrayOutputStream ByteArrayInputStream File]
+           [java.nio.file Files]
+           [java.util.zip ZipOutputStream ZipEntry ZipInputStream ZipFile CRC32]))
+
+(defn- ->ba ^bytes [bytes] (byte-array (map unchecked-byte bytes)))
+(defn- ->ubytes [^bytes ba] (mapv #(bit-and (int %) 0xff) ba))
+(defn- utf8 [s] (b/str->utf8 s))
+
+(defn- java-zip
+  "Reference writer. `entries` is [[name content-string] ...]; `stored?` picks the
+   uncompressed method, which exercises our reader's method-0 path."
+  [entries & {:keys [stored?]}]
+  (let [out (ByteArrayOutputStream.)
+        zos (ZipOutputStream. out)]
+    (doseq [[n c] entries]
+      (let [bs (kbytes/utf8-bytes ^String c)
+            e  (ZipEntry. ^String n)]
+        (when stored?
+          (.setMethod e ZipEntry/STORED)
+          (.setSize e (alength bs))
+          (.setCompressedSize e (alength bs))
+          (let [crc (CRC32.)] (.update crc bs) (.setCrc e (.getValue crc))))
+        (.putNextEntry zos e)
+        (.write zos bs)
+        (.closeEntry zos)))
+    (.close zos)
+    (->ubytes (.toByteArray out))))
+
+(defn- with-temp-zip
+  "Write `bytes` to a temp file and hand a `ZipFile` to `f` — the only way to
+   make the reference read a central directory."
+  [bytes f]
+  (let [tmp (File/createTempFile "org-pkware-zip-test" ".zip")]
+    (try
+      (Files/write (.toPath tmp) (->ba bytes) (into-array java.nio.file.OpenOption []))
+      (with-open [zf (ZipFile. tmp)]
+        (f zf))
+      (finally (.delete tmp)))))
+
+(defn- java-read-all
+  "Every member of `bytes` as {name → content}, read through the reference's
+   central directory."
+  [bytes]
+  (with-temp-zip bytes
+    (fn [^ZipFile zf]
+      (into {}
+            (for [e (enumeration-seq (.entries zf))
+                  :when (not (.isDirectory e))]
+              [(.getName e)
+               (let [is  (.getInputStream zf e)
+                     out (ByteArrayOutputStream.)
+                     buf (byte-array 65536)]
+                 (loop [] (let [n (.read is buf)] (when (pos? n) (.write out buf 0 n) (recur))))
+                 (kbytes/utf8-string (.toByteArray out)))])))))
+
+(def ^:private members
+  [["a.txt" "hello"]
+   ["dir/b.json" (apply str (repeat 50 "{\"key\":\"value with repetition\"}"))]
+   ["dir/nested/c.txt" "third"]
+   ["empty.txt" ""]
+   ["unicode-日本語.txt" "日本語の中身"]])
+
+;; ---------------------------------------------------------------------------
+;; us → reference
+;; ---------------------------------------------------------------------------
+
+(deftest our-archives-are-read-by-the-reference
+  (let [archive (zip/build (mapv (fn [[n c]] {:name n :bytes (utf8 c)}) members))]
+    (is (= (into {} members) (java-read-all archive)))))
+
+(deftest our-stored-members-are-read-by-the-reference
+  (let [archive (zip/build (mapv (fn [[n c]] {:name n :bytes (utf8 c) :method :stored}) members))]
+    (is (= (into {} members) (java-read-all archive)))))
+
+(deftest our-directories-and-comments-survive
+  (let [archive (zip/build [{:name "top/" :bytes []}
+                            {:name "top/file.txt" :bytes (utf8 "inside") :comment "note"}]
+                           {:comment "archive comment"})]
+    (with-temp-zip archive
+      (fn [^ZipFile zf]
+        (is (= "archive comment" (.getComment zf)))
+        (let [dir (.getEntry zf "top/")]
+          (is (some? dir))
+          (is (.isDirectory dir)))
+        (is (= "note" (.getComment (.getEntry zf "top/file.txt"))))))))
+
+(deftest our-archives-are-read-by-the-streaming-reference
+  ;; ZipInputStream ignores the central directory and reads local headers, so
+  ;; this checks that both copies of every size/CRC field agree.
+  (let [archive (zip/build (mapv (fn [[n c]] {:name n :bytes (utf8 c)}) members))
+        zis     (ZipInputStream. (ByteArrayInputStream. (->ba archive)))]
+    (is (= (into {} members)
+           (loop [acc {}]
+             (if-let [e (.getNextEntry zis)]
+               (let [out (ByteArrayOutputStream.)
+                     buf (byte-array 65536)]
+                 (loop [] (let [n (.read zis buf)] (when (pos? n) (.write out buf 0 n) (recur))))
+                 (recur (assoc acc (.getName e) (kbytes/utf8-string (.toByteArray out)))))
+               acc))))))
+
+(deftest our-zip64-archives-are-read-by-the-reference
+  (let [archive (zip/build (mapv (fn [[n c]] {:name n :bytes (utf8 c)}) members)
+                           {:zip64 true})]
+    (is (every? :zip64? (zip/entries archive)))
+    (is (= (into {} members) (java-read-all archive)))))
+
+(deftest zip64-past-the-65535-entry-boundary
+  ;; The only in-suite way to reach the point where ZIP64 stops being optional.
+  (let [entries (mapv (fn [i] {:name (str "f" i ".txt") :bytes []}) (range 65600))
+        archive (zip/build entries)]
+    (testing "our writer switches to ZIP64 on its own"
+      (is (every? :zip64? (take 3 (zip/entries archive))))
+      (is (= 65600 (count (zip/entries archive)))))
+    (testing "and the reference agrees about the entry count"
+      (with-temp-zip archive (fn [^ZipFile zf] (is (= 65600 (.size zf))))))
+    (testing "declining ZIP64 when it is required is an error, not a silent truncation"
+      (is (= :zip64-required
+             (try (zip/build entries {:zip64 false}) ::no-throw
+                  (catch Exception e (:reason (ex-data e)))))))))
+
+;; ---------------------------------------------------------------------------
+;; reference → us
+;; ---------------------------------------------------------------------------
+
+(deftest we-read-reference-archives
+  (let [parsed (zip/parse (java-zip members))]
+    (is (= (mapv first members) (zip/names parsed)))
+    (doseq [[n c] members]
+      (is (= c (b/utf8->str (:bytes (zip/entry parsed n)))) n))))
+
+(deftest we-read-reference-stored-archives
+  (let [parsed (zip/parse (java-zip members :stored? true))]
+    (is (every? #(= 0 (:method %)) parsed))
+    (doseq [[n c] members]
+      (is (= c (b/utf8->str (:bytes (zip/entry parsed n))))))))
+
+(deftest we-read-reference-directory-entries
+  (let [parsed (zip/parse (java-zip [["top/" ""] ["top/f.txt" "x"]]))]
+    (is (:dir? (zip/entry parsed "top/")))
+    (is (= "x" (b/utf8->str (:bytes (zip/entry parsed "top/f.txt")))))))
+
+(deftest we-read-a-large-reference-archive
+  (let [big (apply str (repeat 20000 "log line with some repeated structure\n"))
+        parsed (zip/parse (java-zip [["big.log" big] ["small.txt" "s"]]))]
+    (is (= big (b/utf8->str (:bytes (zip/entry parsed "big.log")))))))
+
+(deftest we-agree-with-the-reference-on-crc32
+  (doseq [[_ c] members]
+    (let [bs (kbytes/utf8-bytes ^String c)
+          crc (CRC32.)]
+      (.update crc bs)
+      (is (= (.getValue crc) (long (:crc32 (first (zip/entries (java-zip [["x" c]])))))
+             )))))

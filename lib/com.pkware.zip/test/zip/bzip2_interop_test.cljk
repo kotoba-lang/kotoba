@@ -1,0 +1,131 @@
+(ns zip.bzip2-interop-test
+  "Conformance for method 12 (bzip2), in both directions.
+
+   `java.util.zip` cannot help here — it implements stored and deflate only — so
+   the oracle is python's `zipfile`, which supports `ZIP_BZIP2`, plus the `unzip`
+   binary where available. That asymmetry is the reason this lives in its own
+   file rather than in `zip.jvm-interop-test`.
+
+   Skipped loudly when python3 is missing."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [zip.core :as zip])
+  (:import [java.io File]))
+
+(defn- have-python? []
+  (try (zero? (:exit (shell/sh "bash" "-c" "command -v python3")))
+       (catch Exception _ false)))
+
+(defn- have-unzip? []
+  (try (zero? (:exit (shell/sh "bash" "-c" "command -v unzip")))
+       (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir
+            "org-pkware-zip-bz2-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+(defn- ->bytes ^bytes [v] (byte-array (map unchecked-byte v)))
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+(defn- ascii [s] (mapv int s))
+
+(defn- python! [dir script]
+  (let [{:keys [exit out err]} (shell/sh "python3" "-c" script :dir dir)]
+    (is (zero? exit) (str "python3 failed: " err))
+    (str/trim out)))
+
+(def ^:private text
+  (vec (mapcat identity (repeat 80 (ascii "a line that repeats inside a zip member\n")))))
+
+(deftest we-read-a-bzip2-archive-written-by-python
+  (if-not (have-python?)
+    (println "SKIP zip.bzip2-interop-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (python! dir "
+import zipfile
+body = b'a line that repeats inside a zip member\\n' * 80
+with zipfile.ZipFile('ref.zip','w') as z:
+    z.writestr('bz.txt', body, compress_type=zipfile.ZIP_BZIP2)
+    z.writestr('df.txt', body, compress_type=zipfile.ZIP_DEFLATED)
+    z.writestr('st.bin', b'stored', compress_type=zipfile.ZIP_STORED)
+    z.writestr('empty.txt', b'', compress_type=zipfile.ZIP_BZIP2)
+")
+        (let [archive (read-ubytes (io/file dir "ref.zip"))
+              by-name (into {} (for [e (zip/parse archive)] [(:name e) e]))]
+          (testing "the methods are what python said they were"
+            (is (= 12 (:method (get by-name "bz.txt"))))
+            (is (= "bzip2" (:method-name (get by-name "bz.txt"))))
+            (is (= 8 (:method (get by-name "df.txt"))))
+            (is (= 0 (:method (get by-name "st.bin")))))
+          (testing "and every member decompresses to what went in"
+            (is (= text (:bytes (get by-name "bz.txt"))))
+            (is (= text (:bytes (get by-name "df.txt"))))
+            (is (= (ascii "stored") (:bytes (get by-name "st.bin"))))
+            (is (= [] (:bytes (get by-name "empty.txt")))))
+          (testing "CRC-32 verification is on by default and passed"
+            (is (= 4 (count by-name)))))
+        (finally (rm-rf dir))))))
+
+(deftest python-reads-a-bzip2-archive-we-wrote
+  (if-not (have-python?)
+    (println "SKIP zip.bzip2-interop-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [archive (zip/build [{:name "bz.txt" :bytes text :method :bzip2}
+                                  {:name "bz1.txt" :bytes text :method :bzip2 :level 1}
+                                  {:name "nested/also.txt" :bytes text :method :bzip2}
+                                  {:name "df.txt" :bytes text}
+                                  {:name "st.bin" :bytes (ascii "raw") :method :stored}])
+              f (io/file dir "ours.zip")]
+          (with-open [o (io/output-stream f)] (.write o (->bytes archive)))
+          (testing "python's zipfile reads every member and its CRC checks out"
+            (let [out (python! dir "
+import zipfile
+z = zipfile.ZipFile('ours.zip')
+bad = z.testzip()
+assert bad is None, 'testzip flagged ' + str(bad)
+for i in z.infolist():
+    print('%s %d %d' % (i.filename, i.compress_type, len(z.read(i.filename))))
+")]
+              (is (= ["bz.txt 12 3200"
+                      "bz1.txt 12 3200"
+                      "nested/also.txt 12 3200"
+                      "df.txt 8 3200"
+                      "st.bin 0 3"]
+                     (str/split-lines out)))))
+          (when (have-unzip?)
+            ;; Info-ZIP is frequently built without bzip2 (macOS ships it that
+            ;; way): it *skips* method-12 members rather than failing, and exits
+            ;; non-zero to say so. That still tests something worth having — that
+            ;; the central directory, local headers and the other members are all
+            ;; readable by a third implementation — so the assertion adapts
+            ;; instead of pretending the tool can verify what it cannot.
+            (let [{:keys [exit out]} (shell/sh "unzip" "-t" "ours.zip" :dir dir)
+                  bzip2-capable? (not (str/includes? out "method not supported"))]
+              (if bzip2-capable?
+                (testing "the unzip binary verifies every member"
+                  (is (zero? exit) out)
+                  (is (str/includes? out "No errors detected")))
+                (testing "this unzip has no bzip2, but still reads our directory and other members"
+                  (println "  NOTE zip.bzip2-interop-test: unzip built without bzip2; method-12 members skipped by it")
+                  (is (str/includes? out "No errors detected"))
+                  (is (str/includes? out "df.txt"))
+                  (doseq [m ["bz.txt" "bz1.txt" "nested/also.txt"]]
+                    (is (str/includes? out m) (str m " should at least be listed"))))))))
+        (finally (rm-rf dir))))))
+
+(deftest a-bzip2-member-that-would-grow-is-stored
+  ;; Same rule deflate already had: the format allows either, every reader handles
+  ;; stored, and an archive that grows its own content is a bug not a feature.
+  (let [tiny (zip/parse (zip/build [{:name "t" :bytes (ascii "x") :method :bzip2}]))]
+    (is (= 0 (:method (first tiny))))
+    (is (= (ascii "x") (:bytes (first tiny))))))
+
+(deftest archives-stay-reproducible-with-bzip2
+  ;; The reproducibility claim in the README covers every method, not just deflate.
+  (let [a (zip/build [{:name "a.txt" :bytes text :method :bzip2}])
+        b (zip/build [{:name "a.txt" :bytes text :method :bzip2}])]
+    (is (= a b))))

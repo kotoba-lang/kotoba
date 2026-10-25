@@ -132,6 +132,7 @@ The bundled standard libraries live in this repository:
 | `org.wiFi.easyConnect` | `org.wiFi.easyConnect/src` | `dpp.uri` (an external specification, publisher wiFi.org) |
 | `org.tukaani.xz` | `org.tukaani.xz/src` | `xz.buffer`, `xz.core`, `xz.crc64`, `xz.lzma` (an external specification, publisher tukaani.org) |
 | `org.sourceware.bzip2` | `org.sourceware.bzip2/src` | `bzip2.bits`, `bzip2.bwt`, `bzip2.core`, `bzip2.crc` (an external specification, publisher sourceware.org) |
+| `com.pkware.zip` | `com.pkware.zip/src` | `zip.bytes`, `zip.core`, `zip.write` (Kotoba project library) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
 | `kotoba.x` | `kotoba.x/src` | `` (Kotoba project library) |
 | `kotoba.tsukasa` | `kotoba.tsukasa/src` | `` (Kotoba project library) |
