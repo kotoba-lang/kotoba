@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.docs` | `kotoba.docs/src` | `docs.docx`, `docs.html`, `docs.markdown`, `docs.model` (Kotoba project library) |
 | `kotoba.custody` | `kotoba.custody/src` | `custody.model`, `custody.seal`, `custody.shamir` (Kotoba project library) |
 | `kotoba.crowdfunding` | `kotoba.crowdfunding/src` | `crowdfunding.campaign`, `crowdfunding.collection`, `crowdfunding.discovery`, `crowdfunding.fee` (Kotoba project library) |
 | `kotoba.chobo` | `kotoba.chobo/src` | `chobo.events`, `chobo.invoice`, `chobo.ledger`, `chobo.ssr` (Kotoba project library) |
