@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.strfmt` | `kotoba.strfmt/src` | `kotoba.strfmt` (Kotoba project library) |
 | `kotoba.sha256d` | `kotoba.sha256d/src` | `sha256d.core`, `sha256d.evolve`, `sha256d.midstate`, `sha256d.mitm` (Kotoba project library) |
 | `kotoba.loopRenderFidelity` | `kotoba.loopRenderFidelity/src` | `render-fidelity.gate`, `render-fidelity.main`, `render-fidelity.measure` (Kotoba project library) |
 | `kotoba.kekkaiCli` | `kotoba.kekkaiCli/src` | `kekkai.cli.commands`, `kekkai.cli.config`, `kekkai.cli.desired`, `kekkai.cli.main` (Kotoba project library) |
