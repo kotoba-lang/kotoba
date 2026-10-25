@@ -1,0 +1,180 @@
+(ns kotoba.annex.grant-test
+  "grant/settle backend のテスト。実 kotobase.net は叩かず、**本番の実挙動**を mock で
+   模す: 401 unauthenticated / 413 single-part limit / 422 size / grant は
+   `:object/state :pending` だけを立て、custody は settle が立てる / 保持していない
+   テナントの download は 404（403 ではない — CID は推測可能なので membership oracle
+   になる）/ remove の grant は GET を presign する。"
+  (:require [kotoba.test :refer [deftest is testing async]]
+            [kotoba.annex.cid :as cid]
+            [kotoba.annex.grant :as g]))
+
+(defn- sha256-hex [b]
+  (-> (js/require "crypto") (.createHash "sha256") (.update b) (.digest "hex")))
+
+(def payload (js/Buffer.from "a gigabyte's worth of intent, in miniature"))
+(def payload-key (str "SHA256E-s" (.-length payload) "--" (sha256-hex payload) ".bin"))
+(def cacao "cacao-with-kotoba://can/object:write")
+
+(defn mock-plane
+  "grant → presigned PUT → settle。`pending` と `held` を分けて持つのが要点で、
+   **settle を通るまで held に入らない**（本番の custody 規則）。
+   opts で settle だけを壊せる（grant は成功、custody は立たない、を作るため）。"
+  [{:keys [pending held blobs auth settle-status]
+    :or {settle-status 200}}]
+  (fn [u & [opts]]
+    (let [o (or opts #js {})
+          method (or (.-method o) "GET")
+          hdr (some-> (.-headers o) (aget "authorization"))
+          body (when (.-body o)
+                 (try (js->clj (js/JSON.parse (.-body o)) :keywordize-keys true)
+                      (catch :default _ nil)))
+          json (fn [status m]
+                 #js {:ok (< status 300) :status status
+                      :text (fn [] (js/Promise.resolve (js/JSON.stringify (clj->js m))))})]
+      (js/Promise.resolve
+       (cond
+         ;; ── presigned transfer target（署名 URL の実体） ───────────────────
+         (re-find #"^https://signed\.example/" u)
+         (let [c (last (.split u "/"))]
+           (if (= method "PUT")
+             (do (swap! blobs assoc c (.-body o))
+                 (swap! pending conj c)
+                 #js {:ok true :status 200})
+             (if-let [b (get @blobs c)]
+               #js {:ok true :status 200 :arrayBuffer (fn [] (js/Promise.resolve b))}
+               #js {:ok false :status 404})))
+
+         ;; ── POST /objects/v1/settle ───────────────────────────────────────
+         (re-find #"/objects/v1/settle$" u)
+         (cond
+           (not= hdr auth) (json 403 {:error "storage capability unavailable"})
+           (not= 200 settle-status) (json settle-status {:error "settle refused"})
+           (not (contains? @pending (:cid body))) (json 409 {:error "not observed"})
+           :else (do (swap! held conj (:cid body))
+                     (json 200 {:cid (:cid body) :state "stored"
+                                :verifiedBy "client-attested"})))
+
+         ;; ── POST /objects/v1/grant/<op> ───────────────────────────────────
+         (re-find #"/objects/v1/grant/" u)
+         (let [op (last (.split u "/"))
+               c (:cid body)]
+           (cond
+             (not= hdr auth) (json 401 {:error "unauthenticated"})
+             (and (= op "upload") (> (or (:size body) 0) g/max-single-put-bytes))
+             (json 413 {:error "object exceeds the single-part limit"
+                        :missingCapability "multipart-put"})
+             (and (= op "upload") (not (number? (:size body))))
+             (json 422 {:error "size is required for an upload grant"})
+             ;; 保持していないテナントの download / remove は 404
+             (and (#{"download" "remove"} op) (not (contains? @held c)))
+             (json 404 {:error "no such object for this tenant"})
+             :else
+             (json 200 {:op op :cid c
+                        :href (str "https://signed.example/" c)
+                        ;; 本番どおり remove も GET を presign する
+                        :method (if (= op "upload") "PUT" "GET")
+                        :headers (if (= op "upload")
+                                   {"content-length" (str (:size body))} {})
+                        :state "pending"})))
+         :else #js {:ok false :status 404})))))
+
+(defn- store-for [opts]
+  (g/grant-store {:endpoint "https://kotobase.net"
+                  :authorization cacao
+                  :fetch (mock-plane (merge {:auth cacao} opts))}))
+
+(defn- fresh []
+  {:pending (atom #{}) :held (atom #{}) :blobs (atom {})})
+
+(deftest grant-roundtrip
+  (testing "store! が grant→PUT→settle の 3 手を踏み、その後 present?/retrieve が通る"
+    (async done
+      (let [{:keys [held] :as st} (fresh)
+            s (store-for st)]
+        (-> ((:store! s) payload-key payload)
+            (.then (fn [ok]
+                     (is (true? ok) "settle まで通って初めて true")
+                     (is (= 1 (count @held)) "custody は settle が立てた")
+                     ((:present? s) payload-key)))
+            (.then (fn [p]
+                     (is (= :yes p))
+                     ((:retrieve s) payload-key)))
+            (.then (fn [b]
+                     (is (= (sha256-hex payload) (sha256-hex b)) "同じバイト列が戻る")
+                     (done))))))))
+
+(deftest grant-is-not-custody
+  (testing "settle が通らなければ STORE を成功と report せず、custody も立たない"
+    (async done
+      (let [{:keys [held pending] :as st} (fresh)
+            s (store-for (assoc st :settle-status 500))]
+        (-> ((:store! s) payload-key payload)
+            (.then (fn [ok]
+                     ;; ここが要点。bytes は object store に届いている（pending）が、
+                     ;; holding は立っていない。true を返すと git-annex が numcopies
+                     ;; 充足と信じて最後のローカルコピーを drop する。
+                     (is (false? ok) "settle 失敗を成功と偽らない")
+                     (is (= 1 (count @pending)) "bytes は届いている")
+                     (is (zero? (count @held)) "custody は立っていない")
+                     ((:present? s) payload-key)))
+            (.then (fn [p]
+                     (is (= :no p) "CHECKPRESENT は custody を答える")
+                     (done))))))))
+
+(deftest grant-unauthenticated
+  (testing "CACAO が違えば grant が 401 で、STORE は false"
+    (async done
+      (let [st (fresh)
+            s (g/grant-store {:endpoint "https://kotobase.net"
+                              :authorization "wrong-cacao"
+                              :fetch (mock-plane (merge {:auth cacao} st))})]
+        (-> ((:store! s) payload-key payload)
+            (.then (fn [ok]
+                     (is (false? ok))
+                     (is (zero? (count @(:blobs st))) "認可前に bytes を送っていない")
+                     (done))))))))
+
+(deftest grant-download-404-is-no
+  (testing "保持していない object の present? は :no（:unknown ではない）"
+    (async done
+      (let [s (store-for (fresh))]
+        (-> ((:present? s) payload-key)
+            (.then (fn [p] (is (= :no p)) (done))))))))
+
+(deftest grant-retrieve-is-fail-closed
+  (testing "署名先が別物を返したら nil。壊れたバイト列を git-annex に渡さない"
+    (async done
+      (let [{:keys [held blobs] :as st} (fresh)
+            s (store-for st)]
+        (-> ((:store! s) payload-key payload)
+            (.then (fn [_]
+                     (is (= 1 (count @held)))
+                     ;; object store 側が中身を差し替えた状況
+                     (reset! blobs {(cid/key->cid payload-key)
+                                    (js/Buffer.from "not the bytes you asked for")})
+                     ((:retrieve s) payload-key)))
+            (.then (fn [b] (is (nil? b)) (done))))))))
+
+(deftest grant-remove-does-not-pretend
+  (testing "remove の grant は GET を presign するので削除にならない — false を返す"
+    (async done
+      (let [s (store-for (fresh))]
+        (-> ((:remove! s) payload-key)
+            (.then (fn [r] (is (false? r)) (done))))))))
+
+(deftest grant-refuses-underivable-key
+  (testing "chunk / encryption の key は CID を導出できない — 黙って別 CID に書かない"
+    (let [s (store-for (fresh))]
+      (is (nil? (cid/key->cid "GPGHMACSHA1--c51589abcdef")) "前提: 導出不可")
+      (is (thrown? js/Error ((:store! s) "GPGHMACSHA1--c51589abcdef" payload))))))
+
+(deftest grant-refuses-mismatched-bytes
+  (testing "key の hash と実バイト列が食い違うなら送る前に落とす"
+    (let [s (store-for (fresh))
+          other (js/Buffer.from "different bytes entirely")]
+      (is (thrown? js/Error ((:store! s) payload-key other))))))
+
+(deftest grant-prepare-requires-cacao
+  (testing "認証が無ければ PREPARE で落ちる（無認証で走り出さない）"
+    (let [s (g/grant-store {:authorization "" :fetch (mock-plane (fresh))})]
+      (is (thrown? js/Error ((:prepare! s) {}))))))

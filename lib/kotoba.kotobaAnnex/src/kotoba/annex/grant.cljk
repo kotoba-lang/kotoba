@@ -1,0 +1,165 @@
+(ns kotoba.annex.grant
+  "kotobase の **large-object 面**（`POST /objects/v1/grant/*` + `/objects/v1/settle`）
+   を backend にする store（ADR-2608012600 D4 / ADR-2608301039 D7 段1）。
+
+   `kotoba.annex.archive`（`PUT /ipfs/:cid`）との違いは 1 点だけで、それが存在理由:
+   **バイト列がこの process を通らない。** grant が presigned URL を返し、client は
+   それを直接 object store へ叩く。したがって `archive-put/max-object-bytes` の
+   4 MiB 天井が構造的に無く、GB 級の annex object が載る（単発 PUT の上限は S3 の
+   5 GiB = `object-grant/max-single-put-bytes`。multipart は未公開で、超えると本番は
+   413 に `:missing-capability :multipart-put` を付けて返す）。
+
+   ## 3 手であって 1 手ではない — grant は custody ではない
+
+     1. `POST /objects/v1/grant/upload  {cid, size}` → `{href, method, headers}`
+     2. その `href` へ直接 PUT（返ってきた headers をそのまま付ける。`content-length`
+        が署名に束縛されているので、勝手に足し引きすると署名が合わない）
+     3. `POST /objects/v1/settle {cid, size}`
+
+   **2 手目まででは `:object/state :pending` しか立たない。** custody（`:holding/*`）を
+   立てるのは settle だけで、これは本番側の設計上の不変条件である
+   （`kotobase.object-grant` の docstring が名指ししている失敗: intent の時点で holding
+   を立てると、URL を渡した直後に client が落ちた時に git-annex が numcopies 充足と
+   信じて**最後のローカルコピーを drop** し、bytes が消えたのに記録は全て正常に見える）。
+   本 ns は settle が 200 を返すまで STORE を成功と report しない。
+
+   ## 認証は CACAO（`/ipfs/:cid` の Bearer とは別物）
+
+   grant 面は `kotoba://can/object:{read,write,remove}` を resources に持つ CACAO を
+   要求する（`object-grant/capabilities`）。`/ipfs/:cid` の静的 Bearer や Biscuit は
+   ここでは通らない。`:authorization` を注入するか、既定で `KOTOBASE_CACAO` を読む。
+
+   ## REMOVE は「できない」と答える
+
+   本番の `grant-response` は `(if upload? \"PUT\" \"GET\")` で presign するので、
+   **`:remove` の grant も GET を返す**。それに従っても削除は起きない。
+   `kotoba.annex.archive` が `/ipfs/:cid` に delete 面が無いことに対して false を
+   返しているのと同じ理由で、ここでも false を返す —— tombstone で「消えたことに
+   する」誤魔化しをしない（実体は残るのだから）。実測 2026-08-30。
+
+   ## 暗号化した object はまだ載らない
+
+   `key->cid` が導出できる key（SHA256E・chunk 無し・暗号化無し）だけを扱う。
+   `encryption=shared` / `chunk=` の key は導出不可なので `require-cid` が throw する
+   （黙って別の CID へ書かない）。暗号化経路の正しい形は key→CID の対応表を datom 面に
+   置くことで、それが ADR-2608301039 D2 の identity/location 分離 —— follow-up。"
+  (:require [kotoba.annex.cid :as cid]))
+
+(def default-endpoint "https://kotobase.net")
+
+(def max-single-put-bytes
+  "S3 PutObject の単発上限（本番 `object-grant/max-single-put-bytes` と同値）。
+   超えたら本番は 413 を返す。こちらでも送る前に落として理由を明示する。"
+  (* 5 1024 1024 1024))
+
+(defn- sha256-hex [b]
+  (-> (js/require "crypto") (.createHash "sha256") (.update b) (.digest "hex")))
+
+(defn- require-cid
+  "key → CIDv1(raw,sha2-256)。導出不可なら throw（fail-closed）。"
+  [key]
+  (or (cid/key->cid key)
+      (throw (js/Error.
+              (str "key から CID を導出できない: " key
+                   " — chunk / encryption を使う構成では key→CID 対応表が要る"
+                   "（ADR-2608301039 D2、未実装）")))))
+
+(defn- json-body [r]
+  (-> (.text r)
+      (.then (fn [t] (try (js->clj (js/JSON.parse t) :keywordize-keys true)
+                          (catch :default _ nil))))))
+
+(defn grant-store
+  "opts: {:endpoint :authorization :fetch}。authorization 省略時は KOTOBASE_CACAO。
+   store 契約（kotoba.annex.store）と同形。関数は Promise を返す。"
+  [{:keys [endpoint authorization fetch]
+    :or {endpoint default-endpoint fetch js/fetch}}]
+  (let [auth (or authorization js/process.env.KOTOBASE_CACAO)
+        headers (fn [extra]
+                  (clj->js (merge {"authorization" auth
+                                   "content-type" "application/json"}
+                                  extra)))
+        post (fn [path body]
+               (fetch (str endpoint path)
+                      #js {:method "POST"
+                           :headers (headers {})
+                           :body (js/JSON.stringify (clj->js body))}))
+        ;; grant は「この op の presigned transfer をくれ」。404 は本番の設計どおり
+        ;; 「このテナントはそれを保持していない」であって「他の誰も持っていない」
+        ;; ではない（CID は推測可能なので 403 だと membership oracle になる）。
+        grant (fn [op cid size]
+                (-> (post (str "/objects/v1/grant/" (name op))
+                          (cond-> {:cid cid} size (assoc :size size)))
+                    (.then (fn [r]
+                             (-> (json-body r)
+                                 (.then (fn [b] {:status (.-status r) :body b})))))))
+        ;; 2 手目と 3 手目。**settle が 200 を返すまで true にしない** —— そこが
+        ;; custody を立てる唯一の手であり、intent を custody と report した瞬間に
+        ;; git-annex は最後のローカルコピーを落としてよいと判断する。
+        upload-then-settle
+        (fn [{:keys [status body]} c size bytes]
+          (if-not (= 200 status)
+            (js/Promise.resolve false)
+            (-> (fetch (:href body)
+                       ;; 署名に束縛された headers をそのまま付ける。足し引きすると
+                       ;; 署名が合わない（content-length が署名対象）。
+                       #js {:method (or (:method body) "PUT")
+                            :headers (clj->js (or (:headers body) {}))
+                            :body bytes})
+                (.then (fn [r]
+                         (if (.-ok r)
+                           (post "/objects/v1/settle" {:cid c :size size})
+                           false)))
+                (.then (fn [r]
+                         (if (or (false? r) (nil? r))
+                           false
+                           (= 200 (.-status r))))))))]
+    {:endpoint endpoint
+     :store!
+     (fn [key bytes]
+       (let [c (require-cid key)
+             size (.-length bytes)]
+         (when (> size max-single-put-bytes)
+           (throw (js/Error. (str "object > max-single-put-bytes (" max-single-put-bytes
+                                  ") — multipart は未公開。本番は 413 を返す"))))
+         ;; 防御: key の hash と実バイト列が食い違うなら送らない。本番も digest を
+         ;; 検証するが、こちらの誤用はこちらで検出した方が原因が分かる。
+         (let [actual (sha256-hex bytes)
+               expect (:hash (cid/parse-key key))]
+           (when (not= actual expect)
+             (throw (js/Error. (str "key の hash と実バイト列の sha256 が不一致: key="
+                                    expect " bytes=" actual)))))
+         (-> (grant :upload c size)
+             (.then (fn [g] (upload-then-settle g c size bytes)))
+             (.then (fn [ok] (boolean ok))))))
+     ;; CHECKPRESENT は custody を訊く。grant/download が 200 なら
+     ;; このテナントの holding が在る（本番は holds? を見てから presign する）。
+     :present?
+     (fn [key]
+       (-> (grant :download (require-cid key) nil)
+           (.then (fn [{:keys [status]}]
+                    (case status 200 :yes 404 :no :unknown)))
+           (.catch (fn [_] :unknown))))
+     :retrieve
+     (fn [key]
+       (let [c (require-cid key)]
+         (-> (grant :download c nil)
+             (.then (fn [{:keys [status body]}]
+                      (when (= 200 status)
+                        (-> (fetch (:href body) #js {:method (or (:method body) "GET")})
+                            (.then (fn [r] (when (.-ok r) (.arrayBuffer r))))))))
+             (.then (fn [buf]
+                      (when buf
+                        (let [b (js/Buffer.from buf)]
+                          ;; fail-closed: 別物が返ってきたら nil。壊れたバイト列を
+                          ;; git-annex に渡さない。
+                          (when (= (sha256-hex b) (:hash (cid/parse-key key))) b))))))))
+     ;; 上の docstring 参照 — remove の grant は GET を presign するので、
+     ;; 従っても削除にならない。成功と偽らない。
+     :remove! (fn [_key] (js/Promise.resolve false))
+     :init! (fn [] true)
+     :prepare!
+     (fn [_config]
+       (when (or (nil? auth) (= auth ""))
+         (throw (js/Error. "KOTOBASE_CACAO が未設定 — grant 面は CACAO 認証が要る")))
+       true)}))
