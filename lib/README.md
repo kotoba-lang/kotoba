@@ -221,6 +221,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
+| `kotoba.teian` | `kotoba.teian/src` | `teian.cacao`, `teian.cli`, `teian.deckllm`, `teian.deckport` (Kotoba project library) |
 | `kotoba.soko` | `kotoba.soko/src` | `soko.events`, `soko.fulfillment`, `soko.projection`, `soko.shipment` (Kotoba project library) |
 | `kotoba.senden` | `kotoba.senden/src` | `senden.attribution`, `senden.campaign`, `senden.channel`, `senden.events` (Kotoba project library) |
 | `kotoba.madoguchi` | `kotoba.madoguchi/src` | `madoguchi.customer`, `madoguchi.events`, `madoguchi.projection`, `madoguchi.ssr` (Kotoba project library) |

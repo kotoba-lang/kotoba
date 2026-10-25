@@ -1,0 +1,151 @@
+(ns teian.distribute
+  "REAL email Distributor for `teian.deckport/mock-deckport`'s injected
+  `:distribute-fn` slot (README.md 'DeckTarget → real backend (injection)') —
+  the concrete, opt-in counterpart to the default no-op distribute-fn.
+  Mirrors `cloud-itonami.mail`'s Resend integration exactly: same
+  dependency-free `java.net.http` transport (`jvm-http-fn`), same
+  `mailer.core/request` request-building, same non-2xx error handling. This
+  is the one teian namespace that touches the network or RESEND_API_KEY;
+  every other teian ns (deckport included) stays pure per its own contract.
+
+  `mock-deckport`'s `:distribute-fn` is called once per `publish!` with
+  `{:activity :target :content :pptx-bytes?}` — `:content` is the verbatim,
+  already-governed `slides.model` EDN (never re-read from the store, see
+  `teian.operation`'s TOCTOU note), so this ns independently re-derives real
+  pptx bytes from `:content` (the same best-effort `slides.office` export
+  `mock-deckport` already attempted, just re-run here since only the boolean
+  crossed the distribute-fn boundary, not the bytes) rather than requiring
+  `deckport.cljc` to thread raw bytes through.
+
+  `kotoba-lang/mailer`'s `mailer.core/message-wire` has no attachment
+  concept yet (`mail.message` doesn't model attachments), so this ns augments
+  the JSON body `mailer.core/request` builds with a base64 Resend
+  `attachments` array directly, per Resend's documented wire format, instead
+  of reinventing the rest of the request (from/to/subject/url/auth all still
+  come from `mailer.core`/`mail.message`)."
+  (:require [kotoba.bytes :as kbytes] [json.compat :as json]
+            [kotoba.lang.text :as str]
+            [mail.message :as message]
+            [mailer.core :as mailer]))
+
+(defn- resend-api-key []
+  (or (System/getenv "RESEND_API_KEY")
+      (throw (ex-info "RESEND_API_KEY is not set" {}))))
+
+(defn jvm-http-fn
+  "Real java.net.http transport, byte-for-byte the same {:url :method
+  :headers :body} -> {:status :body} convention as
+  cloud-itonami.mail/jvm-http-fn (and cloud-itonami.runtime's) — lets every
+  fn in this ns be tested with a stubbed :http-fn instead of a real Resend
+  call."
+  []
+  (fn [{:keys [url method headers body]}]
+    (let [builder (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                      (as-> b (reduce-kv (fn [b k v] (.header b k v)) b headers)))
+          request (case method
+                    :post (-> builder
+                             (.POST (java.net.http.HttpRequest$BodyPublishers/ofString (or body "")))
+                             .build)
+                    (throw (ex-info "Unsupported HTTP method" {:method method})))
+          resp (.send (java.net.http.HttpClient/newHttpClient) request
+                     (java.net.http.HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp) :body (.body resp)})))
+
+(defn try-pptx-bytes
+  "Best-effort real pptx export via kotoba-lang/slides's slides.office —
+  mirrors teian.deckport/try-export-pptx exactly (lazily resolved so a
+  :doc/:sheet content, or any failure anywhere in the office/ooxml/
+  drawingml/presentationml toolchain, degrades to nil instead of throwing —
+  a preview attachment is a nicety, not the actuation)."
+  [content]
+  (when (= :slides/deck (:slides/kind content))
+    (try
+      (when-let [f (requiring-resolve 'slides.office/pptx-bytes-from-deck-edn)]
+        (f (pr-str content)))
+      (catch Exception _ nil))))
+
+(defn- base64 [^bytes bs] (kbytes/base64-encode bs))
+
+(defn- deck-title [content]
+  (or (:slides/title content) (:slides/id content) "deck"))
+
+(defn- attachments-for [pptx-bytes filename]
+  (when pptx-bytes
+    [{:filename filename
+      :content (base64 pptx-bytes)
+      :content_type "application/vnd.openxmlformats-officedocument.presentationml.presentation"}]))
+
+(defn resend-request
+  "Build the {:url :method :headers :body} map the http-fn (default
+  jvm-http-fn) POSTs — the same shape cloud-itonami.mail/
+  send-message-via-resend! builds via mailer.core/request, plus a Resend
+  `attachments` array (base64) when `:pptx-bytes` were supplied. `:from` is
+  the verified Resend sender the caller supplies explicitly (teian never
+  hardcodes/guesses one, mirrors cloud-itonami.mail/send-marketing-
+  outreach!'s convention)."
+  [{:keys [from to subject text pptx-bytes pptx-filename token]}]
+  (let [m (message/message {:from from :to to :subject subject :text text})
+        request (mailer/request :resend {:mail.effect/type :mail/send :mail.effect/message m})
+        json-body (cond-> (:http/json request)
+                    pptx-bytes (assoc :attachments
+                                (attachments-for pptx-bytes (or pptx-filename "deck.pptx"))))]
+    {:url (:http/url request)
+     :method :post
+     :headers {"Authorization" (str "Bearer " (or token (resend-api-key)))
+               "Content-Type" "application/json"}
+     :body (json/generate-string json-body)}))
+
+(defn send-deck-via-resend!
+  "POST `opts` (see resend-request) to Resend via `:http-fn` (default
+  jvm-http-fn, a REAL network call). Returns the parsed JSON response body.
+  Throws on a non-2xx status or a missing RESEND_API_KEY, mirrors
+  cloud-itonami.mail/send-message-via-resend! exactly."
+  [{:keys [http-fn] :as opts}]
+  (let [http-fn (or http-fn (jvm-http-fn))
+        req (resend-request opts)
+        resp (http-fn req)
+        resp-body (json/parse-string (:body resp) true)]
+    (when-not (< (:status resp) 300)
+      (throw (ex-info "Resend send failed" {:status (:status resp) :body resp-body})))
+    resp-body))
+
+(defn- default-subject [{:keys [activity]}]
+  (str "[teian] deck published — " activity))
+
+(defn- default-text [{:keys [activity target]}]
+  (str "teian published the deck for activity \"" activity "\" to " target
+       ".\n\n(This delivery attaches the pptx export when one could be produced;"
+       " otherwise this text summary is the whole delivery.)"))
+
+(defn resend-distribute-fn
+  "Constructs a real `teian.deckport/mock-deckport` `:distribute-fn` — the
+  opt-in counterpart to the default no-op (`teian.operation/build`'s
+  `:deckport` stays `mock-deckport` unless a caller injects this). `:from`
+  is REQUIRED (the verified Resend sender address; teian does not
+  guess/hardcode one). `:subject-fn`/`:text-fn` (each `({:keys [activity
+  target content pptx-bytes?]}) -> string`) let a caller customize the
+  email; the defaults name the activity/target plainly.
+
+  Best-effort pptx: re-derives pptx bytes straight from the delivered
+  `:content` (see try-pptx-bytes) — a `:doc`/`:sheet` draft or any export
+  failure simply sends without an attachment rather than failing the
+  delivery.
+
+  Returns `{:delivery/tool (str \"resend:\" id) :delivery/message-id id}` —
+  the shape `teian.operation`'s `commit-effects!` looks for on `publish!`'s
+  return (mock-deckport forwards a map-shaped distribute-fn result), so it
+  can be recorded on the draft + ledger (mirrors cloud-itonami.mail/
+  send-via-resend!'s `:itonami.effect/tool (str \"resend:\" id)`)."
+  [{:keys [from http-fn token subject-fn text-fn]
+    :or {subject-fn default-subject text-fn default-text}}]
+  (when (str/blank? from)
+    (throw (ex-info "resend-distribute-fn requires :from (the verified Resend sender)" {})))
+  (fn [{:keys [target content] :as call}]
+    (let [pptx (try-pptx-bytes content)
+          resp (send-deck-via-resend!
+                {:from from :to target
+                 :subject (subject-fn call) :text (text-fn call)
+                 :pptx-bytes pptx :pptx-filename (str (deck-title content) ".pptx")
+                 :token token :http-fn http-fn})
+          id (:id resp)]
+      {:delivery/tool (str "resend:" id) :delivery/message-id id})))
