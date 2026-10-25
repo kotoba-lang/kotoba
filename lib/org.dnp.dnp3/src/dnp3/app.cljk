@@ -1,0 +1,283 @@
+(ns dnp3.app
+  "DNP3 application layer — IEEE Std 1815-2012 §9.4 (APCI, the Application
+  Protocol Control Information) and §9.5 (object headers), built on the
+  point payloads in `dnp3.objects`.
+
+  A fragment is:
+
+      Application Control (1)  Function Code (1)  [IIN (2), responses only]
+      object header  points…
+      object header  points…
+      ...
+
+  Application Control:
+
+      bit 7  FIR   first fragment of a multi-fragment application message
+      bit 6  FIN   last fragment
+      bit 5  CON   a confirmation is requested
+      bit 4  UNS   unsolicited
+      3..0   SEQUENCE, 0..15
+
+  An object header is `Group(1) Variation(1) Qualifier(1)`, optionally
+  followed by a range field whose shape the qualifier's low nibble picks,
+  followed by that many point payloads (`dnp3.objects/point-codecs`).
+
+  ;; constructed, not a published spec vector — the function-code and IIN
+  ;; bit assignments below follow the conventions this session recalls as
+  ;; consistent across widely deployed DNP3 stacks, not a verbatim
+  ;; transcription of IEEE 1815 Part 2's own tables checked against the
+  ;; paid standard text in this session. Treat the *mechanics* (bit
+  ;; positions, qualifier framing, object-header repetition) as the
+  ;; authoritative part of this namespace and the specific numeric
+  ;; assignments as best-effort."
+  (:require [dnp3.objects :as objects]))
+
+(def function-codes
+  {:confirm 0
+   :read 1
+   :write 2
+   :select 3
+   :operate 4
+   :direct-operate 5
+   :direct-operate-no-ack 6
+   :cold-restart 13
+   :warm-restart 14
+   :enable-unsolicited 20
+   :disable-unsolicited 21
+   :response 129
+   :unsolicited-response 130})
+
+(def ^:private function-codes-inv (into {} (map (juxt val key)) function-codes))
+
+(defn- le16 [n] [(bit-and n 0xFF) (bit-and (unsigned-bit-shift-right n 8) 0xFF)])
+(defn- rd-le16 [bs i] (+ (nth bs i) (* 256 (nth bs (inc i)))))
+
+;; ── Application Control ─────────────────────────────────────────────────
+
+(defn encode-control
+  [{:keys [fir fin con uns sequence]}]
+  (bit-or (if fir 0x80 0) (if fin 0x40 0) (if con 0x20 0) (if uns 0x10 0)
+          (bit-and sequence 0x0F)))
+
+(defn decode-control
+  [b]
+  {:fir (bit-test b 7) :fin (bit-test b 6) :con (bit-test b 5) :uns (bit-test b 4)
+   :sequence (bit-and b 0x0F)})
+
+;; ── Internal Indications (responses only) ───────────────────────────────
+
+(defn encode-iin
+  [{:keys [broadcast class1-events class2-events class3-events need-time local-control
+           device-trouble device-restart func-code-not-supported object-unknown
+           parameter-error event-buffer-overflow already-executing config-corrupt]}]
+  [(bit-or (if broadcast 0x01 0) (if class1-events 0x02 0) (if class2-events 0x04 0)
+           (if class3-events 0x08 0) (if need-time 0x10 0) (if local-control 0x20 0)
+           (if device-trouble 0x40 0) (if device-restart 0x80 0))
+   (bit-or (if func-code-not-supported 0x01 0) (if object-unknown 0x02 0)
+           (if parameter-error 0x04 0) (if event-buffer-overflow 0x08 0)
+           (if already-executing 0x10 0) (if config-corrupt 0x20 0))])
+
+(defn decode-iin
+  [b1 b2]
+  {:broadcast (bit-test b1 0) :class1-events (bit-test b1 1) :class2-events (bit-test b1 2)
+   :class3-events (bit-test b1 3) :need-time (bit-test b1 4) :local-control (bit-test b1 5)
+   :device-trouble (bit-test b1 6) :device-restart (bit-test b1 7)
+   :func-code-not-supported (bit-test b2 0) :object-unknown (bit-test b2 1)
+   :parameter-error (bit-test b2 2) :event-buffer-overflow (bit-test b2 3)
+   :already-executing (bit-test b2 4) :config-corrupt (bit-test b2 5)})
+
+;; ── object headers ───────────────────────────────────────────────────────
+
+(defn- qualifier-byte [prefix-code range-code] (bit-or (bit-shift-left prefix-code 4) range-code))
+
+(defn encode-object-group
+  "One `Group Variation Qualifier [range] points…` header block.
+
+  `:qualifier-kind` is one of:
+    `:range-8`         — `:start :stop` 1-byte indices, plain points (qualifier 0x00)
+    `:range-16`        — `:start :stop` 2-byte indices, plain points (qualifier 0x01)
+    `:no-range`        — no range field, no points; a class/static poll (qualifier 0x06)
+    `:indexed-count-8` — 1-byte object count, each point prefixed with its
+                          own 1-byte index (qualifier 0x17): `:points` is
+                          `[{:index n :point {...}} …]`, e.g. a CROB write."
+  [{:keys [group variation qualifier-kind start stop points]}]
+  (let [codec (get objects/point-codecs [group variation])]
+    (if (nil? codec)
+      {:status :error :reason :unknown-group-variation :group group :variation variation}
+      (case qualifier-kind
+        :range-8
+        {:status :ok
+         :bytes (into [group variation (qualifier-byte 0 0x00) (bit-and start 0xFF) (bit-and stop 0xFF)]
+                      (mapcat (:encode codec) points))}
+        :range-16
+        {:status :ok
+         :bytes (-> [group variation (qualifier-byte 0 0x01)]
+                    (into (le16 start))
+                    (into (le16 stop))
+                    (into (mapcat (:encode codec) points)))}
+        :no-range
+        {:status :ok :bytes [group variation (qualifier-byte 0 0x06)]}
+        :indexed-count-8
+        {:status :ok
+         :bytes (into [group variation (qualifier-byte 1 0x07) (bit-and (count points) 0xFF)]
+                      (mapcat (fn [{:keys [index point]}]
+                                (into [(bit-and index 0xFF)] ((:encode codec) point)))
+                              points))}
+        {:status :error :reason :unknown-qualifier-kind :qualifier-kind qualifier-kind}))))
+
+(defn- decode-fixed-points
+  "Decode `n` back-to-back fixed-size points starting at `pos`, each via
+  `codec`'s `:decode`. Returns `{:status :ok :points […] :pos pos'}` or an
+  `:incomplete`/`:error`."
+  [buf n-total codec pos n]
+  (loop [i 0 pos pos out []]
+    (if (= i n)
+      {:status :ok :points out :pos pos}
+      (let [size (:size codec)]
+        (if (> (+ pos size) n-total)
+          {:status :incomplete :need (- (+ pos size) n-total)}
+          (let [{:keys [point]} ((:decode codec) buf pos)]
+            (recur (inc i) (+ pos size) (conj out point))))))))
+
+(defn- decode-indexed-points
+  [buf n-total codec pos n]
+  (loop [i 0 pos pos out []]
+    (if (= i n)
+      {:status :ok :points out :pos pos}
+      (if (>= pos n-total)
+        {:status :incomplete :need (- (inc pos) n-total)}
+        (let [idx (nth buf pos)
+              size (:size codec)]
+          (if (> (+ pos 1 size) n-total)
+            {:status :incomplete :need (- (+ pos 1 size) n-total)}
+            (let [{:keys [point]} ((:decode codec) buf (inc pos))]
+              (recur (inc i) (+ pos 1 size) (conj out {:index idx :point point})))))))))
+
+(defn decode-object-group
+  "Decode one `Group Variation Qualifier […] points…` block starting at
+  `pos`. Returns `{:status :ok :header {...} :consumed n}` (`:consumed` is
+  bytes read *from `pos`*, not an absolute position) or a named
+  `:incomplete`/`:error`."
+  [buf pos]
+  (let [buf (vec buf) n (count buf)]
+    (if (< (- n pos) 3)
+      {:status :incomplete :need (- 3 (- n pos))}
+      (let [group (nth buf pos) variation (nth buf (+ pos 1)) qual (nth buf (+ pos 2))
+            range-code (bit-and qual 0x0F)
+            codec (get objects/point-codecs [group variation])]
+        (cond
+          (nil? codec)
+          {:status :error :reason :unknown-group-variation :group group :variation variation}
+          (= range-code 0x06)
+          {:status :ok :consumed 3
+           :header {:group group :variation variation :qualifier-kind :no-range :points []}}
+          (= range-code 0x00)
+          (if (< (- n pos) 5)
+            {:status :incomplete :need (- 5 (- n pos))}
+            (let [start (nth buf (+ pos 3)) stop (nth buf (+ pos 4))
+                  cnt (inc (- stop start))
+                  r (decode-fixed-points buf n codec (+ pos 5) cnt)]
+              (case (:status r)
+                :ok {:status :ok :consumed (- (:pos r) pos)
+                     :header {:group group :variation variation :qualifier-kind :range-8
+                               :start start :stop stop :points (:points r)}}
+                r)))
+          (= range-code 0x01)
+          (if (< (- n pos) 7)
+            {:status :incomplete :need (- 7 (- n pos))}
+            (let [start (rd-le16 buf (+ pos 3)) stop (rd-le16 buf (+ pos 5))
+                  cnt (inc (- stop start))
+                  r (decode-fixed-points buf n codec (+ pos 7) cnt)]
+              (case (:status r)
+                :ok {:status :ok :consumed (- (:pos r) pos)
+                     :header {:group group :variation variation :qualifier-kind :range-16
+                               :start start :stop stop :points (:points r)}}
+                r)))
+          (= range-code 0x07)
+          (if (< (- n pos) 4)
+            {:status :incomplete :need (- 4 (- n pos))}
+            (let [cnt (nth buf (+ pos 3))
+                  r (decode-indexed-points buf n codec (+ pos 4) cnt)]
+              (case (:status r)
+                :ok {:status :ok :consumed (- (:pos r) pos)
+                     :header {:group group :variation variation :qualifier-kind :indexed-count-8
+                               :points (:points r)}}
+                r)))
+          :else
+          {:status :error :reason :unsupported-range-code :range-code range-code})))))
+
+(defn- decode-object-groups
+  "Decode object headers back-to-back until `buf` (from `pos`) is exhausted."
+  [buf pos]
+  (let [n (count buf)]
+    (loop [pos pos out []]
+      (if (>= pos n)
+        {:status :ok :headers out}
+        (let [r (decode-object-group buf pos)]
+          (case (:status r)
+            :ok (recur (+ pos (:consumed r)) (conj out (:header r)))
+            r))))))
+
+;; ── fragments ────────────────────────────────────────────────────────────
+
+(defn encode-request
+  "A full request fragment: 2-byte APCI + concatenated object-header blocks."
+  [{:keys [function object-groups] :as apci}]
+  (let [fc (get function-codes function)]
+    (cond
+      (nil? fc) {:status :error :reason :unknown-function :function function}
+      :else
+      (loop [groups object-groups acc []]
+        (if (empty? groups)
+          {:status :ok :bytes (into [(encode-control apci) fc] acc)}
+          (let [r (encode-object-group (first groups))]
+            (if (= :error (:status r))
+              r
+              (recur (rest groups) (into acc (:bytes r))))))))))
+
+(defn decode-request
+  [buf]
+  (let [buf (vec buf) n (count buf)]
+    (if (< n 2)
+      {:status :incomplete :need (- 2 n)}
+      (let [fc (nth buf 1) fn-kw (get function-codes-inv fc)]
+        (if (nil? fn-kw)
+          {:status :error :reason :unknown-function-code :code fc}
+          (let [r (decode-object-groups buf 2)]
+            (case (:status r)
+              :ok {:status :ok
+                   :fragment (merge (decode-control (nth buf 0))
+                                     {:function fn-kw :object-groups (:headers r)})}
+              r)))))))
+
+(defn encode-response
+  "A full response fragment: 2-byte APCI + 2-byte IIN + object-header blocks."
+  [{:keys [function iin object-groups] :as apci}]
+  (let [fc (get function-codes function)]
+    (cond
+      (nil? fc) {:status :error :reason :unknown-function :function function}
+      :else
+      (loop [groups object-groups acc []]
+        (if (empty? groups)
+          {:status :ok :bytes (into (into [(encode-control apci) fc] (encode-iin iin)) acc)}
+          (let [r (encode-object-group (first groups))]
+            (if (= :error (:status r))
+              r
+              (recur (rest groups) (into acc (:bytes r))))))))))
+
+(defn decode-response
+  [buf]
+  (let [buf (vec buf) n (count buf)]
+    (if (< n 4)
+      {:status :incomplete :need (- 4 n)}
+      (let [fc (nth buf 1) fn-kw (get function-codes-inv fc)]
+        (if (nil? fn-kw)
+          {:status :error :reason :unknown-function-code :code fc}
+          (let [r (decode-object-groups buf 4)]
+            (case (:status r)
+              :ok {:status :ok
+                   :fragment (merge (decode-control (nth buf 0))
+                                     {:function fn-kw
+                                      :iin (decode-iin (nth buf 2) (nth buf 3))
+                                      :object-groups (:headers r)})}
+              r)))))))
