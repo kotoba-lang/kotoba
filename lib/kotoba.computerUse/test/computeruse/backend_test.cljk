@@ -1,0 +1,228 @@
+(ns computeruse.backend-test
+  "Contract tests for the selectable execution-backend layer.
+
+  Every negative test asserts the REASON LITERAL, not merely that
+  something failed. A test that only checks for failure passes when the
+  code fails for an entirely different reason — the known-bad pattern
+  this workspace names (ADR-2608136000)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [computeruse.backend :as b]
+            [computeruse.backends :as impl]))
+
+;; ───────────────────────── a scriptable sh double ─────────────────────────
+
+(defn fake-sh
+  "argv-prefix → {:exit :out :err}, matched on the first token. Records
+  every invocation in `calls`."
+  [table calls]
+  (fn [argv & [_opts]]
+    (swap! calls conj (vec argv))
+    (or (get table (first argv))
+        (get table (vec argv))
+        {:exit 127 :out "" :err (str "fake-sh: no stub for " (pr-str argv))})))
+
+;; ───────────────────────── dispatch-level refusals ─────────────────────────
+
+(deftest unknown-action-kind-is-refused-by-name
+  (let [calls (atom [])
+        be (impl/->HostObjectBackend (fake-sh {} calls) {:cmd ["true"]})
+        r (b/act! be {:kind :teleport})]
+    (is (b/refused? r))
+    (is (= :backend/unsupported-action-kind (:reason r)))
+    (is (= :teleport (:kind r)))
+    (testing "the refusal happens before the backend is reached — no shelling"
+      (is (empty? @calls)))))
+
+(deftest host-object-act-is-refused-with-its-named-reason
+  (let [be (impl/->HostObjectBackend (fake-sh {} (atom [])) {:cmd ["true"]})]
+    (doseq [k [:pointer :key :type :script]]
+      (let [r (b/act! be {:kind k})]
+        (is (b/refused? r) (str k " must be refused"))
+        (is (= :backend/act-unsupported (:reason r))
+            (str k " must be refused with :backend/act-unsupported specifically"))))))
+
+(deftest macos-local-act-is-deny-by-default
+  (testing "without :allow-foreground every act refuses with the focus reason"
+    (let [calls (atom [])
+          be (impl/->MacosLocalBackend (fake-sh {} calls) {})]
+      (doseq [k [:pointer :key :type :script :noop]]
+        (let [r (b/act! be {:kind k :combo "a" :text "a" :coordinate [1 1]})]
+          (is (b/refused? r))
+          (is (= :backend/foreground-not-allowed (:reason r)))))
+      (is (empty? @calls) "a denied act must not shell out at all")))
+  (testing "with :allow-foreground the act path is reached"
+    (let [calls (atom [])
+          be (impl/->MacosLocalBackend
+              (fake-sh {"osascript" {:exit 0 :out "" :err ""}} calls)
+              {:allow-foreground true})
+          r (b/act! be {:kind :key :combo "cmd+l"})]
+      (is (not (b/refused? r)))
+      (is (:ok r))
+      (is (= "osascript" (ffirst @calls))))))
+
+(deftest window-scoped-refuses-synthetic-global-input
+  (let [calls (atom [])
+        be (impl/->WindowScopedBackend (fake-sh {} calls) {:app "X"})]
+    (doseq [k [:pointer :key :type]]
+      (let [r (b/act! be {:kind k :combo "a" :text "a" :coordinate [1 1]})]
+        (is (b/refused? r))
+        (is (= :backend/unsupported-action-kind (:reason r))
+            (str k " must be refused by name, not silently ignored"))))
+    (is (empty? @calls))
+    (testing ":script IS the act path for this backend"
+      (let [be2 (impl/->WindowScopedBackend
+                 (fake-sh {"osascript" {:exit 0 :out "ok\n" :err ""}} calls)
+                 {:app "X"})
+            r (b/act! be2 {:kind :script :applescript "return 1"})]
+        (is (= {:ok true :out "ok"} r))))
+    (testing "an empty :script is refused rather than run"
+      (let [be3 (impl/->WindowScopedBackend (fake-sh {} (atom [])) {:app "X"})
+            r (b/act! be3 {:kind :script :applescript "  "})]
+        (is (= :backend/unsupported-action-kind (:reason r)))))))
+
+(deftest fleet-node-act-is-refused-with-its-named-reason
+  (let [be (impl/->FleetNodeBackend (fake-sh {} (atom [])) {:host "judah"})
+        r (b/act! be {:kind :key :combo "a"})]
+    (is (= :backend/act-unsupported (:reason r)))
+    (is (= "judah" (:host r)))))
+
+;; ───────────────────────── observation semantics ─────────────────────────
+
+(deftest host-object-keeps-a-nonzero-exit-as-an-observation
+  (testing "a gate that measured a failure measured something — it is not a refusal"
+    (let [be (impl/->HostObjectBackend
+              (fake-sh {"nbb" {:exit 1 :out "checking…\n{:outcome :fail :n 3}\n" :err ""}}
+                       (atom []))
+              {:cmd ["nbb" "task.cljs"]})
+          obs (b/observe! be)]
+      (is (not (b/refused? obs)))
+      (is (= 1 (:exit obs)))
+      (is (= {:outcome :fail :n 3} (:observation obs)))))
+  (testing "a command that never ran IS a refusal, by name"
+    (let [be (impl/->HostObjectBackend
+              (fake-sh {"nope" {:exit -1 :out "" :err "ENOENT"}} (atom []))
+              {:cmd ["nope"]})
+          obs (b/observe! be)]
+      (is (b/refused? obs))
+      (is (= :backend/observe-failed (:reason obs)))))
+  (testing "a missing :cmd is refused, not defaulted"
+    (let [be (impl/->HostObjectBackend (fake-sh {} (atom [])) {})
+          obs (b/observe! be)]
+      (is (= :backend/observe-failed (:reason obs))))))
+
+;; ───────────────────────── pending backends ─────────────────────────
+
+(deftest unimplemented-registry-ids-refuse-and-report-unmeasured
+  (doseq [id [:agent-space :macos-vm :linux-container :cf-browser
+              :cf-sandbox :saas-sandbox]]
+    (let [be (b/create-backend id {} {})]
+      (is (some? be) (str id " must still be selectable"))
+      (is (= :backend/not-implemented (:reason (b/observe! be))))
+      (is (= :backend/not-implemented (:reason (b/act! be {:kind :noop}))))
+      (testing "probe says :unmeasured — never false, which would claim a measurement"
+        (is (= :unmeasured (:available? (b/probe! be))))))))
+
+(deftest an-id-outside-the-registry-is-not-constructible
+  (is (nil? (b/create-backend :not-a-backend {} {}))))
+
+;; ───────────────────────── the registry file ─────────────────────────
+
+(def registry (b/load-registry))
+
+(deftest registry-has-exactly-the-ten-ids
+  (is (some? registry) "resources/computeruse/backends.edn must be on the classpath")
+  (is (= 10 (count b/registry-ids)))
+  (is (= (set b/registry-ids) (set (keys (:backends registry))))))
+
+(def qualification-statuses
+  #{:qualified :refused :unavailable :pending :unmeasured})
+
+(deftest every-registry-entry-is-fully-and-datedly-qualified
+  (doseq [[id entry] (:backends registry)]
+    (testing (str id)
+      (is (string? (:description entry)))
+      (is (contains? entry :implemented?))
+      (is (contains? (:isolation entry) :steals-focus?)
+          "isolation must say whether it takes the operator's focus")
+      (is (contains? (:isolation entry) :shares-desktop?))
+      (doseq [cap [:observe :act :probe]]
+        (let [q (get-in entry [:qualification cap])]
+          (is (contains? qualification-statuses (:status q))
+              (str id " " cap " has an unknown status: " (pr-str (:status q))))
+          (is (string? (:measured-at q))
+              (str id " " cap " has a status without a date — a status without a date is not a status")))))))
+
+(deftest pending-and-unavailable-capabilities-carry-a-concrete-unblock
+  (doseq [[id entry] (:backends registry)
+          cap [:observe :act :probe]
+          :let [q (get-in entry [:qualification cap])]
+          :when (contains? #{:pending :unavailable} (:status q))]
+    (is (and (string? (:unblock q)) (seq (:unblock q)))
+        (str id " " cap " is " (:status q) " without an :unblock condition"))))
+
+(deftest implemented-flag-matches-the-implementations
+  (doseq [[id entry] (:backends registry)]
+    (is (= (boolean (:implemented? entry))
+           (contains? impl/implemented-ids id))
+        (str id ": :implemented? in the registry disagrees with computeruse.backends"))))
+
+(deftest refused-capabilities-pin-a-real-refusal-literal
+  (doseq [[id entry] (:backends registry)
+          cap [:observe :act :probe]
+          :let [q (get-in entry [:qualification cap])]
+          :when (= :refused (:status q))]
+    (is (contains? b/refusal-reasons (:reason q))
+        (str id " " cap " pins " (pr-str (:reason q))
+             " which is not a contract refusal literal"))))
+
+;; ───────────── the :script escape hatch (measured hole, 2026-08-29) ─────────────
+
+(deftest window-scoped-refuses-synthetic-input-hidden-inside-a-script
+  (testing "refusing the action KINDS is not enough — a real session reached the
+           same hazard through :script, and the gate allowed it four steps running"
+    (let [calls (atom [])
+          be (impl/->WindowScopedBackend
+              (fake-sh {"osascript" {:exit 0 :out "" :err ""}} calls) nil)]
+      (doseq [[script hazard]
+              [["tell application \"System Events\" to key code 116" "key code"]
+               ["tell application \"Google Chrome\"\n activate\nend tell\ntell application \"System Events\"\n key code 125\nend tell" "key code"]
+               ["tell application \"System Events\" to keystroke \"a\"" "keystroke"]
+               ["tell application \"System Events\" to key down shift" "key down"]
+               ["tell application \"System Events\" to click at {100, 200}" "click at"]
+               ["do shell script \"cliclick c:100,200\"" "shell"]
+               ["run script \"tell application \\\"System Events\\\" to keystroke \\\"x\\\"\"" "run script"]]]
+        (let [r (b/act! be {:kind :script :applescript script})]
+          (is (b/refused? r) (str "must refuse: " (pr-str script)))
+          (is (= :backend/synthetic-input-in-script (:reason r))
+              (str "must refuse by name: " (pr-str script)))
+          (is (string? (:hazard r)) (str "must name the hazard: " hazard))))
+      (is (empty? @calls) "a refused script must never reach osascript"))))
+
+(deftest window-scoped-still-allows-real-app-scripting
+  (let [calls (atom [])
+        be (impl/->WindowScopedBackend (fake-sh {"osascript" {:exit 0 :out "ok\n" :err ""}} calls)
+                                       nil)]
+    (doseq [script ["tell application \"Google Chrome\" to open location \"https://example.com\""
+                    "tell application \"Google Chrome\" to execute javascript \"window.scrollBy(0,500)\" in active tab"
+                    "tell application \"Finder\" to get name of every window"]]
+      (let [r (b/act! be {:kind :script :applescript script})]
+        (is (not (b/refused? r)) (str "must allow: " (pr-str script)))
+        (is (:ok r))))
+    (is (= 3 (count @calls)))))
+
+(deftest an-activating-script-is-allowed-but-reported
+  (testing "activate takes the operator's focus without synthesising input; the
+           receipt must show it rather than the backend pretending it did not happen"
+    (let [be (impl/->WindowScopedBackend
+              (fake-sh {"osascript" {:exit 0 :out "" :err ""}} (atom []))
+              nil)
+          r (b/act! be {:kind :script
+                        :applescript "tell application \"Google Chrome\" to activate"})]
+      (is (:ok r))
+      (is (true? (:activated-app? r))))
+    (let [be (impl/->WindowScopedBackend
+              (fake-sh {"osascript" {:exit 0 :out "" :err ""}} (atom []))
+              nil)
+          r (b/act! be {:kind :script
+                        :applescript "tell application \"Google Chrome\" to get URL of active tab of window 1"})]
+      (is (nil? (:activated-app? r))))))

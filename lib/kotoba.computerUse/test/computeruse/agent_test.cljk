@@ -1,0 +1,112 @@
+(ns computeruse.agent-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [computeruse.computer :as c]
+            [computeruse.tool :as ctool]
+            [computeruse.agent :as agent]
+            [langchain.model :as model]
+            [langchain.message :as msg]
+            [langchain.tool :as tool]
+            [langchain.db :as db]))
+
+(def screen
+  {:size [1280 800]
+   :windows [{:title "Editor" :rect [0 0 800 600] :content ""}
+             {:title "Terminal" :rect [800 0 480 600] :content "$ "}]})
+
+(deftest mock-computer-behaviour
+  (let [{:keys [computer state]} (c/mock-computer screen)]
+    (testing "screenshot renders the screen deterministically"
+      (let [shot (c/-screenshot computer)]
+        (is (str/includes? shot "Screen 1280x800"))
+        (is (str/includes? shot "* [Editor]"))))
+    (testing "click focuses the window under the cursor"
+      (c/-click! computer :left 900 100)
+      (is (= 1 (:focus @state))))
+    (testing "typing goes to the focused window"
+      (c/-type! computer "ls -la")
+      (is (= "$ ls -la" (get-in @state [:screen :windows 1 :content]))))
+    (testing "cursor position tracks moves"
+      (c/-mouse-move! computer 10 20)
+      (is (= [10 20] (c/-cursor-position computer))))
+    (testing "everything is logged"
+      (is (= [:screenshot :click :type :mouse-move]
+             (mapv first (:log @state)))))))
+
+(deftest tool-dispatch
+  (let [{:keys [computer state]} (c/mock-computer screen)
+        t (ctool/computer-tool computer {:width 1280 :height 800})]
+    (testing "schema advertises the action vocabulary"
+      (is (= "computer" (:name t)))
+      (is (some #{"screenshot"} (get-in t [:schema :properties :action :enum])))
+      (is (= {:name "computer"
+              :description (:description t)
+              :input_schema (:schema t)}
+             (tool/->anthropic t))))
+    (testing "actions dispatch onto the protocol"
+      (is (str/includes? ((:fn t) {:action "screenshot"}) "Screen 1280x800"))
+      ((:fn t) {:action "left_click" :coordinate [10 10]})
+      ((:fn t) {:action "type" :text "hi"})
+      ((:fn t) {:action "key" :text "ctrl+s"})
+      ((:fn t) {:action "scroll" :coordinate [10 10]
+                :scroll_direction "down" :scroll_amount 5})
+      (is (= "hi" (get-in @state [:screen :windows 0 :content])))
+      (is (= [:screenshot :click :type :key :scroll]
+             (mapv first (:log @state)))))
+    (testing "unknown action throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   ((:fn t) {:action "fly"}))))))
+
+(defn- scripted-model
+  "screenshot → click terminal → type command → done."
+  []
+  (model/mock-model
+   [(msg/ai "" {:tool-calls [{:id "1" :name "computer" :input {:action "screenshot"}}]})
+    (msg/ai "" {:tool-calls [{:id "2" :name "computer"
+                              :input {:action "left_click" :coordinate [900 100]}}]})
+    (msg/ai "" {:tool-calls [{:id "3" :name "computer"
+                              :input {:action "type" :text "make test"}}
+                             {:id "4" :name "computer"
+                              :input {:action "key" :text "Return"}}]})
+    (msg/ai "" {:tool-calls [{:id "5" :name "done"
+                              :input {:text "Ran make test in the terminal"
+                                      :success true}}]})]))
+
+(deftest agent-loop-with-action-log
+  (let [{:keys [computer state]} (c/mock-computer screen)
+        conn (db/create-conn agent/log-schema)
+        {:keys [result done messages]}
+        (agent/run {:model (scripted-model)
+                    :computer computer
+                    :task "Run make test in the terminal"
+                    :history-conn conn
+                    :session-id "s1"})]
+    (is done)
+    (is (= "Ran make test in the terminal" result))
+    (is (= "$ make test" (get-in @state [:screen :windows 1 :content])))
+    (testing "tool results flow back as :tool messages"
+      (is (str/includes?
+           (:content (first (filter #(= :tool (:role %)) messages)))
+           "Screen 1280x800")))
+    (testing "action log is queryable datoms"
+      (is (= #{"screenshot" "left_click" "type" "key" ""}
+             (set (db/q '[:find [?a ...]
+                          :in $ ?sid
+                          :where [?s :session/id ?sid]
+                                 [?e :caction/session ?s]
+                                 [?e :caction/action ?a]]
+                        (db/db conn) "s1"))))
+      (is (= 5 (db/q '[:find (count ?e) .
+                       :in $ ?sid
+                       :where [?s :session/id ?sid]
+                              [?e :caction/session ?s]]
+                     (db/db conn) "s1"))))))
+
+(deftest max-steps-limits-loop
+  (let [{:keys [computer]} (c/mock-computer screen)
+        m (model/mock-model
+           [(msg/ai "" {:tool-calls [{:id "x" :name "computer"
+                                      :input {:action "screenshot"}}]})])]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (agent/run {:model m :computer computer
+                             :task "loop" :max-steps 4})))))

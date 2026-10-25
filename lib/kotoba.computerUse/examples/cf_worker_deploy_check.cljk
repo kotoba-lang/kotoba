@@ -1,0 +1,209 @@
+(ns cf-worker-deploy-check
+  "Inspect a Cloudflare Worker's DEPLOYMENT state from the dash via computer
+  use — the read-only answer to \"why does the live `etzhayyim-did-web`
+  worker stay pinned to an old version even though `wrangler deploy` +
+  `wrangler versions deploy @100%` report SUCCESS?\" (the blocker that
+  stalled ADR-2606272300 Step 2).
+
+  `wrangler` reported a confusing/contradictory picture (active version
+  unchanged across deploys; gradual-deployment lines), so this drives the
+  ACTUAL Cloudflare dashboard and READS the ground truth:
+    - the worker's ACTIVE deployment (version id + date + SOURCE:
+      Upload / Workers Builds (git) / Version),
+    - whether **Workers Builds** (a connected GitHub repo) owns the
+      active-version pointer (→ activation = merge → CI build, not manual
+      `wrangler deploy`),
+    - the recent deployment / version history,
+    - HOW to advance the active version (the dash control: Deploy /
+      Promote / gradual-deployment %),
+  and persists the findings as EDN via the `save_findings` tool.
+
+  READ-ONLY by default — the agent navigates + reads + screenshots, and
+  NEVER deploys/promotes/edits/deletes/rolls-back. A separate, explicitly
+  opted-in PROMOTE mode (CF_PROMOTE=1, or `-main \"promote\"`) lets it
+  click the single \"Deploy / Promote latest version to 100%\" control and
+  nothing else — for advancing the active version to a freshly-merged
+  build once the human authorizes it.
+
+  Runs on LLM=ollama|gemini|anthropic (see jvm-host). The CF dashboard is
+  vision- + reasoning-heavy navigation, so LLM=anthropic is recommended;
+  local Ollama gemma-4-QAT also works (tools+vision). Login uses
+  `type_secret` (vault ref, never a raw credential); on an unexpected
+  2FA/SSO step with no secret_ref the agent bails (done success=false).
+
+     LLM=anthropic ANTHROPIC_API_KEY=… \\
+       kbb -M:dev:examples -e \"(require 'cf-worker-deploy-check) (cf-worker-deploy-check/-main)\"
+
+  Env:
+    CF_ACCOUNT_ID   Cloudflare account id   (default 4da88288dc30d9ee257f319d3c33ecf0)
+    CF_WORKER       worker / service name   (default etzhayyim-did-web)
+    CF_OUT          output EDN path         (default cf-worker-deploy-check.edn)
+    CF_PROMOTE      \"1\" → enable the gated promote-latest action (default off)
+    CF_VAULT_ITEM   vault item for the CF login (default \"cloudflare\")
+    CF_VAULT        1Password vault name    (optional)
+    VAULT           op | bw                 (default op)
+  op must be signed in (`op signin`) / bw unlocked (`BW_SESSION=…`).
+  The browser should already be open; an already-signed-in dash session
+  avoids the login leg entirely."
+  (:require [computeruse.macos :as macos]
+            [computeruse.vault :as vault]
+            [computeruse.agent :as agent]
+            [jvm-host :as host]
+            [langchain.db :as db]
+            [kotoba.pprint :as pp]))
+
+(defn deployments-url [account worker]
+  (str "https://dash.cloudflare.com/" account
+       "/workers/services/view/" worker "/production/deployments"))
+
+(defn settings-url [account worker]
+  (str "https://dash.cloudflare.com/" account
+       "/workers/services/view/" worker "/production/settings"))
+
+(def base-rules
+  (str "You are a computer-use agent operating the user's macOS desktop to "
+       "INSPECT a Cloudflare Worker's deployment state in the Cloudflare "
+       "dashboard (dash.cloudflare.com).\n"
+       "HARD RULES (credentials):\n"
+       "- NEVER use the `type` action for an email, password, OTP or any\n"
+       "  credential field. Use `type_secret` with the vault secret_ref; the\n"
+       "  host fills it and you never see the value.\n"
+       "- Do not guess any secret. If a login / 2FA / SSO step needs a\n"
+       "  credential you have no secret_ref for, call `done` success=false and\n"
+       "  say exactly what was asked.\n"
+       "Work in the frontmost browser window; cmd+l focuses the address bar.\n"
+       "Screenshot to verify every step before and after acting. Close any\n"
+       "cookie/announcement popup without accepting marketing.\n"
+       "Cloudflare terms: a 'Deployment' has a 'Version' (a uuid) and a\n"
+       "'Source' — 'Upload' (wrangler/API), 'Version' (gradual), or\n"
+       "'Workers Builds' (an auto-build from a connected git repo). The\n"
+       "'Active' deployment is the one currently serving 100% of traffic."))
+
+(def readonly-rules
+  (str "HARD RULES (READ-ONLY scope — this is an inspection task):\n"
+       "- Only navigate, scroll, open tabs/panels, and READ. Take screenshots.\n"
+       "- NEVER click anything that changes deployment or settings: Deploy,\n"
+       "  Promote, Rollback, Edit, Save, Delete, Disconnect, Retry build,\n"
+       "  Quick edit, Rename, or any toggle. If asked to confirm a change,\n"
+       "  cancel/close it. Reading the deployment list, the build settings,\n"
+       "  and a version's detail panel is allowed; changing state is not.\n"))
+
+(defn promote-rules [worker]
+  (str "TASK MODE: PROMOTE (explicitly authorized). In addition to reading,\n"
+       "you MAY perform EXACTLY ONE state change: advance the ACTIVE version\n"
+       "of worker '" worker "' to the LATEST available version (the newest by\n"
+       "created date) at 100% traffic — using the dashboard's Deploy /\n"
+       "Promote / 'Deploy version' control (or set gradual deployment to that\n"
+       "version at 100%). RULES:\n"
+       "- Promote ONLY the single newest version to 100%. Do not edit code,\n"
+       "  change settings, rollback to an older version, or touch any other\n"
+       "  worker. \n"
+       "- BEFORE promoting, screenshot and confirm the version id + created\n"
+       "  date of the version you are about to make active.\n"
+       "- If the newest version is ALREADY active at 100%, change nothing and\n"
+       "  report that. If promoting needs a confirm dialog, confirm only the\n"
+       "  single promote, then screenshot the result.\n"))
+
+(defn save-findings-tool
+  "Tool the agent calls once with the inspected deployment state → EDN."
+  [out worker]
+  {:name "save_findings"
+   :description
+   (str "Save the inspected Cloudflare deployment state for the worker. Call "
+        "once after reading the Deployments list AND the Build settings. "
+        "Returns the path written.")
+   :schema
+   {:type "object"
+    :properties
+    {:active_version_id {:type "string" :description "uuid of the active (100%) deployment's version."}
+     :active_deployed_at {:type "string" :description "When the active deployment was created/deployed (as shown)."}
+     :active_source {:type "string" :description "Source of the active deployment: Upload | Workers Builds | Version | unknown."}
+     :workers_builds_connected {:type "boolean" :description "Is a git repo connected via Workers Builds (Settings → Build)?"}
+     :git_repo {:type "string" :description "The connected GitHub repo + branch, if Workers Builds is on (else empty)."}
+     :recent_versions {:type "array"
+                       :description "Recent deployments newest-first."
+                       :items {:type "object"
+                               :properties {:version_id {:type "string"}
+                                            :created_at {:type "string"}
+                                            :source {:type "string"}
+                                            :active {:type "boolean"}}
+                               :required ["version_id" "created_at"]}}
+     :how_active_set {:type "string"
+                      :description "How the active version is set for this worker (manual wrangler/dash Deploy, or auto via Workers Builds on git push), per what the dash shows."}
+     :promote_instructions {:type "string"
+                            :description "The exact dashboard control / steps to advance the active version to the latest (what to click)."}
+     :promote_performed {:type "boolean" :description "True only if PROMOTE mode actually advanced the active version."}
+     :notes {:type "string" :description "Anything else relevant (gradual %, errors, build status)."}}
+    :required ["active_version_id" "active_source" "workers_builds_connected" "how_active_set"]}
+   :fn (fn [m]
+         (let [doc (merge {:source :cloudflare-dash
+                           :worker worker}
+                          (into {} (map (fn [[k v]] [(keyword "cf" (name k)) v]) m)))]
+           (spit out (with-out-str (pp/pprint doc)))
+           (str "Saved findings for " worker " → " out
+                " (active version " (:active_version_id m)
+                ", source " (:active_source m)
+                ", workers-builds " (:workers_builds_connected m) ").")))})
+
+(defn task [account worker promote?]
+  (str "Goal: inspect the deployment state of Cloudflare Worker '" worker
+       "' in account " account ".\n"
+       "1. In the frontmost browser, open " (deployments-url account worker) "\n"
+       "   (if a login page appears, fill email/password with `type_secret`\n"
+       "   secret_refs you are given, then submit; bail on unexpected 2FA).\n"
+       "2. Read the Deployments list: identify the ACTIVE (100%) deployment —\n"
+       "   its Version id, created/deployed date, and Source. Read the few\n"
+       "   most recent versions too (id, date, source, which is active).\n"
+       "3. Open " (settings-url account worker) " and find the Build section:\n"
+       "   is a GitHub repo connected via Workers Builds? If so, capture the\n"
+       "   repo + branch. This tells whether the active version is advanced\n"
+       "   by git push (CI build) or only by manual Deploy.\n"
+       "4. Determine the exact control to advance the active version to the\n"
+       "   newest version (the Deploy/Promote button or gradual % control).\n"
+       (if promote?
+         (str "5. PROMOTE: advance the active version to the LATEST version at\n"
+              "   100% (one change only), per the PROMOTE rules above, then\n"
+              "   screenshot the result.\n")
+         "")
+       "Finally call `save_findings` with everything you read"
+       (when promote? " (set promote_performed appropriately)")
+       ", then call done success=true with a one-line summary."))
+
+(defn make-vault []
+  (case (or (System/getenv "VAULT") "op")
+    "op" (vault/op-vault {:account (System/getenv "OP_ACCOUNT")})
+    "bw" (vault/bw-vault {})
+    (throw (ex-info "VAULT must be op or bw" {}))))
+
+(defn -main [& [mode]]
+  (let [account (or (System/getenv "CF_ACCOUNT_ID") "4da88288dc30d9ee257f319d3c33ecf0")
+        worker  (or (System/getenv "CF_WORKER") "etzhayyim-did-web")
+        out     (or (System/getenv "CF_OUT") "cf-worker-deploy-check.edn")
+        promote? (or (= mode "promote") (= "1" (System/getenv "CF_PROMOTE")))
+        item    (or (System/getenv "CF_VAULT_ITEM") "cloudflare")
+        vname   (System/getenv "CF_VAULT")
+        ref     (fn [field] (cond-> {:item item :field field} vname (assoc :vault vname)))
+        system  (str base-rules "\n"
+                     (if promote? (promote-rules worker) readonly-rules)
+                     "\nLogin secret_refs (only if a CF login page appears): "
+                     "email=" (pr-str (ref "username"))
+                     " password=" (pr-str (ref "password")) ".")
+        conn    (db/create-conn agent/log-schema)
+        {:keys [result steps]}
+        (agent/run {:model (host/make-model)
+                    :computer (macos/macos-computer)
+                    :vault (make-vault)
+                    :tools [(save-findings-tool out worker)]
+                    :system system
+                    :task (task account worker promote?)
+                    :history-conn conn
+                    :session-id (str "cf-deploy-" worker (when promote? "-promote"))
+                    :max-steps (if promote? 70 50)})]
+    (println "mode:" (if promote? "PROMOTE" "read-only") "| result:" result "| steps:" steps)
+    (println "findings →" out)
+    ;; audit trail records the action + secret_ref, never the secret value
+    (println "audit:"
+             (sort-by first
+                      (db/q '[:find ?step ?a
+                              :where [?e :caction/step ?step] [?e :caction/action ?a]]
+                            (db/db conn))))))

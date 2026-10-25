@@ -1,0 +1,162 @@
+#!/usr/bin/env kbb
+;; bin/cua_bot_run.cljk — run ONE resident CUA bot session (ADR-0003).
+;;
+;;   kbb --backend sci bin/cua_bot_run.cljk --roster <path.edn> --bot <bot-id> \
+;;       --receipts-dir <dir> [--dry-run] [--adapter claude-cli|murakumo|openai-compat]
+;;
+;; Exit codes are three-valued and stay three-valued:
+;;   0  the session completed          (outcome in the receipt)
+;;   1  the session ran and failed
+;;   2  it could not be measured/run   (unreadable or invalid roster,
+;;                                      unknown bot, backend unavailable,
+;;                                      dead model adapter, blank frame)
+;;
+;; The last line of stdout is a single EDN map — the caller reads that.
+;; Everything else on stdout is human progress text.
+
+(ns cua-bot-run
+  (:require [computeruse.backend :as b]
+            [computeruse.backends :as impl]
+            [computeruse.bots :as bots]
+            [computeruse.hostfs :as fs]
+            [computeruse.model-adapters :as adapters]
+            [kotoba.lang.text :as str]))
+
+(def argv (vec *command-line-args*))
+
+(defn- opt [n]
+  (let [i (.indexOf argv n)]
+    (when (and (>= i 0) (< (inc i) (count argv))) (nth argv (inc i)))))
+
+(defn- flag? [n] (>= (.indexOf argv n) 0))
+
+(def sh (impl/default-sh))
+
+(defn- emit! [m code]
+  (println (pr-str m))
+  (js/process.exit code))
+
+(defn- bail! [why detail]
+  (emit! {:outcome :could-not-measure :why why :detail detail} 2))
+
+;; ─────────────────────────────────────────────────────────────────
+
+(def script-dir (fs/dirname (or (first *command-line-args*) "")))
+
+(defn- repo-root
+  "The checkout this CLI lives in — nbb gives no __dirname, so derive it
+  from the process cwd (the CLI is invoked as `kbb --backend sci bin/cua_bot_run.cljk`
+  from the checkout root, which is the published calling contract)."
+  []
+  (fs/cwd))
+
+(defn- probe-adapter
+  "A CHEAP liveness check on the model adapter — presence, not a
+  generation. A full round trip would cost real tokens on every dry run.
+  → {:live? bool :why str}"
+  [adapter-id]
+  (case adapter-id
+    :claude-cli
+    (let [bin (or (fs/getenv "CUA_CLAUDE_BIN") "claude")
+          r (sh ["which" bin] {:timeout-ms 10000})]
+      {:live? (zero? (:exit r))
+       :why (if (zero? (:exit r))
+              (str bin " → " (str/trim (str (:out r))))
+              (str bin " not on PATH"))})
+    :murakumo
+    (let [{:keys [endpoints why]} (adapters/resolve-murakumo-endpoints sh)]
+      {:live? (boolean (seq endpoints)) :why why :endpoints endpoints})
+    ;; openai-compat needs an explicit url; presence of curl is all we
+    ;; can measure without one.
+    (let [r (sh ["which" "curl"] {:timeout-ms 10000})]
+      {:live? (zero? (:exit r)) :why (str "curl " (if (zero? (:exit r)) "present" "absent"))})))
+
+(defn -main []
+  (let [roster-path (opt "--roster")
+        bot-id (opt "--bot")
+        receipts-dir (opt "--receipts-dir")
+        dry-run? (flag? "--dry-run")
+        adapter-id (keyword (or (opt "--adapter")
+                                (fs/getenv "CUA_MODEL_ADAPTER")
+                                (name adapters/default-adapter-id)))]
+
+    (when-not (and roster-path bot-id)
+      (bail! :bad-arguments
+             "usage: kbb --backend sci bin/cua_bot_run.cljk --roster <path> --bot <id> --receipts-dir <dir> [--dry-run]"))
+
+    (let [registry (b/find-registry (repo-root))]
+      (when (nil? registry)
+        (bail! :registry-missing
+               (str "resources/computeruse/backends.edn not found from " (repo-root)
+                    " (script-dir " script-dir ")")))
+
+      (let [roster (bots/read-roster roster-path)
+            problems (bots/roster-problems (bots/registry-known? registry) roster)]
+        (when (seq problems)
+          (bail! :roster-invalid {:roster roster-path :problems problems}))
+
+        (let [bot (bots/find-bot roster bot-id)]
+          (when (nil? bot)
+            (bail! :bot-not-found {:bot bot-id
+                                   :known (mapv :bot/id roster)}))
+
+          (let [{:keys [backend target cwd-resolved-from error]}
+                (bots/bot-backend {:bot bot :roster-path roster-path :sh sh})]
+            (when error (bail! :backend-construction-failed error))
+
+            (println (str "bot " bot-id " · backend " (:bot/backend bot)
+                          " · adapter " adapter-id))
+            (let [probe (b/probe! backend)
+                  ad (probe-adapter adapter-id)
+                  entry (b/registry-entry registry (:bot/backend bot))]
+              (println (str "  probe: " (pr-str probe)))
+              (println (str "  adapter: " (pr-str ad)))
+
+              (cond
+                dry-run?
+                (let [ok? (and (true? (:available? probe)) (:live? ad))]
+                  (emit! {:outcome (if ok? :dry-run-ok :could-not-measure)
+                          :bot bot-id
+                          :backend (:bot/backend bot)
+                          :dry-run? true
+                          :target target
+                          :cwd-resolved-from cwd-resolved-from
+                          :probe probe
+                          :adapter {:id adapter-id :probe ad}
+                          :registry-implemented? (:implemented? entry)}
+                         (if ok? 0 2)))
+
+                (not (true? (:available? probe)))
+                (bail! :backend-unavailable {:backend (:bot/backend bot) :probe probe})
+
+                (not (:live? ad))
+                (bail! :model-adapter-dead {:adapter adapter-id :detail ad})
+
+                :else
+                (let [interpret (adapters/make-adapter adapter-id {:sh sh})]
+                  (when (nil? interpret)
+                    (bail! :unknown-adapter {:adapter adapter-id
+                                             :known adapters/adapter-ids}))
+                  (let [receipt (-> (bots/run-session! {:bot bot
+                                                        :backend backend
+                                                        :interpret interpret})
+                                    (assoc :model-adapter adapter-id
+                                           :roster roster-path
+                                           :target target))
+                        path (when receipts-dir
+                               (bots/write-receipt! receipts-dir receipt))]
+                    (println (str "  outcome: " (:outcome receipt)
+                                  " · steps " (:steps receipt)
+                                  " · tokens " (:tokens-used receipt)
+                                  (when path (str " · receipt " path))))
+                    (emit! (cond-> (select-keys receipt
+                                                [:bot-id :backend :outcome :steps
+                                                 :tokens-used :frames :result :why
+                                                 :started :finished])
+                             path (assoc :receipt path)
+                             true (assoc :actions (mapv #(select-keys % [:step :action :verdict
+                                                                        :reason :backend-refused?])
+                                                        (:actions receipt))))
+                           (bots/outcome->exit (:outcome receipt)))))))))))))
+
+(-main)

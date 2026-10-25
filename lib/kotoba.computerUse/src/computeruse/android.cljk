@@ -1,0 +1,186 @@
+(ns computeruse.android
+  "IComputer over a connected Android device via adb.
+
+  Coordinate model: the model sees screenshots scaled down to
+  :model-width pixels (default 1024). Tap/swipe coordinates
+  supplied by the model are scaled back to physical device pixels
+  before dispatch.
+
+  Screenshot: `adb exec-out screencap -p` → raw PNG bytes →
+  resize with sips → base64 image block.
+
+  Input: `adb shell input tap/swipe/keyevent/text`
+
+  Prereqs:
+    • adb in PATH and device connected with USB debugging enabled
+    • sips (macOS built-in) for PNG resizing"
+  (:require [kotoba.bytes :as kbytes] [computeruse.computer :as c]
+            [kotoba.lang.text :as str])
+  #?(:clj (:import [java.util Arrays]
+                   [java.io ByteArrayOutputStream]
+                   [java.nio ByteBuffer]
+                   [java.nio.file Files Paths OpenOption])))
+
+#?(:clj
+   (do
+
+;; ─── shell helpers ───────────────────────────────────────────────────────────
+
+(defn- sh-bytes
+  "Run command; return stdout as byte[]."
+  [args]
+  (let [p   (.start (ProcessBuilder. ^java.util.List (vec args)))
+        bos (ByteArrayOutputStream.)]
+    (-> (.getInputStream p) (.transferTo bos))
+    (.waitFor p)
+    (.toByteArray bos)))
+
+(defn- sh
+  "Run command; return stdout as trimmed String."
+  [args]
+  (str/trim (kbytes/utf8-string (sh-bytes args))))
+
+;; ─── PNG helpers ─────────────────────────────────────────────────────────────
+
+(defn- strip-to-png
+  "adb may emit a warning line before the PNG bytes.
+   Find the \\x89PNG signature and return everything from there."
+  [^bytes bs]
+  (let [sig (byte-array [0x89 0x50 0x4e 0x47])    ; \\x89PNG
+        n   (alength bs)
+        lim (- n 4)]
+    (loop [i 0]
+      (cond
+        (> i lim) bs                               ; signature not found — return as-is
+        (and (= (aget bs i) (aget sig 0))
+             (= (aget bs (+ i 1)) (aget sig 1))
+             (= (aget bs (+ i 2)) (aget sig 2))
+             (= (aget bs (+ i 3)) (aget sig 3)))
+        (java.util.Arrays/copyOfRange bs i n)
+        :else (recur (inc i))))))
+
+(defn- png-dims
+  "Read width/height from raw PNG bytes (IHDR chunk, bytes 16-23)."
+  [^bytes bs]
+  (when (and bs (> (alength bs) 24))
+    (let [bb (ByteBuffer/wrap bs)]
+      [(.getInt bb 16) (.getInt bb 20)])))
+
+(defn- resize-png
+  "Resize raw PNG bytes to ≤ max-width using sips (macOS)."
+  [^bytes png-bytes max-width]
+  (let [tmp  (java.io.File/createTempFile "cuse-android" ".png")
+        path (fn [f] (Paths/get (.getAbsolutePath f) (make-array String 0)))]
+    (try
+      (Files/write (path tmp) ^bytes png-bytes (make-array OpenOption 0))
+      (sh ["sips" "-Z" (str max-width) (.getAbsolutePath tmp)])
+      (Files/readAllBytes (path tmp))
+      (finally (.delete tmp)))))
+
+;; ─── IComputer ───────────────────────────────────────────────────────────────
+
+(def ^:private android-key-codes
+  {"return" "66" "enter" "66" "newline" "66"
+   "backspace" "67" "delete" "67"
+   "tab" "61"
+   "escape" "111" "esc" "111"
+   "back" "4" "home" "3" "menu" "82"
+   "volumeup" "24" "volumedown" "25"
+   "power" "26" "camera" "27"
+   "up" "19" "down" "20" "left" "21" "right" "22"
+   "space" "62"})
+
+(defn android-computer
+  "IComputer over a connected Android device via adb.
+
+   opts:
+     :serial       adb device serial (nil → first connected device)
+     :model-width  width sent to LLM in pixels (default 1024)"
+  [& [{:keys [serial model-width] :or {model-width 1024}}]]
+  (let [base    (if serial ["adb" "-s" serial] ["adb"])
+        cmd     (fn [& parts] (sh (vec (concat base parts))))
+        cmd-bin (fn [& parts] (sh-bytes (vec (concat base parts))))
+        scale   (atom nil)                ; [sx sy] device-px / model-px
+        to-dev  (fn [mx my]
+                  (let [[sx sy] (or @scale [1.0 1.0])]
+                    [(Math/round (double (* mx sx)))
+                     (Math/round (double (* my sy)))]))]
+
+    (reify c/IComputer
+
+      (-screenshot [_]
+        (let [raw     (strip-to-png (cmd-bin "exec-out" "screencap" "-p"))
+              resized (resize-png raw model-width)
+              ;; physical device size
+              size-out (cmd "shell" "wm" "size")
+              [_ dw dh] (re-find #"(\d+)x(\d+)" size-out)
+              dw      (Long/parseLong (or dw "1080"))
+              dh      (Long/parseLong (or dh "1920"))
+              ;; model dims from resized PNG header
+              [mw mh] (or (png-dims resized) [model-width (long (* model-width (/ dh dw)))])]
+          (reset! scale [(/ (double dw) mw) (/ (double dh) mh)])
+          [{:type "image"
+            :source {:type       "base64"
+                     :media_type "image/png"
+                     :data       (kbytes/base64-encode resized)}}]))
+
+      (-key! [_ combo]
+        (let [lower (str/lower combo)
+              parts (str/split lower #"\+")
+              ;; handle modifier+key combos via multiple keyevents
+              code  (or (android-key-codes (last parts)) (last parts))]
+          (cmd "shell" "input" "keyevent" code)
+          (str "keyevent " combo)))
+
+      (-type! [_ text]
+        ;; adb input text: spaces must be %s, special chars need escaping
+        (let [escaped (-> text
+                          (str/replace "\\" "\\\\")
+                          (str/replace " " "%s")
+                          (str/replace "'" "\\'")
+                          (str/replace "\"" "\\\"")
+                          (str/replace "&" "\\&")
+                          (str/replace ";" "\\;")
+                          (str/replace "|" "\\|")
+                          (str/replace "<" "\\<")
+                          (str/replace ">" "\\>"))]
+          (cmd "shell" "input" "text" escaped)
+          (str "typed " (pr-str text))))
+
+      (-mouse-move! [_ x y]
+        ;; Android has no hover; do a no-op touch (1ms swipe to same point)
+        (let [[dx dy] (to-dev x y)]
+          (cmd "shell" "input" "swipe"
+               (str dx) (str dy) (str dx) (str dy) "1")
+          (str "move→[" dx "," dy "]")))
+
+      (-click! [_ button x y]
+        (let [[dx dy] (to-dev x y)]
+          (case button
+            :double (do (cmd "shell" "input" "tap" (str dx) (str dy))
+                        (Thread/sleep 100)
+                        (cmd "shell" "input" "tap" (str dx) (str dy)))
+            :long   (cmd "shell" "input" "swipe"
+                         (str dx) (str dy) (str dx) (str dy) "800")
+            ;; :left :right :middle → tap
+            (cmd "shell" "input" "tap" (str dx) (str dy)))
+          (str (name button) "-tap [" dx "," dy "]")))
+
+      (-scroll! [_ x y direction amount]
+        (let [[dx dy]  (to-dev x y)
+              dist     (long (* amount 200))
+              [ex ey]  (case (keyword direction)
+                         :up    [dx (- dy dist)]
+                         :down  [dx (+ dy dist)]
+                         :left  [(- dx dist) dy]
+                         :right [(+ dx dist) dy]
+                         [dx (+ dy dist)])]
+          (cmd "shell" "input" "swipe"
+               (str dx) (str dy) (str ex) (str ey) "400")
+          (str "swipe-" (name direction) " ×" amount)))
+
+      (-cursor-position [_]
+        ;; Android has no cursor concept
+        [0 0]))))
+
+))

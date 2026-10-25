@@ -1,0 +1,140 @@
+(ns cloudflare-email-verify
+  "Complete a Cloudflare Email Routing *destination verification* via computer
+  use: drive the frontmost (already-logged-in) browser to the one-time verify
+  URL Cloudflare emails to a new forwarding address, click 'Verify email
+  address', and CONFIRM the result programmatically through the Cloudflare API.
+
+  Why a computer-use agent and not just curl: the verify link
+  (dash.cloudflare.com/email_fwdr/verify?token=…) is consumed by the
+  authenticated dashboard SPA — a headless GET returns 403. The token proves
+  mailbox control; the *click* must happen inside the operator's logged-in
+  browser session. This agent does exactly that one click, nothing else.
+
+  Runs on a LOCAL model by default — Ollama serving gemma 4 QAT (see jvm-host),
+  so nothing leaves the machine. Model backend: LLM=ollama|gemini|anthropic.
+
+     kbb -M:dev:examples -e \\
+       \"(require 'cloudflare-email-verify) (cloudflare-email-verify/-main)\"
+
+  Env:
+    CF_VERIFY_URL     the verify link from the Cloudflare email (required;
+                      may also be passed as the first CLI arg)
+    CF_TARGET_EMAIL   destination being verified, for the API re-check
+                      (default jun784@gmail.com)
+    CF_ACCOUNT_ID     Cloudflare account id (enables the check_verified tool)
+    CF_TOKEN_ITEM     1Password item holding a CF API token (default
+                      \"gftd.cloudflare/API_TOKEN\")
+    CF_TOKEN_FIELD    field in that item (default \"password\")
+    CF_TOKEN_VAULT    optional 1Password vault name
+    VAULT             op | bw   (default op; must be signed in)
+
+  SCOPE: this is a NARROW, near-read-only task. The agent navigates to ONE URL,
+  clicks ONE 'Verify email address' button, and confirms. It must not touch any
+  other account setting (no rules, no DNS, no destinations) — the system prompt
+  forbids it and there is no tool to do so."
+  (:require [computeruse.macos :as macos]
+            [computeruse.vault :as vault]
+            [computeruse.agent :as agent]
+            [jvm-host :as host]
+            [langchain.db :as db]))
+
+(def system-prompt
+  (str "You are a computer-use agent operating the user's macOS desktop to "
+       "complete ONE Cloudflare Email Routing destination verification in the "
+       "frontmost browser window (it is already logged in to dash.cloudflare.com).\n"
+       "HARD RULES (scope):\n"
+       "- Do EXACTLY this: open the given verify URL, then if a button labelled "
+       "'Verify email address' (or 'Verify') is shown, click it once.\n"
+       "- The dashboard often verifies automatically on page load — if the page "
+       "already shows success (e.g. 'verified', 'Email address verified', "
+       "'successfully verified'), do NOT click anything.\n"
+       "- NEVER change any other setting: no routing rules, no DNS, no new "
+       "destinations, no account settings. There is no reason to click anything "
+       "except the single 'Verify email address' button.\n"
+       "- cmd+l focuses the address bar; type the URL there and press enter.\n"
+       "- Screenshot to verify the page state BEFORE and AFTER any click.\n"
+       "When the page shows the address is verified, call the `check_verified` "
+       "tool (if available) to confirm via the API, then call `done` "
+       "success=true. If a login screen or 2FA appears, call `done` "
+       "success=false and say so — do not attempt to log in."))
+
+(defn check-verified-tool
+  "API re-check: GET the account's Email Routing destination addresses and
+  report whether `email` is verified. The CF token is resolved from the vault
+  inside this tool and used only in the Authorization header — it never reaches
+  the model, the message history, or the Datomic action log."
+  [{:keys [vault account-id token-ref]}]
+  {:name "check_verified"
+   :description
+   (str "Confirm via the Cloudflare API whether an Email Routing destination "
+        "address is verified. Call after the verify page shows success. "
+        "Returns 'verified' or 'pending'.")
+   :schema {:type "object"
+            :properties {:email {:type "string"
+                                 :description "Destination address being verified."}}
+            :required ["email"]}
+   :fn (fn [{:keys [email]}]
+         (try
+           (let [token (vault/-resolve vault token-ref)
+                 resp (host/http-fn
+                       {:url (str "https://api.cloudflare.com/client/v4/accounts/"
+                                  account-id "/email/routing/addresses?per_page=50")
+                        :method :get
+                        :headers {"Authorization" (str "Bearer " token)
+                                  "Content-Type" "application/json"}})
+                 body (host/json-read (:body resp))
+                 hit (some #(when (= (:email %) email) %) (:result body))]
+             (cond
+               (not (:success body)) (str "API error: " (pr-str (:errors body)))
+               (nil? hit) (str email " is not a destination on this account")
+               (:verified hit) (str email " is VERIFIED")
+               :else (str email " is still pending")))
+           (catch Exception e
+             (str "check_verified failed: " (.getMessage e)))))})
+
+(defn make-vault []
+  (case (or (System/getenv "VAULT") "op")
+    "op" (vault/op-vault {:account (System/getenv "OP_ACCOUNT")})
+    "bw" (vault/bw-vault {})
+    (throw (ex-info "VAULT must be op or bw" {}))))
+
+(defn task [verify-url target-email account-id]
+  (str "Goal: in the frontmost browser, open this Cloudflare Email Routing "
+       "verify URL and complete the verification:\n  " verify-url "\n"
+       "If the page shows a 'Verify email address' button, click it once; if it "
+       "already shows the address is verified, do not click.\n"
+       (if account-id
+         (str "Then call `check_verified` with email \"" target-email
+              "\" to confirm via the API, and finish with `done`.")
+         (str "Then confirm from the page that \"" target-email "\" is verified "
+              "and finish with `done`."))))
+
+(defn -main [& [arg-url]]
+  (let [verify-url (or arg-url (System/getenv "CF_VERIFY_URL")
+                       (throw (ex-info "CF_VERIFY_URL (or first arg) is required" {})))
+        target (or (System/getenv "CF_TARGET_EMAIL") "jun784@gmail.com")
+        account-id (System/getenv "CF_ACCOUNT_ID")
+        vlt (make-vault)
+        token-ref (cond-> {:item (or (System/getenv "CF_TOKEN_ITEM") "gftd.cloudflare/API_TOKEN")
+                           :field (or (System/getenv "CF_TOKEN_FIELD") "password")}
+                    (System/getenv "CF_TOKEN_VAULT") (assoc :vault (System/getenv "CF_TOKEN_VAULT")))
+        tools (when account-id
+                [(check-verified-tool {:vault vlt :account-id account-id :token-ref token-ref})])
+        conn (db/create-conn agent/log-schema)
+        {:keys [result done steps]}
+        (agent/run (cond-> {:model (host/make-model)
+                            :computer (macos/macos-computer)
+                            :vault vlt
+                            :system system-prompt
+                            :task (task verify-url target account-id)
+                            :history-conn conn
+                            :session-id "cf-email-verify"
+                            :max-steps 20}
+                     tools (assoc :tools tools)))]
+    (println "done:" done "| result:" result "| steps:" steps)
+    (println "audit:"
+             (sort-by first
+                      (db/q '[:find ?step ?a
+                              :where [?e :caction/step ?step]
+                                     [?e :caction/action ?a]]
+                            (db/db conn))))))

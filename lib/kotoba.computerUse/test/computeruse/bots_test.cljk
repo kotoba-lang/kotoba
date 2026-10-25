@@ -1,0 +1,348 @@
+(ns computeruse.bots-test
+  "Tests for the resident bot layer: roster validation, the action gate,
+  and the session loop. Negative tests pin the reason literal."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [computeruse.backend :as b]
+            [computeruse.bots :as bots]
+            [computeruse.hostfs :as fs]
+            [kotoba.lang.edn :as edn]))
+
+(def known? #{:macos-local :window-scoped :host-object :fleet-node
+              :agent-space :macos-vm :linux-container :cf-browser
+              :cf-sandbox :saas-sandbox})
+
+(def good-bot
+  {:bot/id "uiux-bots-page-qa"
+   :bot/goal "verify the page renders"
+   :bot/backend :window-scoped
+   :bot/target {:app "Google Chrome"}
+   :bot/interval-s 21600
+   :bot/max-steps 8
+   :bot/allowed-actions #{:script}
+   :bot/budget-tokens 30000})
+
+;; ───────────────────────── roster validation ─────────────────────────
+
+(deftest a-good-entry-has-no-problems
+  (is (empty? (bots/entry-problems known? good-bot)))
+  (is (empty? (bots/roster-problems known? [good-bot]))))
+
+(defn- reasons [problems] (set (map :reason problems)))
+
+(deftest each-validation-failure-has-its-own-named-reason
+  (testing "unknown backend id"
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/backend :teleporter)))
+                   :bot/unknown-backend)))
+  (testing "blank goal"
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/goal "   ")))
+                   :bot/blank-goal)))
+  (testing "malformed id"
+    (doseq [bad ["Has-Caps" "-leading" "" nil 42
+                 (apply str (repeat 65 "a"))]]
+      (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/id bad)))
+                     :bot/bad-id)
+          (str (pr-str bad) " must be rejected"))))
+  (testing "out-of-range numbers"
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/interval-s 0)))
+                   :bot/bad-interval))
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/max-steps -1)))
+                   :bot/bad-max-steps))
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/max-steps 25)))
+                   :bot/max-steps-above-ceiling))
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/budget-tokens 0)))
+                   :bot/bad-budget)))
+  (testing "allowed-actions outside the vocabulary"
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/allowed-actions #{:script :launch-missiles})))
+                   :bot/bad-allowed-actions))
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/allowed-actions [:script])))
+                   :bot/bad-allowed-actions)
+        "a vector is not a set"))
+  (testing "target must be a map"
+    (is (contains? (reasons (bots/entry-problems known? (assoc good-bot :bot/target "chrome")))
+                   :bot/bad-target)))
+  (testing "an empty allowed-actions set is legal — that is the host-object shape"
+    (is (empty? (bots/entry-problems known? (assoc good-bot :bot/allowed-actions #{}))))))
+
+(deftest duplicate-ids-are-a-roster-level-problem
+  (is (contains? (reasons (bots/roster-problems known? [good-bot good-bot]))
+                 :roster/duplicate-id)))
+
+(deftest an-unreadable-roster-is-not-an-empty-one
+  (is (= #{:roster/unreadable} (reasons (bots/roster-problems known? nil))))
+  (is (= #{:roster/empty} (reasons (bots/roster-problems known? []))))
+  (is (= #{:roster/not-vector} (reasons (bots/roster-problems known? {:a 1})))))
+
+;; ───────────────────────── the gate ─────────────────────────
+
+(def frame {:png-path "/tmp/x.png" :width 800 :height 600})
+
+(deftest gate-allows-a-granted-action-inside-the-frame
+  (is (= :allow (:verdict (bots/gate {:bot (assoc good-bot :bot/allowed-actions #{:pointer})
+                                      :frame frame :step 0 :tokens-used 0}
+                                     {:kind :pointer :button :left :coordinate [10 10]})))))
+
+(deftest gate-refuses-with-pinned-reasons
+  (testing "an action kind the bot was not granted"
+    (let [v (bots/gate {:bot good-bot :frame frame :step 0 :tokens-used 0}
+                       {:kind :type :text "rm -rf"})]
+      (is (= :refuse (:verdict v)))
+      (is (= :gate/action-kind-not-allowed (:reason v)))))
+
+  (testing "a coordinate outside the observed frame"
+    (let [v (bots/gate {:bot (assoc good-bot :bot/allowed-actions #{:pointer})
+                        :frame frame :step 0 :tokens-used 0}
+                       {:kind :pointer :button :left :coordinate [10 9999]})]
+      (is (= :gate/coordinate-outside-frame (:reason v)))
+      (is (= [800 600] (get-in v [:detail :frame])))))
+
+  (testing "an unmeasured frame refuses rather than permitting"
+    (let [v (bots/gate {:bot (assoc good-bot :bot/allowed-actions #{:pointer})
+                        :frame {:png-path "/tmp/x.png"} :step 0 :tokens-used 0}
+                       {:kind :pointer :button :left :coordinate [10 10]})]
+      (is (= :gate/frame-dimensions-unknown (:reason v)))))
+
+  (testing "the step ceiling"
+    (let [v (bots/gate {:bot good-bot :frame frame :step 8 :tokens-used 0}
+                       {:kind :script :applescript "x"})]
+      (is (= :gate/step-ceiling-reached (:reason v)))))
+
+  (testing "the token budget"
+    (let [v (bots/gate {:bot good-bot :frame frame :step 0 :tokens-used 30000}
+                       {:kind :script :applescript "x"})]
+      (is (= :gate/budget-exhausted (:reason v)))))
+
+  (testing "a malformed action"
+    (doseq [a [nil {} {:kind "script"} {:kind :teleport} "click"]]
+      (is (= :gate/malformed-action
+             (:reason (bots/gate {:bot good-bot :frame frame :step 0 :tokens-used 0} a)))
+          (str (pr-str a) " must be refused as malformed")))))
+
+(deftest noop-needs-no-grant
+  (is (= :allow (:verdict (bots/gate {:bot (assoc good-bot :bot/allowed-actions #{})
+                                      :frame frame :step 0 :tokens-used 0}
+                                     {:kind :noop})))))
+
+(deftest ceilings-are-checked-before-the-action
+  (testing "an over-budget session refuses even a granted action"
+    (is (= :gate/budget-exhausted
+           (:reason (bots/gate {:bot good-bot :frame frame :step 0 :tokens-used 999999}
+                               {:kind :script :applescript "x"}))))))
+
+;; ───────────────────────── decision parsing ─────────────────────────
+
+(deftest parse-decision-finds-the-edn-on-the-last-line
+  (is (= {:done true :text "ok"}
+         (bots/parse-decision "I looked at it.\nEverything renders.\n{:done true :text \"ok\"}")))
+  (is (= {:action {:kind :noop}}
+         (bots/parse-decision "```\n{:action {:kind :noop}}\n```")))
+  (testing "no decision is an explicit error, not a silent no-op"
+    (let [d (bots/parse-decision "I am not sure what to do.")]
+      (is (:error d))
+      (is (nil? (:action d))))))
+
+;; ───────────────────────── the session loop ─────────────────────────
+
+(defrecord ScriptedBackend [frames acts log]
+  b/IBackend
+  (-observe! [_ _]
+    (let [f (first @frames)]
+      (swap! frames rest)
+      (swap! log conj [:observe])
+      f))
+  (-act! [_ a]
+    (swap! log conj [:act a])
+    (or (@acts (:kind a)) {:ok true}))
+  (-probe! [_] {:available? true :measured-at "test"}))
+
+(defn- scripted [fs acts log]
+  (->ScriptedBackend (atom (concat fs (repeat (last fs)))) (atom acts) log))
+
+(defn- replies [& texts]
+  (let [remaining (atom texts)]
+    (fn [_] (let [t (first @remaining)]
+              (swap! remaining rest)
+              {:text t :tokens 100 :adapter :test}))))
+
+(deftest a-session-that-reaches-done
+  (let [log (atom [])
+        r (bots/run-session!
+           {:bot (assoc good-bot :bot/max-steps 3)
+            :backend (scripted [frame] {} log)
+            :interpret (replies "{:done true :text \"three sections render\"}")
+            :now-fn (constantly "T")})]
+    (is (= :done (:outcome r)))
+    (is (= "three sections render" (:result r)))
+    (is (= ["/tmp/x.png"] (:frames r)))
+    (is (= 100 (:tokens-used r)))
+    (is (= "uiux-bots-page-qa" (:bot-id r)))
+    (is (= :window-scoped (:backend r)))))
+
+(deftest a-gate-refusal-is-recorded-with-its-reason-and-never-executed
+  (let [log (atom [])
+        r (bots/run-session!
+           {:bot (assoc good-bot :bot/max-steps 2 :bot/allowed-actions #{:script})
+            :backend (scripted [frame] {} log)
+            :interpret (replies "{:action {:kind :type :text \"secret\"}}"
+                                "{:done true :text \"gave up on typing\"}")
+            :now-fn (constantly "T")})]
+    (is (= :done (:outcome r)))
+    (let [refusal (first (:actions r))]
+      (is (= :refuse (:verdict refusal)))
+      (is (= :gate/action-kind-not-allowed (:reason refusal)))
+      (is (= {:kind :type :text "secret"} (:action refusal))))
+    (testing "the backend never saw the refused action"
+      (is (empty? (filter #(= :act (first %)) @log))))))
+
+(deftest a-backend-refusal-is-recorded-not-swallowed
+  (let [log (atom [])
+        r (bots/run-session!
+           {:bot (assoc good-bot :bot/max-steps 2 :bot/allowed-actions #{:script})
+            :backend (scripted [frame]
+                               {:script (b/refusal :backend/act-unsupported {:why "no act surface"})}
+                               log)
+            :interpret (replies "{:action {:kind :script :applescript \"x\"}}"
+                                "{:done true :text \"reported\"}")
+            :now-fn (constantly "T")})
+        a (first (:actions r))]
+    (is (= :allow (:verdict a)) "the gate allowed it")
+    (is (true? (:backend-refused? a)) "and the backend refused it")
+    (is (= :backend/act-unsupported (get-in a [:result :reason])))))
+
+(deftest an-unobservable-environment-is-could-not-measure-not-failed
+  (let [r (bots/run-session!
+           {:bot good-bot
+            :backend (scripted [(b/refusal :backend/observe-failed {:why "no window"})]
+                               {} (atom []))
+            :interpret (replies "{:done true}")
+            :now-fn (constantly "T")})]
+    (is (= :could-not-measure (:outcome r)))
+    (is (= :observe-refused (:why r)))
+    (is (= :backend/observe-failed (get-in r [:refusal :reason])))))
+
+(deftest a-blank-frame-is-could-not-measure
+  (let [r (bots/run-session!
+           {:bot good-bot
+            :backend (scripted [(assoc frame :frame-stats {:blank? true :stddev 0.0})]
+                               {} (atom []))
+            :interpret (replies "{:done true :text \"looks fine\"}")
+            :now-fn (constantly "T")})]
+    (is (= :could-not-measure (:outcome r)))
+    (is (= :frame-blank (:why r)))))
+
+(deftest a-dead-model-adapter-is-could-not-measure
+  (let [r (bots/run-session!
+           {:bot good-bot
+            :backend (scripted [frame] {} (atom []))
+            :interpret (fn [_] {:error "claude CLI never ran" :adapter :claude-cli})
+            :now-fn (constantly "T")})]
+    (is (= :could-not-measure (:outcome r)))
+    (is (= :model-adapter-failed (:why r)))))
+
+(deftest the-step-ceiling-ends-the-session-as-failed
+  (let [r (bots/run-session!
+           {:bot (assoc good-bot :bot/max-steps 2 :bot/allowed-actions #{:script})
+            :backend (scripted [frame] {} (atom []))
+            :interpret (fn [_] {:text "{:action {:kind :script :applescript \"x\"}}"
+                                :tokens 10 :adapter :test})
+            :now-fn (constantly "T")})]
+    (is (= :failed (:outcome r)))
+    (is (= 2 (:steps r)))
+    (is (= 2 (count (:actions r))))))
+
+(deftest the-budget-ends-the-session-as-failed
+  (let [r (bots/run-session!
+           {:bot (assoc good-bot :bot/max-steps 10 :bot/budget-tokens 150
+                        :bot/allowed-actions #{:script})
+            :backend (scripted [frame] {} (atom []))
+            :interpret (fn [_] {:text "{:action {:kind :script :applescript \"x\"}}"
+                                :tokens 100 :adapter :test})
+            :now-fn (constantly "T")})]
+    (is (= :failed (:outcome r)))
+    (is (= :budget-exhausted (:why r)))
+    (is (>= (:tokens-used r) 150))))
+
+(deftest explicit-failure-from-the-model-is-failed-not-done
+  (let [r (bots/run-session!
+           {:bot good-bot
+            :backend (scripted [frame] {} (atom []))
+            :interpret (replies "{:done true :success false :text \"the middle section is empty\"}")
+            :now-fn (constantly "T")})]
+    (is (= :failed (:outcome r)))
+    (is (= "the middle section is empty" (:result r)))))
+
+;; ───────────────────────── exit codes ─────────────────────────
+
+(deftest the-three-valued-outcome-stays-three-valued
+  (is (= 0 (bots/outcome->exit :done)))
+  (is (= 1 (bots/outcome->exit :failed)))
+  (is (= 2 (bots/outcome->exit :could-not-measure)))
+  (testing "an unknown outcome must not read as success"
+    (is (= 2 (bots/outcome->exit :something-else)))))
+
+;; ───────────────────────── receipts ─────────────────────────
+
+(deftest a-receipt-is-written-and-reads-back
+  (let [dir (str (fs/tmp-dir) "/cua-test-receipts-" (fs/epoch-ms))
+        r (bots/run-session!
+           {:bot (assoc good-bot :bot/max-steps 2)
+            :backend (scripted [frame] {} (atom []))
+            :interpret (replies "{:done true :text \"ok\"}")
+            :now-fn (constantly "2026-08-29T00:00:00Z")})
+        p (bots/write-receipt! dir r)]
+    (is (fs/path-exists? p))
+    (let [back (edn/read-string (fs/read-file p))]
+      (is (= :done (:outcome back)))
+      (is (= "uiux-bots-page-qa" (:bot-id back)))
+      (is (= ["/tmp/x.png"] (:frames back)))
+      (is (string? (:started back)))
+      (is (string? (:finished back)))
+      (is (number? (:tokens-used back))))))
+
+;; ───────────────────────── cwd resolution ─────────────────────────
+
+(deftest a-relative-cwd-resolves-against-the-roster-not-the-process
+  (let [root (str (fs/tmp-dir) "/cua-cwd-test-" (fs/epoch-ms))
+        roster (str root "/manifest/cua-bots.edn")]
+    (fs/mkdirs! (str root "/orgs/x/y"))
+    (fs/mkdirs! (str root "/manifest"))
+    (fs/write-file! roster "[]")
+    (testing "found under the roster directory's parent (the superproject layout)"
+      (let [r (bots/resolve-target-cwd roster "orgs/x/y")]
+        (is (= :roster-parent (:resolved-from r)))
+        (is (fs/directory? (:cwd r)))))
+    (testing "a directory that exists nowhere is an error, never a guess"
+      (let [r (bots/resolve-target-cwd roster "orgs/nope/nope")]
+        (is (:error r))
+        (is (nil? (:cwd r)))))
+    (testing "nil cwd stays nil"
+      (is (= {:cwd nil} (bots/resolve-target-cwd roster nil))))))
+
+;; ───────────────────────── prompt content ─────────────────────────
+
+(deftest the-prompt-names-the-application-the-frame-belongs-to
+  (testing "which app owns the window is not visible in the pixels; measured
+           2026-08-29 a model scripted Safari for eight steps while looking at
+           a Chrome window because the prompt never said"
+    (let [p (bots/build-prompt
+             {:bot good-bot :step 0 :history []
+              :observation (assoc frame :window {:id 2985 :app "Google Chrome"
+                                                 :title "about:blank" :w 1300 :h 800})})]
+      (is (re-find #"Google Chrome" p))
+      (is (re-find #"2985" p))
+      (is (re-find #"osascript" p))))
+  (testing "roster detail the backend does not consume still reaches the model"
+    (let [p (bots/build-prompt
+             {:bot (assoc good-bot :bot/target {:app "Google Chrome"
+                                                :url "https://itonami.cloud/bots/"})
+              :step 0 :history []
+              :observation (assoc frame :window {:id 1 :app "Google Chrome" :w 1 :h 1})})]
+      (is (re-find #"itonami\.cloud/bots" p))))
+  (testing "a non-visual observation carries the exit and the verdict"
+    (let [p (bots/build-prompt
+             {:bot (assoc good-bot :bot/allowed-actions #{}) :step 0 :history []
+              :observation {:backend :host-object :exit 2
+                            :observation {:outcome :not-measured}
+                            :raw "…tail…"}})]
+      (is (re-find #":exit 2" p))
+      (is (re-find #":not-measured" p))
+      (is (re-find #"allowed no acting actions" p)))))
