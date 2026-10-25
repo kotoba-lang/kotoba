@@ -1,0 +1,148 @@
+(ns ayatori.discovery-test
+  "Discovery is not retrieval.
+
+  `ayatori.discovery` had no tests until 2026-09-04, while being half of
+  what this repo is named for. What is checked here is what this namespace
+  PROMISES in its own docstrings and what nothing else covers:
+
+    - the content CID is never rewritten, whatever a router answers;
+    - a router that fails transport is one failed response, not a failed
+      lookup -- and in the async path, not a rejected aggregate Promise;
+    - 404 and an empty provider list are answers, not errors;
+    - quorum counts routers that ANSWERED, so one dead router out of two
+      still meets quorum 1 and fails quorum 2.
+
+  The transport is injected, so none of this touches a network."
+  (:require [ayatori.discovery :as discovery]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            #?(:cljs [cljs.test :refer [async]])))
+
+(def ^:private cid "bafkreiabcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopq")
+
+(defn- body
+  "A Delegated Routing V1 `/providers/{cid}` body naming `peers`."
+  [peers]
+  {:Providers (mapv (fn [p] {:ID p :Addrs ["/ip4/127.0.0.1/tcp/4001"]}) peers)})
+
+(defn- responder
+  "An http-fn that answers per-router from `m`, and throws for a router
+  mapped to `::boom`."
+  [m]
+  (fn [{:keys [url]}]
+    (let [router (first (filter #(str/starts-with? url %) (keys m)))
+          answer (get m router)]
+      (if (= ::boom answer)
+        (throw (ex-info "connection refused" {:url url}))
+        answer))))
+
+(def ^:private r1 "https://r1.example")
+(def ^:private r2 "https://r2.example")
+
+;; ---------------------------------------------------------------- sync
+
+(deftest the-content-cid-is-never-rewritten
+  (testing "a router answering with providers does not get to rename the cid"
+    (let [res (discovery/find-providers
+               (responder {r1 {:status 200 :body (body ["peerA"])}})
+               cid {:routers [r1]})]
+      (is (:ok? res))
+      (is (= cid (:cid res)) "the requested cid comes back unchanged")
+      (is (false? (:mutates-cid? res)))
+      (is (= ["peerA"] (mapv :peer (:providers res))))
+      (is (every? #(= cid (:cid %)) (:providers res))
+          "every provider record is stamped with the cid that was asked for")))
+  (testing "and neither does a router answering with nothing"
+    (let [res (discovery/find-providers
+               (responder {r1 {:status 404 :body ""}})
+               cid {:routers [r1]})]
+      (is (:ok? res) "404 is an answer: we asked, nobody provides")
+      (is (= cid (:cid res)))
+      (is (= [] (:providers res))))))
+
+(deftest a-dead-router-is-one-failed-response-not-a-failed-lookup
+  (let [res (discovery/find-providers
+             (responder {r1 ::boom
+                         r2 {:status 200 :body (body ["peerB"])}})
+             cid {:routers [r1 r2] :quorum 1})]
+    (is (:ok? res) "one live router meets quorum 1")
+    (is (= 1 (:answered res)))
+    (is (= ["peerB"] (mapv :peer (:providers res))))
+    (is (= [:transport-error]
+           (->> (:responses res) (remove :ok?) (mapv :reason)))
+        "the failure is reported as a response, not raised")))
+
+(deftest quorum-counts-routers-that-answered
+  (testing "quorum 2 is unmet when only one of two routers answers"
+    (let [res (discovery/find-providers
+               (responder {r1 ::boom
+                           r2 {:status 200 :body (body ["peerB"])}})
+               cid {:routers [r1 r2] :quorum 2})]
+      (is (false? (:ok? res)))
+      (is (= :quorum-unmet (:reason res)))
+      (is (= 1 (:answered res)))
+      (is (= cid (:cid res)) "a failed lookup still names the cid it was asked about")))
+  (testing "every router down is a different answer from quorum-unmet"
+    (let [res (discovery/find-providers
+               (responder {r1 ::boom r2 ::boom})
+               cid {:routers [r1 r2] :quorum 1})]
+      (is (false? (:ok? res)))
+      (is (= :all-routers-failed (:reason res))))))
+
+(deftest providers-union-across-routers-by-peer
+  (let [res (discovery/find-providers
+             (responder {r1 {:status 200 :body (body ["shared" "only-1"])}
+                         r2 {:status 200 :body (body ["shared" "only-2"])}})
+             cid {:routers [r1 r2] :quorum 1})]
+    (is (:ok? res))
+    (is (= 2 (:answered res)))
+    (is (= #{"shared" "only-1" "only-2"} (set (mapv :peer (:providers res))))
+        "the union is by peer, so a provider both routers name appears once")))
+
+(deftest the-default-routers-are-the-spec-repos
+  (testing "ayatori re-exports rather than restating the endpoint list --
+            a second copy would drift from io-ipni-specs silently"
+    (is (seq discovery/default-routers))
+    (is (seq discovery/default-indexers))))
+
+;; --------------------------------------------------------------- async
+
+#?(:cljs
+   (deftest async-transport-rejection-is-a-failed-response-not-a-rejected-promise
+     ;; `find-providers-async`'s own docstring: "Transport rejection is a
+     ;; failed router response, not a rejected aggregate Promise." Nothing
+     ;; checked that, and a missing `.catch` would satisfy every other test
+     ;; here while turning one dead router into a lookup that never resolves.
+     (async done
+       (let [http-fn (fn [{:keys [url]}]
+                       (if (str/starts-with? url r1)
+                         (js/Promise.reject (js/Error. "connection refused"))
+                         (js/Promise.resolve {:status 200 :body (body ["peerB"])})))]
+         (-> (discovery/find-providers-async http-fn cid {:routers [r1 r2] :quorum 1})
+             (.then (fn [res]
+                      (is (:ok? res) "the aggregate resolves")
+                      (is (= 1 (:answered res)))
+                      (is (= ["peerB"] (mapv :peer (:providers res))))
+                      (is (= cid (:cid res)))
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "aggregate Promise rejected: " e))
+                       (done))))))))
+
+#?(:cljs
+   (deftest async-and-sync-agree-on-the-same-answers
+     (async done
+       (let [answers {r1 {:status 200 :body (body ["shared" "only-1"])}
+                      r2 {:status 200 :body (body ["shared" "only-2"])}}
+             sync-res (discovery/find-providers (responder answers) cid
+                                                {:routers [r1 r2] :quorum 1})
+             http-fn (fn [req] (js/Promise.resolve ((responder answers) req)))]
+         (-> (discovery/find-providers-async http-fn cid {:routers [r1 r2] :quorum 1})
+             (.then (fn [async-res]
+                      (is (= (set (mapv :peer (:providers sync-res)))
+                             (set (mapv :peer (:providers async-res))))
+                          "the two paths are the same lookup, not two lookups")
+                      (is (= (:answered sync-res) (:answered async-res)))
+                      (is (= (:ok? sync-res) (:ok? async-res)))
+                      (done)))
+             (.catch (fn [e] (is false (str e)) (done))))))))

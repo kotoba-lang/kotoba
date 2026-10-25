@@ -1,0 +1,328 @@
+#!/usr/bin/env kbb
+;; bench/novelty_window.cljk — Co-Scientist iteration 06. The seed iteration 05
+;; left with a number in it: build the READ-locality pack.
+;;
+;; Iteration 05 section E measured the commit chain under ADR-2608160100's
+;; grouping -- one commit, one pack -- and got a 2x LOSS at every length,
+;; exactly. The reason is arithmetic once seen: a chain that runs backwards
+;; through commits touches exactly ONE block per pack, so N/P = 1.00, and each
+;; link costs 2 (open) + 1 (block) + 1 (catalog) = 4 where per-object costs 2.
+;;
+;; The ADR's stated mechanism is right -- "if they are in the same pack one
+;; Range GET gets them all". A commit-scoped pack cannot put them in the same
+;; pack, because the links are in different commits BY CONSTRUCTION. So the
+;; grouping is the thing to change, not the mechanism.
+;;
+;; This seals one pack per WINDOW of W commits and re-runs that same walk.
+;;
+;; ## What the prediction actually is, written before running
+;;
+;; Per window a walk pays 2 (open) + W (blocks) + 1 (catalog) = W + 3, against
+;; per-object's 2W. So:
+;;
+;;   ratio = 2W / (W + 3)      W=1 -> 0.50x   W=3 -> 1.00x   W=64 -> 1.91x
+;;
+;; Two things follow that are worth stating before the numbers exist:
+;;
+;;   * W = 3 is the BOUNDARY -- a tie. Iteration 02's crossover rule was
+;;     N/P > 3 cold, and window packing makes N/P = W, so the rule predicts its
+;;     own boundary here. A comparison whose inputs never sit on the line cannot
+;;     tell two operators apart, so W = 2, 3, 4 are all measured.
+;;   * The win is CAPPED AT 2x, because per-object pays 2 per block (discover +
+;;     fetch) and packed pays 1. Iteration 05 called N/P = 64 "an order of
+;;     magnitude above either crossover" -- true of N/P, and not a speedup.
+;;     Nothing here can beat 2x on this access path.
+;;
+;; And the per-object arm cannot be warmed out of that 2: a chain visits each
+;; CID exactly once, so a provider cache never gets a second look at anything.
+;; That is why section D's warm/warm tie does not apply to this shape.
+;;
+;; ## Section H exists because a window is not free
+;;
+;; A commit-scoped pack can be sealed the moment the commit lands. A window
+;; CANNOT: it is sealed when it closes. So the newest commits -- up to W - 1 of
+;; them -- have no pack, and a read of the live head walks per-object until it
+;; reaches sealed history. H measures that instead of assuming it away.
+;;
+;; Round trips, never wall clock.
+;;
+;; ## Section K: the depth production actually has
+;;
+;; G and H walk 64 links. kotobase's novelty chain at the fold threshold is FOUR
+;; (measured in kotoba-lang/kotobase-peer: segment size 16, depth = ceil(tx/16)).
+;; K reports ABSOLUTE round trips at that depth, because the packed arm's fixed 3
+;; per window amortises over 64 links and does not over 4 -- so a ratio taken at
+;; depth 64 overstates the prize by more than the grouping change is worth.
+;;
+;; Round trips, never wall clock.
+;;
+;; Run:
+;;   kbb --backend sci --classpath "$(cat bin/classpath.txt)" bench/novelty_window.cljk
+;;   SECTION=g|h|k to run one.
+
+(ns novelty-window
+  (:require [arrangement.core :as arr]
+            [ayatori.pack :as pack]
+            [ayatori.remote :as remote]
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as car2]
+            [ipld.core :as ipld]
+            [kotoba.lang.text :as str]))
+
+(defn- blind [x] (pr-str x))
+(defn- crypto [bytes] bytes)
+(defn- blind-async [x] (js/Promise.resolve (pr-str x)))
+(defn- crypto-async [bytes] (js/Promise.resolve bytes))
+
+(defn- quads [from to]
+  (vec (mapcat (fn [i]
+                 [{:s (str "s" i) :p "kind" :o (if (< i 3) "rare" "common")}
+                  {:s (str "s" i) :p "name" :o (str "Subject " i)}])
+               (range from to))))
+
+(defn- history
+  "`n` successive commits threaded by `prev`. `:groups` is the block set each
+   commit NEWLY wrote -- the only grouping a writer has, and the input both
+   packing policies below are built from."
+  [n per]
+  (let [blocks (atom {})
+        put! (fn [cid by] (swap! blocks assoc cid by) (js/Promise.resolve cid))]
+    (letfn [(step [i prev db groups]
+              (if (= i n)
+                (js/Promise.resolve {:head prev :blocks blocks :groups groups :commits n})
+                (let [before (set (keys @blocks))
+                      db' (reduce arr/assert-quad db (quads (* i per) (* (inc i) per)))]
+                  (-> (arr/commit! put! db' prev arr/current-schema-version
+                                   blind-async crypto-async)
+                      (.then (fn [cid]
+                               (step (inc i) cid db' (conj groups (vec (remove before (keys @blocks)))))))))))]
+      (step 0 nil (arr/empty-db) []))))
+
+(defn- window-groups
+  "Seal one pack per W consecutive commits. W = 1 is exactly the ADR's
+   commit-scoped policy, so it doubles as this file's control: it must
+   reproduce iteration 05's 0.50x or the harness is measuring itself."
+  [groups w]
+  (mapv #(vec (apply concat %)) (partition-all w groups)))
+
+(defn- archives-of [head blocks groups]
+  {:archives (mapv (fn [g] (:bytes (car2/pack {:roots [head]
+                                              :blocks (mapv (fn [c] {:cid c :bytes (get @blocks c)}) g)})))
+                   groups)
+   :catalog (into {} (mapcat (fn [i g] (map (fn [c] [c i]) g)) (range) groups))})
+
+(defn- packed-source
+  "A block source over sealed packs. `fallback` is called for a CID no pack
+   holds -- nil in G (everything is sealed), the per-object plane in H."
+  [{:keys [archives catalog]} ctr fallback]
+  (let [{:keys [reads catalog-reads]} ctr
+        cat-cache (atom #{}) open-cache (atom {})]
+    {:opens open-cache
+     :source (fn [cid]
+               (if-let [i (get catalog cid)]
+                 (do (when-not (contains? @cat-cache i)
+                       (swap! catalog-reads inc) (swap! cat-cache conj i))
+                     (let [op (or (get @open-cache i)
+                                  (let [archive (nth archives i)
+                                        o (pack/open-pack
+                                           {:range-fn (fn [{:keys [range]}]
+                                                        (swap! reads inc)
+                                                        (let [[_ from to] (re-matches #"bytes=(\d+)-(\d*)" range)
+                                                              start (js/parseInt from 10)
+                                                              total (b/bcount archive)
+                                                              end (if (seq to) (min total (inc (js/parseInt to 10))) total)]
+                                                          (b/slice archive start (min end total))))
+                                            :profile {:blocks :packed-blocks :object #{:range-read}}})]
+                                    (swap! open-cache assoc i o) o))]
+                       (pack/read-block op cid)))
+                 (when fallback (fallback cid))))}))
+
+(defn- walk
+  "The chain: decode a commit block, read `prev`, repeat. Nothing here can be
+   batched or prefetched, which is the whole point of the shape."
+  [head get-block]
+  (loop [cid head seen 0]
+    (if (or (nil? cid) (> seen 500))
+      seen
+      (if-let [by (get-block cid)]
+        (let [node (ipld/decode (js/Uint8Array. by))
+              prev (get node "prev")]
+          (recur (when (ipld/link? prev) (ipld/link-cid prev)) (inc seen)))
+        seen))))
+
+(defn- fmt [& xs] (str/join (map (fn [[w v]] (.padStart (str v) w)) (partition 2 xs))))
+
+;; ── G: the read-locality pack ───────────────────────────────────────────────
+
+(defn- section-g [h]
+  (println)
+  (println "G. the chain walk under WINDOW-scoped packs — W commits sealed into one pack")
+  (println (str "   " (:commits h) " commits, all history sealed. W=1 is iteration 05's policy and its control."))
+  (println)
+  (println (fmt 4 "W" 8 "packs" 13 "| per-object" 10 "| packed" 9 "catalog" 8 "reads" 8 "opened"
+                8 "N/P" 9 "vs" 12 "predicted"))
+  (println (str/join (repeat 92 "-")))
+  (let [blocks @(:blocks h)
+        head (:head h)
+        n (:commits h)
+        po-reads (atom 0)
+        n-po (walk head (fn [cid] (swap! po-reads inc) (get blocks cid)))
+        po (* 2 @po-reads)]
+    (when-not (= n-po n)
+      (println "REFUSING: the per-object walk visited" n-po "commits, not" n)
+      (js/process.exit 2))
+    (doseq [w [1 2 3 4 8 16 64]]
+      (let [groups (window-groups (:groups h) w)
+            ps (archives-of head (:blocks h) groups)
+            ctr {:reads (atom 0) :catalog-reads (atom 0)}
+            {:keys [source opens]} (packed-source ps ctr nil)
+            n-pk (walk head source)]
+        (when-not (= n-pk n)
+          (println "REFUSING: the packed walk at W =" w "visited" n-pk "commits, not" n)
+          (js/process.exit 2))
+        (let [pk (+ @(:reads ctr) @(:catalog-reads ctr))
+              npp (/ @(:reads ctr) (max 1 (count @opens)))
+              ;; 2W / (W + 3), stated in the header before any of this ran.
+              pred (/ (* 2 (min w n)) (+ (min w n) 3))]
+          (println (fmt 4 w 8 (count groups) 13 po 10 pk 9 @(:catalog-reads ctr)
+                        8 @(:reads ctr) 8 (count @opens)
+                        8 (.toFixed npp 2)
+                        9 (str (.toFixed (/ po (max 1 pk)) 2) "x")
+                        12 (str (.toFixed pred 2) "x"))))))
+    (println)
+    (println "N/P here counts RANGE READS per pack, so it carries the 2 reads an open costs;")
+    (println "block-per-pack is N/P - 2/P. W=3 is the boundary iteration 02's rule predicts.")))
+
+;; ── H: the live tail, which a window has and a commit does not ──────────────
+
+(defn- section-h [h]
+  (println)
+  (println "H. the LIVE TAIL — a window is sealed when it CLOSES, so the newest commits have no pack")
+  (println "   W=8. The walk starts at the live head and pays per-object until it reaches sealed history.")
+  (println)
+  (println (fmt 9 "commits" 8 "sealed" 7 "tail" 13 "| per-object" 10 "| mixed" 9 "catalog"
+                8 "reads" 8 "po-hits" 9 "vs"))
+  (println (str/join (repeat 92 "-")))
+  (let [blocks @(:blocks h)
+        head (:head h)
+        w 8]
+    (doseq [n [8 12 16 20 24]]
+      ;; A prefix of the real history: the first n commits, whose head is the
+      ;; nth commit's CID. Reached by walking down from the true head.
+      (let [chain (loop [cid head acc []]
+                    (if (or (nil? cid) (= (count acc) (:commits h)))
+                      acc
+                      (let [by (get blocks cid)
+                            node (ipld/decode (js/Uint8Array. by))
+                            prev (get node "prev")]
+                        (recur (when (ipld/link? prev) (ipld/link-cid prev)) (conj acc cid)))))
+            ;; chain is head-first; commit i (0-based, oldest first) is at
+            ;; (dec (count chain) - i). The nth-commit head:
+            sub-head (nth chain (- (count chain) n))
+            groups (vec (take n (:groups h)))
+            n-sealed-windows (quot n w)
+            sealed (vec (take (* n-sealed-windows w) groups))
+            tail-cids (set (apply concat (drop (* n-sealed-windows w) groups)))
+            ps (archives-of sub-head (:blocks h) (window-groups sealed w))
+            ctr {:reads (atom 0) :catalog-reads (atom 0)}
+            po-hits (atom 0)
+            {:keys [source]} (packed-source ps ctr
+                                            (fn [cid]
+                                              (when (contains? tail-cids cid)
+                                                ;; discover + fetch, the same 2 the per-object arm pays
+                                                (swap! po-hits + 2)
+                                                (get blocks cid))))
+            n-mixed (walk sub-head source)
+            po-reads (atom 0)
+            n-po (walk sub-head (fn [cid] (swap! po-reads inc) (get blocks cid)))]
+        (when-not (= n-po n-mixed n)
+          (println "REFUSING: walks disagree at n =" n "—" n-po "vs" n-mixed)
+          (js/process.exit 2))
+        (let [po (* 2 @po-reads)
+              mixed (+ @(:reads ctr) @(:catalog-reads ctr) @po-hits)]
+          (println (fmt 9 n 8 (* n-sealed-windows w) 7 (- n (* n-sealed-windows w))
+                        13 po 10 mixed 9 @(:catalog-reads ctr)
+                        8 @(:reads ctr) 8 @po-hits
+                        9 (str (.toFixed (/ po (max 1 mixed)) 2) "x"))))))
+    (println)
+    (println "tail = commits in the window that has not closed yet. At n = 8, 16, 24 it is empty;")
+    (println "at 12 and 20 it is 4 commits, and those 4 are the NEWEST -- the ones a live read hits first.")))
+
+
+;; ── K: the depth production actually has ────────────────────────────────────
+;;
+;; G and H walk a chain 64 links deep. kotobase's novelty chain is NOT that deep,
+;; and iteration 05 got this wrong by quoting an ADR instead of the code.
+;;
+;; Measured 2026-09-09 in kotoba-lang/kotobase-peer -- `novelty_chain_depth_test`
+;; walks the real chain -- `novelty-segment-size` is 16, so depth = ceil(tx/16):
+;;
+;;     unfolded tx    1   4   16   17   32   64   128
+;;     chain depth    1   1    1    2    2    4     8
+;;
+;; At the fold threshold (64) the chain is FOUR links, not 64. root ADR-2608021000
+;; says depth equals the number of unfolded transactions; that describes the shape
+;; the repo left when segments landed -- `novelty-segment-size`'s own docstring
+;; says "1 was the original shape: one block per unfolded transaction".
+;;
+;; Ratios are the wrong unit at this depth: per window the packed arm pays a FIXED
+;; 3 (2 open + 1 catalog), which amortises over 64 links and does not over 4. So
+;; this section reports ABSOLUTE round trips, and the same 4 links are the ones
+;; kotobase-peer measured as written by 4 DIFFERENT commits (63, 47, 31, 15) --
+;; which is why W = 1 gets one link per pack here too.
+
+(defn- section-k []
+  (println)
+  (println "K. ABSOLUTE round trips at the depth fold maintains — ceil(tx/16), measured in kotobase-peer")
+  (println "   the prize is a count of round trips, not a ratio: the fixed 3 per window does not amortise over 4 links")
+  (println)
+  (println (fmt 10 "unfolded" 8 "links" 14 "| per-object" 12 "commit-pack" 12 "window-pack"
+                14 "win vs p-o" 16 "vs commit-pack"))
+  (println (str/join (repeat 96 "-")))
+  (reduce
+   (fn [pr [tx links]]
+     (.then pr
+            (fn [_]
+              (-> (history links 10)
+                  (.then
+                   (fn [h]
+                     (let [head (:head h)
+                           po-reads (atom 0)
+                           n-po (walk head (fn [cid] (swap! po-reads inc) (get @(:blocks h) cid)))
+                           po (* 2 @po-reads)
+                           arm (fn [w]
+                                 (let [groups (window-groups (:groups h) w)
+                                       ps (archives-of head (:blocks h) groups)
+                                       ctr {:reads (atom 0) :catalog-reads (atom 0)}
+                                       {:keys [source]} (packed-source ps ctr nil)
+                                       n (walk head source)]
+                                   (when-not (= n links)
+                                     (println "REFUSING: the packed walk at W =" w "visited" n "of" links)
+                                     (js/process.exit 2))
+                                   (+ @(:reads ctr) @(:catalog-reads ctr))))
+                           per-commit (arm 1)
+                           windowed (arm links)]
+                       (when-not (= n-po links)
+                         (println "REFUSING: the per-object walk visited" n-po "of" links)
+                         (js/process.exit 2))
+                       (println (fmt 10 tx 8 links 14 po 12 per-commit 12 windowed
+                                     14 (str (- po windowed) " trips")
+                                     16 (str (- per-commit windowed) " trips")))
+                       nil)))))))
+   (js/Promise.resolve nil)
+   ;; unfolded tx -> chain links, from the kotobase-peer measurement above
+   [[16 1] [17 2] [32 2] [64 4] [128 8] [1024 64]]))
+
+(defn -main []
+  (println)
+  (println "ayatori Co-Scientist 06 — pack the NOVELTY WINDOW, not the commit. Counted, not timed.")
+  (let [sec (or (some-> js/process.env.SECTION .toLowerCase) "ghk")]
+    (-> (history 64 10)
+        (.then (fn [h]
+                 (when (str/includes? sec "g") (section-g h))
+                 (when (str/includes? sec "h") (section-h h))
+                 nil))
+        (.then (fn [_] (when (str/includes? sec "k") (section-k))))
+        (.catch (fn [e] (println "FAILED:" (.-message e)) (js/process.exit 2))))))
+
+(-main)

@@ -1,0 +1,126 @@
+(ns kotobase.query.agent-engine-test
+  "`kotobase.query.agent` refuses shapes; `arrangement.datalog` is what actually
+  runs them. Those are two implementations of one grammar and nothing compared
+  them until 2026-08-18.
+
+  The comparison that existed before this namespace ran against DataScript, in
+  `com-junkawasaki/root`'s `grammar-agreement.cljs`, because that is the engine
+  the benchmark plane uses. It is NOT the engine kotobase queries through, and
+  the first thing checking here found was not a disagreement about a shape but
+  a disagreement about the *form*:
+
+      map     {:find [?t] :where [[?e \"company/ticker\" ?t]]}  => #{[\"AAA\"] [\"BBB\"]}
+      vector  [:find ?t :where [?e \"company/ticker\" ?t]]      => #{[]}
+
+  The vector form -- what the dialect is written in, what the prompt teaches,
+  what `validate` approves -- is not rejected by this engine. `(:find <vector>)`
+  is nil, so it runs an empty query and answers with one empty tuple, which no
+  caller can tell from a query that matched nothing."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [arrangement.core :as arr]
+            [arrangement.datalog :as datalog]
+            [kotobase.query.agent :as agent]
+            [kotobase.query.bridge :as bridge]))
+
+(def ^:private everything (constantly true))
+
+(def schema
+  {:datasets ["market-intel"]
+   :attributes [{:attr "source/dataset"} {:attr "company/lei"} {:attr "company/ticker"}
+                {:attr "company/name"} {:attr "company/revenue-usd"} {:attr "repo/kind"}]})
+
+(defn- fixture-db []
+  (-> (arr/empty-db)
+      (arr/assert-quad {:s "e1" :p "source/dataset" :o "market-intel"})
+      (arr/assert-quad {:s "e1" :p "company/ticker" :o "AAA"})
+      (arr/assert-quad {:s "e1" :p "company/name" :o "Alpha"})
+      (arr/assert-quad {:s "e1" :p "company/revenue-usd" :o 200000000000})
+      (arr/assert-quad {:s "e2" :p "source/dataset" :o "market-intel"})
+      (arr/assert-quad {:s "e2" :p "company/ticker" :o "BBB"})
+      (arr/assert-quad {:s "e2" :p "company/revenue-usd" :o 5})
+      (arr/assert-quad {:s "e3" :p "repo/kind" :o "actor"})))
+
+;; ---------------------------------------------------------------- the form
+
+(deftest the-vector-form-is-answered-wrongly-not-refused
+  (testing "pinned because it is the reason ->engine-query and the bridge guard exist"
+    (let [db (fixture-db)]
+      (is (= #{["AAA"] ["BBB"]}
+             (datalog/q db '{:find [?t] :where [[?e "company/ticker" ?t]]} everything)))
+      (is (= #{[]}
+             (datalog/q db '[:find ?t :where [?e "company/ticker" ?t]] everything))
+          "one empty tuple, no exception -- indistinguishable from matching nothing"))))
+
+(deftest bridge-refuses-the-vector-form
+  (let [db (fixture-db)]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (bridge/q db '[:find ?t :where [?e "company/ticker" ?t]] everything))
+        "a refusal the caller can see, instead of #{[]}")
+    (is (= #{["AAA"] ["BBB"]}
+           (bridge/q db '{:find [?t] :where [[?e "company/ticker" ?t]]} everything))
+        "the map form still works, with and without inputs")))
+
+(deftest converted-queries-run
+  (let [db (fixture-db)]
+    (doseq [[label vq expected]
+            [["単一" '[:find ?t :where [?e "company/ticker" ?t]] #{["AAA"] ["BBB"]}]
+             ["join+filter" '[:find ?t :where [?e "company/revenue-usd" ?r] [(>= ?r 100)]
+                                              [?e "company/ticker" ?t]] #{["AAA"]}]
+             ["集約" '[:find (count ?e) :where [?e "company/ticker" _]] #{[2]}]
+             [":in" '[:find ?t :in $ ?d :where [?e "source/dataset" ?d]
+                                               [?e "company/ticker" ?t]] #{["AAA"] ["BBB"]}]]]
+      (testing label
+        (let [mq (agent/->engine-query vq)]
+          (is (= expected
+                 (if (:in mq)
+                   (bridge/q db mq everything ["market-intel"])
+                   (bridge/q db mq everything)))))))))
+
+;; ---------------------------------------------------------------- agreement
+
+(def ^:private accepted-cases
+  '[[:find ?t :where [?e "company/ticker" ?t]]
+    [:find ?t :where [?e "source/dataset" "market-intel"] [?e "company/ticker" ?t]]
+    [:find ?t :where [?e "company/revenue-usd" ?r] [(>= ?r 100)] [?e "company/ticker" ?t]]
+    [:find (count ?e) :where [?e "company/ticker" _]]
+    [:find ?k (count ?e) :where [?e "repo/kind" ?k]]])
+
+(def ^:private refused-cases
+  '[[:find :where [?e "company/ticker" ?t]]
+    [:find ?t :where [?e "company/revenue-usd" ?r] [>= ?r 100] [?e "company/ticker" ?t]]
+    [:find ?n :where [?e "company/revenue-usd" ?r] [?r < 0] [?e "company/name" ?n]]
+    [:find ?t :where ["company/ticker" ?e ?t]]
+    [:find ?t :where [?e "company/ticker"]]
+    [:find ?t :where [?e "company/ticker" ?t] [(>= ?r 1)]]])
+
+(defn- engine-refuses? [db vq]
+  (let [mq (agent/->engine-query vq)]
+    (try (datalog/q db mq everything) false
+         (catch #?(:clj Throwable :cljs :default) _ true))))
+
+(deftest validator-refuses-everything-the-engine-refuses
+  (testing "the mandatory direction: a shape the engine will not run must not
+            reach it, because the caller has already paid for the inference"
+    (let [db (fixture-db)
+          missed (for [vq refused-cases
+                       :when (and (engine-refuses? db vq) (nil? (agent/validate vq schema)))]
+                   vq)]
+      (is (empty? missed) (str "engine refuses but validate accepts: " (pr-str (vec missed)))))))
+
+(deftest validator-does-not-refuse-what-the-engine-runs
+  (testing "the allowed direction is not unlimited: extra strictness is only for
+            :unknown-attributes, which the engine accepts and answers with zero
+            rows -- catching that is the point of the entry"
+    (let [false-refusals (for [vq accepted-cases
+                               :let [r (agent/validate vq schema)]
+                               :when (and r (not= :unknown-attributes (:error r)))]
+                           [vq (:error r)])]
+      (is (empty? false-refusals) (str "false refusals: " (pr-str (vec false-refusals)))))))
+
+(deftest unknown-attributes-are-the-declared-divergence
+  (let [db (fixture-db)
+        vq '[:find ?x :where [?e "no/such-attr" ?x]]]
+    (is (= :unknown-attributes (:error (agent/validate vq schema))))
+    (is (= #{} (datalog/q db (agent/->engine-query vq) everything))
+        "the engine answers zero rows rather than refusing -- so refusing it early
+         is the entry earning its keep, not a disagreement to fix")))

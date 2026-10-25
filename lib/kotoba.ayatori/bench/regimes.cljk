@@ -1,0 +1,204 @@
+#!/usr/bin/env kbb
+;; bench/regimes.cljk — Co-Scientist iteration 04. All three seeds iteration 03
+;; left, in one harness because they share it.
+;;
+;;   A  Where does `packs opened` stop saturating at 3? (iteration 03 saw 3 for
+;;      every history length it tried, and said that was a property of that tree
+;;      rather than a bound.)
+;;   B  Is the catalog cacheable across queries? If a process holds it, the `+P`
+;;      term drops and the crossover returns from 3 to 2. Arithmetic, but the
+;;      question is a deployment one and the answer is measurable.
+;;   C  The chain walk: N large, P small -- the regime the rule now says to pack,
+;;      and the one nobody has benched through this stack.
+;;
+;; Round trips, never wall clock. Every section states its own gate.
+;;
+;; Run:
+;;   kbb --backend sci --classpath "$(cat bin/classpath.txt)" bench/regimes.cljk
+
+(ns regimes
+  (:require [arrangement.core :as arr]
+            [ayatori.pack :as pack]
+            [ayatori.remote :as remote]
+            [kotoba.lang.text :as str]
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as car2]))
+
+(defn- blind [x] (pr-str x))
+(defn- crypto [bytes] bytes)
+(defn- blind-async [x] (js/Promise.resolve (pr-str x)))
+(defn- crypto-async [bytes] (js/Promise.resolve bytes))
+
+(defn- quads [from to rare-n]
+  (vec (mapcat (fn [i]
+                 [{:s (str "s" i) :p "kind" :o (if (< i rare-n) "rare" "common")}
+                  {:s (str "s" i) :p "name" :o (str "Subject " i)}])
+               (range from to))))
+
+(defn- history
+  "`n-commits` commits of `per` subjects, threaded by `prev`. Returns the head,
+   every block, and what each commit newly wrote."
+  [n-commits per rare-n]
+  (let [blocks (atom {})
+        put! (fn [cid by] (swap! blocks assoc cid by) (js/Promise.resolve cid))]
+    (letfn [(step [i prev db groups]
+              (if (= i n-commits)
+                (js/Promise.resolve {:head prev :blocks blocks :groups groups})
+                (let [before (set (keys @blocks))
+                      db' (reduce arr/assert-quad db (quads (* i per) (* (inc i) per) rare-n))]
+                  (-> (arr/commit! put! db' prev arr/current-schema-version blind-async crypto-async)
+                      (.then (fn [cid]
+                               (step (inc i) cid db' (conj groups (vec (remove before (keys @blocks)))))))))))]
+      (step 0 nil (arr/empty-db) []))))
+
+(defn- packs-of [{:keys [head blocks groups]}]
+  {:archives (mapv (fn [g] (:bytes (car2/pack {:roots [head]
+                                               :blocks (mapv (fn [c] {:cid c :bytes (get @blocks c)}) g)})))
+                   groups)
+   :catalog (into {} (mapcat (fn [i g] (map (fn [c] [c i]) g)) (range) groups))})
+
+(defn- packed-source
+  "A block source over P packs. `catalog-cache` is passed IN, so a caller can
+   share it across queries -- which is exactly what section B varies."
+  [{:keys [archives catalog]} catalog-cache counters]
+  (let [{:keys [reads bytes opens catalog-reads]} counters
+        cache (atom {})
+        range-fn-for (fn [archive]
+                       (fn [{:keys [range]}]
+                         (swap! reads inc)
+                         (let [[_ from to] (re-matches #"bytes=(\d+)-(\d*)" range)
+                               start (js/parseInt from 10) total (b/bcount archive)
+                               end (if (seq to) (min total (inc (js/parseInt to 10))) total)
+                               slice (b/slice archive start (min end total))]
+                           (swap! bytes + (b/bcount slice)) slice)))]
+    (fn [cid]
+      (when-let [i (get catalog cid)]
+        (when-not (contains? @catalog-cache i)
+          (swap! catalog-reads inc)
+          (swap! catalog-cache conj i))
+        (let [op (or (get @cache i)
+                     (let [o (pack/open-pack {:range-fn (range-fn-for (nth archives i))
+                                              :profile {:blocks :packed-blocks
+                                                        :object #{:range-read}}})]
+                       (swap! opens inc) (swap! cache assoc i o) o))]
+          (pack/read-block op cid))))))
+
+(defn- counters [] {:reads (atom 0) :bytes (atom 0) :opens (atom 0) :catalog-reads (atom 0)})
+(defn- vals-of [c] (into {} (map (fn [[k v]] [k @v]) c)))
+
+(defn- run-query [{:keys [head blocks]} q src]
+  (let [disc (atom 0) fetches (atom 0) fbytes (atom 0)
+        opened (remote/open-snapshot
+                {:snapshot-cid head
+                 :discover-fn (fn [cid] (swap! disc inc)
+                                {:ok? true :cid cid :mutates-cid? false
+                                 :providers [{:plane :discovery :cid cid :peer "p"
+                                              :addrs [] :mutates-cid? false}]})
+                 :fetch-fn (fn [_ cid] (swap! fetches inc)
+                             (let [by (get @blocks cid)]
+                               (swap! fbytes + (if by (b/bcount by) 0)) by))
+                 :block-source src
+                 :blind-fn blind :decrypt-fn crypto})]
+    {:rows (count (remote/q opened q (constantly true)))
+     :discoveries @disc :fetches @fetches :fetch-bytes @fbytes}))
+
+(def ^:private q-for
+  (fn [rare-n] {:find '[?s ?name]
+                :where [['?s "kind" "rare"] ['?s "name" '?name]]}))
+
+(defn- fmt [& xs] (str/join (map (fn [[w v]] (.padStart (str v) w)) (partition 2 xs))))
+
+;; ── A: where does `packs opened` stop saturating? ───────────────────────────
+(defn- section-a []
+  (println "A. packs opened vs query WIDTH — iteration 03 saw 3 at every history length")
+  (println (fmt 9 "commits" 7 "rare" 8 "blocks" 7 "rows" 12 "per-object" 8 "opened"
+                8 "N" 9 "N/P" 10 "3P+N" 9 "vs"))
+  (println (str/join (repeat 94 "-")))
+  (reduce (fn [pr [nc per rare]]
+            (.then pr (fn [_]
+              (-> (history nc per rare)
+                  (.then (fn [h]
+                    (let [base (run-query h (q-for rare) nil)
+                          po (+ (:discoveries base) (:fetches base))
+                          ps (packs-of h) cc (atom #{}) ct (counters)
+                          src (packed-source ps cc ct)
+                          got (run-query h (q-for rare) src)
+                          v (vals-of ct)
+                          n (- (:reads v) (* 2 (:opens v)))
+                          total (+ (:reads v) (:catalog-reads v))]
+                      (when-not (= (:rows base) (:rows got))
+                        (println "REFUSING: arms disagree" (:rows base) (:rows got))
+                        (js/process.exit 2))
+                      (println (fmt 9 nc 7 rare 8 (count @(:blocks h)) 7 (:rows got)
+                                    12 po 8 (:opens v) 8 n
+                                    9 (.toFixed (/ n (max 1 (:opens v))) 2)
+                                    10 total
+                                    9 (str (.toFixed (/ po total) 2) "x")))
+                      nil)))))))
+          (js/Promise.resolve nil)
+          ;; The 8-commit row answers the width question; the 32-commit rows
+          ;; are here to show the history axis does NOT move it. The wide
+          ;; 32-commit cases were dropped after measuring: 32 commits x 800
+          ;; rare rows rebuilds the tree 32 times and took longer than the
+          ;; whole rest of this file, for a row that repeats what 32/30 says.
+          [[8 100 3] [8 100 30] [8 100 300] [8 100 800]
+           [32 25 3] [32 25 30]]))
+
+;; ── B: is the catalog cacheable across queries? ─────────────────────────────
+(defn- section-b []
+  (println)
+  (println "B. the catalog across TWO queries — cold, then warm on the same cache")
+  (-> (history 2 100 3)
+      (.then (fn [h]
+               (let [ps (packs-of h) cc (atom #{}) ct1 (counters) ct2 (counters)]
+                 (run-query h (q-for 3) (packed-source ps cc ct1))
+                 (run-query h (q-for 3) (packed-source ps cc ct2))
+                 (let [a (vals-of ct1) bq (vals-of ct2)]
+                   (println (fmt 10 "query" 10 "reads" 10 "catalog" 10 "total"))
+                   (println (fmt 10 "1 (cold)" 10 (:reads a) 10 (:catalog-reads a)
+                                 10 (+ (:reads a) (:catalog-reads a))))
+                   (println (fmt 10 "2 (warm)" 10 (:reads bq) 10 (:catalog-reads bq)
+                                 10 (+ (:reads bq) (:catalog-reads bq))))
+                   (println "   a held catalog removes the +P term from every query after the first;")
+                   (println "   the pack OPENS are not shared here, which is a separate cache.")))))))
+
+;; ── C: the chain walk — N large, P small ────────────────────────────────────
+(defn- section-c []
+  (println)
+  (println "C. reading EVERY block of a snapshot one at a time — the hydrate shape")
+  (println (fmt 9 "blocks" 8 "packs" 12 "per-object" 8 "opened" 10 "reads"
+                9 "catalog" 8 "total" 9 "N/P" 9 "vs"))
+  (println (str/join (repeat 84 "-")))
+  (reduce (fn [pr [nc per]]
+            (.then pr (fn [_]
+              (-> (history nc per 3)
+                  (.then (fn [h]
+                    (let [cids (vec (keys @(:blocks h)))
+                          n (count cids)
+                          ps (packs-of h) cc (atom #{}) ct (counters)
+                          src (packed-source ps cc ct)
+                          got (mapv src cids)]
+                      (when (some nil? got)
+                        (println "REFUSING: the packed source did not return every block")
+                        (js/process.exit 2))
+                      (let [v (vals-of ct)
+                            total (+ (:reads v) (:catalog-reads v))]
+                        (println (fmt 9 n 8 (count (:groups h)) 12 (* 2 n)
+                                      8 (:opens v) 10 (:reads v) 9 (:catalog-reads v)
+                                      8 total
+                                      9 (.toFixed (/ n (max 1 (:opens v))) 2)
+                                      9 (str (.toFixed (/ (* 2 n) total) 2) "x"))))
+                      nil)))))))
+          (js/Promise.resolve nil)
+          [[1 200] [2 100] [4 50]]))
+
+(println)
+(println "ayatori Co-Scientist 04 — three regimes. Counted, not timed.")
+(println)
+(def ^:private only (aget (.-env js/process) "SECTION"))
+(-> (case only
+      "b" (section-b)
+      "c" (section-c)
+      (-> (section-a) (.then section-b) (.then section-c)))
+    (.then (fn [_] (println)))
+    (.catch (fn [e] (println "FAILED:" (.-message e)) (js/process.exit 2))))

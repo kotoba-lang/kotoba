@@ -1,0 +1,332 @@
+(ns ayatori.remote-test
+  (:require [arrangement.core :as arr]
+            [ayatori.remote :as remote]
+            [kotoba.test :refer [deftest is testing]]
+            #?(:cljs [cljs.test :refer [async]])
+            [ipld.core :as ipld]
+            [multiformats.core :as mf]))
+
+(defn- providers [cid peers]
+  {:ok? true
+   :cid cid
+   :mutates-cid? false
+   :providers (mapv (fn [peer]
+                      {:plane :discovery :cid cid :peer peer
+                       :addrs [] :mutates-cid? false})
+                    peers)})
+
+(deftest provider-fallback-verifies-before-caching
+  (let [{wanted-cid :cid wanted-bytes :bytes}
+        (ipld/node->block {"kind" "wanted"})
+        {wrong-bytes :bytes} (ipld/node->block {"kind" "wrong"})
+        discoveries (atom 0)
+        getter (remote/provider-block-getter
+                {:discover-fn (fn [cid]
+                                (swap! discoveries inc)
+                                (providers cid ["bad" "good"]))
+                 :fetch-fn (fn [provider _]
+                             (if (= "bad" (:peer provider))
+                               wrong-bytes
+                               wanted-bytes))})]
+    (testing "a mismatching provider is never allowed to name the block"
+      (is (= {"kind" "wanted"} (ipld/decode (getter wanted-cid)))))
+    (testing "the verified block is memoised by content identity"
+      (is (= {"kind" "wanted"} (ipld/decode (getter wanted-cid))))
+      (is (= 1 @discoveries)))))
+
+(deftest every-bad-provider-fails-closed
+  (let [{wanted-cid :cid} (ipld/node->block {"kind" "wanted"})
+        {wrong-bytes :bytes} (ipld/node->block {"kind" "wrong"})
+        getter (remote/provider-block-getter
+                {:discover-fn #(providers % ["bad-a" "bad-b"])
+                 :fetch-fn (fn [_ _] wrong-bytes)})
+        data (try (getter wanted-cid)
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+    (is (= :ayatori/all-providers-failed (:type data)))
+    (is (= wanted-cid (:cid data)))
+    (is (= 2 (count (:attempts data))))
+    (is (every? #(= :ipld/cid-mismatch (:reason %)) (:attempts data)))))
+
+(deftest discovery-cannot-substitute-another-cid
+  (let [{cid :cid bytes :bytes} (ipld/node->block {"kind" "wanted"})
+        fetches (atom 0)
+        getter (remote/provider-block-getter
+                {:discover-fn (fn [_]
+                                {:ok? true :cid "bafy-substitution"
+                                 :providers [] :mutates-cid? false})
+                 :fetch-fn (fn [_ _] (swap! fetches inc) bytes)})
+        data (try (getter cid)
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+    (is (= :ayatori/discovery-cid-mismatch (:type data)))
+    (is (zero? @fetches))))
+
+(deftest gateway-fetcher-turns-provider-addresses-into-block-requests
+  (let [{cid :cid bytes :bytes} (ipld/node->block {"kind" "gateway"})
+        requests (atom [])
+        fetch (remote/gateway-fetcher
+               (fn [request]
+                 (swap! requests conj request)
+                 {:status 200 :body bytes}))
+        provider {:peer "gateway-a"
+                  :addrs ["/not-a-multiaddr"
+                          "/dns4/ignored.example/tcp/443"
+                          "/dns4/blocks.example/tcp/443/https"]}]
+    (is (= (str "https://blocks.example/ipfs/" cid)
+           (remote/gateway-url (last (:addrs provider)) cid)))
+    (is (= {"kind" "gateway"} (ipld/decode (fetch provider cid))))
+    (is (= [{:method :get
+             :url (str "https://blocks.example/ipfs/" cid)
+             :headers {"Accept" "application/vnd.ipld.raw"}}]
+           @requests))))
+
+(deftest malformed-cid-never-reaches-discovery
+  (let [discoveries (atom 0)
+        getter (remote/provider-block-getter
+                {:discover-fn (fn [_] (swap! discoveries inc))
+                 :fetch-fn (fn [_ _] nil)})]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (getter "not-a-cid")))
+    (is (zero? @discoveries))))
+
+(deftest insecure-gateway-is-an-explicit-opt-in
+  (let [{cid :cid} (ipld/node->block {"kind" "gateway"})
+        addr "/dns4/blocks.example/tcp/80/http"]
+    (is (nil? (remote/gateway-url addr cid)))
+    (is (= (str "http://blocks.example/ipfs/" cid)
+           (remote/gateway-url addr cid {:allow-http? true})))))
+
+(deftest verifier-preserves-the-cid-codec
+  (let [bytes #?(:clj (.getBytes "foreign codec" "UTF-8")
+                 :cljs (.encode (js/TextEncoder.) "foreign codec"))
+        dag-pb-cid (mf/cidv1 0x70 (mf/multihash-sha256 bytes))
+        getter (remote/provider-block-getter
+                {:discover-fn #(providers % ["dag-pb-provider"])
+                 :fetch-fn (fn [_ _] bytes)})]
+    (is (= (vec bytes) (vec (getter dag-pb-cid)))
+        "verification hashes the bytes under the codec the CID declares")))
+
+#?(:cljs
+   (deftest async-provider-fallback-verifies-before-memoising
+     (async done
+       (let [wanted (.encode (js/TextEncoder.) "wanted")
+             wrong (.encode (js/TextEncoder.) "wrong")
+             cid (mf/cidv1 0x70 (mf/multihash-sha256 wanted))
+             discoveries (atom 0)
+             getter (remote/provider-block-getter-async
+                     {:discover-fn (fn [asked]
+                                     (swap! discoveries inc)
+                                     (js/Promise.resolve
+                                      (providers asked ["bad" "good"])))
+                      :fetch-fn (fn [provider _]
+                                  (js/Promise.resolve
+                                   (if (= "bad" (:peer provider)) wrong wanted)))})]
+         (-> (getter cid)
+             (.then (fn [bytes]
+                      (is (= (vec wanted) (vec bytes)))
+                      (getter cid)))
+             (.then (fn [_]
+                      (is (= 1 @discoveries) "resolved verified bytes are memoised")
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "async getter threw: " e))
+                       (done))))))))
+
+#?(:cljs
+   (deftest concurrent-async-reads-share-one-verified-flight
+     (async done
+       (let [wanted (.encode (js/TextEncoder.) "shared")
+             cid (mf/cidv1 0x70 (mf/multihash-sha256 wanted))
+             discoveries (atom 0)
+             fetches (atom 0)
+             stats (atom {})
+             getter (remote/provider-block-getter-async
+                     {:discover-fn (fn [asked]
+                                     (swap! discoveries inc)
+                                     (js/Promise.resolve (providers asked ["p1"])))
+                      :fetch-fn (fn [_ _]
+                                  (swap! fetches inc)
+                                  (js/Promise.
+                                   (fn [resolve _]
+                                     (js/setTimeout #(resolve wanted) 5))))
+                      :stats stats})]
+         (-> (js/Promise.all (into-array [(getter cid) (getter cid) (getter cid)]))
+             (.then (fn [results]
+                      (is (every? #(= (vec wanted) (vec %)) (js->clj results)))
+                      (is (= 1 @discoveries))
+                      (is (= 1 @fetches))
+                      (is (= 1 (:verified-blocks @stats)))
+                      (is (= 2 (:in-flight-hits @stats)))
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "shared flight threw: " e))
+                       (done))))))))
+
+#?(:cljs
+   (deftest failed-flight-is-cleared-before-retry
+     (async done
+       (let [wanted (.encode (js/TextEncoder.) "retry")
+             cid (mf/cidv1 0x70 (mf/multihash-sha256 wanted))
+             attempts (atom 0)
+             getter (remote/provider-block-getter-async
+                     {:discover-fn #(js/Promise.resolve (providers % ["p1"]))
+                      :fetch-fn (fn [_ _]
+                                  (if (= 1 (swap! attempts inc))
+                                    (js/Promise.reject (js/Error. "temporary"))
+                                    (js/Promise.resolve wanted)))})]
+         (-> (getter cid)
+             (.then (fn [_] (is false "the first flight must reject")))
+             (.catch (fn [_] (getter cid)))
+             (.then (fn [bytes]
+                      (is (= (vec wanted) (vec bytes)))
+                      (is (= 2 @attempts))
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "retry threw: " e))
+                       (done))))))))
+
+#?(:cljs
+   (deftest worker-native-open-and-prefix-scan
+     (async done
+       (let [blocks (atom {})
+             put! (fn [cid bytes]
+                    (swap! blocks assoc cid bytes)
+                    (js/Promise.resolve cid))
+             blind (fn [x] (js/Promise.resolve (pr-str x)))
+             crypto (fn [bytes] (js/Promise.resolve bytes))
+             quads [{:s "s1" :p "kind" :o "rare"}
+                    {:s "s1" :p "name" :o "Rare One"}
+                    {:s "s2" :p "kind" :o "common"}
+                    {:s "s2" :p "name" :o "Common Two"}
+                    {:s "s3" :p "noise" :o "value"}]]
+         (-> (arr/commit! put! (reduce arr/assert-quad (arr/empty-db) quads)
+                          nil arr/current-schema-version blind crypto)
+             (.then (fn [snapshot-cid]
+                      (remote/open-snapshot-async
+                       {:snapshot-cid snapshot-cid
+                        :discover-fn #(js/Promise.resolve (providers % ["p1"]))
+                        :fetch-fn (fn [_ cid]
+                                    (js/Promise.resolve (get @blocks cid)))
+                        :blind-fn blind :decrypt-fn crypto})))
+             (.then (fn [opened]
+                      (-> (remote/scan-async opened [nil "kind" nil])
+                          (.then (fn [got]
+                                   (is (= #{{:s "s1" :p "kind" :o "rare"}
+                                            {:s "s2" :p "kind" :o "common"}}
+                                          got))
+                                   (remote/q-async
+                                    opened
+                                    '{:find [?s ?name]
+                                      :where [[?s "kind" "rare"]
+                                              [?s "name" ?name]]}
+                                    (constantly true)))))))
+             (.then (fn [got]
+                      (is (= #{["s1" "Rare One"]} got)
+                          "the Worker-native surface executes a real join")
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "async open/scan threw: " e))
+                       (done))))))))
+
+#?(:clj
+   (defn- fixture [quads partitions]
+     (let [blocks (atom {})
+           put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+           blind-fn pr-str
+           encrypt-fn identity
+           decrypt-fn identity
+           db (reduce arr/assert-quad (arr/empty-db) quads)
+           snapshot-cid (arr/commit! put! db nil arr/current-schema-version
+                                     blind-fn encrypt-fn partitions)]
+       {:blocks blocks :snapshot-cid snapshot-cid
+        :blind-fn blind-fn :decrypt-fn decrypt-fn})))
+
+#?(:clj
+   (defn- open-fixture [{:keys [blocks snapshot-cid blind-fn decrypt-fn]}
+                        partitions fetched]
+     (remote/open-snapshot
+      {:snapshot-cid snapshot-cid
+       :discover-fn #(providers % ["provider-a"])
+       :fetch-fn (fn [_ cid]
+                   (swap! fetched conj cid)
+                   (get @blocks cid))
+       :blind-fn blind-fn
+       :decrypt-fn decrypt-fn
+       :partitions partitions})))
+
+#?(:clj
+   (deftest datalog-reads-the-persisted-prefix-without-hydration
+     (let [{:keys [blocks snapshot-cid] :as fixture}
+           (fixture [{:s "s1" :p "kind" :o "rare"}
+                     {:s "s2" :p "kind" :o "common"}
+                     {:s "s3" :p "noise" :o "value"}]
+                    nil)
+           fetched (atom [])
+           opened (open-fixture fixture nil fetched)
+           snapshot (ipld/decode (get @blocks snapshot-cid))
+           pso-root (some-> (get-in snapshot ["index-roots" "pso"])
+                            ipld/link-cid)
+           other-roots (keep #(some-> (get-in snapshot ["index-roots" %])
+                                      ipld/link-cid)
+                             ["spo" "pos" "ocp"])]
+       (is (= #{["s1" "rare"] ["s2" "common"]}
+              (remote/q opened
+                        '{:find [?s ?kind]
+                          :where [[?s "kind" ?kind]]}
+                        (constantly true))))
+       (is (some #{snapshot-cid} @fetched))
+       (is (some #{pso-root} @fetched))
+       (is (not-any? (set other-roots) @fetched)
+           "a predicate prefix must not hydrate unrelated covering indices")
+       (is (= (count (set @fetched)) (:verified-blocks (remote/stats opened)))))))
+
+#?(:clj
+   (deftest declared-range-reads-the-persistent-range-index
+     (let [partition {:attr "score" :boundaries [25 50 75] :budget-bits 2}
+           quads (for [i (range 100)] {:s (str "s" i) :p "score" :o i})
+           {:keys [blocks snapshot-cid] :as fixture} (fixture quads [partition])
+           fetched (atom [])
+           opened (open-fixture fixture [partition] fetched)
+           snapshot (ipld/decode (get @blocks snapshot-cid))
+           range-root (some-> (get-in snapshot ["index-roots" "range"])
+                              ipld/link-cid)
+           pos-root (some-> (get-in snapshot ["index-roots" "pos"])
+                            ipld/link-cid)
+           report (remote/scan-range-report opened "score" 10 20)]
+       (is (true? (:pruned? report)))
+       (is (= 2 (:budget-bits report)))
+       (is (= 10 (count (:quads report))))
+       (is (some #{range-root} @fetched))
+       (is (not (some #{pos-root} @fetched))
+           "a declared range must not fall back to the ordinary pos tree"))))
+
+#?(:cljs
+   (deftest the-sync-api-refuses-promise-returning-crypto-instead-of-answering-empty
+     ;; Measured 2026-09-04 under nbb: the same snapshot answered #{["s1"]}
+     ;; with a synchronous blind-fn and #{} with a Promise-returning one, with
+     ;; no error in between -- a query that COULD NOT RUN returning what a
+     ;; query that ran and matched nothing returns. And `arrangement.core/
+     ;; commit!` REQUIRES Promise-returning blind/encrypt on cljs, so
+     ;; following its contract and then opening synchronously is the natural
+     ;; way to arrive here.
+     (let [opts {:snapshot-cid "bafyreiabcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopq"
+                 :discover-fn (fn [cid] (providers cid ["p"]))
+                 :fetch-fn (fn [_ _] nil)}
+           thrown (fn [o] (try (remote/open-snapshot o) nil
+                               (catch :default e (:type (ex-data e)))))]
+       (testing "a Promise-returning blind-fn is refused, naming the async API"
+         (is (= :ayatori/async-crypto-in-sync-api
+                (thrown (assoc opts :blind-fn #(js/Promise.resolve (pr-str %))
+                               :decrypt-fn identity)))))
+       (testing "so is a Promise-returning decrypt-fn"
+         (is (= :ayatori/async-crypto-in-sync-api
+                (thrown (assoc opts :blind-fn pr-str
+                               :decrypt-fn #(js/Promise.resolve %))))))
+       (testing "a blind-fn that throws on the probe tells us nothing, so it is
+                 allowed through rather than refused on a guess"
+         (is (not= :ayatori/async-crypto-in-sync-api
+                   (thrown (assoc opts
+                                  :blind-fn (fn [x] (if (keyword? x)
+                                                      (throw (js/Error. "no keywords"))
+                                                      (pr-str x)))
+                                  :decrypt-fn identity))))))))

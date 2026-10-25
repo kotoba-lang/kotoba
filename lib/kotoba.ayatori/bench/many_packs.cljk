@@ -1,0 +1,174 @@
+#!/usr/bin/env kbb
+;; bench/many_packs.cljk — Co-Scientist iteration 02, the regime iteration 01
+;; named as unmeasured: "the interesting regime is where a query touches many
+;; packs".
+;;
+;; `bench/fitness.cljk` puts EVERY block of a snapshot into one pack. That is
+;; the best case for packing and it is not the deployed case: ADR-2608160100's
+;; write-side policy is ONE COMMIT, ONE PACK, so a query over a database with a
+;; history touches as many packs as it touches commits.
+;;
+;; ## The judge is the same judge
+;;
+;; Round trips, never wall clock (this workstation runs many agents). Both arms
+;; answer the SAME query over the SAME snapshot and the harness exits 2 if they
+;; disagree, so a cheaper arm cannot win by returning less.
+;;
+;; What is added is a `packs` axis and an honest cost model:
+;;
+;;   per-object   2 per block   (discover + fetch)
+;;   packed       2 per PACK OPENED (header, then index) + 1 per block
+;;
+;; so packing wins while `2P + N < 2N`, i.e. while `N/P > 2` -- more than two
+;; blocks read per pack opened. That is a prediction, and this file measures
+;; whether it holds.
+;;
+;; Run:
+;;   kbb --backend sci --classpath "$(cat bin/classpath.txt)" bench/many_packs.cljk
+
+(ns many-packs
+  (:require [arrangement.core :as arr]
+            [ayatori.pack :as pack]
+            [ayatori.remote :as remote]
+            [ipld.car.v2 :as car2]
+            [ipld.car.bytes :as b]
+            [kotoba.lang.text :as str]))
+
+(defn- blind [x] (pr-str x))
+(defn- crypto [bytes] bytes)
+(defn- blind-async [x] (js/Promise.resolve (pr-str x)))
+(defn- crypto-async [bytes] (js/Promise.resolve bytes))
+
+(defn- corpus [n rare-n]
+  (vec (mapcat (fn [i]
+                 [{:s (str "s" i) :p "kind" :o (if (< i rare-n) "rare" "common")}
+                  {:s (str "s" i) :p "name" :o (str "Subject " i)}])
+               (range n))))
+
+(defn- build [quads]
+  (let [blocks (atom {})
+        put! (fn [cid bytes] (swap! blocks assoc cid bytes) (js/Promise.resolve cid))]
+    (-> (arr/commit! put! (reduce arr/assert-quad (arr/empty-db) quads)
+                     nil arr/current-schema-version blind-async crypto-async)
+        (.then (fn [cid] {:blocks blocks :snapshot-cid cid})))))
+
+(def ^:private query
+  '{:find [?s ?name] :where [[?s "kind" "rare"] [?s "name" ?name]]})
+
+(defn- per-object-arm [{:keys [blocks snapshot-cid]}]
+  (let [discoveries (atom 0) reads (atom 0) bytes (atom 0)
+        opened (remote/open-snapshot
+                {:snapshot-cid snapshot-cid
+                 :discover-fn (fn [cid]
+                                (swap! discoveries inc)
+                                {:ok? true :cid cid :mutates-cid? false
+                                 :providers [{:plane :discovery :cid cid :peer "p"
+                                              :addrs [] :mutates-cid? false}]})
+                 :fetch-fn (fn [_ cid]
+                             (swap! reads inc)
+                             (let [by (get @blocks cid)]
+                               (swap! bytes + (if by (b/bcount by) 0))
+                               by))
+                 :blind-fn blind :decrypt-fn crypto})
+        rows (remote/q opened query (constantly true))]
+    {:arm "per-object" :rows (count rows)
+     :round-trips (+ @discoveries @reads) :bytes @bytes :packs 0}))
+
+(defn- shard
+  "Blocks split into `p` packs, deterministically and by INSERTION ORDER.
+
+  Insertion order is the closest this synthetic corpus gets to write locality:
+  `commit!` writes a snapshot's blocks together, so blocks written near each
+  other are the ones a one-commit-one-pack policy would co-locate. Splitting at
+  random would model a policy nobody proposed and would flatter the per-object
+  arm."
+  [blocks p]
+  (let [v (vec blocks)
+        per (js/Math.ceil (/ (count v) p))]
+    (vec (partition-all (max 1 per) v))))
+
+(defn- packed-arm
+  "`p` packs, opened lazily, through one block-source over a catalog.
+
+  The catalog is an in-memory map here. In a deployment it is a lookup on the
+  datom plane (ADR-2608160100), so a real one costs at least one more request
+  the first time -- this arm is therefore an OPTIMISTIC bound on packing, and
+  saying so is cheaper than discovering it later."
+  [{:keys [blocks snapshot-cid]} p]
+  (let [groups (shard @blocks p)
+        archives (mapv (fn [g]
+                         (:bytes (car2/pack {:roots [snapshot-cid]
+                                             :blocks (mapv (fn [[cid by]] {:cid cid :bytes by}) g)})))
+                       groups)
+        catalog (into {} (mapcat (fn [i g] (map (fn [[cid _]] [cid i]) g))
+                                 (range) groups))
+        range-reads (atom 0) bytes (atom 0) opens (atom 0)
+        open-cache (atom {})
+        range-fn-for (fn [archive]
+                       (fn [{:keys [range]}]
+                         (swap! range-reads inc)
+                         (let [[_ from to] (re-matches #"bytes=(\d+)-(\d*)" range)
+                               start (js/parseInt from 10)
+                               total (b/bcount archive)
+                               end (if (seq to) (min total (inc (js/parseInt to 10))) total)
+                               slice (b/slice archive start (min end total))]
+                           (swap! bytes + (b/bcount slice))
+                           slice)))
+        pack-for (fn [i]
+                   (or (get @open-cache i)
+                       (let [op (pack/open-pack
+                                 {:range-fn (range-fn-for (nth archives i))
+                                  :profile {:blocks :packed-blocks :object #{:range-read}}})]
+                         (swap! opens inc)
+                         (swap! open-cache assoc i op)
+                         op)))
+        discoveries (atom 0)
+        opened (remote/open-snapshot
+                {:snapshot-cid snapshot-cid
+                 :discover-fn (fn [cid]
+                                (swap! discoveries inc)
+                                {:ok? true :cid cid :mutates-cid? false
+                                 :providers [{:plane :discovery :cid cid :peer "p"
+                                              :addrs [] :mutates-cid? false}]})
+                 :fetch-fn (fn [_ _] nil)
+                 :block-source (fn [cid]
+                                 (when-let [i (get catalog cid)]
+                                   (pack/read-block (pack-for i) cid)))
+                 :blind-fn blind :decrypt-fn crypto})
+        rows (remote/q opened query (constantly true))]
+    {:arm (str "packed/" p) :rows (count rows)
+     :round-trips @range-reads :bytes @bytes
+     :packs p :packs-opened @opens :discoveries @discoveries}))
+
+(defn- fmt [& xs]
+  (str/join (map (fn [[w v]] (.padStart (str v) w)) (partition 2 xs))))
+
+(defn -main []
+  (println)
+  (println "ayatori Co-Scientist 02 — many packs. Counted, not timed.")
+  (println "query:" (pr-str query) "  answer fixed at 3 rows")
+  (println)
+  (println (fmt 7 "subj" 8 "blocks" 8 "packs" 6 "rows" 8 "opened"
+                12 "round-trips" 12 "bytes" 14 "vs per-object"))
+  (println (str/join (repeat 92 "-")))
+  (-> (build (corpus 800 3))
+      (.then
+       (fn [snap]
+         (let [base (per-object-arm snap)
+               nblocks (count @(:blocks snap))]
+           (println (fmt 7 800 8 nblocks 8 "-" 6 (:rows base) 8 "-"
+                         12 (:round-trips base) 12 (:bytes base) 14 "1.00x"))
+           (doseq [p [1 2 4 8 16 23]]
+             (let [a (packed-arm snap p)]
+               (when-not (= (:rows a) (:rows base) 3)
+                 (println "REFUSING: arms disagree —" (:rows base) "vs" (:rows a))
+                 (js/process.exit 2))
+               (println (fmt 7 "" 8 "" 8 p 6 (:rows a) 8 (:packs-opened a)
+                             12 (:round-trips a) 12 (:bytes a)
+                             14 (str (.toFixed (/ (:round-trips base) (:round-trips a)) 2) "x")))))
+           (println)
+           (println "per-object = 2 per block (discover + fetch). packed = 2 per pack OPENED + 1 per block.")
+           (println "prediction: packing wins while blocks-read / packs-opened > 2."))))
+      (.catch (fn [e] (println "FAILED:" (.-message e)) (js/process.exit 2)))))
+
+(-main)

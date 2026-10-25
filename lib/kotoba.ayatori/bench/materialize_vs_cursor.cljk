@@ -1,0 +1,116 @@
+#!/usr/bin/env kbb
+;; bench/materialize_vs_cursor.cljk — Co-Scientist iteration 08.
+;;
+;; Iterations 03-07 all measured ROUND TRIPS, and 07 closed by saying ratios are
+;; the wrong unit and absolute trips are the right one. For the pack question it
+;; was. For the question that arrived from production on 2026-09-10 it is not:
+;; that Worker was measured burning 25-32s of CPU with I/O at essentially zero
+;; (one 24s read reported gets:0 -- every block already cached) and fewer than
+;; 100 with-blocks handler runs. Round trips cannot explain a cost that happens
+;; when there are none.
+;;
+;; So this harness counts what that regime spends: ROWS DECRYPTED. One snapshot,
+;; one selective query, two sources.
+;;
+;;   A  arrangement.core/restore    -- rebuild the whole db, then query it.
+;;                                     Its own docstring: "re-asserting every
+;;                                     recovered triple". This is the shape the
+;;                                     live path has (cold-datoms re-decrypts
+;;                                     every row on every request).
+;;   B  arrangement.source/cursor-async via ayatori.remote/q-async
+;;                                  -- "the snapshot is never hydrated into an
+;;                                     in-memory db"; follows only the index
+;;                                     ranges the clauses name.
+;;
+;; Both arms answer the SAME query over the SAME snapshot bytes, so a difference
+;; is the access path and nothing else. The gate: B must return exactly A's rows.
+;; A faster arm that returns different rows is not a faster arm.
+;;
+;; Run:
+;;   kbb --backend sci --classpath "src:$(kbb -Spath)" bench/materialize_vs_cursor.cljk
+
+(ns materialize-vs-cursor
+  (:require [arrangement.core :as arr]
+            [ayatori.remote :as remote]
+            [arrangement.source :as asrc]))
+
+(defn- counters [] {:gets (atom 0) :decrypts (atom 0)})
+(defn- snap [c] (into {} (map (fn [[k v]] [k @v]) c)))
+
+(defn- blind [x] (js/Promise.resolve (pr-str x)))
+(defn- enc [bytes] (js/Promise.resolve bytes))
+(defn- dec-with [c] (fn [bytes] (swap! (:decrypts c) inc) (js/Promise.resolve bytes)))
+(defn- get-sync
+  "`arr/restore`'s contract is a SYNCHRONOUS `(fn [cid] bytes)` even on cljs --
+   only its decrypt-fn is Promise-returning. Handing it a Promise makes the
+   CBOR decode fail on a Promise object, which reads as corrupt bytes."
+  [c blocks] (fn [cid] (swap! (:gets c) inc) (get @blocks cid)))
+(defn- get-async [c blocks] (fn [cid] (swap! (:gets c) inc) (js/Promise.resolve (get @blocks cid))))
+
+(defn- quads
+  "n subjects. Exactly `rare-n` of them carry kind=rare, so the selective query
+   has a result size that does NOT grow with the graph -- which is the whole
+   point: the live path's cost grows with the graph anyway."
+  [n rare-n]
+  (vec (mapcat (fn [i]
+                 [{:s (str "s" i) :p "kind" :o (if (< i rare-n) "rare" "common")}
+                  {:s (str "s" i) :p "name" :o (str "Subject " i)}])
+               (range n))))
+
+(defn- build! [n rare-n]
+  (let [blocks (atom {})
+        put! (fn [cid by] (swap! blocks assoc cid by) (js/Promise.resolve cid))
+        db (reduce arr/assert-quad (arr/empty-db) (quads n rare-n))]
+    (-> (arr/commit! put! db nil arr/current-schema-version blind enc)
+        (.then (fn [cid] {:cid cid :blocks blocks :quad-count (* 2 n)})))))
+
+(def query {:find '[?s ?name]
+            :where [['?s "kind" "rare"] ['?s "name" '?name]]})
+
+(defn- arm-materialize [{:keys [cid blocks]}]
+  (let [c (counters)]
+    (-> (arr/restore (get-sync c blocks) cid (dec-with c))
+        (.then (fn [db]
+                 (-> (remote/q-async {:source (asrc/materialized db)}
+                                     query (constantly true))
+                     (.then (fn [rows] {:rows rows :counts (snap c)}))))))))
+
+(defn- arm-cursor [{:keys [cid blocks]}]
+  (let [c (counters)]
+    (-> (remote/open-snapshot-async
+         {:snapshot-cid cid
+          :discover-fn (fn [k] (js/Promise.resolve
+                                {:ok? true :cid k :mutates-cid? false
+                                 :providers [{:plane :discovery :cid k :peer "p"
+                                              :addrs [] :mutates-cid? false}]}))
+          :fetch-fn (fn [_ k] ((get-async c blocks) k))
+          :blind-fn blind
+          :decrypt-fn (dec-with c)})
+        (.then (fn [opened]
+                 (-> (remote/q-async opened query (constantly true))
+                     (.then (fn [rows] {:rows rows :counts (snap c)}))))))))
+
+(defn- row [n a b]
+  (println (str "  n=" (.padStart (str n) 6)
+                "  quads=" (.padStart (str (* 2 n)) 7)
+                " | materialize gets=" (.padStart (str (:gets (:counts a))) 5)
+                " decrypts=" (.padStart (str (:decrypts (:counts a))) 7)
+                " | cursor gets=" (.padStart (str (:gets (:counts b))) 5)
+                " decrypts=" (.padStart (str (:decrypts (:counts b))) 7)
+                " | rows=" (count (:rows a))
+                " agree=" (= (set (:rows a)) (set (:rows b))))))
+
+(defn- one [n]
+  (-> (build! n 5)
+      (.then (fn [built]
+               (-> (arm-materialize built)
+                   (.then (fn [a] (-> (arm-cursor built)
+                                      (.then (fn [b] (row n a b) [a b]))))))))))
+
+(println "Co-Scientist iteration 08 — rows decrypted, not round trips")
+(println "  same snapshot, same query, two access paths; result size fixed at 5 subjects")
+(-> (one 250)
+    (.then (fn [_] (one 500)))
+    (.then (fn [_] (one 1000)))
+    (.then (fn [_] (one 2000)))
+    (.catch (fn [e] (println "ERR" (str e)) (println (.-stack e)))))
