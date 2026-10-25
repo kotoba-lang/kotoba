@@ -26,5 +26,9 @@ decisions from a compiler artifact.
 - `kotoba-native` remains responsible for aiueos and target ABI semantics.
 - Mach-O and PE are sibling contracts that do not import compiler policy into
   this repository.
-- Mach-O relocation records remain excluded until their target-specific request
-  semantics have a typed boundary.
+- Update 2026-10-22: Mach-O external relocation records have a typed descriptor
+  boundary (`offset`, `type`, `symbol`) for the retained ARM64/x86-64 types.
+  Caller-owned relocation selection remains distinct from record encoding.
+  Canonical Kotoba source is a candidate; native admission and emitted-object
+  qualification remain open. The former condition excluding these records is
+  superseded by that boundary.
