@@ -1,0 +1,202 @@
+(ns safetensors.core
+  "Pure `.cljc` reader/writer for HuggingFace's safetensors tensor-weight format
+   (github.com/huggingface/safetensors) — ADR-2607051400 (`kotoba-lang` ML execution stack)
+   Phase 3, 'Weight loading (safetensors reader)'. safetensors is what this org's actual target
+   checkpoints (TRELLIS / Hunyuan3D-2 / UniRig, all published on HuggingFace) ship as by default
+   — it was designed specifically to avoid pickle's arbitrary-code-execution risk, so this reader
+   intentionally does NOT (and never will) support the PyTorch/pickle format.
+
+   Format (from the real spec, github.com/huggingface/safetensors README, not guessed):
+     - bytes [0,8): `N`, an unsigned little-endian 64-bit integer — the header's byte length.
+     - bytes [8,8+N): a UTF-8 JSON object: tensor-name -> {\"dtype\" \"shape\" \"data_offsets\"},
+       plus an optional `__metadata__` key (an arbitrary string->string map, not a tensor).
+       `data_offsets` are [begin end) *relative to the start of the data section* (i.e. add
+       `8+N` to get an absolute file offset) and never overlap or leave a gap (the whole
+       data section must be exactly covered).
+     - bytes [8+N, EOF): the concatenated raw tensor byte buffers, little-endian, row-major.
+
+   Returns/accepts: `{:metadata {...} :tensors {name {:dtype kw :shape [...] :data <array>}}}`.
+   `:data` is a plain host array (see `safetensors.dtype`'s docstring / this repo's README for
+   the exact array type per dtype) — NOT a `kotoba-lang/num` tensor. `num` has no shape-aware
+   N-D tensor type yet as of this pass (ADR-2607051400 Phase 1 is designed but not landed in
+   `kotoba-lang/num`); wiring `read-bytes`'s `:data` into a real `num` tensor is a fast-follow
+   once Phase 1 lands, not faked here."
+  (:require [safetensors.bytes :as b]
+            [safetensors.json :as json]
+            [safetensors.dtype :as dt]))
+
+;; the spec's own DOS-prevention cap on header size
+(def max-header-bytes 100000000)
+
+(defn- product [shape] (reduce * 1 shape))
+
+;; ---- decode: raw byte range -> a host numeric array, per dtype -------------------------------
+
+(defn- decode-tensor-data [dtype-kw bs start end shape]
+  (let [ew (dt/byte-width dtype-kw)
+        n  (product shape)
+        expected (* n ew)]
+    (when (not= (- end start) expected)
+      (throw (ex-info "tensor byte range does not match shape * dtype width"
+                       {:dtype dtype-kw :shape shape :expected-bytes expected :actual-bytes (- end start)})))
+    ;; NOTE: every output array below is bound with a `^longs`/`^doubles`/`^booleans` type hint
+    ;; (matching the convention `kotoba-lang/num`'s `num.cpu` already uses for primitive arrays),
+    ;; AND every long-array store goes through `b/as-long`. Both are needed: `safetensors.bytes/
+    ;; i64-le`/`u64-le` may internally produce a `clojure.lang.BigInt` even for a value that fits
+    ;; in a `long` (since `+'`/`*'` don't always narrow back down after a promotion), and JVM
+    ;; `aset` on a primitive `long[]` falls back to reflection for a boxed `BigInt` argument —
+    ;; reflection then fails outright because it can't coerce `BigInt` into a `long[]` slot even
+    ;; when the value fits. `b/as-long` forces the coercion explicitly before the store.
+    (case dtype-kw
+      :bool (let [^booleans out #_:clj-kondo/ignore (boolean-array n)]
+              (dotimes [i n] (aset out i (not= 0 (b/ubyte bs (+ start i)))))
+              out)
+      :i8   (let [^longs out (long-array n)]
+              (dotimes [i n]
+                (let [u (b/ubyte bs (+ start i))]
+                  (aset out i (b/as-long (if (>= u 128) (- u 256) u)))))
+              out)
+      :u8   (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/ubyte bs (+ start i)))))
+              out)
+      :i16  (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/i16-le bs (+ start (* i 2))))))
+              out)
+      :u16  (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/u16-le bs (+ start (* i 2))))))
+              out)
+      :f16  (let [^doubles out (double-array n)]
+              (dotimes [i n] (aset out i (dt/f16-bits->double (b/u16-le bs (+ start (* i 2))))))
+              out)
+      :bf16 (let [^doubles out (double-array n)]
+              (dotimes [i n] (aset out i (dt/bf16-bits->double (b/u16-le bs (+ start (* i 2))))))
+              out)
+      :i32  (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/i32-le bs (+ start (* i 4))))))
+              out)
+      :u32  (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/u32-le bs (+ start (* i 4))))))
+              out)
+      :f32  (let [^doubles out (double-array n)]
+              (dotimes [i n] (aset out i (dt/f32-bits->double (b/u32-le bs (+ start (* i 4))))))
+              out)
+      :f64  (let [^doubles out (double-array n)]
+              (dotimes [i n] (aset out i (dt/f64-bits->double (b/u64-le bs (+ start (* i 8))))))
+              out)
+      :i64  (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/i64-le bs (+ start (* i 8))))))
+              out)
+      :u64  (let [^longs out (long-array n)]
+              (dotimes [i n] (aset out i (b/as-long (b/u64-le bs (+ start (* i 8))))))
+              out)
+      :c64  (let [^doubles out (double-array (* 2 n))]
+              (dotimes [i n]
+                (let [off (+ start (* i 8))]
+                  (aset out (* 2 i) (dt/f32-bits->double (b/u32-le bs off)))
+                  (aset out (inc (* 2 i)) (dt/f32-bits->double (b/u32-le bs (+ off 4))))))
+              out)
+      (throw (ex-info (str "unsupported dtype " dtype-kw) {:dtype dtype-kw})))))
+
+(defn read-bytes
+  "Parse safetensors-formatted bytes (a JVM byte[] or a JS Uint8Array) into
+   `{:metadata {...} :tensors {name {:dtype kw :shape [...] :data <array>}}}`.
+   Throws `ex-info` on a malformed header, an unsupported/unknown dtype, or `data_offsets` that
+   don't fit the shape/dtype or the file's actual length."
+  [bs]
+  (let [total (b/byte-length bs)]
+    (when (< total 8)
+      (throw (ex-info "safetensors input too small: missing the 8-byte header-length prefix"
+                       {:byte-length total})))
+    (let [n (b/u64-le bs 0)]
+      (when (> n max-header-bytes)
+        (throw (ex-info "safetensors header too large (> 100MB spec cap)" {:header-bytes n})))
+      (when (< total (+ 8 n))
+        (throw (ex-info "safetensors input truncated: header extends past end of input"
+                         {:header-bytes n :byte-length total})))
+      (let [header-str (b/utf8->str (b/slice bs 8 (+ 8 n)))
+            header (json/parse-json header-str)
+            data-start (+ 8 n)
+            metadata (get header "__metadata__")
+            tensor-entries (dissoc header "__metadata__")
+            tensors (into {}
+                          (map (fn [[nm info]]
+                                 (let [dtype-kw (dt/label->dtype (get info "dtype"))
+                                       shape (vec (get info "shape"))
+                                       [off0 off1] (get info "data_offsets")
+                                       start (+ data-start off0)
+                                       end (+ data-start off1)]
+                                   (when (or (neg? off0) (< off1 off0) (> end total))
+                                     (throw (ex-info "invalid data_offsets for tensor"
+                                                      {:tensor nm :data_offsets [off0 off1] :byte-length total})))
+                                   [nm {:dtype dtype-kw
+                                        :shape shape
+                                        :data (decode-tensor-data dtype-kw bs start end shape)}])))
+                          tensor-entries)]
+        {:metadata metadata :tensors tensors}))))
+
+(defn read-file
+  "Read a safetensors file from disk. JVM: `java.nio.file.Files/readAllBytes`. ClojureScript:
+   best-effort Node/Deno `fs.readFileSync` (host-dependent; not exercised by this repo's own
+   test suite, which uses `read-bytes` directly against in-memory/file-loaded byte arrays)."
+  [path]
+  #?(:clj (read-bytes (java.nio.file.Files/readAllBytes (.toPath (java.io.File. (str path)))))
+     :cljs (read-bytes ((.-readFileSync (js/require "fs")) path))))
+
+;; ---- encode: a host numeric array -> raw bytes, per dtype (writer; used to build test fixtures) --
+
+(defn- encode-tensor-data [dtype-kw data]
+  (let [xs (vec data)
+        ew (dt/byte-width dtype-kw)
+        n (case dtype-kw :c64 (quot (count xs) 2) (count xs))
+        out (b/byte-array-of (* n ew))]
+    (case dtype-kw
+      :bool (dotimes [i n] (b/set-byte! out i (if (nth xs i) 1 0)))
+      :i8   (dotimes [i n] (b/set-byte! out i (mod (nth xs i) 256)))
+      :u8   (dotimes [i n] (b/set-byte! out i (nth xs i)))
+      :i16  (dotimes [i n] (b/write-u16-le! out (* i 2) (nth xs i)))
+      :u16  (dotimes [i n] (b/write-u16-le! out (* i 2) (nth xs i)))
+      :f16  (dotimes [i n] (b/write-u16-le! out (* i 2) (dt/double->f16-bits (nth xs i))))
+      :bf16 (dotimes [i n] (b/write-u16-le! out (* i 2) (dt/double->bf16-bits (nth xs i))))
+      :i32  (dotimes [i n] (b/write-u32-le! out (* i 4) (nth xs i)))
+      :u32  (dotimes [i n] (b/write-u32-le! out (* i 4) (nth xs i)))
+      :f32  (dotimes [i n] (b/write-u32-le! out (* i 4) (dt/double->f32-bits (nth xs i))))
+      :f64  (dotimes [i n] (b/write-u64-le! out (* i 8) (dt/double->f64-bits (nth xs i))))
+      :i64  (dotimes [i n] (b/write-u64-le! out (* i 8) (nth xs i)))
+      :u64  (dotimes [i n] (b/write-u64-le! out (* i 8) (nth xs i)))
+      :c64  (dotimes [i n]
+              (b/write-u32-le! out (* i 8) (dt/double->f32-bits (nth xs (* 2 i))))
+              (b/write-u32-le! out (+ (* i 8) 4) (dt/double->f32-bits (nth xs (inc (* 2 i))))))
+      (throw (ex-info (str "unsupported dtype " dtype-kw) {:dtype dtype-kw})))
+    out))
+
+(defn write-bytes
+  "`{:metadata {...} :tensors {name {:dtype kw :shape [...] :data <seq-or-array>}}}` -> a fresh
+   safetensors byte buffer. Tensors are written in name-sorted order for deterministic,
+   byte-reproducible output (the spec does not require any particular order)."
+  [{:keys [metadata tensors]}]
+  (let [names (sort (keys tensors))
+        step (fn [acc nm]
+               (let [{:keys [dtype shape data]} (get tensors nm)
+                     raw (encode-tensor-data dtype data)
+                     start (:offset acc)
+                     end (+ start (b/byte-length raw))]
+                 (-> acc
+                     (update :chunks conj raw)
+                     (update :header assoc nm {"dtype" (dt/dtype->label dtype)
+                                                "shape" (vec shape)
+                                                "data_offsets" [start end]})
+                     (assoc :offset end))))
+        encoded (reduce step {:chunks [] :header (sorted-map) :offset 0} names)
+        header (cond-> (:header encoded) metadata (assoc "__metadata__" metadata))
+        header-bytes (b/str->utf8 (json/write-json header))
+        len-bytes (b/byte-array-of 8)]
+    (b/write-u64-le! len-bytes 0 (b/byte-length header-bytes))
+    (b/concat-bytes (into [len-bytes header-bytes] (:chunks encoded)))))
+
+(defn write-file
+  "Write `data` (see `write-bytes`) to a safetensors file on disk."
+  [path data]
+  (let [bs (write-bytes data)]
+    #?(:clj (with-open [os (java.io.FileOutputStream. (str path))]
+              (.write os ^bytes bs))
+       :cljs ((.-writeFileSync (js/require "fs")) path bs))))

@@ -1,0 +1,164 @@
+(ns usd.oracle-test
+  "Real Pixar USD oracle validation for `usd.core` (ADR-2607101525 D3/D4).
+
+  JVM-only (`.clj`, like `core_test.clj`) — shells out to `tools/usd_oracle.py`,
+  a thin driver around the real `pxr` Python bindings (`pip install usd-core`),
+  to check this library's emitter/parser against the actual Pixar reference
+  implementation rather than only this repo's own self-referential string
+  comparisons. Requires `python3` with `pxr` importable — set
+  `USD_ORACLE_PYTHON` to point at a specific interpreter (CI does; see
+  .github/workflows/ci.yml) or install `usd-core` into whatever `python3`
+  resolves to for local runs. Skips (not fails) with a clear message when no
+  such interpreter is found, so this suite never silently reports 0 assertions
+  as a pass in an environment that can't run it — see each test's skip message."
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.lang.text :as str]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.usd :as u]))
+
+(defn- oracle-python []
+  (or (System/getenv "USD_ORACLE_PYTHON") "python3"))
+
+(def oracle-available?
+  (delay
+    (try
+      (= 0 (:exit (shell/sh (oracle-python) "-c" "import pxr")))
+      (catch Exception _ false))))
+
+(defn- driver-path []
+  (str (io/file "tools" "usd_oracle.py")))
+
+(defn- run-oracle [cmd path]
+  (let [{:keys [exit out err]} (shell/sh (oracle-python) (driver-path) cmd path)]
+    (when-not (zero? exit)
+      (throw (ex-info (str "usd_oracle.py " cmd " failed: " err) {:exit exit :err err})))
+    out))
+
+(defn- with-temp-usda [content f]
+  (let [tmp (java.io.File/createTempFile "usd-oracle-" ".usda")]
+    (try
+      (spit tmp content)
+      (f (.getAbsolutePath tmp))
+      (finally (.delete tmp)))))
+
+;; Pixar's own Usd.Stage does not preserve textual attribute/rel/nested-prim
+;; declaration *order* on export — only the set of statements and their
+;; values (empirically confirmed: re-exporting our own emitter output through
+;; the real oracle reorders sibling attrs/rels, at every nesting level
+;; independently). This repo's own emitter is order-preserving, and
+;; core_test.clj's round-trip tests correctly assert exact order for that
+;; reason — but comparing *against the oracle* needs an order-insensitive
+;; structural equality instead, or every oracle test would be a false
+;; negative on Pixar's own well-formed output.
+
+(defn- split-prim-form
+  "Mirrors usd.core/prim's own [spec type? name meta? & body] destructuring."
+  [[spec & r]]
+  (let [typ  (when (string? (first r)) (first r))
+        r    (if typ (rest r) r)
+        nm   (first r)
+        r    (rest r)
+        meta (when (map? (first r)) (first r))
+        body (if meta (rest r) r)]
+    {:spec spec :typ typ :nm nm :meta meta :body body}))
+
+(declare normalize-body)
+
+(defn- normalize-item [item]
+  (case (first item)
+    (:attr :rel) item
+    :variant-set (let [[_ vname variants] item]
+                   [:variant-set vname (into {} (for [[vn vbody] variants]
+                                                   [vn (normalize-body vbody)]))])
+    ;; else: a nested prim form
+    (let [{:keys [spec typ nm meta body]} (split-prim-form item)]
+      (into (if typ [spec typ nm] [spec nm])
+            (concat (when meta [meta]) (normalize-body body))))))
+
+(defn- normalize-body [body]
+  (vec (sort-by pr-str (map normalize-item body))))
+
+(defn- prim-structurally=
+  "Equal up to sibling declaration order at every nesting level (spec/type/
+  name/metadata still compared exactly)."
+  [a b]
+  (let [{sa :spec ta :typ na :nm ma :meta ba :body} (split-prim-form a)
+        {sb :spec tb :typ nb :nm mb :meta bb :body} (split-prim-form b)]
+    (and (= sa sb) (= ta tb) (= na nb) (= ma mb)
+         (= (normalize-body ba) (normalize-body bb)))))
+
+(defmacro ^:private deftest-oracle
+  "A deftest that skips (with a printed reason) rather than silently no-ops
+  when no oracle python is available, so an environment lacking usd-core
+  can't be mistaken for a passing oracle check."
+  [name & body]
+  `(deftest ~name
+     (if @oracle-available?
+       (do ~@body)
+       (do (println "SKIP" '~name "— no python3 with `pxr` (usd-core) importable;"
+                     "set USD_ORACLE_PYTHON or `pip install usd-core`.")
+           (is true "oracle unavailable, skipped")))))
+
+(deftest-oracle emitter-output-has-no-compliance-errors
+  (let [src (u/usda {:defaultPrim "hello" :upAxis "Y" :metersPerUnit 1.0}
+              [:def "Xform" :hello {:kind "component"}
+               [:def "Sphere" :world
+                [:attr "double" :radius 2]
+                [:attr "color3f[]" "primvars:displayColor" [[1 0 0]]]]])]
+    (with-temp-usda src
+      (fn [path]
+        (let [lines  (str/split-lines (run-oracle "compliance" path))
+              errors (filter #(str/starts-with? % "ERROR: ") lines)]
+          (is (empty? errors) (pr-str errors)))))))
+
+(deftest-oracle usdcat-oracle-agrees-with-our-parser-on-our-own-output
+  (let [scene [:def "Xform" :hero
+               {:references [:asset "./base.usd"]
+                :apiSchemas [:array "MaterialBindingAPI"]
+                :kind "component"}
+               [:rel :material:binding [:path "/hero/mat"]]
+               [:def "Sphere" :world
+                [:attr "double" :radius 2]
+                [:attr "color3f[]" :primvars:displayColor [[1 0 0]]]]]
+        layer (u/usda {} scene)]
+    (with-temp-usda layer
+      (fn [path]
+        (let [oracle-reexport (run-oracle "roundtrip" path)
+              {oracle-prims :prims} (u/parse oracle-reexport)]
+          (is (= 1 (count oracle-prims)))
+          (is (prim-structurally= scene (first oracle-prims))
+              "Pixar's own Usd.Stage round-trip of our emitter output parses back
+               (via our own parser) to the same prim we started from, modulo the
+               sibling declaration order Usd.Stage itself doesn't preserve"))))))
+
+(deftest-oracle real-world-usda-fixture-agrees-between-our-parser-and-the-oracle
+  (let [src (str "#usda 1.0\n"
+                  "(\n"
+                  "    defaultPrim = \"hello\"\n"
+                  ")\n"
+                  "\n"
+                  "def Xform \"hello\"\n"
+                  "{\n"
+                  "    double3 xformOp:translate = (4, 5, 6)\n"
+                  "    uniform token[] xformOpOrder = [\"xformOp:translate\"]\n"
+                  "\n"
+                  "    def Sphere \"world\"\n"
+                  "    {\n"
+                  "        float3[] extent = [(-2, -2, -2), (2, 2, 2)]\n"
+                  "        color3f[] primvars:displayColor = [(0, 0, 1)]\n"
+                  "        double radius = 2\n"
+                  "        rel material:binding = </hello/mat>\n"
+                  "    }\n"
+                  "}\n")
+        ours (u/parse src)]
+    (with-temp-usda src
+      (fn [path]
+        (let [oracle-reexport (run-oracle "roundtrip" path)
+              theirs (u/parse oracle-reexport)]
+          (is (= (:opts ours) (:opts theirs)))
+          (is (= 1 (count (:prims ours)) (count (:prims theirs))))
+          (is (prim-structurally= (first (:prims ours)) (first (:prims theirs)))
+              "our parser applied to the raw fixture, and to Pixar's own
+               re-export of the same fixture, must agree structurally (modulo
+               Usd.Stage's own non-order-preserving export)"))))))

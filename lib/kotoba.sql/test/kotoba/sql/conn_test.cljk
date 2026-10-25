@@ -1,0 +1,163 @@
+(ns kotoba.sql.conn-test
+  "Portable tests for kotoba.sql.conn: identical on the JVM (sqlite-jdbc) and
+  on the kbb engine (node:sqlite). The scripted workload is held to the
+  literal JVM answers recorded in kotoba.sql.conn-workload/expected; the
+  refusal tests pin the reason on each host (the JVM keeps sqlite-jdbc's own
+  SQLException message, Node refuses with a named keyword)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.sql.conn :as conn]
+            [kotoba.sql.conn-workload :as w]))
+
+(defn- reason
+  "The pinned refusal reason: Node -> the :kotoba.sql.conn/error keyword;
+  JVM -> the driver's exception message (and class)."
+  [f]
+  (try (f) [:no-refusal]
+       (catch #?(:clj Throwable :cljs :default) e
+         #?(:clj [(.getName (class e)) (ex-message e)]
+            :cljs (or (:kotoba.sql.conn/error (ex-data e)) [:unnamed (ex-message e)])))))
+
+(deftest workload-matches-recorded-jvm-answers
+  (let [actual (w/workload w/conn-ops conn/sqlite-datasource)
+        expected w/expected]
+    (testing "evidence floor: the recorded literal is not empty"
+      (is (< 60 (count expected))))
+    (is (= (mapv first expected) (mapv first actual)) "same labels in the same order")
+    (doseq [[[label e] [_ a]] (map vector expected actual)]
+      (is (= e a) (str "observation " label)))))
+
+(deftest datasource-capability
+  (let [ds (conn/sqlite-datasource ":memory:")]
+    (is (conn/datasource? ds))
+    (is (conn/datasource? (conn/sqlite-datasource "jdbc:sqlite::memory:")))
+    (is (not (conn/datasource? nil)))
+    (is (not (conn/datasource? {:url "jdbc:sqlite::memory:"})))
+    (testing "each :memory: connection is its own database"
+      (with-open [a (conn/connection ds)
+                  b (conn/connection ds)]
+        (is (= 0 (conn/execute a "CREATE TABLE t(x)" [])))
+        (is (= 1 (conn/execute a "INSERT INTO t VALUES (?)" [1])))
+        (is (= [1] (conn/query a "SELECT count(*) FROM t" [] #(conn/get-long % 1))))
+        (is (= [0] (conn/query b "SELECT count(*) FROM sqlite_master" [] #(conn/get-long % 1))))))))
+
+(deftest higher-level-and-with-transaction
+  (with-open [c (conn/connection (conn/sqlite-datasource ":memory:"))]
+    (conn/execute c "CREATE TABLE t(k TEXT PRIMARY KEY, v BLOB)" [])
+    (is (= 1 (conn/execute c "INSERT INTO t VALUES (?, ?)" ["a" (w/blob [1 2 3])])))
+    (is (= [["a" [:blob "1,2,3"]]]
+           (conn/query c "SELECT k, v FROM t" [] (fn [rs] [(conn/get-string rs 1) (w/norm (conn/get-bytes rs 2))]))))
+    (is (= [] (conn/query c "SELECT k FROM t WHERE 0" [] identity)) "no rows -> empty vector")
+    (is (= :done (conn/with-transaction [c] (conn/execute c "INSERT INTO t VALUES ('b', NULL)" []) :done)))
+    (is (true? (conn/auto-commit? c)) "auto-commit restored after commit")
+    (is (= :boom (try (conn/with-transaction [c]
+                        (conn/execute c "INSERT INTO t VALUES ('c', NULL)" [])
+                        (throw (ex-info "boom" {})))
+                      (catch #?(:clj Exception :cljs :default) _ :boom))))
+    (is (true? (conn/auto-commit? c)) "auto-commit restored after rollback")
+    (is (= ["a" "b"] (conn/query c "SELECT k FROM t ORDER BY k" [] #(conn/get-string % 1)))
+        "the thrown transaction was rolled back, the committed one kept")))
+
+(deftest bytes-helpers
+  (is (conn/bytes-equal? (w/blob [1 255]) (w/blob [1 255])))
+  (is (not (conn/bytes-equal? (w/blob [1 255]) (w/blob [1 254]))))
+  (is (not (conn/bytes-equal? (w/blob [1]) (w/blob [1 0]))) "length differs")
+  (is (conn/bytes-equal? (w/blob []) (w/blob [])) "empty boundary")
+  (is (conn/bytes-equal? nil nil))
+  (is (not (conn/bytes-equal? (w/blob []) nil)))
+  (is (= 0 (conn/byte-length (w/blob []))))
+  (is (= 3 (conn/byte-length (w/blob [0 1 2]))))
+  (is (conn/blob? (w/blob [])))
+  (is (not (conn/blob? "abc")))
+  (is (not (conn/blob? [1 2])))
+  (is (= 5 (conn/long-value 5)))
+  (is (= "9007199254740993" (str (conn/long-value w/two53+1)))))
+
+(deftest refusals-are-named
+  (let [ds (conn/sqlite-datasource ":memory:")
+        c (conn/connection ds)
+        one (fn [sql f] (with-open [st (conn/prepare c sql)
+                                    rs (conn/execute-query st)]
+                          (conn/next! rs)
+                          (f rs)))]
+    (testing "bad column index / label"
+      (is (= #?(:clj ["java.sql.SQLException" "column 2 out of bounds [1,1]"] :cljs :column-out-of-range)
+             (reason #(one "SELECT 5" (fn [rs] (conn/get-long rs 2))))))
+      (is (= #?(:clj ["java.sql.SQLException" "column 0 out of bounds [1,1]"] :cljs :column-out-of-range)
+             (reason #(one "SELECT 5" (fn [rs] (conn/get-long rs 0))))))
+      (is (= #?(:clj ["java.sql.SQLException" "no such column: 'nope'"] :cljs :no-such-column)
+             (reason #(one "SELECT 5" (fn [rs] (conn/get-long rs "nope"))))))
+      (is (= 5 (one "SELECT 5" (fn [rs] (conn/get-long rs 1)))) "index 1 = the accept boundary"))
+    (testing "auto-commit mode"
+      (is (= #?(:clj ["java.sql.SQLException" "database in auto-commit mode"] :cljs :auto-commit-mode)
+             (reason #(conn/commit! c))))
+      (is (= #?(:clj ["java.sql.SQLException" "database in auto-commit mode"] :cljs :auto-commit-mode)
+             (reason #(conn/rollback! c)))))
+    (testing "statement kind"
+      (is (= #?(:clj ["java.sql.SQLException" "Query returns results"] :cljs :update-returns-rows)
+             (reason #(with-open [st (conn/prepare c "SELECT 1")] (conn/execute-update! st)))))
+      (is (= #?(:clj ["java.sql.SQLException" "Query does not return results"] :cljs :query-returns-no-rows)
+             (reason #(with-open [st (conn/prepare c "CREATE TABLE q(x)")] (conn/execute-query st))))))
+    (testing "wasNull before any column read"
+      (is (= #?(:clj ["java.sql.SQLException" "column -1 out of bounds [1,1]"] :cljs :no-column-read)
+             (reason #(one "SELECT NULL" conn/was-null?)))))
+    (testing "bind index 0"
+      (is (= #?(:clj ["java.lang.ArrayIndexOutOfBoundsException" "Index -1 out of bounds for length 1"]
+                :cljs :parameter-out-of-range)
+             (reason #(with-open [st (conn/prepare c "SELECT ?")] (conn/set-object! st 0 1))))))
+    (testing "closed connection"
+      (conn/close! c)
+      (is (true? (conn/closed? c)))
+      (is (= #?(:clj ["java.sql.SQLException" "database connection closed"] :cljs :connection-closed)
+             (reason #(conn/prepare c "SELECT 1"))))
+      (is (= #?(:clj ["java.sql.SQLException" "database connection closed"] :cljs :connection-closed)
+             (reason #(conn/create-statement c))))
+      (is (nil? (conn/close! c)) "close is idempotent"))))
+
+#?(:cljs
+   (deftest node-only-refusals
+     (testing "a non-sqlite datasource does not open on Node"
+       (is (= :unsupported-datasource
+              (reason #(conn/connection (conn/driver-manager-datasource "jdbc:postgresql://localhost/x")))))
+       (is (= :unsupported-datasource (reason #(conn/connection #js {:url "jdbc:sqlite::memory:"}))))
+       (is (= :unsupported-datasource (reason #(conn/connection nil))))
+       (is (= :unsupported-datasource
+              (reason #(conn/connection (conn/sqlite-datasource "jdbc:sqlite:x.db?foreign_keys=on"))))))
+     (with-open [c (conn/connection (conn/sqlite-datasource ":memory:"))]
+       (testing "positional access outside a row"
+         (is (= :no-current-row
+                (reason #(with-open [st (conn/prepare c "SELECT 5") rs (conn/execute-query st)]
+                           (conn/get-long rs 1)))) "before next!")
+         (is (= :no-current-row
+                (reason #(with-open [st (conn/prepare c "SELECT 5") rs (conn/execute-query st)]
+                           (conn/next! rs) (conn/next! rs) (conn/get-long rs 1)))) "after exhaustion"))
+       (testing "a closed result / statement"
+         (is (= :result-closed
+                (reason #(let [st (conn/prepare c "SELECT 5") rs (conn/execute-query st)]
+                           (conn/next! rs) (conn/close! rs) (conn/get-long rs 1)))))
+         (is (false? (let [st (conn/prepare c "SELECT 5") rs (conn/execute-query st)]
+                       (conn/close! st) (conn/next! rs))) "closing the statement ends its result")
+         (is (= :statement-closed
+                (reason #(let [st (conn/prepare c "SELECT 5")] (conn/close! st) (conn/execute-query st))))))
+       (testing "parameters"
+         (is (= :parameter-out-of-range
+                (reason #(with-open [st (conn/prepare c "SELECT ?")]
+                           (conn/set-object! st 2 5) (conn/execute-query st)))) "more bound than declared")
+         (is (= :unsupported-parameter-type
+                (reason #(with-open [st (conn/prepare c "SELECT ?")] (conn/set-object! st 1 :kw)))))
+         (is (= :unsupported-parameter-type
+                (reason #(with-open [st (conn/prepare c "SELECT ?")] (conn/set-long! st 1 2.5)))))
+         (is (= :unsupported-parameter-type
+                (reason #(with-open [st (conn/prepare c "SELECT ?")] (conn/set-bytes! st 1 "not bytes"))))))
+       (testing "Node BLOB type is Uint8Array, and get-bytes copies"
+         (let [b (first (conn/query c "SELECT x'0102'" [] #(conn/get-bytes % 1)))]
+           (is (instance? js/Uint8Array b))
+           (is (conn/blob? b))
+           (is (false? (bytes? b)) "kbb's bytes? does not accept a Uint8Array: use conn/blob?")))
+       (testing "a value beyond 2^53 is an exact BigInt, a safe one a number"
+         (let [[big safe] (first (conn/query c "SELECT 9007199254740993, 9007199254740991" []
+                                             (fn [rs] [(conn/get-long rs 1) (conn/get-long rs 2)])))]
+           (is (= "9007199254740993" (str big)))
+           (is (not (number? big)))
+           (is (number? safe))))
+       (testing "long-value refuses a non-number"
+         (is (= :not-a-number (reason #(conn/long-value "5"))))))))

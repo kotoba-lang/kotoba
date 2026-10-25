@@ -1,0 +1,266 @@
+(ns kotoba.physics.cloth
+  "Cloth and hair as position-based dynamics: particles, distance constraints,
+  and a projection loop.
+
+  A cloth is a grid of particles joined by three families of distance
+  constraint — structural along the weave, shear across each quad, and bend
+  between next-but-one neighbours — and a hair strand is the degenerate case,
+  a single chain. They are the same solver; nothing here treats them as
+  different subjects.
+
+  Why position-based rather than forces: a spring-mass cloth stiff enough to
+  stop stretching needs a timestep small enough to keep the spring stable, and
+  the two requirements fight. PBD projects positions onto the constraint set
+  instead, so stiffness costs iterations rather than timesteps. The price is
+  that stiffness becomes iteration- and timestep-dependent — XPBD's compliance
+  term removes that, and `:compliance` here is that term.
+
+  What can be checked exactly, and is:
+
+  - **Constraint residual falls with iterations.** More projection means less
+    stretch, monotonically. A solver that has a sign wrong looks plausible in
+    a picture and fails this.
+  - **Free cloth conserves linear momentum.** Each constraint moves the two
+    particles by mass-weighted opposite amounts, so the centre of mass is
+    untouched by projection. Getting the mass weighting wrong — a common slip
+    — breaks this and nothing else visible.
+  - **The solver is frame-indifferent.** Translate and rotate the whole state
+    and the residual is identical, because a distance constraint is.
+  - **A pendulum stays on its circle** and swings at 2 pi sqrt(L/g).
+
+  Not here: self-collision, friction, plasticity, tearing, aerodynamic drag,
+  bending as a dihedral (this uses a distance constraint between next-but-one
+  particles, which resists bending but is not a bending energy), and any
+  implicit integrator. `step` refuses a state it cannot integrate rather than
+  returning particles at NaN."
+  (:require [kotoba.lang.text :as string]))
+
+(defn- v+ [a b] (mapv + a b))
+(defn- v- [a b] (mapv - a b))
+(defn- vs [a s] (mapv #(* s %) a))
+(defn- dot [a b] (reduce + (map * a b)))
+(defn- norm [a] (#?(:clj Math/sqrt :cljs js/Math.sqrt) (dot a a)))
+
+(defn particle
+  "A particle. `inverse-mass` 0 pins it — that is the only kind of pin here,
+  because it is the only one the projection loop has to know about."
+  ([position] (particle position 1.0))
+  ([position inverse-mass]
+   {:particle/position (mapv double position)
+    :particle/previous (mapv double position)
+    :particle/inverse-mass (double inverse-mass)}))
+
+(defn constraint
+  ([i j rest-length] (constraint i j rest-length 0.0))
+  ([i j rest-length compliance]
+   {:constraint/i i :constraint/j j
+    :constraint/rest (double rest-length)
+    :constraint/compliance (double compliance)}))
+
+(defn strand
+  "A hair strand: `n` particles spaced `spacing` apart along `direction` from
+  `origin`, with the first pinned unless `:free?`.
+
+  Bend resistance is a constraint between next-but-one particles, which is what
+  makes a strand hold a curve rather than folding on itself."
+  [{:keys [origin direction spacing count pinned? compliance bend-compliance]
+    :or {origin [0.0 0.0 0.0] direction [0.0 -1.0 0.0] spacing 0.1
+         count 10 pinned? true compliance 0.0 bend-compliance 0.01}}]
+  (let [d (let [n (norm direction)] (if (pos? n) (vs direction (/ 1.0 n)) [0.0 -1.0 0.0]))
+        ps (mapv (fn [i]
+                   (particle (v+ origin (vs d (* spacing i)))
+                             (if (and pinned? (zero? i)) 0.0 1.0)))
+                 (range count))]
+    {:cloth/particles ps
+     :cloth/constraints (into (mapv #(constraint % (inc %) spacing compliance)
+                                    (range (dec count)))
+                              (mapv #(constraint % (+ % 2) (* 2.0 spacing) bend-compliance)
+                                    (range (- count 2))))
+     :cloth/kind :strand}))
+
+(defn grid
+  "A rectangular cloth of `rows` x `cols` particles in the XZ plane at height
+  `y`, with structural, shear and bend constraints. `pins` is a set of [row col]
+  held in place."
+  [{:keys [rows cols spacing y pins compliance shear-compliance bend-compliance]
+    :or {rows 5 cols 5 spacing 0.1 y 0.0 pins #{} compliance 0.0
+         shear-compliance 0.0 bend-compliance 0.01}}]
+  (let [idx (fn [r c] (+ (* r cols) c))
+        ps (vec (for [r (range rows) c (range cols)]
+                  (particle [(* c spacing) y (* r spacing)]
+                            (if (contains? pins [r c]) 0.0 1.0))))
+        diag (* spacing (#?(:clj Math/sqrt :cljs js/Math.sqrt) 2.0))
+        structural (concat (for [r (range rows) c (range (dec cols))]
+                             (constraint (idx r c) (idx r (inc c)) spacing compliance))
+                           (for [r (range (dec rows)) c (range cols)]
+                             (constraint (idx r c) (idx (inc r) c) spacing compliance)))
+        shear (concat (for [r (range (dec rows)) c (range (dec cols))]
+                        (constraint (idx r c) (idx (inc r) (inc c)) diag shear-compliance))
+                      (for [r (range (dec rows)) c (range (dec cols))]
+                        (constraint (idx r (inc c)) (idx (inc r) c) diag shear-compliance)))
+        bend (concat (for [r (range rows) c (range (- cols 2))]
+                       (constraint (idx r c) (idx r (+ c 2)) (* 2.0 spacing) bend-compliance))
+                     (for [r (range (- rows 2)) c (range cols)]
+                       (constraint (idx r c) (idx (+ r 2) c) (* 2.0 spacing) bend-compliance)))]
+    {:cloth/particles ps
+     :cloth/constraints (vec (concat structural shear bend))
+     :cloth/rows rows :cloth/cols cols :cloth/kind :grid}))
+
+(defn residual
+  "The largest distance by which any constraint is violated. This is the number
+  that says whether a cloth is cloth or a bag of springs."
+  [{:keys [cloth/particles cloth/constraints]}]
+  (reduce (fn [worst {:constraint/keys [i j rest]}]
+            (let [d (norm (v- (get-in particles [j :particle/position])
+                              (get-in particles [i :particle/position])))]
+              (max worst (#?(:clj Math/abs :cljs js/Math.abs) (- d rest)))))
+          0.0 constraints))
+
+(defn centre-of-mass [{:keys [cloth/particles]}]
+  (let [ms (map (fn [p] (let [w (:particle/inverse-mass p)] (if (pos? w) (/ 1.0 w) 0.0)))
+                particles)
+        total (reduce + ms)]
+    (if (pos? total)
+      (vs (reduce v+ [0.0 0.0 0.0] (map (fn [p m] (vs (:particle/position p) m)) particles ms))
+          (/ 1.0 total))
+      [0.0 0.0 0.0])))
+
+(defn- project-constraints
+  "XPBD projection: `iterations` passes over the constraint list, with each
+  constraint's Lagrange multiplier ACCUMULATED across them and reset at the
+  start of the step.
+
+  The accumulation is the whole mechanism, and leaving it out is the easy
+  mistake — recomputing lambda from the current violation each pass makes the
+  compliance term a per-pass relaxation factor instead of a material property,
+  so repeated projection drives the violation to zero no matter how compliant
+  the cloth was declared to be. Measured on a 6x6 cloth pinned at two corners
+  with compliance 1e-3: without accumulation the sag went from -0.1313 at 20
+  iterations to -0.1205 at 80, three quarters of the way to the -0.1169 of a
+  rigid cloth. The material a scene describes must not change when a solver
+  setting does."
+  [particles constraints dt iterations]
+  (let [alphas (mapv (fn [{:constraint/keys [compliance]}]
+                       (if (pos? dt) (/ compliance (* dt dt)) 0.0))
+                     constraints)]
+    (first
+     (reduce
+      (fn [[ps lambdas] _]
+        (reduce
+         (fn [[ps lambdas] k]
+           (let [{:constraint/keys [i j rest]} (nth constraints k)
+                 alpha (nth alphas k)
+                 pi (get-in ps [i :particle/position])
+                 pj (get-in ps [j :particle/position])
+                 wi (get-in ps [i :particle/inverse-mass])
+                 wj (get-in ps [j :particle/inverse-mass])
+                 w (+ wi wj)]
+             (if-not (pos? w)
+               [ps lambdas]
+               (let [d (v- pj pi)
+                     len (norm d)]
+                 (if-not (pos? len)
+                   [ps lambdas]
+                   (let [c (- len rest)
+                         lambda (nth lambdas k)
+                         dlambda (/ (- (- c) (* alpha lambda)) (+ w alpha))
+                         n (vs d (/ 1.0 len))]
+                     ;; Mass-weighted and opposite: this is what leaves the
+                     ;; centre of mass untouched.
+                     [(-> ps
+                          (update-in [i :particle/position] v- (vs n (* wi dlambda)))
+                          (update-in [j :particle/position] v+ (vs n (* wj dlambda))))
+                      (assoc lambdas k (+ lambda dlambda))]))))))
+         [ps lambdas] (range (clojure.core/count constraints))))
+      [particles (vec (repeat (clojure.core/count constraints) 0.0))]
+      (range iterations)))))
+
+(defn- collide [particles colliders]
+  (reduce
+   (fn [ps collider]
+     (case (:collider/kind collider)
+       :sphere (let [{:collider/keys [centre radius]} collider]
+                 (mapv (fn [p]
+                         (if-not (pos? (:particle/inverse-mass p))
+                           p
+                           (let [d (v- (:particle/position p) centre)
+                                 len (norm d)]
+                             (if (< len radius)
+                               (assoc p :particle/position
+                                      (v+ centre (vs d (/ radius (max len 1.0e-12)))))
+                               p))))
+                       ps))
+       :plane (let [{:collider/keys [point normal]} collider]
+                (mapv (fn [p]
+                        (if-not (pos? (:particle/inverse-mass p))
+                          p
+                          (let [gap (dot (v- (:particle/position p) point) normal)]
+                            (if (neg? gap)
+                              (update p :particle/position v- (vs normal gap))
+                              p))))
+                      ps))
+       ps))
+   particles colliders))
+
+(defn step-error
+  "Why this state cannot be integrated, or nil."
+  [{:keys [cloth/particles cloth/constraints]} {:keys [dt iterations]}]
+  (cond
+    (not (and (number? dt) (pos? dt)))
+    (str "dt must be positive, got " (pr-str dt))
+
+    (not (and (integer? iterations) (pos? iterations)))
+    (str "iterations must be a positive integer, got " (pr-str iterations)
+         " — zero iterations integrates gravity and projects nothing, which"
+         " is free fall wearing the shape of a cloth")
+
+    (empty? particles)
+    "no particles to integrate"
+
+    (some (fn [{:constraint/keys [i j]}]
+            (or (not (< -1 i (count particles))) (not (< -1 j (count particles))) (= i j)))
+          constraints)
+    (str "a constraint refers to a particle that does not exist, or joins a"
+         " particle to itself: "
+         (pr-str (vec (take 3 (filter (fn [{:constraint/keys [i j]}]
+                                        (or (not (< -1 i (count particles)))
+                                            (not (< -1 j (count particles)))
+                                            (= i j)))
+                                      constraints)))))
+
+    (some (fn [p] (some #(not (and (number? %) (== % %))) (:particle/position p))) particles)
+    "a particle position is NaN before the step — the previous step already failed"))
+
+(defn step
+  "Advance one timestep. Returns `[:ok cloth]` or `[:error msg]`.
+
+  `opts`: `:dt`, `:iterations`, `:gravity` (default [0 -9.81 0]), `:damping`
+  (velocity retained per step, default 1.0 = none) and `:colliders`."
+  [cloth {:keys [dt iterations gravity damping colliders]
+          :or {gravity [0.0 -9.81 0.0] damping 1.0}
+          :as opts}]
+  (if-let [e (step-error cloth (assoc opts :dt dt :iterations iterations))]
+    [:error e]
+    (let [ps (:cloth/particles cloth)
+          ;; Verlet: velocity is implicit in (position - previous).
+          integrated (mapv (fn [p]
+                             (let [{:particle/keys [position previous inverse-mass]} p]
+                               (if-not (pos? inverse-mass)
+                                 (assoc p :particle/previous position)
+                                 (let [v (vs (v- position previous) damping)
+                                       next (v+ (v+ position v) (vs gravity (* dt dt)))]
+                                   (assoc p :particle/previous position
+                                            :particle/position next)))))
+                           ps)
+          projected (project-constraints integrated (:cloth/constraints cloth) dt iterations)
+          collided (collide projected (or colliders []))]
+      [:ok (assoc cloth :cloth/particles collided)])))
+
+(defn simulate
+  "Run `n` steps, stopping at the first error."
+  [cloth opts n]
+  (loop [c cloth i 0]
+    (if (= i n)
+      [:ok c]
+      (let [[status v] (step c opts)]
+        (if (= :error status) [:error (str "step " i ": " v)] (recur v (inc i)))))))

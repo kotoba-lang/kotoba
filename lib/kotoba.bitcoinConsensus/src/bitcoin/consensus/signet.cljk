@@ -1,0 +1,152 @@
+(ns bitcoin.consensus.signet
+  "BIP325 block-challenge extraction and Script verification."
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.script :as script]
+            [bitcoin.consensus.transaction :as transaction]
+            [kotobase.bitcoin.protocol :as header]))
+
+(def signet-header [0xec 0xc7 0xda 0xa2])
+(def block-script-flags #{:p2sh :witness :dersig :null-dummy})
+
+(def default-challenge
+  [0x51 0x21 0x03 0xad 0x5e 0x0e 0xda 0xd1 0x8c 0xb1 0xf0 0xfc
+   0x0d 0x28 0xa3 0xd4 0xf1 0xf3 0xe4 0x45 0x64 0x03 0x37 0x48
+   0x9a 0xbb 0x10 0x40 0x4f 0x2d 0x1e 0x08 0x6b 0xe4 0x30 0x21
+   0x03 0x59 0xef 0x50 0x21 0x96 0x4f 0xe2 0x2d 0x6f 0x8e 0x05
+   0xb2 0x46 0x3c 0x95 0x40 0xce 0x96 0x88 0x3f 0xe3 0xb2 0x78
+   0x76 0x0f 0x04 0x8f 0x51 0x89 0xf2 0xe6 0xc4 0x52 0xae])
+
+(defn- commitment-output [coinbase]
+  (last
+   (keep-indexed
+    (fn [index {:keys [script-pubkey]}]
+      (when (and (<= 38 (count script-pubkey))
+                 (= block/witness-commitment-prefix
+                    (subvec (vec script-pubkey) 0 6)))
+        [index (vec script-pubkey)]))
+    (:outputs coinbase))))
+
+(defn- clear-solution [commitment]
+  (loop [operations (script/parse commitment)
+         found? false
+         solution nil
+         replacement []]
+    (if (empty? operations)
+      {:found? found? :solution solution :script replacement}
+      (let [{:keys [data raw]} (first operations)
+            signet-push?
+            (and (not found?) data
+                 (> (count data) (count signet-header))
+                 (= signet-header
+                    (subvec (vec data) 0 (count signet-header))))
+            next-data (if signet-push? signet-header data)
+            encoded (if data (script/push-data next-data) raw)]
+        (recur (rest operations)
+               (or found? signet-push?)
+               (if signet-push?
+                 (subvec (vec data) (count signet-header))
+                 solution)
+               (into replacement encoded))))))
+
+(defn- parse-solution [bytes]
+  (let [bytes (vec bytes)
+        [script-sig offset]
+        (codec/read-var-bytes bytes 0 script/max-script-size
+                              "signet scriptSig")
+        [witness-count offset] (codec/read-compact-size bytes offset)
+        _ (when (> witness-count transaction/max-witness-items)
+            (codec/fail! :bitcoin.consensus/signet-solution
+                         "Signet witness item count exceeds its limit."
+                         {:count witness-count}))
+        [witness offset]
+        (loop [left witness-count offset offset result []]
+          (if (zero? left)
+            [result offset]
+            (let [[item next-offset]
+                  (codec/read-var-bytes
+                   bytes offset transaction/max-witness-item-bytes
+                   "signet witness item")]
+              (recur (dec left) next-offset (conj result item)))))]
+    (when-not (= offset (count bytes))
+      (codec/fail! :bitcoin.consensus/signet-solution
+                   "Signet solution has trailing data."
+                   {:offset offset :length (count bytes)}))
+    {:script-sig script-sig :witness witness}))
+
+(defn- modified-coinbase-and-solution [parsed-block]
+  (let [coinbase (first (:transactions parsed-block))
+        [index commitment]
+        (or (commitment-output coinbase)
+            (codec/fail! :bitcoin.consensus/missing-signet-commitment
+                         "Signet block requires a witness commitment." {}))
+        {:keys [found? solution script]} (clear-solution commitment)
+        modified
+        (transaction/parse
+         (transaction/serialize
+          (assoc-in coinbase [:outputs index :script-pubkey] script)))]
+    {:coinbase modified
+     :solution (if found?
+                 (parse-solution solution)
+                 {:script-sig [] :witness []})}))
+
+(defn virtual-transactions
+  "Construct BIP325's to_spend and to_sign transactions."
+  [parsed-block challenge]
+  (let [{:keys [coinbase solution]}
+        (modified-coinbase-and-solution parsed-block)
+        modified-root
+        (:root
+         (block/merkle-root
+          (into [(:txid-natural coinbase)]
+                (map :txid-natural
+                     (rest (:transactions parsed-block))))))
+        block-data
+        (vec
+         (take 72
+               (header/encode-block-header
+                (assoc (:header parsed-block)
+                       :merkle-root modified-root))))
+        to-spend
+        (transaction/parse
+         (transaction/serialize
+          {:version 0
+           :inputs [{:txid-natural (vec (repeat 32 0))
+                     :vout 0xffffffff
+                     :script-sig
+                     (vec (concat [0] (script/push-data block-data)))
+                     :sequence 0}]
+           :outputs [{:value 0 :script-pubkey (vec challenge)}]
+           :witnesses nil :locktime 0 :segwit? false}))
+        witness (:witness solution)
+        to-sign
+        (transaction/parse
+         (transaction/serialize
+          {:version 0
+           :inputs [{:txid-natural (:txid-natural to-spend)
+                     :vout 0
+                     :script-sig (:script-sig solution)
+                     :sequence 0}]
+           :outputs [{:value 0 :script-pubkey [0x6a]}]
+           :witnesses (when (seq witness) [witness])
+           :locktime 0 :segwit? (boolean (seq witness))}))]
+    {:to-spend to-spend :to-sign to-sign}))
+
+(defn validate!
+  "Validate the BIP325 solution, accepting the network genesis exception."
+  ([parsed-block] (validate! parsed-block default-challenge))
+  ([parsed-block challenge]
+   (if (= (:hash-hex (header/genesis-header :signet))
+          (get-in parsed-block [:header :hash-hex]))
+     true
+     (let [{:keys [to-spend to-sign]}
+           (virtual-transactions parsed-block challenge)
+           coin (assoc (first (:outputs to-spend))
+                       :height 0 :coinbase? false)]
+       (try
+         (script/verify-input to-sign 0 coin block-script-flags)
+         true
+         (catch kerror/ExceptionInfo error
+           (codec/fail! :bitcoin.consensus/bad-signet-solution
+                        "Signet block challenge solution is invalid."
+                        {:cause (:type (ex-data error))})))))))

@@ -1,0 +1,209 @@
+(ns kotoba.lang.pqh.crypto-test
+  "Port of crypto.test.ts, plus cross-language known-answer vectors
+   (kotoba.lang.pqh.vectors) proving this namespace's XChaCha20-Poly1305 AEAD
+   and canonical CBOR encoding are byte-identical to @noble/ciphers'
+   xchacha20poly1305 and @ipld/dag-cbor's encode -- not just \"does it run\".
+
+   Stays .clj (not .cljc): binds crypto/*aead* to the JVM-only BouncyCastle
+   fixture kotoba.lang.pqh.aead-bc, and kotoba.lang.pqh.vectors' resource
+   loading is :clj-only too (see both namespaces' docstrings). There is no
+   cljs test runner in this repo (deps.edn's :test alias only wires
+   cognitect.test-runner for :clj), so every assertion here is JVM-only
+   regardless of file extension -- renaming to .cljc would be cosmetic."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing use-fixtures]]
+            [cbor.core :as cbor]
+            [kotoba.lang.pqh.crypto :as crypto]
+            [kotoba.lang.pqh.aead-bc :as aead-bc]
+            [kotoba.lang.pqh.util :as u]
+            [kotoba.lang.pqh.vectors :as v]))
+
+(def SENDER "did:web:alice.example")
+
+(use-fixtures :each (fn [f] (binding [crypto/*aead* (aead-bc/bc-aead)] (f))))
+
+;; ── cross-language known-answer vectors ──────────────────────────────────
+
+(deftest xchacha20poly1305-matches-noble
+  (doseq [k [:xchacha20poly1305 :xchacha20poly1305_empty :xchacha20poly1305_bin]]
+    (testing (str k)
+      (let [vec (get v/vectors k)
+            key (v/hb (:key vec))
+            nonce (v/hb (:nonce vec))
+            aad (some-> (:aad vec) v/hb)
+            plaintext (v/hb (or (:plaintext vec) ""))
+            ciphertext (crypto/xchacha20poly1305-encrypt key nonce aad plaintext)]
+        (is (= (:ciphertext vec) (u/bytes->hex ciphertext)))
+        (is (= (seq plaintext) (seq (crypto/xchacha20poly1305-decrypt key nonce aad ciphertext))))))))
+
+(deftest cbor-encode-matches-dag-cbor
+  (is (= (:encoded (:cbor_body1 v/vectors))
+         (u/bytes->hex (cbor/encode (array-map "hello" "world" "n" 42 "list" [1 2 3])))))
+  (is (= (:encoded (:cbor_body2 v/vectors))
+         (u/bytes->hex (cbor/encode (array-map "x" 1))))))
+
+;; ── round-trip (port of "crypto envelope round-trip") ────────────────────
+
+(deftest envelope-round-trip
+  (testing "encrypts and decrypts a CBOR-serializable plaintext"
+    (let [key (crypto/generate-key)
+          plaintext (array-map "hello" "world" "n" 42 "list" [1 2 3])
+          env (crypto/encrypt {:key key :sender SENDER :plaintext plaintext})]
+      (is (= crypto/ENVELOPE-VERSION (:v env)))
+      (is (= crypto/AEAD-ALG (:alg env)))
+      (is (= crypto/NONCE-BYTES (alength ^bytes (:nonce env))))
+      (is (= SENDER (:sender env)))
+      (is (= (crypto/key-id-of key) (:key-id env)))
+      (is (= plaintext (crypto/decrypt {:key key :envelope env})))))
+
+  (testing "propagates inner-type when supplied"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender SENDER :plaintext (array-map "x" 1)
+                                :inner-type "com.etzhayyim.governance.proposal"})]
+      (is (= "com.etzhayyim.governance.proposal" (:inner-type env)))))
+
+  (testing "uses a deterministic nonce when caller supplies one"
+    (let [key (crypto/generate-key)
+          nonce (crypto/generate-nonce)
+          env (crypto/encrypt {:key key :sender SENDER :plaintext (array-map "a" 1) :nonce nonce})]
+      (is (= (seq nonce) (seq (:nonce env)))))))
+
+;; ── AEAD binding (port of "crypto AEAD binding") ──────────────────────────
+
+(deftest aead-binding
+  (testing "rejects ciphertext when AAD differs at decrypt"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender SENDER :plaintext (array-map "confidential" true)
+                                :aad (byte-array [1 2 3])})]
+      (is (thrown? Exception (crypto/decrypt {:key key :envelope env :aad (byte-array [9 9 9])})))))
+
+  (testing "rejects ciphertext when AAD is missing at decrypt"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender SENDER :plaintext (array-map "confidential" true)
+                                :aad (byte-array [1 2 3])})]
+      (is (thrown? Exception (crypto/decrypt {:key key :envelope env})))))
+
+  (testing "detects ciphertext tampering"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender SENDER :plaintext (array-map "x" 1)})
+          ct ^bytes (:ciphertext env)]
+      (aset-byte ct 0 (unchecked-byte (bit-xor (aget ct 0) (unchecked-byte 0xff))))
+      (is (thrown? Exception (crypto/decrypt {:key key :envelope env})))))
+
+  (testing "rejects wrong key"
+    (let [key1 (crypto/generate-key)
+          key2 (crypto/generate-key)
+          env (crypto/encrypt {:key key1 :sender SENDER :plaintext (array-map "x" 1)})]
+      (is (thrown? Exception (crypto/decrypt {:key key2 :envelope env}))))))
+
+;; ── invariants ────────────────────────────────────────────────────────────
+
+(deftest invariants
+  (testing "rejects key of wrong length"
+    (is (thrown? Exception
+                 (crypto/encrypt {:key (byte-array 16) :sender SENDER :plaintext {}}))))
+
+  (testing "rejects nonce of wrong length"
+    (let [key (crypto/generate-key)]
+      (is (thrown? Exception
+                   (crypto/encrypt {:key key :sender SENDER :plaintext {} :nonce (byte-array 12)})))))
+
+  (testing "rejects unknown envelope version at decrypt"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender SENDER :plaintext {}})
+          bumped (assoc env :v 99)]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"envelope version"
+                            (crypto/decrypt {:key key :envelope bumped})))))
+
+  (testing "key-id-of is deterministic and 16 hex chars"
+    (let [key (crypto/generate-key)
+          id1 (crypto/key-id-of key)
+          id2 (crypto/key-id-of key)]
+      (is (= id1 id2))
+      (is (= 16 (count id1)))
+      (is (re-matches #"[0-9a-f]+" id1))))
+
+  (testing "generate-key returns 32 bytes"
+    (is (= crypto/KEY-BYTES (alength (crypto/generate-key))))))
+
+;; ── padding (ADR-2605181200) ──────────────────────────────────────────────
+
+(deftest padding
+  (testing "pad-iso7816 appends 0x80 then 0x00s; unpad recovers original"
+    (let [plain (byte-array [1 2 3 4 5])
+          padded (crypto/pad-iso7816 plain 16)]
+      (is (= 16 (alength padded)))
+      (is (= (unchecked-byte 0x80) (aget padded 5)))
+      (doseq [i (range 6 16)] (is (zero? (aget padded i))))
+      (is (= (seq (crypto/unpad-iso7816 padded)) (seq plain)))))
+
+  (testing "pad-iso7816 rejects target too small"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"too small"
+                          (crypto/pad-iso7816 (byte-array 10) 10))))
+
+  (testing "unpad-iso7816 rejects missing delimiter"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"invalid"
+                          (crypto/unpad-iso7816 (byte-array 16)))))
+
+  (testing "pick-bucket picks the smallest bucket that fits plaintext + delimiter + tag"
+    (is (= 1024 (crypto/pick-bucket 1)))
+    (is (= 1024 (crypto/pick-bucket (- 1024 1 crypto/AEAD-TAG-BYTES))))
+    (is (= 4096 (crypto/pick-bucket (- 1024 crypto/AEAD-TAG-BYTES))))
+    (is (= 65536 (crypto/pick-bucket 60000))))
+
+  (testing "every bucket boundary is exact: len+1+tag == bucket still fits, one more does not"
+    ;; The bug this ladder was extended to fix (ADR-2608070400 D6) was a block
+    ;; size landing exactly ON a boundary and silently overflowing to the next
+    ;; bucket. Pin the boundary at every rung, not just the first.
+    (doseq [[b next-b] (partition 2 1 crypto/PAD-BUCKETS)]
+      (is (= b (crypto/pick-bucket (- b 1 crypto/AEAD-TAG-BYTES)))
+          (str "largest plaintext that still fits bucket " b))
+      (is (= next-b (crypto/pick-bucket (- b crypto/AEAD-TAG-BYTES)))
+          (str "one byte more must spill from " b " to " next-b))))
+
+  (testing "the Merkle block size classes kotobase-peer declares all fit a bucket"
+    ;; kotobase-peer.block-sizing/size-classes, quoted. If that ladder moves and
+    ;; this is not updated, the fleet gate block-sizing-pad-alignment-check
+    ;; catches it — this is the cheap local echo of the same invariant.
+    (doseq [c [16367 32751 65519 131055]]
+      (is (some? (crypto/pick-bucket c))
+          (str "block size class " c " must be inline-paddable"))
+      (is (<= (/ (double (- (crypto/pick-bucket c) c)) c) 0.01)
+          (str "block size class " c " must sit just under its bucket"))))
+
+  (testing "pick-bucket throws when plaintext exceeds largest bucket"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"exceeds"
+                          (crypto/pick-bucket 300000))))
+
+  (testing "encrypt(:pad :bucket) yields ciphertext exactly equal to the bucket size"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender "did:test:a" :plaintext (array-map "x" 1) :pad :bucket})]
+      (is (= crypto/PAD-SCHEME-ISO7816 (:pad env)))
+      (is (= (first crypto/PAD-BUCKETS) (alength ^bytes (:ciphertext env))))
+      (is (= (array-map "x" 1) (crypto/decrypt {:key key :envelope env})))))
+
+  (testing "encrypt(:pad {:bucket 4096}) forces the explicit bucket"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender "did:test:a" :plaintext (array-map "x" 1) :pad {:bucket 4096}})]
+      (is (= 4096 (alength ^bytes (:ciphertext env))))
+      (is (= (array-map "x" 1) (crypto/decrypt {:key key :envelope env})))))
+
+  (testing "differently-sized plaintexts encrypt to the same bucket length"
+    (let [key (crypto/generate-key)
+          small (crypto/encrypt {:key key :sender "did:test:a" :plaintext (array-map "x" 1) :pad :bucket})
+          bigger (crypto/encrypt {:key key :sender "did:test:a"
+                                   :plaintext (array-map "body" (apply str (repeat 500 "x")) "tag" "fill")
+                                   :pad :bucket})]
+      (is (= (alength ^bytes (:ciphertext small)) (alength ^bytes (:ciphertext bigger))))
+      (is (= (first crypto/PAD-BUCKETS) (alength ^bytes (:ciphertext small))))))
+
+  (testing "pad :none (default) leaves ciphertext at native CBOR size + tag"
+    (let [key (crypto/generate-key)
+          env (crypto/encrypt {:key key :sender "did:test:a" :plaintext (array-map "x" 1)})]
+      (is (nil? (:pad env)))
+      (is (< (alength ^bytes (:ciphertext env)) 64))))
+
+  (testing "envelope with pad set decrypts back to plaintext (no caller-side unpad arg)"
+    (let [key (crypto/generate-key)
+          obj (array-map "body" "hi" "n" 7)
+          env (crypto/encrypt {:key key :sender "did:test:a" :plaintext obj :pad :bucket})]
+      (is (= obj (crypto/decrypt {:key key :envelope env}))))))

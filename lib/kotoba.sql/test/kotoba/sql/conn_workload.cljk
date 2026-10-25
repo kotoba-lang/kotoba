@@ -1,0 +1,319 @@
+(ns kotoba.sql.conn-workload
+  "One scripted SQLite workload, parameterized by an OPS map (keyword -> fn
+  with the kotoba.sql.conn signatures). The JVM oracle runs it through raw
+  JDBC interop and through kotoba.sql.conn and compares every observation;
+  the portable test runs it through kotoba.sql.conn on either host and holds
+  the result to the literal JVM answers in `expected`.
+
+  Every observation is [label value] with value normalized so both hosts can
+  answer the same literal: numbers -> [:n \"<decimal>\"], BLOBs ->
+  [:blob <unsigned bytes>], refusals -> :refused."
+  (:require [kotoba.sql.conn :as conn]))
+
+(def conn-ops
+  {:connection conn/connection :create-statement conn/create-statement
+   :execute! conn/execute! :prepare conn/prepare :set-object! conn/set-object!
+   :set-bytes! conn/set-bytes! :set-long! conn/set-long! :set-int! conn/set-int!
+   :set-string! conn/set-string! :set-null! conn/set-null!
+   :execute-update! conn/execute-update! :execute-statement! conn/execute-statement!
+   :execute-query conn/execute-query :next! conn/next! :get-string conn/get-string
+   :get-bytes conn/get-bytes :get-long conn/get-long :get-int conn/get-int
+   :get-object conn/get-object :was-null? conn/was-null?
+   :auto-commit? conn/auto-commit? :set-auto-commit! conn/set-auto-commit!
+   :commit! conn/commit! :rollback! conn/rollback! :close! conn/close!
+   :closed? conn/closed? :add-batch! conn/add-batch! :execute-batch! conn/execute-batch!
+   :clear-batch! conn/clear-batch!})
+
+(defn blob [xs]
+  #?(:clj (byte-array (map unchecked-byte xs))
+     :cljs (js/Uint8Array. (into-array xs))))
+
+(def two53+1 #?(:clj 9007199254740993 :cljs (js/BigInt "9007199254740993")))
+(def two53-1 9007199254740991)
+(def long-max #?(:clj Long/MAX_VALUE :cljs (js/BigInt "9223372036854775807")))
+(def long-min #?(:clj Long/MIN_VALUE :cljs (js/BigInt "-9223372036854775808")))
+
+(defn norm [v]
+  (cond
+    (nil? v) nil
+    (boolean? v) v
+    (string? v) v
+    (keyword? v) v
+    (conn/blob? v) [:blob (apply str (interpose "," (map #(bit-and (aget v %) 255)
+                                                          (range (conn/byte-length v)))))]
+    (sequential? v) (mapv norm v)
+    :else [:n (str v)]))
+
+(defn temp-db-path []
+  #?(:clj (let [f (java.io.File/createTempFile "kotoba-sql-conn" ".db")]
+            (.delete f)
+            (str f))
+     :cljs (let [os (js/process.getBuiltinModule "node:os")]
+             (str (.tmpdir os) "/kotoba-sql-conn-" (js/Date.now) "-"
+                  (rand-int 1000000000) ".db"))))
+
+(defn remove-db! [path]
+  (doseq [suffix ["" "-wal" "-shm" "-journal"]]
+    #?(:clj (.delete (java.io.File. (str path suffix)))
+       :cljs (let [fs (js/process.getBuiltinModule "node:fs")]
+               (try (.unlinkSync fs (str path suffix)) (catch :default _ nil))))))
+
+(defn workload
+  "Run the script against a fresh file database from `make-ds` (path -> ds).
+  Returns the vector of [label value] observations."
+  [ops make-ds]
+  (let [{:keys [connection create-statement execute! prepare set-object!
+                set-bytes! set-long! set-int! set-string! set-null!
+                execute-update! execute-statement! execute-query next!
+                get-string get-bytes get-long get-int get-object was-null?
+                auto-commit? set-auto-commit! commit! rollback! close!
+                closed? add-batch! execute-batch! clear-batch!]} ops
+        path (temp-db-path)
+        ds (make-ds path)
+        out (atom [])
+        obs! (fn [label v] (swap! out conj [label (norm v)]))
+        refused (fn [label f]
+                  (swap! out conj
+                         [label (try (norm (f))
+                                     (catch #?(:clj Throwable :cljs :default) _ :refused))]))
+        exec! (fn [c sql] (with-open [st (create-statement c)] (execute! st sql)))
+        bind! (fn [st params]
+                (doseq [[i v] (map-indexed vector params)]
+                  (if (conn/blob? v) (set-bytes! st (inc i) v) (set-object! st (inc i) v)))
+                st)
+        update! (fn [c sql params]
+                  (with-open [st (bind! (prepare c sql) params)] (execute-update! st)))
+        rows (fn [c sql params row-fn]
+               (with-open [st (bind! (prepare c sql) params)
+                           rs (execute-query st)]
+                 (loop [acc []]
+                   (if (next! rs) (recur (conj acc (row-fn rs))) acc))))
+        one (fn [c sql params row-fn] (first (rows c sql params row-fn)))]
+    (try
+      (let [c (connection ds)]
+        ;; connection defaults and WAL
+        (obs! :journal-wal-returns-rows (exec! c "PRAGMA journal_mode = WAL"))
+        (obs! :journal-mode (one c "PRAGMA journal_mode" [] #(get-string % 1)))
+        (obs! :foreign-keys-default (one c "PRAGMA foreign_keys" [] #(get-long % 1)))
+        (obs! :busy-timeout-default (one c "PRAGMA busy_timeout" [] #(get-long % 1)))
+        (obs! :busy-timeout-set (exec! c "PRAGMA busy_timeout = 5000"))
+        (obs! :busy-timeout-now (one c "PRAGMA busy_timeout" [] #(get-long % 1)))
+        (obs! :dq-string-literal (one c "SELECT \"abc\"" [] #(get-string % 1)))
+        ;; schema
+        (obs! :create-blocks
+              (exec! c "CREATE TABLE IF NOT EXISTS blocks (
+                          cid TEXT PRIMARY KEY, bytes BLOB, n INTEGER,
+                          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                        ) WITHOUT ROWID"))
+        (obs! :create-refs
+              (exec! c "CREATE TABLE refs (name TEXT PRIMARY KEY, cid TEXT NOT NULL,
+                          revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0))"))
+        ;; round trip of TEXT / INTEGER / BLOB / NULL
+        (obs! :insert-a (update! c "INSERT INTO blocks(cid, bytes, n) VALUES (?, ?, ?)"
+                                 ["a" (blob [0 1 127 128 255]) 5]))
+        (obs! :insert-null (update! c "INSERT INTO blocks(cid, bytes, n) VALUES (?, ?, ?)"
+                                    ["null" nil nil]))
+        (obs! :insert-empty-blob (update! c "INSERT INTO blocks(cid, bytes, n) VALUES (?, ?, ?)"
+                                          ["empty" (blob []) 0]))
+        (obs! :select-a (one c "SELECT cid, bytes, n, typeof(bytes), typeof(n) FROM blocks WHERE cid = ?" ["a"]
+                             (fn [rs] (mapv norm [(get-string rs 1) (get-bytes rs 2) (get-long rs 3)
+                                                  (get-object rs 3) (get-string rs 4) (get-string rs 5)]))))
+        (obs! :select-a-by-label (one c "SELECT cid AS Cid, n FROM blocks WHERE cid = ?" ["a"]
+                                      (fn [rs] (mapv norm [(get-string rs "cid") (get-long rs "N")]))))
+        (obs! :blob-equal (one c "SELECT bytes FROM blocks WHERE cid = ?" ["a"]
+                               #(conn/bytes-equal? (blob [0 1 127 128 255]) (get-bytes % 1))))
+        (obs! :blob-unequal (one c "SELECT bytes FROM blocks WHERE cid = ?" ["a"]
+                                 #(conn/bytes-equal? (blob [0 1 127 128 254]) (get-bytes % 1))))
+        (obs! :empty-blob (one c "SELECT bytes, length(bytes), typeof(bytes) FROM blocks WHERE cid = ?" ["empty"]
+                               (fn [rs] (mapv norm [(get-bytes rs 1) (get-long rs 2) (get-string rs 3)]))))
+        (obs! :null-row (one c "SELECT bytes, n FROM blocks WHERE cid = ?" ["null"]
+                             (fn [rs] (mapv norm [(get-bytes rs 1) (was-null? rs)
+                                                  (get-long rs 2) (was-null? rs)
+                                                  (get-string rs 2) (get-object rs 2)
+                                                  (get-int rs 2) (was-null? rs)]))))
+        (obs! :not-null-was-null (one c "SELECT n FROM blocks WHERE cid = ?" ["a"]
+                                      (fn [rs] [(norm (get-long rs 1)) (was-null? rs)])))
+        (obs! :unixepoch-default (one c "SELECT created_at > 1700000000, typeof(created_at) FROM blocks WHERE cid = ?" ["a"]
+                                      (fn [rs] [(norm (get-long rs 1)) (get-string rs 2)])))
+        ;; 64-bit integer boundary
+        (with-open [st (prepare c "INSERT INTO blocks(cid, n) VALUES (?, ?)")]
+          (doseq [[cid v] [["p53m1" two53-1] ["p53p1" two53+1]
+                           ["max" long-max] ["min" long-min]]]
+            (set-string! st 1 cid)
+            (set-long! st 2 v)
+            (obs! (keyword (str "insert-" cid)) (execute-update! st))))
+        (doseq [cid ["p53m1" "p53p1" "max" "min"]]
+          (obs! (keyword (str "read-" cid))
+                (one c "SELECT n, typeof(n), n = ?, CAST(n AS TEXT) FROM blocks WHERE cid = ?"
+                     [(case cid "p53m1" two53-1 "p53p1" two53+1 "max" long-max "min" long-min) cid]
+                     (fn [rs] (mapv norm [(get-long rs 1) (get-object rs 1) (get-string rs 1)
+                                          (get-string rs 2) (get-long rs 3) (get-string rs 4)])))))
+        (obs! :int-truncation (one c "SELECT 4294967297, -2147483649, 2147483647" []
+                                   (fn [rs] (mapv norm [(get-int rs 1) (get-int rs 2) (get-int rs 3)]))))
+        (obs! :coercions (one c "SELECT 2.7, -2.7, 2.5, '12', 'abc', x'e38182', 'あ', 5.0" []
+                              (fn [rs] (mapv norm [(get-long rs 1) (get-long rs 2) (get-string rs 3)
+                                                   (get-long rs 4) (get-long rs 5) (get-string rs 6)
+                                                   (get-bytes rs 7) (get-string rs 8) (get-int rs 1)]))))
+        (obs! :bind-kinds (one c "SELECT typeof(?), typeof(?), typeof(?), typeof(?), typeof(?), ?" [true 7 2.5 "s" nil false]
+                               (fn [rs] (mapv norm [(get-string rs 1) (get-string rs 2) (get-string rs 3)
+                                                    (get-string rs 4) (get-string rs 5) (get-long rs 6)]))))
+        (obs! :set-int-and-null
+              (with-open [st (prepare c "SELECT ?, typeof(?)")]
+                (set-int! st 1 -7)
+                (set-null! st 2 4)
+                (with-open [rs (execute-query st)]
+                  (next! rs)
+                  (mapv norm [(get-long rs 1) (get-string rs 2)]))))
+        (obs! :unbound-parameter (one c "SELECT ?, ?" [1] (fn [rs] (mapv norm [(get-long rs 1) (get-object rs 2)]))))
+        ;; ON CONFLICT DO NOTHING, RETURNING, DDL update count
+        (obs! :conflict-first (update! c "INSERT INTO refs(name, cid) VALUES (?, ?) ON CONFLICT(name) DO NOTHING" ["r" "c1"]))
+        (obs! :conflict-again (update! c "INSERT INTO refs(name, cid) VALUES (?, ?) ON CONFLICT(name) DO NOTHING" ["r" "c2"]))
+        (obs! :returning-insert
+              (rows c "INSERT INTO refs(name, cid) VALUES (?, ?) ON CONFLICT(name) DO NOTHING RETURNING cid, revision"
+                    ["s" "c1"] (fn [rs] [(get-string rs 1) (norm (get-long rs 2))])))
+        (obs! :returning-conflict
+              (rows c "INSERT INTO refs(name, cid) VALUES (?, ?) ON CONFLICT(name) DO NOTHING RETURNING cid, revision"
+                    ["s" "c9"] (fn [rs] [(get-string rs 1) (norm (get-long rs 2))])))
+        (obs! :returning-update
+              (rows c "UPDATE refs SET cid = ?, revision = revision + 1 WHERE name = ? AND cid = ? RETURNING cid, revision"
+                    ["c2" "s" "c1"] (fn [rs] [(get-string rs 1) (norm (get-long rs 2))])))
+        (obs! :returning-update-miss
+              (rows c "UPDATE refs SET cid = ?, revision = revision + 1 WHERE name = ? AND cid = ? RETURNING cid, revision"
+                    ["c3" "s" "c1"] (fn [rs] [(get-string rs 1) (norm (get-long rs 2))])))
+        (obs! :update-many (update! c "UPDATE blocks SET n = n WHERE n IS NOT NULL" []))
+        (obs! :ddl-update-count (update! c "CREATE TABLE ddl_probe(x)" []))
+        (obs! :execute-statement-select (with-open [st (prepare c "SELECT 1")] (execute-statement! st)))
+        (obs! :execute-statement-insert (with-open [st (prepare c "INSERT INTO ddl_probe VALUES (1)")] (execute-statement! st)))
+        (refused :execute-update-on-select #(update! c "SELECT 1" []))
+        (refused :execute-query-on-insert #(rows c "INSERT INTO ddl_probe VALUES (2)" [] identity))
+        ;; next! exhaustion
+        (obs! :next-exhaustion
+              (with-open [st (prepare c "SELECT cid FROM refs ORDER BY cid")
+                          rs (execute-query st)]
+                (mapv norm [(next! rs) (next! rs) (next! rs) (next! rs)])))
+        (obs! :next-empty
+              (with-open [st (prepare c "SELECT cid FROM refs WHERE 0")
+                          rs (execute-query st)]
+                (mapv norm [(next! rs) (next! rs)])))
+        ;; batch
+        (obs! :batch
+              (with-open [st (prepare c "INSERT INTO refs(name, cid) VALUES (?, 'b') ON CONFLICT(name) DO NOTHING")]
+                (set-string! st 1 "b1") (add-batch! st)
+                (set-string! st 1 "b2") (add-batch! st)
+                (set-string! st 1 "r") (add-batch! st)
+                (let [first-run (vec (execute-batch! st))
+                      again (vec (execute-batch! st))]
+                  (set-string! st 1 "b3") (add-batch! st)
+                  (clear-batch! st)
+                  [(mapv norm first-run) (mapv norm again) (mapv norm (vec (execute-batch! st)))])))
+        ;; transactions
+        (let [c2 (connection ds)
+              count-refs (fn [cx] (one cx "SELECT count(*) FROM refs" [] #(get-long % 1)))]
+          (obs! :auto-commit-initial (auto-commit? c))
+          (refused :commit-in-auto-commit #(commit! c))
+          (refused :rollback-in-auto-commit #(rollback! c))
+          (set-auto-commit! c false)
+          (obs! :auto-commit-off (auto-commit? c))
+          (update! c "INSERT INTO refs(name, cid) VALUES ('t1', 'x')" [])
+          (obs! :txn-own-view (count-refs c))
+          (obs! :txn-other-view-before-rollback (count-refs c2))
+          (rollback! c)
+          (obs! :after-rollback (count-refs c))
+          (update! c "INSERT INTO refs(name, cid) VALUES ('t2', 'x')" [])
+          (obs! :txn-other-view-before-commit (count-refs c2))
+          (commit! c)
+          (obs! :txn-other-view-after-commit (count-refs c2))
+          (update! c "INSERT INTO refs(name, cid) VALUES ('t3', 'x')" [])
+          (set-auto-commit! c true)
+          (obs! :set-auto-commit-true-commits (count-refs c2))
+          (obs! :auto-commit-restored (auto-commit? c))
+          (refused :constraint-violation #(update! c "INSERT INTO refs(name, cid, revision) VALUES ('bad', 'x', 0)" []))
+          (obs! :after-constraint (count-refs c2))
+          (close! c2))
+        ;; refusals
+        (refused :bad-column-index (fn [] (one c "SELECT 5" [] #(get-long % 2))))
+        (refused :column-index-zero (fn [] (one c "SELECT 5" [] #(get-long % 0))))
+        (refused :bad-column-label (fn [] (one c "SELECT 5" [] #(get-long % "nope"))))
+        (refused :was-null-before-read (fn [] (one c "SELECT NULL" [] #(was-null? %))))
+        (refused :bind-index-zero #(with-open [st (prepare c "SELECT ?")] (set-object! st 0 1)))
+        (close! c)
+        (obs! :closed? (closed? c))
+        (close! c)
+        (obs! :close-twice-closed? (closed? c))
+        (refused :prepare-on-closed #(prepare c "SELECT 1"))
+        (refused :create-statement-on-closed #(create-statement c)))
+      @out
+      (finally (remove-db! path)))))
+
+(def expected
+  "The JVM (sqlite-jdbc 3.53.2.0, JDK 21) answers, recorded from the oracle."
+  [[:journal-wal-returns-rows true]
+   [:journal-mode "wal"]
+   [:foreign-keys-default [:n "0"]]
+   [:busy-timeout-default [:n "3000"]]
+   [:busy-timeout-set true]
+   [:busy-timeout-now [:n "5000"]]
+   [:dq-string-literal "abc"]
+   [:create-blocks false]
+   [:create-refs false]
+   [:insert-a [:n "1"]]
+   [:insert-null [:n "1"]]
+   [:insert-empty-blob [:n "1"]]
+   [:select-a ["a" [:blob "0,1,127,128,255"] [:n "5"] [:n "5"] "blob" "integer"]]
+   [:select-a-by-label ["a" [:n "5"]]]
+   [:blob-equal true]
+   [:blob-unequal false]
+   [:empty-blob [[:blob ""] [:n "0"] "blob"]]
+   [:null-row [nil true [:n "0"] true nil nil [:n "0"] true]]
+   [:not-null-was-null [[:n "5"] false]]
+   [:unixepoch-default [[:n "1"] "integer"]]
+   [:insert-p53m1 [:n "1"]]
+   [:insert-p53p1 [:n "1"]]
+   [:insert-max [:n "1"]]
+   [:insert-min [:n "1"]]
+   [:read-p53m1 [[:n "9007199254740991"] [:n "9007199254740991"] "9007199254740991" "integer" [:n "1"] "9007199254740991"]]
+   [:read-p53p1 [[:n "9007199254740993"] [:n "9007199254740993"] "9007199254740993" "integer" [:n "1"] "9007199254740993"]]
+   [:read-max [[:n "9223372036854775807"] [:n "9223372036854775807"] "9223372036854775807" "integer" [:n "1"] "9223372036854775807"]]
+   [:read-min [[:n "-9223372036854775808"] [:n "-9223372036854775808"] "-9223372036854775808" "integer" [:n "1"] "-9223372036854775808"]]
+   [:int-truncation [[:n "1"] [:n "2147483647"] [:n "2147483647"]]]
+   [:coercions [[:n "2"] [:n "-2"] "2.5" [:n "12"] [:n "0"] "あ" [:blob "227,129,130"] "5.0" [:n "2"]]]
+   [:bind-kinds ["integer" "integer" "real" "text" "null" [:n "0"]]]
+   [:set-int-and-null [[:n "-7"] "null"]]
+   [:unbound-parameter [[:n "1"] nil]]
+   [:conflict-first [:n "1"]]
+   [:conflict-again [:n "0"]]
+   [:returning-insert [["c1" [:n "1"]]]]
+   [:returning-conflict []]
+   [:returning-update [["c2" [:n "2"]]]]
+   [:returning-update-miss []]
+   [:update-many [:n "6"]]
+   [:ddl-update-count [:n "6"]]
+   [:execute-statement-select true]
+   [:execute-statement-insert false]
+   [:execute-update-on-select :refused]
+   [:execute-query-on-insert :refused]
+   [:next-exhaustion [true true false false]]
+   [:next-empty [false false]]
+   [:batch [[[:n "1"] [:n "1"] [:n "0"]] [] []]]
+   [:auto-commit-initial true]
+   [:commit-in-auto-commit :refused]
+   [:rollback-in-auto-commit :refused]
+   [:auto-commit-off false]
+   [:txn-own-view [:n "5"]]
+   [:txn-other-view-before-rollback [:n "4"]]
+   [:after-rollback [:n "4"]]
+   [:txn-other-view-before-commit [:n "4"]]
+   [:txn-other-view-after-commit [:n "5"]]
+   [:set-auto-commit-true-commits [:n "6"]]
+   [:auto-commit-restored true]
+   [:constraint-violation :refused]
+   [:after-constraint [:n "6"]]
+   [:bad-column-index :refused]
+   [:column-index-zero :refused]
+   [:bad-column-label :refused]
+   [:was-null-before-read :refused]
+   [:bind-index-zero :refused]
+   [:closed? true]
+   [:close-twice-closed? true]
+   [:prepare-on-closed :refused]
+   [:create-statement-on-closed :refused]])

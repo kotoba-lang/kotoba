@@ -112,6 +112,39 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `org.loraAlliance.lorawan` | `org.loraAlliance.lorawan/src` | `lorawan.bytes`, `lorawan.cmac`, `lorawan.crypt`, `lorawan.frame` (an external specification, publisher loraAlliance.org) |
+| `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
+| `org.threadgroup.thread` | `org.threadgroup.thread/src` | `thread.dispatch`, `thread.frag`, `thread.iphc`, `thread.mesh` (an external specification, publisher threadgroup.org) |
+| `org.threejs.core` | `org.threejs.core/src` | `org-threejs.core`, `org-threejs.gltf`, `org-threejs.interop`, `org-threejs.vrm` (an external specification, publisher threejs.org) |
+| `kotoba.wgsl` | `kotoba.wgsl/src` | `kami.wgsl`, `kotoba.wgsl` (Kotoba project library) |
+| `kotoba.webgpuRs` | `kotoba.webgpuRs/src` | `kotoba.webgpu-rs`, `kotoba.webgpu-rs.config`, `kotoba.webgpu-rs.demo`, `kotoba.webgpu-rs.edn` (Kotoba project library) |
+| `kotoba.toml` | `kotoba.toml/src` | `kotoba.toml`, `toml.core` (Kotoba project library) |
+| `kotoba.srt` | `kotoba.srt/src` | `kotoba.srt`, `srt.core` (Kotoba project library) |
+| `kotoba.sql` | `kotoba.sql/src` | `kotoba.sql`, `kotoba.sql.conn`, `sql.core` (Kotoba project library) |
+| `kotoba.sprite2d` | `kotoba.sprite2d/src` | `kami.sprite2d`, `kami.sprite2d.layout`, `kotoba.sprite2d`, `kotoba.sprite2d.animation` (Kotoba project library) |
+| `kotoba.spirv` | `kotoba.spirv/src` | `kotoba.spirv`, `spirv.core` (Kotoba project library) |
+| `kotoba.securities` | `kotoba.securities/src` | `kotoba.securities`, `kotoba.securities.export`, `kotoba.securities.pricing`, `kotoba.securities.ui` (Kotoba project library) |
+| `kotoba.proto` | `kotoba.proto/src` | `kotoba.proto`, `proto.core`, `proto.wire` (Kotoba project library) |
+| `kotoba.pqh` | `kotoba.pqh/src` | `kotoba.lang.pqh.crypto`, `kotoba.lang.pqh.did-signal`, `kotoba.lang.pqh.kdf`, `kotoba.lang.pqh.pq` (Kotoba project library) |
+| `kotoba.playwright` | `kotoba.playwright/src` | `kami.playwright`, `kotoba.playwright`, `playwright-clj.core`, `playwright-clj.install` (Kotoba project library) |
+| `kotoba.pipelines` | `kotoba.pipelines/src` | `kami.pipelines`, `kotoba.pipelines` (Kotoba project library) |
+| `kotoba.physics` | `kotoba.physics/src` | `kami.physics`, `kotoba.physics`, `kotoba.physics.cloth`, `kotoba.physics.contract` (Kotoba project library) |
+| `co.huggingface.safetensors` | `co.huggingface.safetensors/src` | `safetensors.bytes`, `safetensors.core`, `safetensors.dtype`, `safetensors.json` (Kotoba project library) |
+| `kotoba.netsync` | `kotoba.netsync/src` | `kami.netsync`, `kami.netsync.fighting`, `kami.netsync.fps`, `kami.relevancy` (Kotoba project library) |
+| `kotoba.mermaid` | `kotoba.mermaid/src` | `kotoba.mermaid`, `mermaid.core` (Kotoba project library) |
+| `kotoba.level` | `kotoba.level/src` | `kami.level`, `kotoba.level` (Kotoba project library) |
+| `kotoba.kotobaScript` | `kotoba.kotobaScript/src` | `kotoba.script`, `kotoba.script.js-value` (Kotoba project library) |
+| `kotoba.kicad` | `kotoba.kicad/src` | `kicad.core`, `kotoba.kicad` (Kotoba project library) |
+| `kotoba.gpu` | `kotoba.gpu/src` | `kami.gpu`, `kami.gpu.launch`, `kotoba.gpu` (Kotoba project library) |
+| `kotoba.fsm` | `kotoba.fsm/src` | `kami.fsm`, `kami.fsm-oracle`, `kotoba.fsm` (Kotoba project library) |
+| `kotoba.exr` | `kotoba.exr/src` | `exr.core`, `kotoba.exr` (Kotoba project library) |
+| `kotoba.dxf` | `kotoba.dxf/src` | `dxf.core`, `kotoba.dxf` (Kotoba project library) |
+| `kotoba.dcs` | `kotoba.dcs/src` | `dcs.alarm`, `dcs.execute`, `dcs.gpio`, `dcs.modbus` (Kotoba project library) |
+| `kotoba.dance` | `kotoba.dance/src` | `kami.dance`, `kotoba.dance` (Kotoba project library) |
+| `kotoba.cue` | `kotoba.cue/src` | `cue.core`, `kotoba.cue` (Kotoba project library) |
+| `kotoba.chie` | `kotoba.chie/src` | `chie.cell`, `chie.cells.social-post.state-machine`, `chie.methods.analyze`, `chie.methods.autorun` (Kotoba project library) |
+| `kotoba.capnp` | `kotoba.capnp/src` | `capnp.core`, `kotoba.capnp` (Kotoba project library) |
+| `kotoba.bitcoinConsensus` | `kotoba.bitcoinConsensus/src` | `bitcoin.consensus.assumeutxo`, `bitcoin.consensus.block`, `bitcoin.consensus.chainstate`, `bitcoin.consensus.codec` (Kotoba project library) |
 | `kotoba.tenken` | `kotoba.tenken/src` | `tenken.eval`, `tenken.model`, `tenken.policy` (Kotoba project library) |
 | `kotoba.techIpfsSpecsUnixfs` | `kotoba.techIpfsSpecsUnixfs/src` | `unixfs.file` (Kotoba project library) |
 | `kotoba.occupation` | `kotoba.occupation/src` | `kotoba.occupation`, `kotoba.occupation.embedded`, `kotoba.occupation.wave` (Kotoba project library) |

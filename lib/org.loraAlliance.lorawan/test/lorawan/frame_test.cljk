@@ -1,0 +1,113 @@
+(ns lorawan.frame-test
+  "End-to-end data-frame round trip: `lorawan.phy` + `lorawan.mic` +
+  `lorawan.crypt` through `lorawan.frame`'s `encode-data-frame`/
+  `decode-data-frame`. No published spec test vectors exist for a full
+  encrypted+authenticated LoRaWAN frame (as with the rest of this
+  library's crypto-adjacent layers); this suite is self-consistency
+  (`decode(encode(x)) == x`) over a randomised sweep, plus the required
+  negative-test discrimination proof for `:lorawan/mic-mismatch`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [lorawan.frame :as frame]))
+
+(def nwk-s-key (vec (range 0 16)))
+(def app-s-key (vec (range 16 32)))
+
+;; A small deterministic LCG — not `rand-int`, so the sweep is
+;; reproducible across runs and across the JVM/ClojureScript hosts, which
+;; use different PRNGs and seeding behavior.
+(defn- lcg-seq [seed n]
+  (rest (take (inc n) (iterate #(mod (+ (* 1103515245 %) 12345) 2147483648) seed))))
+
+(defn- frame-opts [i]
+  (let [[fcnt-lo dev-lo plen fport-raw payload-seed]
+        (lcg-seq (+ 1 i) 5)
+        ftype (nth [:unconfirmed-data-up :confirmed-data-up
+                    :unconfirmed-data-down :confirmed-data-down]
+                   (mod i 4))
+        fport (inc (mod fport-raw 200))
+        payload (vec (map #(mod (+ payload-seed (* 13 %)) 256) (range (mod plen 60))))]
+    {:ftype ftype
+     :dev-addr (mod dev-lo 0x100000000)
+     :fcnt32 (mod fcnt-lo 100000)
+     :fctrl {:adr (odd? i) :ack (even? i)}
+     :fopts []
+     :fport (when (seq payload) fport)
+     :payload payload
+     :nwk-s-key nwk-s-key
+     :app-s-key app-s-key}))
+
+(deftest data-frame-round-trips-over-a-randomised-sweep
+  (doseq [i (range 200)]
+    (let [opts (frame-opts i)
+          enc (frame/encode-data-frame opts)]
+      (is (= :ok (:status enc)) (str "encode failed at i=" i " " (pr-str enc)))
+      (let [dec (frame/decode-data-frame (:bytes enc) {:fcnt32 (:fcnt32 opts)
+                                                         :nwk-s-key nwk-s-key :app-s-key app-s-key})]
+        (is (= :ok (:status dec)) (str "decode failed at i=" i " " (pr-str dec)))
+        (is (= (:ftype opts) (:ftype dec)) (str "ftype at i=" i))
+        (is (= (:dev-addr opts) (:dev-addr dec)) (str "dev-addr at i=" i))
+        (is (= (mod (:fcnt32 opts) 0x10000) (:fcnt dec)) (str "fcnt at i=" i))
+        (is (= (:payload opts) (:payload dec)) (str "payload at i=" i))
+        (is (= (:fport opts) (:fport dec)) (str "fport at i=" i))))))
+
+(deftest data-frame-with-fopts-round-trips
+  (let [opts (assoc (frame-opts 3) :fopts [0x06] :fport nil :payload [])
+        enc (frame/encode-data-frame opts)]
+    (is (= :ok (:status enc)))
+    (let [dec (frame/decode-data-frame (:bytes enc) {:fcnt32 (:fcnt32 opts)
+                                                       :nwk-s-key nwk-s-key :app-s-key app-s-key})]
+      (is (= :ok (:status dec)))
+      (is (= [0x06] (:fopts dec)))
+      (is (= [] (:payload dec))))))
+
+(deftest port-0-payload-uses-nwk-s-key-not-app-s-key
+  ;; §4.3.3 Table 11 — decrypting with the wrong key on FPort 0 must not
+  ;; silently produce plausible-looking garbage that happens to compare
+  ;; equal; it must produce garbage that differs from the plaintext.
+  (let [opts (assoc (frame-opts 7) :fport 0 :payload [0x01 0x02 0x03 0x04 0x05])
+        enc (frame/encode-data-frame opts)
+        dec (frame/decode-data-frame (:bytes enc) {:fcnt32 (:fcnt32 opts)
+                                                     :nwk-s-key nwk-s-key :app-s-key app-s-key})]
+    (is (= :ok (:status dec)))
+    (is (= [0x01 0x02 0x03 0x04 0x05] (:payload dec)))))
+
+;; ── negative tests: named errors, never thrown, discrimination proved ──────
+
+(deftest not-a-data-frame-is-a-named-error
+  (let [wire [0x00 0x01 0x02 0x03 0x04]] ; MHDR = join-request (FType 0)
+    (is (= :lorawan/not-a-data-frame
+           (:reason (frame/decode-data-frame wire {:fcnt32 0 :nwk-s-key nwk-s-key :app-s-key app-s-key}))))))
+
+(deftest discrimination-mic-mismatch-fires-specifically-not-generically
+  (let [opts (frame-opts 11)
+        enc (frame/encode-data-frame opts)
+        good-wire (:bytes enc)
+        decode-opts {:fcnt32 (:fcnt32 opts) :nwk-s-key nwk-s-key :app-s-key app-s-key}]
+    (testing "control: unmodified frame decodes cleanly"
+      (is (= :ok (:status (frame/decode-data-frame good-wire decode-opts)))))
+    (testing "break: flip the last MIC byte, confirm the SPECIFIC :lorawan/mic-mismatch reason"
+      (let [broken (update good-wire (dec (count good-wire)) bit-xor 0x01)
+            result (frame/decode-data-frame broken decode-opts)]
+        (is (= :error (:status result)))
+        (is (= :lorawan/mic-mismatch (:reason result))
+            (str "wrong reason: " (pr-str result)))))
+    (testing "restore: the original wire bytes decode cleanly again"
+      (is (= :ok (:status (frame/decode-data-frame good-wire decode-opts)))))
+    (testing "break differently: same corrupted MIC, wrong fcnt32 too — still names :lorawan/mic-mismatch, not a different failure"
+      (let [broken (update good-wire (dec (count good-wire)) bit-xor 0x01)
+            result (frame/decode-data-frame broken (assoc decode-opts :fcnt32 (inc (:fcnt32 opts))))]
+        (is (= :lorawan/mic-mismatch (:reason result)))))))
+
+(deftest discrimination-tampered-payload-without-tampered-mic-also-fails-mic-not-silently-decrypts
+  ;; This is the security property the MIC exists for: corrupting
+  ;; FRMPayload without knowing the key changes the bytes the MIC covers,
+  ;; so the MIC check (which runs BEFORE decryption) must catch it.
+  (let [opts (assoc (frame-opts 13) :payload [0xAA 0xBB 0xCC 0xDD])
+        enc (frame/encode-data-frame opts)
+        good-wire (:bytes enc)
+        decode-opts {:fcnt32 (:fcnt32 opts) :nwk-s-key nwk-s-key :app-s-key app-s-key}
+        ;; flip a byte in the middle of the frame, well before the MIC —
+        ;; index chosen to land inside FRMPayload for every ftype used here
+        tampered (update good-wire (- (count good-wire) 5) bit-xor 0xFF)]
+    (is (= :ok (:status (frame/decode-data-frame good-wire decode-opts))) "control")
+    (is (= :lorawan/mic-mismatch (:reason (frame/decode-data-frame tampered decode-opts))))))

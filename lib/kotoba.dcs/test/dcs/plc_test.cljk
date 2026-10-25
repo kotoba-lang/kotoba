@@ -1,0 +1,92 @@
+(ns dcs.plc-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [dcs.model :as m]
+            [dcs.ports :as ports]
+            [dcs.execute :as execute]
+            [dcs.plc :as plc]
+            [dcs.modbus :as modbus])
+  (:import
+   (com.digitalpetri.modbus.client ModbusTcpClient)
+   (com.digitalpetri.modbus.tcp.client NettyTcpClientTransport)
+   (com.digitalpetri.modbus.pdu ReadHoldingRegistersRequest)
+   (java.nio ByteBuffer)
+   (java.util.function Consumer)))
+
+(defrecord AtomIO [values]
+  ports/IFieldIO
+  (read-tag [_ tag-id] (get @values tag-id))
+  (write-tag! [_ tag-id value] (swap! values assoc tag-id value)))
+
+(def ^:private test-port 15022)
+
+(defn- pid-system []
+  (-> (m/system)
+      (m/add-tag (m/tag "PV1" :ai {:range [0 500]}))
+      (m/add-tag (m/tag "OUT1" :ao {:range [0.0 100.0]}))
+      (m/add-loop (m/ctrl-loop "L1" {:pv-tag "PV1" :output-tag "OUT1" :mode :auto
+                                      :setpoint 400.0 :tuning {:kp 0.01 :ki 0.01 :kd 0.0}
+                                      :output-limits [0.0 100.0]}))))
+
+(deftest scan-service-advances-state-continuously
+  (let [io (->AtomIO (atom {"PV1" 50.0}))
+        handle (plc/start! (pid-system) io {:dt 0.02})]
+    (try
+      (Thread/sleep 150)
+      (testing "the background scan cycle has ticked multiple times on its own, unattended"
+        (is (>= @(:dcs/cycle-count handle) 4)))
+      (testing "dcs.execute/scan actually ran against the live IFieldIO -- OUT1 was written"
+        (is (some? (ports/read-tag io "OUT1"))))
+      (testing "the threaded state matches what a direct (non-threaded) dcs.execute/scan would produce for one cycle from init"
+        ;; sanity: init-state + one scan should NOT equal the accumulated multi-cycle state
+        ;; (proves this genuinely ran >1 cycle, not just once)
+        (let [single (execute/scan (pid-system) (execute/init-state) (->AtomIO (atom {"PV1" 50.0})) 0.02)]
+          (is (not= (:dcs/state' single) @(:dcs/state handle)))))
+      (finally
+        (plc/stop! handle)))
+    (testing "stop! actually stops the background thread"
+      (is (false? (plc/running? handle)))
+      (let [count-after-stop @(:dcs/cycle-count handle)]
+        (Thread/sleep 100)
+        (is (= count-after-stop @(:dcs/cycle-count handle)))))))
+
+(defn- real-client ^ModbusTcpClient [port]
+  (let [transport (NettyTcpClientTransport/create
+                    (reify Consumer
+                      (accept [_this b]
+                        (set! (.hostname b) "127.0.0.1")
+                        (set! (.port b) (int port)))))]
+    (ModbusTcpClient/create transport)))
+
+(defn- read-word [^ModbusTcpClient client addr]
+  (let [resp (.readHoldingRegisters client 1 (ReadHoldingRegistersRequest. addr 1))
+        bb (ByteBuffer/wrap (.registers resp))]
+    (bit-and (int (.getShort bb)) 0xFFFF)))
+
+(deftest live-scan-cycle-is-observable-through-a-real-modbus-client
+  (testing "the concrete 'simulated PLC' proof: dcs.plc (persistent scan-cycle service) and
+           dcs.modbus (real Modbus TCP server) share ONE live IFieldIO. A real, independent
+           Modbus client polling the server while the scan cycle runs in the background sees
+           OUT1 actually changing between polls -- the PID logic is genuinely executing on
+           its own schedule, not serving a frozen snapshot."
+    (let [io (->AtomIO (atom {"PV1" 50.0}))
+          rm (-> (modbus/register-map)
+                 (modbus/add-holding
+                  (modbus/holding-register 0 "OUT1" (modbus/scaled-int16 100 false) :read-only)))
+          plc-handle (plc/start! (pid-system) io {:dt 0.02})
+          modbus-handle (modbus/start-server! io rm {:port test-port})]
+      (try
+        (let [client (real-client test-port)]
+          (.connect client)
+          (try
+            (Thread/sleep 60)
+            (let [v1 (read-word client 0)]
+              (Thread/sleep 200)
+              (let [v2 (read-word client 0)]
+                (is (>= @(:dcs/cycle-count plc-handle) 5)
+                    "the scan cycle must actually have run several times during the poll window")
+                (is (not= v1 v2)
+                    "a real external Modbus client must observe OUT1 changing across polls")))
+            (finally (.disconnect client))))
+        (finally
+          (modbus/stop-server! modbus-handle)
+          (plc/stop! plc-handle))))))

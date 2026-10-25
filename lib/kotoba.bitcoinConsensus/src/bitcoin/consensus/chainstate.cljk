@@ -1,0 +1,1017 @@
+(ns bitcoin.consensus.chainstate
+  "Pure most-work block tree with atomic UTXO reorganization."
+  (:require [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.codec :as codec]
+            #?(:clj [bitcoin.consensus.script :as script])
+            #?(:clj [bitcoin.consensus.signet :as signet])
+            [bitcoin.consensus.transaction :as transaction]
+            [bitcoin.consensus.utxo :as utxo]
+            [bitcoin.consensus.versionbits :as versionbits]
+            [kotoba.lang.text :as str]
+            [kotobase.bitcoin.protocol :as header]))
+
+(defn- hex-bytes [value]
+  (mapv (fn [pair]
+          #?(:clj (Integer/parseInt (apply str pair) 16)
+             :cljs (js/parseInt (apply str pair) 16)))
+        (partition 2 value)))
+
+(def consensus-parameters
+  {:mainnet {:bip34-height 227931
+             :bip34-hash
+             "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+             :bip65-height 388381
+             :bip66-height 363725
+             :csv-height 419328
+             :bip113-height 419328
+             :segwit-height 481824
+             :taproot-height 709632
+             :taproot-deployment
+             {:bit 2 :start-time 1619222400 :timeout 1628640000
+              :min-activation-height 709632 :threshold 1815 :period 2016}
+             :halving-interval 210000
+             :assume-valid-hash
+             "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"
+             :minimum-chainwork
+             (hex-bytes
+              "0000000000000000000000000000000000000001128750f82f4c366153a3a030")
+             :script-flag-exceptions
+             {"00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+              #{}
+              "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+              #{:p2sh :witness}}}
+   :testnet {:bip34-height 21111
+             :bip34-hash
+             "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+             :bip65-height 581885
+             :bip66-height 330776
+             :csv-height 770112
+             :bip113-height 770112
+             :segwit-height 834624
+             ;; Taproot activation is versionbits-derived on testnet.
+             :taproot-height nil
+             :taproot-deployment
+             {:bit 2 :start-time 1619222400 :timeout 1628640000
+              :min-activation-height 0 :threshold 1512 :period 2016}
+             :halving-interval 210000
+             :assume-valid-hash
+             "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
+             :minimum-chainwork
+             (hex-bytes
+              "0000000000000000000000000000000000000000000017dde1c649f3708d14b6")
+             :script-flag-exceptions
+             {"00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"
+              #{}}}
+   :testnet4 {:bip34-height 1
+              :bip65-height 1
+              :bip66-height 1
+              :csv-height 1
+              :bip113-height 1
+              :segwit-height 1
+              :enforce-bip94? true
+              :difficulty-adjustment-interval 2016
+              :max-timewarp 600
+              :taproot-height 1
+              :taproot-deployment {:always-active? true}
+              :halving-interval 210000
+              :assume-valid-hash
+              "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+              :minimum-chainwork
+              (hex-bytes
+               "0000000000000000000000000000000000000000000009a0fe15d0177d086304")
+              :script-flag-exceptions {}}
+   :signet {:bip34-height 1
+            :bip65-height 1
+            :bip66-height 1
+            :csv-height 1
+            :bip113-height 1
+            :segwit-height 1
+            :taproot-height 1
+            :taproot-deployment {:always-active? true}
+            :halving-interval 210000
+            :signet? true
+            :assume-valid-hash
+            "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"
+            :minimum-chainwork
+            (hex-bytes
+             "00000000000000000000000000000000000000000000000000000b463ea0a4b8")
+            :script-flag-exceptions {}}
+   :regtest {:bip34-height 1
+             :bip65-height 1
+             :bip66-height 1
+             :csv-height 1
+             :bip113-height 1
+             :segwit-height 0
+             :taproot-height 0
+             :taproot-deployment {:always-active? true}
+             :halving-interval 150
+             :assume-valid-hash nil
+             :minimum-chainwork header/zero-chainwork
+             :script-flag-exceptions {}}})
+
+(def bip30-repeat-blocks
+  #{"00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+    "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"})
+
+(def bip30-recheck-height 1983702)
+
+(defn script-flags
+  "Bitcoin Core block-consensus Script flags for a known block.
+
+  Core retroactively keeps P2SH, WITNESS, and TAPROOT enabled across history
+  and removes only the flags named by its two historical exception blocks.
+  Buried-deployment flags are added after applying that exception."
+  ([parameters height block-hash]
+   (script-flags parameters height block-hash nil))
+  ([{:keys [bip65-height bip66-height csv-height segwit-height
+            script-flag-exceptions]}
+    height block-hash _taproot-active?]
+   (cond-> (get script-flag-exceptions block-hash
+                #{:p2sh :witness :taproot})
+     (>= height bip66-height) (conj :dersig)
+     (>= height bip65-height) (conj :cltv)
+     (>= height csv-height) (conj :csv)
+     (>= height segwit-height) (conj :null-dummy))))
+
+#?(:clj
+   (defn- verifier-for
+     [state height block-hash override]
+     (or override
+         (let [flags
+               (script-flags
+                (:consensus state) height block-hash
+                (or (= :active
+                       (get-in state
+                               [:nodes block-hash :deployments :taproot]))
+                    (true?
+                     (get-in state
+                             [:consensus :taproot-deployment
+                              :always-active?]))))]
+           (fn [transaction input-index coin]
+             (script/verify-input transaction input-index coin flags)))))
+   :cljs
+   (defn- verifier-for
+     [_state _height _block-hash override]
+     (or override
+         (codec/fail! :bitcoin.consensus/missing-script-verifier
+                      "The built-in Script VM is currently JVM-only." {}))))
+
+#?(:clj
+   (defn- sigop-counter
+     [parameters height block-hash]
+     (let [flags (script-flags parameters height block-hash)]
+       (fn [transaction coins]
+         (script/transaction-sigop-cost transaction coins flags))))
+   :cljs
+   (defn- sigop-counter [_parameters _height _block-hash] nil))
+
+(defn- parent-hash [parsed-block]
+  (header/natural-hash->hex (get-in parsed-block [:header :prev-block])))
+
+(defn initialize
+  "Create chainstate from the network's actual genesis block."
+  ([network genesis-block]
+   (initialize network genesis-block nil))
+  ([network genesis-block verify-script]
+   (let [expected (header/genesis-header network)
+        actual (:header genesis-block)]
+    (when-not (= (:hash expected) (:hash actual))
+      (codec/fail! :bitcoin.consensus/wrong-genesis
+                   "Genesis block does not match the configured network."
+                   {:network network :actual (:hash-hex actual)}))
+    (let [base-state {:network network
+                      :consensus (get consensus-parameters network)}
+          taproot-active?
+          (true? (get-in base-state
+                         [:consensus :taproot-deployment :always-active?]))
+          verifier (verifier-for base-state 0 (:hash-hex actual)
+                                 verify-script)
+          {validated-genesis :state}
+          (utxo/apply-block-with-undo
+           utxo/empty-state genesis-block 0 verifier
+           {:sigop-cost-fn
+            (sigop-counter (:consensus base-state) 0 (:hash-hex actual))
+            :halving-interval
+            (get-in base-state [:consensus :halving-interval])})
+          ;; Core indexes the genesis block but never connects its transaction
+          ;; to CoinsDB. The genesis coinbase is therefore absent forever.
+          utxo-state (assoc validated-genesis :coins {})
+          undo {:height -1 :spent {} :created #{}}
+          hash (:hash-hex actual)
+          chainwork (header/header-work (:bits actual))]
+      {:network network
+       :consensus (:consensus base-state)
+       :active-tip hash
+       :best-header hash
+       :header-tips #{hash}
+       :invalid-blocks {}
+       :utxo utxo-state
+       :nodes {hash {:hash hash :parent nil :height 0
+                     :header actual :block genesis-block
+                     :chainwork chainwork :undo undo
+                     :deployments
+                     {:taproot (if taproot-active? :active :defined)}
+                     :active? true :header-valid? true
+                     :block-valid? true :scripts-checked? true}}}))))
+
+(defn- ancestor-nodes [state hash limit]
+  (loop [hash hash remaining limit newest []]
+    (if (or (nil? hash) (zero? remaining))
+      (vec (reverse newest))
+      (let [node (get-in state [:nodes hash])]
+        (recur (:parent node) (dec remaining) (conj newest node))))))
+
+(defn- validate-buried-header-version!
+  [{:keys [bip34-height bip66-height bip65-height]} height header]
+  (let [version (:version header)
+        [minimum deployment activation-height]
+        (cond
+          (>= height bip65-height) [4 :bip65 bip65-height]
+          (>= height bip66-height) [3 :bip66 bip66-height]
+          (>= height bip34-height) [2 :bip34 bip34-height]
+          :else [nil nil nil])]
+    (when (and minimum (< version minimum))
+      (codec/fail! :bitcoin.consensus/obsolete-block-version
+                   "Block version predates an active buried deployment."
+                   {:height height
+                    :version version
+                    :minimum minimum
+                    :deployment deployment
+                    :activation-height activation-height}))))
+
+(defn validate-bip94-timewarp!
+  "Enforce Core's BIP94 adjustment-boundary timestamp floor.
+
+  On testnet4, the first block of each 2,016-block difficulty period may not
+  predate its parent by more than 600 seconds. The equality boundary is valid,
+  matching `ContextualCheckBlockHeader` in Bitcoin Core."
+  [{:keys [enforce-bip94? difficulty-adjustment-interval max-timewarp]}
+   height parent-header candidate-header]
+  (when (and enforce-bip94?
+             (pos? height)
+             (zero? (mod height difficulty-adjustment-interval))
+             (< (:timestamp candidate-header)
+                (- (:timestamp parent-header) max-timewarp)))
+    (codec/fail! :bitcoin.consensus/timewarp-attack
+                 "Block timestamp is too early at a BIP94 adjustment boundary."
+                 {:height height
+                  :timestamp (:timestamp candidate-header)
+                  :parent-timestamp (:timestamp parent-header)
+                  :minimum-timestamp
+                  (- (:timestamp parent-header) max-timewarp)}))
+  candidate-header)
+
+(declare invalid-ancestor)
+
+(defn- validate-header! [state parsed-block now]
+  (let [parent (parent-hash parsed-block)
+        parent-node (get-in state [:nodes parent])]
+    (when-not parent-node
+      (codec/fail! :bitcoin.consensus/unknown-parent
+                   "Block parent is unknown."
+                   {:parent parent}))
+    (when-let [failed (invalid-ancestor state parent)]
+      (codec/fail! :bitcoin.consensus/invalid-ancestor
+                   "Block descends from a known-invalid block."
+                   {:parent parent :invalid-ancestor failed}))
+    (let [context (ancestor-nodes state parent 2017)
+          headers (conj (mapv :header context) (:header parsed-block))
+          result
+          (header/validate-header-consensus
+           headers
+           {:network (:network state)
+            :start-height (:height (first context))
+            :validate-from-index (count context)
+            :now now})]
+      (when-not (:valid? result)
+        (codec/fail! :bitcoin.consensus/invalid-header
+                     "Block header failed contextual consensus."
+                     {:errors (:errors result)}))
+      (validate-bip94-timewarp!
+       (:consensus state) (inc (:height parent-node))
+       (:header parent-node) (:header parsed-block))
+      (validate-buried-header-version!
+       (:consensus state) (inc (:height parent-node))
+       (:header parsed-block))
+      parent-node)))
+
+(declare next-taproot-state)
+
+(defn header-tips
+  "Return the known header leaves, deriving them for pre-v3 states."
+  [state]
+  (or (:header-tips state)
+      (let [nodes (:nodes state)
+            parents (into #{} (keep (comp :parent val)) nodes)]
+        (into #{} (remove parents) (keys nodes)))))
+
+(defn invalid-blocks
+  "Return the minimal persisted set of directly failed block roots."
+  [state]
+  (or (:invalid-blocks state) {}))
+
+(defn invalid-ancestor
+  "Return the first directly invalid block on `hash` ancestry, if any."
+  [state hash]
+  (let [failed (invalid-blocks state)]
+    (when (seq failed)
+      (loop [current hash]
+        (cond
+          (nil? current) nil
+          (contains? failed current) current
+          :else (recur (get-in state [:nodes current :parent])))))))
+
+(defn block-invalid?
+  "True when a block or one of its ancestors is permanently invalid."
+  [state hash]
+  (some? (invalid-ancestor state hash)))
+
+(defn- best-viable-header
+  [state]
+  (let [failed (invalid-blocks state)
+        candidates
+        (into
+         #{(:active-tip state)}
+         (concat
+          (header-tips state)
+          (keep #(get-in state [:nodes % :parent]) (keys failed))))
+        viable
+        (->> candidates
+             (remove nil?)
+             (remove #(block-invalid? state %))
+             sort)]
+    (when (block-invalid? state (:active-tip state))
+      (codec/fail!
+       :bitcoin.consensus/invalid-active-chain
+       "A validated active-chain block cannot be invalidated."
+       {:active-tip (:active-tip state)}))
+    (reduce
+     (fn [best hash]
+       (if (or (nil? best)
+               (header/better-chain?
+                (get-in state [:nodes hash :chainwork])
+                (get-in state [:nodes best :chainwork])))
+         hash
+         best))
+     nil
+     viable)))
+
+(defn mark-block-invalid
+  "Persist one definitive block-consensus failure and recover fork choice.
+
+  Descendants are invalid implicitly through ancestry. Redundant descendant
+  roots are removed, keeping the durable failure set minimal. An already
+  validated block, including genesis, can never be marked invalid."
+  [state hash reason]
+  (let [node (get-in state [:nodes hash])]
+    (when-not node
+      (codec/fail! :bitcoin.consensus/unknown-invalid-block
+                   "Cannot invalidate an unknown block header."
+                   {:hash hash}))
+    (when (or (nil? (:parent node)) (true? (:block-valid? node)))
+      (codec/fail! :bitcoin.consensus/validated-block-invalidation
+                   "A validated block cannot be marked invalid."
+                   {:hash hash :height (:height node)}))
+    (if (block-invalid? state hash)
+      state
+      (let [existing (invalid-blocks state)
+            retained
+            (into {}
+                  (remove
+                   (fn [[failed-hash]]
+                     (loop [current failed-hash]
+                       (cond
+                         (nil? current) false
+                         (= hash current) true
+                         :else
+                         (recur
+                          (get-in state [:nodes current :parent]))))))
+                  existing)
+            failed
+            (assoc retained hash
+                   {:height (:height node)
+                    :reason reason})
+            marked
+            (assoc state
+                   :header-tips (header-tips state)
+                   :invalid-blocks failed)
+            best (best-viable-header marked)]
+        (when-not best
+          (codec/fail! :bitcoin.consensus/no-viable-header
+                       "Block invalidation left no viable header chain."
+                       {:hash hash}))
+        (assoc marked :best-header best)))))
+
+(defn invalid-block-error?
+  "True when an exception identifies a definitive block-consensus failure."
+  [error]
+  (let [data (ex-data error)]
+    (and (string? (:invalid-block-hash data))
+         (= :invalid (:block-validation-result data))
+         (true? (:consensus-invalid? data)))))
+
+(def ^:private mutated-block-error-types
+  ;; Core reports every CheckWitnessMalleation failure as BLOCK_MUTATED. Such
+  ;; a body may be transport-corrupted or malleated and must not poison the
+  ;; otherwise valid header hash permanently.
+  #{:bitcoin.consensus/missing-witness-commitment
+    :bitcoin.consensus/bad-witness-reserved-value
+    :bitcoin.consensus/bad-witness-commitment
+    :bitcoin.consensus/unexpected-witness
+    :bitcoin.consensus/mutated-merkle-tree
+    :bitcoin.consensus/bad-merkle-root})
+
+(def ^:private local-validation-error-types
+  ;; These mean the validator lacks required local state/capability. Marking
+  ;; the remote branch invalid would turn disk damage or host configuration
+  ;; into a persistent consensus decision.
+  #{:bitcoin.consensus/missing-script-verifier
+    :bitcoin.consensus/missing-locktime-ancestor
+    :bitcoin.consensus/unknown-bip30-block
+    :bitcoin.consensus/missing-prevout-data
+    :bitcoin.consensus/missing-block-data
+    :bitcoin.consensus/missing-undo
+    :bitcoin.consensus/closed-utxo-view
+    :bitcoin.consensus/uncommitted-utxo-enumeration
+    :bitcoin.consensus/invalid-outpoint
+    :bitcoin.consensus/invalid-active-chain
+    :bitcoin.consensus/no-viable-header
+    :bitcoin.consensus/unknown-invalid-block
+    :bitcoin.consensus/validated-block-invalidation
+    :bitcoin.consensus/header-block-mismatch
+    :bitcoin.consensus/wrong-genesis
+    :bitcoin.consensus/unknown-parent
+    :bitcoin.consensus/duplicate-header-batch
+    :bitcoin.consensus/known-header-batch
+    :bitcoin.consensus/known-invalid-block
+    :bitcoin.consensus/fault-injector
+    :bitcoin.consensus/sync-resource-limit
+    :bitcoin.consensus/unknown-peer
+    :bitcoin.consensus/chainstate-checksum-mismatch
+    :bitcoin.consensus/chainstate-network-mismatch
+    :bitcoin.consensus/chainstate-not-found
+    :bitcoin.consensus/corrupt-chainstate
+    :bitcoin.consensus/unsupported-chainstate-format})
+
+(def ^:private local-validation-error-prefixes
+  ["sqlite-" "pending-block" "undo-"])
+
+(defn- local-validation-error-type? [type]
+  (or (contains? local-validation-error-types type)
+      (and (keyword? type)
+           (= "bitcoin.consensus" (namespace type))
+           (some #(str/starts-with? (name type) %)
+                 local-validation-error-prefixes))))
+
+(defn block-validation-result
+  "Classify an ExceptionInfo at the block-index failure boundary.
+
+  `:invalid` is a definitive consensus failure, `:mutated` is a retryable body
+  failure that must not poison its header, `:local` requires host recovery,
+  and `:unknown` is outside the consensus error vocabulary."
+  [error]
+  (let [type (:type (ex-data error))]
+    (cond
+      (contains? mutated-block-error-types type) :mutated
+      (local-validation-error-type? type) :local
+      (= "bitcoin.consensus" (namespace type)) :invalid
+      :else :unknown)))
+
+(defn mutated-block-error?
+  "True when a block body should be fetched again without invalidating its header."
+  [error]
+  (= :mutated (block-validation-result error)))
+
+(defn local-validation-error?
+  "True when validation stopped because required local state was unavailable."
+  [error]
+  (= :local (block-validation-result error)))
+
+(defn annotate-block-validation-error
+  "Attach a known block hash without collapsing mutation or local failures.
+
+  Hosts that parse a body outside `accept-block` use this same boundary before
+  making durable invalid-branch decisions."
+  [hash error]
+  (let [data (ex-data error)
+        result (block-validation-result error)]
+    (case result
+      :invalid
+      (ex-info
+       #?(:clj (.getMessage ^Throwable error)
+          :cljs (.-message error))
+       (assoc data
+              :block-hash hash
+              :invalid-block-hash hash
+              :block-validation-result :invalid
+              :consensus-invalid? true)
+       error)
+
+      :mutated
+      (ex-info
+       #?(:clj (.getMessage ^Throwable error)
+          :cljs (.-message error))
+       (assoc data
+              :block-hash hash
+              :block-validation-result :mutated
+              :retryable? true)
+       error)
+
+      ;; Local and unknown exceptions retain their original data. Callers can
+      ;; recover the host without attributing a consensus failure to a branch.
+      error)))
+
+(defn- index-valid-header
+  ([state parsed-header]
+   (index-valid-header state parsed-header
+                       (header/header-work (:bits parsed-header))))
+  ([state parsed-header work]
+   (let [hash (:hash-hex parsed-header)
+         parent (header/natural-hash->hex (:prev-block parsed-header))
+         parent-node (get-in state [:nodes parent])
+         height (inc (:height parent-node))
+         node
+         {:hash hash :parent (:hash parent-node)
+          :height height :header parsed-header :block nil
+          :deployments
+          {:taproot (next-taproot-state state parent-node height)}
+          :chainwork (header/add-chainwork (:chainwork parent-node) work)
+          :active? false :header-valid? true
+          :block-valid? false :scripts-checked? false}
+         indexed (assoc-in state [:nodes hash] node)
+         added
+         (assoc indexed :header-tips
+                (-> (header-tips state) (disj parent) (conj hash)))
+         best-work (get-in state [:nodes (:best-header state) :chainwork])]
+     (if (header/better-chain? (:chainwork node) best-work)
+       (assoc added :best-header hash)
+       added))))
+
+(defn coinbase-height-prefix
+  "Return the minimally encoded BIP34 script prefix for a block height."
+  [height]
+  (cond
+    (zero? height) [0x00]
+    (<= 1 height 16) [(+ 0x50 height)]
+    :else
+    (let [number
+          (loop [value height result []]
+            (if (zero? value)
+              result
+              (recur (quot value 256) (conj result (mod value 256)))))
+          number (if (not (zero? (bit-and 0x80 (peek number))))
+                   (conj number 0)
+                   number)]
+      (into [(count number)] number))))
+
+(defn- starts-with? [value prefix]
+  (= prefix (vec (take (count prefix) value))))
+
+(defn validate-coinbase-height!
+  [parsed-block height]
+  (let [actual (get-in parsed-block
+                       [:transactions 0 :inputs 0 :script-sig])
+        expected (coinbase-height-prefix height)]
+    (when-not (starts-with? actual expected)
+      (codec/fail! :bitcoin.consensus/bad-coinbase-height
+                   "Coinbase scriptSig does not begin with the block height."
+                   {:height height :expected expected
+                    :actual-prefix
+                    (vec (take (max 8 (count expected)) actual))}))))
+
+(defn- median-time-past [state parent]
+  (let [timestamps
+        (sort
+         (map #(get-in % [:header :timestamp])
+              (ancestor-nodes state parent 11)))]
+    (nth timestamps (quot (count timestamps) 2))))
+
+(defn- ancestor-at-height [state tip height]
+  (loop [hash tip]
+    (let [node (get-in state [:nodes hash])]
+      (cond
+        (nil? node) nil
+        (= height (:height node)) node
+        (< (:height node) height) nil
+        :else (recur (:parent node))))))
+
+(defn bip30-overwrite-allowed?
+  "Whether Core skips its BIP30 UTXO collision scan for `block-hash`.
+
+  Coinbase outputs may overwrite only while that scan is skipped. Core skips
+  it for the two historical repeat blocks and, below height 1,983,702, for
+  descendants of the network's pinned BIP34 activation block. The activation
+  block itself is still checked because Core queries its parent ancestry.
+  Networks without a pinned BIP34 hash never receive this optimization."
+  [state block-hash]
+  (let [node (get-in state [:nodes block-hash])
+        _ (when-not node
+            (codec/fail! :bitcoin.consensus/unknown-bip30-block
+                         "BIP30 policy requires an indexed block."
+                         {:hash block-hash}))
+        height (:height node)
+        {:keys [bip34-height bip34-hash]} (:consensus state)
+        bip34-ancestor
+        (when (and bip34-hash (:parent node))
+          (ancestor-at-height state (:parent node) bip34-height))
+        known-bip34-chain?
+        (and bip34-ancestor (= bip34-hash (:hash bip34-ancestor)))]
+    (boolean
+     (and (< height bip30-recheck-height)
+          (or (contains? bip30-repeat-blocks block-hash)
+              known-bip34-chain?)))))
+
+(defn- subtract-chainwork [left right]
+  (loop [index 31 result (vec (repeat 32 0)) borrow 0]
+    (if (neg? index)
+      result
+      (let [difference (- (nth left index) (nth right index) borrow)
+            borrowed? (neg? difference)]
+        (recur (dec index)
+               (assoc result index
+                      (if borrowed? (+ difference 256) difference))
+               (if borrowed? 1 0))))))
+
+(defn- multiply-chainwork-with-overflow
+  "Multiply an unsigned 256-bit value by a small integer.
+
+  The returned value wraps at 256 bits like Core's `arith_uint256`; the
+  overflow flag records whether any high bits were discarded."
+  [value multiplier]
+  (loop [index 31 result (vec (repeat 32 0)) carry 0]
+    (if (neg? index)
+      [result (pos? carry)]
+      (let [product (+ (* (nth value index) multiplier) carry)]
+        (recur (dec index)
+               (assoc result index (mod product 256))
+               (quot product 256))))))
+
+(defn- multiply-chainwork [value multiplier]
+  (first (multiply-chainwork-with-overflow value multiplier)))
+
+(defn- chainwork-at-least? [actual minimum]
+  (not (header/better-chain? minimum actual)))
+
+(def ^:private target-spacing-seconds 600)
+(def ^:private assumevalid-burial-seconds (* 14 24 60 60))
+
+(defn- sufficiently-buried-for-assumevalid?
+  "Core-exact `GetBlockProofEquivalentTime(...) > two weeks` predicate.
+
+  Core first wraps `work-distance * target-spacing` to 256 bits, divides by
+  tip work, then compares the quotient. For nonzero `tip-work`,
+
+      floor(numerator / tip-work) > seconds
+
+  is equivalent to `numerator >= tip-work * (seconds + 1)`. If the right-hand
+  product overflows 256 bits it is mathematically above every wrapped
+  numerator, so the predicate is false. This preserves Core's integer
+  rounding boundary without a costly 256-bit division for every IBD block."
+  [work-distance tip-work]
+  (when-not (every? zero? tip-work)
+    (let [numerator
+          (multiply-chainwork work-distance target-spacing-seconds)
+          [minimum overflow?]
+          (multiply-chainwork-with-overflow
+           tip-work (inc assumevalid-burial-seconds))]
+      (and (not overflow?)
+           (not (header/better-chain? minimum numerator))))))
+
+(defn assumevalid-script-check?
+  "Return true when Script must be checked under Bitcoin Core's assumevalid
+  safety gates. All non-Script consensus checks remain mandatory.
+
+  A storage-backed host may provide `:ancestor-node-at-height-fn` to avoid
+  rebuilding a connection for every ancestor in a normalized lazy map."
+  ([state block-hash]
+   (assumevalid-script-check? state block-hash {}))
+  ([state block-hash {:keys [ancestor-node-at-height-fn]}]
+   (let [{:keys [assume-valid-hash minimum-chainwork]} (:consensus state)
+         ancestor-node (or ancestor-node-at-height-fn ancestor-at-height)
+         block-node (get-in state [:nodes block-hash])
+         assumed-node (get-in state [:nodes assume-valid-hash])
+         best-node (get-in state [:nodes (:best-header state)])
+         in-assumed-chain?
+         (and assumed-node block-node
+              (= block-hash
+                 (:hash
+                  (ancestor-node state assume-valid-hash
+                                 (:height block-node)))))
+         in-best-chain?
+         (and best-node block-node
+              (= block-hash
+                 (:hash
+                  (ancestor-node state (:hash best-node)
+                                 (:height block-node)))))
+         sufficiently-buried?
+         (and best-node block-node
+              (let [work-distance
+                    (subtract-chainwork (:chainwork best-node)
+                                        (:chainwork block-node))
+                    tip-work
+                    (header/header-work
+                     (get-in best-node [:header :bits]))]
+                (sufficiently-buried-for-assumevalid?
+                 work-distance tip-work)))]
+     (not (and assume-valid-hash
+               in-assumed-chain?
+               in-best-chain?
+               (chainwork-at-least? (:chainwork best-node)
+                                    minimum-chainwork)
+               sufficiently-buried?)))))
+
+(defn- median-time-past-at-height
+  [state height ancestor-node-at-height-fn]
+  (let [node ((or ancestor-node-at-height-fn ancestor-at-height)
+              state (:active-tip state) height)]
+    (when-not node
+      (codec/fail! :bitcoin.consensus/missing-locktime-ancestor
+                   "BIP68 coin ancestor is unavailable."
+                   {:height height}))
+    (median-time-past state (:hash node))))
+
+(defn- next-taproot-state [state parent-node height]
+  (let [deployment (get-in state [:consensus :taproot-deployment])
+        parent-state (get-in parent-node [:deployments :taproot] :defined)]
+    (cond
+      (:always-active? deployment) :active
+      (nil? (:period deployment)) parent-state
+      :else
+      (let [period (:period deployment)
+            signal-count
+            (if (zero? (mod height period))
+              (count
+               (filter
+                #(versionbits/signals?
+                  (get-in % [:header :version]) (:bit deployment))
+                (ancestor-nodes state (:hash parent-node) period)))
+              0)]
+        (versionbits/next-state
+         deployment height parent-state
+         (median-time-past state (:hash parent-node))
+         signal-count)))))
+
+(defn- validate-block-context! [state parsed-block parent-node]
+  (let [height (inc (:height parent-node))
+        {:keys [bip34-height bip113-height segwit-height]}
+        (:consensus state)
+        block-time
+        (if (>= height bip113-height)
+          (median-time-past state (:hash parent-node))
+          (get-in parsed-block [:header :timestamp]))]
+    #?(:clj
+       (when (get-in state [:consensus :signet?])
+         (signet/validate! parsed-block)))
+    #?(:clj
+       (script/validate-block-legacy-sigops!
+        (:transactions parsed-block)))
+    (when (>= height bip34-height)
+      (validate-coinbase-height! parsed-block height))
+    (doseq [value (:transactions parsed-block)]
+      (when-not (transaction/final? value height block-time)
+        (codec/fail! :bitcoin.consensus/non-final-transaction
+                     "Block contains a non-final transaction."
+                     {:height height :locktime (:locktime value)})))
+    (block/validate-witness-malleation!
+     (:transactions parsed-block) (>= height segwit-height))))
+
+(defn- common-ancestor [state left right]
+  (loop [left left right right]
+    (let [left-node (get-in state [:nodes left])
+          right-node (get-in state [:nodes right])]
+      (cond
+        (> (:height left-node) (:height right-node))
+        (recur (:parent left-node) right)
+
+        (< (:height left-node) (:height right-node))
+        (recur left (:parent right-node))
+
+        (= left right) left
+        :else (recur (:parent left-node) (:parent right-node))))))
+
+(defn- path-to-ancestor [state tip ancestor]
+  (loop [hash tip result []]
+    (if (= hash ancestor)
+      result
+      (recur (get-in state [:nodes hash :parent]) (conj result hash)))))
+
+(defn- activate-tip [state candidate verify-script options]
+  (let [current (:active-tip state)
+        fork (common-ancestor state current candidate)
+        detach (path-to-ancestor state current fork)
+        attach (reverse (path-to-ancestor state candidate fork))
+        detached
+        (reduce
+         (fn [current-state hash]
+           (let [undo
+                 (or (get-in current-state [:nodes hash :undo])
+                     (when-let [undo-fn (:undo-fn options)]
+                       (undo-fn hash)))]
+             (when-not undo
+               (codec/fail! :bitcoin.consensus/missing-undo
+                            "Active block is missing undo data."
+                            {:hash hash}))
+             (-> current-state
+                 (update :utxo utxo/disconnect-block undo)
+                 (assoc-in [:nodes hash :active?] false))))
+         state detach)]
+    (reduce
+     (fn [current-state hash]
+       (let [node (get-in current-state [:nodes hash])
+             height (:height node)]
+         (when-not (:block node)
+           (codec/fail! :bitcoin.consensus/missing-block-data
+                        "Cannot activate a header without its block data."
+                        {:hash hash :height height}))
+         (try
+           (let [
+               scripts-checked?
+               (assumevalid-script-check? current-state hash options)
+               verifier
+               (if scripts-checked?
+                 (verifier-for current-state height hash verify-script)
+                 (constantly true))
+               csv-active? (>= height
+                               (get-in current-state
+                                       [:consensus :csv-height]))
+               parent-mtp (median-time-past current-state
+                                            (:active-tip current-state))
+               {next-utxo :state undo :undo}
+               (utxo/apply-block-with-undo
+                (:utxo current-state) (:block node) height verifier
+                {:sequence-locks? csv-active?
+                 :allow-bip30-overwrite?
+                 (bip30-overwrite-allowed? current-state hash)
+                 :halving-interval
+                 (get-in current-state [:consensus :halving-interval])
+                 :parent-mtp parent-mtp
+                 :sigop-cost-fn
+                 (sigop-counter (:consensus current-state) height hash)
+                 :coin-mtp
+                 #(median-time-past-at-height
+                   current-state % (:ancestor-node-at-height-fn options))})]
+           (-> current-state
+               (assoc :utxo next-utxo :active-tip hash)
+               (assoc-in [:nodes hash :undo] undo)
+               (assoc-in [:nodes hash :active?] true)
+               (assoc-in [:nodes hash :block-valid?] true)
+               (assoc-in [:nodes hash :scripts-checked?]
+                         scripts-checked?)))
+           (catch :default error
+             (throw (annotate-block-validation-error hash error))))))
+     (assoc detached :active-tip fork) attach)))
+
+(defn accept-header
+  "Validate and index one header without treating it as a validated block.
+  This permits headers-first synchronization while UTXO activation remains
+  strictly block-driven."
+  [state parsed-header now]
+  (let [hash (:hash-hex parsed-header)]
+    (if (contains? (:nodes state) hash)
+      state
+      (do
+        (validate-header! state {:header parsed-header} now)
+        (index-valid-header state parsed-header)))))
+
+(defn accept-headers
+  "Atomically validate and index one chronological header batch.
+
+  Contextual PoW, difficulty, linkage, MTP, and future-time rules are checked
+  once over the shared 2,017-header context instead of rebuilding that window
+  for every header. Any duplicate, known header, broken link, or invalid
+  member rejects the complete immutable transition."
+  [state parsed-headers now]
+  (let [parsed-headers (vec parsed-headers)]
+    (if (empty? parsed-headers)
+      state
+      (let [hashes (mapv :hash-hex parsed-headers)
+            duplicate (first (for [[hash count] (frequencies hashes)
+                                   :when (> count 1)]
+                               hash))
+            known (first (filter #(contains? (:nodes state) %) hashes))]
+        (when duplicate
+          (codec/fail! :bitcoin.consensus/duplicate-header-batch
+                       "Header batch contains a duplicate."
+                       {:hash duplicate}))
+        (when known
+          (codec/fail! :bitcoin.consensus/known-header-batch
+                       "Header batch contains an already indexed header."
+                       {:hash known}))
+        (let [parent
+              (header/natural-hash->hex (:prev-block (first parsed-headers)))
+              parent-node (get-in state [:nodes parent])]
+          (when-not parent-node
+            (codec/fail! :bitcoin.consensus/unknown-parent
+                         "Header batch parent is unknown."
+                         {:parent parent}))
+          (when-let [failed (invalid-ancestor state parent)]
+            (codec/fail! :bitcoin.consensus/invalid-ancestor
+                         "Header batch descends from a known-invalid block."
+                         {:parent parent :invalid-ancestor failed}))
+          (let [context (ancestor-nodes state parent 2017)
+                headers (into (mapv :header context) parsed-headers)
+                result
+                (header/validate-header-consensus
+                 headers
+                 {:network (:network state)
+                  :start-height (:height (first context))
+                  :validate-from-index (count context)
+                  :now now})]
+            (when-not (:valid? result)
+              (codec/fail! :bitcoin.consensus/invalid-header
+                           "Header batch failed contextual consensus."
+                           {:errors (:errors result)}))
+            (doseq [[index parsed-header] (map-indexed vector parsed-headers)]
+              (validate-bip94-timewarp!
+               (:consensus state)
+               (+ (:height parent-node) index 1)
+               (if (zero? index)
+                 (:header parent-node)
+                 (nth parsed-headers (dec index)))
+               parsed-header)
+              (validate-buried-header-version!
+               (:consensus state)
+               (+ (:height parent-node) index 1)
+               parsed-header))
+            (first
+             (reduce
+              (fn [[current work-cache] parsed-header]
+                (let [bits (:bits parsed-header)
+                      work (or (get work-cache bits)
+                               (header/header-work bits))]
+                  [(index-valid-header current parsed-header work)
+                   (assoc work-cache bits work)]))
+              [state {}]
+              parsed-headers))))))))
+
+(defn accept-block
+  "Validate and add a parsed block, activating it atomically only when its
+  cumulative work exceeds the current active tip."
+  ([state parsed-block now]
+   (accept-block state parsed-block now nil {}))
+  ([state parsed-block now verify-script]
+   (accept-block state parsed-block now verify-script {}))
+  ([state parsed-block now verify-script options]
+   (let [hash (get-in parsed-block [:header :hash-hex])]
+    (when-let [failed (invalid-ancestor state hash)]
+      (codec/fail! :bitcoin.consensus/known-invalid-block
+                   "Block belongs to a known-invalid branch."
+                   {:hash hash :invalid-ancestor failed}))
+    (if (get-in state [:nodes hash :block])
+      state
+      (let [existing (get-in state [:nodes hash])
+            parent-node
+            (if existing
+              (get-in state [:nodes (:parent existing)])
+              (validate-header! state parsed-block now))
+            _
+            (try
+              (validate-block-context! state parsed-block parent-node)
+              (catch :default
+                  error
+                (throw (annotate-block-validation-error hash error))))
+            _ (when (and existing
+                         (not= (:header existing) (:header parsed-block)))
+                (codec/fail! :bitcoin.consensus/header-block-mismatch
+                             "Block does not match its validated header."
+                             {:hash hash}))
+            node
+            (or existing
+                {:hash hash :parent (:hash parent-node)
+                 :height (inc (:height parent-node))
+                 :header (:header parsed-block)
+                 :deployments
+                 {:taproot
+                  (next-taproot-state
+                   state parent-node (inc (:height parent-node)))}
+                 :chainwork
+                 (header/add-chainwork
+                  (:chainwork parent-node)
+                  (header/header-work
+                   (get-in parsed-block [:header :bits])))
+                 :active? false :header-valid? true
+                 :block-valid? false :scripts-checked? false})
+            indexed
+            (cond-> state
+              (nil? existing)
+              (assoc :header-tips
+                     (-> (header-tips state)
+                         (disj (:hash parent-node))
+                         (conj hash))))
+            added
+            (cond-> (assoc-in indexed [:nodes hash]
+                              (assoc node :block parsed-block))
+              (or (nil? (:best-header state))
+                  (header/better-chain?
+                   (:chainwork node)
+                   (get-in state
+                           [:nodes (:best-header state) :chainwork])))
+              (assoc :best-header hash))
+            active-work (get-in state [:nodes (:active-tip state)
+                                       :chainwork])]
+        (if (header/better-chain? (:chainwork node) active-work)
+          (activate-tip added hash verify-script options)
+          added))))))
+
+(defn active-height [state]
+  (get-in state [:nodes (:active-tip state) :height]))

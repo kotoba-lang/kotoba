@@ -1,0 +1,285 @@
+(ns bitcoin.consensus.core-vectors
+  "Adapter for Bitcoin Core's official script_tests.json.
+
+  The harness intentionally runs only flag combinations implemented by this
+  consensus kernel. Unsupported policy flags are reported as skipped rather
+  than silently ignored."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [bitcoin.consensus.script :as script]
+            [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.transaction :as transaction]
+            [btc-crypto.schnorr :as schnorr]
+            [kotoba.json :as json]
+            [kotoba.lang.text :as string]
+            [sha256d.core :as sha256d])
+  (:gen-class))
+
+(def opcode
+  {"0" 0x00 "FALSE" 0x00
+   "PUSHDATA1" 0x4c "PUSHDATA2" 0x4d "PUSHDATA4" 0x4e
+   "1NEGATE" 0x4f "RESERVED" 0x50 "1" 0x51 "TRUE" 0x51
+   "2" 0x52 "3" 0x53 "4" 0x54 "5" 0x55 "6" 0x56 "7" 0x57
+   "8" 0x58 "9" 0x59 "10" 0x5a "11" 0x5b "12" 0x5c
+   "13" 0x5d "14" 0x5e "15" 0x5f "16" 0x60
+   "NOP" 0x61 "VER" 0x62 "IF" 0x63 "NOTIF" 0x64
+   "VERIF" 0x65 "VERNOTIF" 0x66 "ELSE" 0x67 "ENDIF" 0x68
+   "VERIFY" 0x69 "RETURN" 0x6a "TOALTSTACK" 0x6b
+   "FROMALTSTACK" 0x6c "2DROP" 0x6d "2DUP" 0x6e
+   "3DUP" 0x6f "2OVER" 0x70 "2ROT" 0x71 "2SWAP" 0x72
+   "IFDUP" 0x73 "DEPTH" 0x74 "DROP" 0x75 "DUP" 0x76
+   "NIP" 0x77 "OVER" 0x78 "PICK" 0x79 "ROLL" 0x7a
+   "ROT" 0x7b "SWAP" 0x7c "TUCK" 0x7d "CAT" 0x7e
+   "SUBSTR" 0x7f "LEFT" 0x80 "RIGHT" 0x81 "SIZE" 0x82
+   "INVERT" 0x83 "AND" 0x84 "OR" 0x85 "XOR" 0x86
+   "EQUAL" 0x87 "EQUALVERIFY" 0x88 "RESERVED1" 0x89
+   "RESERVED2" 0x8a "1ADD" 0x8b "1SUB" 0x8c "2MUL" 0x8d
+   "2DIV" 0x8e "NEGATE" 0x8f "ABS" 0x90 "NOT" 0x91
+   "0NOTEQUAL" 0x92 "ADD" 0x93 "SUB" 0x94 "MUL" 0x95
+   "DIV" 0x96 "MOD" 0x97 "LSHIFT" 0x98 "RSHIFT" 0x99
+   "BOOLAND" 0x9a "BOOLOR" 0x9b "NUMEQUAL" 0x9c
+   "NUMEQUALVERIFY" 0x9d "NUMNOTEQUAL" 0x9e
+   "LESSTHAN" 0x9f "GREATERTHAN" 0xa0
+   "LESSTHANOREQUAL" 0xa1 "GREATERTHANOREQUAL" 0xa2
+   "MIN" 0xa3 "MAX" 0xa4 "WITHIN" 0xa5 "RIPEMD160" 0xa6
+   "SHA1" 0xa7 "SHA256" 0xa8 "HASH160" 0xa9 "HASH256" 0xaa
+   "CODESEPARATOR" 0xab "CHECKSIG" 0xac "CHECKSIGVERIFY" 0xad
+   "CHECKMULTISIG" 0xae "CHECKMULTISIGVERIFY" 0xaf "NOP1" 0xb0
+   "CHECKLOCKTIMEVERIFY" 0xb1 "NOP2" 0xb1
+   "CHECKSEQUENCEVERIFY" 0xb2 "NOP3" 0xb2
+   "NOP4" 0xb3 "NOP5" 0xb4 "NOP6" 0xb5 "NOP7" 0xb6
+   "NOP8" 0xb7 "NOP9" 0xb8 "NOP10" 0xb9 "CHECKSIGADD" 0xba})
+
+(def flag-map
+  {"P2SH" :p2sh
+   "STRICTENC" :strict-encoding
+   "DERSIG" :dersig
+   "LOW_S" :low-s
+   "NULLDUMMY" :null-dummy
+   "CHECKLOCKTIMEVERIFY" :cltv
+   "CHECKSEQUENCEVERIFY" :csv
+   "WITNESS" :witness
+   "CLEANSTACK" :cleanstack
+   "WITNESS_PUBKEYTYPE" :compressed-pubkey
+   "MINIMALDATA" :minimal-data
+   "MINIMALIF" :minimal-if
+   "NULLFAIL" :nullfail
+   "SIGPUSHONLY" :sig-push-only
+   "CONST_SCRIPTCODE" :const-scriptcode
+   "DISCOURAGE_UPGRADABLE_NOPS" :discourage-upgradable-nops
+   "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
+   :discourage-upgradable-witness-program
+   "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+   :discourage-upgradable-taproot-version
+   "DISCOURAGE_OP_SUCCESS" :discourage-op-success
+   "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
+   :discourage-upgradable-pubkeytype
+   "TAPROOT" :taproot})
+
+(def unsupported-flags #{})
+
+(defn- hex-bytes [value]
+  (if (empty? value)
+    []
+    (mapv #(Integer/parseInt (apply str %) 16) (partition 2 value))))
+
+(defn- bytes-hex [bytes]
+  (apply str (map #(format "%02x" (bit-and 0xff %)) bytes)))
+
+(defn- script-number [value]
+  (cond
+    (zero? value) []
+    :else
+    (let [negative? (neg? value)
+          magnitude (abs value)
+          bytes
+          (loop [remaining magnitude result []]
+            (if (zero? remaining)
+              result
+              (recur (quot remaining 256)
+                     (conj result (mod remaining 256)))))
+          sign-collides? (pos? (bit-and 0x80 (peek bytes)))]
+      (cond
+        sign-collides? (conj bytes (if negative? 0x80 0))
+        negative? (update bytes (dec (count bytes)) bit-or 0x80)
+        :else bytes))))
+
+(defn- token-bytes [token]
+  (cond
+    (string/starts-with? token "0x")
+    (hex-bytes (subs token 2))
+
+    (and (string/starts-with? token "'")
+         (string/ends-with? token "'"))
+    (script/push-data
+     (mapv int (kbytes/utf8-bytes (subs token 1 (dec (count token))))))
+
+    (re-matches #"-?[0-9]+" token)
+    (let [number (parse-long token)]
+      (cond
+        (= number -1) [0x4f]
+        (zero? number) [0x00]
+        (<= 1 number 16) [(+ 0x50 number)]
+        :else (script/push-data (script-number number))))
+
+    :else
+    (if-let [value (get opcode
+                        (string/replace token #"^OP_" ""))]
+      [value]
+      (throw (ex-info "Unknown Core Script assembly token."
+                      {:token token})))))
+
+(defn assembly
+  "Parse Bitcoin Core test assembly into raw Script bytes."
+  [source]
+  (vec
+   (mapcat token-bytes
+           (re-seq #"'[^']*'|\S+" source))))
+
+(defn- flags [source]
+  (let [names (if (string/blank? source)
+                []
+                (string/split source #","))]
+    (when (and (not (some unsupported-flags names))
+               (every? flag-map names))
+      (set (keep flag-map names)))))
+
+(def satoshis-per-bitcoin 100000000M)
+
+(defn- amount-satoshis [amount]
+  (long (* (bigdec amount) satoshis-per-bitcoin)))
+
+(defn- fixture [script-sig script-pubkey witness amount]
+  (let [credit
+        {:version 1
+         :inputs [{:txid-natural (vec (repeat 32 0))
+                   :vout 0xffffffff :script-sig [0 0]
+                   :sequence 0xffffffff}]
+         :outputs [{:value amount :script-pubkey script-pubkey}]
+         :witnesses nil :locktime 0 :segwit? false}
+        credit-txid
+        (vec (sha256d/sha256d-bytes
+              (transaction/serialize credit)))
+        coin {:value amount :script-pubkey script-pubkey
+              :height 0 :coinbase? false}
+        spending
+        {:version 1
+         :inputs [{:txid-natural credit-txid
+                   :vout 0 :script-sig script-sig
+                   :sequence 0xffffffff}]
+         :outputs [{:value amount :script-pubkey []}]
+         :witnesses [(or witness [])]
+         :prevout-coins [coin]
+         :locktime 0}]
+    [spending coin]))
+
+(defn- vector-parts [value]
+  (if (vector? (first value))
+    (let [[witness-and-amount script-sig script-pubkey flag-source
+           expected & comments] value]
+      {:witness (mapv hex-bytes (butlast witness-and-amount))
+       :amount (amount-satoshis (last witness-and-amount))
+       :script-sig script-sig :script-pubkey script-pubkey
+       :flags flag-source :expected expected :comments comments})
+    (let [[script-sig script-pubkey flag-source expected & comments] value]
+      {:witness [] :amount 0
+       :script-sig script-sig :script-pubkey script-pubkey
+       :flags flag-source :expected expected :comments comments})))
+
+(def taproot-internal-key
+  (hex-bytes
+   "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
+
+(defn- preprocess-taproot-vector [value]
+  (if-not (some #(and (string? %) (string/includes? % "#"))
+                (tree-seq coll? seq value))
+    value
+    (let [witness-and-amount (first value)
+          script-source
+          (some #(when (and (string? %)
+                            (string/starts-with? % "#SCRIPT#"))
+                   (subs % (count "#SCRIPT#")))
+                witness-and-amount)
+          tapscript (assembly script-source)
+          tapleaf-hash
+          (schnorr/tagged-hash
+           "TapLeaf"
+           (concat [0xc0]
+                   (codec/compact-size (count tapscript))
+                   tapscript))
+          tweaked
+          (schnorr/tweak-public-key taproot-internal-key tapleaf-hash)
+          control-block
+          (vec (concat [(+ 0xc0 (:parity tweaked))]
+                       taproot-internal-key))
+          witness
+          (mapv
+           (fn [element]
+             (cond
+               (and (string? element)
+                    (string/starts-with? element "#SCRIPT#"))
+               (bytes-hex tapscript)
+
+               (= element "#CONTROLBLOCK#")
+               (bytes-hex control-block)
+
+               :else element))
+           witness-and-amount)]
+      (-> value
+          (assoc 0 witness)
+          (assoc 2
+                 (string/replace
+                  (nth value 2)
+                  "#TAPROOTOUTPUT#"
+                  (str "0x" (bytes-hex (:x tweaked)))))))))
+
+(defn- run-vector [index value]
+  (let [value (preprocess-taproot-vector value)
+        {:keys [witness amount script-sig script-pubkey
+                  expected comments]
+           flag-source :flags} (vector-parts value)
+          active-flags (flags flag-source)]
+      (if (nil? active-flags)
+        {:status :skipped}
+        (let [script-sig (assembly script-sig)
+              script-pubkey (assembly script-pubkey)
+              [spending coin]
+              (fixture script-sig script-pubkey witness amount)
+              actual
+              (try
+                (script/verify-input spending 0 coin active-flags)
+                true
+                (catch kerror/ExceptionInfo _ false))
+              expected-success? (= "OK" expected)]
+          (if (= expected-success? actual)
+            {:status :passed}
+            {:status :failed :index index :expected expected
+             :actual (if actual "OK" "FAIL")
+             :flags flag-source :comments comments
+             :script-sig script-sig :script-pubkey script-pubkey})))))
+
+(defn -main [& [path]]
+  (when-not path
+    (throw (ex-info "Usage: kbb -M:core-vectors script_tests.json"
+                    {})))
+  (let [values (json/read-str (slurp path))
+        tests (keep-indexed
+               (fn [index value]
+                 (when (and (vector? value)
+                            (>= (count value) 4)
+                            (or (string? (first value))
+                                (vector? (first value))))
+                   [index value]))
+               values)
+        results (mapv (fn [[index value]]
+                        (run-vector index value))
+                      tests)
+        frequencies (frequencies (map :status results))
+        failures (filterv #(= :failed (:status %)) results)]
+    (println (pr-str {:vectors (count tests)
+                      :passed (get frequencies :passed 0)
+                      :skipped (get frequencies :skipped 0)
+                      :failed (count failures)}))
+    (when (seq failures)
+      (doseq [failure (take 20 failures)]
+        (binding [*out* *err*]
+          (println (pr-str failure))))
+      (System/exit 1))))

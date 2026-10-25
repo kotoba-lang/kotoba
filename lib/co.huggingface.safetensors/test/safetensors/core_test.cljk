@@ -1,0 +1,124 @@
+(ns safetensors.core-test
+  "Correctness tests for the safetensors reader/writer (ADR-2607051400 Phase 3), in three
+   independent layers so a symmetric writer/reader bug can't hide:
+
+   1. `hand-built-bytes...` — a safetensors byte buffer built by hand (literal header JSON +
+      literal IEEE-754 bit patterns), never touching this repo's own `write-bytes`/encoder at
+      all, decoded with `read-bytes` and checked against values computed independently.
+   2. `own-writer-round-trip...` — `write-bytes` then `read-bytes`, across every dtype this
+      reader supports, values chosen to be exactly representable (so equality is meaningful).
+   3. `real-huggingface-fixture...` — a real, small (~508KB), publicly-published safetensors
+      file (`hf-internal-testing/tiny-random-bert`'s `model.safetensors`, fetched from
+      huggingface.co and vendored at test/resources/tiny-bert.safetensors), parsed and checked
+      against facts independently confirmed by inspecting the file with Python (struct+json)
+      before writing this test."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [safetensors.core :as sut]
+            [safetensors.bytes :as b]))
+
+;; =================================================================================================
+;; 1) Hand-built bytes — independent of this repo's own writer.
+;; =================================================================================================
+
+(defn- hand-built-safetensors-bytes []
+  ;; Header: two tensors + __metadata__. Written out as a literal JSON string (not produced by
+  ;; safetensors.json/write-json).
+  ;;   t1 : F32 shape [2] -> values [1.0, 2.0]   (bits 0x3F800000, 0x40000000 — well-known)
+  ;;   t2 : I32 shape [1] -> value  [42]         (bits 0x0000002A)
+  (let [header-json (str "{\"t1\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]},"
+                         "\"t2\":{\"dtype\":\"I32\",\"shape\":[1],\"data_offsets\":[8,12]},"
+                         "\"__metadata__\":{\"note\":\"hand-built\"}}")
+        header-bytes (kbytes/utf8-bytes header-json)
+        n (alength header-bytes)
+        len-bytes (byte-array [(unchecked-byte n) 0 0 0 0 0 0 0]) ;; n < 256, LE trivial by hand
+        ;; t1 data: 1.0f = 00 00 80 3F ; 2.0f = 00 00 00 40 (little-endian IEEE-754 binary32)
+        t1-bytes (byte-array (map unchecked-byte [0x00 0x00 0x80 0x3F 0x00 0x00 0x00 0x40]))
+        ;; t2 data: 42 (i32 LE) = 2A 00 00 00
+        t2-bytes (byte-array (map unchecked-byte [0x2A 0x00 0x00 0x00]))]
+    (is (< n 256) "test precondition: header short enough for a single-byte LE length")
+    (b/concat-bytes [len-bytes header-bytes t1-bytes t2-bytes])))
+
+(deftest hand-built-bytes-decode-correctly
+  (let [{:keys [metadata tensors]} (sut/read-bytes (hand-built-safetensors-bytes))]
+    (is (= {"note" "hand-built"} metadata))
+    (is (= #{"t1" "t2"} (set (keys tensors))))
+    (testing "t1: F32 [1.0 2.0]"
+      (let [t1 (get tensors "t1")]
+        (is (= :f32 (:dtype t1)))
+        (is (= [2] (:shape t1)))
+        (is (= [1.0 2.0] (vec (:data t1))))))
+    (testing "t2: I32 [42]"
+      (let [t2 (get tensors "t2")]
+        (is (= :i32 (:dtype t2)))
+        (is (= [1] (:shape t2)))
+        (is (= [42] (vec (:data t2))))))))
+
+;; =================================================================================================
+;; 2) Own writer -> own reader round-trip, across every supported dtype.
+;; =================================================================================================
+
+(deftest own-writer-round-trip-all-supported-dtypes
+  (let [payload {:metadata {"note" "round-trip test" "producer" "safetensors.core"}
+                 :tensors
+                 {"f32t"  {:dtype :f32  :shape [3]   :data [1.0 -2.5 100.25]}
+                  "f16t"  {:dtype :f16  :shape [3]   :data [1.0 -2.0 0.5]}
+                  "bf16t" {:dtype :bf16 :shape [3]   :data [1.0 -2.0 0.5]}
+                  "f64t"  {:dtype :f64  :shape [2]   :data [3.141592653589793 -1.0e10]}
+                  "i64t"  {:dtype :i64  :shape [2]   :data [123456789012 -42]}
+                  ;; u64 values are stored in a `long-array` (see README's dtype table): exact for
+                  ;; any value < 2^63 (as here — 10^16 needs 34 bits, comfortably clear of the
+                  ;; 32-bit boundary this exercises), but values >= 2^63 don't fit a signed long
+                  ;; and are a documented, known limitation rather than being silently wrong.
+                  "u64t"  {:dtype :u64  :shape [2]   :data [0 10000000000000000]}
+                  "c64t"  {:dtype :c64  :shape [2]   :data [1.0 -1.0 2.5 0.0]}      ;; 2 complex numbers: (1-1i), (2.5+0i)
+                  "i32t"  {:dtype :i32  :shape [4]   :data [0 -1 2147483647 -2147483648]}
+                  "u32t"  {:dtype :u32  :shape [2]   :data [0 4294967295]}
+                  "i16t"  {:dtype :i16  :shape [2]   :data [-32768 32767]}
+                  "u16t"  {:dtype :u16  :shape [2]   :data [0 65535]}
+                  "i8t"   {:dtype :i8   :shape [4]   :data [-128 -1 0 127]}
+                  "u8t"   {:dtype :u8   :shape [4]   :data [0 128 255 1]}
+                  "boolt" {:dtype :bool :shape [2 2] :data [true false false true]}
+                  "scalart" {:dtype :f32 :shape []   :data [7.5]}}}
+        bytes-out (sut/write-bytes payload)
+        {:keys [metadata tensors]} (sut/read-bytes bytes-out)]
+    (is (= {"note" "round-trip test" "producer" "safetensors.core"} metadata))
+    (doseq [[nm {:keys [dtype shape data]}] (:tensors payload)]
+      (testing (str "tensor " nm)
+        (let [got (get tensors nm)]
+          (is (some? got))
+          (is (= dtype (:dtype got)))
+          (is (= shape (:shape got)))
+          (is (= (vec data) (vec (:data got)))))))))
+
+(deftest write-bytes-produces-a-valid-header-length-prefix
+  (let [bs (sut/write-bytes {:tensors {"x" {:dtype :f32 :shape [1] :data [1.0]}}})
+        n (b/u64-le bs 0)
+        total (b/byte-length bs)]
+    ;; header (8+n bytes) plus exactly one f32 element (4 bytes) of tensor data
+    (is (= total (+ 8 n 4)))
+    (is (pos? n))))
+
+;; =================================================================================================
+;; 3) A real, small, publicly-published safetensors file (hf-internal-testing/tiny-random-bert).
+;; =================================================================================================
+;; Facts below were independently confirmed with Python (struct.unpack + json.loads) on the raw
+;; file BEFORE this test was written — this test checks the Clojure reader against those
+;; independently-observed facts, not against itself.
+
+(deftest real-huggingface-fixture-parses-correctly
+  (let [{:keys [metadata tensors]} (sut/read-file "lib/co.huggingface.safetensors/test/resources/tiny-bert.safetensors")]
+    (testing "100 real tensors, __metadata__ present with the exact keys pytorch's saver wrote"
+      (is (= 100 (count tensors)))
+      (is (= {"format" "pt" "cls.predictions.decoder.bias" "cls.predictions.bias"} metadata)))
+    (testing "dtypes actually used by this checkpoint are exactly {F32, I64}"
+      (is (= #{:f32 :i64} (set (map :dtype (vals tensors))))))
+    (testing "spot-check specific tensors' shape/dtype against the file's own header"
+      (is (= {:dtype :i64 :shape [1 512]} (select-keys (get tensors "bert.embeddings.position_ids") [:dtype :shape])))
+      (is (= {:dtype :f32 :shape [32]} (select-keys (get tensors "bert.embeddings.LayerNorm.bias") [:dtype :shape])))
+      (is (= {:dtype :f32 :shape [1124 32]} (select-keys (get tensors "bert.embeddings.word_embeddings.weight") [:dtype :shape]))))
+    (testing "decoded element counts match declared shapes"
+      (doseq [[nm {:keys [shape data]}] tensors]
+        (is (= (reduce * 1 shape) (count data)) (str nm " element count matches shape"))))
+    (testing "position_ids is the standard BERT arange(0,512) row"
+      (let [pos (vec (:data (get tensors "bert.embeddings.position_ids")))]
+        (is (= (vec (range 512)) pos))))))

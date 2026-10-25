@@ -1,0 +1,130 @@
+(ns kami.relevancy-test
+  "The load-bearing gate is `grid-agrees-with-brute-force`: the grid is an
+   optimisation, and an optimisation is only correct if it returns what the
+   definition returns. Everything else here pins behaviour the definition alone
+   does not fix — hysteresis, the delta, and the cost claim."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kami.relevancy :as rel]))
+
+(def policy {:enter 10.0 :exit 15.0})
+
+;; A deterministic pseudo-random scatter. Not `rand`: a gate that samples a
+;; different world each run reports a different answer each run, and the first
+;; failure nobody can reproduce is the last one anybody investigates.
+(defn- scatter
+  ([n] (scatter n 40.0))
+  ([n extent]
+   (into {} (for [i (range n)
+                  :let [a (* i 2.399963229728653)   ;; golden-angle walk
+                        r (* extent (Math/sqrt (/ (double i) n)))]]
+              [(keyword (str "e" i))
+               [(* r (Math/cos a)) (* 0.5 r (Math/sin (* 0.7 a))) (* r (Math/sin a))]]))))
+
+(deftest grid-agrees-with-brute-force
+  (testing "over a scattered world and many observer positions, from a cold start
+            and from a warm previous set — the warm case matters because that is
+            when :exit rather than :enter decides, and an implementation can be
+            right cold and wrong warm"
+    (let [entities (scatter 400)
+          index (rel/build-index policy entities)
+          observers (for [x (range -40 41 13) z (range -40 41 13)] [(double x) 0.0 (double z)])]
+      (doseq [o observers]
+        (let [cold-grid (rel/relevant policy index o entities #{})
+              cold-bf (rel/brute-force-relevant policy o entities #{})]
+          (is (= cold-bf cold-grid) (str "cold at " o)))
+        ;; warm: seed with whatever was relevant at the origin, so the previous
+        ;; set is genuinely unrelated to this observer's position
+        (let [prev (rel/brute-force-relevant policy [0.0 0.0 0.0] entities #{})
+              warm-grid (rel/relevant policy index o entities prev)
+              warm-bf (rel/brute-force-relevant policy o entities prev)]
+          (is (= warm-bf warm-grid) (str "warm at " o)))))))
+
+(deftest hysteresis-holds-an-entity-through-the-band
+  (testing "inside :enter it becomes relevant; between :enter and :exit it is
+            held only if it was already relevant; past :exit it always leaves"
+    (let [e {:a [12.0 0.0 0.0]}                    ;; 12 is between 10 and 15
+          idx (rel/build-index policy e)
+          o [0.0 0.0 0.0]]
+      (is (= #{} (rel/relevant policy idx o e #{}))
+          "in the band from cold: not yet relevant")
+      (is (= #{:a} (rel/relevant policy idx o e #{:a}))
+          "in the band while already relevant: held")))
+  (testing "an entity oscillating across :enter does not flicker once inside"
+    (let [o [0.0 0.0 0.0]
+          positions (cycle [[9.5 0.0 0.0] [11.0 0.0 0.0]])
+          steps (take 8 positions)
+          result (reductions
+                  (fn [prev p]
+                    (let [e {:a p}]
+                      (rel/relevant policy (rel/build-index policy e) o e prev)))
+                  #{}
+                  steps)]
+      (is (= [#{} #{:a} #{:a} #{:a} #{:a} #{:a} #{:a} #{:a} #{:a}] (vec result))
+          "it enters once at 9.5 and is then held at 11.0 rather than dropping"))))
+
+(deftest an-entity-that-leaves-really-leaves
+  (testing "the neighbourhood sweep can only add, so a previously relevant entity
+            that moved far away must be dropped by the explicit hold-over check"
+    (let [e {:a [1000.0 0.0 0.0]}
+          idx (rel/build-index policy e)]
+      (is (= #{} (rel/relevant policy idx [0.0 0.0 0.0] e #{:a}))
+          "still listed as previously relevant, but far outside :exit"))))
+
+(deftest delta-reports-only-the-change
+  (let [d (rel/delta #{:a :b} #{:b :c})]
+    (is (= #{:b :c} (:relevant d)))
+    (is (= #{:c} (:entered d)))
+    (is (= #{:a} (:left d))))
+  (testing "a steady state sends nothing"
+    (let [d (rel/delta #{:a :b} #{:a :b})]
+      (is (empty? (:entered d)))
+      (is (empty? (:left d))))))
+
+(deftest tick-advances-every-observer-and-shares-one-index
+  (let [entities {:a [0.0 0.0 0.0] :b [100.0 0.0 0.0]}
+        observers {:p1 {:pos [0.0 0.0 0.0]}
+                   :p2 {:pos [100.0 0.0 0.0]}}
+        out (rel/tick policy observers entities)]
+    (is (= #{:a} (get-in out [:p1 :relevant])))
+    (is (= #{:b} (get-in out [:p2 :relevant])))
+    (is (= #{:a} (get-in out [:p1 :entered])))
+    (testing "a second tick with no movement reports no change"
+      (let [again (rel/tick policy out entities)]
+        (is (empty? (get-in again [:p1 :entered])))
+        (is (empty? (get-in again [:p1 :left])))))))
+
+(deftest policy-must-have-a-hysteresis-band
+  (is (rel/valid-policy? policy))
+  (is (not (rel/valid-policy? {:enter 10.0 :exit 10.0})) "equal radii is no band")
+  (is (not (rel/valid-policy? {:enter 10.0 :exit 5.0})) "inverted")
+  (is (not (rel/valid-policy? {:enter 0.0 :exit 5.0})))
+  (is (= :relevancy/bad-policy
+         (try (rel/build-index {:enter 10.0 :exit 10.0} {}) nil
+              (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                (:reason (ex-data e)))))
+      "building an index with a degenerate policy must refuse, not silently
+       produce a grid whose cells are the wrong size"))
+
+(deftest the-grid-examines-far-fewer-entities-than-brute-force
+  (testing "the cost claim, measured rather than asserted. Brute force examines
+            every entity for every observer; the grid examines one neighbourhood.
+            Without this the optimisation could be a no-op and every other test
+            here would still pass."
+    ;; The world must be large relative to the interest radius, which is the
+    ;; regime the grid is for. An earlier version scattered 2,000 entities into a
+    ;; radius-40 disc while the 3x3x3 neighbourhood spans 45 units, so the
+    ;; "neighbourhood" covered ~40% of the world and examined 796 of 2,000 — a
+    ;; true measurement of a world too small to need the optimisation at all.
+    (let [entities (scatter 2000 400.0)
+          index (rel/build-index policy entities)
+          observers (for [x (range -300 301 100) z (range -300 301 100)] [(double x) 0.0 (double z)])
+          examined (map #(rel/examined-count index %) observers)
+          worst (apply max examined)
+          total (count entities)]
+      (is (< worst (/ total 10))
+          (str "worst-case neighbourhood was " worst " of " total
+               " entities; the grid is not buying much"))
+      (testing "and it still agrees with the definition at that scale"
+        (doseq [o (take 4 observers)]
+          (is (= (rel/brute-force-relevant policy o entities #{})
+                 (rel/relevant policy index o entities #{}))))))))

@@ -1,0 +1,228 @@
+(ns kotoba.webgpu-rs.render-ir
+  "Parse the EDN render-IR — the same data both the web (CLJS -> WebGPU)
+  and kami-webgpu-rs's native (Rust -> wgpu) executors render (ADR-0001/
+  0040/0044). Direct port of `kami-webgpu-rs::{parse_ir, parse_render_ir,
+  Globals, Instance, Light, Camera, Environment, Material, Mesh, RenderIr,
+  mat4_from_flat}` — pure EDN-in / data-out parsing, no wgpu calls, so
+  this is a 1:1 port rather than an adaptation. All the tolerant-default
+  behaviour (missing key -> default; wrong-shaped value -> default; v1
+  scenes with no `:lights`/`:camera`/`:materials`/`:meshes` parse
+  unchanged) is preserved exactly, including the individual field
+  defaults (see each `parse-*` fn's docstring).
+
+  Where Rust used an enum with a `by_name` fallback (`LightKind`,
+  `MaterialModel`, `AlphaMode`), this port uses a keyword plus a `by-name`
+  fn with the same fallback rule (unrecognized name -> the enum's `_`
+  arm) — idiomatic Clojure, no information lost.
+
+  No network, no I/O."
+  (:require [kotoba.webgpu-rs.edn :as e]
+            #?(:clj [kotoba.lang.edn]
+               :cljs [cljs.reader])))
+
+;; --- Globals (v1: sky + optional eye/target) ------------------------------
+
+(def default-globals
+  "kami-webgpu-rs's `Globals::default()`."
+  {:horizon [0.7 0.8 0.9]
+   :sun-dir [-0.4 -0.85 -0.35]
+   :sun [1.0 0.96 0.85]
+   :eye nil
+   :target nil})
+
+(defn parse-globals
+  "`root :globals` -> a [[default-globals]]-shaped map. `nil`/missing
+  `:globals` yields the defaults untouched (mirrors `Globals::default()`
+  when `g` is absent in the Rust)."
+  [globals-map]
+  (if-not (map? globals-map)
+    default-globals
+    (let [sky (:sky globals-map)]
+      (merge default-globals
+             (when (map? sky)
+               {:horizon (e/vec3 (:horizon sky))
+                :sun-dir (e/vec3 (:sun-dir sky))
+                :sun (e/vec3 (:sun sky))})
+             {:eye (e/opt-vec3 (:eye globals-map))
+              :target (e/opt-vec3 (:target globals-map))}))))
+
+;; --- Instance ---------------------------------------------------------------
+
+(defn parse-instance
+  "One `:instances` entry -> `{:pos :color :size :yaw :metallic :roughness
+  :emissive}`. `:roughness` defaults to `0.65` (everything else `0.0`/
+  `[0 0]`), matching kami-webgpu-rs's `parse_ir`."
+  [m]
+  {:pos (e/vec3 (:pos m))
+   :color (e/vec3 (:color m))
+   :size (e/vec2 (:size m))
+   :yaw (e/numf (:yaw m))
+   :metallic (e/numf (:metallic m))
+   :roughness (if (contains? m :roughness) (e/numf (:roughness m)) 0.65)
+   :emissive (e/numf (:emissive m))})
+
+;; --- richer render-IR vocabulary (ADR-0044) -------------------------------
+
+(defn light-kind-by-name [name]
+  (case name "point" :point "spot" :spot :directional))
+
+(defn material-model-by-name [name]
+  (case name "mtoon" :mtoon "unlit" :unlit :pbr))
+
+(defn alpha-mode-by-name [name]
+  (case name "mask" :mask "blend" :blend :opaque))
+
+(defn parse-light
+  "One `:lights` entry. `:dir` used by directional/spot; `:pos`/`:range`
+  by point/spot; `:spot-inner`/`:spot-outer` (radians) shape the spot
+  cone."
+  [m]
+  {:kind (light-kind-by-name (e/ident (:kind m)))
+   :color (or (e/opt-vec3 (:color m)) [1.0 1.0 1.0])
+   :intensity (if (contains? m :intensity) (e/numf (:intensity m)) 1.0)
+   :dir (or (e/opt-vec3 (:dir m)) [-0.4 -0.85 -0.35])
+   :pos (e/vec3 (:pos m))
+   :range (e/numf (:range m))
+   :spot-inner (e/numf (:inner m))
+   :spot-outer (e/numf (:outer m))
+   :cast-shadow (e/bool-or (:cast-shadow m) false)})
+
+(defn parse-camera
+  "`:camera` map -> `{:eye :target :fov-y :near :far}`. `:eye`/`:target`
+  fall back to the parsed `Globals`' own `:eye`/`:target`, then to fixed
+  defaults, mirroring kami-webgpu-rs's `or(globals.eye).unwrap_or(...)`
+  chain."
+  [m globals]
+  {:eye (or (e/opt-vec3 (:eye m)) (:eye globals) [5.0 3.0 8.0])
+   :target (or (e/opt-vec3 (:target m)) (:target globals) [0.0 1.0 0.0])
+   :fov-y (if (contains? m :fov) (e/numf (:fov m)) 0.9)
+   :near (if (contains? m :near) (e/numf (:near m)) 0.1)
+   :far (if (contains? m :far) (e/numf (:far m)) 1000.0)})
+
+(def default-environment
+  {:ambient [0.7 0.8 0.9] :ground [0.34 0.52 0.30] :ibl-intensity 0.0 :ibl-url nil})
+
+(defn parse-environment
+  "`:env` map, seeded with `env.ambient` inheriting the parsed globals'
+  `:horizon` (matches `env.ambient = globals.horizon` before `:env` is
+  read)."
+  [m globals]
+  (let [base (assoc default-environment :ambient (:horizon globals))]
+    (if-not (map? m)
+      base
+      (let [ibl (:ibl m)]
+        (cond-> base
+          (contains? m :ambient) (assoc :ambient (e/vec3 (:ambient m)))
+          (contains? m :ground) (assoc :ground (e/vec3 (:ground m)))
+          (map? ibl) (assoc :ibl-intensity (if (contains? ibl :intensity) (e/numf (:intensity ibl)) 1.0)
+                             :ibl-url (when (string? (:url ibl)) (:url ibl))))))))
+
+(defn parse-material
+  "One `:materials` entry -> a PBR/MToon material map."
+  [m]
+  {:id (or (e/ident (:id m)) "")
+   :model (material-model-by-name (e/ident (:model m)))
+   :base (or (e/opt-vec3 (:base m)) [1.0 1.0 1.0])
+   :shade (or (e/opt-vec3 (:shade m)) [0.5 0.5 0.5])
+   :metallic (e/numf (:metallic m))
+   :roughness (if (contains? m :roughness) (e/numf (:roughness m)) 0.65)
+   :emissive (e/numf (:emissive m))
+   :alpha-mode (alpha-mode-by-name (e/ident (:alpha-mode m)))
+   :alpha-cutoff (if (contains? m :alpha-cutoff) (e/numf (:alpha-cutoff m)) 0.5)
+   :outline (e/numf (:outline m))
+   :rim (e/numf (:rim m))
+   :matcap (when (string? (:matcap m)) (:matcap m))})
+
+(defn mat4-from-flat
+  "16 flat numbers -> a column-major mat4 (as 4 rows of 4, matching
+  kami-webgpu-rs's `mat4_from_flat`'s `[[f32;4];4]` shape); identity
+  diagonal (`1.0` at `i%5==0`) for missing components, `0.0` otherwise."
+  [v]
+  (let [g (fn [i] (if (< i (count v))
+                     (e/numf (nth v i))
+                     (if (zero? (mod i 5)) 1.0 0.0)))]
+    [[(g 0) (g 1) (g 2) (g 3)]
+     [(g 4) (g 5) (g 6) (g 7)]
+     [(g 8) (g 9) (g 10) (g 11)]
+     [(g 12) (g 13) (g 14) (g 15)]]))
+
+(defn- parse-morphs [m]
+  (if (map? m)
+    (into [] (for [[k v] m :let [name (e/ident k)] :when name]
+                {:name name :weight (e/numf v)}))
+    []))
+
+(defn parse-mesh
+  "One `:meshes` entry -> a skinned/morphable mesh binding (transform +
+  material + skin id + per-frame morph weights + optional inline joint
+  palette). `:rot` defaults to the identity quaternion `[0 0 0 1]`."
+  [m]
+  {:id (or (e/ident (:id m)) "")
+   :url (or (:url m) "")
+   :pos (if (contains? m :pos) (e/vec3 (:pos m)) [0.0 0.0 0.0])
+   :rot (let [s (if (vector? (:rot m)) (:rot m) [])]
+          [(e/numf (get s 0)) (e/numf (get s 1)) (e/numf (get s 2))
+           (e/num-or (get s 3) 1.0)])
+   :scale (if (contains? m :scale) (e/numf (:scale m)) 1.0)
+   :material (e/ident (:material m))
+   :skin (e/ident (:skin m))
+   :joints (if (vector? (:joints m))
+             (into [] (comp (filter vector?) (map mat4-from-flat)) (:joints m))
+             [])
+   :morphs (parse-morphs (:morphs m))
+   :cast-shadow (e/bool-or (:cast-shadow m) true)})
+
+(defn material-lookup [render-ir id] (first (filter #(= (:id %) id) (:materials render-ir))))
+(defn mesh-lookup [render-ir id] (first (filter #(= (:id %) id) (:meshes render-ir))))
+(defn morph-weight
+  "The weight of morph target `name` on `mesh` (`0.0` when absent) —
+  mirrors `Mesh::morph`."
+  [mesh name]
+  (:weight (first (filter #(= (:name %) name) (:morphs mesh))) 0.0))
+
+;; --- top-level parse ---------------------------------------------------------
+
+(defn root-map
+  "Read the top-level EDN form of `src` and return it if it's a map, `nil`
+  otherwise (malformed EDN or a non-map top form) — mirrors kami-scene's
+  `root_map`, which never panics."
+  [src]
+  #?(:clj (try
+            (let [v (kotoba.lang.edn/read-string src)]
+              (when (map? v) v))
+            (catch Exception _ nil))
+     :cljs (try
+             (let [v (cljs.reader/read-string src)]
+               (when (map? v) v))
+             (catch :default _ nil))))
+
+(defn parse-ir
+  "Parse the v1 EDN render-IR (`:globals` + `:instances`) -> `[globals
+  instances]`. Mirrors kami-webgpu-rs's `parse_ir`."
+  [edn-src-or-map]
+  (let [root (if (string? edn-src-or-map) (root-map edn-src-or-map) edn-src-or-map)]
+    (if-not (map? root)
+      [default-globals []]
+      [(parse-globals (:globals root))
+       (into [] (comp (filter map?) (map parse-instance)) (:instances root))])))
+
+(defn parse-render-ir
+  "Parse the richer EDN render-IR: v1 `:globals`+`:instances` plus the
+  additive `:lights`/`:camera`/`:env`/`:materials`/`:meshes` vocabulary
+  (ADR-0044). Backward compatible: a v1 scene parses with empty
+  `:lights`/`:materials`/`:meshes`, no `:camera`, and `:env` seeded from
+  `:globals`' `:horizon`. Mirrors kami-webgpu-rs's `parse_render_ir`."
+  [edn-src-or-map]
+  (let [root (if (string? edn-src-or-map) (root-map edn-src-or-map) edn-src-or-map)
+        [globals instances] (parse-ir root)]
+    (if-not (map? root)
+      {:globals globals :instances instances :lights [] :camera nil
+       :env (assoc default-environment :ambient (:horizon globals))
+       :materials [] :meshes []}
+      {:globals globals
+       :instances instances
+       :lights (into [] (comp (filter map?) (map parse-light)) (:lights root))
+       :camera (when (map? (:camera root)) (parse-camera (:camera root) globals))
+       :env (parse-environment (:env root) globals)
+       :materials (into [] (comp (filter map?) (map parse-material)) (:materials root))
+       :meshes (into [] (comp (filter map?) (map parse-mesh)) (:meshes root))})))

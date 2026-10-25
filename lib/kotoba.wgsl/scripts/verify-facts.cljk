@@ -1,0 +1,812 @@
+#!/usr/bin/env kbb
+;; Re-checks every source in facts.edn against the live authority.
+;;
+;;   kbb --backend sci scripts/verify-facts.cljk                (from the repository root)
+;;   kbb --backend sci scripts/verify-facts.cljk --facts <path>
+;;   kbb --backend sci scripts/verify-facts.cljk --pace <ms>    (delay between page fetches)
+;;
+;; Three exit codes, on purpose:
+;;   0  every source checked out
+;;   1  a source did not check out          -- the register is wrong
+;;   2  the run could not answer            -- NOT a pass
+;;
+;; 2 exists because a check that could not run must not return the same value
+;; as a check that ran and found nothing. An unreadable facts.edn, a source
+;; that could not be reached, a bot challenge standing in front of the page, an
+;; empty register, or a self-test that did not discriminate are all 2, and all
+;; of them print REFUSED.
+;;
+;; THE THREE CHECKS ARE NOT INTERCHANGEABLE.
+;;
+;;   :e-gov-law-id   Resolve the id through the e-Gov law API and require the
+;;                   title and law number to match the register. HTTP status is
+;;                   never consulted here: laws.e-gov.go.jp answers 200 for
+;;                   /law/<anything>, including ids that do not exist.
+;;
+;;   :page-identity  2xx, AND the final URL is still the page asked for, AND
+;;                   the declared charset, AND the <title> matches.
+;;
+;;   :page-text      All of :page-identity, plus every string in
+;;                   :page/must-contain present in the de-tagged body.
+;;
+;; THE CENTRAL PROBLEM ON THIS REGISTER'S HOSTS: THE CHALLENGE IS A 2xx.
+;;
+;; www.meti.go.jp is behind AWS WAF. To an automated client it serves, instead
+;; of the page, a 2468-byte JavaScript challenge carrying
+;; window.awsWafCookieDomainList and window.gokuProps. That response answers
+;; HTTP **202** -- a 2xx -- at the requested URL, with no redirect, and with an
+;; EMPTY <title>.
+;;
+;; Every layer of an ordinary page check reads that as success except the last:
+;;   status  202 is 2xx                          -> pass
+;;   final   served at the requested URL         -> pass
+;;   charset declared utf-8, served utf-8        -> pass
+;;   title   "" vs the expected title            -> MISMATCH
+;;
+;; A verifier that stops there calls it title drift and exits 1, reporting
+;; "the register is wrong" about a run that never reached the authority. The
+;; register is not wrong; the run could not answer. So the challenge is
+;; detected by its own signature BEFORE the status branch, and reported as
+;; :challenge-interposed with verdict :refused -- exit 2.
+;;
+;; This is the same defect class this workspace keeps finding in other shapes:
+;; a check that could not run returning the value of a check that ran clean.
+;; Here it would have run the other way -- a check that could not run returning
+;; the value of a check that ran and FAILED -- which is just as wrong and
+;; sends whoever reads it to edit a register that was correct.
+;;
+;; FETCHES ARE SERIAL AND PACED, AND THAT IS A MEASUREMENT, NOT A STYLE.
+;; The sibling MLIT verifier fetches every page concurrently with p/all. Doing
+;; that here is what TRIPS the challenge: measured 2026-08-26, a cold client
+;; reads real pages, roughly ten requests trips the WAF, and it then holds for
+;; about four and a half minutes. A concurrent verifier would reliably produce
+;; the failure it is meant to detect. Pages are therefore fetched one at a time
+;; with --pace milliseconds between them.
+;;
+;; ALL FOUR HOSTS ANSWER 403, NOT 404, FOR A PATH THAT DOES NOT EXIST.
+;; Each serves a real Japanese "this page does not exist" body at the requested
+;; URL. 403 is not 2xx so status still discriminates, but a checker looking for
+;; 404 specifically, or one reading 403 as "blocked, cannot measure", would
+;; misreport four hosts that answered clearly. The status each host actually
+;; returned is pinned in :host/missing-status and compared on every run.
+;;
+;; SIX SELF-TESTS, EACH ASSERTING THE REASON AND NOT THE VERDICT.
+;; A negative test that only asserts "it went red" counts a run that went red
+;; for an unrelated cause as a discriminating one. Each self-test below drives
+;; the real check function and requires a specific :reason keyword back:
+;;
+;;   :nonexistent-law       an invented law id must not resolve
+;;   :title-drift           a real page with the wrong expected title
+;;   :unexpected-redirect   a URL that lands somewhere else than it asked for
+;;   :missing-text          a real page missing a sentinel string
+;;   :charset-drift         a UTF-8 page declared as Shift_JIS
+;;   :challenge-interposed  the WAF challenge body must classify as a challenge
+;;
+;; The charset self-test declares a real UTF-8 page as Shift_JIS rather than
+;; needing a non-UTF-8 page in the register, because no host cited here serves
+;; one. The challenge self-test runs against a fixture of the real challenge
+;; body rather than against the live WAF, because whether the WAF is engaged at
+;; any moment is not under this run's control -- a self-test that only
+;; discriminates when a third party happens to be blocking us is a self-test
+;; that passes by not running.
+;;
+;; If any of them does not come back with its own reason, the run exits 2 and
+;; reports nothing about the register.
+;;
+;; THE REASON IS PRINTED, NOT JUST THE VERDICT.
+;; Every non-pass line carries its :reason in brackets -- FAIL[charset-drift],
+;; not bare FAIL -- so an outside harness can tell which check fired.
+;;
+;; THE LAW LOOKUPS ARE PACED TOO. Running this in a tight loop (a mutation
+;; suite, say) makes laws.e-gov.go.jp start answering HTML instead of JSON.
+;; That is reported as REFUSED, not as a pass and not as a register error,
+;; because a throttled run establishes nothing either way.
+;;
+;; WHY fetch AND NOT curl. Some go.jp hosts answer 403 to curl over both HTTP/2
+;; and HTTP/1.1, with or without a browser User-Agent, while answering 200 with
+;; full content to fetch at the same moment -- the block is on the TLS
+;; fingerprint. A curl-based verifier records a reachable authority as
+;; permanently unreachable and looks like it measured that. It measured its own
+;; client.
+
+(ns verify-facts
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            ["fs" :as fs]
+            ["process" :as process]))
+
+(def argv (vec (drop 2 (js->clj (.-argv process)))))
+
+(defn- arg [flag default]
+  (let [i (.indexOf (into-array argv) flag)]
+    (if (and (>= i 0) (< (inc i) (count argv))) (nth argv (inc i)) default)))
+
+(def facts-path (arg "--facts" "facts.edn"))
+(def pace-ms (js/parseInt (arg "--pace" "2500")))
+(def static-only? (boolean (some #{"--static"} argv)))
+
+(def UA (str "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+             " (KHTML, like Gecko) Chrome/126 Safari/537.36"))
+(def TIMEOUT-MS 25000)
+
+;; Used only by the self-tests. None is a citation and none is in facts.edn.
+(def NONEXISTENT-LAW-ID "999ZZ9999999999")
+(def NONEXISTENT-PATH "/no-such-page-zzz999.html")
+(def SENTINEL-TEXT "この文字列は実在の官庁ページには存在しない")
+
+;; A real excerpt of the AWS WAF challenge www.meti.go.jp serves to automated
+;; clients, kept verbatim so the detector is asserted against the thing it
+;; exists to catch rather than against a paraphrase of it. The opaque key/iv
+;; blobs are truncated -- they rotate per response and are not what identifies
+;; the page.
+(def CHALLENGE-FIXTURE
+  (str "<html><head><title></title><style>body { font-family: \"Arial\"; }</style>"
+       "<script>window.awsWafCookieDomainList = [];"
+       " window.gokuProps = { \"key\":\"AQIDAHjcYu\", \"iv\":\"A6xOTwHl\","
+       " \"context\":\"VeCB9A94cI2dn6wU\" };</script></head><body></body></html>"))
+
+(defn- die! [code msg]
+  (println msg)
+  (.exit process code))
+
+(defn- refuse! [msg]
+  (die! 2 (str "REFUSED\t" msg "\n"
+               "Refusing to report a pass on a run that could not answer.")))
+
+(defn- sleep [ms] (p/create (fn [res _] (js/setTimeout #(res nil) ms))))
+
+;; Set whenever a bot challenge actually stood in the way of something. Printed
+;; as a token, not left for a reader to infer from the prose.
+;;
+;; An outside harness has to be able to tell "this run was blocked" from "this
+;; run found the register wrong", and it must not do that by grepping English.
+;; Measured while building this: three different prose markers were tried and
+;; all three collided -- "challenge-interposed" appears in the challenge
+;; self-test's SUCCESS line, "REFUSED[challenge-interposed]" misses a challenge
+;; that blocks a self-test rather than a source, and "a bot challenge" appears
+;; in the text of an unrelated guard EXPLAINING what trips one. Prose written
+;; to be read by people is not a machine interface.
+(def blocked (atom 0))
+
+(defn- note-if-blocked! [reason]
+  (when (= :challenge-interposed reason) (swap! blocked inc)))
+
+(defn- with-timeout [f]
+  (let [ctrl (js/AbortController.)
+        timer (js/setTimeout #(.abort ctrl) TIMEOUT-MS)]
+    (-> (f (.-signal ctrl))
+        (.then (fn [r] (js/clearTimeout timer) r))
+        (.catch (fn [e] (js/clearTimeout timer) {:error (str (.-message e))})))))
+
+(defn- normalise [s]
+  (some-> s (str/replace #"\s+" " ") str/trim))
+
+(defn- page-title [body]
+  (normalise (second (re-find #"(?is)<title[^>]*>(.*?)</title>" body))))
+
+(defn- de-tag [body]
+  (-> body
+      (str/replace #"(?s)<script.*?</script>" " ")
+      (str/replace #"(?s)<style.*?</style>" " ")
+      (str/replace #"(?s)<[^>]+>" " ")
+      (str/replace #"\s+" " ")))
+
+(defn- challenge?
+  "Is this body a bot-challenge interstitial standing in for the page?
+
+  Pure, so the self-test can drive it on a fixture instead of waiting for a
+  third party to block us. Keyed on the AWS WAF client markers, which are in
+  the challenge and in no agency page -- not on the 202, because the status is
+  the part that is indistinguishable from success."
+  [body]
+  (boolean (and body (re-find #"awsWafCookieDomainList|gokuProps|awswaf" body))))
+
+(defn- canon-charset
+  "Fold the aliases these hosts actually send onto the label TextDecoder wants.
+  Windows-31J, Shift_JIS and CP932 differ in the corners of the standard but
+  name the same encoding for this purpose; the register declares the family."
+  [c]
+  (let [c (str/lower (or c ""))]
+    (cond
+      (contains? #{"windows-31j" "shift_jis" "shift-jis" "sjis" "x-sjis" "cp932" "ms932"} c) "shift_jis"
+      (contains? #{"euc-jp" "eucjp" "x-euc-jp"} c) "euc-jp"
+      (str/blank? c) "utf-8"
+      :else c)))
+
+(defn- pick-charset
+  "Content-Type wins, then a meta tag. The meta tag is read from a provisional
+  UTF-8 decode, which is safe because the declaration itself is ASCII."
+  [content-type utf8-probe]
+  (canon-charset
+    (or (second (re-find #"(?i)charset=[\"']?([\w\-]+)" (or content-type "")))
+        (second (re-find #"(?i)charset=[\"']?([\w\-]+)" (or utf8-probe "")))
+        "utf-8")))
+
+(defn- fetch-page
+  "{:status :final :charset :title :text :challenge} or {:error ..}. Follows
+  redirects on purpose -- the point is to see WHERE it lands, which a no-follow
+  fetch cannot say. Reads bytes rather than text() so the charset is ours to
+  decide."
+  [url]
+  (with-timeout
+    (fn [sig]
+      (.then (js/fetch url #js {:redirect "follow" :signal sig
+                                :headers #js {"User-Agent" UA
+                                              "Accept" "text/html,application/xhtml+xml,*/*;q=0.8"
+                                              "Accept-Language" "ja,en;q=0.9"}})
+             (fn [res]
+               (.then (.arrayBuffer res)
+                      (fn [buf]
+                        (let [u8 (js/Uint8Array. buf)
+                              probe (.decode (js/TextDecoder. "utf-8") u8)
+                              cs (pick-charset (.get (.-headers res) "content-type") probe)
+                              body (try (.decode (js/TextDecoder. cs) u8)
+                                        (catch :default _ probe))]
+                          {:status (.-status res)
+                           :final (.-url res)
+                           :charset cs
+                           :bytes (.-length u8)
+                           :challenge (challenge? body)
+                           :title (page-title body)
+                           :text (de-tag body)}))))))))
+
+(defn- fetch-json
+  "The content type is checked before parsing, so a host that answers HTML --
+  a throttle page, an outage notice, an edge error -- is reported as that,
+  rather than as an opaque \"Unexpected token '<'\"."
+  [url]
+  (with-timeout
+    (fn [sig]
+      (.then (js/fetch url #js {:signal sig
+                                :headers #js {"User-Agent" UA "Accept" "application/json"}})
+             (fn [res]
+               (let [ct (or (.get (.-headers res) "content-type") "")]
+                 (cond
+                   (not (.-ok res)) {:error (str "HTTP " (.-status res))}
+                   (not (str/includes? (str/lower ct) "json"))
+                   {:error (str "HTTP " (.-status res) " but content-type " (pr-str ct)
+                                " -- the host answered a page, not the API")}
+                   :else (.then (.json res)
+                                (fn [j] {:json (js->clj j :keywordize-keys true)})))))))))
+
+;; --- checks -------------------------------------------------------------
+
+(defn- egov-lookup
+  "Ask the law API about one id. {:missing true} / {:title .. :num ..} / {:error ..}"
+  [id]
+  (p/let [r (fetch-json (str "https://laws.e-gov.go.jp/api/2/laws?law_id=" id))]
+    (if (:error r)
+      {:error (:error r)}
+      (let [total (:total_count (:json r))
+            hit (first (:laws (:json r)))]
+        (if (or (nil? total) (zero? total) (nil? hit))
+          {:missing true :total total}
+          {:title (get-in hit [:revision_info :law_title])
+           :num (get-in hit [:law_info :law_num])})))))
+
+(defn- check-egov [e]
+  (let [id (:egov/law-id e)]
+    (if (str/blank? (str id))
+      (p/resolved {:verdict :refused :reason :no-law-id
+                   :why "tagged :e-gov-law-id but has no :egov/law-id"})
+      (p/let [r (egov-lookup id)]
+        (cond
+          (:error r) {:verdict :refused :reason :law-api-unreachable
+                      :why (str "law API unreachable: " (:error r))}
+          (:missing r) {:verdict :fail :reason :nonexistent-law
+                        :why (str "law id " id " does not exist (total_count "
+                                  (pr-str (:total r))
+                                  ") -- the /law/ URL still answers 200")}
+          (not= (:title r) (:egov/law-title e))
+          {:verdict :fail :reason :law-title-drift
+           :why (str "title drift: register " (pr-str (:egov/law-title e))
+                     " vs API " (pr-str (:title r)))}
+          (not= (:num r) (:egov/law-num e))
+          {:verdict :fail :reason :law-num-drift
+           :why (str "law number drift: register " (pr-str (:egov/law-num e))
+                     " vs API " (pr-str (:num r)))}
+          :else {:verdict :pass :detail (str (:title r) " / " (:num r))})))))
+
+(defn- check-page
+  "Shared by :page-identity and :page-text. `text?` decides whether
+  :page/must-contain is consulted -- and a register entry that carries
+  must-contain without asking for it is itself a finding, because a declared
+  check that nothing runs is the failure this file is built against."
+  [e text?]
+  (let [url (:source/url e)
+        expect-final (or (:page/redirects-to e) url)
+        expect-cs (canon-charset (or (:page/charset e) "utf-8"))
+        needles (vec (:page/must-contain e))]
+    (cond
+      (and text? (empty? needles))
+      (p/resolved {:verdict :refused :reason :no-needles
+                   :why "tagged :page-text but has no :page/must-contain"})
+
+      (and (not text?) (seq needles))
+      (p/resolved {:verdict :fail :reason :unchecked-needles
+                   :why (str "carries :page/must-contain " (pr-str needles)
+                             " but is tagged :page-identity, so nothing reads it")})
+
+      :else
+      (p/let [r (fetch-page url)]
+        (cond
+          (:error r) {:verdict :refused :reason :unreachable
+                      :why (str "unreachable: " (:error r))}
+
+          ;; BEFORE the status branch, on purpose. The challenge answers 202,
+          ;; which is a 2xx, at the requested URL.
+          (:challenge r)
+          {:verdict :refused :reason :challenge-interposed
+           :why (str "a bot challenge stood in for this page (HTTP " (:status r)
+                     ", " (:bytes r) " bytes, title " (pr-str (:title r))
+                     "). The authority was never reached, so this run says "
+                     "nothing about whether the register is right.")}
+
+          (not (<= 200 (:status r) 299))
+          {:verdict :fail :reason :not-2xx :why (str "HTTP " (:status r))}
+
+          (not= (:final r) expect-final)
+          {:verdict :fail :reason (if (:page/redirects-to e)
+                                    :redirect-target-drift
+                                    :unexpected-redirect)
+           :why (str "landed on " (pr-str (:final r)) ", expected "
+                     (pr-str expect-final)
+                     " -- a 2xx from somewhere else is not this page")}
+
+          (not= (:charset r) expect-cs)
+          {:verdict :fail :reason :charset-drift
+           :why (str "charset drift: register declares " (pr-str expect-cs)
+                     ", host served " (pr-str (:charset r))
+                     " -- every string compared below would be decoded wrong")}
+
+          (not= (:title r) (:page/title e))
+          {:verdict :fail :reason :title-drift
+           :why (str "title drift: register " (pr-str (:page/title e))
+                     " vs live " (pr-str (:title r)))}
+
+          :else
+          (let [missing (filterv #(not (str/includes? (:text r) %)) needles)]
+            (if (seq missing)
+              {:verdict :fail :reason :missing-text
+               :why (str "absent from the page: " (pr-str missing))}
+              {:verdict :pass
+               :detail (str "HTTP " (:status r) " / " (:charset r) " / " (:title r)
+                            (when (seq needles)
+                              (str " / " (count needles) " string(s) present")))})))))))
+
+(defn- check [e]
+  (case (:source/verify e)
+    :e-gov-law-id (check-egov e)
+    :page-identity (check-page e false)
+    :page-text (check-page e true)
+    (p/resolved {:verdict :refused :reason :unknown-verify
+                 :why (str "unknown :source/verify " (pr-str (:source/verify e)))})))
+
+;; --- the hosts the page checks rest on ----------------------------------
+
+(defn- check-host
+  "Fetch a path that does not exist and compare with what the register says the
+  host does. The :page-identity branch is only worth anything on a host that
+  refuses unknown paths; where a host does not, the register has to know."
+  [h]
+  (let [host (:host/name h)
+        url (str "https://" host NONEXISTENT-PATH)
+        want (:host/missing-status h)
+        behaviour (:host/missing-path h)]
+    (p/let [r (fetch-page url)]
+      (cond
+        (:error r)
+        {:verdict :refused :reason :host-unreachable
+         :why (str host " could not be reached: " (:error r))}
+
+        ;; A host that is allowed to challenge has said so in the register.
+        ;; One that has not cannot be measured while it is challenging.
+        (and (:challenge r) (not= :refuses-or-challenges behaviour))
+        {:verdict :refused :reason :challenge-interposed
+         :why (str host " answered a bot challenge (HTTP " (:status r)
+                   "), so what it does with an unknown path could not be measured")}
+
+        (= :refuses-or-challenges behaviour)
+        (cond
+          (:challenge r)
+          {:verdict :pass
+           :detail (str "bot challenge (HTTP " (:status r) ", " (:bytes r)
+                        " bytes) -- one of the two behaviours the register declares")}
+          (<= 200 (:status r) 299)
+          {:verdict :fail :reason :host-soft-404
+           :why (str host " answered HTTP " (:status r) " with a real page for "
+                     NONEXISTENT-PATH " (title " (pr-str (:title r))
+                     "). The register allows a refusal or a challenge here, "
+                     "not a 2xx page for a path that does not exist.")}
+          (and want (not= want (:status r)))
+          {:verdict :fail :reason :host-status-drift
+           :why (str host " answered HTTP " (:status r) " for " NONEXISTENT-PATH
+                     ", register measured " want)}
+          :else
+          {:verdict :pass
+           :detail (str "HTTP " (:status r) " for a path that does not exist")})
+
+        (= :refuses behaviour)
+        (cond
+          (<= 200 (:status r) 299)
+          {:verdict :fail :reason :host-soft-404
+           :why (str host " now answers HTTP " (:status r) " for " NONEXISTENT-PATH
+                     " (landed on " (pr-str (:final r)) ", title " (pr-str (:title r))
+                     "). The register says it refuses unknown paths; every "
+                     ":page-identity entry on this host rested on that.")}
+          (and want (not= want (:status r)))
+          {:verdict :fail :reason :host-status-drift
+           :why (str host " answered HTTP " (:status r) " for " NONEXISTENT-PATH
+                     ", register measured " want
+                     " -- still a refusal, but not the one written down")}
+          :else
+          {:verdict :pass
+           :detail (str "HTTP " (:status r) " for a path that does not exist")})
+
+        (= :redirects-to behaviour)
+        (cond
+          (not (<= 200 (:status r) 299))
+          {:verdict :fail :reason :host-behaviour-drift
+           :why (str host " answered HTTP " (:status r)
+                     ", but the register says it redirects everything to "
+                     (pr-str (:host/redirect-target h)))}
+          (not= (:final r) (:host/redirect-target h))
+          {:verdict :fail :reason :host-behaviour-drift
+           :why (str host " sent " NONEXISTENT-PATH " to " (pr-str (:final r))
+                     ", register says " (pr-str (:host/redirect-target h)))}
+          :else
+          {:verdict :pass
+           :detail (str "HTTP " (:status r) " -> " (:final r)
+                        " for a path that does not exist, as declared")})
+
+        :else
+        {:verdict :refused :reason :unknown-host-behaviour
+         :why (str "unknown :host/missing-path " (pr-str behaviour))}))))
+
+;; --- the register's own claims about itself -----------------------------
+
+(defn- coverage-findings [entities sourced hosts]
+  (let [cov (first (filter #(= :coverage (:source/kind %)) entities))
+        page-hosts (into #{} (keep (fn [e]
+                                     (when (#{:page-identity :page-text} (:source/verify e))
+                                       (.-host (js/URL. (:source/url e)))))
+                                   sourced))
+        declared-hosts (into #{} (map :host/name hosts))]
+    (if-not cov
+      ["facts.edn has no :coverage entity -- it never says what it leaves out"]
+      (let [by (frequencies (map :source/verify sourced))
+            ids (map :source/id sourced)
+            urls (map :source/url sourced)
+            undeclared (sort (remove declared-hosts page-hosts))]
+        (cond-> []
+          (not= (:coverage/entries cov) (count sourced))
+          (conj (str ":coverage/entries says " (:coverage/entries cov)
+                     ", file has " (count sourced)))
+          (not= (:coverage/by-verify cov) by)
+          (conj (str ":coverage/by-verify says " (pr-str (:coverage/by-verify cov))
+                     ", file has " (pr-str by)))
+          (not= (count ids) (count (set ids)))
+          (conj "duplicate :source/id -- the join key is not a key")
+          (not= (count urls) (count (set urls)))
+          (conj "duplicate :source/url -- the same source counted twice")
+          (seq undeclared)
+          (conj (str "page entries on hosts with no :host-behaviour entity: "
+                     (pr-str undeclared)
+                     " -- their checks rest on an assumption nothing measures")))))))
+
+(defn- static-entity-findings
+  "Everything wrong with the register that needs no network: a tag nothing can
+  run, a declared check with nothing to check, a check that reads something
+  nobody asked it to read.
+
+  These are separated from the fetching pass on purpose. A miscounted coverage
+  block or a typo in a :source/verify tag is knowable before the first request,
+  and finding it out after forty of them -- against hosts that start serving
+  bot challenges when asked too often -- costs a run that could have answered
+  in milliseconds."
+  [sourced]
+  (vec (keep (fn [e]
+               (let [id (:source/id e)
+                     v (:source/verify e)
+                     needles (vec (:page/must-contain e))]
+                 (cond
+                   (not (#{:e-gov-law-id :page-identity :page-text} v))
+                   {:id id :level :refused :reason :unknown-verify
+                    :why (str "unknown :source/verify " (pr-str v))}
+
+                   (and (= :e-gov-law-id v) (str/blank? (str (:egov/law-id e))))
+                   {:id id :level :refused :reason :no-law-id
+                    :why "tagged :e-gov-law-id but has no :egov/law-id"}
+
+                   (and (= :page-text v) (empty? needles))
+                   {:id id :level :refused :reason :no-needles
+                    :why "tagged :page-text but has no :page/must-contain"}
+
+                   (and (= :page-identity v) (seq needles))
+                   {:id id :level :fail :reason :unchecked-needles
+                    :why (str "carries :page/must-contain " (pr-str needles)
+                              " but is tagged :page-identity, so nothing reads it")}
+
+                   :else nil)))
+             sourced)))
+
+;; --- self-tests ---------------------------------------------------------
+;; Each drives the real check function and requires its own :reason back.
+
+(defn- expect-reason [label want r]
+  (note-if-blocked! (:reason r))
+  (if (= want (:reason r))
+    {:ok true :detail (str label " -> " (name want))}
+    {:ok false :got (:reason r)
+     :why (str label " came back " (pr-str (:verdict r)) " / " (pr-str (:reason r))
+               ", wanted " (pr-str want) ". " (:why r))}))
+
+(defn- self-test-law []
+  (p/let [r (egov-lookup NONEXISTENT-LAW-ID)]
+    (cond
+      (:error r) {:ok false :fatal true
+                  :why (str "law API unreachable (" (:error r) ")")}
+      (:missing r) {:ok true
+                    :detail (str NONEXISTENT-LAW-ID " does not resolve (total_count "
+                                 (pr-str (:total r)) ") though its /law/ URL answers 200")}
+      :else {:ok false
+             :why (str NONEXISTENT-LAW-ID " resolved to " (pr-str (:title r))
+                       " -- the e-Gov branch cannot tell an invented id from a real one")})))
+
+(defn- self-test-challenge []
+  ;; Pure, against a real excerpt of the challenge body. Not against the live
+  ;; WAF: whether it is engaged right now is not this run's to decide, and a
+  ;; self-test that only discriminates while a third party blocks us is one
+  ;; that passes by not running.
+  (p/resolved
+    (if (challenge? CHALLENGE-FIXTURE)
+      (if (challenge? "<html><head><title>経営革新支援 | 中小企業庁</title></head><body>経営革新計画</body></html>")
+        {:ok false
+         :why "the detector fires on an ordinary agency page too -- it would refuse every page in the register"}
+        {:ok true :detail "AWS WAF challenge body -> challenge-interposed, ordinary page -> not"})
+      {:ok false
+       :why (str "the AWS WAF challenge fixture did not classify as a challenge. "
+                 "Every 202 challenge would be reported as title drift, i.e. as "
+                 "the register being wrong.")})))
+
+(defn- self-test-title [probe]
+  (p/let [r (check-page (assoc probe :page/title "この題名ではない") false)]
+    (expect-reason "wrong expected title" :title-drift r)))
+
+(defn- self-test-redirect [probe]
+  ;; Ask for the http:// form of a page the register cites over https. It lands
+  ;; on the https URL, which is not the URL asked for, and nothing declares a
+  ;; redirect -- the branch that catches a 2xx arriving from somewhere else.
+  ;; All three cited agency hosts redirect http to https, so any probe works.
+  (let [https-url (:source/url probe)
+        http-url (str/replace https-url #"^https://" "http://")]
+    (if (= http-url https-url)
+      (p/resolved {:ok false :fatal true
+                   :why "the probe entry is not an https URL, so the redirect branch is never exercised"})
+      (p/let [r (check-page (assoc probe :source/url http-url) false)]
+        (expect-reason (str "http:// form of " https-url " (lands on the https URL)")
+                       :unexpected-redirect r)))))
+
+(defn- self-test-text [probe]
+  (p/let [r (check-page (assoc probe :source/verify :page-text
+                                     :page/must-contain [SENTINEL-TEXT])
+                        true)]
+    (expect-reason "sentinel string that is not on the page" :missing-text r)))
+
+(defn- self-test-charset [probe]
+  ;; Declare a page that is served as UTF-8 to be Shift_JIS. If the decoding
+  ;; step were not load-bearing this would pass, and a host that changed
+  ;; encoding would have every Japanese string compared against mojibake.
+  (p/let [r (check-page (assoc probe :page/charset "shift_jis") false)]
+    (expect-reason "UTF-8 page declared as Shift_JIS" :charset-drift r)))
+
+;; --- run ----------------------------------------------------------------
+
+(defn- read-facts
+  "Read facts.edn as EXACTLY ONE top-level form.
+
+  edn/read-string returns the first form and discards the rest of the string,
+  so a register with a broken or extra entity appended after the closing
+  bracket parses cleanly and verifies green -- the appended text is never seen
+  by anything. Wrapping the file in one more vector turns \"there is trailing
+  content\" into either a reader error or a count, both of which are answerable."
+  []
+  (let [text (try (fs/readFileSync facts-path "utf8")
+                  (catch :default e
+                    (refuse! (str "cannot read " facts-path ": " (.-message e)))))
+        forms (try (edn/read-string (str "[" text "\n]"))
+                   (catch :default e
+                     (refuse! (str "cannot read " facts-path ": " (.-message e)))))]
+    (if (= 1 (count forms))
+      (first forms)
+      (refuse! (str facts-path " holds " (count forms) " top-level forms. "
+                    "Only the first would ever be read, so the rest would be "
+                    "silently ignored.")))))
+
+(defn- serially
+  "Run f over xs one at a time, pacing between them. Concurrency is what trips
+  the challenge on this register's hosts, so this is load-bearing."
+  [f xs]
+  (p/loop [rem (vec xs) acc []]
+    (if (empty? rem)
+      acc
+      (p/let [r (f (first rem))
+              _ (when (seq (rest rem)) (sleep pace-ms))]
+        (p/recur (vec (rest rem)) (conj acc r))))))
+
+(let [data (read-facts)]
+  (when-not (vector? data)
+    (refuse! (str facts-path " is not tx-data (expected a vector of maps)")))
+  (let [entities (filterv map? data)
+        sourced (filterv :source/url entities)
+        hosts (filterv #(= :host-behaviour (:source/kind %)) entities)
+        ;; The page self-tests each need a page the register expects to READ:
+        ;; UTF-8, https, :page-identity. They must NOT all use the same one.
+        ;;
+        ;; Measured 2026-08-26: an earlier revision drove all four against a
+        ;; single probe, which asked one page for the fifth time in about six
+        ;; seconds and tripped that host's AWS WAF. The run then refused -- the
+        ;; right answer, but produced by the verifier's own traffic, and no run
+        ;; could establish anything about the register. So the candidates are
+        ;; interleaved by host and handed out one per self-test.
+        candidates (filterv #(and (= :page-identity (:source/verify %))
+                                  (nil? (:page/charset %))
+                                  (str/starts-with? (:source/url %) "https://"))
+                            sourced)
+        ;; Hosts the register has MEASURED to interpose a challenge go last in
+        ;; the pool. The self-tests are the burstiest thing this run does -- four
+        ;; page fetches back to back -- and aiming that burst at the host most
+        ;; likely to answer with a challenge is how a run blocks itself. This is
+        ;; a preference, not an exclusion: if such a host is all there is, it is
+        ;; still used, and the run refuses honestly if it gets blocked.
+        challenge-prone (into #{} (keep (fn [h] (when (or (:host/challenge h)
+                                                          (= :refuses-or-challenges
+                                                             (:host/missing-path h)))
+                                                  (:host/name h)))
+                                        hosts))
+        by-host (into {} (sort-by (fn [[h _]] [(if (challenge-prone h) 1 0) h])
+                                  (group-by #(.-host (js/URL. (:source/url %))) candidates)))
+        ;; The `when` is not defensive noise. Without it, a register with no
+        ;; page entries reaches `(apply map f [])`, which returns a TRANSDUCER
+        ;; rather than a sequence, and `apply concat` throws -- so the run dies
+        ;; with an uncaught error and exit 1 before any of the guards below can
+        ;; speak. Exit 1 means "the register is wrong"; an unreadable or empty
+        ;; register is "the run could not answer", which is exit 2. Found by
+        ;; scripts/mutation-check.cljk, which asked for "declares 0 sources"
+        ;; and got a stack trace instead.
+        pool (vec (when (seq by-host)
+                    (apply concat
+                           (apply map (fn [& xs] (remove nil? xs))
+                                  (let [groups (vals by-host)
+                                        n (apply max 1 (map count groups))]
+                                    (map #(concat % (repeat (- n (count %)) nil)) groups))))))
+        pick (fn [i] (when (seq pool) (nth pool (mod i (count pool)))))
+        page-entries (filterv #(#{:page-identity :page-text} (:source/verify %)) sourced)]
+    (cond
+      (zero? (count sourced))
+      (refuse! (str facts-path " declares 0 sources. An empty register is not a "
+                    "clean register."))
+
+      ;; Conditional for the same reason the page self-tests are. A
+      ;; :host-behaviour entity exists to back a page check; a register that
+      ;; cites no page needs none, and demanding one would make a laws-only
+      ;; register fetch from agency hosts it never cites -- which is how three
+      ;; law-branch mutations came back INCONCLUSIVE on 2026-08-26, blocked by
+      ;; a challenge on a host that had nothing to do with them.
+      (and (seq page-entries) (zero? (count hosts)))
+      (refuse! (str facts-path " cites pages but declares no :host-behaviour. "
+                    "The page checks would rest on an assumption nothing measures."))
+
+      ;; A register with page entries must be able to exercise the page
+      ;; branches. A register with NO page entries is a different thing -- a
+      ;; laws-only register is legitimate, and there the page self-tests are
+      ;; vacuous rather than missing. They are skipped and SAID to be skipped;
+      ;; a skipped check that prints like a passed one is the whole failure
+      ;; this file is built against.
+      (and (seq page-entries) (empty? pool))
+      (refuse! (str facts-path " has page entries but no UTF-8 https "
+                    ":page-identity entry to drive the page self-tests with. "
+                    "They would pass by not running."))
+
+      (and (seq page-entries) (< (count by-host) 2))
+      (refuse! (str "every :page-identity entry in " facts-path " is on one host ("
+                    (pr-str (keys by-host)) "). The page self-tests would ask that "
+                    "host four times in a row, which is the burst that trips a bot "
+                    "challenge -- the run would refuse because of its own traffic."))
+
+      :else
+      (let [static (static-entity-findings sourced)
+            cov0 (coverage-findings entities sourced hosts)
+            fatal (filterv #(= :refused (:level %)) static)]
+        (doseq [f static]
+          (println (str "  " (str/upper (name (:level f)))
+                        "[" (name (:reason f)) "]\t" (:id f) "\t" (:why f))))
+        (doseq [f cov0] (println (str "  FAIL\tregister.coverage\t" f)))
+        (println (str "STATIC\t" (+ (count static) (count cov0))
+                      "\tfinding(s) before any request was made"))
+        (cond
+          ;; A register that contradicts itself cannot be checked against the
+          ;; world -- part of what it would be checked by is the broken part.
+          (seq fatal)
+          (refuse! (str (count fatal) " source(s) carry no runnable check. "
+                        "Nothing was fetched."))
+
+          (or (seq static) (seq cov0))
+          (die! 1 (str "FAIL\t" (count static) " structural + " (count cov0)
+                       " coverage finding(s). Nothing was fetched."))
+
+          static-only?
+          (die! 0 (str "OK\tstatic only: " (count sourced) " sourced entries, "
+                       (count hosts) " host behaviours, no findings. "
+                       "NOTHING WAS FETCHED -- this says the register is "
+                       "self-consistent, not that it is true."))
+
+          :else
+          (p/let [selfs (serially (fn [f] (f))
+                                  (cond-> [self-test-law self-test-challenge]
+                                    (seq page-entries)
+                                    (into [#(self-test-title (pick 0))
+                                           #(self-test-redirect (pick 1))
+                                           #(self-test-text (pick 2))
+                                           #(self-test-charset (pick 3))])))]
+            (let [selfs (vec selfs)
+                  bad (filterv #(not (:ok %)) selfs)]
+              (doseq [s selfs]
+                (println (str "SELF-TEST\t" (if (:ok s) "ok" "BROKEN") "\t"
+                              (or (:detail s) (:why s)))))
+              (when (empty? page-entries)
+                (println (str "SELF-TEST\tSKIPPED\tthe four page self-tests did not "
+                              "run: this register cites no page, so there is nothing "
+                              "for them to discriminate. Skipped, not passed.")))
+              (when (seq bad)
+                (when (pos? @blocked)
+                  (println (str "BLOCKED\tchallenge\t" @blocked
+                                "\ta bot challenge blocked the self-tests. They did "
+                                "not fail to discriminate; they never ran against the "
+                                "authority.")))
+                (refuse! (str (count bad) " self-test(s) did not discriminate. "
+                              "Nothing below would mean anything.")))
+              (p/let [host-results (serially (fn [h] (p/let [r (check-host h)]
+                                                       (assoc r :entity h)))
+                                             hosts)
+                      results (serially (fn [e] (p/let [r (check e)] (assoc r :entity e)))
+                                        sourced)]
+                (let [host-results (vec host-results)
+                      results (vec results)
+                      all (into host-results results)
+                      byv (fn [v] (filterv #(= v (:verdict %)) all))
+                      passed (byv :pass) failed (byv :fail) refused (byv :refused)]
+                  (println (str "SCANNED\t" (count results) "\tof " (count sourced)
+                                " sourced entries in " facts-path))
+                  (println (str "HOSTS\t" (count host-results) "\tmissing-path behaviours re-measured"))
+                  (doseq [r host-results]
+                    (println (str "  " (str/upper (name (:verdict r)))
+                                  (when (:reason r) (str "[" (name (:reason r)) "]"))
+                                  "\thost:" (:host/name (:entity r))
+                                  "\t" (or (:detail r) (:why r)))))
+                  (doseq [r results]
+                    (println (str "  " (str/upper (name (:verdict r)))
+                                  (when (:reason r) (str "[" (name (:reason r)) "]"))
+                                  "\t" (:source/id (:entity r))
+                                  "\t" (or (:detail r) (:why r)))))
+                  (doseq [r all] (note-if-blocked! (:reason r)))
+                  (println (str "pass=" (count passed) " fail=" (count failed)
+                                " refused=" (count refused)))
+                  (when (pos? @blocked)
+                    (println (str "BLOCKED\tchallenge\t" @blocked
+                                  "\ta bot challenge stood in the way this many times. "
+                                  "Whatever it blocked was not measured either way.")))
+                  (cond
+                    (or (seq refused) (not= (count results) (count sourced)))
+                    (refuse! (str (count refused) " source(s) could not be reached or carry "
+                                  "no usable check. This run does not establish that the "
+                                  "register is correct."))
+
+                    (seq failed)
+                    (die! 1 (str "FAIL\t" (count failed) " source(s)"))
+
+                    :else
+                    (die! 0 (str "OK\t" (count passed) " checks verified ("
+                                 (count results) " sources + " (count host-results)
+                                 " host behaviours)"))))))))))))

@@ -1,0 +1,668 @@
+(ns kotoba.sql.conn
+  "Portable SQL connection capability: the replacement for java.sql
+  (Connection / Statement / PreparedStatement / ResultSet) and
+  javax.sql.DataSource as the fleet's storage code uses them.
+
+  Capability shape: code never reaches a database ambiently. It is handed a
+  DATASOURCE (the granted authority) and derives everything else from it:
+  datasource -> connection -> statement -> result.
+
+  Two hosts, one surface:
+
+  - JVM: every function DELEGATES 1:1 to the JDBC method named in its
+    docstring, on the host object itself. A consumer rewritten from JDBC
+    interop onto these functions behaves byte-for-byte as before; errors are
+    the driver's own java.sql.SQLException.
+  - kbb engine (SCI on Node): the same functions run over `node:sqlite`
+    (DatabaseSync / StatementSync, synchronous). Handles are plain JS objects
+    carrying a `close` method, so `with-open` closes them. Semantics are held
+    to sqlite-jdbc's answers by test (test/kotoba/sql/conn_test.cljk records
+    the JVM answers as literals). Where Node cannot match, the function
+    REFUSES by name: ex-info with {:kotoba.sql.conn/error <keyword>}.
+
+  Node value types: TEXT -> string, INTEGER -> number when it is a safe
+  integer (|n| <= 2^53-1), otherwise a BigInt with the exact value (sqlite-jdbc
+  answers a Long; compare with `str`), REAL -> number, BLOB -> Uint8Array,
+  NULL -> nil. Bind: nil, boolean (-> 1/0 like sqlite-jdbc), integral number
+  or BigInt (-> INTEGER), non-integral number (-> REAL), string, Uint8Array.
+
+  Only SQLite is reachable on Node. PostgreSQL stays JVM-only here (the
+  portable wire protocol is kotoba-lang/org-postgresql-wire; it is not wired
+  into this namespace)."
+  (:require [kotoba.lang.text :as str])
+  #?(:clj (:import [java.sql Connection DriverManager PreparedStatement ResultSet Statement]
+                   [java.util Arrays]
+                   [javax.sql DataSource])))
+
+;; ---------------------------------------------------------------------------
+;; refusal
+
+(defn- refuse!
+  ([reason message] (refuse! reason message {}))
+  ([reason message data]
+   (throw (ex-info (str "kotoba.sql.conn: " message)
+                   (assoc data :kotoba.sql.conn/error reason)))))
+
+(defn- jdbc-url [path-or-url]
+  (let [value (str path-or-url)]
+    (if (str/starts-with? value "jdbc:sqlite:")
+      value
+      (str "jdbc:sqlite:" value))))
+
+;; ---------------------------------------------------------------------------
+;; Node plumbing (kbb engine)
+
+#?(:cljs
+   (do
+     (def ^:private node-sqlite (js/process.getBuiltinModule "node:sqlite"))
+     (def ^:private text-encoder (js/TextEncoder.))
+     (def ^:private text-decoder (js/TextDecoder.))
+
+     (defn- kind [x]
+       (when (and (some? x) (object? x)) (.-kotobaSqlKind x)))
+
+     (defn- bigint? [x]
+       (and (some? x) (identical? js/BigInt (.-constructor x))))
+
+     (defn- u8? [x] (instance? js/Uint8Array x))
+
+     (defn- num->out
+       "An INTEGER as read (BigInt) -> number when safe, else the BigInt."
+       [b]
+       (let [n (js/Number b)]
+         (if (js/Number.isSafeInteger n) n b)))
+
+     (defn- ensure-open-conn! [c]
+       (when-not (= "connection" (kind c))
+         (refuse! :not-a-connection "not a kotoba.sql.conn connection"))
+       (when (.-closed c)
+         (refuse! :connection-closed "database connection closed")))
+
+     (defn- ensure-open-stmt! [st]
+       (when-not (#{"statement" "prepared"} (kind st))
+         (refuse! :not-a-statement "not a kotoba.sql.conn statement"))
+       (when (.-closed st)
+         (refuse! :statement-closed "statement is closed"))
+       (ensure-open-conn! (.-conn st)))
+
+     (defn- close-result! [rs]
+       (when-not (.-closed rs)
+         (set! (.-closed rs) true)
+         (set! (.-row rs) nil)
+         (let [it (.-iter rs)]
+           (when (and it (.-return it)) (.return it)))
+         (let [st (.-stmt rs)]
+           (when (identical? rs (.-result st))
+             (set! (.-result st) nil))))
+       nil)
+
+     (defn- close-stmt! [st]
+       (when-not (.-closed st)
+         (when-let [rs (.-result st)] (close-result! rs))
+         (set! (.-closed st) true))
+       nil)
+
+     (defn- close-conn! [c]
+       (when-not (.-closed c)
+         (set! (.-closed c) true)
+         (.close (.-db c)))
+       nil)
+
+     (defn- node-prepare [c sql]
+       (let [s (.prepare (.-db c) sql)]
+         (.setReadBigInts s true)
+         (.setReturnArrays s true)
+         s))
+
+     (defn- stmt-obj [k c]
+       (let [o (js-obj "kotobaSqlKind" k "conn" c "closed" false
+                       "params" (array) "batch" (array) "result" nil "sql" nil
+                       "native" nil)]
+         (set! (.-close o) (fn [] (close-stmt! o)))
+         o))
+
+     (defn- bind-value
+       "A host value -> what node:sqlite binds the way sqlite-jdbc does."
+       [v]
+       (cond
+         (nil? v) nil
+         (boolean? v) (js/BigInt (if v 1 0))
+         (string? v) v
+         (u8? v) v
+         (bigint? v) v
+         (number? v) (if (js/Number.isInteger v) (js/BigInt v) v)
+         :else (refuse! :unsupported-parameter-type
+                        (str "cannot bind a value of type " (type v))
+                        {:value v})))
+
+     (defn- check-index! [i]
+       (when-not (and (integer? i) (<= 1 i))
+         (refuse! :parameter-out-of-range
+                  (str "parameter index " i " is not >= 1") {:index i})))
+
+     (defn- set-param! [st i v]
+       (ensure-open-stmt! st)
+       (check-index! i)
+       (aset (.-params st) (dec i) (bind-value v))
+       nil)
+
+     (defn- args [st]
+       (let [p (.-params st)]
+         (into-array (map (fn [i] (let [v (aget p i)] (if (undefined? v) nil v)))
+                          (range (alength p))))))
+
+     (defn- run-native [f]
+       (try (f)
+            (catch :default e
+              (if (and (instance? js/Error e)
+                       (= "column index out of range" (.-message e)))
+                (refuse! :parameter-out-of-range
+                         "more parameters bound than the statement has")
+                (throw e)))))
+
+     (defn- columns [native]
+       (vec (map #(.-name %) (.columns native))))
+
+     (defn- open-result! [st native]
+       (when-let [old (.-result st)] (close-result! old))
+       (let [it (run-native #(.apply (.-iterate native) native (args st)))
+             ;; sqlite-jdbc steps the first row inside executeQuery, so
+             ;; errors (constraints in INSERT .. RETURNING) and effects happen
+             ;; here, not on the first next!.
+             first-step (.next it)
+             rs (js-obj "kotobaSqlKind" "result" "stmt" st "iter" it
+                        "pending" first-step "row" nil "state" "before"
+                        "columns" (columns native) "closed" false
+                        "lastNull" nil)]
+         (set! (.-close rs) (fn [] (close-result! rs)))
+         (set! (.-result st) rs)
+         rs))
+
+     (defn- native-of [st]
+       (or (.-native st)
+           (refuse! :not-a-prepared-statement
+                    "this statement has no prepared SQL")))
+
+     (defn- current-value [rs col]
+       (when-not (= "result" (kind rs))
+         (refuse! :not-a-result "not a kotoba.sql.conn result"))
+       (when (.-closed rs) (refuse! :result-closed "result is closed"))
+       (when-not (= "row" (.-state rs))
+         (refuse! :no-current-row
+                  (str "no current row (" (.-state rs) ")")
+                  {:state (keyword (.-state rs))}))
+       (let [cols (.-columns rs)
+             n (count cols)
+             idx (cond
+                   (string? col)
+                   (let [want (.toLowerCase col)
+                         hit (first (keep-indexed
+                                     (fn [i nm] (when (= want (.toLowerCase nm)) i))
+                                     cols))]
+                     (if (nil? hit)
+                       (refuse! :no-such-column (str "no such column: '" col "'")
+                                {:column col})
+                       hit))
+                   (and (integer? col) (<= 1 col n)) (dec col)
+                   :else (refuse! :column-out-of-range
+                                  (str "column " col " out of bounds [1," n "]")
+                                  {:column col :columns n}))
+             v (aget (.-row rs) idx)]
+         (set! (.-lastNull rs) (nil? v))
+         v))
+
+     (defn- real->string [n]
+       (if (and (js/Number.isInteger n) (< (js/Math.abs n) 1e15))
+         (str n ".0")
+         (str n)))
+
+     (defn- value->string [v]
+       (cond (nil? v) nil
+             (string? v) v
+             (bigint? v) (str v)
+             (number? v) (real->string v)
+             (u8? v) (.decode text-decoder v)
+             :else (str v)))
+
+     (defn- value->bigint
+       "sqlite3_column_int64 on any storage class."
+       [v]
+       (cond (nil? v) (js/BigInt 0)
+             (bigint? v) v
+             (number? v) (js/BigInt (js/Math.trunc v))
+             :else (let [s (value->string v)
+                         m (re-find #"^\s*[+-]?\d+" s)]
+                     (if m (js/BigInt.asIntN 64 (js/BigInt (str/trim m))) (js/BigInt 0)))))))
+
+;; ---------------------------------------------------------------------------
+;; datasource
+
+#?(:clj
+   (defn driver-manager-datasource
+     "A javax.sql.DataSource whose getConnection is
+     java.sql.DriverManager/getConnection on `url` (any JDBC URL). On Node the
+     result is a datasource value too; `connection` opens it only when the URL
+     is jdbc:sqlite:, else refuses :unsupported-datasource."
+     ^DataSource [url]
+     (let [url (str url)]
+       (reify DataSource
+         (getConnection [_] (DriverManager/getConnection url))
+         (getConnection [_ user password] (DriverManager/getConnection url user password))
+         (toString [_] (str "DriverManagerDataSource[" url "]")))))
+   :cljs
+   (defn driver-manager-datasource
+     "Node: a datasource value naming a JDBC URL. Only jdbc:sqlite: opens."
+     [url]
+     (js-obj "kotobaSqlKind" "datasource" "url" (str url))))
+
+(defn sqlite-datasource
+  "The SQLite datasource capability for a file path or jdbc:sqlite: URL
+  (\":memory:\" gives a fresh in-memory database per connection, as in
+  sqlite-jdbc).
+  JVM: new org.sqlite.SQLiteDataSource + setUrl. When org.sqlite is NOT on the
+  classpath, falls back to `driver-manager-datasource` on the same URL (which
+  then needs some registered driver that accepts jdbc:sqlite:).
+  Node: a datasource value; `connection` opens node:sqlite DatabaseSync on
+  the path with the jdbc prefix stripped."
+  [path-or-url]
+  (let [url (jdbc-url path-or-url)]
+    #?(:clj
+       (if-let [cls (try (Class/forName "org.sqlite.SQLiteDataSource")
+                         (catch ClassNotFoundException _ nil))]
+         (let [ds (.newInstance (.getConstructor ^Class cls (make-array Class 0))
+                                (object-array 0))]
+           (clojure.lang.Reflector/invokeInstanceMethod ds "setUrl" (object-array [url]))
+           ds)
+         (driver-manager-datasource url))
+       :cljs
+       (js-obj "kotobaSqlKind" "datasource" "url" url))))
+
+(defn datasource?
+  "[instance? javax.sql.DataSource]"
+  [x]
+  #?(:clj (instance? DataSource x)
+     :cljs (= "datasource" (kind x))))
+
+;; ---------------------------------------------------------------------------
+;; connection
+
+(defn connection
+  "[DataSource.getConnection]"
+  [ds]
+  #?(:clj (.getConnection ^DataSource ds)
+     :cljs
+     (let [url (when (datasource? ds) (.-url ds))]
+       (when-not (and url (str/starts-with? url "jdbc:sqlite:"))
+         (refuse! :unsupported-datasource
+                  "only jdbc:sqlite: datasources open on this host"
+                  {:url url}))
+       (let [path (subs url (count "jdbc:sqlite:"))
+             _ (when (str/includes? path "?")
+                 (refuse! :unsupported-datasource
+                          "jdbc:sqlite: URL parameters are not supported on this host"
+                          {:url url}))
+             ;; sqlite-jdbc defaults, measured: foreign_keys 0,
+             ;; busy_timeout 3000, double-quoted string literals accepted.
+             db (new (.-DatabaseSync node-sqlite) path
+                     #js {:enableForeignKeyConstraints false
+                          :enableDoubleQuotedStringLiterals true
+                          :timeout 3000})
+             c (js-obj "kotobaSqlKind" "connection" "db" db "closed" false
+                       "autoCommit" true)]
+         (set! (.-close c) (fn [] (close-conn! c)))
+         c))))
+
+(defn auto-commit?
+  "[Connection.getAutoCommit]"
+  [c]
+  #?(:clj (.getAutoCommit ^Connection c)
+     :cljs (do (ensure-open-conn! c) (.-autoCommit c))))
+
+(defn set-auto-commit!
+  "[Connection.setAutoCommit] Turning it off opens a transaction; turning it
+  back on commits the open one (JDBC and sqlite-jdbc)."
+  [c b]
+  #?(:clj (.setAutoCommit ^Connection c (boolean b))
+     :cljs
+     (do (ensure-open-conn! c)
+         (let [b (boolean b)
+               was (.-autoCommit c)]
+           (cond
+             (and was (not b)) (.exec (.-db c) "BEGIN")
+             (and (not was) b) (when (.-isTransaction (.-db c))
+                                 (.exec (.-db c) "COMMIT")))
+           (set! (.-autoCommit c) b)
+           nil))))
+
+(defn commit!
+  "[Connection.commit]"
+  [c]
+  #?(:clj (.commit ^Connection c)
+     :cljs
+     (do (ensure-open-conn! c)
+         (when (.-autoCommit c)
+           (refuse! :auto-commit-mode "database in auto-commit mode"))
+         (when (.-isTransaction (.-db c)) (.exec (.-db c) "COMMIT"))
+         (.exec (.-db c) "BEGIN")
+         nil)))
+
+(defn rollback!
+  "[Connection.rollback]"
+  [c]
+  #?(:clj (.rollback ^Connection c)
+     :cljs
+     (do (ensure-open-conn! c)
+         (when (.-autoCommit c)
+           (refuse! :auto-commit-mode "database in auto-commit mode"))
+         (when (.-isTransaction (.-db c)) (.exec (.-db c) "ROLLBACK"))
+         (.exec (.-db c) "BEGIN")
+         nil)))
+
+(defn close!
+  "[AutoCloseable.close] on a connection, statement or result. Idempotent."
+  [x]
+  #?(:clj (.close ^java.lang.AutoCloseable x)
+     :cljs (.close x)))
+
+(defn closed?
+  "[Connection.isClosed]"
+  [c]
+  #?(:clj (.isClosed ^Connection c)
+     :cljs (boolean (.-closed c))))
+
+;; ---------------------------------------------------------------------------
+;; statements
+
+(defn create-statement
+  "[Connection.createStatement]"
+  [c]
+  #?(:clj (.createStatement ^Connection c)
+     :cljs (do (ensure-open-conn! c) (stmt-obj "statement" c))))
+
+(defn execute!
+  "[Statement.execute(sql)] -> true when the statement yields rows."
+  [st sql]
+  #?(:clj (.execute ^Statement st ^String sql)
+     :cljs
+     (do (ensure-open-stmt! st)
+         (let [native (node-prepare (.-conn st) sql)
+               rows? (pos? (count (columns native)))]
+           (.run native)
+           rows?))))
+
+(defn prepare
+  "[Connection.prepareStatement(sql)]"
+  [c sql]
+  #?(:clj (.prepareStatement ^Connection c ^String sql)
+     :cljs
+     (do (ensure-open-conn! c)
+         (let [o (stmt-obj "prepared" c)]
+           (set! (.-native o) (node-prepare c sql))
+           (set! (.-sql o) sql)
+           o))))
+
+(defn set-bytes!
+  "[PreparedStatement.setBytes] 1-based."
+  [st i v]
+  #?(:clj (.setBytes ^PreparedStatement st (int i) ^bytes v)
+     :cljs (do (when-not (or (nil? v) (u8? v))
+                 (refuse! :unsupported-parameter-type "set-bytes! needs a Uint8Array"
+                          {:value v}))
+               (set-param! st i v))))
+
+(defn set-object!
+  "[PreparedStatement.setObject] 1-based."
+  [st i v]
+  #?(:clj (.setObject ^PreparedStatement st (int i) v)
+     :cljs (set-param! st i v)))
+
+(defn set-string!
+  "[PreparedStatement.setString] 1-based."
+  [st i v]
+  #?(:clj (.setString ^PreparedStatement st (int i) ^String v)
+     :cljs (do (when-not (or (nil? v) (string? v))
+                 (refuse! :unsupported-parameter-type "set-string! needs a string"
+                          {:value v}))
+               (set-param! st i v))))
+
+(defn- integral! [v]
+  #?(:clj v
+     :cljs (if (or (bigint? v) (and (number? v) (js/Number.isInteger v)))
+             v
+             (refuse! :unsupported-parameter-type "needs an integer" {:value v}))))
+
+(defn set-long!
+  "[PreparedStatement.setLong] 1-based."
+  [st i v]
+  #?(:clj (.setLong ^PreparedStatement st (int i) (long v))
+     :cljs (set-param! st i (integral! v))))
+
+(defn set-int!
+  "[PreparedStatement.setInt] 1-based."
+  [st i v]
+  #?(:clj (.setInt ^PreparedStatement st (int i) (int v))
+     :cljs (set-param! st i (integral! v))))
+
+(defn set-null!
+  "[PreparedStatement.setNull] 1-based; `sql-type` is a java.sql.Types int
+  (ignored by SQLite on both hosts)."
+  [st i sql-type]
+  #?(:clj (.setNull ^PreparedStatement st (int i) (int sql-type))
+     :cljs (set-param! st i nil)))
+
+(defn execute-update!
+  "[PreparedStatement.executeUpdate] -> the row count sqlite3_changes reports
+  (for DDL that is the previous DML's count, on both hosts)."
+  [st]
+  #?(:clj (.executeUpdate ^PreparedStatement st)
+     :cljs
+     (do (ensure-open-stmt! st)
+         (let [native (native-of st)]
+           (when (pos? (count (columns native)))
+             (refuse! :update-returns-rows "Query returns results"))
+           (when-let [rs (.-result st)] (close-result! rs))
+           (js/Number (.-changes (run-native #(.apply (.-run native) native (args st)))))))))
+
+(defn execute-statement!
+  "[PreparedStatement.execute()] -> true when the statement yields rows."
+  [st]
+  #?(:clj (.execute ^PreparedStatement st)
+     :cljs
+     (do (ensure-open-stmt! st)
+         (let [native (native-of st)]
+           (when-let [rs (.-result st)] (close-result! rs))
+           (run-native #(.apply (.-run native) native (args st)))
+           (pos? (count (columns native)))))))
+
+(defn execute-query
+  "[PreparedStatement.executeQuery] -> a result."
+  [st]
+  #?(:clj (.executeQuery ^PreparedStatement st)
+     :cljs
+     (do (ensure-open-stmt! st)
+         (let [native (native-of st)]
+           (when (zero? (count (columns native)))
+             (refuse! :query-returns-no-rows "Query does not return results"))
+           (open-result! st native)))))
+
+(defn add-batch!
+  "[PreparedStatement.addBatch] (addition to the contract: bitcoin-consensus)."
+  [st]
+  #?(:clj (.addBatch ^PreparedStatement st)
+     :cljs (do (ensure-open-stmt! st)
+               (.push (.-batch st) (args st))
+               nil)))
+
+(defn clear-batch!
+  "[Statement.clearBatch] (addition)."
+  [st]
+  #?(:clj (.clearBatch ^PreparedStatement st)
+     :cljs (do (ensure-open-stmt! st)
+               (set! (.-batch st) (array))
+               nil)))
+
+(defn execute-batch!
+  "[Statement.executeBatch] -> int[] on the JVM, a JS array of numbers on
+  Node (alength / aget / vec work on both). The batch is cleared."
+  [st]
+  #?(:clj (.executeBatch ^PreparedStatement st)
+     :cljs
+     (do (ensure-open-stmt! st)
+         (let [native (native-of st)
+               batch (.-batch st)]
+           (when (pos? (count (columns native)))
+             (refuse! :update-returns-rows "Query returns results"))
+           (set! (.-batch st) (array))
+           (into-array
+            (map (fn [a] (js/Number (.-changes (run-native #(.apply (.-run native) native a)))))
+                 batch))))))
+
+;; ---------------------------------------------------------------------------
+;; results
+
+(defn next!
+  "[ResultSet.next] -> boolean. After exhaustion or close it stays false."
+  [rs]
+  #?(:clj (.next ^ResultSet rs)
+     :cljs
+     (if (or (.-closed rs) (= "after" (.-state rs)))
+       false
+       (let [step (if-let [p (.-pending rs)]
+                    (do (set! (.-pending rs) nil) p)
+                    (.next (.-iter rs)))]
+         (set! (.-lastNull rs) nil)
+         (if (.-done step)
+           (do (set! (.-state rs) "after") (set! (.-row rs) nil) false)
+           (do (set! (.-state rs) "row") (set! (.-row rs) (.-value step)) true))))))
+
+(defn get-string
+  "[ResultSet.getString] 1-based index or column label."
+  [rs col]
+  #?(:clj (if (string? col) (.getString ^ResultSet rs ^String col) (.getString ^ResultSet rs (int col)))
+     :cljs (value->string (current-value rs col))))
+
+(defn get-bytes
+  "[ResultSet.getBytes] -> byte[] on the JVM, Uint8Array (a copy) on Node.
+  TEXT / numbers come back as their UTF-8 bytes, as in sqlite-jdbc."
+  [rs col]
+  #?(:clj (if (string? col) (.getBytes ^ResultSet rs ^String col) (.getBytes ^ResultSet rs (int col)))
+     :cljs (let [v (current-value rs col)]
+             (cond (nil? v) nil
+                   (u8? v) (.slice v)
+                   :else (.encode text-encoder (value->string v))))))
+
+(defn get-long
+  "[ResultSet.getLong] NULL -> 0. On Node a value outside +-(2^53-1) comes
+  back as an exact BigInt (sqlite-jdbc: long)."
+  [rs col]
+  #?(:clj (if (string? col) (.getLong ^ResultSet rs ^String col) (.getLong ^ResultSet rs (int col)))
+     :cljs (num->out (value->bigint (current-value rs col)))))
+
+(defn get-int
+  "[ResultSet.getInt] NULL -> 0; truncated to 32 bits like the JVM."
+  [rs col]
+  #?(:clj (if (string? col) (.getInt ^ResultSet rs ^String col) (.getInt ^ResultSet rs (int col)))
+     :cljs (js/Number (js/BigInt.asIntN 32 (value->bigint (current-value rs col))))))
+
+(defn get-object
+  "[ResultSet.getObject] JVM: Integer / Long / Double / String / byte[] / nil.
+  Node: number (BigInt beyond 2^53) / string / Uint8Array / nil."
+  [rs col]
+  #?(:clj (if (string? col) (.getObject ^ResultSet rs ^String col) (.getObject ^ResultSet rs (int col)))
+     :cljs (let [v (current-value rs col)]
+             (cond (bigint? v) (num->out v)
+                   (u8? v) (.slice v)
+                   :else v))))
+
+(defn was-null?
+  "[ResultSet.wasNull] Refuses before any column was read (the JVM throws)."
+  [rs]
+  #?(:clj (.wasNull ^ResultSet rs)
+     :cljs (let [v (.-lastNull rs)]
+             (when (nil? v)
+               (refuse! :no-column-read "no column has been read on this row"))
+             v)))
+
+;; ---------------------------------------------------------------------------
+;; values
+
+(defn blob?
+  "Is `x` this host's BLOB value (byte[] on the JVM, Uint8Array on Node)?
+  Use it where JDBC code said `bytes?`: on the kbb engine `bytes?` is false
+  for a Uint8Array. (Addition to the contract.)"
+  [x]
+  #?(:clj (bytes? x)
+     :cljs (u8? x)))
+
+(defn bytes-equal?
+  "[java.util.Arrays/equals] for BLOB values; nil equals only nil."
+  [a b]
+  #?(:clj (Arrays/equals ^bytes a ^bytes b)
+     :cljs (cond (and (nil? a) (nil? b)) true
+                 (or (nil? a) (nil? b)) false
+                 (not= (alength a) (alength b)) false
+                 :else (loop [i 0]
+                         (cond (= i (alength a)) true
+                               (not= (aget a i) (aget b i)) false
+                               :else (recur (inc i)))))))
+
+(defn byte-length
+  "[alength] of a BLOB value."
+  [b]
+  #?(:clj (alength ^bytes b)
+     :cljs (.-length b)))
+
+(defn long-value
+  "[Number.longValue] of what get-object returned (addition: bitcoin-consensus
+  reads nullable integers through getObject). Node: number -> truncated
+  number; BigInt -> number when safe, else the BigInt."
+  [x]
+  #?(:clj (.longValue ^Number x)
+     :cljs (cond (bigint? x) (num->out x)
+                 (number? x) (js/Math.trunc x)
+                 :else (refuse! :not-a-number "long-value needs a number" {:value x}))))
+
+;; ---------------------------------------------------------------------------
+;; higher level (both hosts)
+
+(defn- bind-all! [st params]
+  (doseq [[index value] (map-indexed vector params)]
+    (if (blob? value)
+      (set-bytes! st (inc index) value)
+      (set-object! st (inc index) value)))
+  st)
+
+(defn execute
+  "Prepare `sql`, bind `params` (blob -> set-bytes!, else set-object!), run
+  executeUpdate, close. -> update count."
+  [c sql params]
+  (with-open [st (bind-all! (prepare c sql) params)]
+    (execute-update! st)))
+
+(defn query
+  "Prepare `sql`, bind `params`, executeQuery, -> vector of (row-fn result)
+  for each row. Everything is closed before returning."
+  [c sql params row-fn]
+  (with-open [st (bind-all! (prepare c sql) params)
+              rs (execute-query st)]
+    (loop [out []]
+      (if (next! rs)
+        (recur (conj out (row-fn rs)))
+        out))))
+
+(defmacro with-transaction
+  "Run `body` with auto-commit off; commit on normal exit, roll back and
+  rethrow on any throw, and restore the previous auto-commit either way."
+  [[c] & body]
+  `(let [c# ~c
+         was# (auto-commit? c#)]
+     (try
+       (set-auto-commit! c# false)
+       (let [v# (do ~@body)]
+         (commit! c#)
+         v#)
+       (catch #?(:clj Throwable :cljs :default) e#
+         (rollback! c#)
+         (throw e#))
+       (finally
+         (set-auto-commit! c# was#)))))

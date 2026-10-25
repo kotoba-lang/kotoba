@@ -1,0 +1,233 @@
+(ns proto.wire-test
+  "Tests for the wire codec.
+
+  The scalar vectors are the worked examples from the Protocol Buffers
+  encoding specification, and every one of them is independently checkable by
+  arithmetic rather than by trusting this implementation — `96 01` is
+  0x16 + 1*128 = 150, `9E A7 05` is 0x1E + 0x27*128 + 5*16384 = 86942. That
+  matters: a codec tested only against its own output agrees with itself and
+  with nothing else.
+
+  The round-trip tests are the ones that protect signature verification. They
+  assert byte-identity, not equivalence, over inputs that a careless decoder
+  would quietly normalise: unknown fields, repeated fields, and a varint
+  written non-canonically."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [proto.wire :as w]))
+
+(defn- b
+  "Hex to byte vector, so spec vectors can be written the way the spec writes
+  them. Variadic so a message can be given field by field."
+  [& ss]
+  (->> (re-seq #"[0-9a-fA-F]{2}" (apply str ss))
+       (mapv #?(:clj  #(Integer/parseInt % 16)
+                :cljs #(js/parseInt % 16)))))
+
+;; ── varints ──────────────────────────────────────────────────────────────────
+
+(deftest varint-spec-vectors
+  (testing "the specification's own examples"
+    (is (= [1]        (w/write-varint 1)))
+    (is (= (b "9601") (w/write-varint 150)) "150 = 0x16 + 1*128")
+    (is (= 150 (:value (w/read-varint (b "9601") 0))))
+    (is (= 300 (:value (w/read-varint (b "ac02") 0))) "300 = 0x2c + 2*128"))
+
+  (testing "past 32 bits — where ClojureScript's bitwise operators would truncate"
+    (doseq [n [4294967295          ; 2^32-1
+               4294967296          ; 2^32
+               1099511627776       ; 2^40
+               9007199254740991]]  ; 2^53-1, the last exact integer in a double
+      (is (= n (:value (w/read-varint (w/write-varint n) 0)))
+          (str n " survives a write/read round trip")))))
+
+(deftest varint-limits
+  (is (thrown? #?(:clj Exception :cljs js/Error) (w/read-varint (b "80") 0))
+      "a truncated varint is an error, not a partial value")
+  (is (thrown? #?(:clj Exception :cljs js/Error) (w/write-varint -1))
+      "negative values are not varints (sint uses zigzag)")
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (w/read-varint (b "ffffffffffffffffff7f") 0))
+      "a value past the exactly-representable range is refused, not rounded")
+
+  (testing "a varint that never terminates"
+    ;; All-zero payload, so the accumulator never grows and only the length
+    ;; guard can stop it. This is the case where the two runtimes used to
+    ;; disagree: the shift reached 2^63 on the tenth byte, which threw
+    ;; `long overflow` on the JVM and nothing at all on ClojureScript. A
+    ;; hostile peer can send exactly these bytes.
+    (doseq [n [10 11 12 20]]
+      (is (thrown-with-msg?
+           #?(:clj Exception :cljs js/Error) #"longer than 10 bytes"
+           (w/read-varint (vec (repeat n 0x80)) 0))
+          (str n " continuation bytes"))))
+
+  (testing "ten bytes is the limit, and a legal ten-byte varint still reads"
+    ;; nine continuation bytes then a terminator: non-canonical, but legal,
+    ;; and it must not be caught by the length guard
+    (is (= 0 (:value (w/read-varint (b "80808080808080808000") 0))))
+    (is (= 10 (:length (w/read-varint (b "80808080808080808000") 0))))))
+
+(deftest zigzag-spec-vectors
+  (is (= [0 1 2 3 4294967294 4294967295]
+         (map w/zigzag-encode [0 -1 1 -2 2147483647 -2147483648])))
+  (is (= [0 -1 1 -2 2147483647 -2147483648]
+         (map w/zigzag-decode [0 1 2 3 4294967294 4294967295]))))
+
+;; ── messages ─────────────────────────────────────────────────────────────────
+
+(deftest spec-message-vectors
+  (testing "Test1 { int32 a = 1 } with a = 150"
+    (let [msg (w/decode (b "089601"))]
+      (is (= 1 (count msg)))
+      (is (= 1 (:field-number (first msg))))
+      (is (= :varint (:wire-type (first msg))))
+      (is (= 150 (w/varint-value (w/field msg 1))))))
+
+  (testing "Test2 { string b = 2 } with b = \"testing\""
+    (let [msg (w/decode (b "120774657374696e67"))]
+      (is (= :length-delimited (:wire-type (first msg))))
+      (is (= "testing" (w/bytes->utf8 (w/bytes-value (w/field msg 2)))))))
+
+  (testing "Test3 { Test1 c = 3 } with c.a = 150 — a nested message"
+    (let [msg (w/decode (b "1a03089601"))]
+      (is (= 150 (-> (w/field msg 3) w/message-value (w/field 1) w/varint-value)))))
+
+  (testing "a packed repeated int32 stays opaque bytes"
+    ;; 22 06 | 03 | 8E 02 | 9E A7 05  =  [3 270 86942]
+    (let [msg (w/decode (b "2206038e029ea705"))
+          payload (w/bytes-value (w/field msg 4))]
+      (is (= 6 (count payload)))
+      (is (= [3 270 86942]
+             (loop [off 0 out []]
+               (if (>= off (count payload))
+                 out
+                 (let [{:keys [value length]} (w/read-varint payload off)]
+                   (recur (+ off length) (conj out value))))))))))
+
+;; ── the property that signature verification rests on ────────────────────────
+
+(deftest round-trip-is-byte-identical
+  (testing "a plain message"
+    (let [bs (b "089601" )]
+      (is (= bs (w/encode (w/decode bs))))))
+
+  (testing "unknown fields survive"
+    ;; field 9 (fixed64) and field 11 (fixed32) are fields this test pretends
+    ;; not to understand. A decoder that dropped them would still produce a
+    ;; parseable message — and a signature over it would never verify.
+    (let [bs (b "089601" "4900000000000000ff" "5d11223344")]
+      (is (= bs (w/encode (w/decode bs))))
+      (is (= 3 (count (w/decode bs))))))
+
+  (testing "a non-canonical varint comes back exactly as it went in"
+    ;; 96 81 00 is 0x16 + 1*128 + 0*16384 = 150, written in three bytes
+    ;; instead of two. A varint field survives this even without :raw, because
+    ;; :value holds the varint's own bytes rather than a decoded number — but
+    ;; a field *built* from the value 150 is three bytes shorter, and that is
+    ;; the difference a signature would see.
+    (let [bs  (b "08968100")
+          msg (w/decode bs)]
+      (is (= 150 (w/varint-value (w/field msg 1))) "the value is still 150")
+      (is (= bs (w/encode msg)) "and the bytes are still three")
+      (is (= (b "089601") (w/encode [(w/varint-field 1 150)]))
+          "whereas building the same value canonically gives two")))
+
+  (testing "a non-canonical *length* prefix — the case only :raw can carry"
+    ;; 12 | 82 00 | 68 69 — field 2, length 2 written as two bytes instead of
+    ;; one. Here :value is just the payload (68 69), so reconstructing the
+    ;; field from its parts necessarily emits the canonical 12 02 68 69.
+    ;; Only the preserved :raw slice reproduces what was signed.
+    (let [bs  (b "12" "8200" "6869")
+          msg (w/decode bs)]
+      (is (= "hi" (w/bytes->utf8 (w/bytes-value (w/field msg 2)))))
+      (is (= bs (w/encode msg)) "round trip is byte-identical")
+      (is (= (b "12026869")
+             (w/encode [(w/bytes-field 2 (w/bytes-value (w/field msg 2)))]))
+          "and rebuilding it from :value alone would have changed the bytes")))
+
+  (testing "repeated fields keep their order"
+    (let [bs (b "0801" "0802" "0803")]
+      (is (= bs (w/encode (w/decode bs))))
+      (is (= [1 2 3] (map w/varint-value (w/fields (w/decode bs) 1))))
+      (is (= 3 (w/varint-value (w/field (w/decode bs) 1)))
+          "field returns the last occurrence, per proto3's last-one-wins rule"))))
+
+(deftest remove-field-then-encode
+  ;; The verification move: strip the signature, reproduce the rest exactly.
+  (let [signed   (b "089601" "12027369" "1a03089601")
+        expected (b "089601" "1a03089601")]
+    (is (= expected (w/encode (w/remove-field (w/decode signed) 2))))
+    (is (= signed (w/encode (w/decode signed))) "and the original is untouched")))
+
+;; ── construction ─────────────────────────────────────────────────────────────
+
+(deftest building-messages
+  (is (= (b "089601") (w/encode [(w/varint-field 1 150)])))
+  (is (= (b "120774657374696e67")
+         (w/encode [(w/bytes-field 2 [0x74 0x65 0x73 0x74 0x69 0x6e 0x67])])))
+  (is (= (b "1a03089601")
+         (w/encode [(w/message-field 3 [(w/varint-field 1 150)])])))
+  (testing "built messages decode back to what was built"
+    (let [msg [(w/varint-field 1 42) (w/bytes-field 2 [1 2 3])]]
+      (is (= msg (mapv #(dissoc % :raw) (w/decode (w/encode msg))))))))
+
+;; ── malformed input ──────────────────────────────────────────────────────────
+
+(deftest rejects-what-it-cannot-represent
+  (testing "proto2 groups are refused rather than mis-parsed"
+    ;; 0b = field 1, wire type 3 (start group). A group body is not
+    ;; length-prefixed, so guessing would desynchronise everything after it.
+    (is (thrown? #?(:clj Exception :cljs js/Error) (w/decode (b "0b")))))
+
+  (testing "a length that runs past the end is an error"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (w/decode (b "12ff01")))))
+
+  (testing "field number 0 is invalid"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (w/decode (b "0001"))))))
+
+;; ── UTF-8 ────────────────────────────────────────────────────────────────────
+
+(deftest utf8-decoding
+  (is (= "testing" (w/bytes->utf8 (b "74657374696e67"))))
+  (is (= "" (w/bytes->utf8 [])))
+  (testing "multi-byte sequences"
+    (is (= "é"  (w/bytes->utf8 (b "c3a9"))))
+    (is (= "あ" (w/bytes->utf8 (b "e38182"))))
+    (is (= "🌍" (w/bytes->utf8 (b "f09f8c8d"))) "outside the BMP — surrogate pair"))
+  (testing "malformed input is refused, not replaced with U+FFFD"
+    ;; These bytes usually sit inside something that was signed; substituting
+    ;; a replacement character would change a value a signature covers.
+    (is (thrown? #?(:clj Exception :cljs js/Error) (w/bytes->utf8 (b "ff"))))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (w/bytes->utf8 (b "c3"))))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (w/bytes->utf8 (b "c341"))))))
+
+(deftest utf8-encoding
+  (is (= (b "74657374696e67") (w/utf8->bytes "testing")))
+  (is (= [] (w/utf8->bytes "")))
+  (testing "every width"
+    (is (= (b "c3a9") (w/utf8->bytes "\u00e9")))
+    (is (= (b "e38182") (w/utf8->bytes "\u3042")))
+    (is (= (b "f09f8c8d") (w/utf8->bytes "\ud83c\udf0d"))
+        "outside the BMP — a surrogate pair in, four bytes out"))
+  (testing "round trip across every width boundary"
+    ;; U+007F/U+0080 is one byte to two, U+07FF/U+0800 two to three,
+    ;; U+FFFF/U+10000 three to four — the three places an encoder gets wrong
+    (doseq [s ["" "a" "\u007f" "\u0080" "\u07ff" "\u0800" "\uffff"
+               "\ud800\udc00" "\udbff\udfff"
+               "storj" "\u30a8\u30e9\u30fc" "mixed \u65e5\u672c\u8a9e"]]
+      (is (= s (w/bytes->utf8 (w/utf8->bytes s))) (pr-str s))))
+  (testing "an unpaired surrogate has no encoding and is refused"
+    ;; U+FFFD would be the usual substitution, and it would change a value a
+    ;; signature covers
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"surrogate"
+                          (w/utf8->bytes (str (char 0xd83c)))))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"surrogate"
+                          (w/utf8->bytes (str (char 0xdf0d)))))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"surrogate"
+                          (w/utf8->bytes (str (char 0xd83c) "a"))))))
+
+(deftest string-fields-are-utf-8-length-delimited
+  (is (= {:field-number 1 :wire-type :length-delimited :value (b "73746f726a")}
+         (w/string-field 1 "storj")))
+  (is (= "\u30a8\u30e9\u30fc"
+         (w/bytes->utf8 (:value (w/string-field 3 "\u30a8\u30e9\u30fc"))))))

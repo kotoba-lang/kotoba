@@ -1,0 +1,220 @@
+(ns safetensors.dtype
+  "The real safetensors dtype table plus real IEEE-754 bit-level codecs for the numeric dtypes
+   this reader supports (ADR-2607051400 Phase 3). All decode/encode below is pure integer/float
+   arithmetic — `bit-and`/`bit-shift-right` are only ever applied to values already known to fit
+   inside 31 bits (safe identically on JVM ints/longs and on JS's 32-bit bitwise ops), and every
+   64-bit combination (F64/I64/U64) is done via `hi * 2^32 + lo` arithmetic instead of a 64-bit
+   bitwise op — so this whole namespace needs zero `#?(:clj/:cljs)` reader-conditional numeric
+   code; the arithmetic is identical on every host.
+
+   Layouts implemented from the real specs (checked against github.com/huggingface/safetensors
+   `safetensors/src/tensor.rs` `Dtype`/`bitsize`, and cross-checked against the Wikipedia
+   half-precision / bfloat16 reference tables — not guessed):
+   - F16  (IEEE 754 binary16): 1 sign / 5 exponent bits (bias 15)  / 10 mantissa bits.
+   - BF16 (bfloat16):          1 sign / 8 exponent bits (bias 127) /  7 mantissa bits — i.e.
+     exactly the *top* 16 bits of an F32 (truncated mantissa, same exponent width as F32), so
+     `bf16-bits->double` reuses the F32 decoder after scaling the 16-bit pattern up by 2^16.
+   - F32  (IEEE 754 binary32): 1 sign / 8 exponent bits (bias 127)  / 23 mantissa bits.
+   - F64  (IEEE 754 binary64): 1 sign / 11 exponent bits (bias 1023) / 52 mantissa bits.
+
+   F16 and BF16 have *different* exponent/mantissa splits despite being the same 16-bit width —
+   conflating them (a common bug) silently produces wildly wrong magnitudes since BF16's exponent
+   range matches F32's (~1e38) while F16's is much narrower (~65504 max).")
+
+;; ---- dtype metadata table ----------------------------------------------------------------
+
+(def dtype-table
+  "keyword -> {:label <the exact safetensors JSON dtype string> :bytes <element width>}"
+  {:bool {:label "BOOL" :bytes 1}
+   :i8   {:label "I8"   :bytes 1}
+   :u8   {:label "U8"   :bytes 1}
+   :i16  {:label "I16"  :bytes 2}
+   :u16  {:label "U16"  :bytes 2}
+   :f16  {:label "F16"  :bytes 2}
+   :bf16 {:label "BF16" :bytes 2}
+   :i32  {:label "I32"  :bytes 4}
+   :u32  {:label "U32"  :bytes 4}
+   :f32  {:label "F32"  :bytes 4}
+   :c64  {:label "C64"  :bytes 8}
+   :f64  {:label "F64"  :bytes 8}
+   :i64  {:label "I64"  :bytes 8}
+   :u64  {:label "U64"  :bytes 8}})
+
+(def ^:private label->kw (into {} (map (fn [[k v]] [(:label v) k])) dtype-table))
+
+;; Real safetensors dtypes this reader deliberately does NOT support yet: sub-byte/microscaling
+;; formats (F4/F6_*) and 8-bit float formats (F8_*). The spec's own README calls sub-1-byte
+;; dtypes out as "alignment tricky" and requiring "non traditional APIs" — out of scope for this
+;; pass. Kept as a named set so hitting one of these produces a clear "known but unsupported"
+;; error instead of being confused with a genuinely-invalid/unknown dtype string.
+(def unsupported-labels
+  #{"F4" "F6_E2M3" "F6_E3M2" "F8_E5M2" "F8_E4M3" "F8_E8M0" "F8_E4M3FNUZ" "F8_E5M2FNUZ"})
+
+(defn label->dtype [label]
+  (or (label->kw label)
+      (if (contains? unsupported-labels label)
+        (throw (ex-info (str "safetensors dtype " label " is real but not yet supported by this "
+                              "reader (sub-byte/microscaling format)")
+                         {:dtype label}))
+        (throw (ex-info (str "unknown safetensors dtype " label) {:dtype label})))))
+
+(defn dtype->label [kw]
+  (or (get-in dtype-table [kw :label])
+      (throw (ex-info (str "unknown dtype keyword " kw) {:dtype kw}))))
+
+(defn byte-width [kw]
+  (or (get-in dtype-table [kw :bytes])
+      (throw (ex-info (str "unknown dtype keyword " kw) {:dtype kw}))))
+
+;; ---- normalize a positive double into [1,2) x 2^e via repeated doubling/halving --------------
+;; (avoids log()/pow() precision pitfalls near exact powers of two that a log2-based approach has)
+
+(defn- frexp2 [^double m]
+  (loop [e 0 m m]
+    (cond
+      (>= m 2.0) (recur (inc e) (/ m 2.0))
+      (< m 1.0)  (recur (dec e) (* m 2.0))
+      :else [e m])))
+
+;; ---- F32 (IEEE 754 binary32) ------------------------------------------------------------------
+
+(defn f32-bits->double
+  "IEEE 754 binary32 bit pattern (0..2^32-1, as produced by `safetensors.bytes/u32-le`) -> double."
+  [bits]
+  (let [sign (if (>= bits 2147483648) -1.0 1.0)
+        bits (if (>= bits 2147483648) (- bits 2147483648) bits)
+        exp  (bit-shift-right bits 23)
+        frac (bit-and bits 0x7FFFFF)]
+    (cond
+      (and (zero? exp) (zero? frac))       (* sign 0.0)
+      (zero? exp)                          (* sign frac (Math/pow 2 -149))
+      (and (= exp 255) (zero? frac))       (* sign ##Inf)
+      (= exp 255)                          ##NaN
+      :else (* sign (+ 1.0 (/ frac 8388608.0)) (Math/pow 2 (- exp 127))))))
+
+(defn double->f32-bits
+  "double -> IEEE 754 binary32 bit pattern (0..2^32-1). Round-to-nearest via exact
+   power-of-two normalization; adequate for this reader's own round-trip writer — not claimed
+   to be a fully IEEE-754-conformant encoder for every corner case (e.g. ties-to-even)."
+  [d]
+  (cond
+    (not= d d) 2143289344            ;; 0x7FC00000 canonical quiet NaN
+    (= d ##Inf) 2139095040           ;; 0x7F800000
+    (= d ##-Inf) 4286578688          ;; 0xFF800000
+    (zero? d) (if (neg? (/ 1.0 d)) 2147483648 0)   ;; distinguish -0.0
+    :else
+    (let [sign (if (neg? d) 2147483648 0)
+          m (Math/abs (double d))
+          [e norm] (frexp2 m)]
+      (if (< e -126)
+        (+ sign (Math/round (/ m (Math/pow 2 -149))))
+        (let [exp (+ e 127)
+              mant (Math/round (* (- norm 1.0) 8388608.0))]
+          (if (>= mant 8388608)
+            (+ sign (* (inc exp) 8388608))
+            (+ sign (* exp 8388608) mant)))))))
+
+;; ---- F16 (IEEE 754 binary16) ------------------------------------------------------------------
+
+(defn f16-bits->double
+  "IEEE 754 binary16 bit pattern (0..65535) -> double. 1/5/10 sign/exponent/mantissa, bias 15."
+  [bits]
+  (let [sign (if (>= bits 32768) -1.0 1.0)
+        bits (if (>= bits 32768) (- bits 32768) bits)
+        exp  (bit-shift-right bits 10)
+        frac (bit-and bits 0x3FF)]
+    (cond
+      (and (zero? exp) (zero? frac)) (* sign 0.0)
+      (zero? exp)                    (* sign frac (Math/pow 2 -24))
+      (and (= exp 31) (zero? frac))  (* sign ##Inf)
+      (= exp 31)                     ##NaN
+      :else (* sign (+ 1.0 (/ frac 1024.0)) (Math/pow 2 (- exp 15))))))
+
+(defn double->f16-bits
+  "double -> IEEE 754 binary16 bit pattern (0..65535)."
+  [d]
+  (cond
+    (not= d d) 32256                 ;; 0x7E00 (a quiet NaN encoding)
+    (= d ##Inf) 31744                ;; 0x7C00
+    (= d ##-Inf) 64512                ;; 0xFC00
+    (zero? d) (if (neg? (/ 1.0 d)) 32768 0)
+    :else
+    (let [sign (if (neg? d) 32768 0)
+          m (Math/abs (double d))
+          [e norm] (frexp2 m)]
+      (if (< e -14)
+        (+ sign (Math/round (/ m (Math/pow 2 -24))))
+        (let [exp (+ e 15)
+              mant (Math/round (* (- norm 1.0) 1024.0))]
+          (if (>= mant 1024)
+            (+ sign (* (inc exp) 1024))
+            (+ sign (* exp 1024) mant)))))))
+
+;; ---- BF16 (bfloat16) — top 16 bits of an F32, different split from F16 -------------------------
+
+(defn bf16-bits->double
+  "bfloat16 bit pattern (0..65535) -> double. bf16 IS the top 16 bits of an F32 (same exponent
+   width/bias as F32, truncated mantissa) — NOT the same layout as F16 — so this scales the
+   16-bit pattern up to a 32-bit magnitude (multiply by 2^16, low 16 bits zero) and reuses the
+   F32 decoder rather than re-deriving a separate exponent/mantissa split."
+  [bits]
+  (f32-bits->double (* bits 65536)))
+
+(defn double->bf16-bits
+  "double -> bfloat16 bit pattern (0..65535): encode as F32, then round the top 16 bits
+   (round-half-up on the truncated low 16 bits — not claimed to be round-to-nearest-even)."
+  [d]
+  (let [f32 (double->f32-bits d)
+        lo16 (mod f32 65536)
+        hi16 (quot f32 65536)]
+    (if (>= lo16 32768) (mod (inc hi16) 65536) hi16)))
+
+;; ---- F64 (IEEE 754 binary64) --------------------------------------------------------------------
+
+(def ^:private two52 4503599627370496)     ;; 2^52
+(def ^:private two63 9223372036854775808)  ;; 2^63
+
+(defn f64-bits->double
+  "IEEE 754 binary64 bit pattern (0..2^64-1, as produced by `safetensors.bytes/u64-le`) -> double.
+   Decomposed via `hi = bits / 2^32`, `lo = bits mod 2^32` (arithmetic, not a 64-bit bitwise op)
+   so the sign/11-bit-exponent/52-bit-mantissa fields can be pulled out of `hi` with `quot`/`mod`
+   (deliberately NOT `bit-and`/`bit-shift-right` here — `bits`/`hi` may be a `clojure.lang.BigInt`
+   on the JVM for values near/above 2^63, and Clojure's bitwise ops reject BigInt outright, even
+   when — as here, after the sign bit is removed — the actual magnitude fits in 31 bits)."
+  [bits]
+  (let [hi (quot bits 4294967296)
+        lo (mod bits 4294967296)
+        sign (if (>= hi 2147483648) -1.0 1.0)
+        hi (if (>= hi 2147483648) #?(:clj (-' hi 2147483648) :cljs (- hi 2147483648)) hi)
+        exp (quot hi 1048576)          ;; hi >> 20
+        frac-hi (mod hi 1048576)       ;; hi & 0xFFFFF
+        frac #?(:clj (+' (*' frac-hi 4294967296) lo) :cljs (+ (* frac-hi 4294967296) lo))]
+    (cond
+      (and (zero? exp) (zero? frac))        (* sign 0.0)
+      (zero? exp)                           (* sign frac (Math/pow 2 -1074))
+      (and (= exp 2047) (zero? frac))       (* sign ##Inf)
+      (= exp 2047)                          ##NaN
+      :else (* sign (+ 1.0 (/ frac (double two52))) (Math/pow 2 (- exp 1023))))))
+
+(defn double->f64-bits
+  "double -> IEEE 754 binary64 bit pattern, returned as the unsigned 64-bit magnitude (0..2^64-1).
+   Exact on JVM (Clojure auto-promotes to bignum past Long range); on ClojureScript this is
+   precision-limited to doubles' 2^53 exact-integer range for the *combined* 64-bit magnitude —
+   documented, not silently wrong, and irrelevant to this repo's own tests (JVM-verified)."
+  [d]
+  (cond
+    (not= d d) (+ (* 2047 two52) 1)
+    (= d ##Inf) (* 2047 two52)
+    (= d ##-Inf) (+ two63 (* 2047 two52))
+    (zero? d) (if (neg? (/ 1.0 d)) two63 0)
+    :else
+    (let [sign (if (neg? d) two63 0)
+          m (Math/abs (double d))
+          [e norm] (frexp2 m)]
+      (if (< e -1022)
+        (+ sign (Math/round (/ m (Math/pow 2 -1074))))
+        (let [exp (+ e 1023)
+              mant (Math/round (* (- norm 1.0) (double two52)))]
+          (if (>= mant two52)
+            (+ sign (* (inc exp) two52))
+            (+ sign (* exp two52) mant)))))))

@@ -1,0 +1,109 @@
+;; etzhayyim.kotoba.encrypted — com.etzhayyim.encrypted.record envelope (root-side).
+;;
+;; ADR-2605181100 Tahoe-on-MST confidential record. This builds/opens the AEAD
+;; ciphertext envelope; the CID is computed OVER the envelope (so MST proofs +
+;; L2 anchor finality apply unchanged), and the AEAD AAD binds the ciphertext to
+;; a stable self-reference to prevent intra-MST record-swap.
+;;
+;; SCOPE (increment #2): the RECORD envelope + AEAD layer + reproducible test
+;; vectors. Per-recipient key distribution (com.etzhayyim.encrypted.keyWrap) is
+;; Signal X3DH+Double Ratchet — that is the kotoba-signal seam; here `wrap-key`
+;; is a pluggable interface (default raw, for vectors) so the record layer is
+;; complete and testable without pulling in the full Signal stack.
+;;
+;; Inner plaintext encoding: the wire spec is CBOR(plaintext). bb has no bundled
+;; CBOR codec, so the reference uses a pluggable `*encode-plaintext*` (default
+;; UTF-8 of canonical EDN pr-str) — swap to CBOR to match the production wire.
+;; The AEAD/envelope framing is independent of this choice.
+
+(ns etzhayyim.kotoba.encrypted
+  (:require [kotoba.bytes :as kbytes] [etzhayyim.kotoba.cid :as cid]
+            [etzhayyim.kotoba.crypto :as crypto]))
+
+(defn- b64 ^String [^bytes b]
+  #?(:clj (kbytes/base64-encode b) :cljs nil))
+(defn- unb64 ^bytes [^String s]
+  #?(:clj (kbytes/base64-decode-bytes s) :cljs nil))
+
+(defn- sha256 ^bytes [^bytes b] (cid/sha2-256-digest b))
+(defn- hexpref [^bytes b ^long nchars]
+  (apply str (take nchars (mapcat #(format "%02x" (bit-and % 0xff)) b))))
+
+(def ^:dynamic *encode-plaintext*
+  "Plaintext -> bytes. Default = UTF-8 of canonical EDN. Bind to a CBOR encoder
+   to match the production wire (the AEAD framing is unaffected)."
+  (fn [v] #?(:clj (kbytes/utf8-bytes (pr-str v)) :cljs nil)))
+(def ^:dynamic *decode-plaintext*
+  (fn [^bytes b] #?(:clj (read-string (kbytes/utf8-string b)) :cljs nil)))
+
+(defn key-id
+  "keyId = hex prefix of sha256(sym-key) (16 hex chars), per ADR-2605181100."
+  [^bytes sym-key] (hexpref (sha256 sym-key) 16))
+
+(defn self-ref-aad
+  "Stable, non-circular self-reference bound into the AEAD AAD: the CID over the
+   envelope's immutable header (innerType|sender|createdAt|keyId). Binding the
+   ciphertext to this prevents swapping a ciphertext under a different header
+   within the same MST. (Production kotoba-crypto binds the MST self-cid; this
+   deterministic ref keeps the reference vectors reproducible.)"
+  [{:keys [innerType sender createdAt keyId]}]
+  #?(:clj (kbytes/utf8-bytes (cid/cid-of-edn [innerType sender createdAt keyId]))
+     :cljs nil))
+
+(defn seal
+  "Build a com.etzhayyim.encrypted.record envelope.
+     sym-key   32-byte symmetric key
+     nonce24   24-byte XChaCha20 nonce (caller-supplied; reproducible — no RNG here)
+     plaintext arbitrary EDN value (encoded via *encode-plaintext*)
+     opts      :sender :innerType :createdAt (all bound into the AAD)
+   Returns the envelope map (nonce/ciphertext base64-encoded)."
+  [^bytes sym-key ^bytes nonce24 plaintext {:keys [sender innerType createdAt]}]
+  (let [kid (key-id sym-key)
+        header {:innerType innerType :sender sender :createdAt createdAt :keyId kid}
+        aad (self-ref-aad header)
+        pt (*encode-plaintext* plaintext)
+        ct+tag (crypto/xchacha20-poly1305-encrypt sym-key nonce24 aad pt)]
+    {:v 1
+     :alg crypto/alg-id
+     :nonce (b64 nonce24)
+     :ciphertext (b64 ct+tag)
+     :keyId kid
+     :innerType innerType
+     :sender sender
+     :createdAt createdAt}))
+
+(defn open
+  "Decrypt + verify an envelope with `sym-key`. Returns the plaintext value.
+   Throws if the AEAD tag fails (tamper / wrong key / swapped header)."
+  [^bytes sym-key envelope]
+  (let [{:keys [nonce ciphertext innerType sender createdAt keyId]} envelope
+        aad (self-ref-aad {:innerType innerType :sender sender
+                           :createdAt createdAt :keyId keyId})
+        pt (crypto/xchacha20-poly1305-decrypt sym-key (unb64 nonce) aad (unb64 ciphertext))]
+    (*decode-plaintext* pt)))
+
+(defn envelope-cid
+  "CID over the encrypted envelope (the record's content address on the MST).
+   'CID is computed over the encrypted envelope' (ADR-2605181100) — so it leaks
+   nothing about the plaintext yet inherits MST verify-cap + L2 finality."
+  [envelope]
+  ;; address over the canonical envelope with map keys in a fixed order
+  (cid/cid-of-edn (into (sorted-map) envelope)))
+
+;; ── keyWrap (structure; Signal wrap is the kotoba-signal seam) ──
+(def ^:dynamic *wrap-key*
+  "(sym-key, recipient-did) -> wrapped-bytes. DEFAULT = raw passthrough for
+   vectors/tests ONLY. Production binds libsignal X3DH+Double Ratchet here."
+  (fn [^bytes sym-key _recipient] sym-key))
+
+(defn key-wrap
+  "Build a com.etzhayyim.encrypted.keyWrap record for one (record, recipient)."
+  [^bytes sym-key {:keys [sender recipient signalSessionId createdAt recordUri]}]
+  (cond-> {:v 1
+           :keyId (key-id sym-key)
+           :sender sender
+           :recipient recipient
+           :ciphertext (b64 (*wrap-key* sym-key recipient))
+           :signalSessionId signalSessionId
+           :createdAt createdAt}
+    recordUri (assoc :recordUri recordUri)))

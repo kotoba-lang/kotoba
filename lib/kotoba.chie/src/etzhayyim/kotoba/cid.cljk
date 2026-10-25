@@ -1,0 +1,141 @@
+;; etzhayyim.kotoba.cid — CIDv1 content-address framing for the root-side Datom log.
+;;
+;; BOUNDARY (ADR-2605262130 + user directive 2026-06-14):
+;;   This is the root-side reference implementation. NO etzhayyim data or
+;;   implementation lives in the kotoba subrepo (40-engine/kotoba/, a separate
+;;   git repo = the generic Rust engine). The canonical religious-corp Datom
+;;   data lives in 80-data/ and its schemas in 00-contracts/schemas/. This
+;;   engine glue lives in root on the bb.edn classpath (70-tools/src).
+;;
+;; FRAMING is canonical (CIDv1 = <multibase> <version> <multicodec> <multihash>):
+;;   multibase  = 'b'  (base32 lower, RFC4648, no padding)
+;;   version    = 0x01
+;;   multicodec = 0x55 (raw)  — content is canonical bytes of the framed value
+;;   multihash  = <hash-code> <digest-len> <digest>
+;;
+;; DIGEST = SHA2-256 (multihash code 0x12). This is the REPO-CANONICAL data-layer
+;;   content address, NOT a placeholder: `orgs/etzhayyim/com-etzhayyim-rasen/methods/cid.py` and the
+;;   WASM loaders (ADR-2605231525 / 2606014500) use the same CIDv1/raw/sha2-256
+;;   framing, byte-identical to `ipfs add --cid-version=1 --raw-leaves`. PROVEN
+;;   here: this fn reproduces the daemon-verified published genome CIDs
+;;   (bafkreiamcn6vz4… graph, bafkreihsvbx4cs… datoms) exactly — see
+;;   test_engine/cid-genome-parity.
+;;   (kotoba-core's *internal block frame* uses blake3-256 (code 0x1e); if a
+;;   future path needs that digest, bind *hash* — the framing is identical, only
+;;   the digest fn changes. Single raw block only: artifacts >256 KiB chunk into
+;;   a UnixFS dag-pb tree (codec 0x70) and need the dag builder, out of scope.)
+
+(ns etzhayyim.kotoba.cid
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str])
+  #?(:clj (:import (java.security MessageDigest))))
+
+;; ── multihash codes ──
+(def sha2-256 0x12)
+(def blake3-256 0x1e)
+
+(defn sha2-256-digest
+  "32-byte SHA2-256 digest of `^bytes b`. Runnable on babashka/JVM."
+  [^bytes b]
+  #?(:clj (.digest (MessageDigest/getInstance "SHA-256") b)
+     :cljs (throw (ex-info "cljs digest not wired (root engine runs on bb/JVM)" {}))))
+
+;; A pluggable [code digest-fn] pair. Default = interim SHA2-256.
+;; Rebind to [blake3-256 <blake3-fn>] once a blake3 impl is available to reach
+;; bit-identical CID parity with kotoba-core.
+(def ^:dynamic *hash* {:code sha2-256 :fn sha2-256-digest})
+
+;; ── base32 (RFC4648, lower, no pad) ──
+(def ^:private b32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn- base32-lower*
+  [^bytes data]
+  (let [n (alength data)
+        sb (StringBuilder.)]
+    (loop [i 0 buf 0 bits 0]
+      (cond
+        (>= bits 5)
+        (let [idx (bit-and (unsigned-bit-shift-right buf (- bits 5)) 0x1f)]
+          (.append sb (.charAt b32-alphabet idx))
+          (recur i buf (- bits 5)))
+
+        (< i n)
+        (recur (inc i)
+               (bit-or (bit-shift-left buf 8) (bit-and (aget data i) 0xff))
+               (+ bits 8))
+
+        (pos? bits)
+        (let [idx (bit-and (bit-shift-left buf (- 5 bits)) 0x1f)]
+          (.append sb (.charAt b32-alphabet idx))
+          (recur i 0 0))
+
+        :else (.toString sb)))))
+
+(def ^:private b32-idx
+  (into {} (map-indexed (fn [i c] [c i]) b32-alphabet)))
+
+(defn- base32-lower-decode
+  "Inverse of base32-lower* (RFC4648 lower, no pad) -> byte-array."
+  ^bytes [^String s]
+  (let [out (java.io.ByteArrayOutputStream.)]
+    (loop [cs (seq s) buf 0 bits 0]
+      (if (empty? cs)
+        (.toByteArray out)
+        (let [v (b32-idx (first cs))
+              buf (bit-or (bit-shift-left buf 5) (int v))
+              bits (+ bits 5)]
+          (if (>= bits 8)
+            (do (.write out (bit-and (unsigned-bit-shift-right buf (- bits 8)) 0xff))
+                (recur (rest cs) buf (- bits 8)))
+            (recur (rest cs) buf bits)))))))
+
+(defn cid-str->bytes
+  "The raw binary CID a CIDv1 string addresses — base32-decode after the 'b'
+   multibase prefix. This is the on-the-wire CID form CARv1 sections carry
+   (`<varint len> <cid-bytes> <data>`). Inverse of the framing built in `cid`."
+  ^bytes [^String c]
+  (when-not (str/starts-with? c "b")
+    (throw (ex-info "expected base32 'b' multibase CIDv1" {:cid c})))
+  (base32-lower-decode (subs c 1)))
+
+(defn cid-bytes->str
+  "Re-attach the 'b' base32 multibase to a binary CIDv1 frame -> CID string.
+   Inverse of `cid-str->bytes`."
+  [^bytes frame]
+  (str "b" (base32-lower* frame)))
+
+(defn- ->bytes ^bytes [s]
+  #?(:clj (kbytes/utf8-bytes ^String s)
+     :cljs (throw (ex-info "cljs not wired" {}))))
+
+(defn cid
+  "Compute the CIDv1 string for `content` (a String or byte-array).
+   Framing is canonical; digest follows *hash* (default interim sha2-256).
+   Returns e.g. \"bafkr...\"-shaped base32 multibase string with leading 'b'."
+  [content]
+  (let [^bytes body (if (string? content) (->bytes content) content)
+        {:keys [code fn]} *hash*
+        ^bytes digest (fn body)
+        dlen (alength digest)
+        ;; <version=1> <codec=raw=0x55> <mh-code> <mh-len> <digest...>
+        header (byte-array [0x01 0x55 code dlen])
+        framed (byte-array (+ (alength header) dlen))]
+    (System/arraycopy header 0 framed 0 (alength header))
+    (System/arraycopy digest 0 framed (alength header) dlen)
+    (str "b" (base32-lower* framed))))
+
+(defn cid-of-edn
+  "CIDv1 of a Clojure value, addressed over its canonical pr-str bytes.
+   pr-str is deterministic for the EDN scalar/collection shapes the Datom log
+   uses ([e a v tx op] vectors of scalars), giving a stable content address."
+  [v]
+  (cid (pr-str v)))
+
+(defn cid-of-file
+  "CIDv1 of a file's raw bytes — byte-identical to `ipfs add --cid-version=1
+   --raw-leaves <file>` for single blocks (<256 KiB)."
+  [path]
+  #?(:clj (with-open [in (clojure.java.io/input-stream path)
+                      out (java.io.ByteArrayOutputStream.)]
+            (clojure.java.io/copy in out)
+            (cid (.toByteArray out)))
+     :cljs (throw (ex-info "cljs not wired" {}))))

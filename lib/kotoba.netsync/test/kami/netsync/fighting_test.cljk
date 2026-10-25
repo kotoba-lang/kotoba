@@ -1,0 +1,139 @@
+(ns kami.netsync.fighting-test
+  "Rollback must reconverge to a peer that never predicted; delay must stall
+   rather than guess; confirms must not cover a tick that can still roll back.
+   A no-op advance, or an always-stall delay, would go green on the wrong half."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kami.netsync.fighting :as fg]))
+
+(def initial {:x {:p1 0 :p2 10} :hp {:p1 10 :p2 10}})
+
+(defn walk
+  "1D walker. `:dx` is -1/0/1. Simultaneous attack while |x1-x2|<=1 trades 1 hp."
+  [state inputs]
+  (let [x1 (+ (get-in state [:x :p1]) (get-in inputs [:p1 :dx] 0))
+        x2 (+ (get-in state [:x :p2]) (get-in inputs [:p2 :dx] 0))
+        trade? (and (get-in inputs [:p1 :attack])
+                    (get-in inputs [:p2 :attack])
+                    (<= (Math/abs (- x1 x2)) 1))
+        hp1 (cond-> (get-in state [:hp :p1]) trade? dec)
+        hp2 (cond-> (get-in state [:hp :p2]) trade? dec)]
+    {:x {:p1 x1 :p2 x2} :hp {:p1 hp1 :p2 hp2}}))
+
+(defn- play
+  "Ingest every [player tick input], then advance `n` times."
+  [engine submissions n]
+  (let [e (reduce (fn [acc [p t in]] (fg/ingest acc p t in)) engine submissions)]
+    (loop [acc e i 0]
+      (if (>= i n)
+        acc
+        (recur (fg/advance acc walk) (inc i))))))
+
+(deftest identical-inputs-stay-in-sync
+  (let [subs [[:p1 1 {:dx 1 :attack false}] [:p2 1 {:dx -1 :attack false}]
+              [:p1 2 {:dx 1 :attack false}] [:p2 2 {:dx -1 :attack false}]]
+        a (play (fg/engine-new initial) subs 2)
+        b (play (fg/engine-new initial) subs 2)]
+    (is (= 2 (:tick a) (:tick b)))
+    (is (= (:state a) (:state b)))
+    (is (= (fg/state-hash (:state a)) (fg/state-hash (:state b))))
+    (is (= {:p1 2 :p2 8} (:x (:state a))))))
+
+(deftest rollback-reconverges-to-the-peer-that-never-guessed
+  (testing "A predicted p2 still (dx 0) at tick 1; the real input was dx -1.
+            after the late ingest, A must match B, who had the real input
+            from the start — and :rollbacks must be non-zero so a 'just
+            overwrite current state' fake cannot pass"
+    (let [policy (assoc fg/default-policy :rollback-window 8 :save-cap 16)
+          ;; B has both inputs for tick 1 and 2 up front.
+          b (play (fg/engine-new policy initial)
+                  [[:p1 1 {:dx 1 :attack false}] [:p2 1 {:dx -1 :attack false}]
+                   [:p1 2 {:dx 1 :attack false}] [:p2 2 {:dx -1 :attack false}]]
+                  2)
+          ;; A only has p1 at first — p2 is predicted empty (dx 0).
+          a0 (play (fg/engine-new policy initial)
+                   [[:p1 1 {:dx 1 :attack false}]
+                    [:p1 2 {:dx 1 :attack false}]]
+                   2)]
+      (is (not= (:state a0) (:state b))
+          "without p2's input, A must have diverged — otherwise the rest is theatre")
+      (let [a1 (-> a0
+                   (fg/ingest :p2 1 {:dx -1 :attack false})
+                   (fg/ingest :p2 2 {:dx -1 :attack false})
+                   (fg/advance walk))]
+        ;; advance after ingest resims the dirty ticks then steps once more;
+        ;; bring B one tick forward with the same empty-default? No: we need
+        ;; A to resim 1..2 to match B at tick 2, without requiring a third
+        ;; simulate. ingest+advance currently: rewind to 1, resim to present (2),
+        ;; then simulate-one → tick 3. So compare A at 2 before that extra step
+        ;; by looking at saves.
+        (is (pos? (:rollbacks a1)))
+        (is (= (get-in b [:saves 2]) (get-in a1 [:saves 2]))
+            "tick 2 after rollback equals the peer that never predicted")))))
+
+(deftest confirm-is-not-emitted-for-a-tick-that-can-still-roll-back
+  (let [policy (assoc fg/default-policy :rollback-window 3 :save-cap 16)
+        e (play (fg/engine-new policy initial)
+                [[:p1 1 {:dx 0 :attack false}] [:p2 1 {:dx 0 :attack false}]
+                 [:p1 2 {:dx 0 :attack false}] [:p2 2 {:dx 0 :attack false}]
+                 [:p1 3 {:dx 0 :attack false}] [:p2 3 {:dx 0 :attack false}]
+                 [:p1 4 {:dx 0 :attack false}] [:p2 4 {:dx 0 :attack false}]]
+                4)
+        [confirms _] (fg/drain-confirms e)]
+    (is (= 4 (:tick e)))
+    (is (= 1 (:confirmed-through e))
+        "window 3 at tick 4 → confirmed through 1, not 4")
+    (is (= [1] (mapv :confirm/tick confirms)))
+    (testing "a late input at the confirmed tick is refused, at a still-open tick is accepted"
+      (let [too-late (fg/ingest e :p1 1 {:dx 1 :attack false})
+            still-open (fg/ingest e :p1 3 {:dx 1 :attack false})]
+        (is (= :too-late (:reason (last (:rejected too-late)))))
+        (is (= 3 (:rewind-from still-open)))))))
+
+(deftest delay-stalls-when-a-real-input-is-missing
+  (let [policy (assoc fg/default-policy :mode :delay)
+        e0 (fg/engine-new policy initial)
+        e1 (-> e0
+               (fg/ingest :p1 1 {:dx 1 :attack false})
+               (fg/advance walk))]
+    (is (true? (:stalled? e1)))
+    (is (= 0 (:tick e1))
+        "delay must not predict the missing side")
+    (let [e2 (-> e1
+                 (fg/ingest :p2 1 {:dx -1 :attack false})
+                 (fg/advance walk))]
+      (is (false? (:stalled? e2)))
+      (is (= 1 (:tick e2)))
+      (is (= {:p1 1 :p2 9} (:x (:state e2))))
+      (is (zero? (:rollbacks e2))
+          "delay never rolls back")
+      (is (= 1 (:confirmed-through e2))
+          "delay confirms the tick it just simulated — no rewrite window"))))
+
+(deftest delay-late-input-after-simulate-is-too-late
+  (let [policy (assoc fg/default-policy :mode :delay)
+        e (play (fg/engine-new policy initial)
+                [[:p1 1 {:dx 0 :attack false}] [:p2 1 {:dx 0 :attack false}]]
+                1)
+        e' (fg/ingest e :p1 1 {:dx 1 :attack false})]
+    (is (= :too-late (:reason (last (:rejected e')))))))
+
+(deftest attack-exchange-is-deterministic
+  (let [closer [[:p1 1 {:dx 1 :attack false}] [:p2 1 {:dx -1 :attack false}]
+                [:p1 2 {:dx 1 :attack false}] [:p2 2 {:dx -1 :attack false}]
+                [:p1 3 {:dx 1 :attack false}] [:p2 3 {:dx -1 :attack false}]
+                [:p1 4 {:dx 1 :attack false}] [:p2 4 {:dx -1 :attack false}]
+                [:p1 5 {:dx 0 :attack true}]  [:p2 5 {:dx 0 :attack true}]]
+        e (play (fg/engine-new initial) closer 5)]
+      (is (= {:p1 4 :p2 6} (:x (:state e))))
+    (is (= {:p1 10 :p2 10} (:hp (:state e)))
+        "|4-6|=2 is out of range 1, so this must NOT have traded — a step that
+         damages every attack would still move, and the next test catches that"))
+  (let [in-range [[:p1 1 {:dx 1 :attack false}] [:p2 1 {:dx -1 :attack false}]
+                  [:p1 2 {:dx 1 :attack false}] [:p2 2 {:dx -1 :attack false}]
+                  [:p1 3 {:dx 1 :attack false}] [:p2 3 {:dx -1 :attack false}]
+                  [:p1 4 {:dx 1 :attack false}] [:p2 4 {:dx -1 :attack false}]
+                  [:p1 5 {:dx 1 :attack true}]  [:p2 5 {:dx -1 :attack true}]]
+        e (play (fg/engine-new initial) in-range 5)]
+    (is (= {:p1 5 :p2 5} (:x (:state e))))
+    (is (= {:p1 9 :p2 9} (:hp (:state e)))
+        "adjacent + both attack → one trade")))

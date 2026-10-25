@@ -1,0 +1,176 @@
+(ns bitcoin.consensus.fuzz
+  "Deterministic, structure-biased fuzzing for consensus wire and Script input."
+  (:refer-clojure :exclude [run!])
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.script :as script]
+            [bitcoin.consensus.transaction :as transaction])
+  (:import [java.util Random]))
+
+(def schema "kotoba.bitcoin.consensus-fuzz.v1")
+(def default-seed 21000000)
+(def default-iterations 5000)
+(def maximum-iterations 1000000)
+(def maximum-input-bytes 4096)
+
+(def ^:private genesis-hex
+  (str
+   "010000000000000000000000000000000000000000000000000000000000000000000000"
+   "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+   "29ab5f49ffff001d1dac2b7c01"
+   "01000000010000000000000000000000000000000000000000000000000000000000000000"
+   "ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f3230303920436861"
+   "6e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f"
+   "722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7"
+   "105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7"
+   "ba0b8d578a4c702b6bf11d5fac00000000"))
+
+(defn- hex-bytes [value]
+  (mapv #(Integer/parseInt (apply str %) 16) (partition 2 value)))
+
+(def ^:private canonical-transaction
+  (transaction/serialize
+   {:version 1
+    :inputs [{:txid-natural (vec (repeat 32 0))
+              :vout 0xffffffff :script-sig [1 1]
+              :sequence 0xffffffff}]
+    :outputs [{:value 0 :script-pubkey [0x51]}]
+    :locktime 0 :segwit? false}))
+
+(def ^:private canonical-block (hex-bytes genesis-hex))
+(def ^:private canonical-scripts
+  [[0x51]
+   [0x76 0xa9 0x14]
+   [0x51 0x63 0x52 0x67 0x53 0x68]
+   [0x00 0x63 0x4c 0xff]
+   [0x50]])
+(def ^:private compact-size-bombs
+  [[0xfd 0xfc 0x00]
+   [0xfe 0xff 0xff 0xff 0x7f]
+   [0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f]])
+
+(defn- random-bytes [^Random random maximum]
+  (vec (repeatedly (.nextInt random (inc maximum))
+                   #(.nextInt random 256))))
+
+(defn- insert-at [value index addition]
+  (vec (concat (subvec value 0 index) addition (subvec value index))))
+
+(defn- mutate [^Random random canonical]
+  (let [canonical (vec canonical)
+        size (count canonical)]
+    (case (.nextInt random 8)
+      0 (random-bytes random maximum-input-bytes)
+      1 (if (zero? size) []
+            (update canonical (.nextInt random size)
+                    bit-xor (bit-shift-left 1 (.nextInt random 8))))
+      2 (subvec canonical 0 (.nextInt random (inc size)))
+      3 (vec (take maximum-input-bytes
+                   (concat canonical (random-bytes random 64))))
+      4 (if (zero? size) [0xff]
+            (assoc canonical (.nextInt random size) (.nextInt random 256)))
+      5 (let [addition (random-bytes random 32)]
+          (vec (take maximum-input-bytes
+                     (insert-at canonical (.nextInt random (inc size))
+                                addition))))
+      6 (let [bomb (nth compact-size-bombs
+                        (.nextInt random (count compact-size-bombs)))]
+          (vec (take maximum-input-bytes
+                     (insert-at canonical (.nextInt random (inc size)) bomb))))
+      7 (vec (reverse canonical)))))
+
+(defn- typed-consensus-error? [error]
+  (let [type (:type (ex-data error))]
+    (and (keyword? type) (= "bitcoin.consensus" (namespace type)))))
+
+(defn- input-evidence [value]
+  {:length (count value)
+   :prefix-hex
+   (apply str (map #(format "%02x" %) (take 256 value)))})
+
+(defn- exercise!
+  [target seed case-index value operation]
+  (try
+    (operation)
+    (catch kerror/ExceptionInfo error
+      (when-not (typed-consensus-error? error)
+        (throw
+         (ex-info "Fuzz target returned an untyped consensus failure."
+                  (merge {:target target :seed seed :case case-index
+                          :failure-data (ex-data error)}
+                         (input-evidence value))
+                  error))))
+    (catch Throwable error
+      (throw
+       (ex-info "Fuzz target escaped with a host exception."
+                (merge {:target target :seed seed :case case-index
+                        :host-exception (str (class error))}
+                       (input-evidence value))
+                error)))))
+
+(defn- transaction-case! [seed case-index value]
+  (exercise!
+   :transaction seed case-index value
+   #(let [parsed (transaction/parse value)
+          serialized (transaction/serialize parsed)]
+      (when-not (= value serialized)
+        (throw
+         (ex-info "Parsed transaction did not round-trip canonically."
+                  {:type :bitcoin.consensus.fuzz/roundtrip}))))))
+
+(defn- block-case! [seed case-index value]
+  (exercise!
+   :block seed case-index value
+   #(let [parsed (block/parse value)
+          serialized (block/serialize parsed)]
+      (when-not (= value serialized)
+        (throw
+         (ex-info "Parsed block did not round-trip canonically."
+                  {:type :bitcoin.consensus.fuzz/roundtrip}))))))
+
+(defn- script-case! [seed case-index value tapscript?]
+  (exercise!
+   (if tapscript? :tapscript :legacy-script) seed case-index value
+   #(let [operations
+          (script/parse value {:unbounded-script? tapscript?
+                               :unbounded-elements? tapscript?})
+          reconstructed (vec (mapcat :raw operations))
+          context
+          {:transaction
+           {:version 2 :locktime 0
+            :inputs [{:txid-natural (vec (repeat 32 1))
+                      :vout 0 :script-sig [] :sequence 0xffffffff}]
+            :outputs [{:value 0 :script-pubkey []}]
+            :prevout-coins [{:value 0 :script-pubkey []}]}
+           :input-index 0 :coin {:value 0 :script-pubkey []}
+           :sigversion (if tapscript? :tapscript :base) :flags #{}}]
+      (when-not (= value reconstructed)
+        (throw
+         (ex-info "Parsed Script did not preserve raw bytes."
+                  {:type :bitcoin.consensus.fuzz/roundtrip})))
+      (script/sigop-count value true)
+      (script/evaluate [] value context))))
+
+(defn run!
+  "Run `iterations` deterministic mutations across three consensus targets."
+  [seed iterations]
+  (when-not (and (integer? seed)
+                 (integer? iterations)
+                 (<= 1 iterations maximum-iterations))
+    (throw (ex-info "Fuzz seed or iteration count is invalid."
+                    {:seed seed :iterations iterations})))
+  (let [random (Random. (long seed))]
+    (dotimes [case-index iterations]
+      (transaction-case! seed case-index
+                         (mutate random canonical-transaction))
+      (block-case! seed case-index (mutate random canonical-block))
+      (let [base (nth canonical-scripts
+                      (.nextInt random (count canonical-scripts)))]
+        (script-case! seed case-index (mutate random base)
+                      (odd? case-index))))
+    {:schema schema :seed seed :iterations iterations
+     :target-cases (* 3 iterations) :result :passed}))
+
+(defn -main [& [seed iterations]]
+  (let [seed (if seed (parse-long seed) default-seed)
+        iterations (if iterations (parse-long iterations) default-iterations)]
+    (println (pr-str (run! seed iterations)))))

@@ -1,0 +1,182 @@
+(ns thread.iphc-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [thread.iphc :as iphc]))
+
+;; ── shared test fixtures — hand-constructed per the byte layout in each
+;;    pack-*-address docstring, so a round trip through unpack (not just
+;;    pack->unpack self-consistency) is a real check ─────────────────────
+
+(def context-prefix [0x20 0x01 0x0D 0xB8 0x00 0x00 0x00 0x00]) ;; 2001:db8::/64
+(def ext-ll [0x02 0x11 0x22 0x33 0x44 0x55 0x66 0x77])         ;; U/L bit already 0 post-flip
+(def short-ll [0xAB 0xCD])
+
+;; SAM=11 stateless: link-local prefix + Modified-EUI-64(ext-ll)
+(def sam11-addr (vec (concat [0xFE 0x80 0 0 0 0 0 0] [0x00 0x11 0x22 0x33 0x44 0x55 0x66 0x77])))
+;; SAM=11 stateless, short link-layer form
+(def sam11-short-addr (vec (concat [0xFE 0x80 0 0 0 0 0 0] [0x00 0x00 0x00 0xFF 0xFE 0x00] short-ll)))
+;; SAM=10 stateless: link-local prefix + 0000:00ff:fe00: + inline u16
+(def sam10-addr (vec (concat [0xFE 0x80 0 0 0 0 0 0] [0x00 0x00 0x00 0xFF 0xFE 0x00] [0x12 0x34])))
+;; SAM=01 stateless: link-local prefix + inline 64 bits
+(def sam01-addr (vec (concat [0xFE 0x80 0 0 0 0 0 0] [0xAA 0xBB 0xCC 0xDD 0xEE 0xFF 0x00 0x11])))
+;; SAM=00: any full address
+(def sam00-addr [0x20 0x01 0x0D 0xB8 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x01])
+;; SAC=1 (context) forms, same shapes against context-prefix instead of fe80::/64
+(def ctx01-addr (vec (concat context-prefix [0xAA 0xBB 0xCC 0xDD 0xEE 0xFF 0x00 0x11])))
+(def ctx10-addr (vec (concat context-prefix [0x00 0x00 0x00 0xFF 0xFE 0x00] [0x56 0x78])))
+(def ctx11-addr (vec (concat context-prefix [0x00 0x11 0x22 0x33 0x44 0x55 0x66 0x77])))
+
+(defn- roundtrip
+  [m]
+  (let [[st bs] (iphc/encode m)]
+    (if (= st :error) [st bs]
+        [:ok (iphc/decode bs {:src-context-prefix (:src-context-prefix m)
+                               :src-link-layer-addr (:src-link-layer-addr m)
+                               :dst-context-prefix (:dst-context-prefix m)
+                               :dst-link-layer-addr (:dst-link-layer-addr m)})
+         bs])))
+
+(def base
+  {:tf :full :ecn 1 :dscp 0x2A :flow-label 0x0ABCDE
+   :nh :inline :next-header 17 ;; UDP
+   :hlim :inline :hop-limit 64
+   :sac? false :sam 0 :src-addr sam00-addr
+   :dac? false :m? false :dam 0 :dst-addr sam00-addr
+   :payload [0xDE 0xAD 0xBE 0xEF]})
+
+(deftest round-trip-full-inline-baseline
+  (let [[st [dst2 fr]] (roundtrip base)]
+    (is (= :ok st)) (is (= :ok dst2))
+    (is (= 1 (:ecn fr))) (is (= 0x2A (:dscp fr))) (is (= 0x0ABCDE (:flow-label fr)))
+    (is (= 17 (:next-header fr))) (is (= 64 (:hop-limit fr)))
+    (is (= sam00-addr (:src-addr fr))) (is (= sam00-addr (:dst-addr fr)))
+    (is (= [0xDE 0xAD 0xBE 0xEF] (:payload fr)))))
+
+(deftest tf-mode-sweep
+  (testing "all four TF modes round trip their (elided fields default to 0)"
+    (doseq [[tf expect-ecn expect-dscp expect-fl]
+            [[:full 3 0x1F 0xABCDE] [:flow-only 2 0 0x12345] [:tc-only 1 0x3F 0] [:elided 0 0 0]]]
+      (let [m (assoc base :tf tf :ecn expect-ecn :dscp expect-dscp :flow-label expect-fl)
+            [st [dst2 fr]] (roundtrip m)]
+        (is (= :ok st) tf) (is (= :ok dst2) tf)
+        (is (= expect-ecn (:ecn fr)) tf)
+        (when (#{:full :tc-only} tf) (is (= expect-dscp (:dscp fr)) tf))
+        (when (#{:full :flow-only} tf) (is (= expect-fl (:flow-label fr)) tf))))))
+
+(deftest hlim-mode-sweep
+  (doseq [[hlim fixed] [[:inline nil] [:hop-1 1] [:hop-64 64] [:hop-255 255]]]
+    (let [m (cond-> (assoc base :hlim hlim) (not= hlim :inline) (assoc :hop-limit nil))
+          m (if (= hlim :inline) (assoc m :hop-limit 200) m)
+          [st [dst2 fr]] (roundtrip m)]
+      (is (= :ok st) hlim) (is (= :ok dst2) hlim)
+      (is (= (or fixed 200) (:hop-limit fr)) hlim))))
+
+(deftest nh-elided-hands-back-remaining-bytes-undecoded
+  (let [m (assoc base :nh :elided :payload [0xF0 0x01 0x02])
+        [st [dst2 fr]] (roundtrip m)]
+    (is (= :ok st)) (is (= :ok dst2))
+    (is (nil? (:next-header fr)))
+    (is (= [0xF0 0x01 0x02] (:payload fr)))))
+
+(deftest cid-byte-round-trip
+  (let [m (assoc base :cid? true :sci 5 :dci 9)
+        [st [dst2 fr]] (roundtrip m)]
+    (is (= :ok st)) (is (= :ok dst2))
+    (is (= 5 (:sci fr))) (is (= 9 (:dci fr)))))
+
+(deftest stateless-unicast-sam-dam-sweep
+  (doseq [[mode addr] [[0 sam00-addr] [1 sam01-addr] [2 sam10-addr] [3 sam11-addr]]]
+    (testing (str "SAM/DAM=" mode)
+      (let [m (assoc base :sam mode :src-addr addr :dam mode :dst-addr addr
+                     :src-link-layer-addr ext-ll :dst-link-layer-addr ext-ll)
+            [st [dst2 fr]] (roundtrip m)]
+        (is (= :ok st) mode) (is (= :ok dst2) mode)
+        (is (= addr (:src-addr fr)) mode)
+        (is (= addr (:dst-addr fr)) mode)))))
+
+(deftest stateless-sam11-short-link-layer
+  (let [m (assoc base :sam 3 :src-addr sam11-short-addr :src-link-layer-addr short-ll
+                 :dam 0 :dst-addr sam00-addr)
+        [st [dst2 fr]] (roundtrip m)]
+    (is (= :ok st)) (is (= :ok dst2))
+    (is (= sam11-short-addr (:src-addr fr)))))
+
+(deftest stateful-context-sweep
+  (doseq [[mode addr] [[1 ctx01-addr] [2 ctx10-addr] [3 ctx11-addr]]]
+    (testing (str "context-based SAM=" mode)
+      (let [m (assoc base :cid? true :sci 1 :dci 1
+                     :sac? true :sam mode :src-addr addr :src-context-prefix context-prefix
+                     :src-link-layer-addr ext-ll
+                     :dac? true :dam mode :dst-addr addr :dst-context-prefix context-prefix
+                     :dst-link-layer-addr ext-ll)
+            [st [dst2 fr]] (roundtrip m)]
+        (is (= :ok st) mode) (is (= :ok dst2) mode)
+        (is (= addr (:src-addr fr)) mode)
+        (is (= addr (:dst-addr fr)) mode)))))
+
+(deftest stateful-unspecified-address
+  (let [m (assoc base :sac? true :sam 0 :src-addr (vec (repeat 16 0)) :dam 0 :dst-addr sam00-addr)
+        [st [dst2 fr]] (roundtrip m)]
+    (is (= :ok st)) (is (= :ok dst2))
+    (is (= (vec (repeat 16 0)) (:src-addr fr)))))
+
+;; ── multicast, RFC 6282 §3.2.3 stateless forms ─────────────────────────
+
+(def mc-dam0 [0xFF 0x02 0 0 0 0 0 0 0 0 0 0 0 0 0 0x01])                       ;; ff02::1
+(def mc-dam1 (vec (concat [0xFF 0x05] (repeat 9 0) [0x11 0x22 0x33 0x44 0x55]))) ;; ff05::11:2233:4455
+(def mc-dam2 (vec (concat [0xFF 0x02] (repeat 11 0) [0x11 0x22 0x33])))          ;; ff02::11:2233
+(def mc-dam3 (vec (concat [0xFF 0x02] (repeat 13 0) [0x11])))                   ;; ff02::11
+
+(deftest multicast-dam-sweep
+  (doseq [[mode addr] [[0 mc-dam0] [1 mc-dam1] [2 mc-dam2] [3 mc-dam3]]]
+    (testing (str "M=1 DAM=" mode)
+      (let [m (assoc base :m? true :dam mode :dst-addr addr :dac? false)
+            [st [dst2 fr]] (roundtrip m)]
+        (is (= :ok st) mode) (is (= :ok dst2) mode)
+        (is (= addr (:dst-addr fr)) mode)
+        (is (true? (:m? fr)))))))
+
+(deftest negative-multicast-context-compression-not-implemented
+  (let [m (assoc base :m? true :dac? true :dam 0 :dst-addr mc-dam0)
+        [st reason] (iphc/encode m)]
+    (is (= :error st))
+    (is (= :thread.iphc/multicast-context-compression-not-implemented reason))))
+
+(deftest negative-prefix-mismatch
+  ;; Ask for SAM=01 (64-bit inline against link-local fe80::/64) with an
+  ;; address that is NOT link-local — encode must refuse rather than
+  ;; silently produce a compressed form that decompresses to the wrong
+  ;; address.
+  (let [m (assoc base :sam 1 :src-addr sam00-addr) ;; sam00-addr is 2001:db8::1, not fe80::
+        [st reason] (iphc/encode m)]
+    (is (= :error st))
+    (is (= :thread.iphc/prefix-mismatch reason))))
+
+(deftest negative-address-not-elidable
+  ;; SAM=10 (16-bit inline) requires BOTH the fe80::/64 prefix AND the
+  ;; fixed 0000:00ff:fe00: middle six bytes — sam01-addr has the right
+  ;; prefix but the wrong middle bytes, so this is a different rejection
+  ;; reason than the prefix-only mismatch above.
+  (let [m (assoc base :sam 2 :src-addr sam01-addr)
+        [st reason] (iphc/encode m)]
+    (is (= :error st))
+    (is (= :thread.iphc/address-not-elidable reason))))
+
+(deftest negative-not-iphc-dispatch
+  (let [[dst reason] (iphc/decode [0x41 0x00 0x00] {})]
+    (is (= :error dst))
+    (is (= :thread.iphc/not-iphc-dispatch reason))))
+
+(deftest negative-header-too-short
+  (let [[dst reason] (iphc/decode [0x60] {})]
+    (is (= :error dst))
+    (is (= :thread.iphc/header-too-short reason))))
+
+(deftest negative-reserved-tf-mode
+  (let [[st reason] (iphc/encode (assoc base :tf :bogus))]
+    (is (= :error st))
+    (is (= :thread.iphc/reserved-tf-mode reason))))
+
+(deftest negative-flow-label-out-of-range
+  (let [[st reason] (iphc/encode (assoc base :flow-label 0x200000))]
+    (is (= :error st))
+    (is (= :thread.iphc/flow-label-out-of-range reason))))

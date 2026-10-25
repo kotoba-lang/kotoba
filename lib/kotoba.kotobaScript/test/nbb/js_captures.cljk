@@ -1,0 +1,96 @@
+(ns test.nbb.js-captures
+  (:require [cljs.test :as t :refer [deftest is run-tests]]
+            [kotoba.script :as script]
+            ["node:fs" :as fs] ["node:os" :as os]
+            ["node:path" :as path] ["node:child_process" :as child]))
+
+(defn module [body]
+  {:format :kotoba.kir/v4 :entry nil :exports ['keep] :effects #{}
+   :functions [{:name 'keep :params ['v] :param-types [:js-value] :result :js-value :body body}
+               {:name 'dispatch :params ['closure] :param-types [:i64]
+                :closure-param-indexes [0] :result :js-value
+                :body '(if (= (pair-first closure) 7)
+                         (js-capture-value (pair-second (pair-second closure)))
+                         (js-undefined))}]})
+
+(defn probe [kir text]
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-js-captures-"))
+        file (path/join dir "library.mjs")]
+    (try
+      (fs/writeFileSync file (script/emit kir))
+      (let [result (child/spawnSync js/process.execPath #js ["--input-type=module" "-e" text file]
+                                   #js {:encoding "utf8" :timeout 20000})]
+        (is (= 0 (.-status result)) (.-stderr result)))
+      (finally (fs/rmSync dir #js {:recursive true :force true})))))
+
+(deftest emitted-capture-identity-and-mixed-chain
+  (doseq [body ['(js-capture-value (js-capture-new v 0))
+               '(dispatch (pair 7 (pair 5 (js-capture-new v 0))))]]
+    (probe (module body)
+"const lib=await import(process.argv[1]);let reads=0;
+const proxy=new Proxy({}, {get(){reads++;throw Error('get')},getPrototypeOf(){reads++;throw Error('prototype')}});
+const r=Proxy.revocable({},{});r.revoke();
+const values=[undefined,null,false,true,0,-0,NaN,0n,'',Symbol('s'),{},[],proxy,r.proxy];
+for(const v of values){const m=lib.instantiateKotoba();if(!Object.is(m.keep(v),v))throw Error('identity');}
+if(reads)throw Error('opaque observation');")))
+
+(deftest emitted-capture-projection-and-ordinary-pair-refusals
+  (doseq [[body expected]
+          [['(do (pair-first (js-capture-new v 0)) v) "js-capture-projection"]
+           ['(js-capture-value (pair 9 0)) "invalid-js-capture-cell"]
+           ['(js-capture-value 0) "invalid-js-capture-cell"]]]
+    (probe (module body)
+           (str "const m=(await import(process.argv[1])).instantiateKotoba();let msg='';"
+                "try{m.keep(undefined)}catch(e){msg=e.message}"
+                "if(msg!==" (js/JSON.stringify expected) ")throw Error('wrong trap:'+msg);"))))
+
+(deftest emitted-capture-allocation-budgets
+  (probe (module '(let [unused (js-capture-new v 0)]
+                    (js-capture-value (js-capture-new v 0))))
+"const lib=await import(process.argv[1]);
+if(!Object.is(lib.instantiateKotoba({}, {fuel:3,cells:2}).keep(undefined),undefined))throw Error('under budget');
+for(const [budget,want] of [[{fuel:2},'budget/fuel'],[{cells:1},'budget/cells']]){let msg='';try{lib.instantiateKotoba({},budget).keep(undefined)}catch(e){msg=e.message}if(msg!==want)throw Error('wrong budget:'+msg);}"))
+
+(deftest emitted-capture-count-remains-bounded
+  (doseq [n [4 5]]
+    (let [chain (reduce (fn [tail _] (list 'js-capture-new 'v tail)) 0 (range n))]
+      (probe (module (list 'dispatch (list 'pair 7 (list 'pair 5 chain))))
+             (str "const m=(await import(process.argv[1])).instantiateKotoba();"
+                  (if (= n 4)
+                    "if(!Object.is(m.keep(undefined),undefined))throw Error('five captures');"
+                    "let msg='';try{m.keep(undefined)}catch(e){msg=e.message}if(msg!=='invalid-closure-capture-chain')throw Error('six captures:'+msg);"))))))
+
+(deftest emitted-capture-arena-counts-ordinary-and-opaque-pairs
+  (doseq [n [4095 4096]]
+    (let [kir (update (module (list 'let ['c '(js-capture-new v 0)]
+                                    (list '__kotoba_loop_1 n '(js-capture-value c))))
+                      :functions conj
+                      {:name '__kotoba_loop_1 :params ['n 'v] :param-types [:i64 :js-value]
+                       :result :js-value
+                       :body '(if (<= n 0) v
+                                (let [unused (pair n 0)] (__kotoba_loop_1 (- n 1) v)))})]
+      (probe kir
+             (str "const m=(await import(process.argv[1])).instantiateKotoba({}, {fuel:100000});"
+                  (if (= n 4095)
+                    "if(!Object.is(m.keep(undefined),undefined))throw Error('shared arena under limit');"
+                    "let msg='';try{m.keep(undefined)}catch(e){msg=e.message}if(msg!=='budget/cells')throw Error('shared arena limit:'+msg);"))))))
+
+(deftest private-capture-methods-retain-allocation-identity
+  (probe (module '(js-capture-value (js-capture-new v 0)))
+"const lib=await import(process.argv[1]);const m=lib.instantiateKotoba();
+const add=WeakSet.prototype.add,has=WeakSet.prototype.has;
+try{WeakSet.prototype.add=()=>{throw Error('ambient add')};WeakSet.prototype.has=()=>{throw Error('ambient has')};
+const r=Proxy.revocable({},{});r.revoke();if(!Object.is(m.keep(r.proxy),r.proxy))throw Error('identity');}
+finally{WeakSet.prototype.add=add;WeakSet.prototype.has=has;}"))
+
+(deftest capture-operation-types-are-checked
+  (doseq [body ['(js-capture-new 1 0) '(js-capture-new v v)
+               '(js-capture-value v) '(js-capture-new v)
+               '(js-capture-value 0 0)]]
+    (is (some? (try (script/emit (module body)) nil
+                   (catch :default e (ex-message e)))))))
+
+(defmethod t/report [::t/default :end-run-tests] [m]
+  (when (or (not= 7 (:test m)) (not= 16 (:pass m)) (pos? (+ (:fail m) (:error m))))
+    (js/process.exit 1)))
+(run-tests 'test.nbb.js-captures)

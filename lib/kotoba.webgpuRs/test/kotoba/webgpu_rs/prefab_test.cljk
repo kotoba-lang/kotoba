@@ -1,0 +1,184 @@
+(ns kotoba.webgpu-rs.prefab-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.webgpu-rs.prefab :as p]
+            [kotoba.webgpu-rs.scene :as scene]))
+
+;; --- the oracle ------------------------------------------------------------
+;;
+;; `:render/props` `:trees` is a two-part template (trunk + canopy) whose
+;; resolution semantics live in Clojure inside `kotoba.webgpu-rs.scene/scatter`.
+;; If the general expander is worth having, it must reproduce that shipped
+;; output *exactly* for real coordinates — otherwise it is a second, subtly
+;; different renderer of the same authoring intent.
+;;
+;; These are the real `:trees` values from
+;; kami-engine/kami-clj-play3d/games/royale/scene.edn, with `:ratio` forced to
+;; 1.0 so every accepted scatter slot becomes a tree pair (the scatter's RNG
+;; and its centre-rejection stay scene.cljc's business; we only consume where
+;; it put things).
+
+(def royale-trees {:color [0.28 0.55 0.30] :h 2.6 :w 1.1 :ratio 1.0})
+
+(defn tree-def
+  "The same template, expressed as data. Derived from `:trees`' fields the way
+  scene.cljc's tree branch does: trunk is 0.3w x 0.5h at the base with a fixed
+  bark colour, canopy is 1.0w x 0.6h lifted to half the tree's height."
+  [{:keys [w h color metallic roughness]}]
+  (let [w (double w) h (double h)]
+    {:parts [{:name :trunk
+              :pos [0.0 0.0 0.0]
+              :size [(* w 0.3) (* h 0.5)]
+              :color [0.45 0.32 0.2]
+              :metallic 0.0 :roughness 0.9 :emissive 0.0}
+             {:name :canopy
+              :pos [0.0 (* h 0.5) 0.0]
+              :size [w (* h 0.6)]
+              :color color
+              :metallic (if (number? metallic) (double metallic) 0.0)
+              :roughness (let [r (if (number? roughness) (double roughness) 0.0)]
+                           (if (zero? r) 0.95 r))
+              :emissive 0.0}]}))
+
+(deftest prefab-oracle-reproduces-scene-trees
+  (let [props {:count 40 :spread 140.0 :trees royale-trees}
+        [_ instances] (scene/scene->ir {:render/props props})
+        ;; scene->ir prepends the ground plane; the rest are trunk/canopy pairs.
+        pairs (partition 2 (rest instances))
+        defs {:prefab/defs {:tree (tree-def royale-trees)}}]
+    (is (pos? (count pairs))
+        "the scatter must actually place trees, or this proves nothing")
+    (is (every? (fn [[trunk canopy]]
+                  (and (= 0.0 (get-in trunk [:pos 1]))
+                       (= (:pos canopy)
+                          [(get-in trunk [:pos 0])
+                           (* 0.5 (:h royale-trees))
+                           (get-in trunk [:pos 2])])))
+                pairs)
+        "sanity: pairs are (trunk at ground, canopy lifted) as scene.cljc emits")
+    (doseq [[trunk canopy] pairs]
+      (let [[x _ z] (:pos trunk)
+            expanded (p/expand (assoc defs :prefab/instances
+                                      [{:prefab :tree :pos [x 0.0 z]}]))]
+        (is (= [trunk canopy] expanded)
+            (str "prefab expansion diverged from scene.cljc at " [x z]))))))
+
+;; --- transform composition -------------------------------------------------
+
+(defn- one [defs inst]
+  (p/expand {:prefab/defs defs :prefab/instances [inst]}))
+
+(def flat {:leaf {:parts [{:name :a :pos [1.0 0.0 0.0] :size [2.0 4.0]
+                           :color [1.0 0.0 0.0] :roughness 0.5}]}})
+
+(deftest instance-transform-applies-to-parts
+  (testing "translation offsets the part"
+    (is (= [10.0 0.0 -3.0]
+           (:pos (first (one flat {:prefab :leaf :pos [9.0 0.0 -3.0]}))))))
+  (testing "uniform scale multiplies both the offset and the size"
+    (let [i (first (one flat {:prefab :leaf :pos [0.0 0.0 0.0] :scale 3.0}))]
+      (is (= [3.0 0.0 0.0] (:pos i)))
+      (is (= [6.0 12.0] (:size i)))))
+  (testing "yaw adds, and rotates the offset right-handed about +Y —
+            a quarter turn sends local +X to -Z (mat4/from-rotation-y)"
+    (let [i (first (one flat {:prefab :leaf :yaw (/ Math/PI 2.0)}))
+          [x y z] (:pos i)]
+      (is (< (Math/abs (double x)) 1e-12))
+      (is (= 0.0 y))
+      (is (< (Math/abs (- (double z) -1.0)) 1e-12))
+      (is (= (/ Math/PI 2.0) (:yaw i))))))
+
+(deftest leaf-defaults-match-render-ir
+  (testing ":roughness absent means 0.65, the same as an :instances entry —
+            not 0.0, which numf's missing-is-zero rule would give"
+    (is (= 0.65 (:roughness (first (one {:d {:parts [{:name :a}]}}
+                                        {:prefab :d})))))))
+
+;; --- nesting and overrides -------------------------------------------------
+
+(def nested
+  {:leaf {:parts [{:name :a :pos [1.0 0.0 0.0] :size [1.0 1.0]
+                   :color [1.0 1.0 1.0] :roughness 0.5}]}
+   :pair {:parts [{:name :left :prefab :leaf :pos [-5.0 0.0 0.0]}
+                  {:name :right :prefab :leaf :pos [5.0 0.0 0.0] :scale 2.0}]}})
+
+(deftest nesting-composes-frames
+  (let [out (one nested {:prefab :pair :pos [100.0 0.0 0.0]})]
+    (is (= 2 (count out)))
+    (is (= [96.0 0.0 0.0] (:pos (first out))) "-5 then +1 local")
+    (is (= [107.0 0.0 0.0] (:pos (second out))) "+5 then +1 scaled by 2")
+    (is (= [2.0 2.0] (:size (second out))) "child scale reaches the leaf size")))
+
+(deftest overrides-address-parts-by-path
+  (testing "a direct child by keyword"
+    (is (= [0.0 1.0 0.0]
+           (:color (first (one flat {:prefab :leaf
+                                     :overrides {:a {:color [0.0 1.0 0.0]}}}))))))
+  (testing "through nesting by path, hitting only the addressed branch"
+    (let [out (one nested {:prefab :pair
+                           :overrides {[:left :a] {:color [0.0 0.0 1.0]}}})]
+      (is (= [0.0 0.0 1.0] (:color (first out))))
+      (is (= [1.0 1.0 1.0] (:color (second out))))))
+  (testing "an override may change a part's transform, not just its material"
+    (is (= [42.0 0.0 0.0]
+           (:pos (first (one flat {:prefab :leaf
+                                   :overrides {:a {:pos [42.0 0.0 0.0]}}})))))))
+
+(deftest variants-inherit-and-override
+  (let [defs (assoc flat :green {:variant-of :leaf
+                                 :overrides {:a {:color [0.0 1.0 0.0]}}})]
+    (testing "a variant is the base shape with its overrides folded in"
+      (let [i (first (one defs {:prefab :green}))]
+        (is (= [0.0 1.0 0.0] (:color i)))
+        (is (= [2.0 4.0] (:size i)) "unoverridden fields come from the base")))
+    (testing "the instance still wins over the variant"
+      (is (= [1.0 1.0 0.0]
+             (:color (first (one defs {:prefab :green
+                                       :overrides {:a {:color [1.0 1.0 0.0]}}}))))))))
+
+(deftest variant-chain-resolves-most-derived-last
+  ;; Two levels are needed to observe precedence at all: with a single variant
+  ;; over a base that overrides nothing, any ordering of the chain merges to the
+  ;; same map. Mutating the chain order was the one change the rest of this
+  ;; namespace could not see.
+  (let [defs {:base {:parts [{:name :a :size [1.0 1.0]
+                              :color [0.0 0.0 0.0] :roughness 0.5}]}
+              :mid {:variant-of :base
+                    :overrides {:a {:color [0.5 0.5 0.5] :roughness 0.1}}}
+              :derived {:variant-of :mid
+                        :overrides {:a {:color [1.0 1.0 1.0]}}}}
+        i (first (one defs {:prefab :derived}))]
+    (is (= [1.0 1.0 1.0] (:color i)) "the most-derived variant wins")
+    (is (= 0.1 (:roughness i)) "a field only the middle sets still reaches through")
+    (is (= [1.0 1.0] (:size i)) "and the base shape is unchanged")))
+
+;; --- refusals --------------------------------------------------------------
+;;
+;; A malformed prefab table must throw, not render as an empty or truncated
+;; scene: a silently-missing building is indistinguishable from a design choice.
+
+(defn- refusal [f]
+  (try (f) nil
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) ex
+         (:reason (ex-data ex)))))
+
+(deftest expansion-refuses-rather-than-diverging
+  (is (= :prefab/unknown-def
+         (refusal #(one flat {:prefab :nope}))))
+  (is (= :prefab/nesting-cycle
+         (refusal #(one {:a {:parts [{:name :x :prefab :b}]}
+                         :b {:parts [{:name :y :prefab :a}]}}
+                        {:prefab :a}))))
+  (is (= :prefab/variant-cycle
+         (refusal #(one {:a {:variant-of :b} :b {:variant-of :a}}
+                        {:prefab :a}))))
+  (is (= :prefab/max-depth
+         (refusal #(p/expand {:prefab/defs {:a {:parts [{:name :x :prefab :b}]}
+                                            :b {:parts [{:name :y :prefab :c}]}
+                                            :c {:parts [{:name :z}]}}
+                              :prefab/instances [{:prefab :a}]}
+                             {:max-depth 1}))))
+  (is (= :prefab/max-instances
+         (refusal #(p/expand {:prefab/defs {:a {:parts [{:name :x} {:name :y}
+                                                        {:name :z}]}}
+                              :prefab/instances [{:prefab :a}]}
+                             {:max-instances 2})))))

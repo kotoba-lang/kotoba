@@ -1,0 +1,208 @@
+(ns wgsl-test
+  "Golden tests for kotoba.wgsl — the shader hiccup. They pin that an EDN AST compiles to the WGSL a
+   game expects: operator/precedence, function calls, vecN<f32> constructors, kebab→snake idents,
+   statements, and a real lighting fragment function. The compiler being .cljc, this same source is
+   what the browser (shadow-cljs) emits, so the test guards the live shader too.
+
+   This file is `.cljc` and is run on **both** runtimes by `run_tests.cljk` (nbb first, JVM after).
+   That is not decoration. `kami.wgsl/num` floats every integral-looking literal precisely because
+   ClojureScript cannot tell 0 from 0.0, and the two runtimes take *different branches* through it:
+
+     (str 0.0)   JVM \"0.0\" → the \".\" test short-circuits    CLJS \"0\"      → falls through, appends \".0\"
+     (str 1e21)  JVM \"1.0E21\" → still the \".\" test          CLJS \"1e+21\"  → only the \"e\" test saves it
+
+   So the `e` branch is unreachable on the JVM. A JVM-only suite cannot observe it at all, and
+   deleting it would stay green forever. See `f32-literal-coercion` below."
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.lang.text :as str]
+            [kami.wgsl :as k]
+            [kotoba.wgsl :as w]))
+
+(deftest expressions
+  (is (= "(a + b)"            (w/expr [:+ :a :b])))
+  (is (= "(a * b * c)"        (w/expr [:* :a :b :c])))
+  (is (= "(-x)"              (w/expr [:- :x])))
+  (is (= "max(dot(N, L), 0.0)" (w/expr [:max [:dot :N :L] 0.0])))
+  (is (= "vec4<f32>(c, 1.0)" (w/expr [:vec4 :c 1.0])))
+  (is (= "g.sun_dir.xyz"     (w/expr :g.sun-dir.xyz)) "kebab→snake, dotted path + swizzle kept")
+  (is (= "pow(x, 2.0)"       (w/expr [:pow :x 2.0])))
+  (is (= "mix(a, b, t)"      (w/expr [:mix :a :b :t]))))
+
+(deftest f32-literal-coercion
+  ;; WGSL has no implicit int→float conversion, so a bare `2` in a float
+  ;; expression is a compile error in the shader. Every integral-looking
+  ;; literal gets a decimal point.
+  (is (= "(a + 2.0)" (w/expr [:+ :a 2])) "integral literal becomes f32")
+  (is (= "(a + 0.0)" (w/expr [:+ :a 0.0])) "a float that prints without a point still gets one")
+  (is (= "(a + 1.5)" (w/expr [:+ :a 1.5])) "a literal that already has a point is left alone")
+  ;; [:i n] is the documented escape hatch: loop bounds and array indices are
+  ;; i32/u32, where a `.0` would not compile.
+  (is (= "-1" (w/expr [:i -1])) "[:i n] emits a raw integer, uncoerced")
+  (is (= "(i < 4)" (w/expr [:< :i [:i 4]])) "raw integers survive inside an operator")
+  ;; Exponent-form literals must pass through untouched. On the JVM this is
+  ;; already guaranteed by the "." test; in JS `(str 1e21)` is "1e+21", which
+  ;; has no point, so ONLY the "e" test stops it becoming "1e+21.0" — a literal
+  ;; WGSL will not parse. Asserted on shape, not on an exact string, because the
+  ;; two runtimes legitimately spell the exponent differently.
+  (let [s (w/expr 1e21)]
+    (is (not (str/ends-with? s ".0")) "exponent literal must not gain a second suffix")
+    (is (str/includes? (str/lower s) "e") "exponent literal keeps exponent form")))
+
+(deftest swizzle-on-a-sub-expression
+  ;; [:. e field] is the WGSL-specific special: a field or swizzle applied to a
+  ;; computed value rather than to a name. The parens are load-bearing — without
+  ;; them `(a + b).xyz` would parse as `a + b.xyz`.
+  (is (= "((a + b)).xyz" (w/expr [:. [:+ :a :b] :xyz])))
+  (is (= "(m[0]).w" (w/expr [:. "m[0]" :w])) "string operands pass through as raw WGSL")
+  (is (= "(f(x)).sun_dir" (w/expr [:. [:f :x] :sun-dir])) "the field is kebab→snake too"))
+
+(deftest statements
+  (is (= "let ndl = max(dot(N, L), 0.0);" (w/stmt [:let :ndl [:max [:dot :N :L] 0.0]])))
+  (is (= "var c: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);" (w/stmt [:var :c :vec3 [:vec3 0.0 0.0 0.0]])) "typed var resolves vec ctor")
+  (is (= "var c = vec3<f32>(0.0);" (w/stmt [:var :c [:vec3 0.0]])) "inferred var (no type)")
+  (is (= "return vec4<f32>(c, 1.0);" (w/stmt [:return [:vec4 :c 1.0]])))
+  (is (= "discard;" (w/stmt [:discard])))
+  (is (str/starts-with? (w/stmt [:if [:> :a 0.0] [[:set :c :a]]]) "if ((a > 0.0)) {")))
+
+(deftest mutating-and-declaring-statements
+  ;; Every statement head the docstring advertises should actually emit. These
+  ;; are the forms a compute kernel is written out of.
+  (is (= "c = a;"            (w/stmt [:set :c :a])))
+  (is (= "acc += x;"         (w/stmt [:+= :acc :x])))
+  (is (= "acc -= x;"         (w/stmt [:-= :acc :x])))
+  (is (= "i++;"              (w/stmt [:++ :i])))
+  (is (= "i--;"              (w/stmt [:-- :i])))
+  (is (= "var c: vec3<f32>;" (w/stmt [:decl :c :vec3])) "declaration without an initialiser")
+  (is (= "return;"           (w/stmt [:return])) "a value-less return")
+  (is (= "store(buf, x);"    (w/stmt [:store :buf :x])) "an unrecognised head is a bare expression statement")
+  (is (= "acc_total = 0.0;"  (w/stmt [:set :acc-total 0.0])) "assignment targets are kebab→snake too"))
+
+(deftest control-flow-blocks
+  ;; `if` bodies are indented by two spaces, and an else arm is emitted only
+  ;; when a third operand is present.
+  (is (= "if ((a > 0.0)) {\n  c = a;\n}"
+         (w/stmt [:if [:> :a 0.0] [[:set :c :a]]]))
+      "if with no else arm")
+  (is (= "if ((a > 0.0)) {\n  c = a;\n} else {\n  c = b;\n}"
+         (w/stmt [:if [:> :a 0.0] [[:set :c :a]] [[:set :c :b]]]))
+      "if/else")
+  ;; Nesting re-indents the inner block's own newlines. Without that, a nested
+  ;; body would be emitted flush against the outer margin — legal WGSL, but the
+  ;; shader source becomes unreadable at exactly the point it is hardest to debug.
+  (is (= "if ((a > 0.0)) {\n  if ((b > 0.0)) {\n    c = a;\n  }\n}"
+         (w/stmt [:if [:> :a 0.0] [[:if [:> :b 0.0] [[:set :c :a]]]]]))
+      "a nested block is indented relative to its parent"))
+
+(deftest for-loops
+  ;; The init statement's trailing `;` is stripped (the `for` header supplies
+  ;; its own separators) and `:++`/`:--` steps become postfix operators rather
+  ;; than statements.
+  (is (= "for (var i = 0; (i < 4); i++) {\n  acc += i;\n}"
+         (w/stmt [:for [:var :i [:i 0]] [:< :i [:i 4]] [:++ :i] [:+= :acc :i]]))
+      "counted loop over a raw-integer bound")
+  (is (= "for (var i = 3; (i > 0); i--) {\n  acc += i;\n}"
+         (w/stmt [:for [:var :i [:i 3]] [:> :i [:i 0]] [:-- :i] [:+= :acc :i]]))
+      "decrementing loop")
+  (is (= "for (var i = 0; (i < 2); i += 1) {\n  acc += i;\n}"
+         (w/stmt [:for [:var :i [:i 0]] [:< :i [:i 2]] [:+= :i [:i 1]] [:+= :acc :i]]))
+      "a non-postfix step falls back to a statement with its `;` stripped"))
+
+(deftest type-spellings
+  ;; The short WGSL aliases and the matNxN expansions are what the kami-render
+  ;; shaders are written in; a dropped entry silently emits the bare keyword.
+  (is (= "var m: mat4x4<f32>;" (w/stmt [:decl :m :mat4])))
+  (is (= "var m: mat3x3<f32>;" (w/stmt [:decl :m :mat3])))
+  (is (= "var v: vec3f;"       (w/stmt [:decl :v :vec3f])) "short alias passes through unexpanded")
+  (is (= "var m: mat4x4f;"     (w/stmt [:decl :m :mat4x4f])))
+  (is (= "@group(0) @binding(2) var<storage, read> ids: array<u32>;"
+         (w/binding* {:group 0 :binding 2 :space :storage :access :read} :ids "array<u32>"))
+      "an exotic type given as a string passes through verbatim")
+  (is (= "@group(1) @binding(0) var depth_tex: texture_depth_2d;"
+         (w/binding* {:group 1 :binding 0} :depth-tex "texture_depth_2d"))
+      "no :space → a bare var, as textures and samplers require"))
+
+(deftest compute-and-storage
+  (is (= "@group(0) @binding(1) var<storage, read_write> buf: array<f32>;"
+         (w/binding* {:group 0 :binding 1 :space :storage :access :read_write} :buf "array<f32>"))
+      "storage buffer with access mode")
+  (is (= "@group(0) @binding(0) var<uniform> g: G;"
+         (w/binding* {:group 0 :binding 0 :space :uniform} :g :G)) "plain uniform (no access)")
+  (let [cs (apply w/func :cs {:stage :compute :workgroup-size [8 8 1]
+                              :params [[:gid [:vec3 :u32] {:builtin :global-invocation-id}]]}
+                  [[:return]])]
+    (is (str/starts-with? cs "@compute @workgroup_size(8, 8, 1)\nfn cs(@builtin(global_invocation_id) gid: vec3<u32>)")
+        "compute entry with workgroup size + global-invocation-id builtin")))
+
+(deftest function-signatures
+  ;; A scalar workgroup size is the common 1-D case and must not be emitted as
+  ;; a bare `@workgroup_size` with no argument list.
+  (is (str/starts-with? (w/func :cs {:stage :compute :workgroup-size 64} [:return])
+                        "@compute @workgroup_size(64)\nfn cs()")
+      "scalar workgroup size")
+  (is (str/starts-with? (w/func :cs {:stage :compute} [:return]) "@compute\nfn cs()")
+      "compute entry without a declared workgroup size")
+  ;; A vertex entry returns its position through @builtin, not @location.
+  (is (= "@vertex\nfn vs(p: vec3<f32>) -> @builtin(position) vec4<f32> {\n  return vec4<f32>(p, 1.0);\n}"
+         (w/func :vs {:stage :vertex :params [[:p [:vec3 :f32]]] :ret [:builtin :position [:vec4 :f32]]}
+                 [:return [:vec4 :p 1.0]]))
+      "@builtin return position")
+  ;; Interpolated fragment inputs carry @location on the parameter.
+  (is (str/includes? (w/func :fs {:stage :fragment
+                                  :params [[:uv [:vec2 :f32] {:location 0}]]
+                                  :ret [:loc 0 [:vec4 :f32]]}
+                             [:return [:vec4 :uv 0.0 1.0]])
+                     "fn fs(@location(0) uv: vec2<f32>)")
+      "@location parameter attribute")
+  ;; A plain helper — no stage, no return type — is a normal WGSL function and
+  ;; must not acquire a stray attribute line or a dangling `->`.
+  (is (= "fn helper(x: f32) {\n  return x;\n}"
+         (w/func :helper {:params [[:x :f32]]} [:return :x]))
+      "stage-less, return-less helper"))
+
+(deftest struct-and-shader-assembly
+  ;; struct* and shader are re-exported by the facade and used by every consumer
+  ;; that declares a vertex-output type, yet nothing pinned them until now.
+  (is (= "struct VO { @builtin(position) clip: vec4<f32>, @location(0) n: vec3<f32> };"
+         (w/struct* :VO [[:clip [:vec4 :f32] {:builtin :position}]
+                         [:n [:vec3 :f32] {:location 0}]]))
+      "struct fields carry the same attributes as function parameters")
+  (is (= "struct Params { count: u32 };" (w/struct* :Params [[:count :u32]]))
+      "a field with no attribute gets no leading space")
+  (is (= "struct Ray { origin: vec3<f32> };" (w/struct* :Ray [[:origin [:vec3 :f32]]]))
+      "field names and types resolve like parameters")
+  (is (= "struct A { x: f32 };\n@group(0) @binding(0) var<uniform> g: G;\nfn f() {\n  return;\n}"
+         (w/shader (w/struct* :A [[:x :f32]])
+                   (w/binding* {:group 0 :binding 0 :space :uniform} :g :G)
+                   (w/func :f {} [:return])))
+      "shader joins top-level items with newlines, in order"))
+
+(deftest the-facade-re-exports-the-whole-surface
+  ;; kotoba.wgsl exists only so historical consumers (sprite-gpu, shaders, sky,
+  ;; render-shaders) keep resolving. A re-export dropped during a tidy-up would
+  ;; break them at require time, and no test noticed: the suite reached only
+  ;; four of the six names. Compare the vars, not sample output — equal output
+  ;; on one input would not prove the facade points at this implementation.
+  (doseq [[nm facade impl] [["expr" w/expr k/expr]
+                            ["stmt" w/stmt k/stmt]
+                            ["func" w/func k/func]
+                            ["struct*" w/struct* k/struct*]
+                            ["binding*" w/binding* k/binding*]
+                            ["shader" w/shader k/shader]]]
+    (is (= facade impl) (str "kotoba.wgsl/" nm " must re-export kami.wgsl/" nm))))
+
+(deftest a-lighting-fragment-compiles
+  (let [src (w/func :fs {:stage :fragment :params [[:i :VO]] :ret [:loc 0 [:vec4 :f32]]}
+                    [:let :N   [:normalize :i.n]]
+                    [:let :L   [:normalize [:- :g.sun-dir.xyz]]]
+                    [:let :ndl [:max [:dot :N :L] 0.0]]
+                    [:return [:vec4 [:* :i.col :ndl] 1.0]])]
+    (is (str/includes? src "@fragment"))
+    (is (str/includes? src "fn fs(i: VO) -> @location(0) vec4<f32> {"))
+    (is (str/includes? src "let ndl = max(dot(N, L), 0.0);"))
+    (is (str/includes? src "return vec4<f32>((i.col * ndl), 1.0);"))
+    (is (= src (apply w/func :fs {:stage :fragment :params [[:i :VO]] :ret [:loc 0 [:vec4 :f32]]}
+                      [[:let :N   [:normalize :i.n]]
+                       [:let :L   [:normalize [:- :g.sun-dir.xyz]]]
+                       [:let :ndl [:max [:dot :N :L] 0.0]]
+                       [:return [:vec4 [:* :i.col :ndl] 1.0]]]))
+        "deterministic")))
