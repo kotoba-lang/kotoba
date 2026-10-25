@@ -1,0 +1,187 @@
+(ns kotoba.verifier-signing-cross-host-parity-test
+  "Cross-host parity for kotoba.verifier.signing: the JVM (java.security) and
+  the Node/nbb engine (node:crypto) exchanging LIVE keys and signatures.
+
+  docs/selfhost-native-binary.md names this as the one remaining evidence gap
+  for the .cljc port of signing: \"a key generated on one host verifies on the
+  other, in both directions, and a signature made on one host is accepted by
+  the other\". The committed vector in verifier-signing-parity-test pins one
+  fixed Node-produced key; it cannot see a host whose GENERATED keys or
+  signatures disagree. This namespace measures the live exchange instead:
+  whichever host runs it, its own process is one host and the other host is
+  spawned as the worker in verifier_signing_cross_host_worker.cljk (the same
+  file on both hosts), so each run covers both directions.
+
+  Measured 2026-10-19 while landing this file: the JVM host cannot even
+  load these namespaces without scripts/jvm-cljk-boot.clj -- clojure.core/ns
+  evaluates the {:kotoba/export [...]} attr-map the .cljk sources carry, so
+  `kotoba.lang.coll` (pinned dep) and `kotoba.verifier.signing` both die with
+  \"Unable to resolve symbol\" on a real JVM while SCI treats the map as data.
+  The boot shim pre-interns those names; no source under test is rewritten.
+
+  Cases that cannot reach the other host are SKIPped with the exact reason
+  and recorded in `skipped` -- a case not run is not a case passed, and
+  run-signing-cross-host-parity.cljk exits 2 for it."
+  (:require [kotoba.test :as t :refer [deftest is testing]]
+            [kotoba.lang.edn :as edn]
+            [kotoba.verifier.signing :as signing]
+            #?(:cljs ["node:child_process" :as cp])
+            #?(:cljs ["node:os" :as os])))
+
+(def ^:private worker "lib/kotoba.kotobaVerifier/test/kotoba/verifier_signing_cross_host_worker.cljk")
+
+;; The exchanged value: strings plus one integer, so the canonical-bytes
+;; agreement between a JVM Long and a nbb bigint is exercised too.
+(def ^:private value {:kotoba "cross-host" :direction "parity" :n 7})
+
+(def skipped (atom nil))
+
+(defn- skip! [name reason]
+  (reset! skipped (str name ": " reason))
+  (println "SKIP" name "--" reason))
+
+(defn- tmp-file [tag]
+  (str #?(:clj (System/getProperty "java.io.tmpdir") :cljs (.tmpdir os))
+       "/kotoba-signing-cross-host-" tag "-" (random-uuid) ".edn"))
+
+(defn- spawn [cmd]
+  #?(:clj (let [p (.start (ProcessBuilder. ^java.util.List cmd))
+                out (slurp (.getInputStream p))
+                err (slurp (.getErrorStream p))
+                code (.waitFor p)]
+            {:status code :out out :err err})
+     :cljs (let [r (cp/spawnSync (first cmd) (clj->js (rest cmd))
+                                #js {:encoding "utf8"
+                                     :cwd (.cwd js/process)
+                                     :maxBuffer (* 8 1024 1024)})]
+             {:status (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))})))
+
+(defn- sibling-command [req-file resp-file]
+  ;; The sibling is always the OTHER host: :clj means this process is the
+  ;; JVM and the worker must run on the kbb/Node engine (the exact command
+  ;; run-tests.cljk documents), :cljs means the reverse via jvm-cljk-run.sh.
+  ;;
+  ;; The osaho classpath hoist is measured, not cargo: on the kbb engine
+  ;; `kotoba.kir` resolves to kotoba-kir/22d31af0/src/kotoba/kir.cljc (which
+  ;; exports `default-fuel`, NOT `max-fuel`) whenever that root precedes the
+  ;; pinned osaho's, and kotoba.verifier then dies with "Unable to resolve
+  ;; symbol: ir/max-fuel" -- the repo's own run-tests.cljk fails identically
+  ;; at origin/main 231997a (measured 2026-10-19). Hoisting the pinned
+  ;; osaho root makes kotoba.kir/max-fuel resolve again.
+  #?(:clj ["sh" "-c" (str "CP=$(kbb -Spath -M:test); "
+                          "OSAHO=$(printf '%s' \"$CP\" | tr ':' '\\n' | grep '/osaho/' | head -1); "
+                          "REST=$(printf '%s' \"$CP\" | tr ':' '\\n' | grep -v '/osaho/' | paste -sd: -); "
+                          "kbb --backend sci --classpath \"src:test:$OSAHO:$REST\" "
+                          worker " '" req-file "' '" resp-file "'")]
+     :cljs ["sh" "lib/kotoba.kotobaVerifier/scripts/jvm-cljk-run.sh" worker req-file resp-file]))
+
+(defn- worker! [req]
+  (let [stamp (str (random-uuid))
+        req-file (tmp-file (str "req-" stamp))
+        resp-file (tmp-file (str "resp-" stamp))
+        _ (spit req-file (pr-str req))
+        run (spawn (sibling-command req-file resp-file))
+        outcome (try (edn/read-string (slurp resp-file))
+                     (catch #?(:clj Exception :cljs :default) _ nil))]
+    (when-not (and outcome (:ok? outcome))
+      (throw (ex-info (str "sibling host worker failed: status " (:status run)
+                           " outcome=" (pr-str outcome)
+                           " out=" (subs (str (:out run)) 0 (min 300 (count (str (:out run)))))
+                           " err=" (subs (str (:err run)) 0 (min 300 (count (str (:err run))))))
+                      {:req req :run run :outcome outcome})))
+    (:result outcome)))
+
+(def ^:private probe
+  (delay (try (worker! {:op :host})
+              (catch #?(:clj Exception :cljs :default) e
+                {:error (ex-message e)}))))
+
+(defn- unavailable-reason [] (:error @probe))
+
+(defn- corrupt [sig]
+  (let [i (quot (count sig) 2)
+        c (subs sig i (inc i))]
+    (str (subs sig 0 i) (if (= c "A") "B" "A") (subs sig (inc i)))))
+
+(deftest the-sibling-host-is-the-other-implementation
+  (if-let [reason (unavailable-reason)]
+    (skip! "the-sibling-host-is-the-other-implementation" reason)
+    (is (= #?(:clj :nbb :cljs :jvm) (:host @probe)))))
+
+(deftest a-key-generated-on-the-other-host-is-valid-here
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-key-generated-on-the-other-host-is-valid-here" reason)
+    (let [k (:key (worker! {:op :generate-keypair}))
+          vk (signing/verification-key k)]
+      (is (signing/valid-key? k))
+      (is (signing/valid-verification-key? vk))
+      (is (= (:signer k) (signing/signer-id (:public-key k))))
+      (is (= (:signer k) (:signer vk))))))
+
+(deftest a-key-generated-here-is-valid-on-the-other-host
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-key-generated-here-is-valid-on-the-other-host" reason)
+    (let [k (signing/generate-keypair)]
+      (is (true? (:valid? (worker! {:op :valid-key? :key k}))))
+      (is (true? (:valid? (worker! {:op :valid-verification-key?
+                                   :key (signing/verification-key k)}))))
+      (is (= (:signer k) (:signer (worker! {:op :signer-id
+                                           :public-key (:public-key k)})))))))
+
+(deftest a-signature-made-on-the-other-host-verifies-here
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-signature-made-on-the-other-host-verifies-here" reason)
+    (let [k (:key (worker! {:op :generate-keypair}))
+          sig (:signature (worker! {:op :sign-value :key k :value value}))]
+      (is (string? sig))
+      (is (signing/verify-value (:public-key k) value sig)))))
+
+(deftest a-signature-made-here-verifies-on-the-other-host
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-signature-made-here-verifies-on-the-other-host" reason)
+    (let [k (signing/generate-keypair)
+          sig (signing/sign-value k value)]
+      (is (true? (:valid? (worker! {:op :verify-value
+                                   :public-key (:public-key k)
+                                   :value value :signature sig})))))))
+
+(deftest both-hosts-sign-the-same-key-and-value-to-the-same-bytes
+  (if-let [reason (unavailable-reason)]
+    (skip! "both-hosts-sign-the-same-key-and-value-to-the-same-bytes" reason)
+    (let [k (:key (worker! {:op :generate-keypair}))
+          remote (:signature (worker! {:op :sign-value :key k :value value}))
+          local (signing/sign-value k value)]
+      (is (= remote local)))))
+
+(deftest a-corrupted-signature-is-refused-on-both-hosts
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-corrupted-signature-is-refused-on-both-hosts" reason)
+    (let [k (:key (worker! {:op :generate-keypair}))
+          sig (:signature (worker! {:op :sign-value :key k :value value}))
+          bad (corrupt sig)]
+      (is (false? (signing/verify-value (:public-key k) value bad)))
+      (is (false? (:valid? (worker! {:op :verify-value
+                                    :public-key (:public-key k)
+                                    :value value :signature bad})))))))
+
+(deftest a-signature-by-a-different-key-is-refused-on-both-hosts
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-signature-by-a-different-key-is-refused-on-both-hosts" reason)
+    (let [k1 (:key (worker! {:op :generate-keypair}))
+          k2 (signing/generate-keypair)
+          sig (:signature (worker! {:op :sign-value :key k1 :value value}))]
+      (is (false? (signing/verify-value (:public-key k2) value sig)))
+      (is (false? (:valid? (worker! {:op :verify-value
+                                    :public-key (:public-key k2)
+                                    :value value :signature sig})))))))
+
+(deftest a-tampered-value-is-refused-on-both-hosts
+  (if-let [reason (unavailable-reason)]
+    (skip! "a-tampered-value-is-refused-on-both-hosts" reason)
+    (let [k (:key (worker! {:op :generate-keypair}))
+          sig (:signature (worker! {:op :sign-value :key k :value value}))
+          tampered (assoc value :n 8)]
+      (is (false? (signing/verify-value (:public-key k) tampered sig)))
+      (is (false? (:valid? (worker! {:op :verify-value
+                                    :public-key (:public-key k)
+                                    :value tampered :signature sig})))))))
