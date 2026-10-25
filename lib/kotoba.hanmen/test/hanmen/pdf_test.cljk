@@ -1,0 +1,878 @@
+(ns hanmen.pdf-test
+  "Placement, against PDFs written here.
+
+  `pdf.core/write-document` is the oracle: a content stream this test wrote
+  says where a mark is in PDF user space, so where it comes out in reader
+  space is arithmetic with one right answer rather than a rendering somebody
+  looked at and thought seemed fine. Every assertion below is a coordinate,
+  not a screenshot."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [hanmen.page :as page]
+            [hanmen.pdf :as hpdf]
+            [pdf.core :as pdf]))
+
+(defn- doc
+  "A one-page PDF with `content` as its content stream."
+  ([content] (doc content {}))
+  ([content {:keys [width height] :or {width 595 height 842}}]
+   (pdf/parse (pdf/write-document [{:width width :height height :content content}]))))
+
+(defn- page-of [content & [opts]]
+  (hpdf/page-at (doc content (or opts {})) 0))
+
+(defn- texts [p] (filterv #(= :text (:item/kind %)) (:page/items p)))
+
+;; ── the flip ─────────────────────────────────────────────────────────────────
+
+(deftest a-baseline-lands-where-the-document-put-it
+  ;; 72pt from the left and 720pt UP from the bottom of an 842pt page is
+  ;; 122pt DOWN from the top. Getting this backwards renders every document
+  ;; upside down, and it is the single most likely mistake in this file.
+  ;; ASCII, because `pdf/write-document` writes a standard-14 Type1 font and
+  ;; truncates every char to one byte — CJK through that path produces
+  ;; mojibake in the FIXTURE, not in the reader. The composite-font test
+  ;; below is where Japanese is actually exercised.
+  (let [p (page-of (pdf/text-command {:x 72 :y 720 :text "Agreement" :size 12}))
+        [t] (texts p)]
+    (is (= 1 (count (texts p))))
+    (is (= "Agreement" (:item/text t)))
+    (is (= 72.0 (:item/x t)))
+    (is (= 122.0 (:item/y t)) "842 − 720")
+    (is (= 12.0 (:item/size t)))
+    (testing "and the page reports its own size"
+      (is (= 595.0 (:page/width p)))
+      (is (= 842.0 (:page/height p))))))
+
+(deftest a-media-box-that-does-not-start-at-the-origin-is-taken-into-account
+  ;; A cropped page. Treating the box as [0 0 w h] puts every mark off the
+  ;; edge by the offset, which looks like "the renderer draws nothing".
+  (let [content (pdf/text-command {:x 110 :y 700 :text "cropped" :size 10})
+        raw (pdf/write-document [{:width 595 :height 842 :content content}])
+        ;; Rewrite the MediaBox in place — same length, so no offset moves.
+        text (apply str (map char raw))
+        cropped (str/replace text "/MediaBox [0 0 595 842]" "/MediaBox [10 20 595 842]")
+        parsed (pdf/parse (mapv #(bit-and (int %) 0xff) (.getBytes ^String cropped "ISO-8859-1")))
+        p (hpdf/page-at parsed 0)
+        [t] (texts p)]
+    (is (= 585.0 (:page/width p)) "595 − 10")
+    (is (= 822.0 (:page/height p)) "842 − 20")
+    (is (= 100.0 (:item/x t)) "110 − 10")
+    (is (= 142.0 (:item/y t)) "822 − (700 − 20)")))
+
+;; ── the matrices ─────────────────────────────────────────────────────────────
+
+(deftest text-accumulates-its-own-advance
+  ;; One BT, one Tm, three shows. A reader that does not advance the text
+  ;; matrix stacks all three on one spot — and because the first one is
+  ;; right, it looks like it works.
+  ;;
+  ;; Asserted through `coalesce`, which joins them precisely BECAUSE the
+  ;; advance put each one where the last one ended. A reader that did not
+  ;; advance would leave three runs at one x, and they would not join.
+  (let [p (page-of (str "BT /F1 10 Tf 1 0 0 1 50 700 Tm "
+                        "(one) Tj (two) Tj (three) Tj ET"))
+        runs (texts p)]
+    (is (= 1 (count runs)) "contiguous, so one run")
+    (is (= "onetwothree" (:item/text (first runs))))
+    (is (= 50.0 (:item/x (first runs)))))
+
+  (testing "and runs that are NOT contiguous stay apart"
+    ;; The same three shows with the pen moved between them. A coalescer
+    ;; that joined on baseline alone would run a two-column line together.
+    (let [p (page-of (str "BT /F1 10 Tf 1 0 0 1 50 700 Tm (one) Tj "
+                          "1 0 0 1 300 700 Tm (two) Tj ET"))
+          runs (texts p)]
+      (is (= 2 (count runs)))
+      (is (= [50.0 300.0] (mapv :item/x runs))))))
+
+(deftest a-producer-that-emits-one-glyph-at-a-time-still-yields-words
+  ;; Measured on a real audit report: 52 runs for one line, so `text-of`
+  ;; returned ["O" "p" "e" "n" …]. That is not a search index and not a
+  ;; quotation, and drawn in a font that is not the document's it reads as
+  ;; `Cont r act s`.
+  (let [p (page-of (str "BT /F1 10 Tf 1 0 0 1 0 700 Tm "
+                        "(H) Tj (e) Tj (l) Tj (l) Tj (o) Tj ET"))]
+    (is (= ["Hello"] (page/text-of p)))
+    (is (= 1 (count (texts p)))))
+
+  (testing "a gap never becomes a space — see `no-space-is-ever-invented-between-runs`"
+    (let [p (page-of (str "BT /F1 10 Tf 1 0 0 1 0 700 Tm (Hi) Tj "
+                          "1 0 0 1 14 700 Tm (there) Tj ET"))]
+      (is (= ["Hi" "there"] (page/text-of p)))))
+
+  (testing "and a different size is a different piece of type"
+    (let [p (page-of (str "BT /F1 10 Tf 1 0 0 1 0 700 Tm (a) Tj "
+                          "/F1 20 Tf (b) Tj ET"))]
+      (is (= 2 (count (texts p)))))))
+
+(deftest a-line-break-uses-the-leading-not-the-last-position
+  ;; `T*` moves relative to the line matrix, not the text matrix. Using the
+  ;; text matrix makes every line after the first drift right by the width
+  ;; of the line above it.
+  (let [p (page-of (str "BT /F1 10 Tf 12 TL 1 0 0 1 40 700 Tm "
+                        "(first line) Tj T* (second line) Tj ET"))
+        [a b] (texts p)]
+    (is (= 40.0 (:item/x a)))
+    (is (= 40.0 (:item/x b)) "back to the left margin, not after `first line`")
+    (is (= 12.0 (- (:item/y b) (:item/y a))) "one leading down the page")))
+
+(deftest a-scaling-cm-scales-the-type
+  ;; 12pt inside a 0.5 scale is 6pt on the page. A viewer that drew the `Tf`
+  ;; operand would be twice the document's size on every scaled form.
+  (let [p (page-of (str "q 0.5 0 0 0.5 0 0 cm "
+                        "BT /F1 12 Tf 1 0 0 1 100 1400 Tm (small) Tj ET Q"))
+        [t] (texts p)]
+    (is (= 6.0 (:item/size t)))
+    (is (= 50.0 (:item/x t)) "100 × 0.5")
+    (is (= 142.0 (:item/y t)) "842 − (1400 × 0.5)")))
+
+(deftest q-and-Q-restore-the-matrix
+  (let [p (page-of (str "q 2 0 0 2 0 0 cm BT /F1 10 Tf 1 0 0 1 10 400 Tm (big) Tj ET Q "
+                        "BT /F1 10 Tf 1 0 0 1 10 400 Tm (normal) Tj ET"))
+        [big normal] (texts p)]
+    (is (= 20.0 (:item/size big)))
+    (is (= 10.0 (:item/size normal)) "Q put the CTM back")
+    (is (= 20.0 (:item/x big)))
+    (is (= 10.0 (:item/x normal)))))
+
+(deftest tj-kerning-numbers-move-the-pen-backwards
+  ;; The numbers in a TJ array are subtracted, in thousandths of text space.
+  ;; A reader that added them would open gaps where the document closed them.
+  (let [tight (page-of "BT /F1 10 Tf 1 0 0 1 0 700 Tm [(A) 1000 (B)] TJ ET")
+        loose (page-of "BT /F1 10 Tf 1 0 0 1 0 700 Tm [(A) -1000 (B)] TJ ET")
+        x-of (fn [p] (:item/x (second (texts p))))]
+    (is (< (x-of tight) (x-of loose))
+        "a positive number pulls the next run left")
+    (is (= 20.0 (- (x-of loose) (x-of tight)))
+        "one em of a 10pt font each way, so twenty points apart")))
+
+;; ── rotation ─────────────────────────────────────────────────────────────────
+
+(deftest rotation-is-applied-to-the-size-and-to-the-marks
+  (let [content (pdf/text-command {:x 100 :y 700 :text "turned" :size 10})
+        raw (pdf/write-document [{:width 595 :height 842 :content content}])
+        text (apply str (map char raw))
+        turned (str/replace text "/Type /Page /Parent" "/Rotate 90 /Type /Page /Parent")
+        parsed (pdf/parse (mapv #(bit-and (int %) 0xff) (.getBytes ^String turned "ISO-8859-1")))
+        p (hpdf/page-at parsed 0)]
+    (is (= 90 (:page/rotation p)))
+    (is (= 842.0 (:page/width p)) "the long edge is across now")
+    (is (= 595.0 (:page/height p)))
+    (testing "and the mark moved with the page rather than staying put"
+      (let [[t] (texts p)]
+        (is (= 700.0 (:item/x t)))
+        (is (= 100.0 (:item/y t)))))))
+
+;; ── rules ────────────────────────────────────────────────────────────────────
+
+(deftest a-filled-rectangle-becomes-a-rule
+  (let [p (page-of (str "0 g " (pdf/rect-command {:x 50 :y 100 :width 200 :height 2
+                                                  :fill? true})))
+        [r] (filterv #(= :rule (:item/kind %)) (:page/items p))]
+    (is (some? r))
+    (is (= 50.0 (:item/x r)))
+    (is (= 740.0 (:item/y r)) "842 − (100 + 2), the TOP edge in reader space")
+    (is (= 200.0 (:item/width r)))
+    (is (= 2.0 (:item/height r)))
+    (is (= 1.0 (:item/ink r)) "0 g is black, which is full ink in reader terms")))
+
+(deftest a-stroked-rectangle-is-not-a-rule
+  ;; `re … S` outlines; only `f` fills. Treating both as filled turns every
+  ;; table border into a solid black block.
+  (let [p (page-of (pdf/rect-command {:x 50 :y 100 :width 200 :height 50 :fill? false}))]
+    (is (empty? (filterv #(= :rule (:item/kind %)) (:page/items p))))))
+
+(deftest grey-becomes-ink-on-the-way-in
+  ;; PDF's 0 is black and this model's 0 is nothing. Converting at the
+  ;; producer keeps the inverted convention out of a format-neutral value —
+  ;; a second producer that read `:item/ink` as PDF grey would draw every
+  ;; rule in negative.
+  (let [p (page-of (str "0.75 g " (pdf/rect-command {:x 0 :y 0 :width 10 :height 10
+                                                     :fill? true})))
+        [r] (filterv #(= :rule (:item/kind %)) (:page/items p))]
+    (is (= 0.25 (:item/ink r)) "1 − 0.75")))
+
+;; ── widths ───────────────────────────────────────────────────────────────────
+
+(deftest a-run-width-is-absent-when-the-font-did-not-ship-widths
+  ;; `write-document` emits Helvetica with no /Widths. An estimate here
+  ;; would be indistinguishable from a measurement downstream.
+  (let [p (page-of (pdf/text-command {:x 10 :y 700 :text "unmeasured" :size 10}))
+        [t] (texts p)]
+    (is (nil? (:item/width t)))))
+
+;; ── composite fonts ──────────────────────────────────────────────────────────
+
+(defn- composite-doc
+  "A hand-written PDF with a `/Type0` font, because `write-document` only
+  emits Helvetica. `pdf.core` finds objects by scanning for `N G obj` and
+  stream ends by searching for `endstream`, so neither a correct xref nor a
+  correct `/Length` is needed here — which is what makes this fixture short
+  enough to read."
+  [tounicode]
+  (let [text (str "%PDF-1.4\n"
+                  "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                  "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+                  "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] "
+                  "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+                  "4 0 obj\n<< /Length 48 >>\nstream\n"
+                  "BT /F1 12 Tf 1 0 0 1 10 50 Tm <00410042> Tj ET\n"
+                  "endstream\nendobj\n"
+                  "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /KozMin "
+                  "/DescendantFonts [9 0 R] /Encoding /Identity-H"
+                  (if tounicode " /ToUnicode 6 0 R" "")
+                  " >>\nendobj\n"
+                  (if tounicode
+                    (str "6 0 obj\n<< /Length 120 >>\nstream\n" tounicode
+                         "\nendstream\nendobj\n")
+                    "")
+                  ;; A descendant font that names its collection, which is
+                  ;; what a registry lookup is keyed on.
+                  "9 0 obj\n<< /Type /Font /Subtype /CIDFontType0 "
+                  "/CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) "
+                  "/Supplement 6 >> >>\nendobj\n"
+                  "trailer\n<< /Size 7 /Root 1 0 R >>\n%%EOF\n")]
+    (pdf/parse (mapv #(bit-and (int %) 0xff)
+                     #?(:clj (.getBytes ^String text "ISO-8859-1")
+                        :cljs (map #(.charCodeAt text %) (range (count text))))))))
+
+(defn- composite-doc-with-encoding
+  "A one-page PDF whose /Type0 font uses `enc` and shows `hex` (a `<…>`
+  string operand)."
+  [enc hex]
+  (let [text (str "%PDF-1.4\n"
+                  "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                  "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+                  "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] "
+                  "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+                  "4 0 obj\n<< /Length 60 >>\nstream\n"
+                  "BT /F1 12 Tf 1 0 0 1 10 50 Tm " hex " Tj ET\nendstream\nendobj\n"
+                  "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /Ryumin "
+                  "/DescendantFonts [9 0 R] /Encoding /" enc " >>\nendobj\n"
+                  "9 0 obj\n<< /Type /Font /Subtype /CIDFontType0 "
+                  "/CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) "
+                  "/Supplement 6 >> >>\nendobj\n"
+                  "trailer\n<< /Size 10 /Root 1 0 R >>\n%%EOF\n")]
+    (pdf/parse (mapv #(bit-and (int %) 0xff)
+                     #?(:clj (.getBytes ^String text "ISO-8859-1")
+                        :cljs (map #(.charCodeAt text %) (range (count text))))))))
+
+(deftest a-two-byte-code-is-read-through-tounicode
+  ;; Identity-H codes are glyph ids, not characters. This is the path every
+  ;; Japanese PDF takes, and reading it as one byte per code produces
+  ;; plausible-looking Latin garbage rather than an obvious failure.
+  (let [p (hpdf/page-at (composite-doc (str "begincmap\n"
+                                            "2 beginbfchar\n"
+                                            "<0041> <5951>\n"
+                                            "<0042> <7D04>\n"
+                                            "endbfchar\n"
+                                            "endcmap"))
+                        0)
+        [t] (texts p)]
+    (is (= "契約" (:item/text t)) "0x0041 0x0042, two codes, not four")
+    (is (= 10.0 (:item/x t)))
+    (is (= 50.0 (:item/y t)) "100 − 50")))
+
+(deftest a-bfrange-increments-its-destination
+  ;; The single-value form. Assuming the array form is the only one drops
+  ;; every range a producer wrote the compact way.
+  ;; The destination is a CODE POINT that increments, not a character that
+  ;; means anything: `<30A2>` is ア and the next two are ィ and イ, which is
+  ;; how katakana is laid out and is why this form exists at all.
+  (is (= {0x41 "ア" 0x42 "ィ" 0x43 "イ"}
+         (select-keys (hpdf/parse-tounicode
+                       "beginbfrange\n<0041> <0043> <30A2>\nendbfrange")
+                      [0x41 0x42 0x43])))
+  (testing "and the array form maps elementwise"
+    (is (= {0x41 "A" 0x42 "Z"}
+           (select-keys (hpdf/parse-tounicode
+                         "beginbfrange\n<0041> <0042> [<0041> <005A>]\nendbfrange")
+                        [0x41 0x42])))))
+
+(defn- measured-doc
+  "A page whose font ships `/Widths`, so the advance is a measurement.
+
+  500/1000 for every code, which is also `default-width` — chosen so the
+  geometry is identical to the unmeasured case and the ONLY difference under
+  test is whether the width was declared."
+  [content]
+  (let [text (str "%PDF-1.4\n"
+                  "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                  "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+                  "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 800] "
+                  "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+                  "4 0 obj\n<< /Length 90 >>\nstream\n" content "\nendstream\nendobj\n"
+                  "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                  "/FirstChar 32 /LastChar 126 /Widths ["
+                  (str/join " " (repeat 95 "500")) "] >>\nendobj\n"
+                  "trailer\n<< /Size 7 /Root 1 0 R >>\n%%EOF\n")]
+    (pdf/parse (mapv #(bit-and (int %) 0xff)
+                     #?(:clj (.getBytes ^String text "ISO-8859-1")
+                        :cljs (map #(.charCodeAt text %) (range (count text))))))))
+
+(deftest no-space-is-ever-invented-between-runs
+  ;; A reversal, and the measurement that caused it is the point: on a real
+  ;; cover page the gaps between consecutive glyphs formed one continuous
+  ;; spread from 0.30 to 0.90 em with no break anywhere. No threshold on
+  ;; that page separates letter-spacing from a word space, and the first
+  ;; version put a space between every pair of letters.
+  ;;
+  ;; So runs the producer placed apart stay apart, at their own coordinates,
+  ;; which is what the document says. Joining them is the caller's choice.
+  (let [p (hpdf/page-at (measured-doc (str "BT /F1 10 Tf 1 0 0 1 0 700 Tm (Hi) Tj "
+                                           "1 0 0 1 14 700 Tm (there) Tj ET")) 0)]
+    (is (= ["Hi" "there"] (page/text-of p))
+        "two runs, not one with a character nobody wrote")
+    (is (= "Hi there" (page/reading-text p))
+        "and joining them is a presentation choice made at the edge"))
+
+  (testing "flush runs still join, because that is not a guess"
+    (let [p (hpdf/page-at (measured-doc (str "BT /F1 10 Tf 1 0 0 1 0 700 Tm "
+                                             "(He) Tj (llo) Tj ET")) 0)]
+      (is (= ["Hello"] (page/text-of p)))))
+
+  (testing "and an unmeasured font joins on the same rule"
+    ;; `write-document` ships no /Widths, so the advance is `default-width`.
+    ;; Flush is flush either way — what changed is that nothing downstream
+    ;; depends on the gap MEANING anything.
+    (let [p (page-of "BT /F1 10 Tf 1 0 0 1 0 700 Tm (H) Tj (i) Tj ET")]
+      (is (= ["Hi"] (page/text-of p))))))
+
+(deftest a-predefined-encoding-splits-its-own-codes
+  ;; `90ms-RKSJ-H` is Shift-JIS: one byte or two, declared in the CMap. A
+  ;; reader that assumed two splits every ASCII character in half and
+  ;; produces twice as many wrong characters as there were right ones.
+  ;;
+  ;; Both halves come from the resolver — the widths are data in a file this
+  ;; library does not read, so splitting here would be guessing at Shift-JIS.
+  (let [;; <41> is one byte (A), <82A0> is two (あ).
+        doc (composite-doc-with-encoding "90ms-RKSJ-H" "<4182A042>")
+        resolver (fn [n]
+                   (when (= "90ms-RKSJ-H" n)
+                     {:split (fn [bytes]
+                               ;; One byte below 0x81, two from 0x81.
+                               (loop [i 0 out []]
+                                 (cond
+                                   (>= i (count bytes)) out
+                                   (< (nth bytes i) 0x81)
+                                   (recur (inc i) (conj out (nth bytes i)))
+                                   :else
+                                   (recur (+ i 2)
+                                          (conj out (+ (* 256 (nth bytes i))
+                                                       (nth bytes (inc i) 0)))))))
+                      :text {0x41 "A" 0x82A0 "あ" 0x42 "B"}}))
+        p (hpdf/page-at doc 0 {:encoding->cmap resolver})
+        [t] (filterv #(= :text (:item/kind %)) (:page/items p))]
+    (is (= "AあB" (:item/text t))
+        "three codes of two different widths, not two codes of one"))
+
+  (testing "and without a resolver it stays a frame rather than mojibake"
+    (let [p (hpdf/page-at (composite-doc-with-encoding "90ms-RKSJ-H" "<4182A042>") 0)]
+      (is (empty? (filterv #(= :text (:item/kind %)) (:page/items p))))))
+
+  (testing "Identity-H is not sent to the resolver"
+    ;; It is not a predefined table lookup — the code IS the CID, and asking
+    ;; would either miss or return the wrong table.
+    (let [asked (atom [])
+          _ (hpdf/page-at (composite-doc nil) 0
+                          {:encoding->cmap (fn [n] (swap! asked conj n) nil)})]
+      (is (empty? @asked)))))
+
+(deftest a-registry-table-reads-a-font-that-shipped-no-tounicode
+  ;; The 25-of-576 case: a CIDFontType0C with no /ToUnicode. The collection
+  ;; publishes what its CIDs mean, and a host that has the table passes it
+  ;; in — this library reads no files and has no classpath of its own.
+  (let [p (hpdf/page-at (composite-doc nil) 0
+                        {:cid->unicode (fn [ordering]
+                                         (when (= "Adobe-Japan1" ordering)
+                                           {0x41 "契" 0x42 "約"}))})
+        [t] (texts p)]
+    ;; The fixture declares Adobe-Japan1 below; without that declaration the
+    ;; resolver is never asked, which is the next assertion.
+    (is (= "契約" (:item/text t)))
+    (is (empty? (filterv #(= :frame (:item/kind %)) (:page/items p)))))
+
+  (testing "a resolver that does not know the ordering changes nothing"
+    (let [p (hpdf/page-at (composite-doc nil) 0
+                          {:cid->unicode (constantly nil)})]
+      (is (empty? (texts p)))
+      (is (= :font/no-tounicode (:item/reason (first (:page/items p)))))))
+
+  (testing "and /ToUnicode still wins when the font ships one"
+    ;; What the producer SAID beats what the collection says: a font may
+    ;; subset a collection privately, and then the table is wrong.
+    (let [p (hpdf/page-at (composite-doc (str "begincmap\n1 beginbfchar\n"
+                                              "<0041> <5951>\nendbfchar\nendcmap"))
+                          0
+                          {:cid->unicode (constantly {0x41 "X" 0x42 "Y"})})]
+      (is (= "契" (:item/text (first (texts p))))
+          "the font's own statement, not the collection's"))))
+
+(deftest a-composite-run-with-no-tounicode-is-a-frame-not-mojibake
+  ;; Text nobody can read is worse than a marked region: it goes into search
+  ;; results and into anything that quotes the page.
+  (let [p (hpdf/page-at (composite-doc nil) 0)
+        [f] (:page/items p)]
+    (is (empty? (texts p)))
+    (is (= :frame (:item/kind f)))
+    (is (= :font/no-tounicode (:item/reason f)))
+    ;; The label names the font AND what kind of file is embedded, because
+    ;; that is what decides which decoder is missing: a bare CFF has no
+    ;; cmap to read and needs a registry CMap resource instead.
+    (is (= "KozMin (Adobe-Japan1, none)" (:item/label f)))
+    (is (page/scanned? p) "and the page says a search cannot see it")))
+
+(deftest every-fill-colour-operator-records-ink
+  ;; `g` and `rg` were tracked and `k`/`sc`/`scn` were not, so a fill in CMYK
+  ;; or a named colour space recorded NO ink and drew at full strength —
+  ;; which is the PDF default and therefore not obviously wrong. Seen on a
+  ;; real poster as a pale panel that came out a solid block.
+  (let [ink-of (fn [ops]
+                 (:item/ink (first (filterv #(= :rule (:item/kind %))
+                                            (:page/items
+                                             (page-of (str ops " "
+                                                           (pdf/rect-command
+                                                            {:x 0 :y 0 :width 10
+                                                             :height 10 :fill? true}))))))))]
+    (is (= 1.0 (ink-of "0 g")) "black")
+    (is (= 0.0 (ink-of "1 g")) "white is no ink at all")
+    (is (= 1.0 (ink-of "0 0 0 1 k")) "CMYK black is K=1")
+    (is (= 0.0 (ink-of "0 0 0 0 k")) "and CMYK white is nothing")
+    (is (= 0.0 (ink-of "1 sc")) "one component is grey")
+    (is (= 1.0 (ink-of "0 0 0 scn")) "three are RGB")
+    (is (= 0.0 (ink-of "0 0 0 0 scn")) "four are CMYK"))
+
+  (testing "a pattern name leaves the previous colour rather than inventing one"
+    ;; `scn` with a name has no numeric operands. A pattern's average colour
+    ;; is not something this can know.
+    (let [p (page-of (str "0.5 g /P1 scn "
+                          (pdf/rect-command {:x 0 :y 0 :width 5 :height 5
+                                             :fill? true})))
+          [r] (filterv #(= :rule (:item/kind %)) (:page/items p))]
+      (is (= 0.5 (:item/ink r))))))
+
+(deftest a-mark-drawn-off-the-page-is-not-on-the-page
+  ;; Measured on a real poster: a rule at (9321, 10277) on a 2384×3370 page.
+  ;; A drawer's viewBox clips it; a count of what is on the page, a digest
+  ;; over the marks, or anything laying them out itself does not.
+  (let [p (page-of (str (pdf/rect-command {:x 10 :y 10 :width 20 :height 20
+                                           :fill? true})
+                        (pdf/rect-command {:x 5000 :y 5000 :width 20 :height 20
+                                           :fill? true})))
+        rules (filterv #(= :rule (:item/kind %)) (:page/items p))]
+    (is (= 1 (count rules)) "the one on the page")
+    (is (= 10.0 (:item/x (first rules)))))
+
+  (testing "a mark straddling the edge stays whole"
+    ;; Trimming it would need the clip path this does not track, and half a
+    ;; letter is worse than a letter that runs off.
+    (let [p (page-of (pdf/rect-command {:x -10 :y 100 :width 40 :height 10
+                                        :fill? true}))]
+      (is (= 1 (count (filterv #(= :rule (:item/kind %)) (:page/items p)))))))
+
+  (testing "and a text run with no measured width is never dropped for its start"
+    ;; The first version of this deleted the second half of a TJ whose
+    ;; kerning pulled it left past the origin: a baseline START of −5 with
+    ;; an ABSENT width is not a mark that is off the page.
+    (let [p (page-of "BT /F1 10 Tf 1 0 0 1 0 700 Tm [(A) 2000 (B)] TJ ET")
+          runs (filterv #(= :text (:item/kind %)) (:page/items p))]
+      (is (= 2 (count runs)))
+      (is (neg? (:item/x (second runs))) "and it really did start off the left"))))
+
+(deftest a-curve-is-drawn-not-outlined
+  ;; The gap: a figure made of beziers produced nothing at all. `re … f` was
+  ;; the only path this understood, so a chart, a logo and a signature were
+  ;; all equally invisible.
+  (let [p (page-of "0 g 10 10 m 20 40 30 40 40 10 c f")
+        [path] (filterv #(= :path (:item/kind %)) (:page/items p))]
+    (is (some? path))
+    (is (str/starts-with? (:item/d path) "M10 832"))
+    (is (str/includes? (:item/d path) "C") "the curve is a curve")
+    (is (= 1.0 (:item/fill path)))
+    (is (nil? (:item/stroke path)) "filled, not stroked"))
+
+  (testing "and its bounding box is the control hull, which is never too small"
+    ;; A cubic stays inside its control points, so the box can be larger
+    ;; than the ink and never smaller — the safe direction for something
+    ;; whose job is deciding what to throw away.
+    (let [p (page-of "0 g 10 10 m 20 40 30 40 40 10 c f")
+          [path] (filterv #(= :path (:item/kind %)) (:page/items p))]
+      (is (= 10.0 (:item/x path)))
+      (is (= 30.0 (:item/width path)) "40 − 10"))))
+
+(deftest a-stroke-and-a-fill-are-different-ink
+  ;; Lower case sets the fill colour and upper case the stroke. Treating
+  ;; them as one is how a hairline table border ends up the colour of the
+  ;; cell behind it.
+  (let [p (page-of "0 g 1 G 2 w 10 10 m 100 10 l S")
+        [path] (filterv #(= :path (:item/kind %)) (:page/items p))]
+    (is (nil? (:item/fill path)) "S strokes and does not fill")
+    (is (= 0.0 (:item/stroke path)) "1 G is white, which is no ink")
+    (is (= 2.0 (:item/stroke-width path))))
+
+  (testing "and B does both"
+    (let [p (page-of "0.5 g 0 G 10 10 m 100 10 l 100 100 l h B")
+          [path] (filterv #(= :path (:item/kind %)) (:page/items p))]
+      (is (= 0.5 (:item/fill path)))
+      (is (= 1.0 (:item/stroke path))))))
+
+(deftest v-and-y-are-curves-and-not-lines
+  ;; Each implies one control point. Drawing either as a line is a curve
+  ;; drawn straight, which looks like a rendering that nearly works.
+  (doseq [op ["v" "y"]]
+    (let [p (page-of (str "0 g 10 10 m 20 40 40 10 " op " f"))
+          [path] (filterv #(= :path (:item/kind %)) (:page/items p))]
+      (is (str/includes? (:item/d path) "C") op))))
+
+(deftest a-path-of-only-rectangles-is-still-rules
+  ;; `re … f` is most of what documents draw, and a box is worth more to a
+  ;; consumer that lays marks out than a closed four-segment path is.
+  (let [p (page-of (str "0 g " (pdf/rect-command {:x 10 :y 10 :width 20 :height 5
+                                                  :fill? true})))]
+    (is (= 1 (count (filterv #(= :rule (:item/kind %)) (:page/items p)))))
+    (is (empty? (filterv #(= :path (:item/kind %)) (:page/items p)))))
+
+  (testing "but a rectangle joined to a curve is one path"
+    (let [p (page-of "0 g 10 10 20 5 re 30 30 m 40 50 50 50 60 30 c f")]
+      (is (= 1 (count (filterv #(= :path (:item/kind %)) (:page/items p)))))
+      (is (empty? (filterv #(= :rule (:item/kind %)) (:page/items p)))))))
+
+(deftest a-path-that-is-never-painted-leaves-nothing
+  ;; `n` ends a path without painting it — it is how a clip is set. A reader
+  ;; that drew it would paint every clip region.
+  (let [p (page-of "0 g 10 10 m 100 100 l n")]
+    (is (empty? (filterv #(= :path (:item/kind %)) (:page/items p))))))
+
+(deftest a-clip-hides-what-the-document-hides
+  ;; `W n` is the idiom: mark the path as the clip, then end it without
+  ;; painting. A reader that ignored it draws content the document does not
+  ;; show — a caption from under a cropped figure, a row from a table that
+  ;; was scrolled.
+  (let [p (page-of (str "q 0 700 100 100 re W n "
+                        "BT /F1 10 Tf 1 0 0 1 10 750 Tm (inside) Tj "
+                        "1 0 0 1 400 750 Tm (outside) Tj ET Q"))]
+    (is (= ["inside"] (page/text-of p))))
+
+  (testing "and Q puts the clip back"
+    ;; `merge` cannot restore a key to absent, so a clip set inside the pair
+    ;; would otherwise survive the restore and swallow the rest of the page.
+    (let [p (page-of (str "q 0 700 100 100 re W n Q "
+                          "BT /F1 10 Tf 1 0 0 1 400 750 Tm (after) Tj ET"))]
+      (is (= ["after"] (page/text-of p)))))
+
+  (testing "and a clip is intersected, never widened"
+    (let [p (page-of (str "q 0 600 300 300 re W n 0 600 100 100 re W n "
+                          "BT /F1 10 Tf 1 0 0 1 10 650 Tm (in) Tj "
+                          "1 0 0 1 200 650 Tm (out) Tj ET Q"))]
+      (is (= ["in"] (page/text-of p))))))
+
+(deftest a-clipped-rule-is-dropped-and-a-straddling-one-is-not
+  (let [p (page-of (str "q 0 700 100 100 re W n 0 g "
+                        (pdf/rect-command {:x 400 :y 750 :width 10 :height 10
+                                           :fill? true})
+                        (pdf/rect-command {:x 90 :y 750 :width 40 :height 10
+                                           :fill? true}) " Q"))
+        rules (filterv #(= :rule (:item/kind %)) (:page/items p))]
+    (is (= 1 (count rules)) "the straddler stays whole, the far one goes")
+    (is (= 90.0 (:item/x (first rules))))))
+
+(defn- gs-doc
+  "A page whose /ExtGState carries `entries`, drawing `content`."
+  [entries content]
+  (let [text (str "%PDF-1.4\n"
+                  "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                  "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+                  "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] "
+                  "/Resources << /ExtGState << /G1 " entries " >> "
+                  "/Pattern << /P1 << /PatternType 1 /PaintType 1 >> >> "
+                  "/Font << /F1 7 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+                  "4 0 obj\n<< /Length 80 >>\nstream\n" content
+                  "\nendstream\nendobj\n"
+                  "7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+                  "trailer\n<< /Size 9 /Root 1 0 R >>\n%%EOF\n")]
+    (pdf/parse (mapv #(bit-and (int %) 0xff)
+                     #?(:clj (.getBytes ^String text "ISO-8859-1")
+                        :cljs (map #(.charCodeAt text %) (range (count text))))))))
+
+(deftest ext-gstate-alpha-reaches-the-ink
+  ;; `gs` was ignored entirely, and it is the most common operator in the
+  ;; corpus after the drawing ones — 1,100 calls, 217 setting a stroke alpha
+  ;; below 1. A 30%-alpha hairline at full ink is a black line where the
+  ;; document has a grey one.
+  (testing "fill alpha"
+    (let [p (hpdf/page-at (gs-doc "<< /ca 0.5 >>"
+                                  "/G1 gs 0 g 10 10 20 20 re f") 0)
+          [r] (filterv #(= :rule (:item/kind %)) (:page/items p))]
+      (is (= 0.5 (:item/ink r)) "black at half alpha is half ink")))
+
+  (testing "stroke alpha, separately"
+    (let [p (hpdf/page-at (gs-doc "<< /CA 0.25 >>"
+                                  "/G1 gs 0 G 10 10 m 100 10 l S") 0)
+          [path] (filterv #(= :path (:item/kind %)) (:page/items p))]
+      (is (= 0.25 (:item/stroke path)))))
+
+  (testing "and text takes the fill alpha too"
+    (let [p (hpdf/page-at (gs-doc "<< /ca 0.5 >>"
+                                  "/G1 gs 0 g BT /F1 10 Tf 1 0 0 1 5 50 Tm (x) Tj ET") 0)
+          [t] (filterv #(= :text (:item/kind %)) (:page/items p))]
+      (is (= 0.5 (:item/ink t)))))
+
+  (testing "and Q restores it"
+    ;; Alpha is graphics state. A `Q` that left it set would fade the rest
+    ;; of the page.
+    (let [p (hpdf/page-at (gs-doc "<< /ca 0.2 >>"
+                                  "q /G1 gs Q 0 g 10 10 20 20 re f") 0)
+          [r] (filterv #(= :rule (:item/kind %)) (:page/items p))]
+      (is (= 1.0 (:item/ink r))))))
+
+(deftest a-patterned-fill-says-it-is-one
+  ;; Before this, `scn` with a name left the previous colour, so the shape
+  ;; was filled in whatever was last set — an arbitrary colour presented as
+  ;; the document's.
+  (let [p (hpdf/page-at (gs-doc "<< >>" "0 g /Pattern cs /P1 scn 10 10 20 20 re f") 0)
+        [r] (filterv #(= :rule (:item/kind %)) (:page/items p))]
+    (is (= :tiling (:item/pattern r)))))
+
+;; ── XObjects ─────────────────────────────────────────────────────────────────
+
+(defn- xobject-doc
+  "A one-page PDF whose page invokes `/X1`, with `X1` as the given object.
+
+  Hand-written for the same reason the composite-font fixture is:
+  `write-document` emits one font and no XObjects."
+  [page-content x1-body & [extra]]
+  (let [text (str "%PDF-1.4\n"
+                  "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                  "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+                  "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] "
+                  "/Resources << /Font << /F1 7 0 R >> /XObject << /X1 5 0 R >> >> "
+                  "/Contents 4 0 R >>\nendobj\n"
+                  "4 0 obj\n<< /Length 99 >>\nstream\n" page-content
+                  "\nendstream\nendobj\n"
+                  "5 0 obj\n" x1-body "\nendobj\n"
+                  "7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+                  (or extra "")
+                  "trailer\n<< /Size 9 /Root 1 0 R >>\n%%EOF\n")]
+    (pdf/parse (mapv #(bit-and (int %) 0xff)
+                     #?(:clj (.getBytes ^String text "ISO-8859-1")
+                        :cljs (map #(.charCodeAt text %) (range (count text))))))))
+
+(deftest a-form-xobject-is-run-not-outlined
+  ;; The gap this closed: a figure drawn as form XObjects came out as a page
+  ;; of dashed boxes. Measured before it was written — one figure in the
+  ;; sample produced 1,415 of them where the drawing was.
+  (let [p (hpdf/page-at
+           (xobject-doc "q 1 0 0 1 0 0 cm /X1 Do Q"
+                        (str "<< /Type /XObject /Subtype /Form /BBox [0 0 200 100] "
+                             "/Resources << /Font << /F1 7 0 R >> >> /Length 60 >>\n"
+                             "stream\nBT /F1 10 Tf 1 0 0 1 20 60 Tm (inside the form) Tj ET\n"
+                             "endstream"))
+           0)
+        [t] (texts p)]
+    (is (= 1 (count (texts p))) "the form's text, not a box")
+    (is (= "inside the form" (:item/text t)))
+    (is (= 20.0 (:item/x t)))
+    (is (= 40.0 (:item/y t)) "100 − 60")
+    (is (empty? (filter #(= :frame (:item/kind %)) (:page/items p))))))
+
+(deftest a-form-s-matrix-and-the-invoking-ctm-both-apply
+  ;; Two transforms compose here and getting either one wrong still draws
+  ;; SOMETHING, which is why this asserts the coordinate rather than the count.
+  (let [p (hpdf/page-at
+           (xobject-doc "q 1 0 0 1 100 0 cm /X1 Do Q"
+                        (str "<< /Type /XObject /Subtype /Form /BBox [0 0 200 100] "
+                             "/Matrix [1 0 0 1 10 20] "
+                             "/Resources << /Font << /F1 7 0 R >> >> /Length 50 >>\n"
+                             "stream\nBT /F1 10 Tf 1 0 0 1 0 0 Tm (m) Tj ET\n"
+                             "endstream"))
+           0)
+        [t] (texts p)]
+    (is (= 110.0 (:item/x t)) "0 + form matrix 10 + invoking cm 100")
+    (is (= 80.0 (:item/y t)) "100 − (0 + 20)")))
+
+(deftest a-form-inherits-the-page-s-resources-when-it-declares-none
+  ;; A form that names /F1 without declaring it means the page's /F1. A
+  ;; reader that only looked in the form would place the text at size zero.
+  (let [p (hpdf/page-at
+           (xobject-doc "/X1 Do"
+                        (str "<< /Type /XObject /Subtype /Form /BBox [0 0 200 100] "
+                             "/Length 50 >>\n"
+                             "stream\nBT /F1 10 Tf 1 0 0 1 5 50 Tm (borrowed) Tj ET\n"
+                             "endstream"))
+           0)
+        [t] (texts p)]
+    (is (= "borrowed" (:item/text t)))
+    (is (= 10.0 (:item/size t)) "the page's /F1, not a missing font at size 0")))
+
+(deftest a-form-that-invokes-itself-stops-and-says-where
+  ;; A template that includes itself is an infinite content stream, and it
+  ;; does not take malice to emit one.
+  (let [p (hpdf/page-at
+           (xobject-doc "/X1 Do"
+                        (str "<< /Type /XObject /Subtype /Form /BBox [0 0 200 100] "
+                             "/Resources << /XObject << /X1 5 0 R >> >> /Length 30 >>\n"
+                             "stream\n/X1 Do\nendstream"))
+           0)
+        frames (filter #(= :frame (:item/kind %)) (:page/items p))]
+    (is (= 1 (count frames)) "one frame at the point it stopped, not a hang")
+    (is (= :form/too-deep (:item/reason (first frames))))))
+
+(deftest an-image-xobject-is-placed-with-an-index-and-never-its-name
+  ;; The name is file content and would become part of a URL. An integer
+  ;; cannot carry anything a document wrote.
+  (let [p (hpdf/page-at
+           (xobject-doc "q 50 0 0 25 10 60 cm /X1 Do Q"
+                        (str "<< /Type /XObject /Subtype /Image /Width 4 /Height 4 "
+                             "/BitsPerComponent 8 /ColorSpace /DeviceRGB "
+                             "/Filter /DCTDecode /Length 4 >>\nstream\nJPEG\nendstream"))
+           0)
+        [img] (filter #(= :image (:item/kind %)) (:page/items p))]
+    (is (some? img))
+    (is (= 0 (:item/index img)))
+    (is (nil? (:item/label img)) "no name anywhere on the item")
+    (testing "DCTDecode bytes ARE a JPEG, so a host can serve them undecoded"
+      (is (= "image/jpeg" (:item/media-type img))))
+    (testing "placed where the CTM put it"
+      (is (= 10.0 (:item/x img)))
+      (is (= 15.0 (:item/y img)) "100 − (60 + 25)")
+      (is (= 50.0 (:item/width img)))
+      (is (= 25.0 (:item/height img))))))
+
+(deftest raw-samples-carry-no-media-type-because-somebody-must-encode-them
+  (let [p (hpdf/page-at
+           (xobject-doc "q 10 0 0 10 0 0 cm /X1 Do Q"
+                        (str "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 "
+                             "/BitsPerComponent 8 /ColorSpace /DeviceGray "
+                             "/Filter /FlateDecode /Length 4 >>\nstream\nRAWX\nendstream"))
+           0)
+        [img] (filter #(= :image (:item/kind %)) (:page/items p))]
+    (is (some? img))
+    (is (nil? (:item/media-type img))
+        "a guessed type arrives at a browser as a broken image")))
+
+(deftest an-image-reports-what-its-samples-are
+  ;; Reported and not converted: turning CMYK into RGB is a decision about
+  ;; what a colour means, and this library does not have the host's answer.
+  ;; Without these a host has only a byte count to infer from, which cannot
+  ;; tell 16-bit gray from 8-bit RGB — they are the same bytes per pixel.
+  (let [img (fn [extra]
+              (first (hpdf/page-images
+                      (xobject-doc "q 10 0 0 10 0 0 cm /X1 Do Q"
+                                   (str "<< /Type /XObject /Subtype /Image "
+                                        "/Width 2 /Height 2 " extra
+                                        " /Length 4 >>\nstream\nABCD\nendstream"))
+                      0)))]
+    (testing "bit depth"
+      (is (= 16 (:bits (img "/BitsPerComponent 16 /ColorSpace /DeviceGray")))))
+    (testing "device spaces"
+      (is (= :gray (:colorspace (img "/BitsPerComponent 8 /ColorSpace /DeviceGray"))))
+      (is (= :rgb (:colorspace (img "/BitsPerComponent 8 /ColorSpace /DeviceRGB"))))
+      (is (= :cmyk (:colorspace (img "/BitsPerComponent 8 /ColorSpace /DeviceCMYK")))))
+    (testing "an unknown space is nil rather than a guess"
+      ;; A wrong colour space produces an image in confidently wrong
+      ;; colours, which reads as a corrupt file.
+      (is (nil? (:colorspace (img "/BitsPerComponent 8 /ColorSpace /Whatever")))))))
+
+(deftest an-indexed-image-carries-its-palette
+  (let [i (first (hpdf/page-images
+                  (xobject-doc
+                   "q 10 0 0 10 0 0 cm /X1 Do Q"
+                   (str "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 "
+                        "/BitsPerComponent 8 "
+                        "/ColorSpace [/Indexed /DeviceRGB 1 <FF0000 00FF00>] "
+                        "/Length 4 >>\nstream\nABCD\nendstream"))
+                  0))]
+    (is (= :indexed (:colorspace i)))
+    (is (= [255 0 0 0 255 0] (:palette i)) "two entries, three components each"))
+
+  (testing "and a palette this cannot convert is absent rather than half-read"
+    (let [i (first (hpdf/page-images
+                    (xobject-doc
+                     "q 10 0 0 10 0 0 cm /X1 Do Q"
+                     (str "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 "
+                          "/BitsPerComponent 8 "
+                          "/ColorSpace [/Indexed /DeviceCMYK 1 <FF000000>] "
+                          "/Length 4 >>\nstream\nABCD\nendstream"))
+                    0))]
+      (is (= :indexed (:colorspace i)))
+      (is (nil? (:palette i))))))
+
+(deftest page-images-are-in-the-order-the-index-counts-in
+  ;; The invariant a host depends on. Reading the page's /XObject dictionary
+  ;; instead gives RESOURCE order, and the two agree only on a document that
+  ;; never invokes a form — so a host that mixed them would serve the wrong
+  ;; picture for the right box, on exactly the documents whose pictures
+  ;; matter. One traversal defines both, here.
+  (let [parsed (xobject-doc
+                ;; The form is invoked FIRST, so its image is index 0 even
+                ;; though /X1 is the page's own resource.
+                "q 10 0 0 10 0 0 cm /X2 Do Q q 10 0 0 10 50 0 cm /X1 Do Q"
+                (str "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                     "/BitsPerComponent 8 /ColorSpace /DeviceGray "
+                     "/Filter /DCTDecode /Length 4 >>\nstream\nPAGE\nendstream")
+                (str "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] "
+                     "/Resources << /XObject << /X9 8 0 R >> >> /Length 20 >>\n"
+                     "stream\n/X9 Do\nendstream\nendobj\n"
+                     "8 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                     "/BitsPerComponent 8 /ColorSpace /DeviceGray "
+                     "/Filter /FlateDecode /Length 4 >>\nstream\nFORM\nendstream\nendobj\n"))
+        ;; /X2 has to resolve to the form; the fixture's page resources name
+        ;; /X1 only, so this asserts on what the walker actually reached.
+        p (hpdf/page-at parsed 0)
+        imgs (filterv #(= :image (:item/kind %)) (:page/items p))
+        listed (hpdf/page-images parsed 0)]
+    (is (= (count imgs) (count listed))
+        "one entry per placed image, not per resource")
+    (is (= (mapv :item/index imgs) (vec (range (count imgs)))))
+    (doseq [{:item/keys [index media-type]} imgs]
+      (is (= media-type (:media-type (nth listed index)))
+          "the item and the bytes agree about what they are"))))
+
+;; ── documents ────────────────────────────────────────────────────────────────
+
+(deftest a-document-is-its-pages-in-order
+  (let [bytes (pdf/write-document
+               [{:width 200 :height 100
+                 :content (pdf/text-command {:x 10 :y 50 :text "one" :size 8})}
+                {:width 200 :height 100
+                 :content (pdf/text-command {:x 10 :y 50 :text "two" :size 8})}
+                {:width 200 :height 100 :content ""}])
+        d (hpdf/read-document bytes)]
+    (is (= 3 (:document/count d)))
+    (is (= ["one" "two"] (mapv #(first (page/text-of %)) (take 2 (:document/pages d)))))
+    (is (= [0 1 2] (mapv :page/index (:document/pages d))))
+    (testing "a page with no marks at all is empty, not scanned"
+      (let [blank (nth (:document/pages d) 2)]
+        (is (page/empty-page? blank))
+        (is (not (page/scanned? blank)))
+        (is (= [] (:document/scanned-pages d)))))))
+
+(deftest a-page-with-marks-but-no-text-is-scanned
+  ;; The state a search has to be able to explain. `app-preview.model` says
+  ;; the same thing about a listing; this answers it from the marks.
+  (let [p (page-of (pdf/rect-command {:x 0 :y 0 :width 100 :height 100 :fill? true}))]
+    (is (page/scanned? p))
+    (is (zero? (page/text-chars p)))))
+
+(deftest bytes-that-are-not-a-pdf-have-no-pages-rather-than-one-blank-one
+  ;; `pdf.core/pages` walks from a nil root into its `:else` branch and hands
+  ;; back `[{}]` — one empty map, which counts as a page. A viewer that
+  ;; believed it drew a blank sheet, and a reader went looking for the
+  ;; missing content of a document that was never there.
+  (let [parsed (pdf/parse (mapv #(bit-and (int %) 0xff)
+                                (.getBytes "this is not a PDF at all" "UTF-8")))]
+    (is (= 1 (count (pdf/pages parsed))) "what the object model reports")
+    (is (zero? (hpdf/page-count parsed)) "and what a page actually is")
+    (is (nil? (hpdf/page-at parsed 0))))
+  (testing "a real document's blank page is still a page"
+    (let [d (hpdf/read-document (pdf/write-document
+                                 [{:width 200 :height 100 :content ""}]))]
+      (is (= 1 (:document/count d))))))
+
+(deftest an-unreadable-stream-is-a-page-with-no-marks-not-a-throw
+  ;; A viewer that threw here would take the whole document down over one
+  ;; page it could not read.
+  (let [p (page-of "BT /F1 !!! garbage ~~~ Tf ((( ET")]
+    (is (map? p))
+    (is (= 595.0 (:page/width p)))))

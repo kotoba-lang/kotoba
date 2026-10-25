@@ -1,0 +1,272 @@
+(ns incremental
+  "Two questions an append has to answer, on a real corpus.
+
+    kbb --backend sci --classpath src:bench \\
+      bench/incremental.cljk [out.edn]
+
+  **1. What does an append cost?** Blocks are content-addressed, so re-putting
+  an unchanged block lands on the same key. The real cost of an append is the
+  count of blocks that DIFFER, measured against rebuilding the same corpus
+  from scratch. If that ratio is not small the append is a rebuild wearing a
+  different name.
+
+  **2. What does it cost in answers?** Impacts are baked against a scoring
+  basis (`build!`'s `:scoring-basis`), and an append scores its new segment
+  against the RECORDED basis so its numbers stay on the same scale as the
+  existing shards'. The price is that both drift away from what a full rebuild
+  of the combined corpus would compute. That drift is the number that decides
+  when a rebuild is due, so it is measured against a full rebuild of exactly
+  the same documents rather than argued about.
+
+  Run on the real corpus (`real_corpus.cljs`) rather than the synthetic one.
+  The synthetic corpus is uniform by construction, so every append would look
+  statistically identical to the corpus it joins — which is precisely the
+  condition under which drift is smallest and the measurement is flattering."
+  (:require [kotoba.lang.text :as str]
+            [kotobase-shard-index.analyze :as analyze]
+            [kotobase-shard-index.append :as append]
+            [kotobase-shard-index.block :as block]
+            [kotobase-shard-index.build :as build]
+            [kotobase-shard-index.codec :as codec]
+            [kotobase-shard-index.compact :as compact]
+            [kotobase-shard-index.node :as node]
+            [kotobase-shard-index.query :as query]
+            [kotobase-shard-index.route :as route]
+            [real-corpus :as rc]))
+
+(def k 10)
+(def root (or (some-> js/process.env.SHARD_INDEX_ROOT) "."))
+
+(defn- mean [xs] (if (empty? xs) 0 (/ (reduce + 0 xs) (count xs))))
+
+(defn- r2 [x] (/ (js/Math.round (* 100 x)) 100))
+(defn- scores [r] (mapv :score (:hits r)))
+(defn- ids [r] (mapv :doc-id (:hits r)))
+
+(defn- overlap
+  "|A ∩ B| / k on doc-ids. Reported next to score agreement because the two
+  answer different questions: scores can shift while the SET of results does
+  not, and that is the difference between a drifting index and a broken one."
+  [a b]
+  (if (zero? (count a)) 1.0 (/ (count (filter (set b) a)) (double (count a)))))
+
+(defn run [docs split-at shard-count]
+  (let [head (subvec docs 0 split-at)
+        tail (subvec docs split-at)
+        {:keys [queries vocabulary]} (rc/queries docs analyze/tokenize)
+
+        ;; A: build head, append tail
+        inc-store (block/memory-store)
+        b0 (build/build! inc-store node/sha256-hex head {:shard-count shard-count})
+        blocks-after-head (block/block-count inc-store)
+        a1 (append/append! inc-store inc-store node/sha256-hex (:manifest-cid b0) tail)
+        blocks-after-append (block/block-count inc-store)
+
+        ;; B: build head+tail in one pass — the answer the append is compared to
+        full-store (block/memory-store)
+        bf (build/build! full-store node/sha256-hex docs
+                         {:shard-count (inc shard-count)})
+        full-blocks (block/block-count full-store)
+
+        ;; C: rebuilding the head alone, to price the append against the thing
+        ;; it replaces (a rebuild of everything seen so far)
+        [inc-counted inc-tally] (block/counting inc-store)
+        [full-counted full-tally] (block/counting full-store)
+
+        per-query
+        (mapv (fn [q]
+                (block/reset-tally! inc-tally)
+                (let [ri (route/search inc-counted (:manifest-cid a1) q {:k k})
+                      gi (:gets @inc-tally)]
+                  (block/reset-tally! full-tally)
+                  (let [rf (route/search full-counted (:manifest-cid bf) q {:k k})
+                        gf (:gets @full-tally)
+                        oracle (query/top-k-exhaustive inc-store (:manifest-cid a1) q {:k k})]
+                    {:q q
+                     :incremental-gets gi :full-gets gf
+                     :incremental-waves (get-in ri [:stats :waves])
+                     :full-waves (get-in rf [:stats :waves])
+                     :shards-absent (get-in ri [:stats :shards-absent])
+                     :shards-opened (get-in ri [:stats :shards-opened])
+                     ;; the drift: same documents, two ways of building
+                     :id-overlap (r2 (overlap (ids ri) (ids rf)))
+                     :scores-equal (= (scores ri) (scores rf))
+                     ;; and: is the incremental index internally consistent?
+                     ;; This must hold regardless of drift — the bounded scan
+                     ;; must agree with a full scan OF THE SAME INDEX.
+                     :self-consistent (= (scores ri) (mapv :score (:hits oracle)))})))
+              queries)]
+    {:docs (count docs)
+     :head (count head)
+     :appended (count tail)
+     :vocabulary vocabulary
+     :queries queries
+     :append-stats (:appended a1)
+     :drift (append/drift-report inc-store (:manifest-cid a1))
+     :blocks {:after-head blocks-after-head
+              :after-append blocks-after-append
+              :written-by-append (- blocks-after-append blocks-after-head)
+              :full-rebuild full-blocks
+              ;; the headline: what fraction of a rebuild did the append cost
+              :append-vs-rebuild (r2 (/ (- blocks-after-append blocks-after-head)
+                                        (double full-blocks)))}
+     :per-query per-query
+     :all-self-consistent (every? :self-consistent per-query)
+     :mean-id-overlap (r2 (/ (reduce + 0 (map :id-overlap per-query))
+                             (max 1 (count per-query))))
+     :scores-identical-count (count (filter :scores-equal per-query))}))
+
+(defn chunking-ab
+  "The same corpus and the same append, built two ways.
+
+  This exists because the first version of the claim was not measured: the
+  content-defined boundary was added after a one-document append rewrote 3,863
+  blocks, but the before and after numbers came from different corpora, which
+  is not a comparison. Here the only thing that differs is `:chunking`."
+  [docs split-at shard-count]
+  (let [head (subvec docs 0 split-at)
+        tail (subvec docs split-at)]
+    (into {}
+          (for [mode [:fixed :content]]
+            (let [store (block/memory-store)
+                  b0 (build/build! store node/sha256-hex head
+                                   {:shard-count shard-count :chunking mode})
+                  before (block/block-count store)
+                  _ (append/append! store store node/sha256-hex (:manifest-cid b0) tail)
+                  after (block/block-count store)]
+              [mode {:index-blocks before
+                     :written-by-append (- after before)
+                     :fraction-of-index (r2 (/ (- after before) (double before)))}])))))
+
+(defn compaction-run
+  "Append in batches like a crawl, then compact, and measure what each does to
+  the read path.
+
+  The two are opposites and the point is to see both: an append adds a shard,
+  and every shard holding a query term is a shard the client opens. Compaction
+  removes shards without touching scores — so its effect should show up as
+  GETs, and NOT as a changed answer."
+  [docs batches shard-count]
+  (let [head-n (quot (count docs) 2)
+        head (subvec docs 0 head-n)
+        tail (subvec docs head-n)
+        per (max 1 (quot (count tail) batches))
+        store (block/memory-store)
+        {:keys [queries]} (rc/queries docs analyze/tokenize)
+        b0 (build/build! store node/sha256-hex head {:shard-count shard-count})
+        [cs tally] (block/counting store)
+        measure (fn [mc]
+                  (let [rs (mapv (fn [q]
+                                   (block/reset-tally! tally)
+                                   (let [r (route/search cs mc q {:k k})]
+                                     {:gets (:gets @tally)
+                                      :waves (get-in r [:stats :waves])
+                                      :scores (mapv :score (:hits r))}))
+                                 queries)]
+                    {:shards (count (:shards (block/get-block store mc)))
+                     :mean-gets (r2 (mean (map :gets rs)))
+                     :max-waves (apply max (map :waves rs))
+                     :scores (mapv :scores rs)}))
+        after-build (measure (:manifest-cid b0))
+        appended (loop [mc (:manifest-cid b0) i 0 acc []]
+                   (if (>= (* i per) (count tail))
+                     {:mc mc :steps acc}
+                     (let [batch (subvec tail (* i per) (min (count tail) (* (inc i) per)))
+                           r (append/append! store store node/sha256-hex mc batch)]
+                       (recur (:manifest-cid r) (inc i) (conj acc (measure (:manifest-cid r)))))))
+        before-compact (measure (:mc appended))
+        blocks-before (block/block-count store)
+        ids (compact/plan store (:mc appended) {})
+        c (when ids (compact/compact! store store node/sha256-hex (:mc appended) ids))
+        after-compact (when c (measure (:manifest-cid c)))]
+    {:head head-n :batches batches
+     :after-build after-build
+     :per-append (mapv #(dissoc % :scores) (:steps appended))
+     :before-compact (dissoc before-compact :scores)
+     :compacted (:compacted c)
+     :after-compact (when after-compact (dissoc after-compact :scores))
+     :blocks-written-by-compaction (- (block/block-count store) blocks-before)
+     ;; the load-bearing check: compaction is not allowed to move an answer
+     :answers-unchanged (when after-compact
+                          (= (:scores before-compact) (:scores after-compact)))}))
+
+(defn -main [& args]
+  (let [out (or (first args)
+                "bench/results/2026-08-08-incremental-real-corpus.edn")
+        adrs (rc/corpus root :adr)
+        readmes (rc/corpus root :readme)
+        both (vec (concat adrs readmes))]
+    (println (str "corpus: " (count adrs) " ADRs + " (count readmes) " READMEs = " (count both)))
+    (when (< (count both) 200)
+      (println "FAIL: corpus too small to measure — is this running at the workspace root?")
+      (js/process.exit 1))
+    (let [runs [{:label :adr-then-readme
+                 :note "append a topically different batch — READMEs onto an ADR index"
+                 :r (run both (count adrs) 8)}
+                {:label :readme-tail
+                 :note "append the last fifth of one homogeneous corpus"
+                 :r (run readmes (int (* 0.8 (count readmes))) 8)}
+                {:label :single-doc
+                 :note "the worst case for an append: one document, so the cost is all fixed overhead"
+                 :r (run (subvec adrs 0 1000) 999 8)}]
+          comp (compaction-run (subvec adrs 0 1600) 6 4)
+          ab-1 (chunking-ab (subvec adrs 0 1000) 999 8)
+          ab-batch (chunking-ab both (count adrs) 8)
+          result {:generated "2026-08-08"
+                  :corpus {:adrs (count adrs) :readmes (count readmes)}
+                  :chunking-ab {:one-document ab-1 :large-batch ab-batch}
+                  :compaction comp
+                  :runs (mapv (fn [{:keys [label note r]}]
+                                (assoc r :label label :note note))
+                              runs)}]
+      (doseq [{:keys [label note r]} runs]
+        (println (str "\n== " (name label) " — " note))
+        (println (str "  head " (:head r) " + appended " (:appended r)
+                      "  vocabulary " (:vocabulary r)))
+        (println (str "  blocks: append wrote " (get-in r [:blocks :written-by-append])
+                      " vs full rebuild " (get-in r [:blocks :full-rebuild])
+                      "  = " (get-in r [:blocks :append-vs-rebuild]) " of a rebuild"))
+        (println (str "  drift: basis " (get-in r [:drift :basis-doc-count])
+                      " -> " (get-in r [:drift :doc-count])
+                      " docs (x" (r2 (get-in r [:drift :doc-growth])) ")"))
+        (println (str "  vs full rebuild: mean top-" k " id overlap " (:mean-id-overlap r)
+                      ", identical score vectors " (:scores-identical-count r)
+                      "/" (count (:per-query r))))
+        (println (str "  self-consistent (bounded scan == full scan of the SAME index): "
+                      (:all-self-consistent r)))
+        (println "  per query:")
+        (doseq [q (:per-query r)]
+          (println (str "    " (:incremental-gets q) " gets / " (:incremental-waves q)
+                        " waves / absent " (:shards-absent q)
+                        " / overlap " (:id-overlap q) "   " (pr-str (:q q))))))
+      (println "\ncompaction — appends grow the shard count, compaction takes it back")
+      (println (str "  after build          : " (:shards (:after-build comp)) " shards, "
+                    (:mean-gets (:after-build comp)) " GETs"))
+      (doseq [[i s] (map-indexed vector (:per-append comp))]
+        (println (str "  after append " (inc i) "       : " (:shards s) " shards, "
+                      (:mean-gets s) " GETs, " (:max-waves s) " waves")))
+      (println (str "  compacted " (pr-str (:merged (:compacted comp)))
+                    " -> " (:into (:compacted comp))
+                    " (" (:blocks-written-by-compaction comp) " blocks written)"))
+      (println (str "  after compaction     : " (:shards (:after-compact comp)) " shards, "
+                    (:mean-gets (:after-compact comp)) " GETs, "
+                    (:max-waves (:after-compact comp)) " waves"))
+      (println (str "  answers unchanged by compaction: " (:answers-unchanged comp)))
+      (println "\nchunking A/B — same corpus, same append, only the boundary rule differs")
+      (doseq [[label ab] [["append 1 document to 999" ab-1]
+                          ["append 3,799 to 1,976" ab-batch]]]
+        (println (str "  " label ":"))
+        (doseq [mode [:fixed :content]]
+          (let [r (get ab mode)]
+            (println (str "    " (name mode) "\tindex " (:index-blocks r)
+                          "\tappend wrote " (:written-by-append r)
+                          "\t(" (:fraction-of-index r) " of the index)")))))
+      (let [fs (js/require "node:fs") path (js/require "node:path")]
+        (.mkdirSync fs (.dirname path out) #js {:recursive true})
+        (.writeFileSync fs out (codec/encode result) "utf8"))
+      (println (str "\nreceipt -> " out))
+      (when-not (every? :all-self-consistent (map :r runs))
+        (println "FAIL: an incrementally built index is not internally consistent")
+        (js/process.exit 1)))))
+
+(-main)

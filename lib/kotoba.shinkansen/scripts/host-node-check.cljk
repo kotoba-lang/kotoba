@@ -1,0 +1,171 @@
+(ns host-node-check
+  "The reference host, RUNNING: start `shinkansen.serve` on an ephemeral
+  port with the reference app (real CIDs, real Ed25519 Biscuit authorizer)
+  and drive it over HTTP with fetch — the thing `host_test` cannot do,
+  because the transport, the JSON wire, the ETag round trip, the reload
+  stream and the dev rebuild path only exist when the server does.
+
+  Prints `CASE<TAB>name<TAB>OK|FAIL<TAB>detail` per case and
+  `SCANNED<TAB>n<TAB>FAILED<TAB>m` at the end. Exit 0 only when n > 0 and
+  m = 0; 1 on any FAIL; 2 when the server could not start (never a pass).
+
+  Run: kbb --backend sci --classpath src:examples:../content-address/src:../org-biscuitsec/src:../org-biscuitsec/test:../authority/src:../text/src scripts/host-node-check.cljk"
+  (:require [biscuit.ed25519 :as e]
+            [biscuit.token :as bt]
+            [clojure.string :as str]
+            [reference-app :as app]
+            [shinkansen.serve :as serve]))
+
+(def results (atom []))
+
+(defn- case! [name ok? detail]
+  (swap! results conj {:name name :ok? (boolean ok?)})
+  (println (str "CASE\t" name "\t" (if ok? "OK" "FAIL") "\t" detail)))
+
+(defn- fetch-text [url opts]
+  (-> (js/fetch url (clj->js opts))
+      (.then (fn [r] (-> (.text r)
+                         (.then (fn [t] {:status (.-status r)
+                                         :headers (into {} (map (fn [[k v]] [k v])) (js/Array.from (.entries (.-headers r))))
+                                         :text t})))))))
+
+(defn- post-invoke [base body & [token]]
+  (fetch-text (str base "/invoke")
+              {:method "POST"
+               :headers (cond-> {"content-type" "application/json"}
+                          token (assoc "authorization" (str "Bearer " token)))
+               :body (js/JSON.stringify (clj->js body))}))
+
+(def app-b "bafkreib4pff766vhpbxbhjbqz3d7ogcwyorbizgp3e5mpezy3ml5o7ci5a")
+
+(defn- token-for-b []
+  (let [t (bt/authority {:facts [['cap "chain/append" (str "kotoba://app/" app-b "/chain")]]
+                         :next-public-key (:public app/k1)
+                         :root-private-key (:private app/root) :sign-fn e/sign-fn})]
+    (.toString (js/Buffer.from (pr-str t) "utf8") "base64")))
+
+(defn- finish [server]
+  ((:stop server))
+  (let [rs @results failed (count (remove :ok? rs))]
+    (println (str "SCANNED\t" (count rs) "\tFAILED\t" failed))
+    (js/process.exit (cond (empty? rs) 2 (pos? failed) 1 :else 0))))
+
+(defn- run [server]
+  (let [base (str "http://127.0.0.1:" (:port server))
+        token (app/mint-dev-token)
+        cid-re #"^\"bafkrei[a-z2-7]{52}\"$"
+        etag0 (atom nil)
+        etag-todos-0 (atom nil)]
+    (-> (fetch-text (str base "/") {})
+        (.then (fn [{:keys [status headers text]}]
+                 (reset! etag0 (get headers "etag"))
+                 (case! "GET / is 200 html with a real CID ETag and a canonical ipfs Link"
+                        (and (= 200 status)
+                             (str/starts-with? (get headers "content-type") "text/html")
+                             (re-matches cid-re (str (get headers "etag")))
+                             (str/starts-with? (str (get headers "link")) "<ipfs://bafkrei")
+                             (= "no-cache" (get headers "cache-control")))
+                        (str status " etag=" (get headers "etag")))
+                 (case! "dev bytes carry the reload listener"
+                        (str/includes? text "/__shinkansen/reload") "")
+                 (fetch-text (str base "/") {:headers {"if-none-match" @etag0}})))
+        (.then (fn [{:keys [status]}]
+                 (case! "If-None-Match with the CID answers 304" (= 304 status) (str status))
+                 (fetch-text (str base "/") {})))
+        (.then (fn [{:keys [status headers text]}]
+                 ;; the second GET is answered by serve's station table — the
+                 ;; hit counter says so; a correct slow-path answer would not
+                 (case! "a repeat GET / is a station-table hit with the same bytes, ETag and length"
+                        (and (= 200 status) (= @etag0 (get headers "etag"))
+                             (pos? ((:table-hits server)))
+                             (str/includes? text "/__shinkansen/reload")
+                             (= (str (.-length (js/Buffer.from text "utf8"))) (get headers "content-length")))
+                        (str status " " (get headers "etag")))
+                 (fetch-text (str base "/") {:method "HEAD"})))
+        (.then (fn [{:keys [status headers text]}]
+                 (case! "HEAD / answers the headers and no body"
+                        (and (= 200 status) (= @etag0 (get headers "etag")) (= "" text))
+                        (str status " body " (count text)))
+                 (fetch-text (str base "/nope/deeper") {})))
+        (.then (fn [{:keys [status text]}]
+                 (case! "unknown name is a 404 that names :no-match"
+                        (and (= 404 status) (str/includes? text ":no-match")) (str status))
+                 (fetch-text (str base "/todos") {})))
+        (.then (fn [{:keys [status headers text]}]
+                 (reset! etag-todos-0 (get headers "etag"))
+                 (case! "ssr /todos renders the empty chain (height 0)"
+                        (and (= 200 status) (str/includes? text "height 0")) (str status))
+                 (post-invoke base {:artifact app/app-cid :input {:kind "action" :event ["todo/add" "milk"]}})))
+        (.then (fn [{:keys [status text]}]
+                 (case! "POST /invoke without a grant is 403 :no-grant-presented"
+                        (and (= 403 status) (str/includes? text "no-grant-presented")) (str status " " text))
+                 (post-invoke base {:artifact app/app-cid :input {:kind "action" :event ["todo/add" "milk"]}} token)))
+        (.then (fn [{:keys [status text]}]
+                 (case! "POST /invoke with the app's token appends (200, db-cid, no grant echoed)"
+                        (and (= 200 status) (str/includes? text "\"db-cid\":\"bafkrei")
+                             (str/includes? text "\"height\":1") (not (str/includes? text "\"grant\"")))
+                        (str status " " (subs text 0 (min 160 (count text)))))
+                 (fetch-text (str base "/todos") {})))
+        (.then (fn [{:keys [status headers text]}]
+                 (case! "ssr /todos now shows the todo, height 1, and a NEW CID"
+                        (and (= 200 status) (str/includes? text "milk") (str/includes? text "height 1")
+                             (not= @etag-todos-0 (get headers "etag")))
+                        (str (get headers "etag")))
+                 (fetch-text (str base "/todos/t1") {})))
+        (.then (fn [{:keys [status text]}]
+                 (case! "ssr /todos/:id resolves the path param" (and (= 200 status) (str/includes? text "milk")) (str status))
+                 (post-invoke base {:artifact app/app-cid :input {:kind "action" :event ["todo/nope" "x"]}} token)))
+        (.then (fn [{:keys [status text]}]
+                 (case! "authorized but undeclared event is 422 :undeclared-event"
+                        (and (= 422 status) (str/includes? text "undeclared-event")) (str status))
+                 (post-invoke base {:artifact app/app-cid :input {:kind "action" :event ["todo/add" "x"]}} (token-for-b))))
+        (.then (fn [{:keys [status text]}]
+                 (case! "another app's token is 403 :out-of-scope"
+                        (and (= 403 status) (str/includes? text "out-of-scope")) (str status " " text))
+                 (post-invoke base {:artifact "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG" :input {:kind "action" :event ["todo/add" "x"]}} token)))
+        (.then (fn [{:keys [status text]}]
+                 (case! "CIDv0 artifact is 400 :cidv0-refused"
+                        (and (= 400 status) (str/includes? text "cidv0-refused")) (str status))
+                 (post-invoke base {:artifact app/app-cid :input {:kind "action" :event ["todo/add" "x"]}} "not-base64-edn!!")))
+        (.then (fn [{:keys [status text]}]
+                 (case! "an unreadable grant is 403 with the app's own reason"
+                        (and (= 403 status) (str/includes? text "grant-unreadable")) (str status " " text))
+                 (post-invoke base {:artifact app/app-cid :input {:kind "query" :params {}}} token)))
+        (.then (fn [{:keys [status text]}]
+                 (case! "a :query with the app's token answers a data station"
+                        (and (= 200 status) (str/includes? text "\"data-cid\":\"bafkrei") (str/includes? text "milk"))
+                        (str status " " (subs text 0 (min 120 (count text)))))
+                 (fetch-text (str base "/invoke") {})))
+        (.then (fn [{:keys [status]}]
+                 (case! "GET /invoke is 405" (= 405 status) (str status))
+                 ;; reload stream: subscribe, then swap the ctx, expect `data: reload`
+                 (js/Promise.
+                  (fn [resolve _]
+                    (-> (js/fetch (str base "/__shinkansen/reload"))
+                        (.then (fn [r]
+                                 (let [reader (.getReader (.-body r)) dec (js/TextDecoder.)]
+                                   (js/setTimeout (fn [] ((:rebuild! server))) 50)
+                                   (-> (.read reader)
+                                       (.then (fn [c] (let [s (.decode dec (.-value c))]
+                                                        (if (str/includes? s "open")
+                                                          (-> (.read reader) (.then (fn [c2] (resolve (.decode dec (.-value c2))))))
+                                                          (resolve s))))))))))))))
+        (.then (fn [s]
+                 (case! "the reload stream fires on rebuild" (str/includes? s "data: reload") (pr-str s))
+                 (fetch-text (str base "/") {})))
+        (.then (fn [{:keys [status text]}]
+                 (case! "a failed rebuild serves its error document as a 500 that names the problem"
+                        (and (= 500 status) (str/includes? text "rebuild-failed") (str/includes? text "syntax"))
+                        (str status))
+                 (finish server)))
+        (.catch (fn [e]
+                  (println (str "CASE\t(driver)\tFAIL\t" (or (.-stack e) e)))
+                  (swap! results conj {:name "driver" :ok? false})
+                  (finish server))))))
+
+(-> (serve/start {:ctx (app/make-ctx {:dev? true}) :port 0
+                  ;; the rebuild path under test FAILS on purpose: the server must keep
+                  ;; serving and say why, which is the whole dev contract
+                  :rebuild-fn (fn [_] {:ok false :problems [{:path "src/app.cljc" :reason "syntax: unmatched delimiter"}]})})
+    (.then run)
+    (.catch (fn [e] (println (str "SETUP\tserver did not start: " e)) (js/process.exit 2))))

@@ -1,0 +1,159 @@
+(ns check-budget
+  "Regression gate for the only number this design rests on: GETs per query.
+
+    kbb --backend sci --classpath src \\
+      bench/check_budget.cljk [--write]
+
+  `--write` records the current measurement as the new budget. Without it the
+  measurement is compared to `bench/budget.edn` and a regression exits 1.
+
+  Why this exists: the kotobase maturity ledger's biggest structural hole is
+  that `kotobase-peer`'s CI runs unit tests and nothing else, so a performance
+  regression is invisible until someone benchmarks by hand (ADR-2607250100,
+  軸 1 — 'the absence of a way to detect regression is a bigger hole than the
+  numbers'). A design whose whole claim is a cost model needs the cost model
+  in CI, not in a receipt someone ran once.
+
+  The budget is a COUNT, never a duration. A duration budget on a shared fleet
+  node measures the node's other tenants."
+  (:require [kotobase-shard-index.block :as block]
+            [kotobase-shard-index.build :as build]
+            [kotobase-shard-index.codec :as codec]
+            [kotobase-shard-index.node :as node]
+            [kotobase-shard-index.query :as query]
+            [kotobase-shard-index.route :as route]
+            [kotobase-shard-index.synth :as synth]))
+
+(def fs (js/require "node:fs"))
+
+;; Fixed corpus and queries. Changing either changes the budget, which is why
+;; they are constants here rather than parameters.
+(def corpus-size 4000)
+(def shard-count 4)
+(def vocab-size 20000)
+(def seed 20260807)
+(def k 10)
+
+(def budget-file "bench/budget.edn")
+
+;; Headroom for changes that shift counts slightly without changing the shape
+;; of the cost model. A real regression — a descent that became linear, a stop
+;; condition that stopped stopping — moves this by multiples, not percent.
+(def tolerance 0.10)
+
+(defn measure []
+  (let [queries (synth/probe-queries vocab-size)
+        store (block/memory-store)
+        {:keys [manifest-cid]} (build/build! store node/sha256-hex
+                                             (synth/corpus corpus-size seed vocab-size)
+                                             {:shard-count shard-count})
+        [counted tally] (block/counting store)
+        per-query (mapv (fn [q]
+                          (block/reset-tally! tally)
+                          (let [r (query/search counted manifest-cid q {:k k})]
+                            {:q q :gets (:gets @tally)
+                             :waves (get-in r [:stats :waves])
+                             :hits (count (:hits r))}))
+                        queries)
+        ;; The routing read path is budgeted too. It is the one that is
+        ;; supposed to be cheaper, and an optimisation with no regression gate
+        ;; is the hole ADR-2607250100 軸 1 describes — just relocated.
+        route-per-query (mapv (fn [q]
+                                (block/reset-tally! tally)
+                                (let [r (route/search counted manifest-cid q {:k k})]
+                                  {:q q :gets (:gets @tally)
+                                   :waves (get-in r [:stats :waves])
+                                   :hits (count (:hits r))}))
+                              queries)]
+    {:corpus-size corpus-size
+     :shard-count shard-count
+     :vocab-size vocab-size
+     :seed seed
+     :k k
+     :index-blocks (block/block-count store)
+     :per-query per-query
+     :total-gets (reduce + 0 (map :gets per-query))
+     :max-gets (apply max (map :gets per-query))
+     :max-waves (apply max (map :waves per-query))
+     :route-per-query route-per-query
+     :route-total-gets (reduce + 0 (map :gets route-per-query))
+     :route-max-gets (apply max (map :gets route-per-query))
+     :route-max-waves (apply max (map :waves route-per-query))}))
+
+;; `test/mutations.cljk` edits `src/` in place while it runs. A measurement
+;; taken in that window measures MUTATED code, and the direction it errs in is
+;; the dangerous one: a broken stop condition stops EARLY, so the numbers look
+;; BETTER. Measured 2026-08-08 — 29 GETs against the true 149, a 5x
+;; "improvement" produced by code that returns wrong answers. Committed as a
+;; budget it would then have failed every correct run afterwards.
+;;
+;; This is the reason a cost gate is not a substitute for a correctness gate,
+;; and the reason this lock exists rather than a note in a README.
+(def mutation-lock ".mutating")
+
+(defn -main [& args]
+  (when (.existsSync fs mutation-lock)
+    (println (str "FAIL: " mutation-lock " exists — test/mutations.cljk is rewriting src/ "
+                  "right now. Any measurement taken here would be of mutated code."))
+    (js/process.exit 1))
+  (let [now (measure)
+        write? (some #{"--write"} args)]
+    (println "measured:" (pr-str (select-keys now [:total-gets :max-gets :max-waves :index-blocks])))
+    (println "  routing:" (pr-str (select-keys now [:route-total-gets :route-max-gets :route-max-waves])))
+    (doseq [{:keys [q gets waves hits]} (:per-query now)]
+      (println (str "  " gets " gets / " waves " waves / " hits " hits   " q)))
+    (cond
+      write?
+      (do (.writeFileSync fs budget-file (codec/encode (assoc now :tolerance tolerance)) "utf8")
+          (println "budget written ->" budget-file))
+
+      (not (.existsSync fs budget-file))
+      (do (println "FAIL: no budget recorded. Run with --write once, and commit it.")
+          (js/process.exit 1))
+
+      :else
+      (let [budget (codec/decode (.readFileSync fs budget-file "utf8"))
+            limit-total (Math/ceil (* (:total-gets budget) (+ 1 tolerance)))
+            limit-max (Math/ceil (* (:max-gets budget) (+ 1 tolerance)))
+            limit-waves (Math/ceil (* (:max-waves budget) (+ 1 tolerance)))
+            ;; A corpus that silently stopped being built would make GETs drop
+            ;; to nothing and read as a spectacular improvement. The check has
+            ;; to be able to fail in both directions.
+            floor (Math/floor (* (:index-blocks budget) 0.5))
+            problems
+            (cond-> []
+              (> (:total-gets now) limit-total)
+              (conj (str "total GETs " (:total-gets now) " > budget " limit-total))
+              (> (:max-gets now) limit-max)
+              (conj (str "worst-query GETs " (:max-gets now) " > budget " limit-max))
+              (> (:max-waves now) limit-waves)
+              (conj (str "worst-query waves " (:max-waves now) " > budget " limit-waves))
+              (> (:route-total-gets now)
+                 (Math/ceil (* (:route-total-gets budget) (+ 1 tolerance))))
+              (conj (str "routing total GETs " (:route-total-gets now) " > budget "
+                         (Math/ceil (* (:route-total-gets budget) (+ 1 tolerance)))))
+              (> (:route-max-waves now)
+                 (Math/ceil (* (:route-max-waves budget) (+ 1 tolerance))))
+              (conj (str "routing worst-query waves " (:route-max-waves now) " > budget "
+                         (Math/ceil (* (:route-max-waves budget) (+ 1 tolerance)))))
+              ;; The routing path exists to be cheaper. If it stops being
+              ;; cheaper the optimisation has been undone, and every other
+              ;; check here would still pass.
+              (> (:route-total-gets now) (:total-gets now))
+              (conj (str "the routing path is no longer cheaper than v1: "
+                         (:route-total-gets now) " vs " (:total-gets now) " GETs"))
+              (< (:index-blocks now) floor)
+              (conj (str "index shrank to " (:index-blocks now) " blocks (< " floor
+                         ") — the corpus or the builder is broken, not the query"))
+              (not-every? pos? (map :hits (:per-query now)))
+              (conj "a query returned zero hits — an index that answers nothing is cheap"))]
+        (if (seq problems)
+          (do (println "\nFAIL: GET budget regression")
+              (doseq [p problems] (println "  -" p))
+              (println "  budget:" (pr-str (select-keys budget [:total-gets :max-gets :max-waves :index-blocks])))
+              (js/process.exit 1))
+          (println (str "\nOK: within budget (total " (:total-gets now) " <= " limit-total
+                        ", max " (:max-gets now) " <= " limit-max
+                        ", waves " (:max-waves now) " <= " limit-waves ")")))))))
+
+(apply -main (drop 3 (vec (js->clj js/process.argv))))

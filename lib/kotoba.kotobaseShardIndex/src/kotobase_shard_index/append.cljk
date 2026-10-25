@@ -1,0 +1,185 @@
+(ns kotobase-shard-index.append
+  "Adding documents without rebuilding the index.
+
+  `build/build!` reads the whole corpus. That is fine for a benchmark and
+  useless for a crawl: the point of a crawl is that it never finishes, and an
+  index that can only be produced from all of the documents at once cannot
+  follow one. Both ADR-2608071500 and ADR-2608085000 name this as the next
+  thing to write, ahead of any further tuning of the read path.
+
+  ## What an append actually costs
+
+  Blocks are content-addressed, so re-putting an unchanged block is a no-op at
+  the same address. The cost of an append is therefore exactly the blocks that
+  DIFFER, and there are only three kinds:
+
+  1. the new segment's own postings, dictionary and metadata;
+  2. the routing dictionary — its leaves change only where a new term or a new
+     (term, shard) pair lands, and internal nodes only along those paths;
+  3. one manifest.
+
+  Nothing belonging to an existing shard is rewritten. `bench/incremental.cljk`
+  measures the ratio against a full rebuild rather than asserting it.
+
+  ## The part that is not free: the scoring basis
+
+  Impacts are precomputed (ADR-2608071500 D-alternatives: scoring at query time
+  would mean shipping global statistics and every candidate's term frequency).
+  BM25's idf is a function of the whole corpus, so **an impact is comparable to
+  another impact only if both were computed against the same N and avgdl**.
+
+  An append cannot recompute the existing shards' impacts without rewriting
+  them, which is the thing it exists to avoid. So it scores the new segment
+  against the basis recorded in the manifest — `:scoring-basis` — and the
+  index stays internally consistent by construction.
+
+  What that costs is accuracy against a hypothetical full rebuild, and the
+  honest name for it is drift: as the corpus grows past the basis, idf values
+  computed from the basis are increasingly wrong for everyone. The design
+  decision is to make the basis **explicit and measured**, not to pretend the
+  problem is absent:
+
+  - `:generation` counts appends since the last full build.
+  - `drift-report` says how far the corpus has moved from its basis.
+  - `bench/incremental.cljk` measures the top-k disagreement against a full
+    rebuild of the same documents, which is the number that decides when a
+    rebuild is due.
+
+  The alternative — rescoring on every append so the answer always matches a
+  full rebuild — is a full rebuild.
+
+  ## Doc ids, and what this namespace does NOT solve
+
+  Ids continue from the manifest's document count, so they stay contiguous and
+  a metadata lookup still resolves shard and offset by arithmetic.
+
+  That makes appends ordered: two appends against the same parent manifest
+  both start at the same id, so they produce two segments claiming the same
+  range. **Neither resulting manifest is corrupt** — each is a complete,
+  internally consistent index — but they have diverged, and only one of them
+  can be the next published state.
+
+  There is deliberately no check for this here. The parent manifest cannot
+  know that someone else has already appended to it; detecting that is exactly
+  what a conditional ref is for, and the ref plane is `inga`'s, out of scope
+  for this subsystem (ADR-2608071500: \"publish の単一 writer は前提であって
+  強制ではない\"). A guard here would be theatre — it would pass while the two
+  writers raced, because the evidence it needs is in the ref, not the block.
+
+  What IS guaranteed, and what the suite checks, is that `append!` is a pure
+  function of `(manifest, docs)`: the same append performed twice produces the
+  same manifest CID. A retry after a lost response is therefore free, and a
+  duplicate append is detectable by comparing addresses."
+  (:require [kotobase-shard-index.analyze :as analyze]
+            [kotobase-shard-index.block :as block]
+            [kotobase-shard-index.build :as build]))
+
+;; ── reading the existing routing dictionary ─────────────────────────
+
+(defn route-entries
+  "Every `[term [entry ...]]` in the routing tree, in order.
+
+  A full walk, on the build side. The read path never does this — it descends
+  to one term — but a merge has to see the whole sorted sequence, because the
+  order is what the tree's descent depends on."
+  [store root]
+  (letfn [(walk [cid]
+            (let [blk (block/get-block store cid)]
+              (if (= :dict-leaf (:kind blk))
+                (vec (:entries blk))
+                (vec (mapcat (fn [[_ child]] (walk child)) (:entries blk))))))]
+    (walk root)))
+
+(defn- global-df
+  "term -> document frequency across every existing shard.
+
+  Summed from the routing entries, which already carry a per-(term, shard)
+  `:df`. No second structure to keep in step."
+  [entries]
+  (reduce (fn [m [t es]] (assoc m t (reduce + 0 (map :df es)))) {} entries))
+
+;; ── drift ───────────────────────────────────────────────────────────
+
+(defn drift-report
+  "How far this index has moved from the basis its impacts were computed on.
+
+  `:doc-growth` is the ratio of documents now to documents at the basis. idf
+  moves with the log of it, so a value near 1 means the baked impacts are
+  still close to what a rebuild would produce and a large one means they are
+  not. This reports the input to that judgement; it does not decide for the
+  caller, because the threshold depends on how much rank movement the caller
+  can tolerate — which `bench/incremental.cljk` measures."
+  [store manifest-cid]
+  (let [m (block/get-block store manifest-cid)
+        basis (:scoring-basis m)
+        now (get-in m [:stats :doc-count])]
+    {:basis-doc-count (:doc-count basis)
+     :doc-count now
+     :generation (:generation basis)
+     :doc-growth (if (pos? (:doc-count basis))
+                   (/ (double now) (:doc-count basis))
+                   1.0)}))
+
+;; ── append ──────────────────────────────────────────────────────────
+
+(defn append!
+  "Add `docs` as one new segment. Returns `{:manifest-cid :stats :appended}`.
+
+  The existing shards' blocks are neither read for their contents nor
+  rewritten. What is read is the routing dictionary (to merge into) and the
+  manifest; what is written is one segment, one routing tree and one manifest."
+  ([sink store hash-fn manifest-cid docs] (append! sink store hash-fn manifest-cid docs {}))
+  ([sink store hash-fn manifest-cid docs opts]
+   (let [manifest (block/get-block store manifest-cid)
+         _ (when-not (:route-root manifest)
+             (throw (ex-info "append needs a routing dictionary; the index was built with :route? false"
+                             {:manifest-cid manifest-cid})))
+         opts (merge build/default-opts (:layout manifest) (:scorer manifest) opts)
+         basis (:scoring-basis manifest)
+         _ (when-not basis
+             (throw (ex-info "manifest has no :scoring-basis — built by a version that could not be appended to"
+                             {:manifest-cid manifest-cid})))
+         shards (:shards manifest)
+         base (get-in manifest [:stats :doc-count])
+         docs (vec (map-indexed (fn [i d] (assoc d :id (+ base i))) docs))
+         n-new (count docs)
+         _ (when (zero? n-new)
+             (throw (ex-info "nothing to append" {})))
+         existing (route-entries store (:route-root manifest))
+         df-before (global-df existing)
+         ;; Local df has to be counted before the segment is built, because the
+         ;; idf a term gets must include the documents in this very segment —
+         ;; otherwise a term appearing for the FIRST time here would be scored
+         ;; with df 0, and idf(N, 0) is the largest value in the range.
+         local-df (reduce (fn [acc d]
+                            (reduce (fn [a t] (update a t (fnil inc 0)))
+                                    acc
+                                    (keys (analyze/doc-terms d (:title-weight opts)))))
+                          {} docs)
+         ;; **The basis, not the current corpus.** Scoring against the current
+         ;; N would put this segment's impacts on a different scale from every
+         ;; existing shard's, and the top-k merge across shards compares them
+         ;; directly.
+         basis-n (:doc-count basis)
+         basis-avgdl (/ (:avgdl-x1000 basis) 1000.0)
+         idf-of (fn [t] (build/idf-value basis-n (+ (get df-before t 0) (get local-df t 0))))
+         sid (inc (reduce max -1 (map :id shards)))
+         {:keys [shard route]} (build/build-shard! sink hash-fn opts sid docs
+                                                   idf-of basis-avgdl)
+         merged (build/merge-route-entries existing route)
+         route-tree (build/build-route-dict! sink hash-fn (:dict-fanout opts) merged
+                                             (or (:chunking opts) :content))
+         shards' (conj shards shard)
+         manifest'
+         (-> manifest
+             (assoc :shards shards'
+                    :route-root (:root route-tree)
+                    :route-height (:height route-tree))
+             (update :stats assoc
+                     :doc-count (+ base n-new)
+                     :term-count (count merged)
+                     :shard-count (count shards'))
+             (update :scoring-basis update :generation inc))]
+     {:manifest-cid (block/put-block! sink hash-fn manifest')
+      :stats (:stats manifest')
+      :appended {:shard-id sid :docs n-new :new-terms (- (count merged) (count existing))}})))

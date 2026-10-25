@@ -1,0 +1,152 @@
+;; kotoba-lang/loop-os-stack-observe
+;;
+;; observe -> evaluate -> decide -> act -> record-evidence, over the
+;; ADR-2809050100 OS-stack gap ledger. Propose-only: the loop's "act" writes
+;; tranche descriptor files into its own workspace and validates them; it
+;; never pushes to machine/ioplan directly. Landing happens through the
+;; superproject's propose -> govern flow (worktree branch, server-side merge).
+(ns loop-os-stack-observe.core
+  (:require [kotoba.io :as kio] [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def format-id :kotoba.machine/v1)
+
+;; ---- gap ledger (the plan of record, ADR-2809050100 §6) --------------------
+
+(def initial-gaps
+  "Dependency-ordered gap ledger. :open -> :captured -> :closed. Closing
+   requires the three-index re-run to show a hit; dates are recorded on every
+   transition. This seed matches the measured state on 2026-09-05."
+  [{:gap/id :repo-maturity-regen
+    :gap/status :closed
+    :gap/closed-date "2026-09-05"
+    :gap/evidence "manifest/repo-maturity.edn regenerated 4264/4264 (superproject b596f2d)"}
+   {:gap/id :hw-specs-uefi-nvme-usb-wifi-ext4
+    :gap/status :closed
+    :gap/closed-date "2026-09-05"
+    :gap/evidence "machine d045768 tranche 1: 5 descriptors, validation round-trip green"}
+   {:gap/id :wayland-protocol-corpus
+    :gap/status :open}
+   {:gap/id :unicode-normalization-and-shaping
+    :gap/status :open}
+   {:gap/id :linker-elf-surface
+    :gap/status :open}
+   {:gap/id :wifi-chipset-probe
+    :gap/status :open
+    :gap/note "802.11ax generic descriptor is :assumed; real chipsets need a host probe"}])
+
+(defn- read-ledger [path]
+  (let [f (kio/file path)]
+    (if (kio/exists? f)
+      (edn/read-string (slurp f))
+      initial-gaps)))
+
+(defn observe-gaps
+  "Read the gap ledger and classify: what is open, what is closed, what moved."
+  [ledger-path]
+  (let [gaps (read-ledger ledger-path)]
+    {:open (vec (filter #(= :open (:gap/status %)) gaps))
+     :closed (vec (filter #(= :closed (:gap/status %)) gaps))
+     :total (count gaps)}))
+
+;; ---- three-index check (the rule from AGENTS.md, mechanized) ---------------
+
+(defn- sh [& args]
+  (let [pb (ProcessBuilder. ^java.util.List (vec args))
+        _ (.redirectErrorStream pb true)
+        p (.start pb)
+        out (slurp (.getInputStream p))
+        _ (.waitFor p)]
+    {:exit (.exitValue p) :out (str/trim out)}))
+
+(defn index-hits
+  "Run the three indexes for `terms` and report which produced hits.
+   Returns {:concept-lookup N :repo-search N :maturity [paths]}.
+   A gap may only move :open -> :captured when at least one index hits."
+  [root terms]
+  (let [concept (sh "nbb" "scripts/concept-lookup.cljk" (first terms))
+        search (sh "nbb" "scripts/repo-search.cljk" (str/join " " terms))
+        ;; repo-maturity is a local EDN scan, not a subprocess
+        mat (let [path (str root "/manifest/repo-maturity.edn")
+                  f (kio/file path)]
+              (if (kio/exists? f)
+                (->> (str/split (slurp f) #"\n")
+                     (filter #(str/includes? % "composite"))
+                     count)
+                0))]
+    {:concept-lookup-hit? (and (zero? (:exit concept)) (not (str/includes? (:out concept) "語彙に無い")))
+     :repo-search-hit? (and (zero? (:exit search)) (seq (:out search)))
+     :maturity-entities mat}))
+
+;; ---- act: tranche descriptor generation ------------------------------------
+
+(defn- pow2? [n] (and (pos-int? n) (zero? (bit-and n (dec n)))))
+
+(defn validation-errors
+  "Mirror of the checks machine.core performs on the descriptor shapes this
+   loop emits. We do NOT reimplement machine.core — a landed descriptor goes
+   through the real machine.core/validation-errors in the machine repo's own
+   test suite (machine d045768 tranche1 test). This subset catches transcription
+   errors BEFORE a proposal is written."
+  [d]
+  (let [storage (:storage d)
+        page (:page d)]
+    (cond-> []
+      (not= format-id (:format d)) (conj :invalid-format)
+      (and page (not (pow2? (:base-bytes page)))) (conj :invalid-page-base-bytes)
+      (and page (not (and (vector? (:huge page))
+                          (every? pow2? (:huge page))))) (conj :invalid-huge-pages)
+      (seq storage)
+      (into (mapcat (fn [dev]
+                      (cond-> []
+                        (not (keyword? (:id dev))) (conj :invalid-storage-id)
+                        (not (pow2? (:block-bytes dev))) (conj :invalid-storage-block-bytes)
+                        (not (contains? #{:none :low :high} (:seek-cost dev))) (conj :invalid-storage-seek-cost)
+                        (not (pos-int? (:max-transfer-bytes dev))) (conj :invalid-storage-max-transfer-bytes)
+                        (and (pos-int? (:max-transfer-bytes dev))
+                             (pos-int? (:block-bytes dev))
+                             (< (:max-transfer-bytes dev) (:block-bytes dev)))
+                        (conj :storage-transfer-smaller-than-block)))
+                    storage)))))
+
+(defn next-tranche
+  "decide: pick the first :open gap (dependency order) and return the tranche
+   plan. Nothing is generated for :captured or :closed gaps."
+  [{:keys [open]}]
+  (when-let [gap (first open)]
+    {:gap (:gap/id gap)
+     :action (case (:gap/id gap)
+               :wayland-protocol-corpus "generate wayland protocol corpus datoms (skill-os-spec-extract)"
+               :unicode-normalization-and-shaping "generate unicode normalization + shaping spec datoms"
+               :linker-elf-surface "generate ELF/linker surface spec datoms around kotoba-native"
+               :wifi-chipset-probe "run host probe on 1-2 chipsets, stamp :measured"
+               "unmapped gap — needs a tranche plan")
+     :priority (count open)}))
+
+(defn run-cycle!
+  "One observe -> evaluate -> decide -> act -> record-evidence pass."
+  [{:keys [root gaps-path ledger-path]
+    :or {root "." gaps-path "resources/gaps/gap-ledger.edn"
+         ledger-path "ledger/os-stack-observe-ledger.edn"}}]
+  (let [abs-path (if (.startsWith gaps-path "/") gaps-path (str root "/" gaps-path))
+        obs (observe-gaps abs-path)
+        hits (index-hits root ["wayland" "unicode" "elf" "linker"])
+        tranche (next-tranche obs)
+        entry {:event/type :os-stack-observe-cycle
+               :event/at (str (java.time.Instant/now))
+               :gaps-open (:total obs)
+               :gaps-open-list (mapv :gap/id (:open obs))
+               :gaps-closed (count (:closed obs))
+               :next-tranche tranche
+               :index-hits hits}]
+    ;; record-evidence: append-only
+    (let [f (kio/file (if (.startsWith ledger-path "/")
+                             ledger-path
+                             (str root "/" ledger-path)))
+          _ (when-let [parent (kio/parent-file f)]
+              (kio/mkdirs parent))
+          entry-str (pr-str entry)]
+      (spit f (str entry-str "\n") :append true))
+    {:entry entry
+     :next-tranche tranche
+     :ledger-path ledger-path}))

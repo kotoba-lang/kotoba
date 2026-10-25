@@ -112,6 +112,17 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.noren` | `kotoba.noren/src` | `noren.build`, `noren.diagnose`, `noren.discovery`, `noren.governor` (Kotoba project library) |
+| `kotoba.loopOsStackObserve` | `kotoba.loopOsStackObserve/src` | `loop-os-stack-observe.core` (Kotoba project library) |
+| `kotoba.shinkansen` | `kotoba.shinkansen/src` | `shinkansen.actions`, `shinkansen.adapter`, `shinkansen.audit`, `shinkansen.bridge` (Kotoba project library) |
+| `kotoba.reader` | `kotoba.reader/src` | `kotoba.reader` (Kotoba project library) |
+| `kotoba.prng` | `kotoba.prng/src` | `kotoba.prng` (Kotoba project library) |
+| `kotoba.moyaiLedger` | `kotoba.moyaiLedger/src` | `moyai.ledger` (Kotoba project library) |
+| `kotoba.math` | `kotoba.math/src` | `kotoba.math` (Kotoba project library) |
+| `kotoba.kotobaseShardIndex` | `kotoba.kotobaseShardIndex/src` | `kotobase-shard-index.analyze`, `kotobase-shard-index.append`, `kotobase-shard-index.block`, `kotobase-shard-index.build` (Kotoba project library) |
+| `kotoba.kotobaNet` | `kotoba.kotobaNet/src` | `kotoba.net.jvm-host` (Kotoba project library) |
+| `kotoba.i64` | `kotoba.i64/src` | `kotoba.i64` (Kotoba project library) |
+| `kotoba.hanmen` | `kotoba.hanmen/src` | `hanmen.page`, `hanmen.pdf`, `hanmen.svg` (Kotoba project library) |
 | `kotoba.htmldom` | `kotoba.htmldom/src` | `htmldom.core` (Kotoba project library) |
 | `kotoba.cssom` | `kotoba.cssom/src` | `cssom.core`, `cssom.layout` (Kotoba project library) |
 | `kotoba.domGpu` | `kotoba.domGpu/src` | `kotoba.wasm.abi`, `kotoba.wasm.debug`, `kotoba.wasm.demo`, `kotoba.wasm.demo-document` (Kotoba project library) |

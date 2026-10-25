@@ -1,0 +1,261 @@
+(ns noren.noren-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [noren.prospect :as prospect]
+            [noren.diagnose :as diagnose]
+            [noren.prescribe :as prescribe]
+            [noren.governor :as gov]
+            [noren.plan :as plan]
+            [noren.build :as build]))
+
+(def now "2026-08-11")
+
+(def dds-css-path
+  "sibling checkout（west は両方 orgs/kotoba-lang/ に展開する）。"
+  "../jp-go-digital-design-system/resources/jp_go_dds/dds.css")
+
+(defn slurp-css []
+  #?(:clj (slurp dds-css-path)
+     :cljs (.readFileSync (js/require "fs") dds-css-path "utf8")))
+
+(def ok-prospect
+  {:prospect/id "p-1"
+   :prospect/name "そば処 まる"
+   :prospect/isic "5610"
+   :prospect/kind :organization
+   :prospect/site-url "https://example.test/maru/"
+   :prospect/observed-at "2026-08-10"
+   :prospect/opt-out-declared? false
+   :prospect/contact {:contact/email "info@example.test"
+                      :contact/source-url "https://example.test/maru/contact"
+                      :contact/observed-at "2026-08-10"}})
+
+;; ── prospect ─────────────────────────────────────────────────────────────
+
+(deftest eligibility
+  (is (:ok? (prospect/eligible ok-prospect now)))
+
+  (testing "個人宛は 4 号の例外に当たらない"
+    (is (= [:recipient-not-a-business]
+           (map :rule (:reasons (prospect/contactable? (assoc ok-prospect :prospect/kind :individual)))))))
+
+  (testing "公表元の URL が無ければ根拠が持てない"
+    (is (contains? (set (map :rule (:reasons (prospect/contactable?
+                                              (update ok-prospect :prospect/contact dissoc :contact/source-url)))))
+                   :no-publication-evidence)))
+
+  (testing "受信拒否の表明は例外を外す"
+    (is (contains? (set (map :rule (:reasons (prospect/eligible
+                                              (assoc ok-prospect :prospect/opt-out-declared? true) now))))
+                   :opt-out-declared)))
+
+  (testing "対象外の業種"
+    (is (contains? (set (map :rule (:reasons (prospect/eligible
+                                              (assoc ok-prospect :prospect/isic "6201") now))))
+                   :industry-out-of-scope)))
+
+  (testing "古い観測で今日の判断をしない"
+    (is (not (prospect/fresh? (assoc ok-prospect :prospect/observed-at "2026-01-01") now 90)))
+    (is (prospect/fresh? ok-prospect now 90))
+    (testing "日付が読めないものは新しい扱いにしない"
+      (is (not (prospect/fresh? (assoc ok-prospect :prospect/observed-at "きのう") now 90)))))
+
+  (testing "受信拒否表明の読み取り"
+    (is (prospect/declared-opt-out? "<p>営業メールはお断りしております</p>"))
+    (is (prospect/declared-opt-out? "<p>No soliciting.</p>"))
+    (is (not (prospect/declared-opt-out? "<p>お気軽にお問い合わせください</p>"))))
+
+  (testing "dedup は scheme と www を吸収する"
+    (is (= "example.test"
+           (prospect/dedup-key {:prospect/site-url "https://www.example.test/x?y=1"})
+           (prospect/dedup-key {:prospect/site-url "http://example.test/"})))))
+
+;; ── diagnose ─────────────────────────────────────────────────────────────
+
+(def poor-page
+  "<!DOCTYPE html><html><head><title>まる</title></head>
+   <body><h1>そば処 まる</h1><p>おいしいそば。</p>
+   <button>予約</button></body></html>")
+
+(def ctx {:surface :storefront :url "http://example.test/maru/" :year 2026})
+
+(deftest diagnosis
+  (testing "取れなかったサイトは 0 点ではなく :absent"
+    (let [d (diagnose/diagnose nil ctx)]
+      (is (= :absent (:verdict d)))
+      (is (= [:no-site] (map :axis (:findings d))))))
+
+  (let [d (diagnose/diagnose poor-page ctx)]
+    (testing "情報の無いページは建て替え判定"
+      (is (= :rebuild (:verdict d)))
+      (is (< (:overall d) 55.0)))
+    (testing "presence の落ちた軸が名指しで出る"
+      (let [ids (set (map :id (filter :finding (get-in d [:axes :presence]))))]
+        (is (contains? ids :https))
+        (is (contains? ids :hours))
+        (is (contains? ids :tel))
+        (is (contains? ids :structured-data))))
+    (testing "findings は効き目の大きい順"
+      (let [w (map #(* (:weight %) (- 1.0 (:score %))) (:findings d))]
+        (is (= (seq w) (seq (reverse (sort w)))))))))
+
+;; ── prescribe ────────────────────────────────────────────────────────────
+
+(deftest prescription
+  (let [d (diagnose/diagnose poor-page ctx)
+        p (prescribe/prescribe d)]
+    (is (= :rebuild (:action p)))
+    (is (<= 1 (count (:claims p)) prescribe/max-claims))
+    (testing "claim は必ず evidence の軸を背負う"
+      (is (empty? (remove (set (map :evidence/axis (:evidence p)))
+                          (prescribe/claim-axes p)))))
+    (testing "こちらが作ってはいけない事実が列挙される"
+      (is (contains? (set (:needs-owner-input p)) :fact/hours))))
+
+  (testing "健全なサイトには売るものが無い"
+    (let [p (prescribe/prescribe {:verdict :healthy :overall 88.0 :findings [] :surface :storefront})]
+      (is (= :none (:action p)))
+      (is (empty? (:claims p))))))
+
+;; ── governor ─────────────────────────────────────────────────────────────
+
+(def sender {:name "cloud-itonami" :address "東京都…" :opt-out-contact "stop@itonami.cloud"})
+
+(defn review-with [overrides]
+  (let [d (diagnose/diagnose poor-page ctx)
+        p (prescribe/prescribe d)]
+    (gov/review (merge {:prospect ok-prospect
+                        :prescription p
+                        :message {:body (str "サイトを拝見しました。配信停止は " (:opt-out-contact sender) " まで。")
+                                  :sender sender}
+                        :history [{:contacted-at "2026-01-01"}]
+                        :suppression #{}
+                        :now now}
+                       overrides))))
+
+(deftest governor-commits-a-well-formed-proposal
+  (let [r (review-with {})]
+    (is (= :commit (:decision r)) (pr-str (:violations r)))
+    ;; 重み × 伸びしろの大きい順に 3 件。順位が変わったらここが落ちる —— 落ちて
+    ;; よい（何を主張しているかが黙って入れ替わるのが困る）。
+    (is (= ["contact-path" "hours" "menu"]
+           (sort (:receipt/claim-axes (:receipt r))))
+        "receipt には主張した軸がそのまま残る")))
+
+;; **落ちることを確かめる。** 落ちない governor は劇場なので、HARD rule は
+;; 1 つずつ壊して実際に :hold になることを見る。
+(deftest governor-holds
+  (do
+   (testing "個人宛"
+     (let [r (review-with {:prospect (assoc ok-prospect :prospect/kind :individual)})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :prospect-ineligible))))
+
+   (testing "一度断られた相手"
+     (let [r (review-with {:suppression #{"example.test"}})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :suppressed))))
+
+   (testing "最短間隔以内の再送"
+     (let [r (review-with {:history [{:contacted-at "2026-08-01"}]})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :resend-too-soon))))
+
+   (testing "接触回数の上限"
+     (let [r (review-with {:history [{:contacted-at "2025-01-01"} {:contacted-at "2025-06-01"}]})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :contact-limit-reached))))
+
+   (testing "測っていない軸の主張"
+     (let [d (diagnose/diagnose poor-page ctx)
+           p (update (prescribe/prescribe d) :claims conj
+                     {:claim/axis :never-measured :claim/text "御社は競合に負けています"})
+           r (review-with {:prescription p})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :claim-without-evidence))))
+
+   (testing "健全なサイトへの接触"
+     (let [r (review-with {:prescription (prescribe/prescribe
+                                          {:verdict :healthy :overall 90.0 :findings [] :surface :storefront})})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :nothing-to-sell))))
+
+   (testing "送信者表示の欠落"
+     (let [r (review-with {:message {:body "配信停止は stop@itonami.cloud まで。"
+                                     :sender (dissoc sender :address)}})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :sender-disclosure-missing))))
+
+   (testing "本文に受信拒否の通知先が無い"
+     (let [r (review-with {:message {:body "サイトを拝見しました。" :sender sender}})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :opt-out-missing))))
+
+   (testing "測れない成果の約束"
+     (let [r (review-with {:message {:body (str "必ず集客が増えます。配信停止は " (:opt-out-contact sender))
+                                     :sender sender}})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :outcome-promise))))
+
+   (testing "相手の素材の複製"
+     (let [d (diagnose/diagnose poor-page ctx)
+           p (assoc (prescribe/prescribe d) :build/borrowed-assets ["logo.png"])
+           r (review-with {:prescription p})]
+       (is (= :hold (:decision r)))
+       (is (contains? (set (map :rule (:violations r))) :asset-reuse))))))
+
+(deftest governor-warns-without-blocking
+  (testing "履歴が渡されていないことは可視化するが止めない"
+    (let [r (review-with {:history []})]
+      (is (= :commit (:decision r)))
+      (is (contains? (set (map :rule (:warnings r))) :history-absent)))))
+
+;; ── plan ─────────────────────────────────────────────────────────────────
+
+(deftest plans
+  (is (= :noren.plan/hiraki (plan/recommend {:action :rebuild :surface :storefront})))
+  (is (nil? (plan/recommend {:action :none :surface :storefront})))
+  (is (= {:net 9800 :tax 980 :gross 10780} (plan/monthly-charge :noren.plan/mamori)))
+
+  (testing "請求面の識別子が無い契約を active にしない"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (plan/activate {:plan-id :noren.plan/mamori :prospect-key "example.test" :now now}))))
+
+  (let [sub (plan/activate {:plan-id :noren.plan/mamori :prospect-key "example.test"
+                            :external-ref "sub_x" :now now})]
+    (is (plan/entitled? sub :diagnosis/monthly now))
+    (is (not (plan/entitled? sub :site/rebuild now)) "守りに建て替えは付かない")
+
+    (testing "解約したら期限の翌日から loop は働かない"
+      (let [c (plan/cancel sub now "2026-09-10")]
+        (is (plan/entitled? c :diagnosis/monthly "2026-09-10"))
+        (is (not (plan/entitled? c :diagnosis/monthly "2026-09-11")))))))
+
+;; ── build ────────────────────────────────────────────────────────────────
+
+(def brief
+  {:name "そば処 まる" :surface :storefront :url "https://maru.example.test/"
+   :description "手打ちそばの店" :address "東京都千代田区1-1-1" :tel "03-1234-5678"
+   :hours ["Mo-Fr 11:00-15:00" "Sa 11:00-20:00"] :year 2026
+   :items [{:name "せいろ" :price 900} {:name "天せいろ" :price 1600}
+           {:name "鴨南蛮" :price 1400 :note "冬季"}]})
+
+(deftest built-site-passes-our-own-bar
+  (let [css (slurp-css)
+        {:keys [html missing]} (build/site brief {:css css})
+        d (diagnose/diagnose html (assoc ctx :url (:url brief)))]
+    (is (empty? missing))
+    (is (= :healthy (:verdict d))
+        (str "自分の建てた面が healthy でない: " (:overall d) " / "
+             (pr-str (map (juxt :id :finding) (:findings d)))))
+    (is (>= (:presence d) 90.0))
+    (is (>= (:ui d) 80.0))))
+
+(deftest build-refuses-to-invent-facts
+  (let [css (slurp-css)
+        {:keys [html missing]} (build/site (dissoc brief :hours :tel) {:css css})]
+    (is (= #{:fact/tel :fact/hours} (set missing)))
+    (testing "貰っていない事実は本文にも構造化データにも現れない"
+      (is (not (str/includes? html "openingHours")))
+      (is (not (str/includes? html "telephone")))
+      (is (not (str/includes? html "営業時間"))))))

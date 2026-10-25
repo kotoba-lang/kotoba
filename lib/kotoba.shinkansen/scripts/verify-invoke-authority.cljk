@@ -1,0 +1,259 @@
+(ns verify-invoke-authority
+  "The authority seam under a REAL authorizer, both directions.
+
+  `test/shinkansen/invoke_test.cljk` proves the seam with a fake
+  authorize-fn — it can only say the seam calls what it was given and
+  refuses when given nothing. This script binds the seam to the workspace's
+  actual decision path and runs an app through it:
+
+    grant      a Biscuit minted with Ed25519 (node:crypto, the binding
+               org-biscuitsec's own real-crypto suite uses), attenuated
+               offline to ONE app's chain
+    verify     biscuit.token/verify against the root PUBLIC key
+    decide     biscuit.kotoba/authorize — the one place `does this token
+               reach that resource` is answered (authority.chain's lattice,
+               kinds closed to the ONE kind the effect names)
+    seam       shinkansen.invoke/dispatch and /query, then the real
+               actions → state chain, then state/walk-chain over the result
+
+  Each case prints `CASE<TAB>name<TAB>verdict` and the reason literal it
+  saw; the end prints `SCANNED<TAB>n<TAB>FAILED<TAB>m`. Exit 0 only when
+  n > 0 and m = 0; exit 1 on any FAIL; exit 2 when the setup itself could
+  not run (a 2 is `could not check`, never `checked and passed`).
+
+  What this does NOT cover, said plainly: the stdio PROCESS with an app
+  attached (stdio.cljc still answers R0 — `mcp/handle-request` is exercised
+  in-process here, which is the function the stdio loop calls per line),
+  and a Biscuit crossing the protobuf wire (biscuit.wire is not on this
+  path; the token model is passed as data, as an in-process host would).
+
+  Run (from the repo root, siblings checked out at their west pins):
+    kbb --backend sci --classpath src:../org-biscuitsec/src:../org-biscuitsec/test:../authority/src:../text/src scripts/verify-invoke-authority.cljk"
+  (:require [biscuit.token :as bt]
+            [biscuit.kotoba :as bk]
+            [biscuit.ed25519 :as e]
+            [clojure.string :as str]
+            [shinkansen.invoke :as invoke]
+            [shinkansen.mcp :as mcp]
+            [shinkansen.state :as state]))
+
+;; ── keys, principals, artifacts ──────────────────────────────────────────
+
+(def root (e/keypair (vec (range 32))))
+(def k1 (e/keypair (vec (range 32 64))))
+(def k2 (e/keypair (vec (range 64 96))))
+(def attacker (e/keypair (vec (map #(+ 100 %) (range 32)))))
+
+(def alice "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
+(def app-a "bafkreia2cc444k5yrw57uhszfrvbri7wee3ljbpb5wfcorykk72kgxhjaq")
+(def app-b "bafkreib4pff766vhpbxbhjbqz3d7ogcwyorbizgp3e5mpezy3ml5o7ci5a")
+(def now "2026-09-16T12:00:00Z")
+
+(defn- chain-of [cid] (str "kotoba://app/" cid "/chain"))
+
+;; ── tokens ───────────────────────────────────────────────────────────────
+
+(def wide
+  "Root-issued: append to ANY app's chain, and query any app."
+  (bt/authority {:facts [['cap "chain/append" "kotoba://app/*"]
+                         ['cap "app/query" "kotoba://app/*"]
+                         ['holder alice]]
+                 :next-public-key (:public k1)
+                 :root-private-key (:private root) :sign-fn e/sign-fn}))
+
+(def narrowed-to-a
+  "Attenuated OFFLINE by the holder of k1 (never the root): only app A's chain."
+  (bt/append wide {:facts [['cap "chain/append" (chain-of app-a)]]
+                   :next-public-key (:public k2)
+                   :private-key (:private k1) :sign-fn e/sign-fn}))
+
+(def query-only
+  (bt/authority {:facts [['cap "app/query" (str "kotoba://app/" app-a)] ['holder alice]]
+                 :next-public-key (:public k1)
+                 :root-private-key (:private root) :sign-fn e/sign-fn}))
+
+(def expired
+  (bt/authority {:facts [['cap "chain/append" "kotoba://app/*"] ['before "2020-01-01T00:00:00Z"]]
+                 :next-public-key (:public k1)
+                 :root-private-key (:private root) :sign-fn e/sign-fn}))
+
+(def forged
+  "The splice: an attacker rewrites the key block 0 names and appends a wide
+  block signed with their own key. Verification must fail at index 0."
+  (bt/append (assoc-in wide [:biscuit/blocks 0 :block/next-public-key] (:public attacker))
+             {:facts [['cap "chain/append" "kotoba://app/*"]]
+              :next-public-key (:public attacker)
+              :private-key (:private attacker) :sign-fn e/sign-fn}))
+
+;; ── the real authorize-fn ────────────────────────────────────────────────
+
+(defn authorize-fn
+  "What a host binds to `invoke`'s seam. Sees exactly what the seam sends:
+  {:principal :artifact :grant :effect}. Verify, then decide; the kind set
+  is closed to the ONE kind this effect names, so a query grant cannot
+  reach a chain append."
+  [{:keys [grant effect]}]
+  (cond
+    (not (map? grant)) {:ok false :reason :no-grant-presented}
+    :else
+    (let [v (bt/verify grant (:public root) e/verify-fn)]
+      (if-not (:ok? v)
+        {:ok false :reason (:reason v) :index (:index v) :verified? false}
+        (let [d (bk/authorize {:token-model grant
+                               :kinds #{(:effect effect)}
+                               :verified? true
+                               :requested (:resource effect)
+                               :now now})]
+          {:ok (boolean (:pass/allowed? d))
+           :reason (:pass/reason d)
+           :depth (:pass/depth d)
+           :effect (:effect effect)})))))
+
+;; ── the app ──────────────────────────────────────────────────────────────
+
+(def decl {:events {:todo/add {:validate (fn [[_ item]] (string? item))}}})
+
+(def cid-fn
+  "Deterministic stand-in for the content-address hash — `invoke` never
+  hashes; this is what the caller injects. A stable label is enough to
+  make the chain walk meaningful."
+  (fn [text] (str "bafk-" (hash text))))
+
+(defn- opts [calls & [grant-less?]]
+  (cond-> {:db {:todos []}
+           :state-fn (fn [db [_ item]] (swap! calls inc) (update db :todos conj item))
+           :cid-fn cid-fn :prev-cid nil :height 1
+           :authorize-fn authorize-fn}
+    grant-less? (dissoc :authorize-fn)))
+
+(defn- action [cid grant event]
+  {:artifact cid :principal alice :grant grant :input {:kind :action :event event}})
+
+(defn- keys-anywhere [v]
+  (cond (map? v) (into (set (keys v)) (mapcat keys-anywhere (vals v)))
+        (sequential? v) (into #{} (mapcat keys-anywhere v))
+        :else #{}))
+
+;; ── cases ────────────────────────────────────────────────────────────────
+
+(def results (atom []))
+
+(defn- case! [name expect-ok? expect-reason f]
+  (let [calls (atom 0)
+        r (try (f calls) (catch :default ex {:threw (str ex)}))
+        got-ok (boolean (:ok r))
+        got-reason (or (:authorizer r) (:reason r))
+        ok? (and (not (:threw r))
+                 (= expect-ok? got-ok)
+                 (or (nil? expect-reason) (= expect-reason got-reason)))]
+    (swap! results conj {:name name :ok? ok? :expect [expect-ok? expect-reason]
+                         :got [got-ok got-reason] :calls @calls :r r})
+    (println (str "CASE\t" name "\t" (if ok? "OK" "FAIL")
+                  "\texpected " (pr-str [expect-ok? expect-reason])
+                  "\tgot " (pr-str [got-ok got-reason])
+                  "\tguest-steps " @calls
+                  (when (:threw r) (str "\tTHREW " (:threw r)))))
+    r))
+
+(defn -main []
+  ;; setup sanity: the tokens verify / fail exactly as constructed, or we
+  ;; cannot check anything (exit 2, not a pass and not a FAIL count)
+  (when-not (and (:ok? (bt/verify narrowed-to-a (:public root) e/verify-fn))
+                 (false? (:ok? (bt/verify forged (:public root) e/verify-fn))))
+    (println "SETUP\tcould not construct verifying/forged tokens")
+    (js/process.exit 2))
+
+  ;; 1. no authorizer bound: refused, guest never ran
+  (case! "no-authorizer-refuses" false :no-authorizer
+         (fn [calls] (invoke/dispatch decl (action app-a narrowed-to-a [:todo/add "milk"]) (opts calls true))))
+
+  ;; 2. no grant presented
+  (case! "no-grant-denied" false :no-grant-presented
+         (fn [calls] (invoke/dispatch decl (action app-a nil [:todo/add "milk"]) (opts calls))))
+
+  ;; 3. the attenuated token, on the app it was narrowed to: allowed,
+  ;;    entry records who + receipt, chain walks, grant is nowhere
+  (let [r (case! "narrowed-token-appends-to-its-app" true nil
+                 (fn [calls] (invoke/dispatch decl (action app-a narrowed-to-a [:todo/add "milk"]) (opts calls))))]
+    (when (:ok r)
+      (let [entry (:entry r)
+            walk (state/walk-chain [entry] cid-fn)]
+        (case! "entry-records-principal-and-receipt-never-grant"
+               true nil
+               (fn [_] {:ok (and (= alice (:principal entry))
+                                 (= :pass/granted (get-in entry [:receipt :reason]))
+                                 (= 2 (get-in entry [:receipt :depth]))
+                                 (not (contains? (keys-anywhere r) :grant)))
+                        :reason (if (contains? (keys-anywhere r) :grant) :grant-leaked :recorded)}))
+        (case! "appended-chain-walks" true nil
+               (fn [_] {:ok (:valid? walk) :reason (if (:valid? walk) :valid (:reason walk))})))))
+
+  ;; 4. the SAME token on another app: the lattice says no
+  (case! "narrowed-token-cannot-reach-another-app" false :out-of-scope
+         (fn [calls] (invoke/dispatch decl (action app-b narrowed-to-a [:todo/add "milk"]) (opts calls))))
+
+  ;; 5. boundary: the wide root token still reaches app B (the wildcard is real)
+  (case! "wide-token-reaches-app-b" true nil
+         (fn [calls] (invoke/dispatch decl (action app-b wide [:todo/add "milk"]) (opts calls))))
+
+  ;; 6. a query-only token cannot append: kind closed to the effect's
+  (case! "query-only-token-cannot-append" false :pass/no-grant
+         (fn [calls] (invoke/dispatch decl (action app-a query-only [:todo/add "milk"]) (opts calls))))
+
+  ;; 7. expired
+  (case! "expired-token-denied" false :expired-or-no-trusted-time
+         (fn [calls] (invoke/dispatch decl (action app-a expired [:todo/add "milk"]) (opts calls))))
+
+  ;; 8. forged (spliced) token: refused cryptographically, at block 0
+  (case! "forged-token-fails-verification" false :signature-mismatch
+         (fn [calls] (invoke/dispatch decl (action app-a forged [:todo/add "milk"]) (opts calls))))
+
+  ;; 9. authorized but undeclared event: the declaration gate still stands
+  (case! "authorized-but-undeclared-event-refused" false :undeclared-event
+         (fn [calls] (invoke/dispatch decl (action app-a wide [:todo/nope "x"]) (opts calls))))
+
+  ;; 10. query through the same seam: the query grant answers a station
+  (case! "query-grant-answers-a-station" true nil
+         (fn [_] (invoke/query {:artifact app-a :principal alice :grant query-only
+                                :input {:kind :query :params {:id "q"}}}
+                               {:authorize-fn authorize-fn :cid-fn cid-fn
+                                :load-fn (fn [p] {:for (:id p)})})))
+
+  ;; 11. the query grant for app A does not answer app B
+  (case! "query-grant-does-not-reach-app-b" false :out-of-scope
+         (fn [_] (invoke/query {:artifact app-b :principal alice :grant query-only
+                                :input {:kind :query :params {}}}
+                               {:authorize-fn authorize-fn :cid-fn cid-fn :load-fn (fn [_] {})})))
+
+  ;; 12. through the MCP protocol layer: tools/call → envelope from the
+  ;;     SESSION's grant → the same seam. A grant smuggled in the arguments
+  ;;     for app B does not win over the session's narrowed token.
+  (let [handlers {:lake-dispatch (fn [env] (invoke/dispatch decl env (opts (atom 0))))}
+        call (fn [ctx args]
+               (mcp/handle-request {:jsonrpc "2.0" :id 1 :method "tools/call"
+                                    :params {:name "lake_dispatch" :arguments args}}
+                                   ctx))
+        text (fn [resp] (get-in resp [:result :content 0 :text]))]
+    (case! "mcp-session-grant-appends" true nil
+           (fn [_] (let [t (text (call {:principal alice :grant narrowed-to-a :handlers handlers}
+                                       {:artifact app-a :event [:todo/add "milk"]}))]
+                     {:ok (str/includes? t ":ok true") :reason (if (str/includes? t alice) :principal-recorded :principal-missing)})))
+    (case! "mcp-smuggled-grant-does-not-widen" false :out-of-scope
+           (fn [_] (let [t (text (call {:principal alice :grant narrowed-to-a :handlers handlers}
+                                       {:artifact app-b :event [:todo/add "milk"] :grant wide}))]
+                     {:ok (str/includes? t ":ok true")
+                      :reason (cond (str/includes? t ":authorizer :out-of-scope") :out-of-scope
+                                    :else :other)})))
+    (case! "mcp-no-session-grant-denied" false :no-grant-presented
+           (fn [_] (let [t (text (call {:principal alice :handlers handlers}
+                                       {:artifact app-a :event [:todo/add "milk"]}))]
+                     {:ok (str/includes? t ":ok true")
+                      :reason (if (str/includes? t ":no-grant-presented") :no-grant-presented :other)}))))
+
+  ;; verdict
+  (let [rs @results
+        failed (filter (complement :ok?) rs)]
+    (println (str "SCANNED\t" (count rs) "\tFAILED\t" (count failed)))
+    (js/process.exit (cond (empty? rs) 2 (seq failed) 1 :else 0))))
+
+(-main)
