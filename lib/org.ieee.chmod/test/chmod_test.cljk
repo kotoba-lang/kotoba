@@ -1,0 +1,145 @@
+;; test/chmod_test.cljk -- build the command and compare it with /bin/chmod on
+;; stdout, stderr, exit status AND the resulting directory tree.
+;;
+;; mkdir writes nothing to stdout when it succeeds, so an output-only
+;; comparison would pass an implementation that created nothing at all. The
+;; tree is what carries the weight, exactly as in org-ieee-cp.
+;;
+;; Both implementations run in the SAME directory, one after the other, with
+;; the fixtures rebuilt in between: the diagnostics contain absolute paths, so
+;; two parallel trees would differ in stderr for reasons unrelated to the
+;; behaviour under test.
+
+(ns chmod-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp-mod (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp-mod cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer"} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-chmod "/bin/chmod")
+
+;; The tree before each run: one existing directory and one existing FILE, so
+;; "already exists" can be tested both ways.
+(defn- reset! [data]
+  (.rmSync fs data #js {:recursive true :force true})
+  (.mkdirSync fs data #js {:recursive true})
+  (.writeFileSync fs (.join path data "f1") "one\n" "utf8")
+  (.writeFileSync fs (.join path data "f2") "two\n" "utf8")
+  (.mkdirSync fs (.join path data "d1"))
+  (.chmodSync fs (.join path data "f1") 0x1a4)   ;; 0644
+  (.chmodSync fs (.join path data "f2") 0x1ed)   ;; 0755
+  (.chmodSync fs (.join path data "d1") 0x1ed))
+
+;; relative path -> "<dir>" or a content hash, for the whole tree.
+(defn- snapshot [root]
+  (letfn [(walk [dir prefix acc]
+            (reduce (fn [a e]
+                      (let [full (.join path dir e)
+                            rel (if (= prefix "") e (str prefix "/" e))]
+                        (if (.isDirectory (.statSync fs full))
+                          (walk full rel (assoc a (str rel "/")
+                                                [(bit-and (.-mode (.statSync fs full)) 0x1ff) "<dir>"]))
+                          (assoc a rel [(bit-and (.-mode (.statSync fs full)) 0x1ff)
+                                        (.toString (.readFileSync fs full) "utf8")]))))
+                    acc
+                    (sort (.readdirSync fs dir))))]
+    (walk root "" {})))
+
+(def cases
+  [;; the basic contract, in both directions
+   ["600" "f1"] ["755" "f1"] ["644" "f2"]
+   ;; a leading zero is the same request
+   ["0600" "f1"] ["0755" "f1"]
+   ;; a directory
+   ["700" "d1"] ["0755" "d1"]
+   ;; several operands, and one that is not there
+   ["600" "f1" "f2"] ["600" "nope"] ["600" "f1" "nope" "f2"]
+   ;; a mode that is not octal
+   ["9999" "f1"] ["abc" "f1"]
+   ;; usage: no operand at all, and a mode with no file
+   [] ["644"]])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-chmod) (refuse (str "no " system-chmod)))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-chmod-"))
+        src (.resolve path (.cwd js/process) "chmod" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "chmod.kexe")
+        blob (.join path tmp "chmod.bin")
+        exe (.join path tmp "chmod")
+        data (.join path tmp "data")]
+    (.writeFileSync fs policy
+                    "{:allow #{[:cap/call 35] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.mkdirSync fs data)
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      (let [real (.realpathSync fs data)
+            p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                          "--allow" "35,38,39"
+                          "--fs-scope" real
+                          "--string-pool" "4000000" "--fuel" "50000000"
+                          "--pairs" "200000" "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+
+    (let [real (.realpathSync fs data)
+          ;; Argument 0 is a MODE, not a path. The sibling harnesses map
+          ;; every non-flag operand to a path, and copying that rule here
+          ;; turned `600` into `<data>/600`: /bin/chmod then rejected it as an
+          ;; invalid mode, this rejected it too, and all fourteen cases
+          ;; "passed" at exit [1 1]. A suite in which nothing succeeds is not
+          ;; a suite that agrees.
+          abs (fn [i n] (if (or (zero? i) (str/starts-with? n "-"))
+                          n
+                          (.join path real n)))
+          b64 (fn [b] (if b (.toString b "base64") ""))
+          once (fn [cmd argv]
+                 (reset! real)
+                 (let [r (run cmd (vec (map-indexed abs argv)) {:cwd real})]
+                   (assoc r :tree (snapshot real))))
+          results
+          (for [argv cases]
+            (let [k (once exe argv)
+                  s (once system-chmod argv)
+                  same? (and (= (b64 (:out k)) (b64 (:out s)))
+                             (= (b64 (:err k)) (b64 (:err s)))
+                             (= (:status k) (:status s))
+                             (= (:tree k) (:tree s)))]
+              {:argv argv :ok same? :exit [(:status k) (:status s)]
+               :tree-same (= (:tree k) (:tree s))
+               :err [(.toString (:err k) "utf8") (.toString (:err s) "utf8")]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))
+                      " exit " (pr-str (:exit r))
+                      (when-not (:ok r)
+                        (str " tree-same=" (:tree-same r) " err=" (pr-str (:err r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))
