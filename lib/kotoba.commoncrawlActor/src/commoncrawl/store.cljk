@@ -1,0 +1,207 @@
+(ns commoncrawl.store
+  "SSoT for this actor's OWN bookkeeping — NOT the ingested content itself
+  (that lives in net-kotobase, the actual write target; see
+  `commoncrawl.kotobase`). This store holds only what the durable outer
+  loop (`commoncrawl.loop`) needs across ticks: the append-only decision
+  ledger, a dedupe index of already-ingested URLs, the seed round-robin
+  cursor, a per-tick fetch budget counter, and a best-effort single-runner
+  lease — the `:agent.loop/*` / `:agent.tick/*` / `:agent.lease/*` /
+  `:agent.budget/*` datom families skill `build-actor` describes for a
+  durable outer loop, kept as separate attr families (not folded into one
+  blob) so each can be queried/reasoned about independently.
+
+  Two backends behind one `Store` protocol, same 'swap, not a rewrite'
+  discipline every actor in this workspace uses:
+
+    - `MemStore`     — atom of plain EDN. Deterministic default for
+                       dev/tests/`commoncrawl.sim` (no deps, no IO).
+    - `DatomicStore` — `langchain.db`-backed (Datomic-API-compatible EAV),
+                       built on `kotoba-lang/langchain-store`'s shared
+                       codec/identity-schema/event-stream helpers
+                       (`enc`/`dec*`/`identity-schema`/`read-stream`/
+                       `append-blob!`) rather than a 191st hand-rolled
+                       `enc`/`dec*` pair (ADR-2607141600) — pure `.cljc`,
+                       runs in-process offline (tests) or against a real
+                       kotoba-server pod by swapping `langchain.db`'s
+                       `:db-api` (see `langchain.kotoba-db`), unchanged
+                       here.
+
+  LEASE CAVEAT (documented honestly, not glossed over): `acquire-lease!`
+  is a best-effort single-runner guard for a SINGLE process's atom
+  (MemStore) or a single in-process langchain.db connection (DatomicStore)
+  — it is NOT a distributed lock across multiple processes/machines. That
+  is an acceptable scope for a scheduled routine that a scheduler (not
+  multiple concurrent workers) invokes one tick at a time; it is NOT
+  sufficient if this actor is ever run by multiple concurrent schedulers
+  against the SAME store instance."
+  (:require [langchain.db :as d]
+            [langchain-store.core :as ls]
+            #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])))
+
+(defprotocol Store
+  (ledger [s] "the append-only commit/hold decision ledger, oldest-first")
+  (append-ledger! [s fact])
+  (ingested-url? [s url] "true iff this actor has already committed `url`")
+  (mark-ingested! [s url record] "record {:committed-at :category ...} for `url`")
+  (cursor [s] "current round-robin index into the seed list")
+  (advance-cursor! [s next-idx])
+  (lease [s lease-id] "-> {:owner :expires-at} or nil")
+  (acquire-lease! [s lease-id owner now-ms ttl-ms]
+    "true iff `owner` now holds the lease (fresh, expired, or already
+    held by `owner`) — see ns docstring's LEASE CAVEAT.")
+  (release-lease! [s lease-id owner] "clears the lease iff `owner` holds it")
+  (tick-budget-used [s tick-id] "fetches already recorded against `tick-id`")
+  (record-fetch! [s tick-id] "increments the fetch counter for `tick-id`")
+  (tick-log [s] "append-only per-tick summary log, oldest-first")
+  (append-tick! [s tick-fact]))
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defn- lease-live? [{:keys [expires-at]} now-ms]
+  (and expires-at (> expires-at now-ms)))
+
+(defrecord MemStore [a]
+  Store
+  (ledger [_] (:ledger @a))
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (ingested-url? [_ url] (contains? (:ingested @a) url))
+  (mark-ingested! [s url record] (swap! a assoc-in [:ingested url] record) s)
+  (cursor [_] (:cursor @a 0))
+  (advance-cursor! [s next-idx] (swap! a assoc :cursor next-idx) s)
+  (lease [_ lease-id] (get-in @a [:leases lease-id]))
+  (acquire-lease! [_ lease-id owner now-ms ttl-ms]
+    (let [[old _new] (swap-vals! a update-in [:leases lease-id]
+                                 (fn [existing]
+                                   (if (and existing (lease-live? existing now-ms)
+                                            (not= owner (:owner existing)))
+                                     existing
+                                     {:owner owner :expires-at (+ now-ms ttl-ms)})))
+          prior (get-in old [:leases lease-id])]
+      (or (nil? prior) (not (lease-live? prior now-ms)) (= owner (:owner prior)))))
+  (release-lease! [s lease-id owner]
+    (swap! a update :leases
+           (fn [leases] (if (= owner (:owner (get leases lease-id))) (dissoc leases lease-id) leases)))
+    s)
+  (tick-budget-used [_ tick-id] (get-in @a [:budget tick-id] 0))
+  (record-fetch! [s tick-id] (swap! a update-in [:budget tick-id] (fnil inc 0)) s)
+  (tick-log [_] (:ticks @a))
+  (append-tick! [_ tick-fact] (swap! a update :ticks conj tick-fact) tick-fact))
+
+(defn mem-store
+  "A fresh, empty MemStore — the deterministic default for dev/tests/sim."
+  []
+  (->MemStore (atom {:ledger [] :ingested {} :cursor 0 :leases {} :budget {} :ticks []})))
+
+(defn- read-edn-file [path]
+  (try
+    #?(:clj (when (.exists (java.io.File. ^String path))
+              (edn/read-string (slurp path)))
+       :cljs (let [fs (js/require "fs")]
+               (when (.existsSync fs path)
+                 (edn/read-string (.readFileSync fs path "utf8")))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn- write-edn-file! [path data]
+  #?(:clj (spit path (pr-str data))
+     :cljs (.writeFileSync (js/require "fs") path (pr-str data) "utf8")))
+
+(defn file-store
+  "A MemStore whose atom is loaded from `path` on creation and re-persisted
+  (whole-file overwrite, `pr-str`'d EDN) after every mutation — the ONLY
+  cross-PROCESS durability this repo's outer loop (`commoncrawl.loop`) has
+  without standing up a real kotoba-server pod behind `DatomicStore`
+  (swapping `langchain.db`'s `:db-api` for that is a real, but separate,
+  operational step — see `datomic-store`'s docstring). Honest limitation:
+  this is a single-file read-modify-write, NOT transactional/concurrent-
+  safe across multiple processes writing the SAME path at once — adequate
+  for a scheduled routine invoking one tick at a time (the common case this
+  actor is built for), not for concurrent multi-worker scheduling against
+  one file."
+  [path]
+  (let [initial (or (read-edn-file path)
+                    {:ledger [] :ingested {} :cursor 0 :leases {} :budget {} :ticks []})
+        a (atom initial)]
+    (add-watch a ::persist (fn [_ _ _ new-state] (write-edn-file! path new-state)))
+    (->MemStore a)))
+
+;; ───────────────────────── DatomicStore (langchain-store) ─────────────────
+
+(def ^:private schema
+  (merge
+   (ls/identity-schema #{:ledger/seq :page/url :agent.lease/id
+                         :agent.budget/tick-id :agent.tick/seq})
+   {:agent.loop/id {:db/unique :db.unique/identity}}))
+
+(def ^:private cursor-id "cursor")
+
+(defrecord DatomicStore [conn]
+  Store
+  (ledger [_] (ls/read-stream conn :ledger/seq :ledger/fact))
+  (append-ledger! [_ fact]
+    (ls/append-blob! conn :ledger/seq :ledger/fact (count (ls/read-stream conn :ledger/seq :ledger/fact)) fact)
+    fact)
+  (ingested-url? [_ url]
+    (boolean (d/q '[:find ?e . :in $ ?url :where [?e :page/url ?url]] (d/db conn) url)))
+  (mark-ingested! [s url record]
+    (d/transact! conn [{:page/url url :page/record (ls/enc record)}])
+    s)
+  (cursor [_]
+    (or (d/q '[:find ?v . :in $ ?id :where [?e :agent.loop/id ?id] [?e :agent.loop/cursor ?v]]
+             (d/db conn) cursor-id)
+        0))
+  (advance-cursor! [s next-idx]
+    (d/transact! conn [{:agent.loop/id cursor-id :agent.loop/cursor next-idx}])
+    s)
+  (lease [_ lease-id]
+    ;; NOTE: `:find ?owner ?exp` WITHOUT a trailing `.` -- the `.` scalar
+    ;; modifier is only valid for a SINGLE find-variable query; using it
+    ;; with two variables silently misparses under langchain.db's engine
+    ;; (confirmed: yields a non-numeric :expires-at that blows up
+    ;; lease-live?'s `>` comparison). A tuple result set is the correct
+    ;; shape for 2+ find vars; `:agent.lease/id`'s identity uniqueness
+    ;; guarantees at most one matching row.
+    (let [rows (d/q '[:find ?owner ?exp :in $ ?id
+                       :where [?e :agent.lease/id ?id]
+                              [?e :agent.lease/owner ?owner]
+                              [?e :agent.lease/expires-at ?exp]]
+                     (d/db conn) lease-id)
+          row (first rows)]
+      (when row {:owner (first row) :expires-at (second row)})))
+  (acquire-lease! [s lease-id owner now-ms ttl-ms]
+    (let [existing (lease s lease-id)]
+      (if (and existing (lease-live? existing now-ms) (not= owner (:owner existing)))
+        false
+        (do (d/transact! conn [{:agent.lease/id lease-id :agent.lease/owner owner
+                                :agent.lease/expires-at (+ now-ms ttl-ms)}])
+            true))))
+  (release-lease! [s lease-id owner]
+    (when-let [existing (lease s lease-id)]
+      (when (= owner (:owner existing))
+        ;; "" + expires-at 0, not nil -- a nil attribute value isn't a
+        ;; meaningful EAV assertion (langchain.db, DataScript-like, has no
+        ;; "value is nil" distinct from "attribute absent"); an
+        ;; already-expired sentinel row makes lease-live? false regardless
+        ;; of owner, which is exactly "released" for acquire-lease!'s check.
+        (d/transact! conn [{:agent.lease/id lease-id :agent.lease/owner ""
+                            :agent.lease/expires-at 0}])))
+    s)
+  (tick-budget-used [_ tick-id]
+    (or (d/q '[:find ?v . :in $ ?id :where [?e :agent.budget/tick-id ?id] [?e :agent.budget/used ?v]]
+             (d/db conn) tick-id)
+        0))
+  (record-fetch! [s tick-id]
+    (d/transact! conn [{:agent.budget/tick-id tick-id :agent.budget/used (inc (tick-budget-used s tick-id))}])
+    s)
+  (tick-log [_] (ls/read-stream conn :agent.tick/seq :agent.tick/fact))
+  (append-tick! [s tick-fact]
+    (ls/append-blob! conn :agent.tick/seq :agent.tick/fact (count (tick-log s)) tick-fact)
+    tick-fact))
+
+(defn datomic-store
+  "A fresh DatomicStore over a new in-process langchain.db connection. Same
+  data shape/contract as MemStore (see test/commoncrawl/store_contract_test.cljc)
+  — swapping `langchain.db`'s own `:db-api` (see `langchain.kotoba-db`)
+  points this at a real kotoba-server pod without touching this ns."
+  []
+  (->DatomicStore (d/create-conn schema)))

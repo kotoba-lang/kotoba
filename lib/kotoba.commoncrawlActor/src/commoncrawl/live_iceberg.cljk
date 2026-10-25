@@ -1,0 +1,87 @@
+(ns commoncrawl.live-iceberg
+  "Real IO for `commoncrawl.iceberg`'s `:iceberg-sync-fn` seam: appends
+  already-shaped rows to the `net_kotobase.commoncrawl_page` Iceberg table
+  in Cloudflare R2 Data Catalog (bucket `net-kotobase-datalake`, account
+  `4da88288dc30d9ee257f319d3c33ecf0`, the same Cloudflare account
+  `cloud-itonami/otent` already uses for its own tables).
+
+  nbb-only (`child_process`/`fs`/`path`), per `commoncrawl.live-http`'s own
+  ns docstring discipline: real IO stays out of every `.cljc` namespace so
+  the offline test suite never touches a subprocess or the network.
+
+  `cp/spawnSync` (blocking), NOT the async `cp/spawn` `cloud-itonami/otent`
+  moved to on 2026-08-28 — that move fixed a real problem (a blocking
+  Iceberg commit inside `Promise.all` starves EVERY sibling feed's
+  deadline), but this actor has no sibling fetch running concurrently: one
+  `bin/tick.cljk` invocation is a single sequential pass over at most
+  `budget-cap` (default 3) seeds, called once, then the process exits.
+  There is nothing here for a blocking call to starve.
+
+  `--create` is passed on every append call. `scripts/iceberg_append.py`
+  only actually creates the table when it is genuinely absent (see its own
+  docstring), so this is safe on every run, not just the first — the same
+  choice `otent.cljs`'s `commit!`/`create?` plumbing makes explicit at the
+  call site; here it is simply always true, since this actor has exactly
+  one destination table."
+  (:require [commoncrawl.iceberg :as iceberg]
+            [kotoba.lang.text :as str]))
+
+(def ^:private cp (js/require "child_process"))
+(def ^:private fs (js/require "fs"))
+(def ^:private path (js/require "path"))
+
+(def account "4da88288dc30d9ee257f319d3c33ecf0")
+(def bucket "net-kotobase-datalake")
+
+(defn- write-ndjson!
+  "rows (vector of flat string maps, `commoncrawl.iceberg/->row` shape) ->
+  the NDJSON file path written. One file per call, under TMPDIR, never
+  reused — `scripts/iceberg_append.py` streams it and this actor's own
+  budget cap keeps it small (<= a few rows), so batching further would add
+  complexity for no measured benefit."
+  [rows]
+  (let [dir (.join path (or (.. js/process -env -TMPDIR) "/tmp") "commoncrawl-iceberg")
+        _ (.mkdirSync fs dir #js {:recursive true})
+        f (.join path dir (str "batch-" (js/Date.now) "-" (rand-int 100000) ".ndjson"))]
+    (.writeFileSync fs f
+                    (str (str/join "\n" (map #(js/JSON.stringify (clj->js %)) rows)) "\n"))
+    f))
+
+(defn sync-fn
+  "The real `:iceberg-sync-fn` for `commoncrawl.loop/tick!`. `rows` are
+  already `commoncrawl.iceberg/->row`-shaped. Returns:
+
+    {:ok? true :appended n}
+    {:ok? false :error :could-not-answer :detail \"...\"}  -- no/bad
+      CF_CATALOG_TOKEN, or the catalog was unreachable (writer exit 2)
+    {:ok? false :error :refused :detail \"...\"}            -- schema
+      drift, or another refusal the writer reports (exit 1)
+    {:ok? false :error :spawn-failed | :exception :detail \"...\"}
+
+  Never throws — a catalog outage must degrade this tick's `:iceberg`
+  summary field, not crash the tick. net-kotobase ingestion (the premise)
+  has already happened by the time this runs; a failure here is never a
+  reason to hold or re-attempt the commit."
+  [rows]
+  (try
+    (let [f (write-ndjson! rows)
+          script (.join path (js/process.cwd) "scripts" "iceberg_append.py")
+          args (clj->js (concat [script]
+                                 ["--account" account "--bucket" bucket
+                                  "--namespace" iceberg/namespace-name "--table" iceberg/table
+                                  "--ndjson" f "--create"]))
+          r (.spawnSync cp "python3" args #js {:encoding "utf8" :env js/process.env})]
+      (cond
+        (some? (.-error r))
+        {:ok? false :error :spawn-failed :detail (.. r -error -message)}
+
+        (zero? (.-status r))
+        {:ok? true :appended (count rows)}
+
+        (= 2 (.-status r))
+        {:ok? false :error :could-not-answer :detail (str/trim (or (.-stderr r) ""))}
+
+        :else
+        {:ok? false :error :refused :detail (str/trim (or (.-stderr r) ""))}))
+    (catch :default e
+      {:ok? false :error :exception :detail (.-message e)})))

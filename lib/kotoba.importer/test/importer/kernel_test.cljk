@@ -1,0 +1,319 @@
+(ns importer.kernel-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [importer.coverage :as cov]
+            [importer.cursor :as cur]
+            [importer.model :as m]
+            [importer.normalize :as n]
+            [importer.outcome :as out]
+            [importer.plan :as plan]
+            [importer.ports :as ports]
+            [importer.receipt :as receipt]))
+
+;; --- a source to test against ---------------------------------------------
+
+(def gov
+  (m/governance {:classification :restricted :pii-tier 3
+                 :retention-days 2555 :consent-required? true
+                 :purpose "compliance:audit"}))
+
+(def src
+  (-> (m/source "com.example.suite" "Example Suite"
+                {:origin-domain "example.com" :governance gov})
+      (m/add-stream :mail {:cursor-style :delta-token
+                           :history-retention (* 7 24 60 60 1000)
+                           :resync-on #{:token-expired}})
+      (m/add-stream :files {:cursor-style :page-token
+                            :history-retention :unbounded})))
+
+;; --- outcome ---------------------------------------------------------------
+
+(deftest outcome-keeps-three-values
+  (is (= [0 1 2] (map out/exit-code [:synced :failed :unmeasured]))
+      "a shell must be able to tell 'nothing to do' from 'never found out'")
+  (is (= :unmeasured (out/worst []))
+      "a batch that ran nothing has not synced anything")
+  (is (= :failed (out/worst [:synced :unmeasured :failed])))
+  (is (= :unmeasured (out/worst [:synced :unmeasured])))
+  (is (= {:synced 1 :failed 0 :unmeasured 2} (out/tally [:synced :unmeasured :unmeasured]))
+      "zero rows are present so nobody reads a missing row as none")
+  (is (not (out/green? :unmeasured))))
+
+;; --- model -----------------------------------------------------------------
+
+(deftest source-must-declare-its-terms
+  (is (m/valid? src))
+  (testing "governance is not optional"
+    (let [bare (-> (m/source "com.example.suite" "Example Suite")
+                   (m/add-stream :mail {:cursor-style :none :history-retention :unbounded}))]
+      (is (some #(= :governance/missing (:importer/code %)) (m/errors bare)))
+      (is (thrown? #?(:clj Exception :cljs js/Error) (m/validated bare)))))
+  (testing "a missing retention is an error; :unknown is a legal answer"
+    (let [absent (-> (m/source "com.example.s" "S" {:governance gov})
+                     (m/add-stream :mail {:cursor-style :none}))
+          stated (-> (m/source "com.example.s" "S" {:governance gov})
+                     (m/add-stream :mail {:cursor-style :none :history-retention :unknown}))]
+      (is (some #(= :stream/no-history-retention (:importer/code %)) (m/errors absent)))
+      (is (m/valid? stated))))
+  (testing "an expirable cursor must name what expires it"
+    (let [s (-> (m/source "com.example.s" "S" {:governance gov})
+                (m/add-stream :mail {:cursor-style :delta-token :history-retention :unknown}))]
+      (is (some #(= :stream/no-resync-condition (:importer/code %)) (m/errors s))))))
+
+;; --- cursor ----------------------------------------------------------------
+
+(def c0 (cur/cursor src :mail "jun@example.com"))
+
+(defn- good-report [n]
+  {:outcome :synced :next-token "t1" :planned n :persisted n :watermark 100 :at 1000})
+
+(deftest cursor-starts-in-backfill
+  (is (= :backfill (cur/phase c0)))
+  (is (not (cur/started? c0)))
+  (is (nil? (cur/token c0))))
+
+(deftest advance-refuses-a-partial-write
+  (let [r (cur/advance c0 (assoc (good-report 10) :persisted 7))]
+    (is (= :held (:importer.cursor/state r)))
+    (is (= :partial-write (:importer.cursor/reason r)))
+    (is (= c0 (:importer.cursor/cursor r))
+        "a held move returns the cursor untouched, so the page is re-read rather than skipped")))
+
+(deftest advance-refuses-when-the-sink-over-counts
+  (let [r (cur/advance c0 (assoc (good-report 5) :persisted 9))]
+    (is (= :over-persist (:importer.cursor/reason r)))))
+
+(deftest advance-refuses-unless-synced
+  (doseq [o [:failed :unmeasured]]
+    (let [r (cur/advance c0 (assoc (good-report 3) :outcome o))]
+      (is (= :not-synced (:importer.cursor/reason r)) (str "outcome " o)))))
+
+(deftest advance-moves-on-the-good-path
+  (let [r (cur/advance c0 (good-report 10))
+        c (:importer.cursor/cursor r)]
+    (is (= :advanced (:importer.cursor/state r)))
+    (is (= "t1" (cur/token c)))
+    (is (= 100 (cur/watermark c)))
+    (is (cur/started? c))
+    (is (not (cur/exhausted? c)))))
+
+(deftest a-final-page-marks-the-backfill-exhausted
+  (let [c (:importer.cursor/cursor (cur/advance c0 (assoc (good-report 4) :next-token nil)))]
+    (is (cur/exhausted? c))))
+
+(deftest promote-refuses-before-the-backfill-is-done
+  (let [mid (:importer.cursor/cursor (cur/advance c0 (good-report 4)))
+        r (cur/promote mid "delta-1" 2000)]
+    (is (= :held (:importer.cursor/state r)))
+    (is (= :backfill-incomplete (:importer.cursor/reason r)))
+    (is (= :backfill (cur/phase (:importer.cursor/cursor r))))))
+
+(deftest promote-works-once-the-backfill-is-exhausted
+  (let [done (:importer.cursor/cursor (cur/advance c0 (assoc (good-report 4) :next-token nil)))
+        r (cur/promote done "delta-1" 2000)]
+    (is (= :promoted (:importer.cursor/state r)))
+    (is (= :incremental (cur/phase (:importer.cursor/cursor r))))
+    (is (= "delta-1" (cur/token (:importer.cursor/cursor r))))))
+
+(defn- incremental []
+  (-> c0
+      (cur/advance (assoc (good-report 4) :next-token nil)) :importer.cursor/cursor
+      (cur/promote "delta-1" 2000) :importer.cursor/cursor))
+
+(deftest incremental-refuses-a-regressing-watermark
+  (let [r (cur/advance (assoc (incremental) :importer.cursor/watermark 500)
+                       (assoc (good-report 2) :watermark 400))]
+    (is (= :watermark-regressed (:importer.cursor/reason r)))))
+
+(deftest incremental-refuses-a-missing-resume-token
+  (let [r (cur/advance (incremental) (assoc (good-report 2) :next-token nil))]
+    (is (= :no-token (:importer.cursor/reason r)))))
+
+(deftest backfill-tolerates-what-incremental-does-not
+  (testing "paging history need not move a watermark forwards"
+    (let [c (assoc c0 :importer.cursor/watermark 500)
+          r (cur/advance c (assoc (good-report 2) :watermark 400))]
+      (is (= :advanced (:importer.cursor/state r))))))
+
+(deftest expired-is-three-valued
+  (let [week (* 7 24 60 60 1000)
+        fresh (:importer.cursor/cursor (cur/advance c0 (good-report 1)))]
+    (is (false? (cur/expired? fresh 1000)))
+    (is (true? (cur/expired? fresh (+ 1000 week 1))))
+    (is (false? (cur/expired? (cur/cursor src :files "d") 999999))
+        "an unbounded retention never expires")
+    (let [unknown (-> (m/source "com.example.u" "U" {:governance gov})
+                      (m/add-stream :mail {:cursor-style :none :history-retention :unknown}))
+          cu (:importer.cursor/cursor
+              (cur/advance (cur/cursor unknown :mail "k") (good-report 1)))]
+      (is (nil? (cur/expired? cu 999999))
+          "unknown retention answers nil, not false -- absence of an answer is not an answer"))))
+
+(deftest reset-returns-to-backfill-and-records-why
+  (let [c (:importer.cursor/cursor (cur/advance c0 (good-report 1)))
+        r (cur/reset c :token-expired 5000)]
+    (is (= :backfill (cur/phase r)))
+    (is (nil? (cur/token r)))
+    (is (= 100 (cur/watermark r)) "what was once imported is still true")
+    (is (= 1 (count (:importer.cursor/resets r))))))
+
+;; --- plan and receipt ------------------------------------------------------
+
+(defn- page [n outcome]
+  (plan/plan {:stream :mail :key "jun@example.com"
+              :items (when (= :synced outcome) (repeat n {:mail/id (str "rfc5322:m" n)}))
+              :next-token "t1" :outcome outcome :watermark 100}))
+
+(deftest commit-lands-the-good-path
+  (let [{:keys [importer/outcome importer/receipt importer/cursor]}
+        (plan/commit (page 3 :synced) c0 {:importer.sink/persisted 3} 1000)]
+    (is (= :synced outcome))
+    (is (cur/started? cursor))
+    (is (empty? (receipt/problems receipt)))
+    (is (not (receipt/silent-hole? receipt)))))
+
+(deftest a-held-move-is-not-a-sync
+  (let [{:keys [importer/outcome importer/receipt importer/cursor]}
+        (plan/commit (page 3 :synced) c0 {:importer.sink/persisted 1} 1000)]
+    (is (= :failed outcome) "read and not landed is a failure, not a quiet success")
+    (is (= c0 cursor))
+    (is (= :partial-write (:importer.receipt/held-reason receipt)))
+    (is (not (receipt/silent-hole? receipt)))
+    (is (empty? (receipt/problems receipt)))))
+
+(deftest an-unmeasurable-page-stays-unmeasured
+  (let [{:keys [importer/outcome]}
+        (plan/commit (page 0 :unmeasured) c0 {:importer.sink/persisted 0} 1000)]
+    (is (= :unmeasured outcome) "could not reach the provider is not 'nothing new'")))
+
+(deftest a-plan-cannot-carry-items-it-did-not-fetch
+  (let [bad (plan/plan {:stream :mail :key "k" :items [{:mail/id "x"}]
+                        :outcome :unmeasured})]
+    (is (some #(= :plan/items-without-sync (:importer/code %)) (plan/problems bad)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (plan/commit bad c0 {:importer.sink/persisted 1} 1)))))
+
+(deftest silent-hole-is-detectable-and-never-produced
+  (testing "the predicate discriminates"
+    (is (receipt/silent-hole?
+         {:importer.receipt/moved? true :importer.receipt/planned 10
+          :importer.receipt/persisted 7})))
+  (testing "and commit never produces one, on either path"
+    (doseq [persisted [0 1 3]]
+      (let [{:keys [importer/receipt]}
+            (plan/commit (page 3 :synced) c0 {:importer.sink/persisted persisted} 1)]
+        (is (not (receipt/silent-hole? receipt)) (str "persisted " persisted))))))
+
+(deftest the-sink-count-is-the-sinks-own
+  (let [sink (ports/counting-sink #(= "rfc5322:reject" (:mail/id %)))
+        records [{:mail/id "rfc5322:a"} {:mail/id "rfc5322:reject"}]
+        report (ports/-persist! sink records)]
+    (is (= 1 (:importer.sink/persisted report)))
+    (is (= 1 (count (:importer.sink/rejected report))))
+    (let [{:keys [importer/outcome]}
+          (plan/commit (plan/plan {:stream :mail :key "k" :items records
+                                   :next-token "t" :outcome :synced})
+                       c0 report 1)]
+      (is (= :failed outcome)
+          "a sink that rejected one of two must not let the cursor past both"))))
+
+;; --- coverage --------------------------------------------------------------
+
+(def sk (cur/stream-key c0))
+
+(deftest an-unimported-stream-says-so
+  (is (= :never-imported (cov/state cov/coverage sk 1000)))
+  (let [a (cov/answer [] cov/coverage [sk] 1000)]
+    (is (cov/empty-and-incomplete? a)
+        "no rows plus no coverage must never be read as 'no'")
+    (is (= [[sk :never-imported]] (cov/gaps a)))))
+
+(deftest a-covered-stream-makes-an-empty-answer-mean-no
+  (let [c (-> (incremental)
+              (cur/advance {:outcome :synced :next-token "d2" :planned 0 :persisted 0 :at 3000})
+              :importer.cursor/cursor)
+        cv (cov/record cov/coverage c :synced 3000)
+        a (cov/answer [] cv [sk] 3000)]
+    (is (= :covered (cov/state cv sk 3000)))
+    (is (cov/complete? a))
+    (is (not (cov/empty-and-incomplete? a))
+        "here, and only here, an empty list is an answer")))
+
+(deftest a-provider-with-no-published-window-is-still-covered
+  (testing "Graph, Drive and Calendar publish no cursor expiry. If `state` let
+            that overrule a run it watched succeed, every stream on those
+            providers would be permanently uncertain, every answer permanently
+            incomplete, and a reader told 'incomplete' about everything would
+            stop reading it."
+    (let [unknown-src (-> (m/source "com.example.u" "U" {:governance gov})
+                          (m/add-stream :mail {:cursor-style :none
+                                               :history-retention :unknown}))
+          c (-> (cur/cursor unknown-src :mail "k")
+                (cur/advance {:outcome :synced :next-token nil :planned 1 :persisted 1 :at 10})
+                :importer.cursor/cursor
+                (cur/promote nil 10) :importer.cursor/cursor)
+          k (cur/stream-key c)
+          cv (cov/record cov/coverage c :synced 10)
+          a (cov/answer [] cv [k] 999999)]
+      (is (= :covered (cov/state cv k 999999)))
+      (is (cov/complete? a))
+      (testing "and the thing we genuinely cannot answer is carried separately"
+        (is (true? (cov/expiry-unknown? cv k 999999)))
+        (is (true? (get-in a [:importer/coverage k :importer.coverage/expiry-unknown?])))))))
+
+(deftest a-published-window-does-not-set-the-caveat
+  (let [c (:importer.cursor/cursor (cur/advance c0 (good-report 1)))
+        cv (cov/record cov/coverage c :synced 1000)]
+    (is (false? (cov/expiry-unknown? cv sk 1000))
+        "the flag means 'the provider publishes none', not 'we did not look'")))
+
+(deftest coverage-tracks-backfilling-stale-and-unknown
+  (let [mid (:importer.cursor/cursor (cur/advance c0 (good-report 4)))
+        week (* 7 24 60 60 1000)]
+    (is (= :backfilling (cov/state (cov/record cov/coverage mid :synced 1000) sk 1000)))
+    (is (= :stale (cov/state (cov/record cov/coverage mid :failed 1000) sk 1000))
+        "a stream whose last run failed is not current")
+    (is (= :stale (cov/state (cov/record cov/coverage mid :synced 1000) sk (+ 1000 week 1)))
+        "a lapsed cursor is not current either")
+    (is (not (contains? cov/states :unknown))
+        "removed on purpose -- see the note on `states`")))
+
+;; --- normalize -------------------------------------------------------------
+
+(deftest an-address-is-identity-and-a-name-is-not
+  (is (= {:person/address "jun@example.com" :person/name "Jun Kawasaki"}
+         (n/address "Jun Kawasaki <Jun@Example.com>")))
+  (is (= {:person/address "jun@example.com" :person/name "Jun Kawasaki"}
+         (n/address "\"Jun Kawasaki\" <jun@example.com>")))
+  (is (= {:person/address "jun@example.com"} (n/address "JUN@example.com")))
+  (is (nil? (n/address nil)))
+  (is (nil? (n/address "  "))))
+
+(deftest both-providers-land-on-the-same-person
+  (let [from-gmail (n/address "Jun Kawasaki <jun@example.com>")
+        from-graph (n/address {:emailAddress {:address "Jun@example.com" :name "Jun Kawasaki"}})
+        from-graph-strings (n/address {"emailAddress" {"address" "jun@EXAMPLE.com" "name" "Jun"}})]
+    (is (= (:person/address from-gmail) (:person/address from-graph)))
+    (is (= (:person/address from-gmail) (:person/address from-graph-strings))
+        "string-keyed JSON must not silently drop the recipient")))
+
+(deftest recipients-deduplicate-and-keep-order
+  (is (= [{:person/address "a@x.com"} {:person/address "b@x.com"}]
+         (n/addresses ["a@x.com" "B@x.com" "a@X.com"]))))
+
+(deftest the-same-message-from-both-providers-is-one-record
+  (let [gmail (n/mail {:message-id "<CAF123@mail.example.com>" :cid "bafyA"
+                       :subject "Re: quote" :at 100 :from "a@x.com"})
+        graph (n/mail {:message-id "CAF123@mail.example.com" :cid "bafyB"
+                       :subject "Re: quote" :at 100
+                       :from {:emailAddress {:address "a@x.com"}}})]
+    (is (= (:mail/id gmail) (:mail/id graph))
+        "a company that migrated has everyone in both systems; keying on the provider id doubles all of them")
+    (is (= "rfc5322:CAF123@mail.example.com" (:mail/id gmail)))))
+
+(deftest a-message-without-a-header-id-falls-back-to-its-bytes
+  (is (= "blob:bafyX" (:mail/id (n/mail {:cid "bafyX" :at 1}))))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (n/mail {:at 1}))))
+
+(deftest an-empty-page-has-no-watermark
+  (is (nil? (n/watermark-of [])))
+  (is (= 300 (n/watermark-of [{:mail/at 100} {:mail/at 300} {:mail/at 200}]))))

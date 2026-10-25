@@ -220,6 +220,19 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.statementFetch` | `kotoba.statementFetch/src` | `kotoba.statement-fetch`, `kotoba.statement-fetch.agent-browser`, `kotoba.statement-fetch.api`, `kotoba.statement-fetch.connector` (Kotoba project library) |
+| `kotoba.shohyo` | `kotoba.shohyo/src` | `kotoba.shohyo`, `kotoba.shohyo.genka`, `kotoba.shohyo.ifrs`, `kotoba.shohyo.jp` (Kotoba project library) |
+| `kotoba.sgp4` | `kotoba.sgp4/src` | `sgp4.core`, `sgp4.frames`, `sgp4.time`, `sgp4.tle` (Kotoba project library) |
+| `kotoba.importer` | `kotoba.importer/src` | `importer.connector`, `importer.coverage`, `importer.cursor`, `importer.model` (Kotoba project library) |
+| `kotoba.edaFlowDemo` | `kotoba.edaFlowDemo/src` | `eda-flow-demo.flow` (Kotoba project library) |
+| `kotoba.commoncrawlActor` | `kotoba.commoncrawlActor/src` | `commoncrawl.cdx`, `commoncrawl.embeddings`, `commoncrawl.extract`, `commoncrawl.iceberg` (Kotoba project library) |
+| `kotoba.langchainStore` | `kotoba.langchainStore/src` | `langchain-store.core` (Kotoba project library) |
+| `kotoba.comMicrosoftGraph` | `kotoba.comMicrosoftGraph/src` | `microsoft-graph.connector` (Kotoba project library) |
+| `kotoba.comGoogleGmail` | `kotoba.comGoogleGmail/src` | `google-gmail.connector` (Kotoba project library) |
+| `kotoba.comGoogleDrive` | `kotoba.comGoogleDrive/src` | `google-drive.connector` (Kotoba project library) |
+| `kotoba.comGoogleChat` | `kotoba.comGoogleChat/src` | `google-chat.client`, `google-chat.connector` (Kotoba project library) |
+| `kotoba.comGoogleCalendar` | `kotoba.comGoogleCalendar/src` | `google-calendar.connector` (Kotoba project library) |
+| `kotoba.bonsai` | `kotoba.bonsai/src` | `bonsai.b2-git`, `bonsai.delta`, `bonsai.git-codec`, `bonsai.git-object` (Kotoba project library) |
 | `kotoba.torihikiTerminal` | `kotoba.torihikiTerminal/src` | `torihiki-terminal.client`, `torihiki-terminal.config`, `torihiki-terminal.deploy`, `torihiki-terminal.keys` (Kotoba project library) |
 | `kotoba.diskspace` | `kotoba.diskspace/src` | `` (Kotoba project library) |
 | `kotoba.mesh` | `kotoba.mesh/src` | `kotoba.mesh.kotoba-oracle`, `kotoba.mesh.node` (Kotoba project library) |

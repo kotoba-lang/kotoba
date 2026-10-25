@@ -1,0 +1,166 @@
+(ns commoncrawl.cdx
+  "Common Crawl CDX index query + WARC-envelope stripping — the PURE,
+  portable core of the `:fetch` StateGraph node. Ports the LESSONS of two
+  existing clients rather than their code:
+
+    - `dossier.commoncrawl` (cloud-itonami-isic-8291, JVM-only
+      org.httpkit.client): `url=` is a MANDATORY CDX query param (there is
+      no bare-domain/keyword search — confirmed live, ADR-2607182400), and
+      a genuine no-match is HTTP **404 with a real JSON body**
+      (`{\"message\": \"No Captures found for: ...\"}`), NOT a bare 200 or a
+      transport error. A naive '200-only' parser silently degrades every
+      real no-match into 'unknown' (nil) instead of 'confirmed absent' ([]);
+      this ns keeps that distinction (see `captures-of`'s docstring) so a
+      caller can tell the two apart, same as dossier.commoncrawl does.
+    - `kenchi.commoncrawl` (kotoba-lang): the index-query -> per-capture
+      WARC-range-fetch -> extract shape, with the actual binary WARC fetch
+      left as an INJECTED capability (never inlined into the pure ns).
+
+  Every network call is a capability injected by the caller — `fetch-fn`
+  (CDX index queries) and, for the WARC body, an already-decompressed-text
+  string handed to `strip-warc-envelope`. This keeps the whole ns free of
+  IO, so it runs identically under :clj (tests, `kbb -M:test`) and
+  :cljs (nbb, the actor's real runtime — repo-wide runtime priority). The
+  REAL network/gzip glue (curl range-fetch + zlib gunzip) lives in
+  `commoncrawl.live-http` (nbb-only, `.cljs`), never here — same
+  'pure core vs. injected real IO' split as `commoncrawl.llm`/
+  `commoncrawl.embeddings`/`commoncrawl.kotobase`."
+  (:require [kotoba.lang.text :as str]))
+
+(def cdx-base "https://index.commoncrawl.org")
+(def data-base "https://data.commoncrawl.org")
+
+;; ── 1. collection discovery ──────────────────────────────────────────────
+
+(defn latest-collection-id
+  "The most recent monthly collection id (\"CC-MAIN-YYYY-WW\") — Common Crawl
+  publishes a new one roughly monthly with no fixed schedule, so this is
+  resolved live rather than hardcoded (mirrors dossier.commoncrawl's own
+  reasoning). `list-collections-fn` is `(fn [] collections-vector | nil)`,
+  ALREADY parsed (see ns docstring) — injectable for tests. nil on a
+  transport failure — never a stale guess."
+  [list-collections-fn]
+  (some-> (list-collections-fn) first :id))
+
+;; ── 2. CDX index query ───────────────────────────────────────────────────
+
+(defn captures-of
+  "Every capture record Common Crawl has for the EXACT `url` (never a
+  domain-wide crawl — see ns docstring) in `collection-id`.
+
+  `fetch-fn` is `(fn [{:keys [path query]}] -> already-parsed-result)`:
+  the SAME seam `dossier.commoncrawl`'s `live-http-fn` hands to its own
+  `captures-of` after parsing the real newline-delimited-JSON (a match) or
+  404-JSON (`[{:message \"No Captures found for: ...\"}]`, a no-match) body
+  — tests inject a fake returning canned Clojure data directly (see
+  test/commoncrawl/cdx_test.cljk), the real nbb http-fn
+  (`commoncrawl.live-http`) does the actual HTTP GET + JSON parse.
+
+  Returns:
+    a non-empty vector — one or more real captures.
+    `[]`                — CONFIRMED absent from this crawl (the real API's
+                           own no-match shape, a single `{:message ...}`
+                           map, collapses to this).
+    `nil`                — transport/parse failure, genuinely UNKNOWN.
+  These three are deliberately different so a caller never conflates
+  'confirmed absent' with 'we don't actually know' (the exact bug
+  dossier.commoncrawl's own live verification found and fixed)."
+  [fetch-fn collection-id url]
+  (let [result (fetch-fn {:path (str "/" collection-id "-index")
+                          :query {"url" url "output" "json"}})]
+    (cond
+      (nil? result) nil
+      (and (sequential? result) (= 1 (count result)) (:message (first result))) []
+      (sequential? result) result
+      :else nil)))
+
+(defn latest-capture
+  "The most recent capture for `url` in `collection-id` (captures are NOT
+  guaranteed newest-first by the real API, so this sorts by `:timestamp`
+  explicitly — same discipline as dossier.commoncrawl), or nil when there
+  is none (confirmed absent OR unknown; distinguish those via `captures-of`
+  directly if it matters to the caller)."
+  [fetch-fn collection-id url]
+  (some->> (captures-of fetch-fn collection-id url)
+           seq
+           (sort-by :timestamp)
+           last))
+
+(defn has-web-presence?
+  "True iff `url` has at least one capture in `collection-id`. A `false`
+  here is honestly 'not found in THIS crawl' — see ns docstring, this can
+  never be read as 'this domain has no website'."
+  [fetch-fn collection-id url]
+  (boolean (seq (captures-of fetch-fn collection-id url))))
+
+(defn latest-response-capture
+  "Like `latest-capture`, but filtered to `:status \"200\"` captures ONLY
+  (kenchi.commoncrawl's own `index-query` applies this same filter) —
+  `latest-capture`/`has-web-presence?` deliberately do NOT filter by status
+  (any capture, including a redirect/error, is honest evidence of 'a crawl
+  saw this URL'), but fetching a WARC record for its BODY needs an actual
+  200 response: a URL's most RECENT capture by timestamp is not
+  necessarily a 200 (confirmed live: www.sec.gov's newest CC-MAIN-2026-25
+  capture was a tiny 301-redirect stub with no page content — picking
+  'most recent regardless of status' silently fetched that instead of any
+  of the URL's many real 200 captures). Returns nil when no 200 capture
+  exists for `url` in `collection-id`."
+  [fetch-fn collection-id url]
+  (some->> (captures-of fetch-fn collection-id url)
+           seq
+           (filter #(= "200" (:status %)))
+           seq
+           (sort-by :timestamp)
+           last))
+
+;; ── 3. WARC envelope stripping (pure string parsing) ────────────────────
+;; A WARC record fetched by byte-range is: a WARC-header block, a blank
+;; line, then the ENTIRE captured HTTP response (its own status line +
+;; headers + blank line + body) verbatim. Two header layers to strip, not
+;; one. This fn is pure text -> text so it's fully testable with literal
+;; fixture strings (no gzip/network needed) — the actual byte-range fetch +
+;; gunzip that produces `decompressed-text` lives in commoncrawl.live-http.
+
+(defn- split-header-body
+  "First blank-line boundary (\\r\\n\\r\\n or \\n\\n) -> [header-block body]. A
+  missing boundary returns [s \"\"] rather than throwing — a truncated/
+  malformed WARC record degrades to an empty body, never an exception."
+  [s]
+  (if-let [i (or (str/index-of s "\r\n\r\n") (str/index-of s "\n\n"))]
+    (let [sep-len (if (str/index-of s "\r\n\r\n") 4 2)]
+      [(subs s 0 i) (subs s (+ i sep-len))])
+    [s ""]))
+
+(defn strip-warc-envelope
+  "Decompressed WARC record text -> the captured page's raw HTTP body (HTML,
+  usually). Strips the WARC-header block, then the embedded HTTP response's
+  own header block. Returns \"\" (never nil/throw) on anything that doesn't
+  look like a WARC response record — a caller treats an empty body as 'no
+  usable content', same as a genuine extraction miss."
+  [decompressed-text]
+  (if-not (string? decompressed-text)
+    ""
+    (let [[warc-headers rest1] (split-header-body decompressed-text)]
+      (if-not (re-find #"(?i)WARC-Type:\s*response" warc-headers)
+        ""
+        (let [[_http-headers body] (split-header-body rest1)]
+          (or body ""))))))
+
+(defn fetch-page-text
+  "Orchestrates: latest 200-response capture (`latest-response-capture`,
+  NOT `latest-capture` — see its docstring for why a plain 'most recent'
+  pick can land on a contentless redirect/error record) in `collection-id`
+  for `url` -> WARC record fetch (`warc-fetch-fn`, `(fn [capture] ->
+  decompressed-text | nil)`, injected — real IO lives in
+  commoncrawl.live-http) -> stripped HTTP body.
+
+  Returns {:url :capture :text} on success, or nil when there's no 200
+  capture, the fetch failed, or the stripped body is blank — a single
+  'nothing usable' outcome so the :fetch node doesn't need to distinguish
+  different kinds of miss to decide whether to proceed to :advise."
+  [fetch-fn warc-fetch-fn collection-id url]
+  (when-let [capture (latest-response-capture fetch-fn collection-id url)]
+    (when-let [raw (try (warc-fetch-fn capture) (catch #?(:clj Exception :cljs :default) _ nil))]
+      (let [text (strip-warc-envelope raw)]
+        (when (seq (str/trim text))
+          {:url url :capture capture :text text})))))

@@ -1,0 +1,294 @@
+(ns langchain-store.contract-test
+  "The invariants the 316 consumers depend on but that `core-test` did not
+  pin — plus the three sharp edges this library has and should not lose
+  quietly.
+
+  `core-test` covers the happy paths: values round-trip, the stream comes
+  back sorted, a blob decodes to its default. Each of those tests was
+  written alongside the code it covers, so each one passes for the reason
+  the author had in mind. This namespace asks the other question — **what
+  would still be green if the implementation regressed?** — and pins the
+  answers. Each test below was watched go red against a deliberately
+  broken copy before it landed (`scripts/maturity-loop/mutations.edn`,
+  suite `langchain-store` — 12 mutations, all seen to bite on 2026-08-15);
+  the mutation that breaks each one is named in its docstring. The one
+  exception says so in its own docstring and explains what it pins
+  instead — a test with no mutation behind it is worth having only if it
+  admits that is what it is.
+
+  Three groups:
+
+    1. Claims the library makes in prose and never checked in code. The
+       central one: blobs are stored as *strings*. That is the entire
+       reason the codec exists and no test looked at a stored datom.
+    2. Assertions `core-test` makes too weakly to discriminate. Its
+       ordering test appends 1,2,3 in order — deleting `sort-by` leaves
+       it green often enough that it is not a gate.
+    3. Sharp edges: behaviors that are surprising, currently correct-by-
+       definition, and would change silently under a plausible
+       \"improvement\". Pinned so that changing them costs a red test and
+       a README edit rather than 316 consumers finding out at runtime.
+
+  Portable `.cljc` — both runtimes are gates and this namespace must be
+  in `cljs-runner`'s `run-tests` list or CLJS silently never runs it."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langchain.db :as d]
+            [langchain-store.core :as ls]))
+
+(defn- datom-value
+  "The value of the single `attr` datom in `conn`. Filters by attribute
+  rather than indexing, because `d/datoms` order differs by runtime —
+  measured 2026-08-15: the same two writes come back `[:x/payload :x/id]`
+  on the JVM and `[:x/id :x/payload]` under CLJS. A test that took
+  `(first ...)` would pass on one runtime and fail on the other."
+  [conn attr]
+  (some (fn [[_ a v]] (when (= a attr) v)) (d/datoms (d/db conn) :eavt)))
+
+;; ═══════════════ 1. claims made in prose, never checked ═══════════════
+
+(deftest blobs-are-stored-as-strings-not-as-structure
+  "The library's reason for existing. `core.cljc`'s docstring: compound
+  values are stored as EDN strings *so langchain.db doesn't expand them
+  into sub-entities*. Every existing test reads back through `dec*`, so
+  dropping `enc` entirely would round-trip fine through an in-memory db
+  and stay green — the claim about what is on disk was never tested.
+
+  Mutation: make `enc` the identity function."
+  (testing "put-blob! stores a string"
+    (let [conn (d/create-conn (ls/identity-schema [:x/id]))]
+      (ls/put-blob! conn :x/id :x/payload "k" {:deep {:a [1 2 3]}})
+      (let [stored (datom-value conn :x/payload)]
+        (is (string? stored) "the payload datom holds EDN text, not a map")
+        (is (= "{:deep {:a [1 2 3]}}" stored))
+        (is (= {:deep {:a [1 2 3]}} (ls/dec* stored))))))
+
+  (testing "append-blob! stores a string"
+    (let [conn (d/create-conn (ls/identity-schema [:ev/seq]))]
+      (ls/append-blob! conn :ev/seq :ev/edn 0 {:kind :a})
+      (is (string? (datom-value conn :ev/edn)))))
+
+  (testing "map->tx marks :blob? fields as text and leaves the rest alone"
+    (let [spec {:id {:attr :a/id}
+                :tags {:attr :a/tags :blob? true}
+                :n {:attr :a/n}}
+          tx (ls/map->tx spec {:id "a" :tags [:x :y] :n 3})]
+      (is (= "[:x :y]" (:a/tags tx)) "the compound field is encoded")
+      (is (= 3 (:a/n tx)) "a scalar is NOT encoded — it needs no blob")
+      (is (= "a" (:a/id tx))))))
+
+(deftest identity-schema-is-what-makes-a-re-put-upsert
+  "Why `put-blob!`'s docstring insists `id-attr` be `:db.unique/identity`.
+  Without it the second write forks a second entity and nothing complains
+  — the store now holds two answers for one key and `blob-lookup` returns
+  whichever the query reaches. `core-test` only ever writes through a
+  conn built by `identity-schema`, so it never sees the failure mode the
+  schema exists to prevent.
+
+  Mutation: `identity-schema` stops marking `:db/unique` (returns `{}` per
+  attr). Both halves then fork and this goes red — which is the point: the
+  helper is a one-liner, so it is easy to believe it is decorative."
+  (let [forked (d/create-conn {})
+        keyed (d/create-conn (ls/identity-schema [:x/id]))]
+    (doseq [conn [forked keyed]]
+      (ls/put-blob! conn :x/id :x/payload "k" {:v 1})
+      (ls/put-blob! conn :x/id :x/payload "k" {:v 2}))
+    (is (= 2 (count (distinct (map first (d/datoms (d/db forked) :eavt)))))
+        "no identity -> the re-put forked a second entity, silently")
+    (is (= 1 (count (distinct (map first (d/datoms (d/db keyed) :eavt)))))
+        "identity -> the re-put upserted onto the same entity")
+    (is (= {:v 2} (ls/blob-lookup keyed :x/id :x/payload "k")))))
+
+(deftest blob-lookup-is-nil-when-the-entity-has-no-payload-yet
+  "An id-only entity is ordinary: `map->tx` omits absent keys, so a store
+  that writes the identity before the body leaves exactly this shape. The
+  lookup must read nil rather than throw, because callers branch on nil.
+  `core-test` covers the absent-*entity* case; this is the present-entity
+  /absent-attribute case, which takes a different path through `d/q`.
+
+  **No mutation gates this one, and that is a finding rather than an
+  omission.** The obvious mutation — drop the `(when s ...)` guard in
+  `dec*` — does not make it red, because measured 2026-08-15 on both
+  runtimes `(edn/read-string nil)` *returns nil*: `clojure.edn` on the JVM
+  and `cljs.reader` under CLJS both do. So the guard is defensive, not
+  load-bearing, and neither this test nor `core-test`'s `(is (nil? (dec*
+  nil)))` can distinguish its presence. What is pinned here is the
+  dependency's behavior — an unsatisfiable `d/q` yielding nil — which is
+  what makes the nil-branching in 316 consumers correct."
+  (let [conn (d/create-conn (ls/identity-schema [:x/id]))]
+    (d/transact! conn [{:x/id "k"}])
+    (is (nil? (ls/blob-lookup conn :x/id :x/payload "k")))
+    (testing "and it starts reading once the payload lands"
+      (ls/put-blob! conn :x/id :x/payload "k" {:v 1})
+      (is (= {:v 1} (ls/blob-lookup conn :x/id :x/payload "k"))))))
+
+;; ══════════ 2. assertions core-test makes too weakly to gate ══════════
+
+(deftest read-stream-sorts-numerically-not-by-arrival-or-as-text
+  "`core-test`'s ordering test appends seqs 1,2,3 *in order* and asserts
+  it gets 1,2,3 back — which is also what an unsorted read returns when
+  the query happens to yield them that way, so it does not discriminate.
+  This one appends out of order and crosses the 9/10 boundary, so it is
+  red for both plausible regressions:
+
+    - drop `sort-by`      -> arrival order  [7 2 11 0 10 1]
+    - sort as strings     -> lexicographic  [0 1 10 11 2 7]
+
+  Mutations: `sort-by first` -> `identity`; `sort-by first` ->
+  `sort-by (comp str first)`."
+  (let [conn (d/create-conn (ls/identity-schema [:ev/seq]))]
+    (doseq [s [7 2 11 0 10 1]]
+      (ls/append-blob! conn :ev/seq :ev/edn s {:s s}))
+    (is (= [0 1 2 7 10 11] (mapv :s (ls/read-stream conn :ev/seq :ev/edn)))
+        "sorted by seq as a number")))
+
+(deftest append-record-numbers-the-ledger-from-zero-and-contiguously
+  "`core-test` asserts the records come back in append order and that the
+  stamps are right, but never looks at the sequence numbers themselves —
+  so off-by-one in `next-seq` keeps it green while every consumer that
+  indexes the ledger, or resumes from `(count records)`, shifts by one.
+
+  Mutation: `(count (read-stream ...))` -> `(inc (count (read-stream ...)))`."
+  (let [conn (d/create-conn (ls/identity-schema [:r/seq]))]
+    (doseq [t [:a :b :c]]
+      (ls/append-record! conn :r/seq :r/edn t {} 1))
+    (is (= [0 1 2] (sort (map (fn [[_ _ v]] v)
+                              (d/datoms (d/db conn) :eavt nil :r/seq))))
+        "first record is seq 0 and the numbering has no gaps")))
+
+(deftest stamp-overwrites-a-spoofed-stamp-on-the-whole-path
+  "`core-test` pins this on `stamp` alone. The property that matters to an
+  audit ledger is that it survives `append-record!` too — a caller cannot
+  backdate a record by passing `:timestamp` in the payload.
+
+  Mutation: `assoc` -> `merge` with the record-data winning."
+  (let [conn (d/create-conn (ls/identity-schema [:r/seq]))]
+    (ls/append-record! conn :r/seq :r/edn :commit
+                       {:who "a" :type :spoofed :timestamp 1} 42)
+    (let [rec (first (ls/read-stream conn :r/seq :r/edn))]
+      (is (= :commit (:type rec)) "the ledger's type wins")
+      (is (= 42 (:timestamp rec)) "the ledger's timestamp wins")
+      (is (= "a" (:who rec)) "the rest of the payload survives"))))
+
+(deftest map->tx-omits-absent-keys-so-a-partial-write-does-not-erase
+  "The `some?` gate is what makes a partial write safe: a store that
+  updates status alone must not blank the fields it left out. `core-test`
+  reads a partial write back through a conn, where an omitted attribute
+  and an attribute written as nil both read as nil — so it cannot tell
+  the two apart, which is exactly the difference that matters on upsert.
+
+  Mutation: drop the `some?` gate (`(assoc tx attr ...)` unconditionally)."
+  (let [spec {:id {:attr :a/id} :status {:attr :a/status} :note {:attr :a/note}}]
+    (testing "an absent key is absent from the tx map, not present as nil"
+      (let [tx (ls/map->tx spec {:id "a" :status :intake})]
+        (is (= {:a/id "a" :a/status :intake} tx))
+        (is (not (contains? tx :a/note)))))
+    (testing "so the second, partial write leaves the first one's field intact"
+      (let [conn (d/create-conn (ls/identity-schema [:a/id]))]
+        (d/transact! conn [(ls/map->tx spec {:id "a" :status :intake :note "keep me"})])
+        (d/transact! conn [(ls/map->tx spec {:id "a" :status :bound})])
+        (let [back (ls/pull->map spec :id (d/pull (d/db conn) (ls/pull-pattern spec) [:a/id "a"]))]
+          (is (= :bound (:status back)) "the written field moved")
+          (is (= "keep me" (:note back)) "the omitted field was not erased"))))))
+
+;; ═══════════════════════ 3. sharp edges, pinned ═══════════════════════
+;; Each of these is current, deliberate behavior that a plausible
+;; "improvement" would change silently for 316 consumers. Pinned so the
+;; change costs a red test and a README edit. None of them is a bug
+;; report — they are the places where the obvious reading is wrong.
+
+(deftest coerce-does-not-apply-to-blob-fields
+  "`pull->map`'s `cond` tries `blob?` before `coerce`, so a field marked
+  both is decoded and the `:coerce` fn never runs. That is the useful
+  order — a blob's decoded value is already its logical value — but it is
+  invisible at the call site, where a spec carrying both reads as though
+  both apply.
+
+  Mutation: swap the two `cond` branches."
+  (let [spec {:id {:attr :a/id}
+              :f {:attr :a/f :blob? true :coerce (constantly :COERCED)}}]
+    (is (= [1 2] (:f (ls/pull->map spec :id {:a/id "x" :a/f (ls/enc [1 2])})))
+        "decoded, not coerced")))
+
+(deftest blob-default-fires-on-false-and-nil-not-only-on-absence
+  "`pull->map` decodes with `(or (dec* v) default)`, so a blob whose
+  stored value is `false` — or `nil` — reads back as the `:default`, not
+  as what was written. `false` is not a compound value and no consumer
+  should be blobbing one, which is why `or` has been fine; but the
+  docstring says \"nil -> :default\" and the code means \"falsey ->
+  :default\". Pinned rather than fixed: changing `or` to a `some?` test
+  changes what 316 consumers read back from ledgers already on disk, so
+  it needs its own measurement, not a drive-by.
+
+  Mutation: `(or (dec* v) default)` -> `(if-some [d (dec* v)] d default)`
+  — i.e. the tempting fix. It must break this test, not pass it quietly."
+  (let [spec {:id {:attr :a/id} :f {:attr :a/f :blob? true :default :DEFAULT}}]
+    (is (= :DEFAULT (:f (ls/pull->map spec :id {:a/id "x" :a/f (ls/enc false)})))
+        "a stored false reads as the default")
+    (is (= :DEFAULT (:f (ls/pull->map spec :id {:a/id "x" :a/f (ls/enc nil)})))
+        "a stored nil reads as the default")
+    (testing "while a stored empty collection survives — it is not falsey"
+      (is (= [] (:f (ls/pull->map spec :id {:a/id "x" :a/f (ls/enc [])})))))))
+
+(deftest append-record-catches-up-through-a-gap-and-clobbers
+  "The README says `append-record!` is not atomic because it derives the
+  next sequence from `(count stream)`. The consequence is sharper than
+  \"two writers can collide\": a ledger with a *gap* below its high-water
+  mark makes the counter land on a record that already exists, and
+  `seq-attr` being `:db.unique/identity` turns that into an upsert. The
+  older record is overwritten and the stream length does not change, so
+  nothing observable says a record was lost.
+
+  Seqs 0,1,3 -> count 3 -> the next append writes seq 3, on top of the
+  record already there. Pinned because it is the concrete failure the
+  README's caveat is abstractly describing, and because any fix (track a
+  high-water mark instead of counting) must announce itself here.
+
+  Mutation: `(count (read-stream ...))` -> a high-water-mark computation
+  — the fix. It must break this test, so that fixing it is a decision."
+  (let [conn (d/create-conn (ls/identity-schema [:r/seq]))]
+    (doseq [[s v] [[0 {:n 0}] [1 {:n 1}] [3 {:n :will-be-lost}]]]
+      (ls/append-blob! conn :r/seq :r/edn s v))
+    (is (= 3 (count (ls/read-stream conn :r/seq :r/edn))))
+    (ls/append-record! conn :r/seq :r/edn :new {} 7)
+    (let [log (ls/read-stream conn :r/seq :r/edn)]
+      (is (= 3 (count log)) "still three records — the append replaced one")
+      (is (not-any? #(= :will-be-lost (:n %)) log)
+          "the record at seq 3 was clobbered by the catch-up")
+      (is (= :new (:type (last log)))))))
+
+(deftest enc-is-not-canonical-text-so-do-not-address-a-blob-by-its-bytes
+  "`enc` is `pr-str`, which emits a map in iteration order. Below nine
+  entries that is insertion order; above it, hash order. Measured
+  2026-08-15 on both runtimes: a 12-key map encodes as `{:k8 8, :k11 11,
+  :k5 5, …}` on the JVM *and* under CLJS — the two agree here, but
+  neither is sorted, and neither promises to keep agreeing.
+
+  So the value round-trips (asserted) while the text is not a content
+  address (asserted). A consumer hashing a blob to dedupe or to build a
+  CID must sort first. If someone makes `enc` canonical this test goes
+  red, which is the point — that is a compatibility event for every
+  ledger already written, not a cleanup.
+
+  Mutation: `pr-str` -> a canonical (sorted) encoder."
+  (let [big (into {} (map (fn [i] [(keyword (str "k" i)) i])) (range 12))]
+    (is (= big (ls/dec* (ls/enc big))) "the value survives regardless")
+    (is (not= (ls/enc big) (pr-str (into (sorted-map) big)))
+        "the text is NOT canonically ordered — sort before hashing")
+    (testing "and it is stable within a runtime, so equal maps encode alike"
+      (is (= (ls/enc big) (ls/enc (into {} (reverse (seq big)))))))))
+
+(deftest now-ms-is-a-real-clock-and-append-record-reads-it
+  "`now-ms` is deliberately not injectable; `stamp` takes `ts` so tests can
+  pin it, and `append-record!`'s short arity reads the clock. `core-test`
+  checks `now-ms` in isolation and that the short arity produces *some*
+  positive timestamp. What is unpinned is that it reads the clock at
+  append time rather than, say, a value captured when the ns loaded.
+
+  Mutation: bind `now-ms`'s result at namespace load and reuse it."
+  (let [conn (d/create-conn (ls/identity-schema [:r/seq]))
+        before (ls/now-ms)]
+    (ls/append-record! conn :r/seq :r/edn :audit {:who "c"})
+    (let [ts (:timestamp (first (ls/read-stream conn :r/seq :r/edn)))
+          after (ls/now-ms)]
+      (is (<= before ts after)
+          "the stamp was read during the append, inside this test's window"))))

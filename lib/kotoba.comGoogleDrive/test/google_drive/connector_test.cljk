@@ -1,0 +1,105 @@
+(ns google-drive.connector-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [connector.declare :as decl]
+            [connector.invoke :as invoke]
+            [connector.model :as m]
+            [connector.ports :as ports]
+            [connector.registry :as reg]
+            [connector.validate :as v]
+            [google-drive.connector :as c]))
+
+(def registry (reg/registry [c/provider]))
+
+(deftest descriptor-is-valid-and-correctly-named
+  (is (empty? (v/errors c/descriptor)))
+  (is (true? (v/name-conformant? c/descriptor "com-google-drive"))))
+
+(deftest listing-files-does-not-ask-for-permission-to-read-them
+  (testing "metadata tools carry only the metadata scope"
+    (let [scopes (m/scopes-for c/descriptor ["google_drive_search_files"
+                                             "google_drive_get_file"
+                                             "google_drive_list_permissions"])]
+      (is (some #{c/metadata-scope} scopes))
+      (is (not (some #{c/content-scope} scopes))
+          "drive.readonly is content access; a file lister must not hold it")))
+  (testing "export is the one tool that needs content access, and says so"
+    (is (= [c/content-scope]
+           (:connector/scopes (m/tool c/descriptor "google_drive_export_document"))))))
+
+(deftest search-requests-the-fields-it-normalizes
+  (let [req (invoke/request-for registry "google_drive_search_files"
+                                {"q" "name contains 'budget'"})
+        fields (get-in req [:connector.http/query "fields"])]
+    (is (= "https://www.googleapis.com/drive/v3/files" (:connector.http/url req)))
+    (is (= "name contains 'budget'" (get-in req [:connector.http/query "q"])))
+    (testing "Drive's default projection is id/name/mimeType, so every other
+              field the normalizer reads has to be asked for by name"
+      (doseq [f ["modifiedTime" "owners" "webViewLink" "trashed" "size"]]
+        (is (str/includes? fields f) (str "fields is missing " f))))))
+
+(deftest a-file-id-is-encoded-into-the-path
+  (let [req (invoke/request-for registry "google_drive_get_file" {"fileId" "a/b+c"})]
+    (is (= "https://www.googleapis.com/drive/v3/files/a%2Fb%2Bc" (:connector.http/url req)))))
+
+(deftest export-defaults-to-plain-text
+  (is (= {"mimeType" "text/plain"}
+         (:connector.http/query (invoke/request-for registry "google_drive_export_document"
+                                                    {"fileId" "f1"}))))
+  (is (= {"mimeType" "text/csv"}
+         (:connector.http/query (invoke/request-for registry "google_drive_export_document"
+                                                    {"fileId" "f1" "mimeType" "text/csv"})))))
+
+(deftest there-is-no-binary-download-tool
+  (is (not (some #(str/includes? % "download") (m/tool-names c/descriptor)))
+      "bytes belong on the object plane, not in a tool result — see the namespace docstring"))
+
+(deftest search-normalizes-to-rows-and-keeps-the-page-token
+  (let [http (ports/http-fn
+              (fn [_] {:connector.http/status 200
+                       :connector.http/body
+                       {"nextPageToken" "tok2"
+                        "files" [{"id" "f1" "name" "Budget" "mimeType" "application/vnd.google-apps.spreadsheet"
+                                  "modifiedTime" "2026-08-08T00:00:00Z"
+                                  "owners" [{"emailAddress" "jun@example.com"}]
+                                  "trashed" false}]}}))
+        result (invoke/call registry "google_drive_search_files" {"q" "x"}
+                            {:http http
+                             :tokens (ports/static-tokens {"com.google.drive" "tok"})})
+        [f] (:files result)]
+    (is (= "tok2" (:next-page-token result)))
+    (is (= "Budget" (:name f)))
+    (is (= ["jun@example.com"] (:owners f)))
+    (is (false? (:trashed? f)))))
+
+(deftest permissions-answer-whether-a-file-left-the-org
+  (let [http (ports/http-fn
+              (fn [_] {:connector.http/status 200
+                       :connector.http/body
+                       {"permissions" [{"id" "p1" "type" "anyone" "role" "reader"
+                                        "allowFileDiscovery" true}]}}))
+        result (invoke/call registry "google_drive_list_permissions" {"fileId" "f1"}
+                            {:http http
+                             :tokens (ports/static-tokens {"com.google.drive" "tok"})})]
+    (is (= [{:id "p1" :type "anyone" :role "reader" :email nil :domain nil :discoverable? true}]
+           (:permissions result)))))
+
+(deftest every-tool-declares-scopes-and-an-effect
+  (doseq [t (m/tools c/descriptor)]
+    (is (seq (:connector/scopes t)))
+    (is (#{:read :write} (:connector/effect t)))
+    (is (str/starts-with? (:connector/name t) "google_drive_"))))
+
+(deftest connector-edn-matches-the-descriptor
+  (testing "the committed declaration is generated, not maintained — a second
+            source of truth for one contract is how the two start to disagree"
+    (let [committed (edn/read-string
+                     #?(:clj (slurp "connector.edn")
+                        :cljs (.readFileSync (js/require "fs") "connector.edn" "utf8")))]
+      (is (= (decl/declaration c/provider
+                               {:namespace "google-drive.connector"
+                                :var "provider"
+                                :authority "90-docs/adr/2608097000-connector-plane-one-repo-per-connector.edn"})
+             committed)
+          "run: kbb --backend sci --classpath \"src:../connector/src\" emit-connector-edn.cljk"))))

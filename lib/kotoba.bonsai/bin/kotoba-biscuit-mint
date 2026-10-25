@@ -1,0 +1,100 @@
+#!/usr/bin/env kbb
+(ns kotoba-biscuit-mint
+  "Exchange a kotobase service-account token for a repository Biscuit and
+   write it where kotobase-private-git-adapter reads it.
+
+     POST <authn>/v1/biscuit/token
+       Authorization: Bearer <service token>
+       {\"tenantId\": …, \"repository\": <rid>, \"permissions\": [...]}
+
+   Nothing secret is taken from argv (it takes no arguments at all):
+     KOTOBA_SERVICE_TOKEN_FILE  file holding the kb_sa_… service token (mode 600)
+     KOTOBA_TENANT_ID           the tenant id, or KOTOBA_TENANT_ID_FILE
+     KOTOBA_GIT_REPOSITORY      the private repository id, e.g. rad:cloud-murakumo
+     KOTOBA_GIT_PERMISSIONS     comma-separated, default git:fetch,git:push
+     KOTOBA_GIT_BISCUIT_FILE    where to write the token (replaced atomically, mode 600)
+     KOTOBA_AUTHN_URL           default https://auth.kotoba.cloud
+     KOTOBA_GIT_ALLOW_HTTP_LOOPBACK=1  plain http to 127.0.0.1/localhost (tests)
+
+   The Biscuit lives 15 minutes (authn.biscuit/ttl-seconds); run this again
+   before a push that may outlast it -- the adapter re-reads the file for
+   every request, so replacing it mid-push is safe. Prints only the file and
+   the expiry; never the token."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:crypto" :as crypto]
+            [bonsai.private-wire :as wire]))
+
+(defn- fail! [m]
+  (fs/writeSync 2 (str "kotoba-biscuit-mint: " m "\n"))
+  (.exit js/process 1))
+
+(defn- env [k] (let [v (aget (.-env js/process) k)] (when (and v (not= "" (.trim v))) (.trim v))))
+
+(defn- secret-file [var]
+  (let [f (or (env var) (fail! (str var " is required")))]
+    (when-not (fs/existsSync f) (fail! (str var " names a file that does not exist")))
+    (when-not (zero? (bit-and (.-mode (fs/statSync f)) 63))
+      (fail! (str f " is readable by group or other; chmod 600 it")))
+    (.trim (fs/readFileSync f "utf8"))))
+
+(defn- authn-url []
+  (let [base (or (env "KOTOBA_AUTHN_URL") "https://auth.kotoba.cloud")
+        u (try (js/URL. base) (catch :default _ (fail! "KOTOBA_AUTHN_URL is not a URL")))
+        loopback? (contains? #{"127.0.0.1" "localhost"} (.-hostname u))]
+    (when-not (or (= "https:" (.-protocol u))
+                  (and loopback? (= "http:" (.-protocol u))
+                       (= "1" (env "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK"))))
+      (fail! "KOTOBA_AUTHN_URL must be https"))
+    (str (.-origin u) "/v1/biscuit/token")))
+
+(defn- write-atomically!
+  "Same directory, exclusive create at 0600, fsync, rename over the old
+   token: a reader sees the old token or the new one, never half of one, and
+   the token is never on disk under a wider mode."
+  [file content]
+  (let [tmp (path/join (path/dirname file)
+                       (str "." (path/basename file) ".tmp-" (.toString (crypto/randomBytes 6) "hex")))
+        fd (fs/openSync tmp "wx" 384)]                          ; 384 = 0600
+    (try (fs/writeSync fd content) (fs/fsyncSync fd) (finally (fs/closeSync fd)))
+    (try (fs/renameSync tmp file)
+         (catch :default e (fs/rmSync tmp #js {:force true}) (throw e)))))
+
+(when (seq *command-line-args*)
+  (fail! "takes no arguments; configure it with the environment (see the namespace docstring)"))
+
+(let [service (secret-file "KOTOBA_SERVICE_TOKEN_FILE")
+      tenant (or (env "KOTOBA_TENANT_ID")
+                 (when (env "KOTOBA_TENANT_ID_FILE") (secret-file "KOTOBA_TENANT_ID_FILE"))
+                 (fail! "KOTOBA_TENANT_ID or KOTOBA_TENANT_ID_FILE is required"))
+      rid (or (env "KOTOBA_GIT_REPOSITORY") (fail! "KOTOBA_GIT_REPOSITORY is required"))
+      permissions (vec (map #(.trim %) (.split (or (env "KOTOBA_GIT_PERMISSIONS") "git:fetch,git:push") ",")))
+      out (or (env "KOTOBA_GIT_BISCUIT_FILE") (fail! "KOTOBA_GIT_BISCUIT_FILE is required"))
+      url (authn-url)]
+  ;; The shapes authn itself enforces, checked here so a typo fails before a
+  ;; request: authn's bearer-token accepts [A-Za-z0-9._~-]{20,2048} and
+  ;; enterprise/verify-service-token wants kb_sa_ and 40-256 characters.
+  (when-not (and (re-matches #"kb_sa_[A-Za-z0-9._~-]+" service) (<= 40 (count service) 256))
+    (fail! "the service token is not a kb_sa_ token"))
+  (when (re-find #"[\x00-\x1f\x7f]" tenant) (fail! "the tenant id contains control characters"))
+  (when-not (wire/valid-rid? rid) (fail! "KOTOBA_GIT_REPOSITORY is not a valid private repository id"))
+  (when-not (every? #(re-matches #"git:[a-z]+" %) permissions)
+    (fail! "KOTOBA_GIT_PERMISSIONS must be git:* names"))
+  (-> (js/fetch url #js {:method "POST"
+                         :headers #js {:authorization (str "Bearer " service)
+                                       "content-type" "application/json"}
+                         :body (js/JSON.stringify
+                                (clj->js {:tenantId tenant :repository rid :permissions permissions}))})
+      (.then (fn [r] (.then (.text r) (fn [t] [(.-status r) t]))))
+      (.then (fn [[status text]]
+               (let [body (try (js->clj (js/JSON.parse text)) (catch :default _ nil))]
+                 (when-not (= 201 status)
+                   (fail! (str "authn answered HTTP " status ": " (or (get body "error") "no error text"))))
+                 (let [token (get body "token")]
+                   (when-not (and (string? token) (re-matches #"[A-Za-z0-9_-]{80,8192}" token))
+                     (fail! "authn's answer does not carry a Biscuit"))
+                   (write-atomically! out (str token "\n"))
+                   (fs/writeSync 2 (str "kotoba-biscuit-mint: wrote " out " (expires "
+                                        (get body "expiresAt") ")\n"))
+                   (.exit js/process 0)))))
+      (.catch (fn [e] (fail! (str "request failed: " (or (ex-message e) (.-message e) e)))))))

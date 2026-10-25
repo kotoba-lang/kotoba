@@ -1,0 +1,130 @@
+(ns microsoft-graph.connector-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [connector.auth :as auth]
+            [connector.declare :as decl]
+            [connector.invoke :as invoke]
+            [connector.model :as m]
+            [connector.ports :as ports]
+            [connector.registry :as reg]
+            [connector.validate :as v]
+            [microsoft-graph.connector :as c]))
+
+(def registry (reg/registry [c/provider]))
+(def tokens (ports/static-tokens {"com.microsoft.graph" "tok"}))
+
+(deftest descriptor-is-valid-and-correctly-named
+  (is (empty? (v/errors c/descriptor)))
+  (is (true? (v/name-conformant? c/descriptor "com-microsoft-graph"))))
+
+(deftest offline-access-is-in-the-base-scopes
+  (testing "without it Microsoft issues no refresh token, and the connector has
+            to be reauthorized by hand every hour"
+    (is (some #{"offline_access"}
+              (get-in c/descriptor [:connector/auth :connector.auth/base-scopes])))))
+
+(deftest reading-mail-does-not-grant-sending-it
+  (let [scopes (m/scopes-for c/descriptor ["microsoft_graph_list_messages"
+                                           "microsoft_graph_get_message"])]
+    (is (some #{c/mail-read-scope} scopes))
+    (is (not (some #{c/mail-send-scope} scopes))))
+  (testing "free/busy needs the calendar scope and nothing else"
+    (let [scopes (m/scopes-for c/descriptor ["microsoft_graph_get_schedule"])]
+      (is (some #{c/calendar-scope} scopes))
+      (is (not (some #{c/mail-read-scope} scopes))))))
+
+(deftest search-and-orderby-are-not-combined
+  (testing "Graph answers 400 for $search with $orderby, for a reason no caller can see"
+    (let [searched (invoke/request-for registry "microsoft_graph_list_messages"
+                                       {"search" "invoice"})
+          plain (invoke/request-for registry "microsoft_graph_list_messages" {})]
+      (is (nil? (get-in searched [:connector.http/query "$orderby"])))
+      (is (= "\"invoice\"" (get-in searched [:connector.http/query "$search"]))
+          "$search takes a quoted string")
+      (is (= "receivedDateTime desc" (get-in plain [:connector.http/query "$orderby"]))))))
+
+(deftest a-time-window-selects-calendar-view
+  (testing "/me/events returns the series master; calendarView returns occurrences"
+    (let [windowed (invoke/request-for registry "microsoft_graph_list_events"
+                                       {"startDateTime" "2026-08-08T00:00:00"
+                                        "endDateTime" "2026-08-15T00:00:00"})
+          unwindowed (invoke/request-for registry "microsoft_graph_list_events" {})]
+      (is (str/ends-with? (:connector.http/url windowed) "/me/calendarView"))
+      (is (str/ends-with? (:connector.http/url unwindowed) "/me/events")))))
+
+(deftest send-mail-defaults-to-keeping-a-copy
+  (let [req (invoke/request-for registry "microsoft_graph_send_mail"
+                                {"to" ["a@example.com"] "body" "hi" "subject" "s"})]
+    (is (true? (get (:connector.http/body req) "saveToSentItems"))
+        "a message the sender cannot find in Sent Items is one they cannot prove they sent")
+    (is (= [{"emailAddress" {"address" "a@example.com"}}]
+           (get-in req [:connector.http/body "message" "toRecipients"])))
+    (is (= "Text" (get-in req [:connector.http/body "message" "body" "contentType"]))))
+  (testing "an explicit false is honoured"
+    (is (false? (get (:connector.http/body
+                      (invoke/request-for registry "microsoft_graph_send_mail"
+                                          {"to" ["a@example.com"] "body" "hi"
+                                           "saveToSentItems" false}))
+                     "saveToSentItems")))))
+
+(deftest get-schedule-wraps-times-with-a-zone
+  (let [req (invoke/request-for registry "microsoft_graph_get_schedule"
+                                {"schedules" ["a@example.com"]
+                                 "startTime" "2026-08-08T00:00:00"
+                                 "endTime" "2026-08-08T23:59:59"})]
+    (is (= {"dateTime" "2026-08-08T00:00:00" "timeZone" "UTC"}
+           (get-in req [:connector.http/body "startTime"]))
+        "Graph requires a zone on both ends; UTC beats guessing the caller's")
+    (is (= 30 (get-in req [:connector.http/body "availabilityViewInterval"])))))
+
+(deftest send-mail-reports-acceptance-not-nil
+  (let [http (ports/http-fn (fn [_] {:connector.http/status 202 :connector.http/body nil}))
+        result (invoke/call registry "microsoft_graph_send_mail"
+                            {"to" ["a@example.com"] "body" "hi"}
+                            {:http http :tokens tokens})]
+    (is (= {:accepted true :status 202} result)
+        "sendMail answers 202 with no body; nil would read as a failure")))
+
+(deftest messages-normalize-to-addresses-not-nested-objects
+  (let [http (ports/http-fn
+              (fn [_] {:connector.http/status 200
+                       :connector.http/body
+                       {"value" [{"id" "m1" "subject" "Hi"
+                                  "from" {"emailAddress" {"address" "a@example.com"}}
+                                  "toRecipients" [{"emailAddress" {"address" "b@example.com"}}]
+                                  "isRead" false "hasAttachments" true}]
+                        "@odata.nextLink" "https://…"}}))
+        result (invoke/call registry "microsoft_graph_list_messages" {}
+                            {:http http :tokens tokens})
+        [msg] (:messages result)]
+    (is (= "a@example.com" (:from msg)))
+    (is (= ["b@example.com"] (:to msg)))
+    (is (false? (:read? msg)))
+    (is (some? (:next-link result)))))
+
+(deftest pkce-is-required-by-this-provider
+  (is (true? (get-in c/descriptor [:connector/auth :connector.auth/pkce?])))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (auth/authorization-url c/descriptor
+                                       {:client-id "cid" :redirect-uri "u"
+                                        :state "s" :scopes ["User.Read"]}))))
+
+(deftest every-tool-declares-scopes-and-an-effect
+  (doseq [t (m/tools c/descriptor)]
+    (is (seq (:connector/scopes t)))
+    (is (#{:read :write} (:connector/effect t)))
+    (is (str/starts-with? (:connector/name t) "microsoft_graph_"))))
+
+(deftest connector-edn-matches-the-descriptor
+  (testing "the committed declaration is generated, not maintained — a second
+            source of truth for one contract is how the two start to disagree"
+    (let [committed (edn/read-string
+                     #?(:clj (slurp "connector.edn")
+                        :cljs (.readFileSync (js/require "fs") "connector.edn" "utf8")))]
+      (is (= (decl/declaration c/provider
+                               {:namespace "microsoft-graph.connector"
+                                :var "provider"
+                                :authority "90-docs/adr/2608097000-connector-plane-one-repo-per-connector.edn"})
+             committed)
+          "run: kbb --backend sci --classpath \"src:../connector/src\" emit-connector-edn.cljk"))))

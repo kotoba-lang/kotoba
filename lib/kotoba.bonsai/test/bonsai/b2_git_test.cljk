@@ -1,0 +1,159 @@
+(ns bonsai.b2-git-test
+  (:require [kotoba.test :refer [deftest is]]
+            #?@(:cljs [[bonsai.b2-git :as b2]
+                       [bonsai.remote-helper :as helper]
+                       [multiformats.core :as mf]
+                       ["node:fs" :as fs]
+                       ["node:path" :as path]
+                       ["node:os" :as os]
+                       ["node:child_process" :as cp]])))
+
+#?(:cljs
+   (do
+(def a (apply str (repeat 40 "a")))
+(def b (apply str (repeat 40 "b")))
+(def c (apply str (repeat 40 "c")))
+(def ep {:rid "fixture" :root "unused"})
+
+(deftest closure-checks-every-edge-type-before-skipping-seen-objects
+  (let [m {"refs" {"refs/tags/blob" b "refs/heads/main" a}
+           "objects" {a {"type" "commit"} b {"type" "blob"}}}]
+    (with-redefs [b2/fetch-many! (fn [& _])
+                  b2/object-bytes (fn [_ oid _] {:type "commit" :body (js/Buffer.from (str "tree " b "\n\nmessage\n"))})]
+      (is (thrown-with-msg? js/Error #"wrong object type" (b2/closure-valid? ep m)))))
+  (doseq [[kind header objects]
+          [["commit" (str "tree " b "\nparent " c) {b {"type" "tree"} c {"type" "blob"}}]
+           ["tag" (str "object " b "\ntype commit") {b {"type" "blob"}}]]]
+    (let [m {"refs" {"refs/tags/test" a} "objects" (assoc objects a {"type" kind})}]
+      (with-redefs [b2/fetch-many! (fn [& _])
+                    b2/object-bytes (fn [_ oid entry] {:type (get entry "type")
+                                                      :body (js/Buffer.from (if (= oid a) (str header "\n\nmessage") ""))})]
+        (is (thrown-with-msg? js/Error #"wrong object type" (b2/closure-valid? ep m)))))))
+
+(deftest raw-git-names-messages-and-gitlinks
+  (let [tree (js/Buffer.concat #js [(js/Buffer.from "100644 name\n") (js/Buffer.from #js [255 0])
+                                   (js/Buffer.from b "hex") (js/Buffer.from "160000 external\u0000")
+                                   (js/Buffer.from c "hex")])
+        commit (js/Buffer.concat #js [(js/Buffer.from (str "tree " a "\n\n")) (js/Buffer.from #js [255])])]
+    (is (= [[b "blob"]] (b2/object-edges "tree" tree)))
+    (is (= [[a "tree"]] (b2/object-edges "commit" commit)))
+    (is (thrown? js/Error (b2/object-edges "tree" (.subarray tree 0 12))))
+    (is (thrown? js/Error (b2/object-edges "commit" (js/Buffer.from (str "tree " a "\ntree " b "\n\n")))))))
+
+(deftest corrupt-object-and-invalid-ref-are-refused
+  (let [before (str (mf/cidv1-raw [0 1 254 255]))]
+    (try
+      (b2/install-hash!)
+      (is (= before (str (mf/cidv1-raw [0 1 254 255]))))
+      (is (= before (str (mf/cidv1-raw (js/Uint8Array.from #js [0 1 254 255])))))
+      (is (thrown-with-msg? js/Error #"CID mismatch"
+                            (b2/verify-block "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                             (js/Buffer.from "bad") true)))
+      (is (thrown-with-msg? js/Error #"Invalid manifest ref"
+                            (b2/validate-manifest! ep {"version" 1 "rid" "fixture"
+                                                       "refs" {"refs/heads/../bad" a} "objects" {a {"type" "commit"}}})))
+      (finally (mf/install-sha256! mf/portable-sha256)))))
+
+(defn checked [env & args]
+  (let [r (cp/spawnSync (first args) (clj->js (rest args))
+                        #js {:env env :encoding "utf8" :timeout 90000 :maxBuffer 10485760})]
+    (when-not (= 0 (.-status r))
+      (throw (ex-info (str "Command failed: " (pr-str args) "\n" (.-stdout r) (.-stderr r)) {})))
+    (.-stdout r)))
+
+(deftest eviction-preserves-dirty-files-and-authoritative-state
+  (let [root (fs/mkdtempSync (path/join (os/tmpdir) "bonsai-b2-evict-"))
+        w (path/join root "mount") gd (path/join root "control.git")
+        cache (path/join root "cache") state (path/join root "state")
+        url "kotoba://b2/test-bucket/fixture" f (path/join w "file.txt")
+        ep {:url url :rid "fixture" :profile {"mount" w "python" "fixture-controller" "controller" "fixture"}}
+        workspace {:worktree w :gitdir gd :url url}
+        delegated (atom []) original-run b2/run! cwd (.cwd js/process)]
+    (try
+      (checked (.-env js/process) "git" "init" "-q" "--separate-git-dir" gd w)
+      (fs/writeFileSync f "safe\n")
+      (b2/git! gd ["--work-tree" w "add" "file.txt"])
+      (b2/git! gd ["-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test" "commit" "-qm" "fixture"])
+      (fs/mkdirSync state)
+      (fs/writeFileSync (path/join state "identity-fixture") "authoritative local state")
+      (let [head (b2/text-git gd ["rev-parse" "HEAD"])
+            mirror (helper/materialized-path url (path/join cache "mirrors"))]
+        (with-redefs [b2/current-workspace (fn [& _] workspace) b2/endpoint (fn [_] ep)
+                      b2/cache-root (fn [] cache) b2/state-root (fn [] state)
+                      b2/remote-state (fn [_] {:manifest {"refs" {"refs/heads/main" head}}})
+                      b2/run! (fn [exe args & options]
+                                (if (= exe "fixture-controller")
+                                  (do (swap! delegated conj args) (js/Buffer.alloc 0))
+                                  (apply original-run exe args options)))]
+          (b2/evict! ["--repo" w "file.txt"])
+          (is (= [["fixture" "evict" "file.txt"]] @delegated))
+          (fs/writeFileSync f "uncommitted\n")
+          (is (thrown-with-msg? js/Error #"Uncommitted" (b2/evict! ["--repo" w "file.txt"])))
+          (is (= 1 (count @delegated)))
+          (is (= "uncommitted\n" (fs/readFileSync f "utf8")))
+          (doseq [p [mirror (path/join cache "blocks/fixture") (path/join cache "events/fixture")]]
+            (fs/mkdirSync p #js {:recursive true})
+            (fs/writeFileSync (path/join p "disposable") "cache"))
+          (b2/evict-history-cache!)
+          (is (not (fs/existsSync mirror)))
+          (is (not (fs/existsSync (path/join cache "blocks/fixture")))))
+        (is (fs/existsSync (path/join state "identity-fixture")))
+        (is (fs/existsSync (path/join gd "HEAD"))))
+      (finally (.chdir js/process cwd) (fs/rmSync root #js {:recursive true :force true})))))
+
+(deftest native-git-roundtrip-with-client-and-global-hook-overrides
+  (let [root (fs/mkdtempSync (path/join (os/tmpdir) "bonsai-b2-review-"))
+        bin (fs/realpathSync "bin") stub (fs/realpathSync "lib/kotoba.bonsai/test/b2_rclone_stub.mjs")
+        state (path/join root "state") cache (path/join root "cache") remote (path/join root "remote")
+        mount (path/join root "mounted") src (path/join mount "source")
+        clone (path/join root "clone") gd (path/join root "clone.git")
+        hooks (path/join root "global-hooks") global (path/join root "gitconfig")
+        env (js/Object.assign #js {} (.-env js/process)
+                              #js {:PATH (str bin ":" (.. js/process -env -PATH))
+                                   :KOTOBA_B2_STATE state :KOTOBA_B2_CACHE cache :KOTOBA_RCLONE stub
+                                   :B2_TEST_REMOTE remote :GIT_CONFIG_GLOBAL global :GIT_CONFIG_NOSYSTEM "1"
+                                   :GIT_AUTHOR_NAME "Bonsai" :GIT_COMMITTER_NAME "Bonsai"
+                                   :GIT_AUTHOR_EMAIL "bonsai@example.test" :GIT_COMMITTER_EMAIL "bonsai@example.test"})
+        run (partial checked env)
+        git (fn [& args] (apply run "git" "-C" src args))]
+    (try
+      (fs/mkdirSync hooks #js {:recursive true})
+      (fs/mkdirSync mount)
+      (fs/writeFileSync global (str "[core]\n hooksPath = " hooks "\n"))
+      (run "git" "kotoba-b2" "configure" "test-bucket" "fake" mount stub)
+      (run "git" "kotoba-b2" "init" "fixture" src)
+      (fs/writeFileSync (path/join src "file.txt") "old\n")
+      (git "add" ".") (git "commit" "-qm" "first")
+      (let [old-blob (.trim (git "rev-parse" "HEAD:file.txt"))
+            url (.trim (git "remote" "get-url" "origin"))
+            rid (last (.split url "/")) events (path/join remote "test-bucket/.kotoba/git" rid "events")]
+        ;; Both overrides bypassed the pre-receive hook before this review fix.
+        (git "-c" (str "core.hooksPath=" hooks) "push" "-u" "origin" "main")
+        (is (= 1 (count (fs/readdirSync events))) "ACK includes durable publication despite client/global hooksPath")
+        (fs/writeFileSync (path/join src "file.txt") "new\n")
+        (git "commit" "-qam" "second") (git "push")
+        (is (= 2 (count (fs/readdirSync events))))
+        (git "push" "origin" "main:refs/heads/probe")
+        (git "push" "origin" ":refs/heads/probe")
+        (git "push" "origin" "main:refs/heads/probe")
+        (git "push" "origin" ":refs/heads/probe")
+        (is (= 6 (count (fs/readdirSync events))) "existing-commit branch lifecycle and tombstones")
+        (let [bad-env (js/Object.assign #js {} env #js {:B2_TEST_REJECT_PUBLICATION "1"})
+              r (cp/spawnSync "git" (clj->js ["-C" src "push" "origin" "main:refs/heads/refused"])
+                              #js {:env bad-env :encoding "utf8" :timeout 90000})]
+          (is (not= 0 (.-status r)))
+          (is (.includes (str (.-stderr r)) "pre-receive hook declined"))
+          (is (= 6 (count (fs/readdirSync events)))))
+        (fs/rmSync cache #js {:recursive true :force true})
+        (run "git" "clone" "--filter=blob:none" "--separate-git-dir" gd url clone)
+        (is (= "new\n" (fs/readFileSync (path/join clone "file.txt") "utf8")))
+        (let [no-fetch (js/Object.assign #js {} env #js {:GIT_NO_LAZY_FETCH "1"})
+              r (cp/spawnSync "git" (clj->js ["-C" clone "cat-file" "-e" old-blob]) #js {:env no-fetch})]
+          (is (not= 0 (.-status r)) "historical blob absent after filtered clone"))
+        (run "git" "-C" clone "restore" "--source=HEAD^" "--" "file.txt")
+        (is (= "old\n" (fs/readFileSync (path/join clone "file.txt") "utf8")))
+        (is (.includes (run "git" "-C" clone "diff" "--" "file.txt") "+old"))
+        (run "git" "-C" clone "restore" "--" "file.txt")
+        (run "git" "-C" clone "fsck" "--full")
+        (is (= "new\n" (fs/readFileSync (path/join clone "file.txt") "utf8"))))
+      (finally (fs/rmSync root #js {:recursive true :force true})))))))

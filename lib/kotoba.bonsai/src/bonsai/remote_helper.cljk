@@ -1,0 +1,168 @@
+(ns bonsai.remote-helper
+  "Lifecycle and safety boundary for git-remote-kotoba transports.
+
+   The :cljs branch is what `bin/git-remote-kotoba` runs under kbb (nbb,
+   JVM-free). Everything there is synchronous on purpose: the helper speaks
+   Git's line protocol on stdin, then hands the same file descriptor to
+   upload-pack/receive-pack, so stdin is read one byte at a time with
+   `fs.readSync` -- a stream reader would buffer protocol bytes that belong
+   to the child -- and stdout is written with `fs.writeSync`, because
+   process.stdout on a macOS pipe is asynchronous and `process.exit` would
+   drop what it had not flushed."
+  #?(:clj (:require [kotoba.bytes :as kbytes] [babashka.process :as process]
+                    [kotoba.io :as io]
+                    [kotoba.lang.text :as str])
+     :cljs (:require ["node:fs" :as fs]
+                     ["node:path" :as path]
+                     ["node:crypto" :as crypto]
+                     ["node:child_process" :as cp]))
+  #?(:clj (:import (java.security MessageDigest))))
+
+(def services #{"git-upload-pack" "git-receive-pack"})
+
+(defn- starts-with? [s prefix]
+  #?(:clj (str/starts-with? s prefix) :cljs (.startsWith s prefix)))
+
+(defn- blank? [s]
+  #?(:clj (str/blank? s) :cljs (or (nil? s) (= "" (.trim s)))))
+
+#?(:clj (defn- hex [bytes] (apply str (map #(format "%02x" (bit-and (int %) 0xff)) bytes))))
+
+(defn cache-key [remote]
+  #?(:clj (hex (.digest (MessageDigest/getInstance "SHA-256") (kbytes/utf8-bytes ^String remote)))
+     :cljs (-> (crypto/createHash "sha256") (.update remote "utf8") (.digest "hex"))))
+
+(defn- absolute? [p]
+  #?(:clj (io/absolute? (io/file p)) :cljs (path/isAbsolute p)))
+
+(defn local-path? [url]
+  (or (starts-with? url "/") (starts-with? url "kotoba::")))
+
+(defn local-path [url]
+  (cond
+    (starts-with? url "kotoba::") (subs url (count "kotoba::"))
+    (starts-with? url "/") url
+    :else nil))
+
+(defn network-remote? [url]
+  (or (starts-with? url "kotoba://")
+      (starts-with? url "https://")
+      (starts-with? url "http://")))
+
+(defn materialized-path
+  "Resolve URL to a bare repository path. Network remotes are isolated below
+   an explicit absolute cache root and keyed by the full remote SHA-256."
+  [url cache-root]
+  (if-let [p (local-path url)]
+    p
+    (do
+      (when-not (network-remote? url)
+        (throw (ex-info "unsupported kotoba remote URL" {:reason :unsupported-url})))
+      (when-not (and cache-root (absolute? cache-root))
+        (throw (ex-info "KOTOBA_GIT_CACHE must be an absolute path for network remotes"
+                        {:reason :invalid-cache})))
+      #?(:clj (io/path (io/file cache-root (str (cache-key url) ".git")))
+         :cljs (path/join cache-root (str (cache-key url) ".git"))))))
+
+(defn- mkdirs! [dir]
+  #?(:clj (io/mkdirs (io/file dir)) :cljs (fs/mkdirSync dir #js {:recursive true})))
+
+#?(:cljs
+   (defn- write-err! [s] (fs/writeSync 2 s)))
+
+(defn run-adapter!
+  "Run the configured adapter as argv, never through a shell. Operation is
+   `fetch` or `push`; remote and path are separate arguments so credentials
+   never need to be interpolated into a command string. The adapter's stdout
+   is forwarded to stderr: stdout belongs to the Git protocol."
+  [adapter operation remote path]
+  (when-not (and adapter (not (blank? adapter)))
+    (throw (ex-info "KOTOBA_GIT_ADAPTER is required for network remotes"
+                    {:reason :missing-adapter})))
+  #?(:clj
+     (let [result @(process/process [adapter operation remote path]
+                                    {:in :inherit :out :string :err :inherit})]
+       (when-not (blank? (:out result))
+         (binding [*out* *err*] (print (:out result)) (flush)))
+       (when-not (zero? (:exit result))
+         (throw (ex-info "kotoba Git adapter failed"
+                         {:reason :adapter-failed :operation operation
+                          :exit (:exit result)}))))
+     :cljs
+     ;; stdin is "ignore", not inherited: it is Git's protocol pipe, and an
+     ;; adapter has no business reading it.
+     (let [r (cp/spawnSync adapter #js [operation remote path]
+                           #js {:stdio #js ["ignore" "pipe" "inherit"]
+                                :maxBuffer (* 64 1024 1024)})]
+       (when (some-> (.-stdout r) .-length pos?) (write-err! (.-stdout r)))
+       (when-not (= 0 (.-status r))
+         (throw (ex-info "kotoba Git adapter failed"
+                         {:reason :adapter-failed :operation operation
+                          :exit (.-status r)}))))))
+
+(defn prepare!
+  [url {:keys [cache-root adapter]}]
+  (let [p (materialized-path url cache-root)]
+    (when (network-remote? url)
+      (mkdirs! cache-root)
+      (run-adapter! adapter "fetch" url p))
+    p))
+
+(defn connect!
+  "Run Git service over the materialized repo. Successful receive-pack is
+   followed by adapter `push`, which is where a kotobase adapter verifies the
+   resulting object closure and submits signed nekko.ref-event updates."
+  [service url opts]
+  (when-not (contains? services service)
+    (throw (ex-info "unsupported Git service" {:reason :unsupported-service})))
+  (let [p (or (:prepared-path opts) (prepare! url opts))
+        exit #?(:clj (:exit @(process/process [service p]
+                                              {:in :inherit :out :inherit :err :inherit}))
+                :cljs (let [r (cp/spawnSync service #js [p] #js {:stdio "inherit"})]
+                        (if (and (not (.-error r)) (number? (.-status r))) (.-status r) 128)))]
+    (when (and (zero? exit) (= service "git-receive-pack")
+               (network-remote? url))
+      (run-adapter! (:adapter opts) "push" url p))
+    exit))
+
+#?(:cljs
+   (defn read-line!
+     "One protocol line from fd 0, without reading past its newline. nil at EOF."
+     []
+     (let [buf (js/Buffer.alloc 1)]
+       (loop [acc []]
+         (let [n (try (fs/readSync 0 buf 0 1 nil)
+                      (catch :default e
+                        (if (= "EAGAIN" (.-code e)) ::again (throw e))))]
+           (cond
+             (= n ::again) (recur acc)
+             (zero? n) (when (seq acc) (.toString (js/Buffer.from (clj->js acc)) "utf8"))
+             (= 10 (aget buf 0)) (.toString (js/Buffer.from (clj->js acc)) "utf8")
+             :else (recur (conj acc (aget buf 0)))))))))
+
+#?(:cljs
+   (defn main!
+     "The remote-helper command loop. Returns the process exit code."
+     [[_remote-name url] env]
+     (let [out! (fn [s] (fs/writeSync 1 s))
+           fail (fn [m] (write-err! (str "git-remote-kotoba: " m "\n")) 1)]
+       (try
+         (loop []
+           (let [line (read-line!)]
+             (cond
+               (or (nil? line) (= line "")) 0
+               (= line "capabilities") (do (out! "connect\n\n") (recur))
+               (starts-with? line "connect ")
+               (let [service (subs line (count "connect "))
+                     opts {:cache-root (aget env "KOTOBA_GIT_CACHE")
+                           :adapter (aget env "KOTOBA_GIT_ADAPTER")}
+                     ;; Materialization must finish before accepting connect.
+                     ;; From this empty response onward stdin/stdout are
+                     ;; exclusively the Git byte stream.
+                     _ (when-not (contains? services service)
+                         (throw (ex-info "unsupported Git service" {:reason :unsupported-service})))
+                     p (prepare! url opts)]
+                 (out! "\n")
+                 (connect! service url (assoc opts :prepared-path p)))
+               :else (fail (str "unsupported command: " line)))))
+         (catch :default e (fail (ex-message e)))))))

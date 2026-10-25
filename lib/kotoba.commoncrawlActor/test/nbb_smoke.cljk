@@ -1,0 +1,133 @@
+;; nbb (ClojureScript-on-Node) smoke test — proves the ENTIRE actor
+;; (seeds/cdx/extract/llm/embeddings/identity/kotobase/policy/store/
+;; operation/loop, i.e. every .cljc ns this repo ships) actually loads and
+;; runs on the nbb runtime, not just the JVM `kbb -M:test` suite —
+;; the repo-wide runtime priority (kotoba wasm > clojurewasm > cljs > nbb
+;; > jvm/bb) makes nbb this actor's FIRST-CLASS target, so this is not an
+;; optional extra check.
+;;
+;; Run (from this repo, sibling checkouts present at ../<name>, the west
+;; layout):
+;;   kbb --backend sci --classpath "src:test:../langgraph/src:../langchain/src:../langchain-store/src:../org-chainagnostic-cacao/src:../org-ietf-ed25519/src:../org-ietf-cbor/src" \
+;;     test/nbb_smoke.cljk
+;;
+;; Exits nonzero on any failure. Runs entirely offline (mocked
+;; fetch-fn/warc-fetch-fn/complete-fn/embed-fn/ingest-fn) — no network.
+(require '[commoncrawl.cdx :as cdx]
+         '[commoncrawl.embeddings :as embeddings]
+         '[commoncrawl.extract :as extract]
+         '[commoncrawl.iceberg :as iceberg]
+         '[commoncrawl.identity :as identity]
+         '[commoncrawl.kotobase :as kotobase]
+         '[commoncrawl.live-iceberg :as live-iceberg]
+         '[commoncrawl.llm :as llm]
+         '[commoncrawl.loop :as loop]
+         '[commoncrawl.operation :as op]
+         '[commoncrawl.policy :as policy]
+         '[commoncrawl.seeds :as seeds]
+         '[commoncrawl.store :as store]
+         '[cacao.core :as cacao]
+         '[kotoba.lang.text :as str])
+
+(def checks (atom {}))
+(defn- check! [k v] (swap! checks assoc k (boolean v)))
+
+;; ── seeds ────────────────────────────────────────────────────────────────
+(check! :seeds-embedded-valid (every? seeds/valid-seed? seeds/embedded-seeds))
+(check! :seeds-domain-of (= "www.gleif.org" (seeds/domain-of "https://www.gleif.org/x")))
+
+;; ── extract ──────────────────────────────────────────────────────────────
+(check! :extract-title (= "GLEIF" (extract/title-of "<html><title>GLEIF</title></html>")))
+(check! :extract-strip (= "Hello World" (extract/strip-html "<p>Hello <b>World</b></p>")))
+
+;; ── cdx (offline fixtures — no network) ─────────────────────────────────
+(def warc-fixture
+  (str "WARC/1.0\r\nWARC-Type: response\r\n\r\n"
+       "HTTP/1.1 200 OK\r\n\r\n<html><title>GLEIF</title><body>hello nbb</body></html>"))
+(defn- fake-cc-fetch [routes]
+  (fn [{:keys [path query]}] (get routes [path (get query "url")])))
+(def cc-routes
+  {["/CC-MAIN-2026-25-index" "https://www.gleif.org/"]
+   [{:url "https://www.gleif.org/" :timestamp "20260701000000" :status "200"
+     :filename "a.warc.gz" :offset "0" :length "1"}]
+   ["/CC-MAIN-2026-25-index" "https://nonexistent.example/"]
+   [{:message "No Captures found for: nonexistent.example"}]})
+(check! :cdx-no-match-is-empty-vector
+        (= [] (cdx/captures-of (fake-cc-fetch cc-routes) "CC-MAIN-2026-25" "https://nonexistent.example/")))
+(check! :cdx-fetch-page-text
+        (some? (cdx/fetch-page-text (fake-cc-fetch cc-routes) (constantly warc-fixture)
+                                    "CC-MAIN-2026-25" "https://www.gleif.org/")))
+
+;; ── llm ──────────────────────────────────────────────────────────────────
+(def llm-proposal
+  (llm/advise (constantly "{:category \"registry\" :summary \"s\" :entities [\"GLEIF\"] :confidence 0.9}")
+              {:url "https://www.gleif.org/" :title "GLEIF" :text "hello"}))
+(check! :llm-parses (= "registry" (:category llm-proposal)))
+
+;; ── embeddings ───────────────────────────────────────────────────────────
+(check! :embeddings-parse (= [1.0 2.0] (embeddings/embed (constantly {:data [{:embedding [1 2]}]}) "x")))
+
+;; ── identity (CACAO self-mint, REAL Ed25519 signing under nbb) ──────────
+(def test-actor "nbb-smoke-actor")
+(defn- cleanup! []
+  (let [fs (js/require "fs")]
+    (when (.existsSync fs (identity/identity-path test-actor)) (.unlinkSync fs (identity/identity-path test-actor)))
+    (when (.existsSync fs (str "." test-actor)) (.rmdirSync fs (str "." test-actor)))))
+(cleanup!)
+(def id (identity/load-or-create-identity! test-actor))
+(def session (identity/mint-kotobase-session id {:db-name "webpages" :ttl-seconds 3600}))
+(def verified (cacao/verify (:cacao-b64 session)))
+(check! :identity-did-shape (str/starts-with? (:did id) "did:key:z"))
+(check! :identity-cacao-verifies (:valid? verified))
+(check! :identity-pin-capability (some #{"kotoba://can/kotobase:pin"} (:resources session)))
+(cleanup!)
+
+;; ── kotobase client (payload shape only, no real network) ───────────────
+(def captured-req (atom nil))
+(def ingest-result
+  (kotobase/ingest! (fn [req] (reset! captured-req req) {:status 200 :body {"status" "ok"}})
+                    {:cacao-b64 "c1" :did "did:key:z6MkTest"}
+                    {:url "https://www.gleif.org/" :title "GLEIF" :text "hello"}))
+(check! :kotobase-ingest-ok (:ok ingest-result))
+(check! :kotobase-request-shape (= (kotobase/ingest-url) (:url @captured-req)))
+
+;; ── policy ───────────────────────────────────────────────────────────────
+(def demo-seeds [{:domain "www.gleif.org" :url "https://www.gleif.org/"}])
+(check! :policy-out-of-scope
+        (:hard? (policy/check {:domain "evil.example.com"} {:seeds demo-seeds :exclude #{} :budget {:used 0 :cap 5}}
+                              {:confidence 0.9})))
+
+;; ── full StateGraph run + durable loop (mocked capabilities) ────────────
+(def db (store/mem-store))
+(def actor
+  (op/build db {:advise-fn (constantly {:category "c" :summary "s" :entities [] :confidence 0.9})
+               :fetch-fn (constantly [{:timestamp "1" :status "200" :filename "f.warc.gz" :offset "0" :length "1"}])
+               :warc-fetch-fn (constantly warc-fixture)
+               :ingest-fn (constantly {:ok true})
+               :collection-id "CC-MAIN-2026-25"}))
+(def run-result (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} {:seeds demo-seeds :exclude #{} :budget {:used 0 :cap 5}}))
+(check! :operation-commits (= :commit (get-in run-result [:state :disposition])))
+(check! :store-ledger-has-one-fact (= 1 (count (store/ledger db))))
+
+(def tick-summary (loop/tick! {:store (store/mem-store) :actor actor :seeds demo-seeds
+                               :budget-cap 1 :owner "nbb-smoke" :now-ms (constantly 1000)}))
+(check! :loop-tick-committed (= 1 (:committed tick-summary)))
+(check! :loop-tick-iceberg-disabled-by-default (true? (get-in tick-summary [:iceberg :disabled?])))
+
+;; ── iceberg row-shaping + live-iceberg module load (no real subprocess) ──
+(check! :iceberg-ns-loads-under-nbb (= "commoncrawl_page" iceberg/table))
+(check! :live-iceberg-ns-loads-under-nbb (some? live-iceberg/sync-fn))
+(def iceberg-tick-summary
+  (loop/tick! {:store (store/mem-store) :actor actor :seeds demo-seeds :budget-cap 1
+              :owner "nbb-smoke-iceberg" :now-ms (constantly 1000) :collection-id "CC-MAIN-2026-25"
+              :iceberg-sync-fn (fn [rows] {:ok? true :appended (count rows) :captured rows})}))
+(check! :loop-tick-iceberg-batches-committed-rows
+        (and (= 1 (get-in iceberg-tick-summary [:iceberg :appended]))
+             (= "https://www.gleif.org/" (get (first (get-in iceberg-tick-summary [:iceberg :captured])) "url"))
+             (= "CC-MAIN-2026-25" (get (first (get-in iceberg-tick-summary [:iceberg :captured])) "collection_id"))))
+
+(println (pr-str @checks))
+(if (every? true? (vals @checks))
+  (println "ALL OK —" (count @checks) "checks passed under nbb")
+  (do (println "FAILURES:" (into {} (remove (comp true? val) @checks)))
+      (js/process.exit 1)))

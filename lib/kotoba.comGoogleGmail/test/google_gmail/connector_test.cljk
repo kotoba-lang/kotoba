@@ -1,0 +1,110 @@
+(ns google-gmail.connector-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [connector.declare :as decl]
+            [connector.invoke :as invoke]
+            [connector.model :as m]
+            [connector.ports :as ports]
+            [connector.registry :as reg]
+            [connector.validate :as v]
+            [google-gmail.connector :as c]))
+
+(def registry (reg/registry [c/provider]))
+(def tokens (ports/static-tokens {"com.google.gmail" "tok"}))
+
+(deftest descriptor-is-valid-and-correctly-named
+  (is (empty? (v/errors c/descriptor)))
+  (is (true? (v/name-conformant? c/descriptor "com-google-gmail"))))
+
+(deftest searching-a-mailbox-does-not-grant-filing-or-sending
+  (testing "this is the gap in the app's single gmail.modify grant"
+    (let [scopes (m/scopes-for c/descriptor ["gmail_search_messages" "gmail_get_message"])]
+      (is (some #{c/read-scope} scopes))
+      (is (not (some #{c/modify-scope} scopes)))
+      (is (not (some #{c/send-scope} scopes)))))
+  (testing "filing and sending are separate grants from each other too"
+    (is (= [c/modify-scope] (:connector/scopes (m/tool c/descriptor "gmail_modify_labels"))))
+    (is (= [c/send-scope] (:connector/scopes (m/tool c/descriptor "gmail_send_message"))))))
+
+(deftest read-only-leaves-a-mailbox-nobody-can-write-to
+  (let [d (m/read-only c/descriptor)]
+    (is (= ["gmail_get_message" "gmail_list_labels" "gmail_search_messages"]
+           (m/tool-names d)))
+    (is (= [c/read-scope] (remove #{"openid" "email"} (m/scopes d))))))
+
+(deftest no-tool-asks-for-full-account-access
+  (doseq [t (m/tools c/descriptor)
+          s (:connector/scopes t)]
+    (is (not= "https://mail.google.com/" s)
+        (str (:connector/name t) " asks for full account access, including permanent delete"))))
+
+(deftest get-message-defaults-to-metadata
+  (let [req (invoke/request-for registry "gmail_get_message" {"id" "m1"})]
+    (is (= "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1" (:connector.http/url req)))
+    (is (= {"format" "metadata"} (:connector.http/query req))
+        "a search result that silently pulled full bodies would be an expensive surprise")))
+
+(deftest modify-omits-absent-halves
+  (let [req (invoke/request-for registry "gmail_modify_labels"
+                                {"id" "m1" "addLabelIds" ["Label_1"]})]
+    (is (= "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/modify"
+           (:connector.http/url req)))
+    (is (= {"addLabelIds" ["Label_1"]} (:connector.http/body req))
+        "sending removeLabelIds: null would be a request to remove nothing, spelled oddly")))
+
+(deftest search-returns-ids-and-says-so
+  (let [http (ports/http-fn
+              (fn [_] {:connector.http/status 200
+                       :connector.http/body {"messages" [{"id" "m1"} {"id" "m2"}]
+                                             "resultSizeEstimate" 2}}))
+        result (invoke/call registry "gmail_search_messages" {"q" "is:unread"}
+                            {:http http :tokens tokens})]
+    (is (= ["m1" "m2"] (:message-ids result)))
+    (is (= 2 (:result-size-estimate result)))
+    (testing "messages.list carries no headers; inventing empty ones would read
+              as 'this message has no subject'"
+      (is (not (contains? result :messages)))
+      (is (str/includes? (:note result) "gmail_get_message")))))
+
+(deftest headers-are-turned-into-a-map-case-insensitively
+  (let [http (ports/http-fn
+              (fn [_] {:connector.http/status 200
+                       :connector.http/body
+                       {"id" "m1" "threadId" "t1" "labelIds" ["INBOX"]
+                        "snippet" "hello"
+                        "payload" {"headers" [{"name" "Subject" "value" "Hi"}
+                                              {"name" "FROM" "value" "a@example.com"}
+                                              {"name" "To" "value" "b@example.com"}]}}}))
+        result (invoke/call registry "gmail_get_message" {"id" "m1"}
+                            {:http http :tokens tokens})]
+    (is (= "Hi" (:subject result)))
+    (is (= "a@example.com" (:from result)) "FROM and From are the same header")
+    (is (= ["INBOX"] (:label-ids result)))))
+
+(deftest sending-without-a-grant-fails-before-the-request
+  (let [seen (atom false)
+        http (ports/http-fn (fn [_] (reset! seen true) {:connector.http/status 200}))
+        result (invoke/call registry "gmail_send_message" {"raw" "…"}
+                            {:http http :tokens (ports/static-tokens {})})]
+    (is (= :connector/not-connected (:connector/code result)))
+    (is (false? @seen) "no request is made without a token")))
+
+(deftest every-tool-declares-scopes-and-an-effect
+  (doseq [t (m/tools c/descriptor)]
+    (is (seq (:connector/scopes t)))
+    (is (#{:read :write} (:connector/effect t)))
+    (is (str/starts-with? (:connector/name t) "gmail_"))))
+
+(deftest connector-edn-matches-the-descriptor
+  (testing "the committed declaration is generated, not maintained — a second
+            source of truth for one contract is how the two start to disagree"
+    (let [committed (edn/read-string
+                     #?(:clj (slurp "connector.edn")
+                        :cljs (.readFileSync (js/require "fs") "connector.edn" "utf8")))]
+      (is (= (decl/declaration c/provider
+                               {:namespace "google-gmail.connector"
+                                :var "provider"
+                                :authority "90-docs/adr/2608097000-connector-plane-one-repo-per-connector.edn"})
+             committed)
+          "run: kbb --backend sci --classpath \"src:../connector/src\" emit-connector-edn.cljk"))))

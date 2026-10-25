@@ -1,0 +1,192 @@
+(ns bonsai.private-repo-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.lang.text :as str] [biscuit.token :as biscuit-token]
+            [bonsai.private-repo :as private]
+            [kotoba.test :refer [deftest is]]
+            #?(:clj [envelope.seal-jvm :as seal]
+               :cljs [envelope.seal-sync :as seal])
+            [ipld.core :as ipld]))
+
+(defn- utf8-bytes [s] (kbytes/utf8-bytes ^String s))
+(defn- text [bs] (kbytes/utf8-string bs))
+
+(defn- recipient [id]
+  (let [{:keys [priv pub]} (seal/generate-recipient)]
+    {:id id :priv priv :pub pub :wire {:id id :pub pub}}))
+
+(defn- fake-sign [private payload]
+  (str private "|" payload))
+
+(defn- fake-verify [public payload signature]
+  (= signature (fake-sign public payload)))
+
+(defn- token [rid operation]
+  (biscuit-token/authority
+   {:facts [['right rid operation]]
+    :checks []
+    :next-public-key "delegate-key"
+    :root-private-key "root-key"
+    :sign-fn fake-sign}))
+
+(deftest encrypted-round-trip-is-content-addressed
+  (let [alice (recipient "did:key:alice")
+        snapshot (private/seal-snapshot
+                  {:rid "rad:private-repo"
+                   :bundle-bytes (utf8-bytes "git bundle bytes\nrefs/heads/main\n")
+                   :recipients [(:wire alice)]})
+        restored (private/restore-snapshot (:snapshot/descriptor-bytes snapshot)
+                                           (:snapshot/ciphertext snapshot))]
+    (is (= (:snapshot/cid snapshot) (:snapshot/cid restored)))
+    (is (= (:snapshot/ciphertext-cid snapshot)
+           (:snapshot/ciphertext-cid restored)))
+    (is (= "git bundle bytes\nrefs/heads/main\n"
+           (text (private/open-snapshot restored (:id alice) (:priv alice)))))))
+
+(deftest sharing-rewraps-the-key-and-not-the-repository
+  (let [alice (recipient "did:key:alice")
+        bob (recipient "did:key:bob")
+        before (private/seal-snapshot
+                {:rid "rad:shared-repo" :bundle-bytes (utf8-bytes "bundle")
+                 :recipients [(:wire alice)]})
+        after (private/share-snapshot before (:id alice) (:priv alice) (:wire bob))]
+    (is (private/ciphertext-unchanged? before after))
+    (is (not= (:snapshot/cid before) (:snapshot/cid after))
+        "the access descriptor is a new content-addressed child")
+    (is (= "bundle" (text (private/open-snapshot after (:id bob) (:priv bob)))))))
+
+(deftest revocation-is-a-new-key-and-a-new-ciphertext
+  (let [alice (recipient "did:key:alice")
+        bob (recipient "did:key:bob")
+        shared (-> (private/seal-snapshot
+                    {:rid "rad:rotating-repo" :bundle-bytes (utf8-bytes "secret bundle")
+                     :recipients [(:wire alice)]})
+                   (private/share-snapshot (:id alice) (:priv alice) (:wire bob)))
+        rotated (private/rotate-without shared (:id alice) (:priv alice)
+                                        (:id bob) [(:wire alice)])]
+    (is (= 1 (:snapshot/epoch rotated)))
+    (is (not= (:snapshot/ciphertext-cid shared)
+              (:snapshot/ciphertext-cid rotated)))
+    (is (= "secret bundle"
+           (text (private/open-snapshot rotated (:id alice) (:priv alice)))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"no grant"
+                          (private/open-snapshot rotated (:id bob) (:priv bob))))))
+
+(deftest corrupted-ciphertext-is-rejected-before-decryption
+  (let [alice (recipient "did:key:alice")
+        snapshot (private/seal-snapshot
+                  {:rid "rad:private-repo" :bundle-bytes (utf8-bytes "bundle")
+                   :recipients [(:wire alice)]})
+        corrupted #?(:clj (aclone ^bytes (:snapshot/ciphertext snapshot))
+                     :cljs (js/Uint8Array.from (:snapshot/ciphertext snapshot)))]
+    #?(:clj (aset-byte corrupted 0 (unchecked-byte (bit-xor 1 (aget corrupted 0))))
+       :cljs (aset corrupted 0 (bit-xor 1 (aget corrupted 0))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"CID mismatch"
+                          (private/restore-snapshot
+                           (:snapshot/descriptor-bytes snapshot) corrupted)))))
+
+(deftest descriptor-shape-is-closed-and-canonical
+  (let [alice (recipient "did:key:alice")
+        snapshot (private/seal-snapshot
+                  {:rid "rad:private-repo" :bundle-bytes (utf8-bytes "bundle")
+                   :recipients [(:wire alice)]})
+        descriptor (assoc (:snapshot/descriptor snapshot) "plaintextOid" "leak")
+        descriptor-bytes (ipld/encode descriptor)]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"invalid.*descriptor"
+                          (private/restore-snapshot descriptor-bytes
+                                                    (:snapshot/ciphertext snapshot))))))
+
+(deftest biscuit-right-is-exact-and-fail-closed
+  (let [rid "rad:private-repo"
+        push (token rid "push")
+        allow (private/authorize push {:rid rid :operation "push"
+                                       :root-public-key "root-key"
+                                       :verify-fn fake-verify})
+        wrong-operation (private/authorize push {:rid rid :operation "fetch"
+                                                 :root-public-key "root-key"
+                                                 :verify-fn fake-verify})
+        wrong-repo (private/authorize push {:rid "rad:other" :operation "push"
+                                            :root-public-key "root-key"
+                                            :verify-fn fake-verify})]
+    (is (true? (:allowed? allow)))
+    (is (= :no-policy-matched (:reason wrong-operation)))
+    (is (= :no-policy-matched (:reason wrong-repo)))
+    (is (false? (:allowed? (private/authorize
+                            (assoc-in push [:biscuit/blocks 0 :block/facts]
+                                      [['right rid "fetch"]])
+                            {:rid rid :operation "fetch"
+                             :root-public-key "root-key"
+                             :verify-fn fake-verify}))))))
+
+(deftest ipni-sees-only-randomized-ciphertext-identity
+  (let [alice (recipient "did:key:alice")
+        rid "rad:do-not-publish-this"
+        snapshot (private/seal-snapshot
+                  {:rid rid :bundle-bytes (utf8-bytes "private source")
+                   :recipients [(:wire alice)]})
+        ad (private/private-advertisement
+            snapshot {:peer "12D3KooWProvider"
+                      :addrs ["/dns4/ipfs.kotobase.net/tcp/443/https"]
+                      :context-id (vec (range 16))
+                      :multihash [18 32 1 2 3]})
+        rendered (pr-str ad)]
+    (is (= (:snapshot/ciphertext-cid snapshot) (:cid ad)))
+    (is (false? (:mutates-cid? ad)))
+    (is (not (str/includes? rendered rid)))
+    (is (not (str/includes? rendered "private source")))
+    (is (= :opaque-context-id-required
+           (:error (private/private-advertisement
+                    snapshot {:peer "p" :addrs [] :context-id [1 2 3]
+                              :multihash [18 32 1]}))))))
+
+;; ── hybrid X25519 + ML-KEM-768 snapshots ─────────────────────────────────
+;; Only envelope.seal-sync (kbb) wraps hybrid recipients; on the JVM the same
+;; request is refused before any key is made, never sealed classically.
+
+#?(:cljs
+   (defn- hybrid-recipient [id]
+     (let [{:keys [priv pub pq-priv pq-pub]} (seal/generate-hybrid-recipient)]
+       {:id id :keys {:priv priv :pq-priv pq-priv}
+        :wire {:id id :pub pub :pq-pub pq-pub}})))
+
+#?(:cljs
+   (deftest hybrid-snapshot-round-trips-shares-and-rotates
+     (let [alice (hybrid-recipient "did:key:alice")
+           bob (hybrid-recipient "did:key:bob")
+           snapshot (private/seal-snapshot
+                     {:rid "rad:pq-repo" :bundle-bytes (utf8-bytes "pq bundle")
+                      :recipients [(:wire alice)] :kem :x25519+ml-kem-768})
+           envelope (get-in snapshot [:snapshot/descriptor "envelope"])]
+       (is (= "x25519+ml-kem-768" (get envelope "kem")))
+       (is (every? #(= "x25519+ml-kem-768" (get % "kem")) (get envelope "recipients")))
+       (is (= (:snapshot/cid snapshot)
+              (:snapshot/cid (private/restore-snapshot (:snapshot/descriptor-bytes snapshot)
+                                                       (:snapshot/ciphertext snapshot))))
+           "the storage-side validator accepts the hybrid descriptor")
+       (is (= "pq bundle" (text (private/open-snapshot snapshot (:id alice) (:keys alice)))))
+       (is (thrown? js/Error (private/open-snapshot snapshot (:id alice) (get-in alice [:keys :priv])))
+           "the X25519 half alone does not open it")
+       (let [shared (private/share-snapshot snapshot (:id alice) (:keys alice) (:wire bob))
+             rotated (private/rotate-without shared (:id alice) (:keys alice)
+                                             (:id bob) [(:wire alice)])]
+         (is (private/ciphertext-unchanged? snapshot shared))
+         (is (= "pq bundle" (text (private/open-snapshot shared (:id bob) (:keys bob)))))
+         (is (= "x25519+ml-kem-768" (get-in rotated [:snapshot/descriptor "envelope" "kem"]))
+             "rotation keeps the KEM")
+         (is (= "pq bundle" (text (private/open-snapshot rotated (:id alice) (:keys alice)))))
+         (is (thrown-with-msg? kerror/ExceptionInfo #"no grant"
+                               (private/open-snapshot rotated (:id bob) (:keys bob))))))))
+
+#?(:cljs
+   (deftest a-hybrid-snapshot-refuses-a-classical-recipient
+     (is (thrown? js/Error
+                  (private/seal-snapshot
+                   {:rid "rad:pq-repo" :bundle-bytes (utf8-bytes "b")
+                    :recipients [(:wire (recipient "did:key:classical"))]
+                    :kem :x25519+ml-kem-768})))))
+
+#?(:clj
+   (deftest the-jvm-refuses-hybrid-snapshots-rather-than-downgrading
+     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hybrid snapshots need"
+                           (private/seal-snapshot
+                            {:rid "rad:pq-repo" :bundle-bytes (utf8-bytes "b")
+                             :recipients [(:wire (recipient "did:key:alice"))]
+                             :kem :x25519+ml-kem-768})))))

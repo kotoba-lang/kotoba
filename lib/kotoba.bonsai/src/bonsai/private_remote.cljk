@@ -1,0 +1,321 @@
+(ns bonsai.private-remote
+  "The client half of kotobase's private-Git storage plane: what
+  `bin/kotobase-private-git-adapter` runs for git-remote-kotoba's
+  `fetch|push <remote> <cache>`.
+
+  Wire contract (kotobase-api-gateway-cljs `kotobase.git-private-snapshot`):
+
+    GET /git/v1/repos/<rid>/private/head          -> 404, or {frontier [event…] forked}
+    GET /git/v1/repos/<rid>/private/blocks/<cid>  -> exact IPLD bytes
+    PUT /git/v1/repos/<rid>/private/blocks/<cid>  descriptor (DAG-CBOR) / ciphertext (raw)
+    PUT /git/v1/repos/<rid>/private/head          {snapshot_cid operation expected_heads}
+
+  every request carrying `Authorization: Biscuit <token>`, and block PUTs
+  `X-Kotoba-Git-Operation: push`. The token is read from the file
+  `KOTOBA_GIT_BISCUIT_FILE` names, again for every request (a 15-minute
+  Biscuit is replaced underneath a long push), never from argv.
+
+  The service never sees a bundle or a key: push seals `git bundle create
+  --all` to this machine's recipient (bonsai.recipient-store) and any
+  `KOTOBA_GIT_RECIPIENTS`, uploads the two blocks, then appends a head; fetch
+  verifies both blocks against their CIDs and the head before a key is used.
+
+  ## Concurrency is Git-shaped, and nothing here picks a winner
+
+  The cache remembers the tip it was materialized from
+  (`<cache>/kotoba-private-base`). A push names THAT tip as its descriptor
+  parent and as `expected_heads` -- not whatever the head says now. If
+  someone pushed in between, the head has moved, and the push is refused
+  (locally, and by the service's frontier check if the race is closer than
+  that): fetch, merge, push again -- what Git does for a non-fast-forward.
+  Using the current head as `expected_heads` would instead stack this
+  snapshot on a tip whose commits it does not contain and silently drop
+  them.
+
+  A head with more than one tip is two writers the service kept apart
+  rather than ordered. Fetch and push both refuse it, naming the tips;
+  choosing one would discard the other's commits without anyone deciding to.
+
+  ## CID hashing
+
+  `install-sha256!` puts node:crypto's SHA-256 behind multiformats' digest
+  seam. The seam proves it against the portable digest on a fixed corpus
+  before accepting it, so every CID is the same bytes it was. For a 17 MB
+  bundle under kbb (2026-10-07) seal / verify / open took 52 / 29 / 38 ms
+  with it and 26 / 52 / 49 s with the portable digest."
+  (:require #?@(:cljs [["node:fs" :as fs]
+                       ["node:os" :as os]
+                       ["node:path" :as path]
+                       ["node:crypto" :as crypto]
+                       ["node:child_process" :as cp]
+                       [clojure.edn :as edn]
+                       [bonsai.private-repo :as private]
+                       [bonsai.private-wire :as wire]
+                       [bonsai.recipient-store :as store]
+                       [multiformats.core :as mf]])))
+
+#?(:cljs
+   (do
+     ;; ------------------------------------------------------------ digest
+
+     (defn- ->buffer [b]
+       (cond
+         (instance? js/Buffer b) b
+         (js/ArrayBuffer.isView b) (js/Buffer.from (.-buffer b) (.-byteOffset b) (.-byteLength b))
+         :else (js/Buffer.from (clj->js (mapv #(bit-and % 0xff) b)))))
+
+     (defn node-sha256 [b]
+       (let [d (.digest (.update (crypto/createHash "sha256") (->buffer b)))]
+         (js/Uint8Array. (.-buffer d) (.-byteOffset d) (.-length d))))
+
+     (defn install-sha256!
+       "node:crypto under multiformats' SHA-256 seam, after the seam has
+        proved it equal to the portable digest. Idempotent."
+       []
+       (when-not (= :installed (mf/sha256-provider))
+         (mf/install-sha256! node-sha256)))
+
+     ;; ------------------------------------------------------- environment
+
+     (defn- env [k] (aget (.-env js/process) k))
+
+     (def base-file "kotoba-private-base")
+
+     (defn endpoint
+       "`kotoba://host[:port]/<rid>` -> {:base url-prefix :rid rid}. https
+        only, except an explicit loopback test (KOTOBA_GIT_ALLOW_HTTP_LOOPBACK=1)."
+       [remote]
+       (let [u (try (js/URL. remote) (catch :default _ nil))]
+         (when-not (and u (= "kotoba:" (.-protocol u)))
+           (throw (ex-info "remote must be kotoba://host/<rid>" {:reason :bad-remote})))
+         (let [host (.-hostname u) port (.-port u)
+               rid (.replace (js/decodeURIComponent (or (.-pathname u) "")) (js/RegExp. "^/") "")
+               loopback? (contains? #{"127.0.0.1" "localhost"} host)
+               scheme (if (and loopback? (= "1" (env "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK"))) "http" "https")]
+           (when-not (and (re-matches #"[A-Za-z0-9.-]+" host) (wire/valid-rid? rid))
+             (throw (ex-info "unsafe kotoba remote (host or repository id)" {:reason :bad-remote})))
+           {:rid rid
+            :base (str scheme "://" host (when (not= "" port) (str ":" port))
+                       "/git/v1/repos/" (js/encodeURIComponent rid) "/private")})))
+
+     (defn authorization
+       "`Biscuit <token>` from the file KOTOBA_GIT_BISCUIT_FILE names, read now.
+        The file may hold the bare token or the whole header value."
+       []
+       (let [f (env "KOTOBA_GIT_BISCUIT_FILE")]
+         (when-not (and f (fs/existsSync f))
+           (throw (ex-info "KOTOBA_GIT_BISCUIT_FILE must name a file holding the repository Biscuit"
+                           {:reason :no-biscuit})))
+         (when-not (zero? (bit-and (.-mode (fs/statSync f)) 63))
+           (throw (ex-info (str f " is readable by group or other; chmod 600 it")
+                           {:reason :biscuit-permissions})))
+         (let [raw (.trim (fs/readFileSync f "utf8"))
+               token (.replace raw (js/RegExp. "^Biscuit\\s+" "i") "")]
+           (when-not (re-matches #"[A-Za-z0-9_-]{80,8192}" token)
+             (throw (ex-info (str f " does not hold one base64url Biscuit") {:reason :bad-biscuit})))
+           (str "Biscuit " token))))
+
+     ;; ---------------------------------------------------------------- git
+
+     (defn- git! [args & [{:keys [out]}]]
+       (let [r (cp/spawnSync "git" (clj->js args)
+                             #js {:stdio #js ["ignore" "pipe" "pipe"] :maxBuffer (* 256 1024 1024)})]
+         (when-not (= 0 (.-status r))
+           (throw (ex-info (str "git " (first args) " failed: " (.trim (str (.-stderr r))))
+                           {:reason :git :exit (.-status r)})))
+         (when (= :string out) (str (.-stdout r)))))
+
+     (defn- has-head? [cache] (fs/existsSync (path/join cache "HEAD")))
+
+     (defn- read-base [cache]
+       (let [f (path/join cache base-file)]
+         (when (fs/existsSync f)
+           (let [v (edn/read-string (fs/readFileSync f "utf8"))]
+             (when (map? v) v)))))
+
+     (defn- write-base! [cache base]
+       (let [f (path/join cache base-file) tmp (str f ".tmp")]
+         (fs/writeFileSync tmp (str (pr-str base) "\n"))
+         (fs/renameSync tmp f)))
+
+     ;; --------------------------------------------------------------- http
+
+     (defn- error-text [response]
+       (-> (.text response)
+           (.then (fn [t] (let [m (try (js->clj (js/JSON.parse t)) (catch :default _ nil))]
+                            (or (get m "error") (subs t 0 (min 200 (count t)))))))))
+
+     (defn- http-failure [what response]
+       (-> (error-text response)
+           (.then (fn [t] (throw (ex-info (str what ": HTTP " (.-status response) " " t)
+                                          {:reason :http :status (.-status response) :error t}))))))
+
+     (defn get-head
+       "-> Promise<frontier vector of head events (keyword keys)>, [] when the
+        repository has no head yet."
+       [{:keys [base]}]
+       (-> (js/fetch (str base "/head") #js {:headers #js {:authorization (authorization)}})
+           (.then (fn [r]
+                    (case (.-status r)
+                      404 []
+                      200 (-> (.json r)
+                              (.then #(vec (get (js->clj % :keywordize-keys true) :frontier))))
+                      (http-failure "private head read" r))))))
+
+     (defn- get-block [{:keys [base]} cid]
+       (-> (js/fetch (str base "/blocks/" cid) #js {:headers #js {:authorization (authorization)}})
+           (.then (fn [r]
+                    (if (= 200 (.-status r))
+                      (.then (.arrayBuffer r) #(js/Uint8Array. %))
+                      (http-failure (str "private block " cid) r))))))
+
+     (defn- put-block! [{:keys [base]} {:keys [cid content-type bytes]}]
+       (-> (js/fetch (str base "/blocks/" cid)
+                     #js {:method "PUT"
+                          :headers #js {:authorization (authorization)
+                                        "content-type" content-type
+                                        "x-kotoba-git-operation" "push"}
+                          :body bytes})
+           (.then (fn [r] (when-not (= 201 (.-status r))
+                            (http-failure (str "private block upload " cid) r))))))
+
+     (defn- put-head! [{:keys [base]} command]
+       (-> (js/fetch (str base "/head")
+                     #js {:method "PUT"
+                          :headers #js {:authorization (authorization)
+                                        "content-type" "application/json"}
+                          :body (js/JSON.stringify (clj->js command))})
+           (.then (fn [r]
+                    (if (#{200 201} (.-status r))
+                      (.json r)
+                      (http-failure "private head update" r))))))
+
+     ;; ------------------------------------------------------------ shapes
+
+     (defn- refuse-fork! [frontier]
+       (when (> (count frontier) 1)
+         (throw (ex-info (str "the remote private repository has " (count frontier)
+                              " tips (concurrent pushes were kept apart, not ordered): "
+                              (pr-str (mapv :snapshot_cid frontier))
+                              ". Refusing to pick one; reconciling forks is not supported by this adapter yet.")
+                         {:reason :forked :tips (mapv :snapshot_cid frontier)}))))
+
+     (defn- base-of [event]
+       {:snapshot-cid (:snapshot_cid event) :ciphertext-cid (:ciphertext_cid event)
+        :epoch (:epoch event)})
+
+     (defn- recipients [self-descriptor]
+       (let [f (env "KOTOBA_GIT_RECIPIENTS")
+             others (when (and f (not= "" f))
+                      (let [v (edn/read-string (fs/readFileSync f "utf8"))]
+                        (when-not (and (vector? v)
+                                       (every? #(and (map? %) (string? (:id %)) (string? (:pub %))
+                                                     (string? (:pq-pub %)))
+                                               v))
+                          (throw (ex-info (str f " must be an EDN vector of {:id :pub :pq-pub}")
+                                          {:reason :bad-recipients})))
+                        v))]
+         (->> (cons self-descriptor others)
+              (map #(select-keys % [:id :pub :pq-pub]))
+              (reduce (fn [acc r] (if (some #(= (:id r) (:id %)) acc) acc (conj acc r))) []))))
+
+     ;; ------------------------------------------------------------- fetch
+
+     (defn open-tip
+       "Download, verify and decrypt one head event. -> Promise<bundle bytes>.
+        Both CIDs and the descriptor's repository are checked against the
+        event before the key is used."
+       [ep event keyring]
+       (-> (js/Promise.all #js [(get-block ep (:snapshot_cid event))
+                                (get-block ep (:ciphertext_cid event))])
+           (.then (fn [[descriptor ciphertext]]
+                    (let [snapshot (try (private/restore-snapshot descriptor ciphertext)
+                                        (catch :default e
+                                          (throw (ex-info (str "remote snapshot failed verification: "
+                                                               (ex-message e))
+                                                          {:reason :verification} e))))]
+                      (when-not (and (= (:snapshot_cid event) (:snapshot/cid snapshot))
+                                     (= (:ciphertext_cid event) (:snapshot/ciphertext-cid snapshot))
+                                     (= (:rid ep) (:snapshot/rid snapshot)))
+                        (throw (ex-info "remote snapshot does not match its head event"
+                                        {:reason :verification})))
+                      (try (private/open-snapshot snapshot (:id keyring) (:keys keyring))
+                           (catch :default e
+                             (throw (ex-info (str "cannot open the remote snapshot with recipient "
+                                                  (:id keyring) ": " (ex-message e))
+                                             {:reason :cannot-open} e)))))))))
+
+     (defn fetch!
+       "Materialize the remote's single tip into the bare `cache`."
+       [remote cache keyring]
+       (let [ep (endpoint remote)]
+         (-> (get-head ep)
+             (.then
+              (fn [frontier]
+                (refuse-fork! frontier)
+                (let [tip (first frontier)]
+                  (cond
+                    (nil? tip)
+                    (when-not (has-head? cache) (git! ["init" "-q" "--bare" cache]))
+
+                    (and (has-head? cache) (= (:snapshot_cid tip) (:snapshot-cid (read-base cache))))
+                    nil
+
+                    :else
+                    (-> (open-tip ep tip keyring)
+                        (.then
+                         (fn [bundle]
+                           (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-private-"))
+                                 f (path/join dir "repo.bundle")]
+                             (try
+                               (fs/writeFileSync f bundle #js {:mode 384})
+                               (if (has-head? cache)
+                                 (git! ["--git-dir" cache "fetch" "-q" "--prune" f "+refs/*:refs/*"])
+                                 (git! ["clone" "-q" "--mirror" f cache]))
+                               (write-base! cache (base-of tip))
+                               (finally (fs/rmSync dir #js {:recursive true :force true}))))))))))))))
+
+     ;; -------------------------------------------------------------- push
+
+     (defn push!
+       "Seal the bare `cache` and append it as the child of the tip this cache
+        was fetched from. -> Promise<the head response>."
+       [remote cache keyring]
+       (let [ep (endpoint remote)
+             base (read-base cache)]
+         (when (empty? (.trim (git! ["--git-dir" cache "for-each-ref"] {:out :string})))
+           (throw (ex-info "nothing to push: the repository has no refs" {:reason :empty})))
+         (-> (get-head ep)
+             (.then
+              (fn [frontier]
+                (refuse-fork! frontier)
+                (when-not (= (mapv :snapshot_cid frontier)
+                             (if base [(:snapshot-cid base)] []))
+                  (throw (ex-info (str "the remote moved since this cache was fetched (now "
+                                       (pr-str (mapv :snapshot_cid frontier)) ", fetched "
+                                       (pr-str (:snapshot-cid base)) "); fetch, merge, and push again")
+                                  {:reason :moved})))
+                (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-private-"))
+                      f (path/join dir "repo.bundle")]
+                  (try
+                    (git! ["--git-dir" cache "bundle" "create" "-q" f "--all"])
+                    (private/seal-snapshot
+                     {:rid (:rid ep)
+                      :epoch (or (:epoch base) 0)
+                      :parent (:snapshot-cid base)
+                      :bundle-bytes (js/Uint8Array. (fs/readFileSync f))
+                      :recipients (recipients (:descriptor keyring))
+                      :kem :x25519+ml-kem-768})
+                    (finally (fs/rmSync dir #js {:recursive true :force true}))))))
+             (.then
+              (fn [snapshot]
+                (let [blocks (wire/snapshot-blocks snapshot)]
+                  (-> (reduce (fn [p b] (.then p #(put-block! ep b))) (js/Promise.resolve nil) blocks)
+                      (.then #(put-head! ep (wire/head-command snapshot "push"
+                                                               {:expected-heads
+                                                                (if base [(:snapshot-cid base)] [])})))
+                      (.then (fn [response]
+                               (write-base! cache {:snapshot-cid (:snapshot/cid snapshot)
+                                                   :ciphertext-cid (:snapshot/ciphertext-cid snapshot)
+                                                   :epoch (:snapshot/epoch snapshot)})
+                               response)))))))))))

@@ -1,0 +1,134 @@
+(ns commoncrawl.cdx-test
+  "commoncrawl.cdx exercised entirely offline via an injected fake fetch-fn
+  — same discipline as dossier.commoncrawl-test, including the real
+  404-with-JSON-body no-match quirk this ADR explicitly asks not to
+  regress on."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [commoncrawl.cdx :as cdx]))
+
+(defn- fake-fetch [routes]
+  (fn [{:keys [path query]}] (get routes [path (get query "url")])))
+
+(def example-capture-old
+  {:url "https://www.gleif.org/" :timestamp "20260101000000" :status "200"
+   :filename "a.warc.gz" :offset "100" :length "50"})
+(def example-capture-new
+  {:url "https://www.gleif.org/" :timestamp "20260701000000" :status "200"
+   :filename "b.warc.gz" :offset "200" :length "60"})
+(def no-match-response [{:message "No Captures found for: nonexistent-domain.jp"}])
+
+(defn- routes []
+  {["/CC-MAIN-2026-25-index" "https://www.gleif.org/"] [example-capture-old example-capture-new]
+   ["/CC-MAIN-2026-25-index" "https://nonexistent-domain.jp/"] no-match-response})
+
+(deftest captures-of-real-404-no-match-quirk-returns-empty-vector-not-nil
+  (testing "a genuine no-match is HTTP 404 WITH a real JSON body -- must be [] (confirmed
+           absent), never nil (unknown) -- the exact lesson dossier.commoncrawl's own
+           live verification found and fixed (ADR-2607182400)"
+    (let [fetch (fake-fetch (routes))]
+      (is (= [] (cdx/captures-of fetch "CC-MAIN-2026-25" "https://nonexistent-domain.jp/"))))))
+
+(deftest captures-of-transport-failure-returns-nil-never-empty-vector
+  (let [always-nil (fn [_] nil)]
+    (is (nil? (cdx/captures-of always-nil "CC-MAIN-2026-25" "https://anything.jp/"))
+        "nil (unknown) must never be conflated with [] (confirmed absent)")))
+
+(deftest captures-of-returns-every-real-match
+  (let [fetch (fake-fetch (routes))]
+    (is (= 2 (count (cdx/captures-of fetch "CC-MAIN-2026-25" "https://www.gleif.org/"))))))
+
+(deftest latest-capture-picks-the-newest-timestamp-not-just-the-first-result
+  (let [fetch (fake-fetch (routes))
+        c (cdx/latest-capture fetch "CC-MAIN-2026-25" "https://www.gleif.org/")]
+    (is (= "20260701000000" (:timestamp c))
+        "fixture lists the OLDER capture first -- must not just take (first result)")))
+
+(deftest latest-capture-on-no-match-is-nil
+  (let [fetch (fake-fetch (routes))]
+    (is (nil? (cdx/latest-capture fetch "CC-MAIN-2026-25" "https://nonexistent-domain.jp/")))))
+
+(deftest has-web-presence?-true-for-real-match-false-for-confirmed-no-match
+  (let [fetch (fake-fetch (routes))]
+    (is (true? (cdx/has-web-presence? fetch "CC-MAIN-2026-25" "https://www.gleif.org/")))
+    (is (false? (cdx/has-web-presence? fetch "CC-MAIN-2026-25" "https://nonexistent-domain.jp/")))))
+
+;; ── latest-response-capture: the real-world redirect-stub bug this ADR's
+;; live verification actually found (www.sec.gov's newest CC-MAIN-2026-25
+;; capture was a contentless 301-redirect stub, not any of its many real
+;; 200 captures) ────────────────────────────────────────────────────────
+
+(def redirect-capture
+  {:url "http://www.sec.gov/" :timestamp "20260618174822" :status "301"
+   :filename "r.warc.gz" :offset "1482848" :length "513"})
+(def ok-capture-old
+  {:url "https://www.sec.gov/" :timestamp "20260606041423" :status "200"
+   :filename "a.warc.gz" :offset "808896753" :length "76587"})
+
+(defn- redirect-routes []
+  {["/CC-MAIN-2026-25-index" "https://www.sec.gov/"] [ok-capture-old redirect-capture]})
+
+(deftest latest-response-capture-skips-a-newer-redirect-for-an-older-200
+  (testing "a newer capture that isn't status 200 must never be picked over an older 200 --
+           latest-capture (no status filter) WOULD pick the redirect here; this is exactly
+           why fetch-page-text uses latest-response-capture instead"
+    (let [fetch (fake-fetch (redirect-routes))]
+      (is (= "301" (:status (cdx/latest-capture fetch "CC-MAIN-2026-25" "https://www.sec.gov/")))
+          "sanity: latest-capture picks the newer (redirect) record, unfiltered")
+      (is (= "200" (:status (cdx/latest-response-capture fetch "CC-MAIN-2026-25" "https://www.sec.gov/")))))))
+
+(deftest latest-response-capture-nil-when-no-200-capture-exists
+  (let [fetch (fake-fetch {["/CC-MAIN-2026-25-index" "https://x/"] [redirect-capture]})]
+    (is (nil? (cdx/latest-response-capture fetch "CC-MAIN-2026-25" "https://x/")))))
+
+(deftest fetch-page-text-skips-a-non-200-capture-for-an-older-200
+  (let [fetch (fake-fetch (redirect-routes))
+        fixture (str "WARC/1.0\r\nWARC-Type: response\r\n\r\n"
+                     "HTTP/1.1 200 OK\r\n\r\n<html><body>real content</body></html>")
+        warc-fetch-fn (fn [capture] (when (= "200" (:status capture)) fixture))
+        result (cdx/fetch-page-text fetch warc-fetch-fn "CC-MAIN-2026-25" "https://www.sec.gov/")]
+    (is (some? result) "must find the older 200 capture's real content, not miss on the redirect")))
+
+(deftest latest-collection-id-reads-the-first-collection
+  (is (= "CC-MAIN-2026-25" (cdx/latest-collection-id (fn [] [{:id "CC-MAIN-2026-25"} {:id "CC-MAIN-2026-21"}]))))
+  (is (nil? (cdx/latest-collection-id (fn [] nil))) "a transport failure degrades to nil, never a stale guess"))
+
+;; ── WARC envelope stripping ──────────────────────────────────────────────
+
+(def warc-fixture
+  (str "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: https://www.gleif.org/\r\n\r\n"
+       "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+       "<html><title>GLEIF</title><body>hello</body></html>"))
+
+(deftest strip-warc-envelope-strips-both-header-layers
+  (is (= "<html><title>GLEIF</title><body>hello</body></html>"
+         (cdx/strip-warc-envelope warc-fixture))))
+
+(deftest strip-warc-envelope-non-response-record-is-blank
+  (is (= "" (cdx/strip-warc-envelope "WARC/1.0\r\nWARC-Type: warcinfo\r\n\r\nsome metadata"))))
+
+(deftest strip-warc-envelope-non-string-input-is-blank-not-throw
+  (is (= "" (cdx/strip-warc-envelope nil))))
+
+;; ── fetch-page-text orchestration ────────────────────────────────────────
+
+(deftest fetch-page-text-happy-path
+  (let [fetch (fake-fetch (routes))
+        warc-fetch-fn (fn [capture] (when (= "https://www.gleif.org/" (:url capture)) warc-fixture))
+        result (cdx/fetch-page-text fetch warc-fetch-fn "CC-MAIN-2026-25" "https://www.gleif.org/")]
+    (is (some? result))
+    (is (= "https://www.gleif.org/" (:url result)))
+    (is (re-find #"hello" (:text result)))))
+
+(deftest fetch-page-text-no-capture-is-nil
+  (let [fetch (fake-fetch (routes))]
+    (is (nil? (cdx/fetch-page-text fetch (constantly nil) "CC-MAIN-2026-25" "https://nonexistent-domain.jp/")))))
+
+(deftest fetch-page-text-warc-fetch-throws-degrades-to-nil
+  (let [fetch (fake-fetch (routes))
+        throwing (fn [_] (throw (ex-info "boom" {})))]
+    (is (nil? (cdx/fetch-page-text fetch throwing "CC-MAIN-2026-25" "https://www.gleif.org/")))))
+
+(deftest fetch-page-text-blank-stripped-body-is-nil
+  (let [fetch (fake-fetch (routes))
+        warc-fetch-fn (constantly "WARC/1.0\r\nWARC-Type: response\r\n\r\nHTTP/1.1 200 OK\r\n\r\n   ")]
+    (is (nil? (cdx/fetch-page-text fetch warc-fetch-fn "CC-MAIN-2026-25" "https://www.gleif.org/")))))

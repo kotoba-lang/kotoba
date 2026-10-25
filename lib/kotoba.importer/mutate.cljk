@@ -1,0 +1,153 @@
+#!/usr/bin/env kbb
+;; Break each invariant on purpose, in a scratch copy, and require the suite to
+;; go red AND to name the test that pins it.
+;;
+;;   kbb --backend sci --classpath "src:../connector/src" mutate.cljk [--connector <dir>]
+;;
+;; A green suite proves the code passes its tests. It does not prove the tests
+;; would notice if the code stopped being right. This does, and it is the
+;; reason a reader can believe the other file.
+(ns mutate
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            ["os" :as os]
+            ["child_process" :as cp]
+            [kotoba.lang.text :as str]))
+
+(def argv (vec (drop 2 (js->clj js/process.argv))))
+(defn- flag [name default]
+  (if-let [i (some (fn [[i a]] (when (= a name) i)) (map-indexed vector argv))]
+    (nth argv (inc i) default)
+    default))
+
+(def connector-src (flag "--connector" "../connector/src"))
+
+(def mutations
+  [{:id :partial-write
+    :file "src/importer/cursor.cljk"
+    :from "      (< persisted planned)"
+    :to   "      (< persisted -1)"
+    :expect "advance-refuses-a-partial-write"
+    :why "a cursor may advance past records the sink never took"}
+
+   {:id :not-synced
+    :file "src/importer/cursor.cljk"
+    :from "      (not= :synced outcome)"
+    :to   "      (= :never-an-outcome outcome)"
+    :expect "advance-refuses-unless-synced"
+    :why "a failed page moves the cursor"}
+
+   {:id :watermark-regression
+    :file "src/importer/cursor.cljk"
+    :from "           (neg? (compare watermark (:importer.cursor/watermark c))))"
+    :to   "           false)"
+    :expect "incremental-refuses-a-regressing-watermark"
+    :why "an out-of-order page rewinds the high-water mark"}
+
+   {:id :early-promotion
+    :file "src/importer/cursor.cljk"
+    :from "    (not (exhausted? c))"
+    :to   "    (and false (not (exhausted? c)))"
+    :expect "promote-refuses-before-the-backfill-is-done"
+    :why "history not yet read is skipped, and every later run looks healthy"}
+
+   {:id :empty-batch-is-green
+    :file "src/importer/outcome.cljk"
+    :from "      :unmeasured\n      (apply max-key"
+    :to   "      :synced\n      (apply max-key"
+    :expect "outcome-keeps-three-values"
+    :why "a batch that ran nothing reports success"}
+
+   {:id :held-is-a-sync
+    :file "src/importer/plan.cljk"
+    :from "                  :else :failed)"
+    :to   "                  :else :synced)"
+    :expect "a-held-move-is-not-a-sync"
+    :why "read-and-not-landed is reported as a success"}
+
+   {:id :governance-optional
+    :file "src/importer/model.cljk"
+    :from "  (if (nil? g)"
+    :to   "  (if (and false (nil? g))"
+    :expect "source-must-declare-its-terms"
+    :why "an importer collects mail without declaring a PII tier or a retention"}
+
+   {:id :retention-absent-ok
+    :file "src/importer/model.cljk"
+    :from "    (when-not (or (contains? retention-values ret)"
+    :to   "    (when-not (or true (contains? retention-values ret)"
+    :expect "source-must-declare-its-terms"
+    :why "a cursor's validity window is left unstated rather than measured"}
+
+   {:id :bare-answer-allowed
+    :file "src/importer/connector.cljk"
+    :from "      :else no-coverage)))"
+    :to   "      :else body)))"
+    :expect "an-answer-without-coverage-is-refused"
+    :why "a bot receives an empty list it cannot tell from an unimported mailbox"}
+
+   {:id :provider-id-as-identity
+    :file "src/importer/normalize.cljk"
+    :from "      (not (str/blank? (str m))) (str \"rfc5322:\" m)"
+    :to   "      (not (str/blank? (str cid))) (str \"blob:\" cid)"
+    :expect "the-same-message-from-both-providers-is-one-record"
+    :why "one message in two systems is stored twice, doubling every later count"}
+
+   {:id :unknown-window-overrules-a-measured-run
+    :file "src/importer/coverage.cljk"
+    :from "      (not= :synced outcome) :stale\n      (= true (cur/expired? cursor now)) :stale"
+    :to   "      (nil? (cur/expired? cursor now)) :stale\n      (not= :synced outcome) :stale"
+    :expect "a-provider-with-no-published-window-is-still-covered"
+    :why "every Graph, Drive and Calendar stream reads as uncertain forever, so the caveat stops meaning anything"}
+
+   {:id :coverage-defaults-to-covered
+    :file "src/importer/coverage.cljk"
+    :from "    :never-imported))"
+    :to   "    :covered))"
+    :expect "an-unimported-stream-says-so"
+    :why "a mailbox nobody imported reports itself as fully read"}])
+
+(defn- copy-tree! [src dst]
+  (fs/mkdirSync dst #js {:recursive true})
+  (doseq [e (fs/readdirSync src #js {:withFileTypes true})]
+    (let [s (path/join src (.-name e)) d (path/join dst (.-name e))]
+      (if (.isDirectory e) (copy-tree! s d) (fs/copyFileSync s d)))))
+
+(defn- run-suite [dir]
+  (let [r (cp/spawnSync "npx"
+                        #js ["--yes" "kbb" "--backend" "sci" "--classpath"
+                             (str "src:test:" (path/resolve connector-src))
+                             "run-tests.cljk"]
+                        #js {:cwd dir :encoding "utf8"})]
+    {:code (.-status r) :out (str (.-stdout r) (.-stderr r))}))
+
+(let [root (fs/mkdtempSync (path/join (os/tmpdir) "importer-mutate-"))
+      failures (atom [])]
+  (println "mutating" (count mutations) "invariants in" root)
+  (doseq [{:keys [id file from to expect why]} mutations]
+    (let [dir (path/join root (name id))]
+      (copy-tree! "." dir)
+      (let [p (path/join dir file)
+            before (fs/readFileSync p "utf8")]
+        (if-not (str/includes? before from)
+          (do (println "  REFUSED" id "-- anchor not found in" file)
+              (swap! failures conj [id :anchor-missing]))
+          (do
+            (fs/writeFileSync p (str/replace before from to))
+            (let [{:keys [code out]} (run-suite dir)]
+              (cond
+                (zero? code)
+                (do (println "  SURVIVED" id "--" why)
+                    (swap! failures conj [id :survived]))
+
+                (not (str/includes? out expect))
+                (do (println "  WRONG-TEST" id "-- red, but" expect "did not name it")
+                    (swap! failures conj [id :wrong-test]))
+
+                :else
+                (println "  caught  " (name id) "->" expect))))))))
+  (if (seq @failures)
+    (do (println "\n" (count @failures) "mutation(s) not caught:" (pr-str @failures))
+        (js/process.exit 1))
+    (do (println "\nall" (count mutations) "mutations caught by the test that pins them")
+        (js/process.exit 0))))

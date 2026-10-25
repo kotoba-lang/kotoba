@@ -1,0 +1,115 @@
+(ns scheduled
+  "One scheduled commoncrawl-actor tick, wired for launchd
+  (LaunchAgent `net-kotobase.commoncrawl-actor-tick`, see
+  `ops/net-kotobase.commoncrawl-actor-tick.plist`).
+
+    kbb --backend sci bin/scheduled.cljk
+
+  ## Why a wrapper rather than launchd calling `tick.cljs` directly
+
+  Both of this actor's real credentials come from places `bin/tick.cljk`
+  itself cannot read from under launchd:
+
+  - `CF_CATALOG_TOKEN` — the macOS Keychain, fetched by exact service +
+    account name (`gftd.cf`/`API_TOKEN`), never by enumerating the store
+    (this workspace's safety floor #7).
+  - `COMMONCRAWL_MURAKUMO_TOKEN` — `commoncrawl.live-http/murakumo-token`
+    falls back to a `KAGI_BIN`-driven `kagi get`, and kagi cannot show its
+    Keychain-unlock prompt under launchd (superproject skill
+    `secrets-location-map`, and `cloud-itonami/otent`'s own
+    `bin/scheduled.cljk` hits the identical wall for its catalog token).
+    This reads `~/.gftd/commoncrawl-actor-murakumo-token` (mode 600)
+    instead — the file-based fallback this workspace's own convention
+    documents for exactly this problem (see `MURAKUMO_SERVICE_TOKEN`'s
+    entry in `secrets-location-map/references/murakumo.md`).
+
+  ## Missing credentials degrade the tick; they do not stop it
+
+  Unlike `otent`'s wrapper — whose catalog token IS its premise, so a
+  missing token refuses the whole cycle — neither credential here is this
+  actor's premise:
+
+  - Missing `CF_CATALOG_TOKEN` only degrades that tick's `:iceberg` field
+    to `{:ok? false :error :could-not-answer ...}` (`commoncrawl.live-iceberg`'s
+    own documented contract). Net-kotobase ingestion is unaffected.
+  - Missing the murakumo token degrades every page's `:advise` proposal to
+    zero confidence, which `commoncrawl.policy`'s existing confidence
+    floor already routes to HOLD — the actor's designed default for an
+    untrusted/unavailable advisor, not a new failure mode this wrapper
+    invents.
+
+  So this logs a warning per missing credential and runs the tick anyway.
+
+  exit: whatever `bin/tick.cljk` itself exits — today always 0 unless an
+  uncaught exception escapes it. A HELD tick is this actor's normal,
+  designed outcome (a fetch miss, an out-of-scope seed, low confidence),
+  not a scheduler failure, so this wrapper does not invent a nonzero exit
+  for it."
+  (:require ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(defn- log [& xs]
+  (println (str (.toISOString (js/Date.)) " " (str/join " " xs))))
+
+(defn- keychain
+  "One credential, fetched by its exact service and account — never an
+  enumeration of the store."
+  [service account]
+  (let [r (cp/spawnSync "security"
+                        #js ["find-generic-password" "-s" service "-a" account "-w"]
+                        #js {:encoding "utf8"})]
+    (when (zero? (.-status r)) (not-empty (str/trim (str (.-stdout r)))))))
+
+(defn- murakumo-token-file []
+  (path/join (or (aget js/process.env "HOME") ".") ".gftd" "commoncrawl-actor-murakumo-token"))
+
+(defn- murakumo-token []
+  (let [f (murakumo-token-file)]
+    (when (fs/existsSync f)
+      (not-empty (str/trim (fs/readFileSync f "utf8"))))))
+
+(def classpath
+  "Every sibling `bin/tick.cljk` requires, at rest beside this repo per the
+  west layout (`../../kotoba-lang/<name>`, not `../<name>` — see
+  deps.edn's `:dev` alias comment). `authority` is transitive
+  (`org-chainagnostic-cacao` requires `authority.scope`) but still has to
+  be on this list, or it loads fine by hand and fails only under launchd,
+  in a log nobody reads."
+  (str "src:"
+       (path/join ".." ".." "kotoba-lang" "text" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "langgraph" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "langchain" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "langchain-store" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "org-chainagnostic-cacao" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "org-ietf-ed25519" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "org-ietf-cbor" "src") ":"
+       (path/join ".." ".." "kotoba-lang" "authority" "src")))
+
+(defn- budget []
+  (or (some-> (aget js/process.env "COMMONCRAWL_TICK_BUDGET") str/trim not-empty)
+      "1"))
+
+(defn -main []
+  (let [catalog-token (keychain "gftd.cf" "API_TOKEN")
+        murakumo (murakumo-token)
+        env (js/Object.assign #js {} js/process.env
+                              (clj->js (cond-> {}
+                                         catalog-token (assoc "CF_CATALOG_TOKEN" catalog-token)
+                                         murakumo (assoc "COMMONCRAWL_MURAKUMO_TOKEN" murakumo))))]
+    (when-not catalog-token
+      (log "WARN: no gftd.cf/API_TOKEN in the Keychain -- this tick's :iceberg"
+           "field will report :could-not-answer; kotobase.net ingestion is unaffected"))
+    (when-not murakumo
+      (log "WARN: no" (murakumo-token-file) "-- every page this tick advises"
+           "gets a zero-confidence proposal and HOLDs (commoncrawl.policy's"
+           "existing confidence floor), not a new failure mode"))
+    (let [r (cp/spawnSync "kbb"
+                          #js ["--backend" "sci" "--classpath" classpath (path/join "bin" "tick.cljk")
+                               "--budget" (budget)]
+                          #js {:encoding "utf8" :stdio "inherit" :env env})]
+      (log "tick exit" (.-status r))
+      (js/process.exit (or (.-status r) 1)))))
+
+(-main)

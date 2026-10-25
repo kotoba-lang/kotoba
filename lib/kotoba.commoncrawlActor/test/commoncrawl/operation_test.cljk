@@ -1,0 +1,71 @@
+(ns commoncrawl.operation-test
+  "The full StateGraph contract as executable tests — the single invariant:
+  the LLM's proposal never reaches net-kotobase unless commoncrawl.policy
+  says :ok?, and every run leaves exactly one ledger fact."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [commoncrawl.operation :as op]
+            [commoncrawl.store :as store]))
+
+(def demo-seeds
+  [{:domain "www.gleif.org" :url "https://www.gleif.org/"}])
+
+(defn- ctx [] {:seeds demo-seeds :exclude #{} :budget {:used 0 :cap 5}})
+
+(defn- fresh-actor [{:keys [advise-fn fetch-fn warc-fetch-fn ingest-fn]}]
+  (let [db (store/mem-store)]
+    [db (op/build db {:advise-fn advise-fn
+                      :fetch-fn (or fetch-fn (constantly [{:timestamp "1" :status "200"
+                                                           :filename "f.warc.gz" :offset "0" :length "1"}]))
+                      :warc-fetch-fn (or warc-fetch-fn
+                                         (constantly (str "WARC/1.0\r\nWARC-Type: response\r\n\r\n"
+                                                          "HTTP/1.1 200 OK\r\n\r\n<html>hi</html>")))
+                      :ingest-fn (or ingest-fn (constantly {:ok true :status 200}))
+                      :collection-id "CC-MAIN-TEST"})]))
+
+(deftest clean-confident-extraction-commits
+  (let [[db actor] (fresh-actor {:advise-fn (constantly {:category "c" :summary "s" :entities [] :confidence 0.9})})
+        res (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))]
+    (is (= :commit (get-in res [:state :disposition])))
+    (is (= 1 (count (store/ledger db))))
+    (is (= :committed (:t (first (store/ledger db)))))
+    (is (store/ingested-url? db "https://www.gleif.org/"))))
+
+(deftest out-of-scope-domain-holds-without-calling-ingest
+  (let [ingest-called (atom false)
+        [db actor] (fresh-actor {:advise-fn (constantly {:category "c" :summary "s" :entities [] :confidence 0.9})
+                                 :ingest-fn (fn [_] (reset! ingest-called true) {:ok true})})
+        res (op/run-seed! actor {:domain "evil.example.com" :url "https://evil.example.com/"} (ctx))]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (not @ingest-called) "commit's ingest-fn must never be called for a rejected proposal")
+    (is (= 1 (count (store/ledger db))))
+    (is (= :policy-hold (:t (first (store/ledger db)))))
+    (is (some #{:out-of-scope} (:basis (first (store/ledger db)))))))
+
+(deftest low-confidence-extraction-holds-soft
+  (let [[db actor] (fresh-actor {:advise-fn (constantly {:category "?" :summary "?" :entities [] :confidence 0.1})})
+        res (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (true? (:soft? (first (store/ledger db)))))))
+
+(deftest fetch-miss-holds-without-running-advise
+  (let [advise-called (atom false)
+        [db actor] (fresh-actor {:advise-fn (fn [_] (reset! advise-called true) {:category "" :summary "" :entities [] :confidence 0.9})
+                                 :fetch-fn (constantly nil)})
+        res (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (not @advise-called) "a fetch miss must short-circuit straight to :hold")
+    (is (= :fetch-miss (:t (first (store/ledger db)))))))
+
+(deftest ingest-failure-is-still-recorded-as-committed-with-ingest-ok-false
+  (testing "a net-kotobase-side failure doesn't crash the run -- the ledger honestly
+           records ingest-ok?=false rather than claiming success"
+    (let [[db actor] (fresh-actor {:advise-fn (constantly {:category "c" :summary "s" :entities [] :confidence 0.9})
+                                   :ingest-fn (constantly {:ok false :status 500})})
+          res (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))]
+      (is (= :commit (get-in res [:state :disposition])) "policy allowed it; the actor still tried")
+      (is (false? (:ingest-ok? (first (store/ledger db))))))))
+
+(deftest every-run-leaves-exactly-one-ledger-fact
+  (let [[db actor] (fresh-actor {:advise-fn (constantly {:category "c" :summary "s" :entities [] :confidence 0.9})})]
+    (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))
+    (is (= 1 (count (store/ledger db))))))

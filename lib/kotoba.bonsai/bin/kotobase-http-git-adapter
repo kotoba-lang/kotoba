@@ -1,0 +1,125 @@
+#!/usr/bin/env kbb
+(ns kotobase-http-git-adapter
+  "HTTPS production adapter for git-remote-kotoba.
+
+   Wire contract:
+     GET /git/v1/repos/<rid>/bundle
+     PUT /git/v1/repos/<rid>/bundle
+
+   PUT body is a Git bundle. Headers bind its SHA-256 and the complete ref
+   projection. The service must verify the bundle closure and authorize/ref-
+   event the update before acknowledging it."
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]))
+
+(defn fail! [m] (throw (ex-info m {})))
+
+(defn env [k] (aget (.-env js/process) k))
+
+(defn sha256-file [f]
+  ;; Bundles can be large; keep the original adapter's bounded streaming hash.
+  (let [fd (fs/openSync f "r") hash (crypto/createHash "sha256") buf (js/Buffer.alloc 65536)]
+    (try
+      (loop []
+        (let [n (fs/readSync fd buf 0 (.-length buf) nil)]
+          (when (pos? n) (.update hash (.subarray buf 0 n)) (recur))))
+      (.digest hash "hex")
+      (finally (fs/closeSync fd)))))
+
+(defn run!
+  "Run argv without a shell. `:in` is written to the child's stdin; `:out
+   :string` captures stdout, otherwise it is forwarded to stderr (stdout is
+   the Git protocol stream of the helper that invoked us)."
+  [argv & [{:keys [in out]}]]
+  (let [r (cp/spawnSync (first argv) (clj->js (rest argv))
+                        #js {:input (or in "")
+                             :stdio #js ["pipe" "pipe" "inherit"]
+                             :maxBuffer (* 64 1024 1024)})]
+    (when-not (= :string out)
+      (when (some-> (.-stdout r) .-length pos?) (fs/writeSync 2 (.-stdout r))))
+    (when-not (= 0 (.-status r))
+      (throw (ex-info "command failed" {:argv (first argv) :exit (.-status r)})))
+    {:exit 0 :out (str (.-stdout r))}))
+
+(defn auth-config []
+  (let [auth (env "KOTOBA_GIT_AUTHORIZATION")]
+    (when-not (and auth (not= "" (.trim auth))
+                   (not (re-find #"[\x00-\x1f\x7f\"\\]" auth)))
+      (fail! "KOTOBA_GIT_AUTHORIZATION is required and must be one safe header value"))
+    ;; Header travels through curl stdin, not argv/process listings.
+    (str "header = \"Authorization: " auth "\"\n")))
+
+(defn url-encode
+  "java.net.URLEncoder/encode(s, UTF-8) -- the form the JVM adapter sent."
+  [s]
+  (-> (js/encodeURIComponent s)
+      (.replace (js/RegExp. "[!'()~]" "g")
+                (fn [c] (str "%" (.toUpperCase (.toString (.charCodeAt c 0) 16)))))
+      (.replace (js/RegExp. "%20" "g") "+")))
+
+(defn endpoint [remote]
+  (let [u (try (js/URL. remote) (catch :default _ (fail! "unsafe kotoba remote")))]
+    (when-not (= "kotoba:" (.-protocol u)) (fail! "remote must use kotoba://"))
+    (let [host (.-hostname u) port (.-port u)
+          rid (.replace (js/decodeURIComponent (or (.-pathname u) "")) (js/RegExp. "^/") "")
+          loopback? (contains? #{"127.0.0.1" "localhost"} host)
+          http-test? (and loopback? (= "1" (env "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK")))
+          scheme (if http-test? "http" "https")]
+      (when-not (and host (re-matches #"[A-Za-z0-9.-]+" host)
+                     (not= "" (.trim rid)) (not (.includes rid "..")))
+        (fail! "unsafe kotoba remote"))
+      (str scheme "://" host (when (not= "" port) (str ":" port)) "/git/v1/repos/"
+           (url-encode rid) "/bundle"))))
+
+(defn refs-edn [git-dir]
+  (:out (run! ["git" "--git-dir" git-dir "for-each-ref"
+               "--format=%(refname) %(objectname)"] {:out :string})))
+
+(try
+  (let [[operation remote cache] *command-line-args*
+      url (endpoint remote)
+      tmp-dir (fs/mkdtempSync (path/join (os/tmpdir) "kotobase-git-"))
+      temp (path/join tmp-dir "repo.bundle")
+      has-head? #(fs/existsSync (path/join cache "HEAD"))]
+  (try
+    (case operation
+      "fetch"
+      (let [status (.trim (:out (run! ["curl" "--config" "-" "--silent" "--show-error"
+                                       "--output" temp "--write-out" "%{http_code}" url]
+                                      {:in (auth-config) :out :string})))]
+        (cond
+          (= status "404")
+          (if-not (has-head?)
+            (run! ["git" "init" "--bare" cache])
+            ;; A missing or access-hidden remote is not permission to serve the
+            ;; previous credential's cached refs. Empty bootstrap caches remain OK.
+            (when (not= "" (.trim (refs-edn cache)))
+              (fail! "bundle fetch failed HTTP 404 (cached refs not served)")))
+          (= status "200")
+          (if (has-head?)
+            (run! ["git" "--git-dir" cache "fetch" "--prune" temp "+refs/*:refs/*"])
+            (run! ["git" "clone" "--mirror" temp cache]))
+          :else (fail! (str "bundle fetch failed HTTP " status))))
+
+      "push"
+      (do
+        (run! ["git" "--git-dir" cache "bundle" "create" temp "--all"])
+        ;; Padded, like java.util.Base64/getUrlEncoder (Node's base64url is not).
+        (let [refs-b64 (-> (.toString (js/Buffer.from (refs-edn cache) "utf8") "base64")
+                           (.replace (js/RegExp. "\\+" "g") "-")
+                           (.replace (js/RegExp. "/" "g") "_"))
+              config (str (auth-config)
+                          "header = \"Content-Type: application/x-git-bundle\"\n"
+                          "header = \"X-Kotoba-Bundle-SHA256: " (sha256-file temp) "\"\n"
+                          "header = \"X-Kotoba-Refs-EDN-B64: " refs-b64 "\"\n")]
+          (run! ["curl" "--config" "-" "--fail-with-body" "--silent" "--show-error"
+                 "--request" "PUT" "--upload-file" temp url]
+                {:in config})))
+      (fail! (str "unsupported operation: " operation)))
+    (finally (fs/rmSync tmp-dir #js {:recursive true :force true}))))
+  (catch :default e
+    (fs/writeSync 2 (str "kotobase-http-git-adapter: " (ex-message e) "\n"))
+    (set! (.-exitCode js/process) 1)))
