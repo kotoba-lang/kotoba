@@ -216,6 +216,7 @@ The bundled standard libraries live in this repository:
 | `org.signal.protocol` | `org.signal.protocol/src` | `kotoba.signal.group`, `kotoba.signal.hkdf`, `kotoba.signal.ratchet`, `kotoba.signal.sealed` (an external specification, publisher signal.org) |
 | `org.graphql.http` | `org.graphql.http/src` | `kotobase.protocols.graphql`, `kotobase.protocols.graphql.http`, `kotobase.protocols.graphql.json` (an external specification, publisher graphql.org) |
 | `org.opencypher.cypher` | `org.opencypher.cypher/src` | `kotobase.protocols.cypher`, `kotobase.protocols.cypher.http`, `kotobase.protocols.cypher.json` (an external specification, publisher opencypher.org) |
+| `org.apache.tinkerpopGremlin` | `org.apache.tinkerpopGremlin/src` | `kotobase.gremlin.envelope`, `kotobase.gremlin.json`, `kotobase.gremlin.traversal`, `kotobase.gremlin.wire` (an external specification, publisher apache.org) |
 | `kotoba.kototamaNative` | `kotoba.kototamaNative/src` | `kototama.native.executor`, `kototama.native.lease-transport` (Kotoba project library) |
 | `kotoba.kotobaVerifier` | `kotoba.kotobaVerifier/src` | `kotoba.verifier`, `kotoba.verifier.conformance`, `kotoba.verifier.linux-static`, `kotoba.verifier.signing` (Kotoba project library) |
 | `kotoba.kotobaNative` | `kotoba.kotobaNative/src` | `kotoba.native.aarch64`, `kotoba.native.affine`, `kotoba.native.aggregate-abi`, `kotoba.native.document` (Kotoba project library) |

@@ -1,0 +1,242 @@
+;; Not a unit test — an EXECUTABLE end-to-end demo/test that must genuinely
+;; pass when run, matching kotoba-lang/nostr's
+;; test/nostr/relay_transport_test.cljs and org-ietf-sftp's
+;; test/kotobase/sftp/transport/ssh_demo.cljs precedent: **a REAL,
+;; cross-process demo** — spawns an actual second `nbb` OS process
+;; (bin/gremlin_server.cljk, found on --classpath's `bin/`), connects to its
+;; real bound TCP port from THIS process (acting as the WebSocket client —
+;; this test file's own minimal WS client, built on node:net + node:crypto,
+;; same zero-npm-dependency discipline as the server, and it deliberately
+;; reuses kotobase.gremlin.wire's own try-decode-frame rather than a second
+;; hand-rolled frame parser), and proves the full stack for real: real RFC
+;; 6455 handshake -> real client-MASKED WebSocket text frame carrying a real
+;; GraphSON RequestMessage JSON body -> the SECOND PROCESS's
+;; kotobase.gremlin.traversal/execute actually runs the traversal against
+;; its own in-memory kotobase.local store -> a real GraphSON ResponseMessage
+;; text frame comes back over the same real socket.
+;;
+;; HONEST SCOPE: this is genuinely cross-process (see run-demo below spawn
+;; a second `nbb` OS process, not an in-process function call) — NOT an
+;; in-process shortcut. It does NOT prove interop with a real Apache
+;; TinkerPop Gremlin Server or gremlin-python/gremlin-javascript driver —
+;; no such test exists in this repo, and none is claimed to (this repo's
+;; GraphSON envelope is its own honest v0.1 approximation, see
+;; kotobase.gremlin.wire's ns docstring).
+;;
+;; Scenario 1: g.V().hasLabel('users').has('role','admin').values('name')
+;;   -> ["Alice" "Carol"], a real materialize+filter+project round trip.
+;; Scenario 2: g.V().hasLabel('users').has('role','admin').out('worksAt')
+;;   .values('name') -> ["Engineering"], the real cross-collection join
+;;   (users -> departments) over the wire.
+;; Scenario 3: an out-of-scope step ([:repeat ...]) sent as real bytecode
+;;   over the real socket -> a real GraphSON error ResponseMessage (status
+;;   code 597), proving the wire layer surfaces translate/execute errors
+;;   correctly, not just the happy path.
+;;
+;; Prints PASS/FAIL per scenario, a final "RESULT: N/M scenarios passed"
+;; line, exits 0 iff all passed. Run from this repo's root:
+;;
+;;   kbb --backend sci --classpath "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src" \
+;;     test/kotobase/gremlin/wire_test.cljk
+
+(ns kotobase.gremlin.wire-test
+  (:require ["node:child_process" :as cp]
+            ["node:net" :as net]
+            ["node:crypto" :as ncrypto]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [kotobase.gremlin.json :as json]
+            [kotobase.gremlin.wire :as wire]))
+
+(def classpath
+  "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src")
+(def demo-port 8901)
+
+(defn- sleep-ms [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- try-connect-once [host port]
+  (js/Promise.
+   (fn [resolve _]
+     (let [sock (net/createConnection #js {:host host :port port})]
+       (.on sock "connect" (fn [] (.destroy sock) (resolve true)))
+       (.on sock "error" (fn [_e] (.destroy sock) (resolve false)))))))
+
+(defn- wait-for-port [host port attempts interval-ms]
+  (p/let [ok? (try-connect-once host port)]
+    (cond
+      ok? true
+      (<= attempts 0) false
+      ;; This machine runs many concurrent Claude Code sessions in parallel
+      ;; (documented environment hazard) -- nbb's own cold-start time for
+      ;; the child process is not reliably sub-second under load, same
+      ;; generous budget org-ietf-sftp's ssh_demo.cljs uses for the same
+      ;; reason.
+      :else (p/let [_ (sleep-ms interval-ms)] (wait-for-port host port (dec attempts) interval-ms)))))
+
+;; ---------------------------------------------------------------------------
+;; Minimal real WS client (test-only; separate from kotobase.gremlin.wire's
+;; server code, but reuses its frame-decode fn directly rather than
+;; reimplementing it a second time).
+;; ---------------------------------------------------------------------------
+
+(defn- ws-connect
+  "Real TCP connect + real RFC 6455 client handshake (Sec-WebSocket-Key,
+  waits for the literal 101 response). Returns a Promise<socket>."
+  [port]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [socket (net/createConnection #js {:host "127.0.0.1" :port port})
+           key (.toString (.randomBytes ncrypto 16) "base64")
+           handshake-buf (atom (js/Buffer.alloc 0))
+           handshake-done (atom false)]
+       (.on socket "connect"
+            (fn []
+              (.write socket
+                      (str "GET / HTTP/1.1\r\n"
+                           "Host: 127.0.0.1:" port "\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: " key "\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n"))))
+       (.on socket "data"
+            (fn [chunk]
+              (when-not @handshake-done
+                (swap! handshake-buf (fn [b] (js/Buffer.concat #js [b chunk])))
+                (let [text (.toString @handshake-buf "latin1")]
+                  (when (str/includes? text "\r\n\r\n")
+                    (reset! handshake-done true)
+                    (if (str/includes? text "101")
+                      (resolve socket)
+                      (reject (js/Error. (str "handshake failed: " text)))))))))
+       (.on socket "error" reject)))))
+
+(defn- mask-payload
+  "Client frames MUST be masked (RFC 6455 §5.1). Returns [mask-key-buf masked-payload-buf]."
+  [payload-buf]
+  (let [mask (.randomBytes ncrypto 4)
+        masked (js/Buffer.alloc (.-length payload-buf))]
+    (dotimes [i (.-length payload-buf)]
+      (.writeUInt8 masked
+                   (bit-xor (.readUInt8 payload-buf i) (.readUInt8 mask (mod i 4)))
+                   i))
+    [mask masked]))
+
+(defn- ws-client-send-text!
+  "Encode+send a REAL masked client text frame — deliberately NOT reusing
+  kotobase.gremlin.wire's encode-text-frame (that one is server-side/
+  unmasked-only); this is the genuine client-side masking path the server's
+  unmask! must correctly reverse."
+  [socket s]
+  (let [payload (js/Buffer.from s "utf8")
+        [mask-key masked] (mask-payload payload)
+        len (.-length masked)
+        b0 (bit-or 0x80 0x1) ;; FIN=1, opcode=text
+        len-byte-and-ext (cond
+                           (< len 126) (js/Buffer.from #js [(bit-or 0x80 len)]) ;; MASK bit + len
+                           (< len 65536) (let [b (js/Buffer.alloc 3)]
+                                           (.writeUInt8 b (bit-or 0x80 126) 0)
+                                           (.writeUInt16BE b len 1) b)
+                           :else (let [b (js/Buffer.alloc 9)]
+                                   (.writeUInt8 b (bit-or 0x80 127) 0)
+                                   (.writeBigUInt64BE b (js/BigInt len) 1) b))
+        frame (js/Buffer.concat #js [(js/Buffer.from #js [b0]) len-byte-and-ext mask-key masked])]
+    (.write socket frame)))
+
+(defn- collect-text-frames!
+  "Attach a data listener to `socket` that decodes complete (unmasked,
+  server->client) WS text frames via kotobase.gremlin.wire's OWN
+  try-decode-frame, appending each decoded (still-JSON-string) payload to
+  `out` (an atom holding a vector)."
+  [socket out]
+  (let [buf-atom (atom (js/Buffer.alloc 0))]
+    (.on socket "data"
+         (fn [chunk]
+           (swap! buf-atom (fn [b] (js/Buffer.concat #js [b chunk])))
+           (loop []
+             (when-let [{:keys [opcode payload consumed]} (wire/try-decode-frame @buf-atom)]
+               (swap! buf-atom #(.slice % consumed))
+               (when (= opcode 0x1)
+                 (swap! out conj (.toString payload "utf8")))
+               (recur)))))))
+
+(defn- wait-for [pred-fn attempts interval-ms]
+  (p/let [ok? (pred-fn)]
+    (cond
+      ok? true
+      (<= attempts 0) false
+      :else (p/let [_ (sleep-ms interval-ms)] (wait-for pred-fn (dec attempts) interval-ms)))))
+
+;; ---------------------------------------------------------------------------
+;; Driver
+;; ---------------------------------------------------------------------------
+
+(def results (atom []))
+(defn- check! [label ok?]
+  (swap! results conj [label ok?])
+  (println (if ok? "PASS" "FAIL") label))
+
+(defn run-demo []
+  (println "\n--- kotobase.gremlin.wire real cross-process demo ---")
+  (println "  spawning a second `nbb` OS process running bin/gremlin_server.cljk listen --port"
+            demo-port "...")
+  (let [err-chunks (atom [])
+        child (cp/spawn "nbb" #js ["--classpath" classpath "lib/org.apache.tinkerpopGremlin/bin/gremlin_server.cljk" "listen"
+                                    "--port" (str demo-port)]
+                         #js {:cwd (js/process.cwd)})]
+    (.on (.-stderr child) "data" (fn [chunk] (swap! err-chunks conj (str chunk))))
+    (-> (p/let [up? (wait-for-port "127.0.0.1" demo-port 150 150)]
+          (if-not up?
+            (do (println "FAIL: child `listen` process never bound port" demo-port)
+                (println "  child stderr:" (str/join "" @err-chunks))
+                (.kill child)
+                false)
+            (p/let [socket (ws-connect demo-port)
+                    _ (println "  real RFC 6455 handshake completed (101 Switching Protocols received) with the CHILD process")
+                    received (atom [])
+                    _ (collect-text-frames! socket received)
+
+                    ;; Scenario 1 -- V().hasLabel().has().values()
+                    _ (ws-client-send-text! socket (wire/encode-request
+                                                     [[:V] [:hasLabel "users"] [:has "role" "admin"] [:values "name"]]
+                                                     "req-1"))
+                    _ (wait-for #(p/resolved (some (fn [m] (str/includes? m "\"req-1\"")) @received)) 50 100)
+                    resp1 (wire/decode-response
+                           (some (fn [m] (when (str/includes? m "\"req-1\"") m)) @received))
+                    _ (check! "scenario 1: V().hasLabel('users').has('role','admin').values('name') over the real socket -> [\"Alice\" \"Carol\"]"
+                              (and (= 200 (:code resp1)) (= ["Alice" "Carol"] (:data resp1))))
+
+                    ;; Scenario 2 -- real cross-collection join over the wire
+                    _ (ws-client-send-text! socket (wire/encode-request
+                                                     [[:V] [:hasLabel "users"] [:has "role" "admin"]
+                                                      [:out "worksAt"] [:values "name"]]
+                                                     "req-2"))
+                    _ (wait-for #(p/resolved (some (fn [m] (str/includes? m "\"req-2\"")) @received)) 50 100)
+                    resp2 (wire/decode-response
+                           (some (fn [m] (when (str/includes? m "\"req-2\"") m)) @received))
+                    _ (check! "scenario 2: V().hasLabel('users').has('role','admin').out('worksAt').values('name') over the real socket -- real cross-collection join -> [\"Engineering\"]"
+                              (and (= 200 (:code resp2)) (= ["Engineering"] (:data resp2))))
+
+                    ;; Scenario 3 -- out-of-scope step -> real GraphSON error response
+                    _ (ws-client-send-text! socket (json/encode
+                                                     {"requestId" "req-3" "op" "bytecode" "processor" "traversal"
+                                                      "args" {"gremlin" [["V"] ["repeat" ["out" "worksAt"]] ["values" "name"]]}}))
+                    _ (wait-for #(p/resolved (some (fn [m] (str/includes? m "\"req-3\"")) @received)) 50 100)
+                    resp3 (wire/decode-response
+                           (some (fn [m] (when (str/includes? m "\"req-3\"") m)) @received))
+                    _ (check! "scenario 3: an out-of-scope [:repeat ...] step sent as real bytecode over the real socket -> GraphSON error ResponseMessage (code 597), not a crash or a silent wrong answer"
+                              (and (= 597 (:code resp3))
+                                   (str/includes? (or (:message resp3) "") "unsupported traversal step")))]
+              (.destroy socket)
+              (.kill child)
+              (let [failures (filter (fn [[_ ok?]] (not ok?)) @results)]
+                (println "\nRESULT:" (- (count @results) (count failures)) "/" (count @results) "scenarios passed")
+                (empty? failures)))))
+        (.catch (fn [e]
+                  (println "DEMO CRASHED:" e)
+                  (println "  child stderr so far:" (str/join "" @err-chunks))
+                  (.kill child)
+                  false)))))
+
+(-> (run-demo)
+    (.then (fn [pass?] (js/process.exit (if pass? 0 1))))
+    (.catch (fn [e] (println "DEMO CRASHED (outer):" e) (js/process.exit 1))))
