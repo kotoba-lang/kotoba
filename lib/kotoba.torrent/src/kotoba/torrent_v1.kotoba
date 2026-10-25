@@ -1,0 +1,178 @@
+(ns kotoba.torrent-v1)
+
+;; A bounded BitTorrent v1 protocol kernel. Network and filesystem authority
+;; deliberately stay outside this component. All offsets are relative to the
+;; caller-owned linear-memory buffer and every recursive parser is fuel-bound.
+
+(defn bt-metainfo-valid? [ptr length]
+  (if (or (<= length 0) (> length 1048576)
+          (not (= (mem-byte-at ptr 0) 100)))
+    0
+    (bencode-valid? ptr length 4096 1048576)))
+
+(defn bt-key-equal? [ptr key-data-start key-length expected-ptr expected-length]
+  (if (not (= key-length expected-length))
+    0
+    (bt-bytes-equal? (+ ptr key-data-start) expected-ptr key-length 0)))
+
+(defn bt-find-dict-value [ptr end index expected-ptr expected-length fuel]
+  (if (or (<= fuel 0) (>= index end)
+          (= (mem-byte-at ptr index) 101))
+    -1
+    (let [key-data-start (bencode-parse-decimal ptr end index 0 0 1024)]
+      (if (< key-data-start 0)
+        -1
+        (let [key-length (bencode-decimal-value ptr (- key-data-start 1) index 0)
+              value-start (+ key-data-start key-length)]
+          (if (> value-start end)
+            -1
+            (if (= (bt-key-equal? ptr key-data-start key-length
+                                 expected-ptr expected-length) 1)
+              value-start
+              (let [next (bencode-skip-value ptr end value-start (- fuel 1) 1048576)]
+                (if (< next 0)
+                  -1
+                  (bt-find-dict-value ptr end next expected-ptr expected-length
+                                      (- fuel 1)))))))))))
+
+(defn bt-top-level-value [ptr length key-ptr key-length]
+  (if (or (= (bt-metainfo-valid? ptr length) 0)
+          (not (= (mem-byte-at ptr 0) 100)))
+    -1
+    (bt-find-dict-value ptr length 1 key-ptr key-length 4096)))
+
+(defn bt-info-start [ptr length]
+  (let [start (bt-top-level-value ptr length (str-ptr "info") 4)]
+    (if (and (>= start 0) (= (mem-byte-at ptr start) 100)) start -1)))
+
+(defn bt-info-end [ptr length]
+  (let [start (bt-info-start ptr length)]
+    (if (< start 0) -1 (bencode-skip-value ptr length start 4096 1048576))))
+
+(defn bt-announce-data-start [ptr length]
+  (let [start (bt-top-level-value ptr length (str-ptr "announce") 8)]
+    (if (< start 0) -1 (bt-skip-string-prefix ptr length start))))
+
+(defn bt-skip-string-prefix [ptr end index]
+  (bencode-parse-decimal ptr end index 0 0 1048576))
+
+(defn bt-announce-length [ptr length]
+  (let [start (bt-top-level-value ptr length (str-ptr "announce") 8)
+        data-start (if (>= start 0)
+                     (bt-skip-string-prefix ptr length start)
+                     -1)]
+    (if (< data-start 0)
+      -1
+      (bencode-decimal-value ptr (- data-start 1) start 0))))
+
+(defn bt-compact-peers-valid? [ptr length]
+  (if (and (>= length 0) (= (* (/ length 6) 6) length)) 1 0))
+
+(defn bt-compact-peer-port [ptr length peer-index]
+  (let [offset (* peer-index 6)]
+    (if (or (< peer-index 0) (> (+ offset 6) length))
+      -1
+      (+ (* (mem-byte-at ptr (+ offset 4)) 256)
+         (mem-byte-at ptr (+ offset 5))))))
+
+(defn bt-compact-peer-ipv4 [ptr length peer-index]
+  (let [offset (* peer-index 6)]
+    (if (or (< peer-index 0) (> (+ offset 6) length))
+      -1
+      (bt-i32-be ptr offset))))
+
+(defn bt-i32-be [ptr offset]
+  (+ (* (mem-byte-at ptr offset) 16777216)
+     (* (mem-byte-at ptr (+ offset 1)) 65536)
+     (* (mem-byte-at ptr (+ offset 2)) 256)
+     (mem-byte-at ptr (+ offset 3))))
+
+(defn bt-store-i32-be! [ptr offset value]
+  (let [a (byte-store! ptr offset (bit-and (bit-shift-right value 24) 255))
+        b (byte-store! ptr (+ offset 1) (bit-and (bit-shift-right value 16) 255))
+        c (byte-store! ptr (+ offset 2) (bit-and (bit-shift-right value 8) 255))]
+    (byte-store! ptr (+ offset 3) (bit-and value 255))))
+
+(defn bt-copy! [source-ptr target-ptr count index]
+  (if (>= index count)
+    count
+    (let [stored (byte-store! target-ptr index (mem-byte-at source-ptr index))]
+      (bt-copy! source-ptr target-ptr count (+ index 1)))))
+
+(defn bt-handshake! [out-ptr out-cap info-hash-ptr peer-id-ptr]
+  (if (< out-cap 68)
+    -1
+    (let [a (byte-store! out-ptr 0 19)
+          b (bt-copy! (str-ptr "BitTorrent protocol") (+ out-ptr 1) 19 0)
+          r0 (byte-store! out-ptr 20 0)
+          r1 (byte-store! out-ptr 21 0)
+          r2 (byte-store! out-ptr 22 0)
+          r3 (byte-store! out-ptr 23 0)
+          r4 (byte-store! out-ptr 24 0)
+          r5 (byte-store! out-ptr 25 0)
+          r6 (byte-store! out-ptr 26 0)
+          r7 (byte-store! out-ptr 27 0)
+          h (bt-copy! info-hash-ptr (+ out-ptr 28) 20 0)
+          p (bt-copy! peer-id-ptr (+ out-ptr 48) 20 0)]
+      68)))
+
+(defn bt-bytes-equal? [left-ptr right-ptr count index]
+  (if (>= index count)
+    1
+    (if (= (mem-byte-at left-ptr index) (mem-byte-at right-ptr index))
+      (bt-bytes-equal? left-ptr right-ptr count (+ index 1))
+      0)))
+
+(defn bt-handshake-valid? [ptr length expected-info-hash-ptr]
+  (if (and (= length 68)
+           (= (mem-byte-at ptr 0) 19)
+           (= (bt-bytes-equal? (+ ptr 1) (str-ptr "BitTorrent protocol") 19 0) 1)
+           (= (bt-bytes-equal? (+ ptr 28) expected-info-hash-ptr 20 0) 1))
+    1
+    0))
+
+(defn bt-request-valid? [piece-index begin block-length piece-count piece-length]
+  (if (and (>= piece-index 0) (< piece-index piece-count)
+           (>= begin 0) (< begin piece-length)
+           (> block-length 0) (<= block-length 16384)
+           (<= (+ begin block-length) piece-length))
+    1
+    0))
+
+(defn bt-request! [out-ptr out-cap piece-index begin block-length]
+  (if (or (< out-cap 17)
+          (= (bt-request-valid? piece-index begin block-length 2147483647 2147483647) 0))
+    -1
+    (let [a (bt-store-i32-be! out-ptr 0 13)
+          b (byte-store! out-ptr 4 6)
+          c (bt-store-i32-be! out-ptr 5 piece-index)
+          d (bt-store-i32-be! out-ptr 9 begin)
+          e (bt-store-i32-be! out-ptr 13 block-length)]
+      17)))
+
+(defn bt-message-length [ptr available]
+  (if (< available 4)
+    -1
+    (let [length (bt-i32-be ptr 0)]
+      (if (or (< length 0) (> length 1048585)) -1 length))))
+
+(defn bt-piece-valid? [ptr available expected-piece expected-begin max-block]
+  (let [message-length (bt-message-length ptr available)]
+    (if (and (>= message-length 9)
+             (<= (+ message-length 4) available)
+             (= (mem-byte-at ptr 4) 7)
+             (= (bt-i32-be ptr 5) expected-piece)
+             (= (bt-i32-be ptr 9) expected-begin)
+             (<= (- message-length 9) max-block))
+      (- message-length 9)
+      -1)))
+
+(defn bt-peer-has-piece? [bitfield-ptr bitfield-length piece-index]
+  (let [byte-index (bit-shift-right piece-index 3)
+        bit-index (bit-and piece-index 7)]
+    (if (or (< piece-index 0) (>= byte-index bitfield-length))
+      0
+      (if (= (bit-and (mem-byte-at bitfield-ptr byte-index)
+                      (bit-shift-left 1 (- 7 bit-index))) 0)
+        0
+        1))))

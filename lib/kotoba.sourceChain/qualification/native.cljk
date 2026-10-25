@@ -1,0 +1,463 @@
+;; Native qualification for kotoba.source-chain.
+;;
+;; Compiles kotoba/source_chain.kotoba with amu for a native target, extracts
+;; the exports, builds amu's C kexe loader, then builds signed entries on the
+;; host and asks the compiled guest through the loader. Every answer is
+;; pinned, including the reason code of each refusal; the missing-grant rows
+;; pin that the guest TRAPS rather than answers.
+;;
+;; Ed25519 signing happens here, on the host, because signing is the key
+;; holder's job (kagi in production). The guest only verifies.
+;;
+;; usage (from this repository's root):
+;;   kbb --backend sci qualification/native.cljk [--amu <dir>]
+;;       [--platform host|linux-podman] [--isa aarch64|x86_64]
+;; default --amu is ../amu (the west layout: orgs/kotoba-lang/amu).
+;;
+;; --platform host (default): this machine's native target and a loader
+;;   built with cc; --isa must be the host's.
+;; --platform linux-podman: target <isa>-linux, run inside the podman
+;;   machine (the same VM amu's scripts/test-linux-static-handlers.cljk
+;;   uses). The loaders are built static in the localhost/c3-gcc container.
+;;   aarch64 runs the production loader with its seccomp filter in force;
+;;   x86_64 runs under qemu-x86_64-static with the loader built
+;;   -DKEXE_SANITIZER_TEST, because qemu-user cannot install a guest-arch
+;;   seccomp filter (amu measured the same). The kexe loader's shared-state
+;;   mmap needs vm.overcommit_memory=1 on the small VM; the run sets it and
+;;   puts the previous value back.
+;;
+;; exit 0: every row passed   1: a row failed   3: could not run (build,
+;; toolchain or arguments) -- never reported as a pass.
+(ns qualification.native
+  (:require ["crypto" :as crypto]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [clojure.string :as str]))
+
+(defn die [& msg] (apply println "COULD-NOT-RUN" msg) (js/process.exit 3))
+
+;; --- arguments: everything after this script's own path ----------------------
+
+(def args
+  (let [argv (vec js/process.argv)
+        i (first (keep-indexed (fn [i a] (when (str/ends-with? a "native.cljk") i)) argv))]
+    (when-not i (die "cannot find the script in argv" (pr-str argv)))
+    (subvec argv (inc i))))
+
+(defn opt [flag default]
+  (let [i (.indexOf (clj->js args) flag)]
+    (if (>= i 0) (nth args (inc i) nil) default)))
+
+(def amu-dir (path/resolve (opt "--amu" "../amu")))
+(def host-arch (case (os/arch) "arm64" "aarch64" "x64" "x86_64" nil))
+(def platform (opt "--platform" "host"))
+(def arch (opt "--isa" host-arch))
+(when-not (#{"host" "linux-podman"} platform) (die "unknown --platform" platform))
+(when-not (#{"aarch64" "x86_64"} arch) (die "unknown --isa" arch))
+(when (and (= platform "host") (not= arch host-arch))
+  (die "--platform host runs only the host ISA" host-arch "not" arch))
+(def linux? (= platform "linux-podman"))
+
+;; under /var/folders on macOS, which the podman machine mounts
+(def work (fs/mkdtempSync (path/join (os/tmpdir) "source-chain-native-")))
+
+(defn sh! [what cmd argv]
+  (let [r (cp/spawnSync cmd (clj->js argv) #js {:encoding "utf8" :maxBuffer (* 16 1024 1024)})]
+    (when (or (.-error r) (not= 0 (.-status r)))
+      (die what "failed:" (str (.-error r)) (str/trim (str (.-stdout r) (.-stderr r)))))
+    (str (.-stdout r))))
+
+(defn vm! [what command] (sh! what "podman" ["machine" "ssh" command]))
+
+;; --- build -------------------------------------------------------------------
+
+(def guest (path/resolve "kotoba/source_chain.kotoba"))
+(when-not (fs/existsSync guest) (die "run from the repository root; missing" guest))
+(def amu (path/join amu-dir "bin/amu"))
+(when-not (fs/existsSync amu) (die "no amu at" amu "(pass --amu <dir>)"))
+
+(def policy (path/join work "policy.edn"))
+(fs/writeFileSync policy "{:allow #{[:cap/call 2] [:cap/call 3]}}")
+(def kexe (path/join work "source-chain.kexe"))
+(sh! "amu compile" amu (concat ["compile" guest "--policy" policy "--output" kexe]
+                               (when linux? ["--target" (str arch "-linux")])))
+
+(def code (path/join work "source-chain.bin"))
+(def offsets
+  (into {}
+        (for [sym ["verify-chain" "head-tag" "fork-evidence" "verify-warrant" "replay-balance" "validate-dna"]]
+          (let [out (sh! (str "amu extract-native " sym) amu
+                         ["extract-native" kexe "--symbol" sym "--output" code])
+                grab (fn [k] (some-> (re-find (re-pattern (str ":" k " (\\d+)")) out) second js/parseInt))]
+            [sym {:offset (grab "offset") :arity (grab "arity")}]))))
+(when (some (fn [[_ v]] (or (nil? (:offset v)) (nil? (:arity v)))) offsets)
+  (die "could not read offsets" (pr-str offsets)))
+
+(def loader (path/join work "kexe-loader"))
+(fs/copyFileSync (path/join amu-dir "tools/kexe_loader.c") (path/join work "kexe_loader.c"))
+(if linux?
+  (vm! "building the Linux loader"
+       (str "podman run --rm -v " work ":" work " localhost/c3-gcc sh -c 'cd " work " && "
+            (if (= arch "aarch64")
+              "gcc -std=c11 -O2 -static kexe_loader.c -o kexe-loader"
+              "x86_64-linux-gnu-gcc -std=c11 -O2 -static -DKEXE_SANITIZER_TEST kexe_loader.c -o kexe-loader")
+            "'"))
+  (sh! "cc kexe_loader.c" "cc" ["-O2" "-o" loader (path/join work "kexe_loader.c")]))
+
+(def overcommit-before
+  (when linux?
+    (let [v (str/trim (vm! "reading vm.overcommit_memory" "sysctl -n vm.overcommit_memory"))]
+      (vm! "setting vm.overcommit_memory" "sudo sysctl -q -w vm.overcommit_memory=1")
+      v)))
+
+;; what a missing grant looks like: the emitted mask check traps with the
+;; ISA's trap instruction (brk on aarch64, ud2 on x86_64 -- amu measured both)
+(def grant-trap (if (= arch "x86_64") "SIGILL" "SIGTRAP"))
+
+(defn exec-loader [argv]
+  (if linux?
+    (let [r (cp/spawnSync "podman"
+                          #js ["machine" "ssh"
+                               (str (when (= arch "x86_64") "qemu-x86_64-static ")
+                                    (str/join " " (cons loader argv)))]
+                          #js {:encoding "utf8" :maxBuffer (* 16 1024 1024)})]
+      (str/trim (str (.-stdout r) (.-stderr r))))
+    (let [r (cp/spawnSync loader (clj->js argv) #js {:encoding "utf8"})]
+      (str/trim (str (.-stdout r) (.-stderr r))))))
+;; --- entries -----------------------------------------------------------------
+
+(defn hex [^js buf] (.toString buf "hex"))
+(defn sha256-hex [s] (-> (crypto/createHash "sha256") (.update s "utf8") (.digest "hex")))
+
+(defn keypair [seed-byte]
+  (let [seed (js/Buffer.alloc 32 seed-byte)
+        der (js/Buffer.concat #js [(js/Buffer.from "302e020100300506032b657004220420" "hex") seed])
+        priv (crypto/createPrivateKey #js {:key der :format "der" :type "pkcs8"})
+        pub-der (.export (crypto/createPublicKey priv) #js {:format "der" :type "spki"})]
+    {:priv priv :pub (hex (.subarray pub-der 12))}))
+
+;; the retired Rust tests used these seeds: [42u8; 32] and [99u8; 32]
+(def alice (keypair 42))
+(def mallory (keypair 99))
+
+(defn pad20 [n] (let [s (str n)] (str (apply str (repeat (- 20 (count s)) "0")) s)))
+(def open-policy (sha256-hex "kotoba.data-policy/open"))
+
+(defn message [{:keys [agent seq prev ts policy content header]}]
+  (str (or header "kotoba.source-chain/v1") "\n"
+       "agent:" agent "\n"
+       "seq:" (pad20 seq) "\n"
+       "prev:" (or prev (apply str (repeat 64 "-"))) "\n"
+       "ts:" (pad20 ts) "\n"
+       "policy:" (or policy open-policy) "\n"
+       "content:" content "\n"))
+
+(defn sign-hex [kp msg]
+  (hex (crypto/sign nil (js/Buffer.from msg "utf8") (:priv kp))))
+
+;; one 454-byte entry as hex: key ++ sig ++ message. `key` and `signer`
+;; default to the message's own agent so each vector changes one thing.
+(defn entry [{:keys [kp key signer] :as fields}]
+  (let [msg (message (assoc fields :agent (or (:agent fields) (:pub kp))))]
+    (when-not (= 358 (count msg)) (die "vector message is" (count msg) "bytes"))
+    {:msg msg
+     :hex (str (or key (:pub kp)) (sign-hex (or signer kp) msg) (hex (js/Buffer.from msg "utf8")))}))
+
+(defn content [s] (sha256-hex s))
+
+(defn chain [kp n]
+  (loop [i 0 prev nil out []]
+    (if (= i n)
+      out
+      (let [e (entry {:kp kp :seq i :prev prev :ts (+ 1000 i) :content (content (str "c" i))})]
+        (recur (inc i) (sha256-hex (:msg e)) (conj out e))))))
+
+(defn run
+  ([sym allow regions] (run sym allow regions []))
+  ([sym allow regions extra]
+   (let [{:keys [offset arity]} (get offsets sym)
+         argv (concat [code (str offset) (str arity) arch allow]
+                      (mapcat (fn [i r] [(str "g:" r) (str "gl:" i)]) (range) regions)
+                      (map str extra))]
+     (exec-loader argv))))
+
+(defn utf8-hex [s] (hex (js/Buffer.from s "utf8")))
+
+;; a warrant region: issuer key ++ sig ++ warrant message ++ entry A ++ entry B
+(defn warrant-message [{:keys [issuer accused seq a b rule]}]
+  (str "kotoba.warrant/v1\n"
+       "issuer:" issuer "\n"
+       "accused:" accused "\n"
+       "rule:" (or rule "fork") "\n"
+       "seq:" (pad20 seq) "\n"
+       "a:" a "\n"
+       "b:" b "\n"))
+
+(defn warrant [{:keys [kp signer ea eb] :as fields}]
+  (let [msg (warrant-message (merge {:issuer (:pub kp)} fields))]
+    (when-not (= 332 (count msg)) (die "warrant message is" (count msg) "bytes"))
+    (str (:pub kp) (sign-hex (or signer kp) msg) (utf8-hex msg) (:hex ea) (:hex eb))))
+
+;; a countersigned transfer record: spender key ++ receiver key ++ both sigs ++ message
+(defn transfer-message [{:keys [spender receiver amount amount-text nonce]}]
+  (str "kotoba.engi.transfer/v1\n"
+       "spender:" spender "\n"
+       "receiver:" receiver "\n"
+       "amount:" (or amount-text (pad20 amount)) "\n"
+       "nonce:" (sha256-hex (str "nonce-" nonce)) "\n"))
+
+(defn transfer [{:keys [from to receiver-signer] :as fields}]
+  (let [msg (transfer-message (merge {:spender (:pub from) :receiver (:pub to)} fields))]
+    (when-not (= 270 (count msg)) (die "transfer message is" (count msg) "bytes"))
+    {:id (sha256-hex msg)
+     :hex (str (:pub from) (:pub to) (sign-hex from msg) (sign-hex (or receiver-signer to) msg) (utf8-hex msg))}))
+
+;; a chain whose entries carry the given content ids, in order
+(defn chain-of [kp contents]
+  (loop [i 0 prev nil [c & more] contents out []]
+    (if (nil? c)
+      out
+      (let [e (entry {:kp kp :seq i :prev prev :ts (+ 5000 i) :content c})]
+        (recur (inc i) (sha256-hex (:msg e)) more (conj out e))))))
+
+
+;; replay-balance answers balance + 2^50; 2^50 + a small balance is exact in a JS number
+(defn balance-answer [b] (str (+ 1125899906842624 b)))
+
+;; a DNA manifest, as written (allow lines in the order given)
+(defn manifest [{:keys [name version max allows]}]
+  (str "kotoba.dna/v1\n" "name:" name "\n" "version:" version "\n"
+       "max-content:" max "\n" (apply str (map #(str "allow:" % "\n") allows)) "end\n"))
+
+(defn hex4 [n] (let [s (.toString n 16)] (str (apply str (repeat (- 4 (count s)) "0")) s)))
+
+;; a content record: 2-byte big-endian length ++ document
+(defn record [doc] (str (hex4 (.-length (js/Buffer.from doc "utf8"))) (utf8-hex doc)))
+
+;; region for validate-dna: manifest ++ chain ++ records. The chain's genesis
+;; names `genesis` (the DNA id unless overridden), later entries name docs.
+(defn dna-region [{:keys [kp m docs genesis records extra]}]
+  (let [contents (cons (or genesis (sha256-hex m)) (map sha256-hex docs))]
+    {:region (str (utf8-hex m) (apply str (map :hex (chain-of kp contents)))
+                  (apply str (or records (map record docs))) (or extra ""))
+     :n (count contents)
+     :mlen (.-length (js/Buffer.from m "utf8"))}))
+
+;; --- rows --------------------------------------------------------------------
+
+(def results (atom []))
+(defn check [label actual expected]
+  (swap! results conj {:label label :ok (= actual expected) :actual actual :expected expected}))
+
+(let [three (chain alice 3)
+      hex-of (fn [es] (apply str (map :hex es)))
+      [e0 e1 _] three
+      h0 (sha256-hex (:msg e0))
+      V "verify-chain" H "head-tag" F "fork-evidence" G "2,3"]
+  (check "valid chain of 3 verifies with count 3" (run V G [(hex-of three)]) "3")
+  (check "a single genesis entry verifies" (run V G [(hex-of [e0])]) "1")
+  (check "head-tag is the host sha256 prefix of the last message"
+         (run H G [(hex-of three)])
+         ;; BigInt: 60 bits do not survive a JS number (2^53)
+         (.toString (js/BigInt (str "0x" (subs (sha256-hex (:msg (last three))) 0 15)))))
+  (check "region that is not whole entries: -6" (run V G [(str (hex-of three) "00")]) "-6")
+  (check "content byte tampered after signing: -3"
+         (run V G [(hex-of [e0 (update e1 :hex #(str (subs % 0 (- (count %) 4)) "30" (subs % (- (count %) 2))))])])
+         "-3")
+  (check "data policy changed after signing: -3"
+         (let [m (message {:agent (:pub alice) :seq 1 :prev h0 :ts 1001
+                           :policy (sha256-hex "kotoba.data-policy/encrypted") :content (content "c1")})]
+           (run V G [(str (:hex e0) (:pub alice) (sign-hex alice (:msg e1)) (hex (js/Buffer.from m "utf8")))]))
+         "-3")
+  (check "zeroed signature: -3"
+         (run V G [(str (:hex e0) (:pub alice) (apply str (repeat 128 "0")) (hex (js/Buffer.from (:msg e1) "utf8")))])
+         "-3")
+  (check "signed by another key under this agent's key and name: -3"
+         (run V G [(hex-of [e0 (entry {:kp alice :signer mallory :seq 1 :prev h0 :ts 1001 :content (content "c1")})])])
+         "-3")
+  (check "a second agent's entry inside this chain: -5"
+         (run V G [(hex-of [e0 (entry {:kp mallory :seq 1 :prev h0 :ts 1001 :content (content "c1")})])])
+         "-5")
+  (check "message names one agent, key bytes are another: -5"
+         (run V G [(hex-of [(entry {:kp alice :agent (:pub mallory) :key (:pub alice) :seq 0 :ts 1 :content (content "x")})])])
+         "-5")
+  (check "correctly signed entry at the wrong seq: -1"
+         (run V G [(hex-of [e0 (entry {:kp alice :seq 2 :prev h0 :ts 1001 :content (content "c1")})])])
+         "-1")
+  (check "correctly signed entry naming the wrong prev: -2"
+         (run V G [(hex-of [e0 (entry {:kp alice :seq 1 :prev (content "not-the-head") :ts 1001 :content (content "c1")})])])
+         "-2")
+  (check "genesis that names a prev: -2"
+         (run V G [(hex-of [(entry {:kp alice :seq 0 :prev (content "ghost") :ts 1 :content (content "x")})])])
+         "-2")
+  (check "non-ASCII byte in the message: -4"
+         (run V G [(str (:pub alice) (sign-hex alice (:msg e0)) "ff" (subs (hex (js/Buffer.from (:msg e0) "utf8")) 2))])
+         "-4")
+  (check "wrong schema line: -4"
+         (run V G [(:hex (entry {:kp alice :header "kotoba.source-chain/v0" :seq 0 :ts 1 :content (content "x")}))])
+         "-4")
+  (check "empty region is an empty chain: 0" (run V G [""]) "0")
+  (check "empty chain has no head: -7" (run H G [""]) "-7")
+  (check "seq/ts digit boundary does not collide (distinct heads)"
+         (let [a (entry {:kp alice :seq 0 :ts 123 :content (content "x")})
+               b (entry {:kp alice :seq 0 :ts 1230 :content (content "x")})
+               ha (run H G [(:hex a)]) hb (run H G [(:hex b)])]
+           (and (re-matches #"\d+" ha) (re-matches #"\d+" hb) (not= ha hb)))
+         true)
+  (let [fa (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-bob")})
+        fb (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})
+        other-seq (entry {:kp alice :seq 2 :prev h0 :ts 1002 :content (content "later")})
+        other-agent (entry {:kp mallory :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})
+        forged (entry {:kp alice :signer mallory :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})]
+    (check "fork: same agent, same seq, different content: 1" (run F G [(:hex fa) (:hex fb)]) "1")
+    (check "not a fork: the same entry twice: 0" (run F G [(:hex fa) (:hex fa)]) "0")
+    (check "not a fork: different seq: 0" (run F G [(:hex fa) (:hex other-seq)]) "0")
+    (check "not a fork: different agents: 0" (run F G [(:hex fa) (:hex other-agent)]) "0")
+    (check "no fork evidence from a forged signature: -3" (run F G [(:hex fa) (:hex forged)]) "-3"))
+  ;; --- warrant ---------------------------------------------------------------
+  (let [W "verify-warrant"
+        carol (keypair 7)
+        fa (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-bob")})
+        fb (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})
+        ha (sha256-hex (:msg fa)) hb (sha256-hex (:msg fb))
+        base {:kp carol :accused (:pub alice) :seq 1 :a ha :b hb :ea fa :eb fb}]
+    (check "warrant with its fork as evidence verifies: 1" (run W G [(warrant base)]) "1")
+    (check "warrant signed by someone other than its issuer: -3"
+           (run W G [(warrant (assoc base :signer mallory))]) "-3")
+    (check "warrant whose issuer line names another key: -5"
+           (run W G [(warrant (assoc base :issuer (:pub mallory)))]) "-5")
+    (check "warrant whose evidence is not a fork: -8"
+           (run W G [(warrant (assoc base :b ha :eb fa))]) "-8")
+    (check "warrant naming the wrong seq: -9" (run W G [(warrant (assoc base :seq 2))]) "-9")
+    (check "warrant accusing someone other than the forked agent: -9"
+           (run W G [(warrant (assoc base :accused (:pub carol)))]) "-9")
+    (check "warrant whose hashes do not name its evidence: -9"
+           (run W G [(warrant (assoc base :b (content "elsewhere")))]) "-9")
+    (check "warrant naming its evidence in the other order: -9"
+           (run W G [(warrant (assoc base :a hb :b ha))]) "-9")
+    (check "warrant carrying forged evidence: -3"
+           (run W G [(warrant (assoc base :eb (entry {:kp alice :signer mallory :seq 1 :prev h0 :ts 1001
+                                                       :content (content "spend-to-carol")})))])
+           "-3")
+    (check "warrant for a rule it does not know: -4"
+           (run W G [(warrant (assoc base :rule "fake"))]) "-4")
+    (check "warrant region one byte short: -6"
+           (run W G [(let [w (warrant base)] (subs w 0 (- (count w) 2)))]) "-6"))
+  ;; --- mutual credit replay ----------------------------------------------------
+  (let [R "replay-balance"
+        bob (keypair 11)
+        carol (keypair 7)
+        t1 (transfer {:from alice :to bob :amount 30 :nonce 1})
+        t2 (transfer {:from bob :to alice :amount 10 :nonce 2})
+        c0 (content "plain entry")
+        region (fn [kp contents transfers] (str (hex-of (chain-of kp contents)) (apply str (map :hex transfers))))
+        a-region (region alice [c0 (:id t1) (:id t2)] [t1 t2])
+        b-region (region bob [(:id t1) (:id t2)] [t1 t2])
+        a-answer (run R G [a-region] [3 100])
+        b-answer (run R G [b-region] [2 100])]
+    (check "spender's replay: -30 +10 = -20" a-answer (balance-answer -20))
+    (check "receiver's replay: +30 -10 = +20" b-answer (balance-answer 20))
+    (check "mutual credit is net zero across both chains"
+           (+ (- (js/parseInt a-answer) 1125899906842624) (- (js/parseInt b-answer) 1125899906842624)) 0)
+    (check "a chain with no transfers replays to zero"
+           (run R G [(region alice [c0] [])] [1 0]) (balance-answer 0))
+    (check "credit limit exactly reached at the lowest point, -30, is allowed (limit 30)"
+           (run R G [a-region] [3 30]) (balance-answer -20))
+    (check "credit limit exceeded by one at the lowest point: -10" (run R G [a-region] [3 29]) "-10")
+    (check "transfer no entry references: -11"
+           (run R G [(region alice [c0 (:id t1)] [t1 t2])] [2 100]) "-11")
+    (check "transfer referenced twice (would count twice): -12"
+           (run R G [(region alice [(:id t1) (:id t1)] [t1])] [2 100]) "-12")
+    (check "transfers out of chain order: -14"
+           (run R G [(region alice [(:id t1) (:id t2)] [t2 t1])] [2 100]) "-14")
+    (let [t3 (transfer {:from carol :to bob :amount 5 :nonce 3})]
+      (check "transfer the chain's agent is not party to: -13"
+             (run R G [(region alice [(:id t3)] [t3])] [1 100]) "-13"))
+    (let [t4 (transfer {:from alice :to bob :amount 5 :nonce 4 :receiver-signer mallory})]
+      (check "transfer the receiver did not countersign: -3"
+             (run R G [(region alice [(:id t4)] [t4])] [1 100]) "-3"))
+    (let [t5 (transfer {:from alice :to bob :amount 0 :nonce 5})]
+      (check "zero amount: -4" (run R G [(region alice [(:id t5)] [t5])] [1 100]) "-4"))
+    (let [t6 (transfer {:from alice :to bob :amount-text "00000001000000000000" :nonce 6})]
+      (check "amount above the bound: -4" (run R G [(region alice [(:id t6)] [t6])] [1 100]) "-4"))
+    (let [t7 (transfer {:from alice :to alice :amount 5 :nonce 7})]
+      (check "transfer to oneself: -4" (run R G [(region alice [(:id t7)] [t7])] [1 100]) "-4"))
+    (check "region that is not chain plus whole transfers: -6"
+           (run R G [(str a-region "00")] [3 100]) "-6")
+    (check "no chain at all: -6" (run R G [a-region] [0 100]) "-6")
+    (check "a tampered chain is refused before any transfer counts: -3"
+           (run R G [(let [es (chain-of alice [c0 (:id t1)])]
+                       (str (:hex (first es)) (:pub alice) (apply str (repeat 128 "0"))
+                            (utf8-hex (:msg (second es))) (:hex t1)))]
+                [2 100])
+           "-3"))
+  ;; --- DNA ---------------------------------------------------------------------
+  (let [D "validate-dna"
+        spec {:name "market" :version "1.0.0" :max 400
+              :allows ["kotoba.engi.transfer/v1" "kotoba.post/v1"]}
+        m (manifest spec)
+        post "kotoba.post/v1\nhello from alice\n"
+        bob (keypair 11)
+        tmsg (transfer-message {:spender (:pub alice) :receiver (:pub bob) :amount 30 :nonce 1})
+        v (fn [{:keys [region n mlen]}] (run D G [region] [n mlen]))]
+    (check "chain under its DNA with every document resolved: 3"
+           (v (dna-region {:kp alice :m m :docs [post tmsg]})) "3")
+    (check "genesis alone under its DNA: 1" (v (dna-region {:kp alice :m m :docs []})) "1")
+    (check "allow lines out of order are not canonical: -19"
+           (v (dna-region {:kp alice :m (manifest (update spec :allows reverse)) :docs []})) "-19")
+    (check "a repeated allow line is not canonical: -19"
+           (v (dna-region {:kp alice :m (manifest (assoc spec :allows ["kotoba.post/v1" "kotoba.post/v1"])) :docs []}))
+           "-19")
+    (check "bytes after the end line: -19"
+           (v (dna-region {:kp alice :m (str m "x\n") :docs []})) "-19")
+    (check "max-content wider than 6 digits: -19"
+           (v (dna-region {:kp alice :m (manifest (assoc spec :max 1000000)) :docs []})) "-19")
+    (check "genesis that does not name the DNA: -18"
+           (v (dna-region {:kp alice :m m :docs [] :genesis (content "no dna")})) "-18")
+    (check "same rules, bumped version, is another DNA: -18"
+           (v (dna-region {:kp alice :m (manifest (assoc spec :version "1.1.0")) :docs []
+                           :genesis (sha256-hex m)}))
+           "-18")
+    (check "an entry whose document is not supplied: -15"
+           (v (dna-region {:kp alice :m m :docs [post tmsg] :records [(record post)]})) "-15")
+    (check "a document that is not the one the entry names: -15"
+           (v (dna-region {:kp alice :m m :docs [post] :records [(record "kotoba.post/v1\nedited\n")]})) "-15")
+    (let [at-max (str "kotoba.post/v1\n" (apply str (repeat (- 400 16) "a")) "\n")
+          over (str "kotoba.post/v1\n" (apply str (repeat (- 401 16) "a")) "\n")]
+      (check "a document exactly max-content long is allowed: 2"
+             (v (dna-region {:kp alice :m m :docs [at-max]})) "2")
+      (check "a document one byte over max-content: -16"
+             (v (dna-region {:kp alice :m m :docs [over]})) "-16"))
+    (check "a document whose schema the DNA does not allow: -17"
+           (v (dna-region {:kp alice :m m :docs ["kotoba.secret/v1\nshh\n"]})) "-17")
+    (check "a document with no schema line: -4"
+           (v (dna-region {:kp alice :m m :docs ["no newline at all"]})) "-4")
+    (check "bytes after the last record: -6"
+           (v (dna-region {:kp alice :m m :docs [post] :extra "00"})) "-6")
+    (check "a tampered entry inside a DNA region: -3"
+           (let [{:keys [region n mlen]} (dna-region {:kp alice :m m :docs [post]})
+                 cut (+ (* 2 mlen) (* 2 454) (* 2 32))]
+             (run D G [(str (subs region 0 cut) (apply str (repeat 128 "0")) (subs region (+ cut 128)))] [n mlen]))
+           "-3")
+    (check "manifest length past the region: -6"
+           (let [{:keys [region n]} (dna-region {:kp alice :m m :docs []})]
+             (run D G [region] [n 100000]))
+           "-6"))
+  (check "without the verify grant the guest traps, it does not answer"
+         (str/includes? (run V "3" [(hex-of three)]) grant-trap) true)
+  (check "without the sha256 grant the guest traps, it does not answer"
+         (str/includes? (run V "2" [(hex-of three)]) grant-trap) true))
+
+(let [rs @results
+      bad (remove :ok rs)]
+  (doseq [r rs]
+    (println (if (:ok r) "PASS" "FAIL") (:label r)
+             (if (:ok r) "" (str "  actual=" (pr-str (:actual r)) " expected=" (pr-str (:expected r))))))
+  (println (str "SCANNED\t" (count rs) "\tPASSED\t" (- (count rs) (count bad)) "\tFAILED\t" (count bad)
+                "\tTARGET\t" arch "\tPLATFORM\t" platform))
+  (when overcommit-before
+    (vm! "restoring vm.overcommit_memory" (str "sudo sysctl -q -w vm.overcommit_memory=" overcommit-before)))
+  (fs/rmSync work #js {:recursive true :force true})
+  (js/process.exit (cond (zero? (count rs)) 3 (seq bad) 1 :else 0)))

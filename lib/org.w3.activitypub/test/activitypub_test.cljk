@@ -1,0 +1,127 @@
+(ns activitypub-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def source (slurp "lib/org.w3.activitypub/src/activitypub.kotoba"))
+(defn call [kir function & args] (ir/execute kir function (vec args)))
+(defn dnull [] ["null"])
+(defn dbool [value] ["bool" value])
+(defn di64 [value] ["i64" value])
+(defn dstr [value] ["string" value])
+(defn dkw [value] ["keyword" value])
+(defn dvec [& values] ["vector" (vec values)])
+(defn dmap [entries]
+  ["map" (->> entries (sort-by (comp str key))
+              (mapv (fn [[key value]] [(dkw key) value])))])
+(defn dget [document key]
+  (some (fn [[candidate value]] (when (= candidate (dkw key)) value)) (second document)))
+(defn error-codes [document]
+  (mapv #(second (dget % :error)) (second document)))
+
+(deftest reference-preserves-activitypub-contract
+  (let [kir (:kir (compiler/compile-source source :js-kotoba-v1))
+        base "https://example.test/users/alice"
+        endpoint-doc (call kir 'endpoints base)
+        public-key (dmap {:id (dstr "did:key:alice#main")})
+        actor-options
+        (dmap {:id (dstr base)
+               :inbox (dget endpoint-doc :inbox)
+               :outbox (dget endpoint-doc :outbox)
+               :followers (dget endpoint-doc :followers)
+               :following (dget endpoint-doc :following)
+               :liked (dget endpoint-doc :liked)
+               :preferred-username (dstr "alice")
+               :name (dstr "Alice")
+               :summary (dstr "Hello")
+               :public-key public-key})
+        actor (call kir 'actor actor-options)
+        item (dmap {:id (dstr "urn:activity:1")})
+        collection-options
+        (dmap {:id (dstr (str base "/outbox"))
+               :total-items (di64 1)
+               :items (dvec item)
+               :first (dstr "urn:first")
+               :last (dstr "urn:last")
+               :current (dstr "urn:current")
+               :next (dstr "urn:next")
+               :prev (dstr "urn:prev")})
+        ordered (call kir 'ordered-collection collection-options)
+        page (call kir 'ordered-page collection-options)
+        request (call kir 'activity-request
+                      (dmap {:method (dstr "POST")
+                             :url (dstr (str base "/inbox"))
+                             :actor actor
+                             :object item
+                             :body item}))]
+    (is (= (keyword "@context") (call kir 'context-key)))
+    (is (= "https://www.w3.org/ns/activitystreams" (call kir 'as-context)))
+    (is (= "https://www.w3.org/ns/activitystreams#Public" (call kir 'public)))
+    (is (= (dstr "Person") (dget actor :type)))
+    (is (= (dstr "alice") (dget actor :preferredUsername)))
+    (is (= public-key (dget actor :publicKey)))
+    (is (= (dstr (str base "/inbox")) (dget actor :inbox)))
+    (is (= (dstr "OrderedCollection") (dget ordered :type)))
+    (is (= (dstr "OrderedCollectionPage") (dget page :type)))
+    (is (= (di64 1) (dget ordered :totalItems)))
+    (is (= (dvec item) (dget ordered :items)))
+    (is (= (dmap {}) (dget request :headers)))
+    (is (= actor (dget request :actor)))
+    (is (= (dbool true) (dget (call kir 'validate actor) :valid?)))
+    (is (= (dvec) (call kir 'errors actor)))
+    (is (= #{} (set (:effects kir))))
+    (testing "defaults, false option omission, and ordered errors"
+      (let [minimal (call kir 'actor (dmap {}))
+            omitted (call kir 'actor (dmap {:name (dbool false)}))
+            missing-request (call kir 'activity-request (dmap {}))]
+        (is (= (dnull) (dget minimal :id)))
+        (is (= (dnull) (dget minimal :inbox)))
+        (is (nil? (dget omitted :name)))
+        (is (= (dnull) (dget missing-request :method)))
+        (is (= (dmap {}) (dget missing-request :headers)))
+        (is (= [:activitypub/missing-id :activitypub/missing-type]
+               (error-codes (call kir 'errors (dmap {})))))
+        (is (= [:activitypub/document-must-be-map]
+               (error-codes (call kir 'errors (dvec)))))))
+    (testing "constructor boundaries reject malformed documents"
+      (is (thrown? kerror/ExceptionInfo (call kir 'actor (dvec))))
+      (is (thrown? kerror/ExceptionInfo
+                   (call kir 'collection (dmap {:items (dstr "not-a-vector")})))))))
+
+(defn compiler-root []
+  (nth (iterate #(.getParent ^java.nio.file.Path %)
+                (java.nio.file.Path/of (.toURI (io/resource "kotoba/compiler/core.clj")))) 4))
+(defn base64 [value] (kbytes/base64-encode value))
+
+(deftest restricted-javascript-and-typed-wasm-conform-semantically
+  (let [javascript (compiler/compile-source source :js-kotoba-v1)
+        wasm (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        js64 (base64 (kbytes/utf8-bytes ^String (:source javascript)))
+        wasm64 (base64 ^bytes (:bytes wasm))
+        probe
+        (shell/sh
+          "node" "--input-type=module" "-e"
+          (str "import(process.argv[1]).then(async host=>{"
+               "const j=await import('data:text/javascript;base64," js64 "');"
+               "const w=await host.instantiateKotoba(Buffer.from(process.argv[2],'base64'));"
+               "const run=(x,doc)=>{const map=e=>doc(['map',e.map(([k,v])=>[['keyword',k],v]).sort((a,b)=>a[0][1]<b[0][1]?-1:a[0][1]>b[0][1]?1:0)]);"
+               "const base='https://example.test/users/alice';const ep=x.endpoints(base);"
+               "const get=(d,k)=>d[1].find(e=>e[0][0]==='keyword'&&e[0][1]===k)?.[1];"
+               "const opts=map([[':id',['string',base]],[':inbox',get(ep,':inbox')],[':outbox',get(ep,':outbox')],[':preferred-username',['string','alice']]]);"
+               "const a=x.actor(opts);if(get(a,':type')[1]!=='Person'||get(a,':preferredUsername')[1]!=='alice')throw Error('actor');"
+               "const item=map([[':id',['string','urn:activity:1']]]);const c=x['ordered-collection'](map([[':id',['string',base+'/outbox']],[':total-items',['i64',1n]],[':items',doc(['vector',[item]])]]));"
+               "if(get(c,':type')[1]!=='OrderedCollection'||get(c,':items')[1].length!==1)throw Error('collection');"
+               "const req=x['activity-request'](map([]));if(get(req,':method')[0]!=='null'||get(req,':headers')[0]!=='map')throw Error('request');"
+               "if(get(x.validate(a),':valid?')[1]!==true||x.errors(map([]))[1].length!==2)throw Error('validate');"
+               "let hostRejected=false;try{x.actor({})}catch(e){hostRejected=true}if(!hostRejected)throw Error('host-reject');"
+               "let shapeRejected=false;try{x.collection(map([[':items',['string','bad']]]))}catch(e){shapeRejected=true}if(!shapeRejected)throw Error('shape-reject');};"
+               "run(j.instantiateKotoba({}),x=>x);run(w.instance.exports,w.typedValues.document);"
+               "}).catch(e=>{console.error(e);process.exit(99)})")
+          (.toString (.toUri (.resolve (compiler-root) "runtime/browser-host.mjs"))) wasm64)]
+    (is (zero? (:exit probe)) (str (:out probe) (:err probe)))))
+
+(deftest production-source-authority
+  (is (= ["lib/org.w3.activitypub/src/activitypub.kotoba"]
+         (->> (file-seq (io/file "src")) (filter #(.isFile %)) (map str) sort vec))))

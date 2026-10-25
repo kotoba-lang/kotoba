@@ -1,0 +1,569 @@
+;; kotoba.source-chain -- per-agent signed source chain, verified in the guest
+;; (ADR-2609261900 stage A; reference: the retired Rust
+;; kotoba-server/workspace/crates/kotoba-dht/src/source_chain.rs).
+;;
+;; The chain arrives as ONE granted region (loader `g:<hex>` / `gl:<n>`):
+;; entries back to back, each exactly 454 bytes --
+;;
+;;   [agent key 32][Ed25519 signature 64][signed message 358]
+;;
+;; The signed message is fixed-width ASCII text, LF-terminated lines:
+;;
+;;   kotoba.source-chain/v1
+;;   agent:<64 hex: the same 32-byte key>
+;;   seq:<20 decimal digits, first two 0>
+;;   prev:<64 hex: sha256 of the previous message> | prev:<64 '-'> at seq 0
+;;   ts:<20 decimal digits, first two 0>
+;;   policy:<64 hex: sha256 of the data-policy document>
+;;   content:<64 hex: sha256 of the content>
+;;
+;; Why text: on the kexe loader `:hash/sha256` digests a STRING and a string
+;; must be valid UTF-8, while `:identity/verify` reads a granted byte span.
+;; An ASCII message is the one byte sequence both can take unchanged, so the
+;; bytes that are verified are exactly the bytes that are hashed. The entry
+;; hash (what `prev` names) is sha256 of the message. Every identifying
+;; field -- agent, seq, prev, ts, policy, content -- is inside it, which is
+;; the injectivity the Rust entry_cid fixed (seq/ts can no longer collide at
+;; a digit boundary because both are fixed width).
+;;
+;; Answers (i64): a count or tag >= 0 on success, or a NEGATIVE reason --
+;;   -1 seq mismatch    -2 prev mismatch   -3 invalid signature
+;;   -4 malformed text  -5 agent mismatch  -6 region is not whole entries
+;; The order checks run in is malformed, agent, signature, seq, prev: an
+;; untrusted entry is authenticated before its position is believed.
+
+(ns kotoba.source-chain
+  (:export [verify-chain head-tag fork-evidence verify-warrant replay-balance validate-dna])
+  (:capabilities #{:identity/verify :hash/sha256}))
+
+(defn- entry-size [] :i64 454)
+(defn- msg-len [] :i64 358)
+
+;; --- bytes -> text ----------------------------------------------------------
+
+(defn- hex-digit [v :i64] :string
+  (string-substring "0123456789abcdef" v (+ v 1)))
+
+(defn- hex-byte [v :i64] :string
+  (string-concat (hex-digit (quot v 16)) (hex-digit (- v (* 16 (quot v 16))))))
+
+(defn- key-hex-from [s [:slice :u8] at :i64 i :i64] :string
+  (if (>= i 32)
+    ""
+    (string-concat (hex-byte (slice-get s (+ at i))) (key-hex-from s at (+ i 1)))))
+
+;; 1 when every byte in [at, at+n) is printable ASCII or LF, else 0
+(defn- ascii-span [s [:slice :u8] at :i64 i :i64 n :i64] :i64
+  (if (>= i n)
+    1
+    (let [b (slice-get s (+ at i))]
+      (if (= b 10)
+        (ascii-span s at (+ i 1) n)
+        (if (< b 32) 0 (if (> b 126) 0 (ascii-span s at (+ i 1) n)))))))
+
+(defn- fill [s [:slice :u8] at :i64 v :vector-i64 i :i64 n :i64] :vector-i64
+  (if (>= i n) v (fill s at (vector-assoc! v i (slice-get s (+ at i))) (+ i 1) n)))
+
+(defn- span-text [s [:slice :u8] at :i64 n :i64] :string
+  (string-from-utf8 (bytes-from-vector-i64 (fill s at (vector-alloc n) 0 n))))
+
+;; --- text fields ------------------------------------------------------------
+
+(defn- lower-hex-run [t :string at :i64 i :i64 n :i64] :i64
+  (if (>= i n)
+    1
+    (let [c (string-code-point-at t (+ at i))]
+      (if (< c 48) 0
+          (if (<= c 57) (lower-hex-run t at (+ i 1) n)
+              (if (< c 97) 0
+                  (if (<= c 102) (lower-hex-run t at (+ i 1) n) 0)))))))
+
+(defn- digit-run [t :string at :i64 i :i64 n :i64] :i64
+  (if (>= i n)
+    1
+    (let [c (string-code-point-at t (+ at i))]
+      (if (< c 48) 0 (if (> c 57) 0 (digit-run t at (+ i 1) n))))))
+
+(defn- decimal-at [t :string at :i64 i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (decimal-at t at (+ i 1) n (+ (* acc 10) (- (string-code-point-at t (+ at i)) 48)))))
+
+(defn- dash-run [t :string at :i64 i :i64 n :i64] :i64
+  (if (>= i n)
+    1
+    (if (= (string-code-point-at t (+ at i)) 45) (dash-run t at (+ i 1) n) 0)))
+
+;; 1 when `expected` sits at `at`. A span past the end is an answer (0), not
+;; a substring the runtime refuses -- string-substring traps (SIGILL) there,
+;; which a variable-length manifest reaches when its last line is shorter
+;; than the prefix being tried.
+(defn- lit [t :string at :i64 expected :string] :i64
+  (if (> (+ at (string-byte-length expected)) (string-byte-length t))
+    0
+    (if (string=? (string-substring t at (+ at (string-byte-length expected))) expected) 1 0)))
+
+(defn- lf [t :string at :i64] :i64
+  (if (= (string-code-point-at t at) 10) 1 0))
+
+;; the fixed-width shape; field VALUES are judged by the caller
+(defn- shape-ok [t :string] :i64
+  (if (= 0 (lit t 0 "kotoba.source-chain/v1")) 0
+  (if (= 0 (lf t 22)) 0
+  (if (= 0 (lit t 23 "agent:")) 0
+  (if (= 0 (lower-hex-run t 29 0 64)) 0
+  (if (= 0 (lf t 93)) 0
+  (if (= 0 (lit t 94 "seq:")) 0
+  (if (= 0 (digit-run t 98 0 20)) 0
+  (if (= 0 (lit t 98 "00")) 0
+  (if (= 0 (lf t 118)) 0
+  (if (= 0 (lit t 119 "prev:")) 0
+  (if (= 0 (+ (lower-hex-run t 124 0 64) (dash-run t 124 0 64))) 0
+  (if (= 0 (lf t 188)) 0
+  (if (= 0 (lit t 189 "ts:")) 0
+  (if (= 0 (digit-run t 192 0 20)) 0
+  (if (= 0 (lit t 192 "00")) 0
+  (if (= 0 (lf t 212)) 0
+  (if (= 0 (lit t 213 "policy:")) 0
+  (if (= 0 (lower-hex-run t 220 0 64)) 0
+  (if (= 0 (lf t 284)) 0
+  (if (= 0 (lit t 285 "content:")) 0
+  (if (= 0 (lower-hex-run t 293 0 64)) 0
+  (if (= 0 (lf t 357)) 0
+    1)))))))))))))))))))))))
+
+;; --- one entry --------------------------------------------------------------
+
+(defn- verify-request [key :i64 msg :i64 mlen :i64 sig :i64] :string
+  (string-concat (string-from-i64 key)
+    (string-concat " " (string-concat (string-from-i64 msg)
+      (string-concat " " (string-concat (string-from-i64 mlen)
+        (string-concat " " (string-from-i64 sig))))))))
+
+(defn- verify [req :string] :string (identity/verify req))
+
+(defn- signature-ok [addr :i64] :i64
+  (if (string=? (verify (verify-request addr (+ addr 96) (msg-len) (+ addr 32))) "1")
+    1 0))
+
+(defn- sha256 [t :string] :string
+  (hash/sha256 t))
+
+;; The entry's message as text, or "" when it is not printable ASCII (so a
+;; hostile byte is refused by name here rather than trapping in the decoder).
+(defn- entry-text [s [:slice :u8] at :i64] :string
+  (if (= 1 (ascii-span s (+ at 96) 0 (msg-len)))
+    (span-text s (+ at 96) (msg-len))
+    ""))
+
+;; 0 ok, or the negative reason. `expected-key-hex` is the chain's agent;
+;; `prev-hash` is "" at seq 0.
+(defn- check-entry [s [:slice :u8] base :i64 at :i64 t :string seq :i64
+                    expected-key-hex :string prev-hash :string] :i64
+  (if (= 0 (string-byte-length t)) -4
+  (if (= 0 (shape-ok t)) -4
+  (if (= 0 (if (string=? (string-substring t 29 93) (key-hex-from s at 0)) 1 0)) -5
+  (if (= 0 (if (string=? (string-substring t 29 93) expected-key-hex) 1 0)) -5
+  (if (= 0 (signature-ok (+ base at))) -3
+  (if (= 0 (if (= (decimal-at t 98 0 20 0) seq) 1 0)) -1
+  (if (= seq 0)
+    (if (= 1 (dash-run t 124 0 64)) 0 -2)
+    (if (string=? (string-substring t 124 188) prev-hash) 0 -2)))))))))
+
+;; --- the chain --------------------------------------------------------------
+
+;; walks entries i..n-1; answers n on success, or the first negative reason
+(defn- walk [s [:slice :u8] base :i64 origin :i64 i :i64 n :i64 key-hex :string prev-hash :string] :i64
+  (if (>= i n)
+    n
+    (let [at (+ origin (* i (entry-size)))
+          t (entry-text s at)
+          verdict (check-entry s base at t i key-hex prev-hash)]
+      (if (< verdict 0)
+        verdict
+        (walk s base origin (+ i 1) n key-hex (sha256 t))))))
+
+(defn- entry-count [len :i64] :i64
+  (if (= len (* (quot len (entry-size)) (entry-size))) (quot len (entry-size)) -6))
+
+;; Number of entries in a valid chain (0 for an empty region), or the first
+;; negative reason. The chain's agent is the key of entry 0.
+(defn verify-chain [base :i64 len :i64] :i64
+  (let [n (entry-count len)]
+    (if (< n 0)
+      n
+      (if (= n 0)
+        0
+        (let [s (slice-of-u8 base len)]
+          (walk s base 0 0 n (key-hex-from s 0 0) ""))))))
+
+;; --- head ------------------------------------------------------------------
+
+(defn- hex-value [c :i64] :i64
+  (if (<= c 57) (- c 48) (- c 87)))
+
+(defn- hex-prefix [h :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n) acc (hex-prefix h (+ i 1) n (+ (* acc 16) (hex-value (string-code-point-at h i))))))
+
+;; The head entry's hash, as the value of its first 15 hex digits (60 bits,
+;; so always a non-negative i64); a caller holding the full digest compares
+;; this prefix. Negative reason when the chain does not verify; -7 when it
+;; is empty (an empty chain has no head -- not the same answer as a head).
+(defn head-tag [base :i64 len :i64] :i64
+  (let [n (verify-chain base len)]
+    (if (< n 0)
+      n
+      (if (= n 0)
+        -7
+        (let [s (slice-of-u8 base len)]
+          (hex-prefix (sha256 (entry-text s (* (- n 1) (entry-size)))) 0 15 0))))))
+
+;; --- fork evidence -----------------------------------------------------------
+
+;; Two entries -- `sa` at `at-a` and `sb` at `at-b`, each 454 bytes, `a-addr`
+;; and `b-addr` their absolute addresses -- are evidence of a fork when both
+;; are validly signed by the same agent at the same seq over different
+;; messages. 1 = fork, 0 = not a fork, negative = one does not verify.
+(defn- fork-verdict [sa [:slice :u8] a-addr :i64 at-a :i64
+                     sb [:slice :u8] b-addr :i64 at-b :i64] :i64
+  (let [ta (entry-text sa at-a)
+        tb (entry-text sb at-b)]
+    (if (= 0 (string-byte-length ta)) -4
+    (if (= 0 (string-byte-length tb)) -4
+    (if (= 0 (shape-ok ta)) -4
+    (if (= 0 (shape-ok tb)) -4
+    (if (= 0 (if (string=? (string-substring ta 29 93) (key-hex-from sa at-a 0)) 1 0)) -5
+    (if (= 0 (if (string=? (string-substring tb 29 93) (key-hex-from sb at-b 0)) 1 0)) -5
+    (if (= 0 (signature-ok a-addr)) -3
+    (if (= 0 (signature-ok b-addr)) -3
+    (if (string=? (string-substring ta 29 93) (string-substring tb 29 93))
+      (if (= (decimal-at ta 98 0 20 0) (decimal-at tb 98 0 20 0))
+        (if (string=? ta tb) 0 1)
+        0)
+      0)))))))))))
+
+;; Two entries, each one granted region of 454 bytes.
+(defn fork-evidence [a-base :i64 a-len :i64 b-base :i64 b-len :i64] :i64
+  (if (= 0 (if (= a-len (entry-size)) 1 0)) -6
+  (if (= 0 (if (= b-len (entry-size)) 1 0)) -6
+    (fork-verdict (slice-of-u8 a-base a-len) a-base 0
+                  (slice-of-u8 b-base b-len) b-base 0))))
+
+;; --- warrant -----------------------------------------------------------------
+;;
+;; A warrant is an issuer's signed accusation that carries its own evidence.
+;; One granted region of 1336 bytes:
+;;
+;;   [issuer key 32][signature 64][warrant message 332][entry A 454][entry B 454]
+;;
+;;   kotoba.warrant/v1
+;;   issuer:<64 hex: the same 32-byte key>
+;;   accused:<64 hex: the agent whose chain forked>
+;;   rule:fork
+;;   seq:<20 decimal digits, first two 0: the seq both entries claim>
+;;   a:<64 hex: sha256 of entry A's message>
+;;   b:<64 hex: sha256 of entry B's message>
+;;
+;; The warrant is only as good as its evidence: it verifies when the issuer
+;; signed it AND the two entries are a fork (fork-verdict = 1) AND the
+;; warrant names exactly that fork -- the accused, the seq and both hashes.
+;; A warrant cannot accuse on hearsay, and no one can re-point a valid
+;; signature at different evidence. Extra reasons:
+;;   -8 the evidence is not a fork   -9 the warrant does not name its evidence
+
+(defn- warrant-size [] :i64 1336)
+(defn- warrant-msg-len [] :i64 332)
+
+(defn- warrant-shape-ok [t :string] :i64
+  (if (= 0 (lit t 0 "kotoba.warrant/v1")) 0
+  (if (= 0 (lf t 17)) 0
+  (if (= 0 (lit t 18 "issuer:")) 0
+  (if (= 0 (lower-hex-run t 25 0 64)) 0
+  (if (= 0 (lf t 89)) 0
+  (if (= 0 (lit t 90 "accused:")) 0
+  (if (= 0 (lower-hex-run t 98 0 64)) 0
+  (if (= 0 (lf t 162)) 0
+  (if (= 0 (lit t 163 "rule:fork")) 0
+  (if (= 0 (lf t 172)) 0
+  (if (= 0 (lit t 173 "seq:")) 0
+  (if (= 0 (digit-run t 177 0 20)) 0
+  (if (= 0 (lit t 177 "00")) 0
+  (if (= 0 (lf t 197)) 0
+  (if (= 0 (lit t 198 "a:")) 0
+  (if (= 0 (lower-hex-run t 200 0 64)) 0
+  (if (= 0 (lf t 264)) 0
+  (if (= 0 (lit t 265 "b:")) 0
+  (if (= 0 (lower-hex-run t 267 0 64)) 0
+  (if (= 0 (lf t 331)) 0
+    1)))))))))))))))))))))
+
+(defn- signed-span-ok [key :i64 sig :i64 msg :i64 mlen :i64] :i64
+  (if (string=? (verify (verify-request key msg mlen sig)) "1") 1 0))
+
+(defn- same [a :string b :string] :i64
+  (if (string=? a b) 1 0))
+
+;; 1 when the warrant verifies, or the negative reason.
+(defn verify-warrant [base :i64 len :i64] :i64
+  (if (= 0 (if (= len (warrant-size)) 1 0))
+    -6
+    (let [s (slice-of-u8 base len)
+          wt (if (= 1 (ascii-span s 96 0 (warrant-msg-len)))
+               (span-text s 96 (warrant-msg-len))
+               "")]
+      (if (= 0 (string-byte-length wt)) -4
+      (if (= 0 (warrant-shape-ok wt)) -4
+      (if (= 0 (same (string-substring wt 25 89) (key-hex-from s 0 0))) -5
+      (if (= 0 (signed-span-ok base (+ base 32) (+ base 96) (warrant-msg-len))) -3
+        (let [at-a 428
+              at-b 882
+              verdict (fork-verdict s (+ base at-a) at-a s (+ base at-b) at-b)]
+          (if (< verdict 0)
+            verdict
+            (if (= verdict 0)
+              -8
+              (let [ta (entry-text s at-a)
+                    tb (entry-text s at-b)]
+                (if (= 0 (same (string-substring wt 98 162) (string-substring ta 29 93))) -9
+                (if (= 0 (if (= (decimal-at wt 177 0 20 0) (decimal-at ta 98 0 20 0)) 1 0)) -9
+                (if (= 0 (same (string-substring wt 200 264) (sha256 ta))) -9
+                (if (= 0 (same (string-substring wt 267 331) (sha256 tb))) -9
+                  1)))))))))))))))
+
+;; --- engi mutual credit --------------------------------------------------------
+;;
+;; A transfer is a countersigned record, 462 bytes:
+;;
+;;   [spender key 32][receiver key 32][spender sig 64][receiver sig 64][message 270]
+;;
+;;   kotoba.engi.transfer/v1
+;;   spender:<64 hex>
+;;   receiver:<64 hex>
+;;   amount:<20 decimal digits, first eight 0, not all 0>
+;;   nonce:<64 hex: makes each transfer distinct>
+;;
+;; Both parties sign the same message and each appends an entry whose
+;; `content` is the transfer's id, sha256 of the message, to its own chain.
+;; There is no global ledger: a balance is the replay of one agent's chain
+;; (mirrors HoloFuel; reference engi_chain.rs replay_balance). Mutual credit
+;; is net-zero: the spender's loss is the receiver's gain, so the balances of
+;; everyone sum to zero and nothing is issued.
+;;
+;; replay-balance takes one granted region: the agent's chain (`n` entries)
+;; followed by the transfers it references, in chain order. It answers the
+;; balance PLUS 2^50 (so every balance is a non-negative answer and every
+;; negative answer is a reason), or:
+;;   -10 the balance fell below -credit-limit at some transfer
+;;   -11 a transfer is not referenced by any entry of the chain
+;;   -12 a transfer is referenced by more than one entry (it would count twice)
+;;   -13 the chain's agent is neither spender nor receiver
+;;   -14 transfers are not in the order of the entries that reference them
+;; A double spend is not visible inside one chain -- it is a fork, which is
+;; what fork-evidence and verify-warrant are for. Completeness is the
+;; caller's: the replay counts the transfers it is given.
+
+(defn- transfer-size [] :i64 462)
+(defn- transfer-msg-len [] :i64 270)
+(defn- balance-bias [] :i64 1125899906842624)
+
+(defn- transfer-shape-ok [t :string] :i64
+  (if (= 0 (lit t 0 "kotoba.engi.transfer/v1")) 0
+  (if (= 0 (lf t 23)) 0
+  (if (= 0 (lit t 24 "spender:")) 0
+  (if (= 0 (lower-hex-run t 32 0 64)) 0
+  (if (= 0 (lf t 96)) 0
+  (if (= 0 (lit t 97 "receiver:")) 0
+  (if (= 0 (lower-hex-run t 106 0 64)) 0
+  (if (= 0 (lf t 170)) 0
+  (if (= 0 (lit t 171 "amount:")) 0
+  (if (= 0 (digit-run t 178 0 20)) 0
+  (if (= 0 (lit t 178 "00000000")) 0
+  (if (= 0 (lf t 198)) 0
+  (if (= 0 (lit t 199 "nonce:")) 0
+  (if (= 0 (lower-hex-run t 205 0 64)) 0
+  (if (= 0 (lf t 269)) 0
+    1))))))))))))))))
+
+;; index of the one chain entry whose content is `id`: -11 none, -12 several
+(defn- referencing-entry [s [:slice :u8] i :i64 n :i64 id :string found :i64] :i64
+  (if (>= i n)
+    (if (< found 0) -11 found)
+    (let [t (entry-text s (* i (entry-size)))]
+      (if (string=? (string-substring t 293 357) id)
+        (if (>= found 0) -12 (referencing-entry s (+ i 1) n id i))
+        (referencing-entry s (+ i 1) n id found)))))
+
+(defn- replay [s [:slice :u8] base :i64 n :i64 j :i64 m :i64 agent :string
+               limit :i64 last-entry :i64 balance :i64] :i64
+  (if (>= j m)
+    (+ balance (balance-bias))
+    (let [at (+ (* n (entry-size)) (* j (transfer-size)))
+          t (if (= 1 (ascii-span s (+ at 192) 0 (transfer-msg-len)))
+              (span-text s (+ at 192) (transfer-msg-len))
+              "")]
+      (if (= 0 (string-byte-length t)) -4
+      (if (= 0 (transfer-shape-ok t)) -4
+      (let [spender (string-substring t 32 96)
+            receiver (string-substring t 106 170)
+            amount (decimal-at t 178 0 20 0)]
+        (if (= amount 0) -4
+        (if (= 1 (same spender receiver)) -4
+        (if (= 0 (same spender (key-hex-from s at 0))) -5
+        (if (= 0 (same receiver (key-hex-from s (+ at 32) 0))) -5
+        (if (= 0 (signed-span-ok (+ base at) (+ base at 64) (+ base at 192) (transfer-msg-len))) -3
+        (if (= 0 (signed-span-ok (+ base at 32) (+ base at 128) (+ base at 192) (transfer-msg-len))) -3
+        (if (= 0 (+ (same agent spender) (same agent receiver))) -13
+          (let [k (referencing-entry s 0 n (sha256 t) -1)]
+            (if (< k 0)
+              k
+              (if (<= k last-entry)
+                -14
+                (let [next (if (= 1 (same agent spender)) (- balance amount) (+ balance amount))]
+                  (if (< next (- 0 limit))
+                    -10
+                    (replay s base n (+ j 1) m agent limit k next)))))))))))))))))))
+
+(defn replay-balance [base :i64 len :i64 n :i64 credit-limit :i64] :i64
+  (let [chain-len (* n (entry-size))
+        rest (- len chain-len)]
+    (if (< n 1) -6
+    (if (< rest 0) -6
+    (if (= 0 (if (= rest (* (quot rest (transfer-size)) (transfer-size))) 1 0)) -6
+      (let [s (slice-of-u8 base len)
+            key-hex (key-hex-from s 0 0)
+            verdict (walk s base 0 0 n key-hex "")]
+        (if (< verdict 0)
+          verdict
+          (replay s base n 0 (quot rest (transfer-size)) key-hex credit-limit -1 0))))))))
+
+;; --- DNA ---------------------------------------------------------------------
+;;
+;; A DNA is the rule set a chain lives under, named by its content: the DNA
+;; id is sha256 of the manifest (reference dna.rs dna_id). The manifest is
+;; ASCII, one field per LF-terminated line:
+;;
+;;   kotoba.dna/v1
+;;   name:<1..64 printable characters>
+;;   version:<1..64 printable characters>
+;;   max-content:<1..6 decimal digits: the largest content document, bytes>
+;;   allow:<schema>          one or more, strictly ascending
+;;   end
+;;
+;; Ascending allow lines make the manifest canonical, so the same rule set
+;; has one id however it was written (the Rust with_rule sorted for the same
+;; reason); an unsorted or repeated allow line is refused, not re-sorted.
+;;
+;; A chain lives under a DNA when its genesis entry's content IS the DNA id
+;; (Holochain's genesis records the DNA hash the same way), and every later
+;; entry's content is resolved: the caller supplies the document whose sha256
+;; the entry names, it is ASCII, no longer than max-content, and its first
+;; line -- its schema -- is one the DNA allows. So nothing the DNA has not
+;; admitted can sit in the chain as an opaque hash, and a validator holding
+;; the documents sees every transfer the chain names.
+;;
+;; validate-dna takes one granted region:
+;;   [manifest mlen][chain n*454][record for entry 1]...[record for entry n-1]
+;; each record is [length: 2 bytes big-endian][document]. It answers n, or:
+;;   -15 a document is missing, or its sha256 is not the entry's content
+;;   -16 a document is longer than max-content
+;;   -17 a document's schema is not allowed by the DNA
+;;   -18 the genesis entry's content is not the DNA id
+;;   -19 the manifest is malformed or not canonical
+
+(defn- line-end [t :string from :i64] :i64
+  (string-index-of-from t "\n" from))
+
+;; index just past a "<prefix><1..64 printable>\n" line at `at`, or -1
+(defn- text-line [t :string at :i64 prefix :string] :i64
+  (if (= 0 (lit t at prefix))
+    -1
+    (let [from (+ at (string-byte-length prefix))
+          e (line-end t from)]
+      (if (< e 0) -1
+      (if (< (- e from) 1) -1
+      (if (> (- e from) 64) -1
+        (+ e 1)))))))
+
+;; walks allow lines from `at`; `prev` is the previous schema ("" before the
+;; first). Answers the index of the "end" line, or -1.
+(defn- allow-lines [t :string at :i64 prev :string count :i64] :i64
+  (if (= 1 (lit t at "allow:"))
+    (let [next (text-line t at "allow:")]
+      (if (< next 0)
+        -1
+        (let [schema (string-substring t (+ at 6) (- next 1))]
+          (if (= count 0)
+            (allow-lines t next schema (+ count 1))
+            (if (< (string-compare prev schema) 0)
+              (allow-lines t next schema (+ count 1))
+              -1)))))
+    (if (= count 0) -1 at)))
+
+;; max-content of a canonical manifest, or -19
+(defn- manifest-max-content [t :string] :i64
+  (if (= 0 (lit t 0 "kotoba.dna/v1\n"))
+    -19
+    (let [a (text-line t 14 "name:")
+          b (if (< a 0) -1 (text-line t a "version:"))]
+      (if (< b 0)
+        -19
+        (if (= 0 (lit t b "max-content:"))
+          -19
+          (let [from (+ b 12)
+                e (line-end t from)]
+            (if (< e 0) -19
+            (if (< (- e from) 1) -19
+            (if (> (- e from) 6) -19
+            (if (= 0 (digit-run t from 0 (- e from))) -19
+              (let [end-at (allow-lines t (+ e 1) "" 0)]
+                (if (< end-at 0) -19
+                (if (= 0 (lit t end-at "end\n")) -19
+                (if (= 0 (if (= (+ end-at 4) (string-byte-length t)) 1 0)) -19
+                  (decimal-at t from 0 (- e from) 0)))))))))))))))
+
+(defn- schema-allowed [manifest :string schema :string] :i64
+  (if (< (string-index-of manifest (string-concat "\nallow:" (string-concat schema "\n"))) 0) 0 1))
+
+(defn- entry-content [s [:slice :u8] at :i64] :string
+  (string-substring (entry-text s at) 293 357))
+
+;; checks the records for entries i..n-1 starting at byte `c`; answers the
+;; index just past the last record, or a negative reason
+(defn- dna-records [s [:slice :u8] len :i64 origin :i64 i :i64 n :i64 c :i64
+                    manifest :string max-content :i64] :i64
+  (if (>= i n)
+    c
+    (if (> (+ c 2) len)
+      -15
+      (let [l (+ (* 256 (slice-get s c)) (slice-get s (+ c 1)))
+            d (+ c 2)]
+        (if (< l 1) -15
+        (if (> (+ d l) len) -15
+        (if (> l max-content) -16
+        (if (= 0 (ascii-span s d 0 l)) -4
+          (let [doc (span-text s d l)
+                schema-end (line-end doc 0)]
+            (if (= 0 (same (sha256 doc) (entry-content s (+ origin (* i (entry-size)))))) -15
+            (if (< schema-end 1) -4
+            (if (= 0 (schema-allowed manifest (string-substring doc 0 schema-end))) -17
+              (dna-records s len origin (+ i 1) n (+ d l) manifest max-content)))))))))))))
+
+(defn validate-dna [base :i64 len :i64 n :i64 mlen :i64] :i64
+  (if (< n 1) -6
+  (if (< mlen 1) -6
+  (if (> (+ mlen (* n (entry-size))) len) -6
+    (let [s (slice-of-u8 base len)]
+      (if (= 0 (ascii-span s 0 0 mlen))
+        -19
+        (let [manifest (span-text s 0 mlen)
+              max-content (manifest-max-content manifest)]
+          (if (< max-content 0)
+            max-content
+            (let [verdict (walk s base mlen 0 n (key-hex-from s mlen 0) "")]
+              (if (< verdict 0)
+                verdict
+                (if (= 0 (same (entry-content s mlen) (sha256 manifest)))
+                  -18
+                  (let [end (dna-records s len mlen 1 n (+ mlen (* n (entry-size))) manifest max-content)]
+                    (if (< end 0) end
+                    (if (= end len) n -6))))))))))))))

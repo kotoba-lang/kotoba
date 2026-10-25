@@ -119,6 +119,29 @@ The bundled standard libraries live in this repository:
 | `org.ecmaInternational.ecma262` | `org.ecmaInternational.ecma262/src` | `` (an external specification, publisher ecmaInternational.org) |
 | `org.ieee.du` | `org.ieee.du/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.find` | `org.ieee.find/src` | `` (an external specification, publisher ieee.org) |
+| `org.jsonrpc.core` | `org.jsonrpc.core/src` | `` (an external specification, publisher jsonrpc.org) |
+| `org.oasisOpen.odf` | `org.oasisOpen.odf/src` | `` (an external specification, publisher oasisOpen.org) |
+| `org.w3.activitypub` | `org.w3.activitypub/src` | `` (an external specification, publisher w3.org) |
+| `org.w3.activitystreams` | `org.w3.activitystreams/src` | `` (an external specification, publisher w3.org) |
+| `org.w3.epub` | `org.w3.epub/src` | `` (an external specification, publisher w3.org) |
+| `org.w3.turtle` | `org.w3.turtle/src` | `` (an external specification, publisher w3.org) |
+| `org.w3.vc` | `org.w3.vc/src` | `` (an external specification, publisher w3.org) |
+| `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
+| `kotoba.x` | `kotoba.x/src` | `` (Kotoba project library) |
+| `kotoba.tsukasa` | `kotoba.tsukasa/src` | `` (Kotoba project library) |
+| `kotoba.translate` | `kotoba.translate/src` | `` (Kotoba project library) |
+| `kotoba.torrent` | `kotoba.torrent/src` | `` (Kotoba project library) |
+| `kotoba.tenso` | `kotoba.tenso/src` | `` (Kotoba project library) |
+| `kotoba.tasks` | `kotoba.tasks/src` | `` (Kotoba project library) |
+| `kotoba.sysTms` | `kotoba.sysTms/src` | `` (Kotoba project library) |
+| `kotoba.sumitsubo` | `kotoba.sumitsubo/src` | `` (Kotoba project library) |
+| `kotoba.sourceChain` | `kotoba.sourceChain/src` | `` (Kotoba project library) |
+| `kotoba.site` | `kotoba.site/src` | `` (Kotoba project library) |
+| `kotoba.shacl` | `kotoba.shacl/src` | `` (Kotoba project library) |
+| `kotoba.screen` | `kotoba.screen/src` | `` (Kotoba project library) |
+| `kotoba.repository` | `kotoba.repository/src` | `` (Kotoba project library) |
+| `kotoba.pluginHermes` | `kotoba.pluginHermes/src` | `` (Kotoba project library) |
+| `kotoba.osMessaging` | `kotoba.osMessaging/src` | `` (Kotoba project library) |
 | `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
 | `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
 | `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |
