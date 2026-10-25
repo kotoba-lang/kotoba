@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.hls` | `kotoba.hls/src` | `kotoba.hls`, `kotoba.hls.player`, `kotoba.hls.view` (Kotoba project library) |
 | `kotoba.erasure` | `kotoba.erasure/src` | `erasure.codec`, `erasure.gf`, `erasure.kotoba-oracle`, `erasure.lrc` (Kotoba project library) |
 | `kotoba.ekycNativeProvider` | `kotoba.ekycNativeProvider/src` | `ekyc-native-provider.core`, `ekyc-native-provider.ports` (Kotoba project library) |
 | `kotoba.mrz` | `kotoba.mrz/src` | `mrz.adapters.template-ocr`, `mrz.checksum`, `mrz.core`, `mrz.glyph` (Kotoba project library) |
