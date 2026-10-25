@@ -1,0 +1,142 @@
+(ns call
+  "Make one unary DRPC call and print what came back.
+
+      kbb -M:call 127.0.0.1:19500 /echo.Echo/Echo 'hello storj'
+      kbb --backend sci --classpath \"$(kbb -A:cljs -Spath)\" scripts/call.cljk \\
+        127.0.0.1:19500 /echo.Echo/Echo 'hello storj'
+
+  A harness, not part of the library: `drpc.client` never touches a socket,
+  which is what lets the same description drive a JVM stream and a Node one.
+  The socket handling is here, and it is the only place in this repo that has
+  any.
+
+  Prints `response <text>` on success, `error <code> <message>` when the peer
+  refused, and exits non-zero on either failure."
+  (:require [kotoba.lang.text :as str]
+            [drpc.client :as c]
+            [drpc.session :as sess]
+            [drpc.wire :as w]
+            #?(:cljs ["node:net" :as net]))
+  #?(:clj (:import (java.net Socket))))
+
+(def stream-id
+  "The stream a call runs on. Named `stream-id` rather than `stream` because a
+  function called `stream` was added beside it and shadowed the constant — a
+  call then passed the function itself as its stream id, and every packet
+  failed to encode. The third shadowing of this shape in this library."
+  1)
+
+(defn- report [result]
+  (cond
+    (:message result) (do (println (str "response " (c/utf8-string (:message result)))) 0)
+    (:error result)   (do (println (str "error " (get-in result [:error :code])
+                                        " " (get-in result [:error :message])))
+                          1)
+    :else             (do (println "closed with no answer") 1)))
+
+(defn- report-stream [result]
+  (doseq [m (:messages result)]
+    (println (str "response " (c/utf8-string m))))
+  (cond (:error result) (do (println (str "error " (get-in result [:error :message]))) 1)
+        (seq (:messages result)) 0
+        :else (do (println "no messages") 1)))
+
+(defn stream-call
+  "Open a stream, send each comma-separated chunk as its own message, close the
+  sending side, and read whatever comes back.
+
+  A streaming receive finishes on the peer's `CloseSend`, not on its first
+  message — applying the unary rule here reads the first chunk and calls the
+  download finished."
+  [[addr rpc chunks]]
+  (let [[host port-s] (str/split addr #":")
+        port #?(:clj (parse-long port-s) :cljs (js/parseInt port-s 10))
+        parts (str/split (or chunks "a,bb,ccc") #",")
+        [st open] (sess/begin-stream (sess/session) {:rpc rpc})
+        [st bodies] (reduce (fn [[st acc] chunk]
+                              (let [[st bs] (sess/send-on st (:stream open)
+                                                          (c/ascii-bytes chunk))]
+                                [st (into acc bs)]))
+                            [st []] parts)
+        [st done] (sess/end-send st (:stream open))
+        request (vec (concat (:bytes open) bodies done))
+        stream-id (:stream open)]
+    #?(:clj
+       (let [sock (doto (Socket. ^String host (int port)) (.setSoTimeout 15000))
+             out (.getOutputStream sock)
+             in  (.getInputStream sock)]
+         (.write out (byte-array (map unchecked-byte request)))
+         (.flush out)
+         (loop [st st]
+           (let [buf (byte-array 8192)
+                 n   (.read in buf)]
+             (if (neg? n)
+               (do (.close sock) (System/exit 1))
+               (let [{:keys [state completed]} (sess/feed st (take n (seq buf)))]
+                 (if-let [r (first completed)]
+                   (do (.close sock) (System/exit (report-stream (:result r))))
+                   (recur state)))))))
+
+       :cljs
+       (let [sock (.connect net #js {:host host :port port})
+             st' (atom st)]
+         (.on sock "connect" #(.write sock (js/Uint8Array.from (into-array request))))
+         (.on sock "data"
+              (fn [chunk]
+                (let [fed (sess/feed @st' chunk)]
+                  (reset! st' (:state fed))
+                  (when-let [r (first (:completed fed))]
+                    (.destroy sock)
+                    (js/process.exit (report-stream (:result r)))))))
+         (.on sock "error" (fn [e] (println (str "FAIL " (.-message e)))
+                             (js/process.exit 1)))))
+    stream-id))
+
+(defn run [[addr rpc payload]]
+  (let [[host port-s] (str/split addr #":")
+        port    #?(:clj (parse-long port-s) :cljs (js/parseInt port-s 10))
+        request (c/request {:stream stream-id :rpc rpc :request (c/ascii-bytes payload)})]
+    #?(:clj
+       (let [sock (doto (Socket. ^String host (int port)) (.setSoTimeout 15000))
+             out  (.getOutputStream sock)
+             in   (.getInputStream sock)]
+         (.write out (byte-array (map unchecked-byte request)))
+         (.flush out)
+         (loop [state (w/reader), seen []]
+           (let [buf (byte-array 8192)
+                 n   (.read in buf)]
+             (if (neg? n)
+               ;; the peer hung up: whatever arrived is the whole answer
+               (do (.close sock) (System/exit (report (c/collect seen stream-id))))
+               (let [{:keys [state packets]} (w/feed state (take n (seq buf)))
+                     seen   (into seen packets)
+                     result (c/collect seen stream-id)]
+                 (if (c/complete? result)
+                   (do (.close sock) (System/exit (report result)))
+                   (recur state seen)))))))
+
+       :cljs
+       (let [sock (.connect net #js {:host host :port port})
+             state (atom (w/reader))
+             seen  (atom [])
+             finish (fn [] (js/process.exit (report (c/collect @seen stream-id))))]
+         (.on sock "connect" #(.write sock (js/Uint8Array.from (into-array request))))
+         (.on sock "data"
+              (fn [chunk]
+                ;; not `{:keys [state ...]}`: that binding shadows the atom of
+                ;; the same name, and `reset!` then gets handed the map
+                (let [fed (w/feed @state chunk)]
+                  (reset! state (:state fed))
+                  (swap! seen into (:packets fed))
+                  (when (c/complete? (c/collect @seen stream-id))
+                    (.destroy sock)
+                    (finish)))))
+         (.on sock "end" finish)
+         (.on sock "error" (fn [e] (println (str "FAIL " (.-message e)))
+                             (js/process.exit 1)))))))
+
+(defn dispatch [args]
+  (if (= "stream" (first args)) (stream-call (rest args)) (run args)))
+
+#?(:clj (defn -main [& args] (dispatch args)))
+#?(:cljs (dispatch (vec *command-line-args*)))

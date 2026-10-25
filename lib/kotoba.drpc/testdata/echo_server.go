@@ -1,0 +1,230 @@
+// Command echo_server is a DRPC server built out of storj.io/drpc itself, so
+// that a call answered by it is evidence rather than a rehearsal.
+//
+// There is no generated code here on purpose. `drpc.Handler` is one method and
+// `drpc.Encoding` is two, so a raw byte-passing encoding is enough to answer a
+// unary call — and it keeps the fixture free of protoc, which would otherwise
+// have to be installed and pinned to test forty lines of framing.
+//
+// The reply is `<rpc>:<request>`, so a passing test proves the rpc *name*
+// arrived and was routed, not merely that some bytes came back.
+//
+//	go run echo_server.go -port 19500
+//
+// It prints `listening <port>` once bound and serves until killed.
+package main
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strings"
+
+	"storj.io/drpc"
+	"storj.io/drpc/drpcconn"
+	"storj.io/drpc/drpcserver"
+)
+
+// raw is a drpc.Message that is its own bytes.
+type raw struct{ data []byte }
+
+// rawEncoding passes bytes through untouched. A real service would put
+// protobuf here; what is being tested is the framing underneath it.
+type rawEncoding struct{}
+
+func (rawEncoding) Marshal(msg drpc.Message) ([]byte, error) {
+	return msg.(*raw).data, nil
+}
+
+func (rawEncoding) Unmarshal(buf []byte, msg drpc.Message) error {
+	m := msg.(*raw)
+	m.data = append([]byte(nil), buf...)
+	return nil
+}
+
+type echo struct{}
+
+func (echo) HandleRPC(stream drpc.Stream, rpc string) error {
+	// Collect is the streaming shape an Upload has: many messages in, one
+	// answer out. It reads until the client stops and reports what it heard,
+	// so a client that sends three chunks and is told "3/N" has had every one
+	// of them arrive in order.
+	if rpc == "/echo.Echo/Collect" {
+		count, total := 0, 0
+		for {
+			var chunk raw
+			if err := stream.MsgRecv(&chunk, rawEncoding{}); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return err
+			}
+			count++
+			total += len(chunk.data)
+		}
+		fmt.Printf("rpc %s collected %d messages, %d bytes\n", rpc, count, total)
+		return stream.MsgSend(&raw{data: []byte(fmt.Sprintf("%d/%d", count, total))},
+			rawEncoding{})
+	}
+
+	// Emit is the other shape, a Download: one request in, many answers out.
+	if rpc == "/echo.Echo/Emit" {
+		var in raw
+		if err := stream.MsgRecv(&in, rawEncoding{}); err != nil {
+			return err
+		}
+		n := len(in.data)
+		fmt.Printf("rpc %s emitting %d messages\n", rpc, n)
+		for i := 0; i < n; i++ {
+			if err := stream.MsgSend(&raw{data: []byte{in.data[i]}}, rawEncoding{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	var in raw
+	if err := stream.MsgRecv(&in, rawEncoding{}); err != nil {
+		return err
+	}
+	fmt.Printf("rpc %s (%d bytes)\n", rpc, len(in.data))
+	out := raw{data: append([]byte(rpc+":"), in.data...)}
+	return stream.MsgSend(&out, rawEncoding{})
+}
+
+// streamCall opens a stream with the reference client, sends each argument as
+// its own message, then reads whatever comes back. This is the direction
+// drpc.server has to survive for an Upload.
+func streamCall(addr, rpcName string, chunks []string) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("FAIL dial: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = conn.Close() }()
+
+	client := drpcconn.New(conn)
+	defer func() { _ = client.Close() }()
+
+	stream, err := client.NewStream(context.Background(), rpcName, rawEncoding{})
+	if err != nil {
+		fmt.Printf("FAIL new stream: %v\n", err)
+		os.Exit(1)
+	}
+	for _, chunk := range chunks {
+		if err := stream.MsgSend(&raw{data: []byte(chunk)}, rawEncoding{}); err != nil {
+			fmt.Printf("FAIL send: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		fmt.Printf("FAIL close send: %v\n", err)
+		os.Exit(1)
+	}
+	for {
+		var out raw
+		if err := stream.MsgRecv(&out, rawEncoding{}); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			fmt.Printf("FAIL recv: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("response %s\n", string(out.data))
+	}
+}
+
+// recorder is a drpc.Transport that keeps what was written and is empty when
+// read. Invoke fails once it tries to read the response, which is fine: the
+// bytes it wrote first are the vector.
+type recorder struct{ written []byte }
+
+func (r *recorder) Write(p []byte) (int, error) {
+	r.written = append(r.written, p...)
+	return len(p), nil
+}
+func (r *recorder) Read([]byte) (int, error) { return 0, io.EOF }
+func (r *recorder) Close() error             { return nil }
+
+// dumpRequest prints the exact bytes storj.io/drpc writes for a unary call, so
+// drpc.client can be checked against them rather than against itself.
+func dumpRequest(rpc, payload string) {
+	rec := &recorder{}
+	conn := drpcconn.New(rec)
+	var out raw
+	// the error is expected: there is nothing to read back
+	_ = conn.Invoke(context.Background(), rpc, rawEncoding{},
+		&raw{data: []byte(payload)}, &out)
+	_ = conn.Close()
+
+	fmt.Printf("{;; generated by testdata/echo_server.go -dump\n")
+	fmt.Printf(" :rpc %q\n", rpc)
+	fmt.Printf(" :payload %q\n", payload)
+	fmt.Printf(" :request %q}\n", hex.EncodeToString(rec.written))
+}
+
+// callServer dials a DRPC server and makes one unary call with the reference
+// client. This is the direction drpc.server has to survive: a real
+// drpcconn.Conn on the other end, not a rehearsal of one.
+func callServer(addr, rpc, payload string) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("FAIL dial: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = conn.Close() }()
+
+	client := drpcconn.New(conn)
+	defer func() { _ = client.Close() }()
+
+	var out raw
+	if err := client.Invoke(context.Background(), rpc, rawEncoding{},
+		&raw{data: []byte(payload)}, &out); err != nil {
+		fmt.Printf("FAIL invoke: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("response %s\n", string(out.data))
+}
+
+func main() {
+	port := flag.Int("port", 0, "port to listen on, 0 for any")
+	call := flag.String("call", "", "host:port of a server to call instead of serving")
+	streamTo := flag.String("stream-call", "", "host:port of a server to stream to")
+	chunks := flag.String("chunks", "a,bb,ccc", "comma-separated messages for -stream-call")
+	dump := flag.Bool("dump", false, "print the bytes a unary call writes")
+	rpc := flag.String("rpc", "/echo.Echo/Echo", "rpc name for -dump")
+	payload := flag.String("payload", "hello storj", "request payload for -dump")
+	flag.Parse()
+
+	if *dump {
+		dumpRequest(*rpc, *payload)
+		return
+	}
+
+	if *call != "" {
+		callServer(*call, *rpc, *payload)
+		return
+	}
+
+	if *streamTo != "" {
+		streamCall(*streamTo, *rpc, strings.Split(*chunks, ","))
+		return
+	}
+
+	lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
+	if err != nil {
+		fmt.Printf("FAIL listen: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("listening %d\n", lis.Addr().(*net.TCPAddr).Port)
+	_ = os.Stdout.Sync()
+
+	if err := drpcserver.New(echo{}).Serve(context.Background(), lis); err != nil {
+		fmt.Printf("serve ended: %v\n", err)
+	}
+}

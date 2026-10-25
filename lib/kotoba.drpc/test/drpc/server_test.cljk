@@ -1,0 +1,159 @@
+(ns drpc.server-test
+  "Reading a call off the wire and answering it.
+
+  The request side is checked against bytes `drpc.client` writes, which are
+  themselves checked against `drpcconn`'s — so this is held to the reference
+  implementation at one remove. The reply side is checked by reading it back
+  with `drpc.client`, and at no remove at all in CI, where a real
+  `drpcconn.Conn` calls a server built from this."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [drpc.client :as c]
+            [drpc.server :as srv]
+            [drpc.wire :as w]))
+
+(defn- text [bs] (apply str (map char bs)))
+
+(def ^:private rpc "/echo.Echo/Echo")
+
+(defn- call-bytes
+  ([] (call-bytes 1 rpc "hello"))
+  ([stream rpc' payload]
+   (c/request {:stream stream :rpc rpc' :request (c/ascii-bytes payload)})))
+
+;; ── reading a call ──────────────────────────────────────────────────────────
+
+(deftest a-whole-call-arrives-as-one
+  (let [{:keys [state calls]} (srv/feed (srv/incoming) (call-bytes))]
+    (is (= 1 (count calls)))
+    (let [call (first calls)]
+      (is (= 1 (:stream call)))
+      (is (= rpc (:rpc call)))
+      (is (= "hello" (text (:request call)))))
+    (is (empty? (srv/pending state)))))
+
+(deftest a-call-is-not-ready-until-the-client-stops-talking
+  ;; the Message alone is not enough: a handler that ran on it would answer a
+  ;; request it had only partly heard
+  (let [bs (call-bytes)
+        without-close-send (subvec bs 0 (- (count bs) 4))
+        {:keys [state calls]} (srv/feed (srv/incoming) without-close-send)]
+    (is (empty? calls))
+    (is (= #{1} (srv/pending state)))
+    (testing "and is ready once it does"
+      (let [{:keys [calls]} (srv/feed state (subvec bs (- (count bs) 4)))]
+        (is (= 1 (count calls)))
+        (is (= "hello" (text (:request (first calls)))))))))
+
+(deftest calls-on-different-streams-do-not-mix
+  (let [{:keys [calls]} (srv/feed (srv/incoming)
+                                  (into (call-bytes 1 "/a/A" "first")
+                                        (call-bytes 2 "/b/B" "second")))]
+    (is (= [1 2] (mapv :stream calls)))
+    (is (= ["/a/A" "/b/B"] (mapv :rpc calls)))
+    (is (= ["first" "second"] (mapv (comp text :request) calls)))))
+
+(deftest an-empty-request-is-a-request
+  ;; ContactPingRequest has no fields and still arrives as a zero-length
+  ;; Message; nil would be a third state a handler has to know about
+  (let [{:keys [calls]} (srv/feed (srv/incoming) (call-bytes 1 "/contact.Contact/PingNode" ""))]
+    (is (= 1 (count calls)))
+    (is (= [] (:request (first calls))))))
+
+(deftest a-call-split-across-reads-is-still-one-call
+  (let [bs (call-bytes)
+        thirds (partition-all (quot (count bs) 3) bs)
+        result (reduce (fn [{:keys [state calls]} chunk]
+                           (let [r (srv/feed state (vec chunk))]
+                             {:state (:state r) :calls (into calls (:calls r))}))
+                       {:state (srv/incoming) :calls []}
+                       thirds)]
+    (is (= 1 (count (:calls result))))
+    (is (= "hello" (text (:request (first (:calls result))))))))
+
+(deftest metadata-arrives-with-its-call
+  (let [bs (c/request {:stream 1 :rpc rpc :request (c/ascii-bytes "x")
+                       :metadata [9 9 9]})
+        {:keys [calls]} (srv/feed (srv/incoming) bs)]
+    (is (= [9 9 9] (:metadata (first calls))))))
+
+;; ── refusals ────────────────────────────────────────────────────────────────
+;;
+;; this side is reachable by anyone who can open a socket, so every guess is a
+;; decision made on a stranger's behalf
+
+(deftest a-message-before-its-invoke-is-refused
+  (let [orphan (w/encode-packet {:kind :message :stream 1 :message 1 :data [1 2]})]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"message before its invoke"
+                          (srv/feed (srv/incoming) orphan)))))
+
+(deftest two-invokes-on-one-stream-are-refused
+  (let [twice (into (w/encode-packet {:kind :invoke :stream 1 :message 1
+                                      :data (c/ascii-bytes "/a/A")})
+                    (w/encode-packet {:kind :invoke :stream 1 :message 2
+                                      :data (c/ascii-bytes "/b/B")}))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"second invoke"
+                          (srv/feed (srv/incoming) twice)))))
+
+(deftest a-close-send-with-nothing-behind-it-is-refused
+  (let [bare (w/encode-packet {:kind :close-send :stream 1 :message 1 :data []})]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"never invoked"
+                          (srv/feed (srv/incoming) bare)))))
+
+(deftest a-call-that-closes-without-a-request-is-refused
+  (let [bs (into (w/encode-packet {:kind :invoke :stream 1 :message 1
+                                   :data (c/ascii-bytes rpc)})
+                 (w/encode-packet {:kind :close-send :stream 1 :message 2 :data []}))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"without sending a request"
+                          (srv/feed (srv/incoming) bs)))))
+
+(deftest a-cancelled-call-is-forgotten-rather-than-served
+  (let [bs (into (w/encode-packet {:kind :invoke :stream 1 :message 1
+                                   :data (c/ascii-bytes rpc)})
+                 (w/encode-packet {:kind :cancel :stream 1 :message 2 :data []}))
+        {:keys [state calls]} (srv/feed (srv/incoming) bs)]
+    (is (empty? calls))
+    (is (empty? (srv/pending state)))))
+
+;; ── answering ───────────────────────────────────────────────────────────────
+
+(deftest a-reply-reads-back-as-a-reply
+  (let [bs (srv/respond 1 (c/ascii-bytes "pong"))
+        r (c/collect (:packets (w/feed (w/reader) bs)) 1)]
+    (is (= "pong" (text (:message r))))
+    (is (true? (:closed-send? r)))
+    (is (c/complete? r))))
+
+(deftest a-reply-is-message-then-close-send-and-not-close
+  ;; Close is what a *client* sends when it is done with a stream; a server
+  ;; sending one tells the client the stream is dead before it has read the
+  ;; answer
+  (let [packets (:packets (w/feed (w/reader) (srv/respond 1 [1])))]
+    (is (= [:message :close-send] (mapv :kind packets)))
+    (is (= [1 2] (mapv :message packets)))))
+
+(deftest a-large-reply-still-reads-back-as-one-message
+  (let [big (vec (repeat 200000 0x41))
+        packets (:packets (w/feed (w/reader) (srv/respond 1 big)))]
+    (is (= 200000 (count (:data (first packets)))))))
+
+(deftest an-error-reply-carries-its-code
+  (let [bs (srv/respond-error 1 17 "no such rpc")
+        r (c/collect (:packets (w/feed (w/reader) bs)) 1)]
+    (is (nil? (:message r)))
+    (is (= 17 (get-in r [:error :code])))
+    (is (= "no such rpc" (get-in r [:error :message])))
+    (is (c/complete? r))))
+
+(deftest error-codes-survive-past-thirty-two-bits
+  ;; bit-shift-right loses the top half of these on the JVM, and JavaScript's
+  ;; bitwise operators lose it on the other side
+  (doseq [code [0 1 255 256 4294967295 4294967296 1099511627776]]
+    (let [r (c/collect (:packets (w/feed (w/reader) (srv/respond-error 1 code "x"))) 1)]
+      (is (= code (get-in r [:error :code])) (str "code " code)))))
+
+;; ── both halves against each other ──────────────────────────────────────────
+
+(deftest what-the-client-writes-is-what-the-server-reads
+  (doseq [payload ["" "x" "hello storj" (apply str (repeat 5000 "y"))]]
+    (let [{:keys [calls]} (srv/feed (srv/incoming) (call-bytes 1 rpc payload))]
+      (is (= payload (text (:request (first calls)))) (str (count payload) " bytes")))))

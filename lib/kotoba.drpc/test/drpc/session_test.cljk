@@ -1,0 +1,164 @@
+(ns drpc.session-test
+  "Several calls on one connection, and which arriving packet is whose.
+
+  All of this is a value folding over bytes, so none of it needs a socket —
+  which is the point. The interleavings a real connection produces once in a
+  while are produced here every run."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [drpc.client :as c]
+            [drpc.session :as s]
+            [drpc.wire :as w]))
+
+(defn- ascii [str'] (c/ascii-bytes str'))
+
+(defn- reply
+  ([stream text] (reply stream 1 text))
+  ([stream message text]
+   (w/encode-packet {:kind :message :stream stream :message message
+                     :data (ascii text)})))
+
+(defn- err [stream code text]
+  (w/encode-packet {:kind :error :stream stream :message 1
+                    :data (into (conj (vec (repeat 7 0)) code) (ascii text))}))
+
+;; ── allocating streams ──────────────────────────────────────────────────────
+
+(deftest streams-are-handed-out-in-order-and-never-reused
+  ;; two calls sharing a stream would each accept the other's answer, and
+  ;; neither would ever know
+  (let [[st a] (s/begin (s/session) {:rpc "/a/A" :request []})
+        [st b] (s/begin st {:rpc "/b/B" :request []})
+        [st d] (s/begin st {:rpc "/c/C" :request []})]
+    (is (= [1 2 3] [(:stream a) (:stream b) (:stream d)]))
+    (is (= #{1 2 3} (s/pending st)))))
+
+(deftest a-completed-stream-is-not-handed-out-again
+  ;; the reader refuses a regression, so a reused id could never be spoken on
+  (let [[st a] (s/begin (s/session) {:rpc "/a/A" :request []})
+        {st :state} (s/feed st (reply (:stream a) "done"))
+        [_ b] (s/begin st {:rpc "/b/B" :request []})]
+    (is (= 2 (:stream b)))))
+
+(deftest the-request-bytes-are-what-drpc-client-would-write
+  (let [[_ a] (s/begin (s/session) {:rpc "/a/A" :request [1 2]})]
+    (is (= (c/request {:stream 1 :rpc "/a/A" :request [1 2]}) (:bytes a)))))
+
+;; ── dispatch ────────────────────────────────────────────────────────────────
+
+(deftest answers-go-to-the-call-that-asked
+  (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+        [st _] (s/begin st {:rpc "/b/B" :request []})
+        {:keys [state completed]} (s/feed st (into (reply 1 "first") (reply 2 "second")))]
+    (is (= 2 (count completed)))
+    (is (= {1 "first" 2 "second"}
+           (into {} (map (juxt :stream #(apply str (map char (:message (:result %))))))
+                 completed)))
+    (is (empty? (s/pending state)) "and both are forgotten once answered")))
+
+(deftest a-call-still-waiting-stays-waiting
+  (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+        [st _] (s/begin st {:rpc "/b/B" :request []})
+        {:keys [state completed]} (s/feed st (reply 1 "only one"))]
+    (is (= [1] (mapv :stream completed)))
+    (is (= #{2} (s/pending state)))))
+
+(deftest a-packet-split-across-two-feeds-is-still-one-answer
+  ;; whatever a socket read produced, in whatever chunking it arrived
+  (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+        bs (reply 1 "split down the middle")
+        half (quot (count bs) 2)
+        {st :state c1 :completed} (s/feed st (subvec bs 0 half))
+        {st :state c2 :completed} (s/feed st (subvec bs half))]
+    (is (empty? c1) "nothing is complete yet, and nothing is lost")
+    (is (= 1 (count c2)))
+    (is (= "split down the middle" (apply str (map char (:message (:result (first c2)))))))
+    (is (empty? (s/pending st)))))
+
+(deftest an-error-completes-a-call-as-surely-as-an-answer
+  (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+        [st _] (s/begin st {:rpc "/b/B" :request []})
+        {:keys [state completed]} (s/feed st (into (err 1 17 "no such rpc") (reply 2 "fine")))]
+    (is (= 2 (count completed)))
+    (let [by-stream (into {} (map (juxt :stream :result)) completed)]
+      (is (= 17 (get-in by-stream [1 :error :code])))
+      (is (nil? (get-in by-stream [1 :message])))
+      (is (= (ascii "fine") (get-in by-stream [2 :message]))))
+    (is (empty? (s/pending state)))))
+
+(deftest a-packet-for-nobody-is-reported-rather-than-dropped
+  ;; a server does not invent streams, so this cannot happen on a healthy
+  ;; connection — and dropping it silently would turn a protocol violation
+  ;; into a call that hangs
+  (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+        {:keys [state completed]} (s/feed st (into (reply 1 "mine") (reply 2 "nobody's")))]
+    (is (= [1] (mapv :stream completed)))
+    (is (= 1 (count (s/orphaned state))))
+    (is (= 2 (:stream (first (s/orphaned state)))))))
+
+(deftest finished-calls-do-not-accumulate
+  ;; a node's satellite connection is long-lived; keeping every completed call
+  ;; is a leak with a schedule rather than a bug with a stack trace
+  (let [st (reduce (fn [st i]
+                     (let [[st a] (s/begin st {:rpc "/a/A" :request []})]
+                       (:state (s/feed st (reply (:stream a) (str i))))))
+                   (s/session)
+                   (range 200))]
+    (is (empty? (s/pending st)))
+    (is (empty? (:calls st)))
+    (is (= 201 (:next-stream st)) "and the ids kept climbing")))
+
+(deftest ids-may-not-walk-backwards
+  ;; drpc.wire's rule, reached through the session: a peer answering an older
+  ;; stream after a newer one is a peer replaying, and it is refused rather
+  ;; than dispatched
+  (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+        [st _] (s/begin st {:rpc "/b/B" :request []})]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"monotonicity"
+                          (s/feed st (into (reply 2 "newer") (reply 1 "older")))))))
+
+(defn- close-send [stream]
+  (w/encode-packet {:kind :close-send :stream stream :message 1 :data []}))
+
+;; message ids advance within a stream just as stream ids do — a second packet
+;; reusing id 1 is refused by the reader before it ever reaches the session
+
+(deftest what-a-call-was-already-told-is-not-forgotten
+  ;; A packet that does not complete a call, followed by one that does. The
+  ;; session has to fold into the result it already has, not start a fresh one
+  ;; per packet — otherwise the first packet's effect is silently lost, and it
+  ;; is lost whether the two arrive together or in separate reads.
+  ;;
+  ;; Unusual from a healthy server, which answers and closes. It is here
+  ;; because a control that removed the fold left every other test passing:
+  ;; the gap was in the coverage, not in the code.
+  (testing "in one feed"
+    (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+          {:keys [completed]} (s/feed st (into (close-send 1) (reply 1 2 "answer")))
+          r (:result (first completed))]
+      (is (= (ascii "answer") (:message r)))
+      (is (true? (:closed-send? r)) "the CloseSend is still recorded")))
+  (testing "and split across two"
+    (let [[st _] (s/begin (s/session) {:rpc "/a/A" :request []})
+          {st :state c1 :completed} (s/feed st (close-send 1))
+          {c2 :completed} (s/feed st (reply 1 2 "answer"))
+          r (:result (first c2))]
+      (is (empty? c1) "CloseSend alone does not end a call")
+      (is (= (ascii "answer") (:message r)))
+      (is (true? (:closed-send? r))))))
+
+(deftest one-feed-of-everything-is-the-same-as-many
+  (testing "the session holds no state a caller has to sequence for it"
+    (let [start (first (s/begin (first (s/begin (s/session) {:rpc "/a/A" :request []}))
+                                {:rpc "/b/B" :request []}))
+          all   (into (reply 1 "one") (reply 2 "two"))
+          at-once (s/feed start all)
+          byte-at-a-time (reduce (fn [{:keys [state completed]} b]
+                                   (let [r (s/feed state [b])]
+                                     {:state (:state r)
+                                      :completed (into completed (:completed r))}))
+                                 {:state start :completed []}
+                                 all)]
+      (is (= (mapv :stream (:completed at-once))
+             (mapv :stream (:completed byte-at-a-time))))
+      (is (= (mapv :result (:completed at-once))
+             (mapv :result (:completed byte-at-a-time)))))))
