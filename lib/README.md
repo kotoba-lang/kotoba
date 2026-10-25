@@ -114,6 +114,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
 | `org.loraAlliance.lorawan` | `org.loraAlliance.lorawan/src` | `lorawan.bytes`, `lorawan.cmac`, `lorawan.crypt`, `lorawan.frame` (an external specification, publisher loraAlliance.org) |
 | `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
+| `org.threadgroup.thread` | `org.threadgroup.thread/src` | `thread.dispatch`, `thread.frag`, `thread.iphc`, `thread.mesh` (an external specification, publisher threadgroup.org) |
 | `co.huggingface.safetensors` | `co.huggingface.safetensors/src` | `safetensors.bytes`, `safetensors.core`, `safetensors.dtype`, `safetensors.json` (Kotoba project library) |
 | `kotoba.netsync` | `kotoba.netsync/src` | `kami.netsync`, `kami.netsync.fighting`, `kami.netsync.fps`, `kami.relevancy` (Kotoba project library) |
 | `kotoba.mermaid` | `kotoba.mermaid/src` | `kotoba.mermaid`, `mermaid.core` (Kotoba project library) |
