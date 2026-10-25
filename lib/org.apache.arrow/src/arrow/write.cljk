@@ -1,0 +1,312 @@
+(ns arrow.write
+  "Arrow IPC files, written from `columnar.vector` columns.
+
+  The other half of `arrow.source`, and the thing that turns the lake from a
+  place objects land into a place query results can be *materialised*: a scan
+  produces columns, and this turns columns into an object other systems can
+  open.
+
+  ## Columns in, not rows
+
+  The input is `columnar.vector` columns because that is the engine's
+  currency — `plan/scan` already has them, and going through rows would
+  transpose twice for nothing. `columns-of-rows` exists for callers that only
+  have rows.
+
+  ## The layout rules that are silent when broken
+
+  - **A body buffer starts on an 8-byte boundary**, and so does each message.
+    A reader that trusts the declared offsets — including this repo's — will
+    happily read a misaligned file, which is exactly why misalignment survives
+    a round-trip against ourselves and is caught only by handing the bytes to
+    a real Arrow implementation.
+  - **A validity buffer of length 0 means \"no nulls\"**, and is what a writer
+    emits when `null_count` is 0. The buffer entry still exists; it is its
+    length that is zero. Omitting the entry would shift every later buffer.
+  - **An offsets buffer has n+1 entries.** The extra one is the end of the
+    last value, which is what lets a reader slice the final element the same
+    way as every other.
+
+  ## What it writes
+
+  The types `arrow.source` reads, minus the ones it refuses. No dictionary
+  encoding and no body compression: both are refused on the read side, and a
+  writer that emitted what its own reader rejects would be a strange thing to
+  own."
+  (:require [kotoba.bytes :as kbytes] [arrow.build :as bld]
+            [columnar.vector :as cvec]))
+
+(def ^:private metadata-version 4)          ; V5
+(def ^:private magic [0x41 0x52 0x52 0x4F 0x57 0x31])
+
+(def ^:private type-tag
+  {:null 1 :int 2 :floating-point 3 :binary 4 :utf8 5 :bool 6})
+
+(defn- fixed-width [t]
+  (get {:int8 1 :uint8 1 :int16 2 :uint16 2 :int32 4 :uint32 4
+        :int64 8 :uint64 8 :float 4 :double 8} t))
+
+(defn- signed? [t] (contains? #{:int8 :int16 :int32 :int64} t))
+(defn- int-type? [t] (some? (re-find #"^u?int" (name t))))
+
+;; ── the schema half of a field ──────────────────────────────────────────────
+
+(defn- type-table
+  "The `Type` union member for `t`, and its union tag."
+  [b t]
+  (case t
+    (:int8 :int16 :int32 :int64 :uint8 :uint16 :uint32 :uint64)
+    (do (bld/start-object! b 2)
+        (bld/add-scalar! b 0 (* 8 (fixed-width t)) 4 0)
+        (bld/add-scalar! b 1 (if (signed? t) 1 0) 1 0)
+        [(type-tag :int) (bld/end-object! b)])
+
+    (:float :double)
+    (do (bld/start-object! b 1)
+        (bld/add-scalar! b 0 (if (= t :float) 1 2) 2 0)
+        [(type-tag :floating-point) (bld/end-object! b)])
+
+    ;; Bool, Utf8, Binary and Null carry no parameters, so their tables are
+    ;; empty -- which is a real table with an empty vtable, not an absent one.
+    (:bool :utf8 :binary :null)
+    (do (bld/start-object! b 0)
+        [(type-tag (if (= t :bool) :bool (if (= t :utf8) :utf8
+                                             (if (= t :binary) :binary :null))))
+         (bld/end-object! b)])
+
+    (throw (ex-info (str "arrow: writing " (pr-str t) " is not implemented")
+                    {:type :arrow/unsupported-type :logical t}))))
+
+(defn- field-table [b {:keys [name type nullable?]}]
+  (let [name-off (bld/create-string! b name)
+        [tag type-off] (type-table b type)
+        children (bld/create-offset-vector! b [])]
+    (bld/start-object! b 7)
+    (bld/add-offset! b 0 name-off)
+    (bld/add-scalar! b 1 (if (false? nullable?) 0 1) 1 0)
+    (bld/add-scalar! b 2 tag 1 0)
+    (bld/add-offset! b 3 type-off)
+    (bld/add-offset! b 5 children)
+    (bld/end-object! b)))
+
+(defn- schema-table [b fields]
+  (let [offs (mapv #(field-table b %) fields)
+        v (bld/create-offset-vector! b offs)]
+    (bld/start-object! b 4)
+    ;; endianness Little = 0 = the default, so it is omitted rather than written
+    (bld/add-offset! b 1 v)
+    (bld/end-object! b)))
+
+;; ── the buffer half of a batch ──────────────────────────────────────────────
+
+(defn- bitmap
+  "`flags` as an LSB-first bitmap, padded to whole bytes."
+  [flags]
+  (mapv (fn [byte-i]
+          (reduce (fn [acc bit]
+                    (let [i (+ (* 8 byte-i) bit)]
+                      (if (and (< i (count flags)) (nth flags i))
+                        (bit-or acc (bit-shift-left 1 bit))
+                        acc)))
+                  0 (range 8)))
+        (range (quot (+ (count flags) 7) 8))))
+
+(defn- le-bytes [v n]
+  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long v) (* 8 %)) 0xff) (range n))
+     :cljs (if (<= n 4)
+             (mapv #(bit-and (unsigned-bit-shift-right (bit-and v 0xffffffff) (* 8 %)) 0xff)
+                   (range n))
+             (let [m (js/Math.abs v)]
+               (when (> m js/Number.MAX_SAFE_INTEGER)
+                 (throw (ex-info "integer exceeds this runtime's exact range"
+                                 {:type :arrow/precision-unavailable :approx v})))
+               (let [lo0 (mod m 4294967296)
+                     hi0 (js/Math.floor (/ m 4294967296))
+                     [lo hi] (if (neg? v)
+                               (if (zero? lo0)
+                                 [0 (mod (- 4294967296 hi0) 4294967296)]
+                                 [(- 4294967296 lo0) (- 4294967295 hi0)])
+                               [lo0 hi0])]
+                 (into (mapv #(bit-and (unsigned-bit-shift-right lo (* 8 %)) 0xff) (range 4))
+                       (mapv #(bit-and (unsigned-bit-shift-right hi (* 8 %)) 0xff) (range 4))))))))
+
+(defn- float-bytes [v n]
+  #?(:clj (if (= n 4)
+            (le-bytes (bit-and (Float/floatToIntBits (float v)) 0xffffffff) 4)
+            (le-bytes (Double/doubleToLongBits (double v)) 8))
+     :cljs (let [buf (js/ArrayBuffer. n)]
+             (if (= n 4)
+               (aset (js/Float32Array. buf) 0 v)
+               (aset (js/Float64Array. buf) 0 v))
+             (vec (js/Array.from (js/Uint8Array. buf))))))
+
+(defn- utf8-bytes [s]
+  #?(:clj (mapv #(bit-and % 0xff) (kbytes/utf8-bytes ^String s))
+     :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+
+(defn- column-buffers
+  "The buffers for one column, in the order a record batch lists them.
+
+  A null slot contributes a zero (or an empty slice) to the values buffer:
+  the mask is the truth, and what sits under an invalid slot is unconstrained
+  padding rather than data."
+  [t col]
+  (let [n (cvec/count col)
+        valid (:valid col)
+        nulls (cvec/null-count col)
+        validity (if (zero? nulls) [] (bitmap valid))
+        at (fn [i] (cvec/value-at col i))]
+    (case t
+      :null []
+      :bool [validity (bitmap (mapv #(boolean (at %)) (range n)))]
+      (:utf8 :binary)
+      (let [payloads (mapv (fn [i]
+                             (let [v (at i)]
+                               (cond (nil? v) []
+                                     (= t :utf8) (utf8-bytes v)
+                                     :else (vec v))))
+                           (range n))
+            offs (reduce (fn [acc p] (conj acc (+ (peek acc) (count p))))
+                         [0] payloads)]
+        [validity
+         (vec (mapcat #(le-bytes % 4) offs))
+         (vec (apply concat payloads))])
+      ;; fixed width
+      (let [w (fixed-width t)]
+        [validity
+         (vec (mapcat (fn [i]
+                        (let [v (at i)]
+                          (cond (nil? v) (repeat w 0)
+                                (int-type? t) (le-bytes v w)
+                                :else (float-bytes v w))))
+                      (range n)))]))))
+
+(defn- pad8 [bs] (into (vec bs) (repeat (mod (- (count bs)) 8) 0)))
+
+(defn- batch-body
+  "The concatenated, padded body of one batch, plus each buffer's
+  `{:offset :length}` — offsets relative to the body's start."
+  [fields cols]
+  (loop [bufs (mapcat (fn [f c] (column-buffers (:type f) c)) fields cols)
+         body [] metas []]
+    (if-let [b (first bufs)]
+      (recur (rest bufs)
+             (into body (pad8 b))
+             (conj metas {:offset (count body) :length (count b)}))
+      {:body body :buffers metas})))
+
+(defn- record-batch-table [b rows nodes buffers]
+  (let [nodes-v (bld/create-struct-vector!
+                 b nodes 16 8
+                 (fn [bb {:keys [length nulls]}]
+                   (bld/place! bb nulls 8)      ; reverse field order: an
+                   (bld/place! bb length 8)))   ; inline struct writes backwards
+        bufs-v (bld/create-struct-vector!
+                b buffers 16 8
+                (fn [bb {:keys [offset length]}]
+                  (bld/place! bb length 8)
+                  (bld/place! bb offset 8)))]
+    (bld/start-object! b 5)
+    (bld/add-scalar! b 0 rows 8 ::never)
+    (bld/add-offset! b 1 nodes-v)
+    (bld/add-offset! b 2 bufs-v)
+    (bld/end-object! b)))
+
+;; ── the encapsulated message envelope ───────────────────────────────────────
+
+(defn- message
+  "`0xFFFFFFFF`, a padded metadata length, the metadata, then the body.
+
+  The padding is what puts the body on an 8-byte boundary: the prefix is 8
+  bytes, so the metadata length must itself be a multiple of 8."
+  [header-type header-fn body]
+  (let [b (bld/builder)
+        header (header-fn b)
+        _ (bld/start-object! b 5)
+        _ (bld/add-scalar! b 0 metadata-version 2 ::never)
+        _ (bld/add-scalar! b 1 header-type 1 0)
+        _ (bld/add-offset! b 2 header)
+        _ (bld/add-scalar! b 3 (count body) 8 0)
+        msg (bld/end-object! b)
+        flat (bld/finish! b msg)
+        padded (pad8 flat)]
+    {:bytes (vec (concat [0xFF 0xFF 0xFF 0xFF]
+                         (le-bytes (count padded) 4)
+                         padded
+                         body))
+     :meta-len (+ 8 (count padded))
+     :body-len (count body)}))
+
+(defn- schema-message [fields]
+  (message 1 (fn [b] (schema-table b fields)) []))
+
+(defn- batch-message [fields cols]
+  (let [rows (if (seq cols) (cvec/count (first cols)) 0)
+        {:keys [body buffers]} (batch-body fields cols)
+        nodes (mapv (fn [c] {:length (cvec/count c) :nulls (cvec/null-count c)}) cols)]
+    (message 3 (fn [b] (record-batch-table b rows nodes buffers)) body)))
+
+(defn- footer [fields blocks]
+  (let [b (bld/builder)
+        schema (schema-table b fields)
+        dicts (bld/create-struct-vector! b [] 24 8 (fn [_ _]))
+        recs (bld/create-struct-vector!
+              b blocks 24 8
+              (fn [bb {:keys [offset meta-len body-len]}]
+                (bld/place! bb body-len 8)
+                (bld/place! bb 0 4)              ; the padding the struct's
+                (bld/place! bb meta-len 4)       ; 8-byte alignment forces
+                (bld/place! bb offset 8)))]
+    (bld/start-object! b 5)
+    (bld/add-scalar! b 0 metadata-version 2 ::never)
+    (bld/add-offset! b 1 schema)
+    (bld/add-offset! b 2 dicts)
+    (bld/add-offset! b 3 recs)
+    (bld/finish! b (bld/end-object! b))))
+
+;; ── public ──────────────────────────────────────────────────────────────────
+
+(defn fields-of
+  "Schema fields derived from `named-cols` (`[[name column] ...]`).
+
+  Nullability is taken from the data, which is the honest default for a
+  materialised query result: a column with no nulls in it is still declared
+  nullable unless the caller says otherwise, because the next batch may
+  disagree."
+  [named-cols]
+  (mapv (fn [[n c]] {:name n :type (:type c) :nullable? true}) named-cols))
+
+(defn file
+  "Arrow IPC file bytes.
+
+  `{:fields [{:name :type :nullable?} ...] :batches [[col ...] ...]}`, where
+  each batch is a vector of `columnar.vector` columns matching `:fields` in
+  order. Every batch becomes one record batch, which is one prunable chunk to
+  `arrow.source`."
+  [{:keys [fields batches]}]
+  (let [head (vec (concat magic [0 0]))
+        schema (schema-message fields)]
+    (loop [bs batches
+           out (into head (:bytes schema))
+           blocks []]
+      (if-let [cols (first bs)]
+        (let [m (batch-message fields cols)]
+          (recur (rest bs)
+                 (into out (:bytes m))
+                 (conj blocks {:offset (count out)
+                               :meta-len (:meta-len m)
+                               :body-len (:body-len m)})))
+        (let [f (footer fields blocks)]
+          (vec (concat out f (le-bytes (count f) 4) magic)))))))
+
+(defn of-columns
+  "A single-batch file from `[[name column] ...]`."
+  [named-cols]
+  (file {:fields (fields-of named-cols) :batches [(mapv second named-cols)]}))
+
+(defn columns-of-rows
+  "Columns from `rows` (maps) for `named-types` (`[[name type] ...]`).
+
+  For callers holding `plan/scan` output rather than columns."
+  [named-types rows]
+  (mapv (fn [[n t]] [n (cvec/column t (mapv #(get % n) rows))]) named-types))

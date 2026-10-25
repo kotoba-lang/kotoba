@@ -1,0 +1,334 @@
+(ns arrow.reader-test
+  "Decoded against files written by Arrow's own writer.
+
+  Every fixture came out of pyarrow (`test/fixtures/generate.py`), and so did
+  every expectation: `ground-truth.edn` is emitted by the same script, from
+  the files it just wrote. A fixture this repo generated itself would test the
+  decoder against its own misunderstanding of the format, and expectations
+  transcribed by hand would drift from the fixtures the first time either was
+  regenerated."
+  (:require [arrow.decode :as decode]
+            [arrow.flatbuffers :as fb]
+            [arrow.ipc :as ipc]
+            [arrow.source :as asrc]
+            [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
+            [columnar.aggregate :as agg]
+            [columnar.bytes :as bytes]
+            [columnar.plan :as plan]
+            [columnar.source :as csrc]
+            [columnar.vector :as cvec]
+            #?(:clj [clojure.java.io :as io]))
+  #?(:clj (:import [java.nio ByteBuffer])))
+
+(defn read-fixture [name]
+  #?(:clj (with-open [in (io/input-stream (io/file "lib/org.apache.arrow/test/fixtures" name))]
+            (let [out (java.io.ByteArrayOutputStream.)]
+              (io/copy in out)
+              (mapv #(bit-and % 0xff) (.toByteArray out))))
+     ;; Array.from on the Buffer itself, NOT on a Uint8Array over its .buffer:
+     ;; Node pools small allocations, so a Buffer's underlying ArrayBuffer is
+     ;; usually a shared slab and reading it whole yields the pool rather than
+     ;; the file.
+     :cljs (vec (js/Array.from (.readFileSync (js/require "fs")
+                                              (str "lib/org.apache.arrow/test/fixtures/" name))))))
+
+(defn- read-text [name]
+  #?(:clj (slurp (io/file "lib/org.apache.arrow/test/fixtures" name))
+     :cljs (.readFileSync (js/require "fs") (str "lib/org.apache.arrow/test/fixtures/" name) "utf8")))
+
+(def plain (delay (read-fixture "plain.arrow")))
+(def types (delay (read-fixture "types.arrow")))
+(def compressed (delay (read-fixture "compressed.arrow")))
+(def lz4ed (delay (read-fixture "lz4.arrow")))
+(def truth (delay (edn/read-string (read-text "ground-truth.edn"))))
+
+(defn- expected [file k] (get-in @truth [file k]))
+
+;; On ClojureScript every int64 in these fixtures past 2^53 is refused rather
+;; than rounded, so the columns that carry one are asserted separately.
+(def ^:private exact-int64? #?(:clj true :cljs false))
+
+;; ── the footer ──────────────────────────────────────────────────────────────
+
+(deftest footer-parses-a-real-file
+  (let [m (asrc/metadata @plain)]
+    (is (= (expected "plain.arrow" "columns") (mapv :name (:fields (:schema m)))))
+    (is (= (expected "plain.arrow" "batches") (count (:batches m))))
+    (testing "every block points inside the file"
+      (is (every? (fn [{:keys [offset meta-len body-len]}]
+                    (and (pos? offset) (pos? meta-len)
+                         (<= (+ offset meta-len body-len) (count @plain))))
+                  (:batches m))))
+    (testing "types come back as the schema declared them"
+      (is (= [:int64 :utf8 :utf8 :int64]
+             (mapv #(:type (:logical %)) (:fields (:schema m))))))))
+
+(deftest a-truncated-or-foreign-file-is-refused
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (asrc/metadata (vec (repeat 16 0)))))
+  (testing "trailing magic alone is not enough"
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (asrc/metadata (into (vec (repeat 8 0)) ipc/magic))))))
+
+;; ── values ──────────────────────────────────────────────────────────────────
+
+(defn- whole-column
+  "Every value of `column`, concatenated across batches — the file's column as
+  the writer handed it to pyarrow."
+  [s column]
+  (vec (mapcat (fn [c]
+                 (let [col (csrc/-read-column s c column)]
+                   (map #(cvec/value-at col %) (range (cvec/count col)))))
+               (range (csrc/-chunk-count s)))))
+
+(deftest columns-decode-to-the-values-that-were-written
+  (let [s (asrc/open @plain)]
+    (is (= (expected "plain.arrow" "columns") (csrc/-schema s)))
+    (is (= (get (expected "plain.arrow" "values") "price") (whole-column s "price")))
+    (is (= (get (expected "plain.arrow" "values") "region") (whole-column s "region")))
+    (testing "a nullable column keeps null distinct from a value"
+      (is (= (get (expected "plain.arrow" "values") "note") (whole-column s "note"))))
+    (when exact-int64?
+      (testing "a value past 2^53 survives exactly"
+        (is (= (get (expected "plain.arrow" "values") "big") (whole-column s "big")))))))
+
+(deftest projected-column-buffers-retain-native-backing
+  (let [backing #?(:clj (let [b (ByteBuffer/allocateDirect (count @plain))]
+                          (.put b (byte-array (map unchecked-byte @plain)))
+                          (.flip b))
+                   :cljs (js/Uint8Array. (clj->js @plain)))
+        s (asrc/open backing)
+        {:keys [rows copy-boundary buffers]}
+        (asrc/column-buffer-views s 0 "price")]
+    (is (= 3 rows))
+    (is (= :borrowed-source copy-boundary))
+    (is (= [:validity :values] (mapv :role buffers)))
+    (is (every? #(satisfies? bytes/IByteView (:view %)) buffers))
+    (is (= (mapv :length buffers)
+           (mapv #(bytes/view-size (:view %)) buffers)))
+    (let [native (bytes/native-view (:view (second buffers)))]
+      #?(:clj (do (is (.isDirect ^ByteBuffer native))
+                  (is (.isReadOnly ^ByteBuffer native)))
+         :cljs (is (instance? js/Uint8Array native))))))
+
+(deftest compressed-buffer-view-refuses-before-body-fetch
+  (let [{:keys [source log]} (bytes/counting (bytes/of-vector @compressed))
+        s (asrc/open source)
+        _ (csrc/-chunk-rows s 0)
+        before (:bytes @log)
+        e (try (asrc/column-buffer-views s 0 "price") nil
+               (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+    (is (= :arrow/buffer-view-requires-decompression (:type e)))
+    (is (= :decompression (:copy-boundary e)))
+    (is (= before (:bytes @log)))))
+
+(deftest a-value-past-2-to-the-53-is-refused-rather-than-rounded
+  ;; The claim `arrow.flatbuffers/i64` makes: exact or nothing, never a
+  ;; plausible wrong number. On the JVM that means exact; under ClojureScript
+  ;; it means a throw, and the wrong behaviour -- silently returning
+  ;; 4611686018427387904 -- would pass any test that only checked the JVM.
+  (let [s (asrc/open @plain)]
+    #?(:clj (is (= 4611686018427387905 (first (whole-column s "big"))))
+       :cljs (is (thrown? :default (whole-column s "big"))))))
+
+(deftest the-physical-layouts-decode
+  (let [s (asrc/open @types)
+        vals (expected "types.arrow" "values")]
+    (is (= (expected "types.arrow" "columns") (csrc/-schema s)))
+    (testing "a bit-packed boolean"
+      (is (= (get vals "flag") (whole-column s "flag"))))
+    (testing "a float64"
+      (is (= (get vals "ratio") (whole-column s "ratio"))))
+    (testing "a float32, which is a different four-byte reader"
+      (is (= (get vals "small") (whole-column s "small"))))
+    (testing "a null-free string"
+      (is (= (get vals "label") (whole-column s "label"))))
+    (testing "a column that is entirely null"
+      (is (= (get vals "absent") (whole-column s "absent"))))
+    (testing "int32 and int8, so every fixed-width stride is exercised"
+      (is (= (get vals "count32") (whole-column s "count32")))
+      (is (= (get vals "tiny") (whole-column s "tiny"))))
+    (testing "negative int64 — the two's-complement path"
+      ;; A decoder that reads the high word as unsigned returns a number near
+      ;; 2^64 for each of these and throws nothing.
+      (is (= (get vals "delta") (whole-column s "delta"))))))
+
+;; ── statistics: what Arrow records, and what it does not ────────────────────
+
+(deftest arrow-reports-rows-and-nulls-and-makes-no-claim-about-bounds
+  (let [s (asrc/open @plain)]
+    (is (= (expected "plain.arrow" "rows")
+           (mapv #(csrc/-chunk-rows s %) (range (csrc/-chunk-count s)))))
+    (testing "null counts come from the field nodes"
+      (is (= 7 (reduce + (map #(:nulls (csrc/-chunk-stats s % "note"))
+                              (range (csrc/-chunk-count s)))))))
+    (testing "and there are no bounds, because the format does not record them"
+      (is (every? (fn [c]
+                    (let [st (csrc/-chunk-stats s c "price")]
+                      (and (contains? st :rows)
+                           (not (contains? st :min))
+                           (not (contains? st :max)))))
+                  (range (csrc/-chunk-count s)))
+          "inventing :min/:max here would make columnar.stats prune on a
+           claim the file never made"))))
+
+(deftest absent-bounds-forbid-pruning-rather-than-permitting-it
+  ;; The single most dangerous way to get this wrong, and the reason
+  ;; columnar.stats states it as rule 1: a source with no bounds must cause
+  ;; every chunk to be READ. Rows vanishing from answers is a silent failure.
+  (let [{:keys [source reads]} (csrc/counting (asrc/open @plain))
+        {:keys [rows chunks-read chunks-skipped]}
+        (plan/scan source {:columns ["price"] :predicates [[:= "price" 120]]})]
+    (is (= 1 (count rows)) "the predicate still selects exactly one row")
+    (is (= 3 chunks-read))
+    (is (= 0 chunks-skipped)
+        "no chunk may be skipped on a file that recorded no min/max")
+    (is (= #{0 1 2} (:chunks (csrc/read-counts {:reads reads})))
+        "and all three were actually read -- the same query over Parquet reads one")))
+
+(deftest an-all-null-chunk-is-the-one-thing-arrow-can-prune
+  ;; null_count == length is a proof, and it is the only one Arrow's metadata
+  ;; supplies. Pruning on it is not a special case in the engine: columnar.stats
+  ;; already derives it from :rows and :nulls.
+  (let [s (asrc/open @types)
+        st (csrc/-chunk-stats s 0 "absent")]
+    (is (= (:rows st) (:nulls st)))
+    (let [{:keys [chunks-read chunks-skipped]}
+          (plan/scan s {:columns ["absent"] :predicates [[:= "absent" 1]]})]
+      (is (= 0 chunks-read))
+      (is (= 1 chunks-skipped)))))
+
+;; ── aggregates: the cheap side is smaller, and visibly so ───────────────────
+
+(deftest count-comes-out-of-the-metadata
+  (let [{:keys [source log]} (bytes/counting (bytes/of-vector @plain))
+        s (asrc/open source)
+        after-open (:bytes @log)]
+    (is (= {:value 9 :from :statistics :read 0}
+           (agg/aggregate s {:agg :count})))
+    (testing "count-non-null too, from the field nodes"
+      (is (= {:value 2 :from :statistics :read 0}
+             (agg/aggregate s {:agg :count-non-null :column "note"}))))
+    (testing "and neither touched a buffer"
+      ;; Batch metadata is read -- that is the point, it is small and it is
+      ;; enough -- but no column buffer was fetched.
+      (is (< (- (:bytes @log) after-open) (count @plain))))))
+
+(deftest max-falls-through-to-a-scan-because-arrow-records-no-bounds
+  ;; Parquet answers this from the footer with `:read 0`. Arrow cannot, and
+  ;; the difference shows up in the reported provenance rather than in a
+  ;; wrong answer or a changed protocol.
+  (let [s (asrc/open @plain)
+        r (agg/aggregate s {:agg :max :column "price"})]
+    (is (= 230 (:value r)))
+    (is (= :scan (:from r)))
+    (is (= 3 (:read r)))))
+
+;; ── refusals name what they refuse ──────────────────────────────────────────
+
+(deftest zstd-buffers-decode-and-agree-with-the-uncompressed-file
+  ;; Arrow compresses per BUFFER, each with its own int64 length prefix, and a
+  ;; prefix of -1 means that buffer was stored raw because compressing would
+  ;; have made it bigger. Small buffers -- a one-byte validity bitmap, a short
+  ;; offsets buffer -- routinely take that path, so a decoder that always
+  ;; decompresses fails on exactly the files that compress well.
+  (let [z (asrc/open @compressed) p (asrc/open @plain)]
+    (doseq [col ["price" "region" "note"] chunk [0 1 2]]
+      (is (= (:values (csrc/-read-column p chunk col))
+             (:values (csrc/-read-column z chunk col)))
+          (str col " chunk " chunk))))
+  (testing "and count still comes out of the metadata, as it did when the
+            buffers were refused"
+    (is (= {:value 9 :from :statistics :read 0}
+           (agg/aggregate (asrc/open @compressed) {:agg :count})))))
+
+(deftest metadata-survives-buffers-this-reader-cannot-decode
+  ;; The Arrow analogue of "statistics work on files this reader cannot
+  ;; decode". Compression is a property of the buffers; batch lengths and null
+  ;; counts live in the metadata and are never compressed.
+  (let [s (asrc/open @lz4ed)]
+    (is (= (expected "lz4.arrow" "columns") (csrc/-schema s)))
+    (is (= {:value 9 :from :statistics :read 0} (agg/aggregate s {:agg :count})))
+    (is (= {:value 2 :from :statistics :read 0}
+           (agg/aggregate s {:agg :count-non-null :column "note"})))
+    (testing "and the refusal names the codec"
+      (let [e (try (csrc/-read-column s 0 "price") nil
+                   (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+        (is (= :arrow/unsupported-compression (:type e)))
+        (is (= :lz4-frame (:compression e)))
+        (is (= [:zstd] (:decodable e))
+            "the refusal names what IS decodable, so it stays accurate as
+             codecs land")))))
+
+(deftest a-refusal-costs-no-download
+  (let [{:keys [source log]} (bytes/counting (bytes/of-vector @lz4ed))
+        s (asrc/open source)
+        ;; Warm the batch metadata first. Naming the codec REQUIRES reading it
+        ;; -- that is where the compression is declared -- so the claim is
+        ;; that no BUFFER is fetched, and isolating it is what makes the
+        ;; assertion mean that rather than "nothing happened".
+        _ (csrc/-chunk-rows s 0)
+        before (:bytes @log)]
+    (try (csrc/-read-column s 0 "price") (catch #?(:clj Exception :cljs :default) _ nil))
+    (is (= before (:bytes @log))
+        "check-readable! runs before any buffer range is fetched")))
+
+(deftest an-unknown-column-is-refused-by-name
+  (let [s (asrc/open @plain)
+        e (try (csrc/-read-column s 0 "nope") nil
+               (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+    (is (= :arrow/unknown-column (:type e)))
+    (is (= ["price" "region" "note" "big"] (:columns e)))))
+
+;; ── the projection property the format exists for ───────────────────────────
+
+(deftest reading-one-column-does-not-fetch-another
+  (let [{:keys [source log]} (bytes/counting (bytes/of-vector @plain))
+        s (asrc/open source)
+        _ (csrc/-chunk-rows s 0)          ; batch metadata, read once either way
+        before (:bytes @log)
+        _ (csrc/-read-column s 0 "price")
+        price-bytes (- (:bytes @log) before)
+        body-len (:body-len (first (:batches (asrc/metadata @plain))))]
+    ;; Three rows of int64 plus a validity buffer. If the reader were fetching
+    ;; the batch body whole, this would be `body-len` -- all four columns.
+    (is (pos? price-bytes))
+    (is (< price-bytes (quot body-len 2))
+        "one column's buffers, at their own offsets, of their own lengths")))
+
+;; ── the flatbuffers grammar, against hand-built buffers ─────────────────────
+
+(deftest a-vtable-offset-is-subtracted-not-added
+  ;; The one thing that is easy to get backwards, and it survives every buffer
+  ;; where the writer happened to emit the vtable first. Built here rather than
+  ;; taken from a fixture because pyarrow does not emit a shared backwards
+  ;; vtable on demand.
+  (let [;; table at 8 whose vtable sits AFTER it at 20, so the soffset is
+        ;; negative and a decoder that adds lands outside the buffer.
+        bs (vec (concat [8 0 0 0]                ; root uoffset -> 8
+                        [0 0 0 0]                ; padding
+                        [244 255 255 255]        ; soffset = -12 -> vtable at 20
+                        [42 0 0 0]               ; field 0 = 42
+                        [0 0 0 0]
+                        [6 0 8 0 4 0 0 0]))      ; vtable: size 6, table 8, f0 @4
+        t (fb/root bs)]
+    (is (= 8 t))
+    (is (= 42 (fb/scalar fb/u32 bs t 0 0)))))
+
+(deftest an-absent-field-yields-its-default-not-zero
+  (let [bs (vec (concat [4 0 0 0]
+                        [4 0 0 0]        ; soffset = 4 -> vtable at 0
+                        [4 0 8 0]))      ; vtable size 4: no slots at all
+        t (fb/root bs)]
+    (is (nil? (fb/field-offset bs t 0)))
+    (is (= :default (fb/scalar fb/u32 bs t 0 :default)))))
+
+(deftest an-empty-validity-buffer-means-all-valid
+  ;; Not all-null. Reading it the other way produces a column of nulls from a
+  ;; file with no nulls in it, and every aggregate over it still returns a
+  ;; number.
+  (is (= [true true true] (decode/valid-mask [] 3)))
+  (testing "and a present bitmap is read least-significant-bit first"
+    (is (= [true false true false false false false false]
+           (decode/valid-mask [2r00000101] 8)))))
