@@ -1,0 +1,170 @@
+(ns kotoba.torrent-app.download
+  (:require [json.data-json :as json]
+            [clojure.java.io :as io])
+  (:import (java.io ByteArrayOutputStream DataInputStream DataOutputStream RandomAccessFile)
+           (java.net HttpURLConnection Socket URL)
+           (java.nio.file Files StandardCopyOption)
+           (java.security MessageDigest)
+           (java.util Arrays)))
+
+(defn emit! [m] (println (json/write-str m)) (flush))
+(defn bytes= [a b] (Arrays/equals ^bytes a ^bytes b))
+(defn sha1 [^bytes bs] (.digest (MessageDigest/getInstance "SHA-1") bs))
+
+(defn parse-bencode [^bytes data]
+  (letfn [(parse-at [i]
+            (let [c (bit-and (aget data i) 255)]
+              (cond
+                (= c 105) (let [end (loop [p (inc i)] (if (= 101 (bit-and (aget data p) 255)) p (recur (inc p))))]
+                              [(Long/parseLong (String. data (inc i) (- end i 1) "US-ASCII")) (inc end)])
+                (= c 108) (loop [p (inc i) out []]
+                            (if (= 101 (bit-and (aget data p) 255)) [out (inc p)]
+                                (let [[v n] (parse-at p)] (recur n (conj out v)))))
+                (= c 100) (loop [p (inc i) out {} spans {}]
+                            (if (= 101 (bit-and (aget data p) 255))
+                              [(with-meta out {:spans spans}) (inc p)]
+                              (let [[k kp] (parse-at p)
+                                    key (String. ^bytes k "UTF-8")
+                                    start kp
+                                    [v n] (parse-at kp)]
+                                (recur n (assoc out key v) (assoc spans key [start n])))))
+                (<= 48 c 57) (let [colon (loop [p i] (if (= 58 (bit-and (aget data p) 255)) p (recur (inc p))))
+                                     len (Integer/parseInt (String. data i (- colon i) "US-ASCII"))
+                                     start (inc colon) end (+ start len)]
+                                 [(Arrays/copyOfRange data start end) end])
+                :else (throw (ex-info "invalid bencode" {:offset i})))))]
+    (let [[value end] (parse-at 0)]
+      (when-not (= end (alength data)) (throw (ex-info "trailing bencode" {:offset end})))
+      value)))
+
+(defn text [x] (String. ^bytes x "UTF-8"))
+(defn pct [^bytes bs] (apply str (map #(format "%%%02X" (bit-and (int %) 255)) bs)))
+(defn peer-id [] (.getBytes (str "-KT0001-" (format "%012d" (mod (System/currentTimeMillis) 1000000000000))) "US-ASCII"))
+
+(defn tracker-peers [announce info-hash peer-id total]
+  (let [sep (if (.contains announce "?") "&" "?")
+        query (str announce sep "info_hash=" (pct info-hash) "&peer_id=" (pct peer-id)
+                   "&port=6881&uploaded=0&downloaded=0&left=" total "&compact=1&event=started")
+        conn ^HttpURLConnection (.openConnection (URL. query))]
+    (.setConnectTimeout conn 10000) (.setReadTimeout conn 15000)
+    (.setRequestProperty conn "User-Agent" "KotobaTorrent/0.1")
+    (when-not (= 200 (.getResponseCode conn)) (throw (ex-info "tracker HTTP failure" {:status (.getResponseCode conn)})))
+    (let [response (parse-bencode (.readAllBytes (.getInputStream conn)))
+          peers ^bytes (get response "peers")]
+      (when-not (and peers (zero? (mod (alength peers) 6))) (throw (ex-info "tracker returned no compact peers" {})))
+      (mapv (fn [i]
+              [(str (bit-and (aget peers i) 255) "." (bit-and (aget peers (+ i 1)) 255) "."
+                    (bit-and (aget peers (+ i 2)) 255) "." (bit-and (aget peers (+ i 3)) 255))
+               (+ (* 256 (bit-and (aget peers (+ i 4)) 255)) (bit-and (aget peers (+ i 5)) 255))])
+            (range 0 (alength peers) 6)))))
+
+(defn write-i32! [^DataOutputStream out n] (.writeInt out (int n)))
+(defn read-message [^DataInputStream in]
+  (let [n (.readInt in)]
+    (if (zero? n) {:id -1 :payload (byte-array 0)}
+        (let [id (.readUnsignedByte in) payload (byte-array (dec n))]
+          (.readFully in payload) {:id id :payload payload}))))
+
+(defn connect-peer [[host port] info-hash pid]
+  (let [s (Socket.)]
+    (.connect s (java.net.InetSocketAddress. host (int port)) 7000) (.setSoTimeout s 15000)
+    (let [in (DataInputStream. (.getInputStream s)) out (DataOutputStream. (.getOutputStream s))
+          proto (.getBytes "BitTorrent protocol" "US-ASCII")]
+      (.writeByte out 19) (.write out proto) (.write out (byte-array 8)) (.write out info-hash) (.write out pid) (.flush out)
+      (when-not (= 19 (.readUnsignedByte in)) (throw (ex-info "bad peer handshake" {})))
+      (let [p (byte-array 19) reserved (byte-array 8) remote-hash (byte-array 20) remote-id (byte-array 20)]
+        (.readFully in p) (.readFully in reserved) (.readFully in remote-hash) (.readFully in remote-id)
+        (when-not (and (= "BitTorrent protocol" (String. p "US-ASCII")) (bytes= info-hash remote-hash))
+          (throw (ex-info "peer info hash mismatch" {}))))
+      (write-i32! out 1) (.writeByte out 2) (.flush out)
+      (loop [fuel 128 bitfield nil]
+        (when (zero? fuel) (throw (ex-info "peer did not unchoke" {})))
+        (let [{:keys [id payload]} (read-message in)]
+          (cond (= id 1) {:socket s :in in :out out :bitfield bitfield}
+                (= id 5) (recur (dec fuel) payload)
+                :else (recur (dec fuel) bitfield)))))))
+
+(defn has-piece? [^bytes bitfield piece]
+  (or (nil? bitfield)
+      (let [i (quot piece 8)]
+        (and (< i (alength bitfield))
+             (not (zero? (bit-and (bit-and (aget bitfield i) 255) (bit-shift-left 1 (- 7 (mod piece 8))))))))))
+
+(defn request-block! [{:keys [^DataInputStream in ^DataOutputStream out]} piece begin length]
+  (write-i32! out 13) (.writeByte out 6) (write-i32! out piece) (write-i32! out begin) (write-i32! out length) (.flush out)
+  (loop [fuel 256]
+    (when (zero? fuel) (throw (ex-info "piece response timeout" {})))
+    (let [{:keys [id ^bytes payload]} (read-message in)]
+      (cond
+        (= id 0) (throw (ex-info "peer choked" {}))
+        (= id 7) (let [pi (java.nio.ByteBuffer/wrap payload)
+                       got-piece (.getInt pi) got-begin (.getInt pi)
+                       block (byte-array (- (alength payload) 8))]
+                   (.get pi block)
+                   (if (and (= piece got-piece) (= begin got-begin)) block (recur (dec fuel))))
+        :else (recur (dec fuel))))))
+
+(defn download-piece! [peer piece piece-length]
+  (let [buf (ByteArrayOutputStream.)]
+    (loop [begin 0]
+      (if (>= begin piece-length) (.toByteArray buf)
+          (let [n (min 16384 (- piece-length begin)) block (request-block! peer piece begin n)]
+            (when-not (= n (alength block)) (throw (ex-info "short block" {})))
+            (.write buf block) (recur (+ begin n)))))))
+
+(defn attempt-piece [active address info-hash pid hashes piece plen]
+  (let [p (atom active)]
+    (try
+      (when-not @p (reset! p (connect-peer address info-hash pid)))
+      (if-not (has-piece? (:bitfield @p) piece)
+        {:skip true :peer @p}
+        (let [data (download-piece! @p piece plen)
+              expected (Arrays/copyOfRange hashes (* piece 20) (+ (* piece 20) 20))]
+          (if (bytes= expected (sha1 data))
+            {:data data :peer @p}
+            (throw (ex-info "piece hash mismatch" {:piece piece})))))
+      (catch Exception e
+        (when @p (try (.close ^Socket (:socket @p)) (catch Exception _)))
+        {:error e}))))
+
+(defn download! [torrent-path output-dir]
+  (let [raw (Files/readAllBytes (.toPath (io/file torrent-path)))
+        root (parse-bencode raw) info (get root "info")
+        [is ie] (get (:spans (clojure.core/meta root)) "info")
+        info-hash (sha1 (Arrays/copyOfRange raw is ie))
+        name (text (get info "name")) total (long (get info "length"))
+        piece-size (long (get info "piece length")) hashes ^bytes (get info "pieces")
+        count-pieces (quot (alength hashes) 20) announce (text (get root "announce")) pid (peer-id)
+        peers (tracker-peers announce info-hash pid total)
+        target (io/file output-dir name) part (io/file output-dir (str name ".part"))]
+    (.mkdirs (.getParentFile target))
+    (emit! {:event "torrent/start" :name name :bytes total :pieces count-pieces :peers (count peers)})
+    (with-open [raf (RandomAccessFile. part "rw")]
+      (.setLength raf total)
+      (loop [piece 0 peer-list (cycle peers) active nil failures 0]
+        (when (< piece count-pieces)
+          (let [plen (int (min piece-size (- total (* piece piece-size))))
+                result (attempt-piece active (first peer-list) info-hash pid hashes piece plen)]
+            (cond
+              (:data result)
+              (do (.seek raf (* piece piece-size)) (.write raf ^bytes (:data result))
+                  (emit! {:event "torrent/progress" :piece (inc piece) :pieces count-pieces
+                          :bytes (min total (* (inc piece) piece-size)) :total total})
+                  (recur (inc piece) peer-list (:peer result) 0))
+              (:skip result)
+              (do (.close ^Socket (:socket (:peer result)))
+                  (recur piece (rest peer-list) nil (inc failures)))
+              :else
+              (do (when (> failures (* 4 (max 1 (count peers)))) (throw (:error result)))
+                  (emit! {:event "torrent/peer-failed" :piece piece
+                          :message (.getMessage ^Exception (:error result))})
+                  (recur piece (rest peer-list) nil (inc failures))))))))
+    (Files/move (.toPath part) (.toPath target)
+                (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE StandardCopyOption/REPLACE_EXISTING]))
+    (emit! {:event "torrent/complete" :path (.getPath target) :bytes total})
+    (.getPath target)))
+
+(defn -main [& [torrent output]]
+  (when-not (and torrent output) (throw (ex-info "usage: torrent output-directory" {})))
+  (try (download! torrent output)
+       (catch Exception e (emit! {:event "torrent/error" :message (.getMessage e)}) (System/exit 1))))

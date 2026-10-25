@@ -1,0 +1,189 @@
+(ns gateway.request
+  "Parsing an IPFS HTTP Gateway request (specs.ipfs.tech/http-gateways) — the
+  path form, the subdomain form, and the query parameters that change what the
+  response *is* rather than how it looks.
+
+  Two URL shapes address the same content and they are not interchangeable:
+
+      /ipfs/{cid}/path            path gateway
+      {cid}.ipfs.{host}/path      subdomain gateway
+
+  The subdomain form exists for **origin isolation**: two different CIDs served
+  from one host share a browser origin, so one page's script can read the
+  other's storage and cookies. Moving the CID into the authority makes the
+  browser treat them as different sites. A gateway that serves only the path
+  form is not merely less convenient — it cannot safely host untrusted content.
+
+  ## The case trap
+
+  DNS labels are case-insensitive. A CIDv0 (`Qm…`) and a base58 CIDv1 are
+  **case-sensitive**, so they cannot be a subdomain label at all: `QmFoo.ipfs.…`
+  and `qmfoo.ipfs.…` are the same host to DNS and different CIDs to IPFS. The
+  spec's answer is a redirect to the base32 form, which is lowercase by
+  construction. A gateway that skips the redirect appears to work — until a
+  resolver or proxy normalizes the case and the request starts resolving to a
+  different CID, or to nothing.
+
+  `parse` reports this as `:redirect` rather than an error, because it *is* the
+  correct handling and the caller should emit a 301."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [kotoba.lang.text :as str]))
+
+(def ^:const namespace-ipfs "ipfs")
+(def ^:const namespace-ipns "ipns")
+
+(def response-formats
+  "`?format=` and its `Accept` equivalent (specs.ipfs.tech/http-gateways/trustless-gateway).
+
+  These change what the body *is*, not how it is presented:
+
+  - `raw` — the single block's bytes, verifiable by hashing them
+  - `car` — a CAR stream of the blocks, verifiable the same way
+  - `dag-json` / `dag-cbor` — the IPLD node, re-encoded
+
+  Absent, the gateway *deserializes*: it walks UnixFS and returns a file, which
+  the client cannot verify. That difference is the whole meaning of \"trustless
+  gateway\", and defaulting to the deserialized form is right for browsers and
+  wrong for anything that intends to check what it got."
+  {"raw" "application/vnd.ipld.raw"
+   "car" "application/vnd.ipld.car"
+   "dag-json" "application/vnd.ipld.dag-json"
+   "dag-cbor" "application/vnd.ipld.dag-cbor"
+   "json" "application/json"
+   "cbor" "application/cbor"
+   "tar" "application/x-tar"
+   "ipns-record" "application/vnd.ipfs.ipns-record"})
+
+(def format-by-content-type
+  (into {} (map (fn [[k v]] [v k])) response-formats))
+
+;; ── CID shape (only what routing needs to know) ───────────────────────────
+
+(defn cidv0?
+  "A base58 CIDv0 — `Qm…`, 46 characters. Case-sensitive, so it cannot be a
+  DNS label."
+  [s]
+  (boolean (and s (= 46 (count s)) (str/starts-with? s "Qm"))))
+
+(defn base32-cidv1?
+  "A base32 CIDv1: multibase prefix `b`, lowercase alphanumerics. Lowercase by
+  construction, which is exactly why it is the subdomain-safe form."
+  [s]
+  (boolean (and s (re-matches #"b[a-z2-7]{58,}" s))))
+
+(defn subdomain-safe?
+  "Can this identifier be a DNS label? A CIDv0 or any mixed-case identifier
+  cannot, because DNS is case-insensitive."
+  [s]
+  (boolean (and s (= s (str/lower s)) (not (cidv0? s)))))
+
+;; ── query ─────────────────────────────────────────────────────────────────
+
+(defn- decode-component [s]
+  #?(:clj (form-urlencoded/form-decode (str s))
+     :cljs (js/decodeURIComponent (str s))))
+
+(defn parse-query
+  "`a=1&b=2` → `{\"a\" \"1\" \"b\" \"2\"}`. A repeated key keeps the **first**
+  value: the alternative — last wins — lets a proxy or a crafted link append a
+  second `?format=` and change what the gateway returns."
+  [q]
+  (reduce (fn [m pair]
+            (let [[k v] (str/split pair #"=" 2)]
+              (if (or (str/blank? k) (contains? m (decode-component k)))
+                m
+                (assoc m (decode-component k) (decode-component (or v ""))))))
+          {}
+          (remove str/blank? (str/split (or q "") #"&"))))
+
+(defn requested-format
+  "The response format, from `?format=` or `Accept`, or nil for deserialized.
+
+  `?format=` wins over `Accept` (spec, trustless-gateway §Request): the query
+  parameter is explicit and survives being pasted into a browser, while
+  `Accept` is set by whatever library made the request."
+  [query accept]
+  (or (get response-formats (get query "format"))
+      (some (fn [t] (when (contains? format-by-content-type t) t))
+            (map str/trim (str/split (or accept "") #",")))))
+
+;; ── the request ───────────────────────────────────────────────────────────
+
+(defn- split-path
+  "`/ipfs/bafy…/a/b` → `[\"ipfs\" \"bafy…\" \"a/b\"]`."
+  [path]
+  (let [segs (remove str/blank? (str/split (or path "") #"/"))]
+    (when (>= (count segs) 2)
+      [(first segs) (second segs) (str/join "/" (drop 2 segs))])))
+
+(defn- subdomain-parts
+  "`bafy….ipfs.example.net` → `[\"bafy…\" \"ipfs\" \"example.net\"]`, or nil."
+  [host]
+  (let [labels (str/split (str/lower (or host "")) #"\.")]
+    (when (>= (count labels) 3)
+      (let [ns' (second labels)]
+        (when (#{namespace-ipfs namespace-ipns} ns')
+          [(first labels) ns' (str/join "." (drop 2 labels))])))))
+
+(defn parse
+  "Parse a gateway request.
+
+  Returns one of:
+
+  - `{:kind :content :namespace \"ipfs\"|\"ipns\" :id … :path … :format … :style :path|:subdomain}`
+  - `{:kind :redirect :status 301 :location …}` — the CIDv0/subdomain case
+  - `{:kind :not-gateway}` — a URL this gateway does not own, so the caller can
+    fall through to its own routes rather than 404
+  - `{:kind :error :status … :reason …}`
+
+  `host` is required for subdomain parsing. The **original case** of the path
+  is preserved because a CIDv0 in the path is legitimately case-sensitive; only
+  the host is lower-cased, since DNS already did."
+  [{:keys [host path query accept]}]
+  (let [q (if (map? query) query (parse-query query))
+        fmt (requested-format q accept)]
+    (if-let [[id ns' base] (subdomain-parts host)]
+      ;; Subdomain form. The identifier is already lower-cased by DNS, so a
+      ;; CIDv0 arriving here has *already* been damaged — there is nothing to
+      ;; recover, and saying so is better than resolving something else.
+      (if (and (= ns' namespace-ipfs) (not (base32-cidv1? id)))
+        {:kind :error :status 400
+         :reason :non-subdomain-safe-cid
+         :detail (str "'" id "' is not a base32 CIDv1; DNS lower-cased the label "
+                      "and a case-sensitive CID cannot survive that")}
+        {:kind :content :namespace ns' :id id
+         :path (str/replace (or path "") #"^/" "")
+         :format fmt :style :subdomain :gateway-host base})
+      (if-let [[ns' id rest-path] (split-path path)]
+        (if-not (#{namespace-ipfs namespace-ipns} ns')
+          {:kind :not-gateway}
+          (cond
+            (str/blank? id)
+            {:kind :error :status 400 :reason :missing-identifier}
+
+            ;; A CIDv0 in the *path* is fine; it only breaks as a DNS label.
+            ;; The redirect is what a subdomain gateway owes it.
+            :else
+            {:kind :content :namespace ns' :id id :path rest-path
+             :format fmt :style :path}))
+        {:kind :not-gateway}))))
+
+(defn subdomain-redirect
+  "The 301 a subdomain gateway owes a path-form request (spec,
+  subdomain-gateway §Request). Returns nil when the identifier cannot be a DNS
+  label — a CIDv0 has to be converted to base32 first, and this namespace does
+  not carry a CID codec to do it."
+  [{:keys [namespace id path]} gateway-host]
+  (when (subdomain-safe? id)
+    {:kind :redirect :status 301
+     :location (str "https://" id "." namespace "." gateway-host
+                    "/" (or path ""))}))
+
+(defn immutable?
+  "Is this request for content that can never change? True for `/ipfs/` — the
+  identifier is a hash of the bytes — and false for `/ipns/`, whose whole
+  purpose is to change.
+
+  Everything about caching follows from this one predicate, which is why it is
+  a function rather than a comment."
+  [{:keys [namespace]}]
+  (= namespace-ipfs namespace))

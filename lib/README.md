@@ -99,6 +99,14 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.torrentApp` | `kotoba.torrentApp/src` | `kotoba.torrent-app`, `kotoba.torrent-app.download` (Kotoba project library) |
+| `kotoba.techIpfsSpecsHttpGateway` | `kotoba.techIpfsSpecsHttpGateway/src` | `gateway.cache`, `gateway.request`, `gateway.resolve` (Kotoba project library) |
+| `kotoba.oauth` | `kotoba.oauth/src` | `oauth.adapters.client-auth`, `oauth.adapters.discovery`, `oauth.adapters.http`, `oauth.adapters.java-http` (Kotoba project library) |
+| `kotoba.kotobaIssue` | `kotoba.kotobaIssue/src` | `kotoba.issue.bcf`, `kotoba.issue.bcf.xml`, `kotoba.issue.gate`, `kotoba.issue.opencde` (Kotoba project library) |
+| `kotoba.ioStripeIssuing` | `kotoba.ioStripeIssuing/src` | `io.stripe.issuing.core`, `io.stripe.issuing.exercise`, `io.stripe.issuing.state` (Kotoba project library) |
+| `kotoba.ctf` | `kotoba.ctf/src` | `ctf.adapters.auth-client`, `ctf.adapters.etzhayyim`, `ctf.adapters.evidence-ledger`, `ctf.adapters.retry` (Kotoba project library) |
+| `kotoba.atprotoClient` | `kotoba.atprotoClient/src` | `kotoba.lang.atproto-client.atproto`, `kotoba.lang.atproto-client.http-jdk`, `kotoba.lang.atproto-client.pds` (Kotoba project library) |
+| `kotoba.aml` | `kotoba.aml/src` | `aml.adapters.auth-client`, `aml.adapters.etzhayyim`, `aml.adapters.evidence-ledger`, `aml.adapters.retry` (Kotoba project library) |
 | `kotoba.zone` | `kotoba.zone/src` | `zone.model`, `zone.validate`, `zone.zone` (Kotoba project library) |
 | `kotoba.yakuwariView` | `kotoba.yakuwariView/src` | `yakuwari-view.hiccup`, `yakuwari-view.model` (Kotoba project library) |
 | `kotoba.yakuwari` | `kotoba.yakuwari/src` | `yakuwari.policy`, `yakuwari.reconcile`, `yakuwari.spec` (Kotoba project library) |
