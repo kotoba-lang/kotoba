@@ -1,0 +1,363 @@
+(ns ichiran.governor-contract-test
+  "The propose-only TallyGovernor contract as executable tests — ichiran's
+  analog of teian's propose-only contract test / koyomi's zero-trust contract
+  test. Invariant: the actor never publishes a tally workbook the
+  TallyGovernor would reject, tally-LLM never actuates directly, and
+  `:tally/publish` is always a human call regardless of phase."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [ichiran.store :as store]
+            [ichiran.coordllm :as coordllm]
+            [ichiran.tallyport :as tallyport]
+            [ichiran.operation :as op]))
+
+(defn- fresh [] (let [s (store/seed-db)] [s (op/build s)]))
+
+(defn- fresh-with-tallyport
+  "Like `fresh`, but wires a mock-tallyport whose distribute-fn appends every
+  {:activity :target :content :envelope?} call to the returned atom — so a
+  test can assert on exactly what tallyport/publish! delivered, not just on
+  the store's post-hoc state."
+  []
+  (let [s (store/seed-db)
+        distributed (atom [])
+        tp (tallyport/mock-tallyport (atom {}) #(swap! distributed conj %))]
+    [s (op/build s {:tallyport tp}) distributed]))
+
+(defn- ctx [phase] {:phase phase})
+
+(defn- run [actor tid req phase]
+  (g/run* actor {:request req :context (ctx phase)} {:thread-id tid}))
+
+;; a deterministic, always-compliant proposal for reify-based adversarial
+;; tests to selectively mutate — mirrors teian/koyomi's reify pattern.
+(defn- clean-proposal [& [overrides]]
+  (merge {:recommendation :draft :workbook-id "act-finance-q3-tally" :content nil
+         :tenant "gftdcojp/cloud-itonami" :effect :draft
+         :summary "x" :rationale "x" :cites [] :redactions []
+         :confidence 0.9}
+        overrides))
+
+(deftest ingest-always-records
+  (testing "observe path records a ground fact regardless of phase"
+    (let [[s actor] (fresh)
+          res (run actor "i" {:op :artifact/register :artifact "act-new"
+                              :value {:id "act-new" :repo "gftdcojp/cloud-itonami"
+                                      :title "臨時集計" :status :open}} 0)]
+      (is (= :record (get-in res [:state :disposition])))
+      (is (= "gftdcojp/cloud-itonami" (:repo (store/artifact s "act-new")))))))
+
+(deftest clean-draft-auto-commits-at-phase3
+  (testing "phase 3: a clean, correctly-tenanted draft is not high-stakes → auto"
+    (let [[s actor] (fresh)
+          res (run actor "d" {:op :tally/draft :artifact "act-finance-q3"} 3)]
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :proposed (:status (store/draft-of s "act-finance-q3"))))
+      (is (= "gftdcojp/cloud-itonami" (:tenant (store/draft-of s "act-finance-q3")))))))
+
+(deftest draft-requires-human-at-phase1
+  (testing "phase 1: drafting is allowed but never auto-commits"
+    (let [[_ actor] (fresh)
+          r1 (run actor "d1" {:op :tally/draft :artifact "act-finance-q3"} 1)]
+      (is (= :interrupted (:status r1))))))
+
+;; ── no-actuation: a :tally/draft proposal's :effect must be :draft, never :publish ──
+
+(deftest no-actuation-happy-path
+  (testing "a compliant :draft-effect proposal is not held on :no-actuation"
+    (let [[s _] (fresh)
+          ok-adv (reify coordllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor ok-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "na-ok"})]
+      (is (not= :hold (get-in res [:state :disposition])))
+      (is (= :committed (:t (last (store/ledger s))))
+          "a compliant proposal commits — no :ichiran-hold fact is ever appended"))))
+
+(deftest no-actuation-adversarial-hold
+  (testing "a proposal that claims to already :publish is held un-overridably"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor (-advise [_ _ _] (clean-proposal {:effect :publish})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "na-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-actuation} (-> (store/ledger s) last :basis))))))
+
+;; ── redaction-required: sensitive cites must be covered by :redactions ──
+
+(deftest redaction-required-happy-path
+  (testing "a sensitive cite WITH a matching redaction commits cleanly"
+    (let [[s _] (fresh)
+          ok-adv (reify coordllm/Advisor
+                   (-advise [_ _ _] (clean-proposal {:cites [:financial] :redactions [:financial]})))
+          a2 (op/build s {:advisor ok-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "rr-ok"})]
+      (is (= :commit (get-in res [:state :disposition]))))))
+
+(deftest redaction-required-adversarial-hold
+  (testing "a sensitive cite with NO redaction is held un-overridably"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor
+                    (-advise [_ _ _] (clean-proposal {:cites [:financial] :redactions []})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "rr-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-redaction} (-> (store/ledger s) last :basis))))))
+
+(deftest redaction-required-covers-all-sensitive-categories
+  (testing "legal and personnel cites are just as protected as financial"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor
+                    (-advise [_ _ _] (clean-proposal {:cites [:legal :personnel] :redactions [:legal]})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "rr-partial"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-redaction} (-> (store/ledger s) last :basis))))))
+
+;; ── tenant-isolation: the draft's tenant must equal the artifact's own repo ──
+
+(deftest tenant-isolation-happy-path
+  (testing "a proposal whose tenant matches the artifact's repo commits cleanly"
+    (let [[s _] (fresh)
+          ok-adv (reify coordllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor ok-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "ti-ok"})]
+      (is (= :commit (get-in res [:state :disposition]))))))
+
+(deftest tenant-isolation-adversarial-hold
+  (testing "a proposal for a DIFFERENT tenant than the artifact's own repo is held"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor
+                    (-advise [_ _ _] (clean-proposal {:tenant "someone-else/other-repo"})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-finance-q3"} :context (ctx 3)}
+                      {:thread-id "ti-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:tenant-mismatch} (-> (store/ledger s) last :basis))))))
+
+;; ── missing-subject: an INDEPENDENT, UNCONDITIONAL check — the referenced
+;; artifact must already be registered, regardless of what the proposal's
+;; :content/:tenant say. Modeled fresh on koyomi's fixed
+;; missing-activity-violations (ADR-2607062030); must fire for BOTH
+;; :tally/draft and :tally/publish — not just draft. ──
+
+(deftest missing-subject-happy-path-draft
+  (testing "a draft for an already-registered artifact is not held on :missing-subject"
+    (let [[s actor] (fresh)
+          res (run actor "ms-ok-d" {:op :tally/draft :artifact "act-finance-q3"} 3)]
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :committed (:t (last (store/ledger s))))
+          "a compliant proposal commits — no :ichiran-hold fact (missing-subject or otherwise)
+           is ever appended"))))
+
+(deftest missing-subject-adversarial-hold-draft
+  (testing ":tally/draft for an artifact that was never registered is held un-overridably,
+            regardless of how compliant the rest of the proposal looks"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-hallucinated"} :context (ctx 3)}
+                      {:thread-id "ms-bad-d"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-subject} (-> (store/ledger s) last :basis))))))
+
+(deftest missing-subject-adversarial-hold-publish
+  (testing ":tally/publish for an artifact that was never registered is held un-overridably —
+            the unconditional check applies at publish-time too, not just draft-time"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor (-advise [_ _ _] (clean-proposal {:recommendation :publish :effect :published})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/publish :artifact "act-hallucinated"
+                                    :target "cfo@example.com"} :context (ctx 3)}
+                      {:thread-id "ms-bad-p"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-subject} (-> (store/ledger s) last :basis))))))
+
+;; kept for continuity with teian's naming (same check as missing-subject-*, just
+;; the historical un-adorned label).
+(deftest unregistered-artifact-is-held
+  (testing "a draft for an artifact that was never registered is held"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :tally/draft :artifact "act-hallucinated"} :context (ctx 3)}
+                      {:thread-id "no-art"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-subject} (-> (store/ledger s) last :basis))))))
+
+(deftest phase0-disables-assessments
+  (let [[s actor] (fresh)
+        res (run actor "p0" {:op :tally/draft :artifact "act-finance-q3"} 0)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))))
+
+;; ── fail-closed on missing/unrecognized :phase: a lost/garbled phase must
+;; resolve to phase 0's (ingest-only) ruleset, the LEAST permissive one, never
+;; `phase/default-phase` (3, the MOST permissive — auto-commits :tally/draft).
+;; Both "no :phase key at all" and "a :phase not in ichiran.phase/phases"
+;; must HOLD (:phase-disabled), exactly like an explicit phase 0 would, and
+;; must NOT auto-commit like an explicit (or previously-defaulted) phase 3. ──
+
+(deftest phase-fails-closed-on-missing-or-unrecognized-phase
+  (doseq [[case-label context] [["no :phase key at all" {}]
+                                ["an out-of-range :phase (not a key of ichiran.phase/phases)" {:phase 99}]]]
+    (testing (str case-label " must NOT silently behave like phase 3's auto-commit ruleset")
+      (let [[s actor] (fresh)
+            res (g/run* actor {:request {:op :tally/draft :artifact "act-finance-q3"} :context context}
+                        {:thread-id (str "phase-fail-closed-" (hash context))})]
+        (is (= :hold (get-in res [:state :disposition])))
+        (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))
+        (is (nil? (store/draft-of s "act-finance-q3"))
+            "no draft was ever committed — the missing/unrecognized phase did not auto-commit")))))
+
+(deftest publish-always-requires-human
+  (testing "publishing (:tally/publish) is high-stakes at every assess-enabled phase"
+    (doseq [phase [1 2 3]]
+      (let [[s actor] (fresh)
+            _  (run actor (str "draft-" phase) {:op :tally/draft :artifact "act-finance-q3"} 3)
+            r1 (run actor (str "pub-" phase) {:op :tally/publish :artifact "act-finance-q3"
+                                              :target "cfo@example.com"} phase)]
+        (is (= :interrupted (:status r1)) (str "phase " phase " must still interrupt"))
+        (let [r2 (g/run* actor {:approval {:status :approved :by "cfo-alice"}}
+                         {:thread-id (str "pub-" phase) :resume? true})]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= :published (:status (store/draft-of s "act-finance-q3")))))))))
+
+;; ── publish-time recheck: redaction/tenant are re-verified against the
+;; CURRENTLY STORED draft at :tally/publish time, not trusted from draft-time
+;; approval alone (defense-in-depth against drift between the two) ──
+
+(deftest publish-recheck-happy-path
+  (testing "a clean draft with no drift publishes normally (recheck doesn't break the happy path)"
+    (let [[s actor] (fresh)
+          _  (run actor "recheck-ok-draft" {:op :tally/draft :artifact "act-finance-q3"} 3)
+          r1 (run actor "recheck-ok-pub" {:op :tally/publish :artifact "act-finance-q3"
+                                          :target "cfo@example.com"} 3)]
+      (is (= :interrupted (:status r1)) "still routes to a human — recheck doesn't skip sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "cfo-alice"}}
+                       {:thread-id "recheck-ok-pub" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :published (:status (store/draft-of s "act-finance-q3"))))))))
+
+(deftest publish-recheck-catches-post-draft-redaction-drift
+  (testing "a draft revised (out-of-band, bypassing governor) after draft-time approval to
+            add an unredacted sensitive cite is HELD at :tally/publish — the redaction fact
+            validated at draft-time is not blindly trusted at publish-time"
+    (let [[s actor] (fresh)
+          _ (run actor "recheck-redact-draft" {:op :tally/draft :artifact "act-finance-q3"} 3)]
+      (is (= :proposed (:status (store/draft-of s "act-finance-q3"))) "sanity: draft committed cleanly")
+      ;; simulate drift: the stored draft's content is revised directly (as if by a later,
+      ;; out-of-band process) to cite unredacted financial data.
+      (store/record-datom! s {:kind :draft :id "act-finance-q3"
+                              :value {:cites [:financial] :redactions []}})
+      (let [r1 (run actor "recheck-redact-pub" {:op :tally/publish :artifact "act-finance-q3"
+                                                :target "cfo@example.com"} 3)]
+        (is (= :hold (get-in r1 [:state :disposition]))
+            "hard violation short-circuits straight to hold, no human interrupt needed")
+        (is (some #{:missing-redaction} (-> (store/ledger s) last :basis)))
+        (is (not= :published (:status (store/draft-of s "act-finance-q3"))))))))
+
+(deftest publish-recheck-catches-post-draft-tenant-drift
+  (testing "a draft revised (out-of-band) after draft-time approval to a mismatched tenant
+            is HELD at :tally/publish"
+    (let [[s actor] (fresh)
+          _ (run actor "recheck-tenant-draft" {:op :tally/draft :artifact "act-finance-q3"} 3)]
+      (is (= :proposed (:status (store/draft-of s "act-finance-q3"))) "sanity: draft committed cleanly")
+      (store/record-datom! s {:kind :draft :id "act-finance-q3"
+                              :value {:tenant "someone-else/other-repo"}})
+      (let [r1 (run actor "recheck-tenant-pub" {:op :tally/publish :artifact "act-finance-q3"
+                                                :target "cfo@example.com"} 3)]
+        (is (= :hold (get-in r1 [:state :disposition])))
+        (is (some #{:tenant-mismatch} (-> (store/ledger s) last :basis)))
+        (is (not= :published (:status (store/draft-of s "act-finance-q3"))))))))
+
+;; ── delivery must use the GOVERNED content, never a stale commit-time store
+;; re-read: unlike the recheck tests above (which mutate the store BEFORE the
+;; :tally/publish request even starts, so ichiran.governor/check's own
+;; govern-time recheck catches the drift), this simulates a mutation landing
+;; WHILE the publish approval sits in the :request-approval interrupt — i.e.
+;; strictly AFTER :advise/:govern already ran and validated the ORIGINAL
+;; content. Per langgraph.graph/run*'s resume semantics, resuming after human
+;; approval jumps straight from :request-approval to :commit — :advise/
+;; :govern never re-run — so a commit-time `store/draft-of` re-read would
+;; blindly deliver whatever is CURRENTLY stored, bypassing everything the
+;; governor validated for this approval. ──
+
+(deftest publish-uses-governed-content-not-a-stale-commit-time-store-read
+  (testing "TOCTOU: mutating the stored draft's content WHILE a publish approval is
+            pending (e.g. a legitimate concurrent :tally/draft revision on the same
+            artifact) must not let a since-injected unredacted sensitive-cite draft
+            slip into what actually gets delivered — the human approved the
+            ORIGINALLY governed content, so that is what tallyport/publish! must
+            receive, not a fresh store re-read at commit time"
+    (let [[s actor distributed] (fresh-with-tallyport)
+          _ (run actor "toctou-draft" {:op :tally/draft :artifact "act-finance-q3"} 3)
+          governed-content (:content (store/draft-of s "act-finance-q3"))
+          r1 (run actor "toctou-pub" {:op :tally/publish :artifact "act-finance-q3"
+                                      :target "cfo@example.com"} 3)]
+      (is (some? governed-content) "sanity: the drafted content is real, not nil")
+      (is (= :interrupted (:status r1)) "publishing always interrupts for human sign-off")
+      ;; Simulate a concurrent draft mutation landing on the SAME artifact while this
+      ;; publish approval sits in the interrupt queue — swap in tampered content that
+      ;; cites unredacted financial data (exactly what the redaction-required
+      ;; invariant exists to keep out of delivery).
+      (store/record-datom! s {:kind :draft :id "act-finance-q3"
+                              :value {:content {:tampered? true}
+                                      :cites [:financial] :redactions []}})
+      ;; Approve the ORIGINAL (pre-mutation) publish request.
+      (let [r2 (g/run* actor {:approval {:status :approved :by "cfo-alice"}}
+                       {:thread-id "toctou-pub" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition]))
+            "approving a clean, already-governed publish still commits")
+        (is (= 1 (count @distributed)) "publish! ran exactly once")
+        (is (= governed-content (:content (first @distributed)))
+            "publish! delivered the ORIGINALLY governed content, unaffected by the later mutation")
+        (is (not= {:tampered? true} (:content (first @distributed)))
+            "the since-injected tampered content never reaches delivery")))))
+
+(deftest publish-delivers-the-governed-store-draft-not-a-divergent-proposal
+  (testing "governor/check's :tally/publish recheck validates the STORE'S draft
+           (see governor.cljc), never `proposal` -- so the delivered content
+           must come from that same checked draft, not from a divergent
+           proposal the recheck never actually validated. Otherwise the
+           redaction/tenant-isolation recheck would validate one map while
+           the system commits and delivers a different, unvalidated one."
+    (let [[s clean-actor distributed] (fresh-with-tallyport)
+          _ (run clean-actor "gov-draft" {:op :tally/draft :artifact "act-finance-q3"} 3)
+          clean-content (:content (store/draft-of s "act-finance-q3"))
+          ;; adversarial advisor: at :tally/publish time, proposes :content
+          ;; that diverges entirely from the already-committed clean draft
+          bad-adv (reify coordllm/Advisor
+                    (-advise [_ _ _] {:recommendation :publish :effect :published
+                                      :content {:leaked "unredacted-financial-data"}
+                                      :cites [] :redactions [] :tenant "gftdcojp/cloud-itonami"
+                                      :summary "x" :rationale "x" :confidence 0.95}))
+          tp (tallyport/mock-tallyport (atom {}) #(swap! distributed conj %))
+          adversarial-actor (op/build s {:advisor bad-adv :tallyport tp})
+          r1 (run adversarial-actor "gov-pub" {:op :tally/publish :artifact "act-finance-q3"
+                                               :target "cfo@example.com"} 3)]
+      (is (= :interrupted (:status r1)) "still requires human sign-off")
+      (let [r2 (g/run* adversarial-actor {:approval {:status :approved :by "cfo-alice"}}
+                       {:thread-id "gov-pub" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= 1 (count @distributed)) "publish! ran exactly once")
+        (is (= clean-content (:content (last @distributed)))
+            "delivered content is the GOVERNED store draft, not the adversarial proposal")
+        (is (not= {:leaked "unredacted-financial-data"} (:content (last @distributed)))
+            "the proposal's forged content never reaches delivery")))))
+
+(deftest reject-signoff-holds
+  (testing "a human rejection of a publish records a hold, not a delivery"
+    (let [[s actor] (fresh)
+          _  (run actor "draft-r" {:op :tally/draft :artifact "act-finance-q3"} 3)
+          _  (run actor "pub-r" {:op :tally/publish :artifact "act-finance-q3"
+                                 :target "cfo@example.com"} 3)
+          r2 (g/run* actor {:approval {:status :rejected :by "cfo-alice"}}
+                     {:thread-id "pub-r" :resume? true})]
+      (is (= :hold (get-in r2 [:state :disposition])))
+      (is (not= :published (:status (store/draft-of s "act-finance-q3")))))))

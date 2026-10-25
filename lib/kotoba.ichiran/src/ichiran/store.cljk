@@ -1,0 +1,147 @@
+(ns ichiran.store
+  "SSoT for ichiran — a tally/rollup-sheet generation control plane, behind a
+  `Store` protocol so the backend is a swap (MemStore default ‖ DatomicStore
+  via langchain.db, itself swappable to real Datomic Local / kotoba-server).
+
+  Domain = the draft/review/publish lifecycle for the tally workbooks ichiran
+  generates on behalf of an itonami activity's ledger. The actor only ever
+  writes :draft records (control-plane proposals; :content is verbatim
+  kotoba-lang/sheets EDN — ichiran never invents its own representation);
+  delivering a tally is an EXTERNAL effect performed by a TallyTarget port,
+  and only after human sign-off.
+
+    artifact — the itonami activity a tally is drafted for: repo (the
+               tenant identity), title, status (:open/:closed)
+    draft    — the committed/proposed tally for an artifact (workbook-id,
+               content, confidence, cites, redactions, tenant, status
+               :proposed/:published)
+
+  Charter: the append-only **ledger is ichiran's tally-generation audit
+  trail** (who drafted what, on what basis, who approved publishing it,
+  when) — the property a mutable spreadsheet folder can't give you.
+
+  `seed!` is a per-id UPSERT (delegates to the same `record-datom!` merge
+  every write already goes through), NOT a wholesale replace of
+  `:artifacts` — re-seeding with one new artifact must never wipe out any
+  artifact already seeded earlier. Both MemStore and DatomicStore implement
+  this identically from the start (ADR-2607062030 amendment: this is the bug
+  class teian's `MemStore.seed!` originally had and later fixed — ichiran
+  never has it in the first place, see test/ichiran/store_contract_test.cljk's
+  `seed-upserts-per-id-does-not-wipe-existing-artifacts`)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.db :as d]
+            [ichiran.model :as model]))
+
+(defprotocol Store
+  (artifact [s id])
+  (all-artifacts [s])
+  (draft-of [s artifact-id] "committed/proposed draft for an artifact, or nil")
+  (ledger [s])
+  (record-datom! [s record] "append/merge an ichiran ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable tally-generation audit fact")
+  (seed! [s data]           "bulk-seed entity collections (idempotent per-id upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+
+(defn demo-data
+  "cloud-itonami's tally book: act-finance-q3 (Q3 財務集計) and
+  act-headcount (人員集計) — both clean, known-tenant artifacts."
+  []
+  {:artifacts
+   {"act-finance-q3" (model/artifact "act-finance-q3" "gftdcojp/cloud-itonami" "Q3 財務集計")
+    "act-headcount"  (model/artifact "act-headcount" "gftdcojp/cloud-itonami" "人員集計")}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (artifact [_ id] (get-in @a [:artifacts id]))
+  (all-artifacts [_] (sort-by :id (vals (:artifacts @a))))
+  (draft-of [_ artifact-id] (get-in @a [:drafts artifact-id]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :artifact (swap! a update-in [:artifacts id] merge value)
+      :draft    (swap! a update-in [:drafts id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data]
+    ;; per-id upsert (via the same record-datom! merge MemStore already uses
+    ;; for writes) — mirrors DatomicStore.seed! exactly, so seeding again with
+    ;; a new id never wipes out unrelated already-seeded artifacts.
+    (doseq [[id art] (:artifacts data)] (record-datom! s {:kind :artifact :id id :value art}))
+    s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :drafts {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:artifact/id {:db/unique :db.unique/identity}
+   :draft/id    {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (artifact [this id]
+    (-> (pull* this [:artifact/edn] [:artifact/id id]) :artifact/edn dec*))
+  (all-artifacts [this]
+    (->> (q* this '[:find [?id ...] :where [?e :artifact/id ?id]])
+         (map #(artifact this %)) (sort-by :id)))
+  (draft-of [this artifact-id]
+    (-> (pull* this [:draft/edn] [:draft/id artifact-id]) :draft/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :artifact (tx* s [{:artifact/id id :artifact/edn (enc (merge (artifact s id) value))}])
+      :draft    (tx* s [{:draft/id id :draft/edn (enc (merge (draft-of s id) value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id art] (:artifacts data)] (record-datom! s {:kind :artifact :id id :value art}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see ichiran.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))
