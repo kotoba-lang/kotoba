@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.cofog` | `kotoba.cofog/src` | `kotoba.cofog`, `kotoba.cofog.embedded` (Kotoba project library) |
 | `kotoba.technology` | `kotoba.technology/src` | `kotoba.technology`, `kotoba.technology.embedded` (Kotoba project library) |
 | `kotoba.torrentApp` | `kotoba.torrentApp/src` | `kotoba.torrent-app`, `kotoba.torrent-app.download` (Kotoba project library) |
 | `kotoba.techIpfsSpecsHttpGateway` | `kotoba.techIpfsSpecsHttpGateway/src` | `gateway.cache`, `gateway.request`, `gateway.resolve` (Kotoba project library) |
