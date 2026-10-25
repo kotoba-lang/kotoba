@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.consumability` | `kotoba.consumability/src` | `consumability.core` (Kotoba project library) |
 | `kotoba.composer` | `kotoba.composer/src` | `kotoba.composer`, `kotoba.composer.generation`, `kotoba.composer.pipeline`, `kotoba.composer.stem` (Kotoba project library) |
 | `kotoba.comTeamsBot` | `kotoba.comTeamsBot/src` | `teams.client`, `teams.events`, `teams.jwt`, `teams.jwt-verify` (Kotoba project library) |
 | `kotoba.comProlificApp` | `kotoba.comProlificApp/src` | `prolific.browser`, `prolific.channel`, `prolific.client`, `prolific.core` (Kotoba project library) |
