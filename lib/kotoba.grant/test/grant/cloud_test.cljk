@@ -1,0 +1,750 @@
+(ns grant.cloud-test
+  (:require [grant.cloud :as cloud]
+            [grant.json :as json]
+            #?(:clj [kotoba.lang.edn :as edn])
+            #?(:clj [kotoba.io :as io])
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]))
+
+;; CIDs and digests computed outside the code under test, so the decoder is
+;; checked against an independent oracle rather than against itself:
+;;   sha256("hello world") = b94d27b9…cde9
+;;   sha256("other bytes") = a3ead5ee…a795
+(def hello-digest "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+(def raw-cid "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e")
+(def cbor-cid "bafyreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e")
+(def other-digest "a3ead5eedad5df82318c51685dbc1c147a36d1ff8584fc82de6b08d0bf63a795")
+
+(def policy {:aiueos.policy/net-allow #{"kotobase.net" "api.murakumo.cloud"}})
+(def no-network {:aiueos.policy/net-allow #{}})
+(def plaintext {:aiueos.policy/net-allow #{"kotobase.net"}
+                :aiueos.cloud/storage-origin "http://kotobase.net"})
+(def loopback {:aiueos.policy/net-allow #{"127.0.0.1"}
+               :aiueos.cloud/storage-origin "http://127.0.0.1:8080"
+               :aiueos.cloud/allow-insecure-origins #{"http://127.0.0.1"}})
+
+;; ── the CID says what the bytes must hash to ──────────────────────────────
+
+(deftest a-cid-decodes-to-the-digest-it-commits-to
+  (is (= hello-digest (:digest-hex (cloud/cid-info raw-cid))))
+  (is (= :raw (:codec-name (cloud/cid-info raw-cid))))
+  (is (= :dag-cbor (:codec-name (cloud/cid-info cbor-cid)))
+      "same bytes, different codec, same digest")
+  (is (= hello-digest (:digest-hex (cloud/cid-info cbor-cid)))))
+
+(deftest a-string-that-is-not-a-base32-cidv1-decodes-to-nothing
+  (testing "not multibase base32"
+    (is (nil? (cloud/cid-info "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")))
+    (is (nil? (cloud/cid-info "zdpuAyvkgEDQm9j"))))
+  (testing "not base32 at all"
+    (is (nil? (cloud/cid-info "b!!!!"))))
+  (testing "truncated"
+    (is (nil? (cloud/cid-info "bafk"))))
+  (testing "empty and nil"
+    (is (nil? (cloud/cid-info "")))
+    (is (nil? (cloud/cid-info nil)))))
+
+;; ── reading a block ───────────────────────────────────────────────────────
+
+(deftest a-block-read-carries-the-digest-forward
+  (let [plan (cloud/plan-block-read policy raw-cid)]
+    (is (cloud/allowed? plan))
+    (is (= "https://kotobase.net/ipfs/bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
+           (get-in plan [:aiueos.cloud/request :url])))
+    (is (= :get (get-in plan [:aiueos.cloud/request :method])))
+    (is (= hello-digest (:aiueos.cloud/expect-digest plan)))))
+
+(deftest any-codec-may-be-read
+  (is (cloud/allowed? (cloud/plan-block-read policy cbor-cid))
+      "reading a dag-cbor block is ordinary; only PUT is raw-only"))
+
+(deftest an-empty-allowlist-denies-the-read
+  (let [plan (cloud/plan-block-read no-network raw-cid)]
+    (is (not (cloud/allowed? plan)))
+    (is (= :origin-not-allowed (:aiueos.cloud/reason plan)))))
+
+;; ── the transport is part of the decision ─────────────────────────────────
+
+(deftest plaintext-is-refused-even-to-an-allowed-host
+  (let [plan (cloud/plan-block-read plaintext raw-cid)]
+    (is (= :insecure-transport (:aiueos.cloud/reason plan))
+        "the allowlist matches on host and would have admitted this")
+    (is (:aiueos.policy/net-allow plaintext))))
+
+(deftest an-operator-can-mark-one-origin-plaintext
+  (is (cloud/allowed? (cloud/plan-block-read loopback raw-cid))
+      "spelled out in policy, so it is visible in the deployment")
+  (is (= :insecure-transport
+         (:aiueos.cloud/reason (cloud/plan-block-read
+                                (assoc loopback :aiueos.cloud/storage-origin "http://10.0.0.1")
+                                raw-cid)))
+      "the exemption is one origin, not plaintext in general"))
+
+(deftest an-alias-that-resolves-onto-plaintext-is-refused
+  (is (= :insecure-transport
+         (:aiueos.cloud/reason (cloud/admit-model policy {:endpoint "http://api.murakumo.cloud"
+                                                          :alias-for "qwen3.6-35b-a3b"}))))) 
+
+;; ── who is on the other end ───────────────────────────────────────────────
+
+(def pin-a "af696ad28431887358d6bbc84d02af910ce3fa246dbbcf4264efef8d34a9c083")
+(def pin-b (apply str (repeat 64 "b")))
+(def pin-c (apply str (repeat 64 "c")))
+
+(def pinned
+  "The shape a deployment uses: each key bound to the host it was measured
+  from."
+  (assoc policy :aiueos.cloud/trust-anchors
+         {"kotobase.net" {:pins #{pin-a} :measured "2026-08-21"}
+          "api.murakumo.cloud" {:pins #{pin-b} :measured "2026-08-21"}}))
+
+(def kotobase {:spki-sha256 pin-a :host "kotobase.net"})
+
+(deftest nothing-declared-is-not-anything
+  (is (= :no-trust-anchors (:aiueos.cloud/reason (cloud/admit-peer policy kotobase)))
+      "an empty pin set is an operator who has not said, not an operator who said yes")
+  (is (false? (cloud/anchors-declared? policy)))
+  (is (false? (cloud/anchors-declared? (assoc policy :aiueos.cloud/trust-anchors {}))))
+  (is (true? (cloud/anchors-declared? pinned))))
+
+(deftest nothing-measured-is-not-a-pass
+  (is (= :peer-unmeasured (:aiueos.cloud/reason (cloud/admit-peer pinned {:host "kotobase.net"}))))
+  (is (= :peer-unmeasured (:aiueos.cloud/reason
+                           (cloud/admit-peer pinned {:spki-sha256 "" :host "kotobase.net"})))))
+
+(deftest a-caller-that-cannot-say-which-host-it-reached-has-not-checked
+  (let [v (cloud/admit-peer pinned {:spki-sha256 pin-a})]
+    (is (= :peer-host-unknown (:aiueos.cloud/reason v))
+        "the key is pinned -- and to WHICH host is half the question, so a
+         caller that omits the host has asked half of it")
+    (is (= pin-a (:aiueos.cloud/observed-spki v)))))
+
+(deftest a-key-that-was-not-named-is-refused
+  (let [v (cloud/admit-peer pinned {:spki-sha256 pin-c :host "kotobase.net"})]
+    (is (= :peer-not-pinned (:aiueos.cloud/reason v)))
+    (is (= pin-c (:aiueos.cloud/observed-spki v)) "and it says which key it saw")
+    (is (= "kotobase.net" (:aiueos.cloud/host v)) "and which host it was reaching")))
+
+(deftest a-named-key-is-admitted-however-it-is-cased
+  (is (cloud/allowed? (cloud/admit-peer pinned kotobase)))
+  (is (= :host (:aiueos.cloud/anchor-binding (cloud/admit-peer pinned kotobase))))
+  (is (cloud/allowed? (cloud/admit-peer pinned (assoc kotobase :spki-sha256
+                                                      (str/upper pin-a)))))
+  (is (cloud/allowed? (cloud/admit-peer
+                       (assoc policy :aiueos.cloud/trust-anchors
+                              {"KOTOBASE.NET" {:pins #{(str/upper pin-a)}}})
+                       kotobase))
+      "the policy is normalised too, so a capitalised host is not a second host"))
+
+;; ── a pin is a pin FOR A HOST ─────────────────────────────────────────────
+;;
+;; The flat set accepted any pinned key from any allowed host. With three hosts
+;; in one policy that is an attacker who can answer for one of them answering
+;; for all three.
+
+(deftest presenting-one-authoritys-key-for-another-is-its-own-refusal
+  (let [v (cloud/admit-peer pinned {:spki-sha256 pin-b :host "kotobase.net"})]
+    (is (= :peer-pinned-to-other-host (:aiueos.cloud/reason v))
+        "murakumo's key, offered by kotobase: the one refusal here that cannot
+         be a rotation, because a rotation does not hand you somebody else's
+         key")
+    (is (= ["api.murakumo.cloud"] (:aiueos.cloud/pinned-for v))
+        "and it says whose key it is, because that is what makes it actionable")
+    (is (= pin-b (:aiueos.cloud/observed-spki v)))
+    (is (not= :peer-not-pinned (:aiueos.cloud/reason v))
+        "which is a different sentence from a key nobody named")))
+
+(deftest a-host-this-policy-says-nothing-about-is-not-a-bad-key
+  (let [v (cloud/admit-peer pinned {:spki-sha256 pin-a :host "infer.murakumo.cloud"})]
+    (is (= :host-not-pinned (:aiueos.cloud/reason v))
+        "no pins for that host at all -- an operator who has not said, in the
+         host dimension, and not a peer that lied")
+    (is (= "infer.murakumo.cloud" (:aiueos.cloud/host v)))))
+
+;; ── the flat set: accepted, marked, and refusable on demand ───────────────
+
+(def unbound (assoc policy :aiueos.cloud/trust-anchors #{pin-a}))
+
+(deftest the-flat-set-is-accepted-and-says-on-every-verdict-that-it-is-flat
+  (let [v (cloud/admit-peer unbound {:spki-sha256 pin-a :host "kotobase.net"})]
+    (is (cloud/allowed? v))
+    (is (= :unbound (:aiueos.cloud/anchor-binding v))
+        "a device booted from a release-borne anchor set has no host field to
+         bind to; it is accepted, and it says so on the line of every receipt
+         rather than being the thing nobody can see"))
+  (is (cloud/allowed? (cloud/admit-peer unbound {:spki-sha256 pin-a}))
+      "and it cannot ask the host question, so it does not pretend to")
+  (is (= :peer-not-pinned (:aiueos.cloud/reason
+                           (cloud/admit-peer unbound {:spki-sha256 pin-c
+                                                      :host "kotobase.net"})))))
+
+(deftest a-deployment-that-can-bind-hosts-can-refuse-a-policy-that-does-not
+  (let [strict (assoc unbound :aiueos.cloud/require-host-bound-anchors? true)]
+    (is (= :trust-anchors-unbound (:aiueos.cloud/reason
+                                   (cloud/admit-peer strict {:spki-sha256 pin-a
+                                                             :host "kotobase.net"})))
+        "the shipped live policy sets this, so it cannot regress to the weaker
+         shape without the gate saying which shape it is")
+    (is (cloud/allowed? (cloud/admit-peer
+                         (assoc pinned :aiueos.cloud/require-host-bound-anchors? true)
+                         kotobase)))))
+
+(deftest a-pin-that-cannot-be-a-sha256-is-refused-rather-than-carried
+  (let [bad (assoc policy :aiueos.cloud/trust-anchors
+                   {"kotobase.net" {:pins #{pin-a "not-a-pin"}}})
+        v (cloud/admit-peer bad kotobase)]
+    (is (= :anchor-binding-malformed (:aiueos.cloud/reason v))
+        "a malformed pin can never match a measured key, so a policy holding
+         one partly cannot work while looking entirely valid -- and the half
+         that works would hide it")
+    (is (= ["not-a-pin"] (:aiueos.cloud/malformed-pins v)))))
+
+;; ── a rotation is a window, and the window is grant.anchors' ─────────────
+
+(def rotating
+  (assoc policy :aiueos.cloud/trust-anchors
+         {"kotobase.net" {:pins #{pin-b}
+                          :previous #{pin-a}
+                          :accept-previous-until-ms 2000}}))
+
+(deftest during-a-rotation-both-keys-work-and-afterwards-one-does
+  (let [during (assoc rotating :aiueos.cloud/now-ms 1500)
+        after (assoc rotating :aiueos.cloud/now-ms 2001)]
+    (is (cloud/allowed? (cloud/admit-peer during {:spki-sha256 pin-b :host "kotobase.net"}))
+        "the new key")
+    (is (cloud/allowed? (cloud/admit-peer during {:spki-sha256 pin-a :host "kotobase.net"}))
+        "and the old one, for now -- a Cloudflare edge mid-rotation serves both,
+         and a client that refuses one of them goes red on a healthy authority")
+    (is (cloud/allowed? (cloud/admit-peer after {:spki-sha256 pin-b :host "kotobase.net"})))
+    (let [v (cloud/admit-peer after {:spki-sha256 pin-a :host "kotobase.net"})]
+      (is (= :peer-pin-expired (:aiueos.cloud/reason v))
+          "the clock retires the old key, not an edit -- and it is this host's
+           own key, so it is a schedule and not somebody else's certificate")
+      (is (= 2000 (:aiueos.cloud/accept-previous-until-ms v))
+          "with the window it fell outside, because the fix is either finish
+           the rotation or widen the window"))
+    (is (= :open (:aiueos.cloud/rotation-window
+                  (cloud/admit-peer during {:spki-sha256 pin-b :host "kotobase.net"})))
+        "and an admission during a rotation says it was during one")
+    (is (= #{pin-a pin-b} (cloud/usable-pins during "kotobase.net")))
+    (is (= #{pin-b} (cloud/usable-pins after "kotobase.net")))))
+
+(deftest without-a-clock-the-window-cannot-be-evaluated-so-it-is-not-honoured
+  (is (= #{pin-b} (cloud/usable-pins rotating "kotobase.net"))
+      "no :aiueos.cloud/now-ms -- a check that could not run falls towards
+       refusing, never towards admitting")
+  (is (= :peer-pin-window-unevaluated
+         (:aiueos.cloud/reason (cloud/admit-peer rotating {:spki-sha256 pin-a
+                                                           :host "kotobase.net"})))
+      "and it is not reported as :peer-pin-expired: nobody measured whether the
+       window had closed, which is a different fact from measuring that it had")
+  (is (= :peer-pin-window-unevaluated
+         (:aiueos.cloud/reason
+          (cloud/admit-peer (assoc policy :aiueos.cloud/trust-anchors
+                                   {"kotobase.net" {:pins #{pin-b} :previous #{pin-a}}}
+                                   :aiueos.cloud/now-ms 9999)
+                            {:spki-sha256 pin-a :host "kotobase.net"})))
+      "a previous set with no deadline is the same hole from the other side:
+       a rotation with no end is not a rotation"))
+
+(deftest trust-anchors-is-a-reporting-view-and-not-a-decision
+  (is (= #{pin-a pin-b} (cloud/trust-anchors rotating))
+      "every pin the policy names, current and retiring, for counting and for
+       checking they are all well formed")
+  (is (= :peer-pinned-to-other-host
+         (:aiueos.cloud/reason (cloud/admit-peer pinned {:spki-sha256 pin-b
+                                                         :host "kotobase.net"})))
+      "and asking it instead of admit-peer is the bug this section is about:
+       pin-b IS in that set"))
+
+;; ── judging the response ──────────────────────────────────────────────────
+
+(deftest bytes-that-hash-to-the-cid-are-admitted
+  (let [plan (cloud/plan-block-read policy raw-cid)
+        v (cloud/admit-block plan {:status 200 :digest-hex hello-digest})]
+    (is (cloud/allowed? v))
+    (is (= hello-digest (:aiueos.cloud/digest v)))))
+
+(deftest bytes-that-hash-to-something-else-are-refused
+  (let [plan (cloud/plan-block-read policy raw-cid)
+        v (cloud/admit-block plan {:status 200 :digest-hex other-digest})]
+    (is (= :digest-mismatch (:aiueos.cloud/reason v)))
+    (is (= hello-digest (:aiueos.cloud/expect-digest v)))
+    (is (= other-digest (:aiueos.cloud/observed-digest v)))))
+
+(deftest a-provider-that-did-not-hash-does-not-get-a-pass
+  (let [plan (cloud/plan-block-read policy raw-cid)]
+    (is (= :digest-missing (:aiueos.cloud/reason (cloud/admit-block plan {:status 200})))
+        "no measurement is not the same fact as a good measurement")
+    (is (= :digest-missing (:aiueos.cloud/reason
+                            (cloud/admit-block plan {:status 200 :digest-hex ""}))))))
+
+(deftest a-non-200-is-refused-before-the-digest-is-consulted
+  (let [plan (cloud/plan-block-read policy raw-cid)
+        v (cloud/admit-block plan {:status 404 :digest-hex hello-digest})]
+    (is (= :response-not-ok (:aiueos.cloud/reason v)))
+    (is (= 404 (:aiueos.cloud/status v)))))
+
+(deftest a-denied-plan-cannot-be-used-to-admit-anything
+  (let [plan (cloud/plan-block-read no-network raw-cid)
+        v (cloud/admit-block plan {:status 200 :digest-hex hello-digest})]
+    (is (= :plan-not-allowed (:aiueos.cloud/reason v)))
+    (is (= :origin-not-allowed (:aiueos.cloud/plan-reason v))
+        "the original refusal is reported, not paraphrased")))
+
+;; ── writing a block: raw only ─────────────────────────────────────────────
+
+(deftest a-raw-cid-may-be-written
+  (let [plan (cloud/plan-block-write policy raw-cid)]
+    (is (cloud/allowed? plan))
+    (is (= :put (get-in plan [:aiueos.cloud/request :method])))))
+
+(deftest a-dag-cbor-identity-cid-is-refused-before-the-request
+  (let [plan (cloud/plan-block-write policy cbor-cid)]
+    (is (= :cid-not-raw (:aiueos.cloud/reason plan)))
+    (is (= :dag-cbor (:aiueos.cloud/codec plan))
+        "the Location of those bytes is the raw CID of the same bytes")))
+
+;; ── the alias is a redirect ───────────────────────────────────────────────
+
+(deftest resolving-the-alias-never-names-a-model
+  (let [plan (cloud/plan-model-resolve policy)]
+    (is (cloud/allowed? plan))
+    (is (= "https://api.murakumo.cloud/infer/models/murakumo-main"
+           (get-in plan [:aiueos.cloud/request :url])))
+    (is (= "murakumo-main" (:aiueos.cloud/alias plan)))))
+
+(deftest an-endpoint-inside-the-allowlist-is-admitted
+  (let [v (cloud/admit-model policy {:endpoint "https://api.murakumo.cloud"
+                                     :alias-for "qwen3.6-35b-a3b"})]
+    (is (cloud/allowed? v))
+    (is (= "murakumo-main" (get-in v [:aiueos.cloud/model :alias])))))
+
+(deftest an-endpoint-the-allowlist-never-admitted-is-refused
+  (let [v (cloud/admit-model policy {:endpoint "https://attacker.example/infer"
+                                     :alias-for "qwen3.6-35b-a3b"})]
+    (is (= :resolved-endpoint-not-allowed (:aiueos.cloud/reason v))
+        "admitting the resolver is not admitting whatever it names next")))
+
+(deftest an-alias-that-resolves-to-nothing-is-refused
+  (is (= :alias-unresolved (:aiueos.cloud/reason (cloud/admit-model policy {}))))
+  (is (= :alias-unresolved (:aiueos.cloud/reason (cloud/admit-model policy {:endpoint ""})))))
+
+;; ── the request carries the alias, not the model ──────────────────────────
+
+(def admitted-model
+  (:aiueos.cloud/model (cloud/admit-model policy {:endpoint "https://api.murakumo.cloud"
+                                                  :alias-for "qwen3.6-35b-a3b"})))
+
+(deftest an-inference-request-sends-the-alias
+  (let [plan (cloud/plan-inference policy admitted-model {:messages [{:role "user" :content "hi"}]})]
+    (is (cloud/allowed? plan))
+    (is (= "https://api.murakumo.cloud/v1/messages" (get-in plan [:aiueos.cloud/request :url])))
+    (is (= "murakumo-main" (get-in plan [:aiueos.cloud/request :body :model])))
+    (is (false? (:aiueos.cloud/pinned? plan)))))
+
+(deftest pinning-to-what-the-alias-currently-points-at-is-refused
+  (let [plan (cloud/plan-inference policy admitted-model
+                                   {:messages [{:role "user" :content "hi"}]
+                                    :model-override "qwen3.6-35b-a3b"})]
+    (is (= :model-is-alias-target (:aiueos.cloud/reason plan))
+        "that override looks like precision and is a snapshot")))
+
+(deftest a-deliberate-pin-to-another-model-is-honoured
+  (let [plan (cloud/plan-inference policy admitted-model
+                                   {:messages [{:role "user" :content "hi"}]
+                                    :model-override "some-other-model"})]
+    (is (cloud/allowed? plan))
+    (is (= "some-other-model" (get-in plan [:aiueos.cloud/request :body :model])))
+    (is (true? (:aiueos.cloud/pinned? plan))
+        "the plan says it was pinned, so a receipt can too")))
+
+(deftest a-request-with-no-messages-is-refused
+  (is (= :messages-missing
+         (:aiueos.cloud/reason (cloud/plan-inference policy admitted-model {:messages []})))))
+
+;; ── performing ────────────────────────────────────────────────────────────
+
+(deftest an-allowed-plan-reaches-the-fetch-function
+  (let [plan (cloud/plan-block-read policy raw-cid)
+        seen (atom nil)
+        r (cloud/perform policy plan (fn [req] (reset! seen req) {:status 200}))]
+    (is (:ok? r))
+    (is (= :get (:method @seen)))
+    (is (= (get-in plan [:aiueos.cloud/request :url]) (:url @seen)))))
+
+(deftest a-denied-plan-never-reaches-the-fetch-function
+  (let [plan (cloud/plan-block-read no-network raw-cid)
+        called (atom false)
+        r (cloud/perform no-network plan (fn [_] (reset! called true) {:status 200}))]
+    (is (false? (:ok? r)))
+    (is (= :origin-not-allowed (:aiueos.cloud/denied r)))
+    (is (false? @called))))
+
+(deftest a-plan-whose-url-stopped-being-allowed-is-checked-again-at-call-time
+  (let [plan (cloud/plan-block-read policy raw-cid)
+        called (atom false)
+        r (cloud/perform no-network plan (fn [_] (reset! called true) {:status 200}))]
+    (is (false? (:ok? r)))
+    (is (false? @called)
+        "planning-time approval is not a ticket the call site stops checking")))
+
+;; ── every reason this namespace can produce is declared ───────────────────
+
+(deftest the-declared-reason-set-is-complete
+  (doseq [r [:cid-unparsable :cid-not-raw :origin-not-allowed :plan-not-allowed
+             :insecure-transport :no-trust-anchors :peer-unmeasured :peer-not-pinned
+             :trust-anchors-unbound :anchor-binding-malformed
+             :peer-host-unknown :host-not-pinned :peer-pinned-to-other-host
+             :peer-pin-expired :peer-pin-window-unevaluated
+             :response-not-ok :response-upstream-fault :digest-missing :digest-mismatch
+             :payload-digest-mismatch
+             :write-unauthorized :write-forbidden :write-digest-rejected
+             :alias-unresolved :resolved-endpoint-not-allowed
+             :model-is-alias-target :messages-missing
+             :response-unmeasured :body-unparsable :completion-empty
+             :response-shape-unknown :response-shape-mismatch
+             :response-streaming-unsupported]]
+    (is (contains? cloud/deny-reasons r) (str r " is produced but not declared"))))
+
+;; ── the peer having a bad minute is not the bytes being wrong ─────────────
+
+(def block-plan (cloud/plan-block-read policy raw-cid))
+
+(deftest a-transient-upstream-fault-is-not-a-refusal
+  (testing "5xx, the whole range, including Cloudflare's 52x origin errors"
+    (doseq [status [500 502 503 504 520 522 524 599]]
+      (is (true? (cloud/upstream-fault-status? status)) (str status))))
+  (testing "and nothing else, on purpose"
+    (doseq [status [200 400 401 403 404 422 429 499 600 nil "503"]]
+      (is (false? (cloud/upstream-fault-status? status)) (str status))))
+  (testing "429 is retryable and is still a refusal: it is the authority
+            answering about THIS caller, which is a fact about this machine"
+    (is (= :response-not-ok
+           (:aiueos.cloud/reason (cloud/admit-block block-plan {:status 429}))))))
+
+(deftest the-two-unmeasurable-reasons-are-declared-where-the-meaning-lives
+  (is (= #{:response-unmeasured :response-upstream-fault} cloud/unmeasurable-reasons))
+  (doseq [r cloud/unmeasurable-reasons]
+    (is (contains? cloud/deny-reasons r)))
+  (is (not (contains? cloud/unmeasurable-reasons :digest-mismatch))
+      "the bytes not being what the CID promised is never retryable")
+  (is (not (contains? cloud/unmeasurable-reasons :peer-not-pinned))))
+
+(deftest a-block-read-tells-a-bad-minute-apart-from-a-bad-answer
+  (let [flaky (cloud/admit-block block-plan {:status 503})
+        wrong (cloud/admit-block block-plan {:status 200 :digest-hex other-digest})]
+    (is (= :response-upstream-fault (:aiueos.cloud/reason flaky)))
+    (is (= 503 (:aiueos.cloud/status flaky)) "and the status is on it either way")
+    (is (= :digest-mismatch (:aiueos.cloud/reason wrong)))
+    (is (contains? cloud/unmeasurable-reasons (:aiueos.cloud/reason flaky)))
+    (is (not (contains? cloud/unmeasurable-reasons (:aiueos.cloud/reason wrong)))
+        "one says the peer is having a bad minute; the other says the bytes
+         were not what the CID promised, and a gate that spends the same exit
+         code on both teaches its operator to investigate the weather")))
+
+;; -- the resolution is JSON, and reading it is a decision ------------------
+
+(def alias-body
+  ;; The shape api.murakumo.cloud actually answered on 2026-08-21. It names a
+  ;; THIRD host, which is the whole reason admit-model re-checks.
+  (str "{\"alias-for\":\"qwen3.8-27b\",\"id\":\"murakumo-main\","
+       "\"endpoint\":\"https://infer.murakumo.cloud/v1/chat/completions\"}"))
+
+(def with-infer
+  (assoc policy :aiueos.policy/net-allow
+         #{"kotobase.net" "api.murakumo.cloud" "infer.murakumo.cloud"}))
+
+(deftest a-resolution-is-read-by-name-not-keywordised
+  (let [plan (cloud/plan-model-resolve with-infer)
+        v (cloud/admit-resolution with-infer plan {:status 200 :body alias-body})]
+    (is (cloud/allowed? v))
+    (is (= "https://infer.murakumo.cloud/v1/chat/completions"
+           (get-in v [:aiueos.cloud/model :endpoint])))
+    (is (= "qwen3.8-27b" (get-in v [:aiueos.cloud/model :alias-for])))
+    (is (= :resolved (:aiueos.cloud/endpoint-source v)))))
+
+(deftest a-resolution-that-names-a-host-the-operator-never-admitted-is-refused
+  (let [plan (cloud/plan-model-resolve policy)
+        v (cloud/admit-resolution policy plan {:status 200 :body alias-body})]
+    (is (= :resolved-endpoint-not-allowed (:aiueos.cloud/reason v))
+        "admitting the resolver is not admitting whatever it names next --
+         measured live on 2026-08-21, the alias names infer.murakumo.cloud")))
+
+(deftest a-resolver-that-could-not-be-measured-is-not-an-unresolved-alias
+  (let [plan (cloud/plan-model-resolve policy)]
+    (is (= :response-unmeasured (:aiueos.cloud/reason (cloud/admit-resolution policy plan {})))
+        "no status means the request faulted; there was nothing to refuse")
+    (is (= :response-upstream-fault
+           (:aiueos.cloud/reason (cloud/admit-resolution policy plan {:status 503 :body ""})))
+        "a 503 is the edge having a bad minute, not the alias being wrong")
+    (is (= :response-not-ok
+           (:aiueos.cloud/reason (cloud/admit-resolution policy plan {:status 404 :body ""})))
+        "and an alias the authority does not have is still a refusal")
+    (is (= :body-unparsable
+           (:aiueos.cloud/reason (cloud/admit-resolution policy plan {:status 200 :body "not json"})))
+        "could not read it and read it and it was empty are different facts")))
+
+(deftest an-endpointless-resolution-does-not-quietly-become-the-origin
+  (let [plan (cloud/plan-model-resolve policy)
+        body "{\"alias-for\":\"qwen3.8-27b\",\"id\":\"murakumo-main\"}"]
+    (is (= :alias-unresolved
+           (:aiueos.cloud/reason (cloud/admit-resolution policy plan {:status 200 :body body})))
+        "a machine authorised by an omission has not been authorised")
+    (testing "unless the operator says so in policy, and then the receipt says which"
+      (let [on (assoc policy :aiueos.cloud/endpoint-from-origin? true)
+            v (cloud/admit-resolution on plan {:status 200 :body body})]
+        (is (cloud/allowed? v))
+        (is (= :configured-origin (:aiueos.cloud/endpoint-source v)))
+        (is (= "https://api.murakumo.cloud" (get-in v [:aiueos.cloud/model :endpoint])))))))
+
+;; -- the endpoint may already say where to POST ----------------------------
+
+(def path-model
+  (:aiueos.cloud/model
+   (cloud/admit-model with-infer {:endpoint "https://infer.murakumo.cloud/v1/chat/completions"
+                                  :alias-for "qwen3.8-27b"})))
+
+(deftest an-endpoint-that-names-a-path-is-the-request-url
+  (let [plan (cloud/plan-inference with-infer path-model {:messages [{:role "user" :content "hi"}]})]
+    (is (cloud/allowed? plan))
+    (is (= "https://infer.murakumo.cloud/v1/chat/completions"
+           (get-in plan [:aiueos.cloud/request :url]))
+        "appending /v1/messages would produce an address the authority never named")
+    (is (true? (:aiueos.cloud/endpoint-carries-path? plan)))
+    (is (false? (:aiueos.cloud/endpoint-carries-path?
+                 (cloud/plan-inference policy admitted-model
+                                       {:messages [{:role "user" :content "hi"}]})))
+        "and a bare origin still gets the path appended")))
+
+;; -- judging a completion --------------------------------------------------
+
+(def inference-plan
+  "The Anthropic-shaped surface: a bare origin, so /v1/messages is appended."
+  (cloud/plan-inference policy admitted-model {:messages [{:role "user" :content "hi"}]}))
+
+(def chat-plan
+  "The shape the live alias actually resolves onto."
+  (cloud/plan-inference with-infer path-model {:messages [{:role "user" :content "hi"}]}))
+
+(def messages-body
+  (str "{\"stop_reason\":\"end_turn\",\"content\":"
+       "[{\"type\":\"text\",\"text\":\"pong\"}]}"))
+
+(def chat-body
+  (str "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":"
+       "{\"role\":\"assistant\",\"content\":\"pong\"}}]}"))
+
+;; -- the plan declares the shape; it is not sniffed from the body ----------
+
+(deftest the-plan-says-which-answer-it-expects
+  (is (= :messages-v1 (:aiueos.cloud/response-shape inference-plan)))
+  (is (= :chat-completions-v1 (:aiueos.cloud/response-shape chat-plan))
+      "derived from the path the authority named, not guessed from what came back")
+  (testing "and an operator can say so outright"
+    (is (= :messages-v1
+           (:aiueos.cloud/response-shape
+            (cloud/plan-inference (assoc with-infer :aiueos.cloud/response-shape :messages-v1)
+                                  path-model {:messages [{:role "user" :content "hi"}]}))))))
+
+(deftest a-completion-that-arrived-is-admitted
+  (testing "the /v1/messages shape"
+    (let [v (cloud/admit-inference inference-plan {:status 200 :body messages-body})]
+      (is (cloud/allowed? v))
+      (is (= "pong" (:aiueos.cloud/completion v)))
+      (is (= 4 (:aiueos.cloud/completion-chars v)))
+      (is (= "end_turn" (:aiueos.cloud/stop-reason v)))
+      (is (= :messages-v1 (:aiueos.cloud/response-shape v))
+          "the verdict says which shape it read, so a receipt does not have to guess")))
+  (testing "the chat-completions shape, which is what the live alias resolves to"
+    (let [v (cloud/admit-inference chat-plan {:status 200 :body chat-body})]
+      (is (cloud/allowed? v))
+      (is (= "pong" (:aiueos.cloud/completion v)))
+      (is (= "stop" (:aiueos.cloud/stop-reason v)))
+      (is (= :chat-completions-v1 (:aiueos.cloud/response-shape v))))))
+
+(deftest each-reader-reads-only-its-own-shape
+  (is (= :response-shape-mismatch
+         (:aiueos.cloud/reason (cloud/admit-inference inference-plan {:status 200 :body chat-body})))
+      "a chat-completions body where /v1/messages was asked for is a different
+       document, not an empty answer")
+  (is (= :response-shape-mismatch
+         (:aiueos.cloud/reason (cloud/admit-inference chat-plan {:status 200 :body messages-body})))
+      "and the same in the other direction -- one lenient reader would call
+       both of these empty and hide the fact that the wrong host answered"))
+
+(deftest a-stream-is-refused-by-name-rather-than-as-the-wrong-document
+  ;; The real thing, as either surface emits it with `stream: true`: SSE frames
+  ;; carrying chat-completions deltas. This plane never asks for one, so the
+  ;; case that matters is an authority that starts streaming on its own.
+  (let [sse (str "data: {\"choices\":[{\"delta\":{\"content\":\"po\"}}]}\n\n"
+                 "data: {\"choices\":[{\"delta\":{\"content\":\"ng\"}}]}\n\n"
+                 "data: [DONE]\n\n")]
+    (testing "the content type says so"
+      (let [v (cloud/admit-inference chat-plan {:status 200
+                                                :content-type "text/event-stream"
+                                                :body sse})]
+        (is (= :response-streaming-unsupported (:aiueos.cloud/reason v))
+            "not :body-unparsable, which reads as the authority being broken
+             when the truth is that this client does not implement what it was
+             sent")
+        (is (= "text/event-stream" (:aiueos.cloud/content-type v)))))
+    (testing "and so does the framing, when nobody said"
+      (is (= :response-streaming-unsupported
+             (:aiueos.cloud/reason (cloud/admit-inference chat-plan {:status 200 :body sse})))))
+    (testing "a JSON document is not mistaken for one"
+      (is (cloud/allowed? (cloud/admit-inference chat-plan {:status 200
+                                                            :content-type "application/json"
+                                                            :body chat-body})))
+      (is (= :body-unparsable
+             (:aiueos.cloud/reason (cloud/admit-inference chat-plan {:status 200
+                                                                     :body "not json"})))
+          "genuinely unreadable bytes still read as unreadable"))
+    (testing "the predicate on its own"
+      (is (true? (cloud/streaming-response? {:content-type "text/event-stream; charset=utf-8"})))
+      (is (true? (cloud/streaming-response? {:body "event: ping\ndata: {}\n\n"})))
+      (is (false? (cloud/streaming-response? {:body chat-body})))
+      (is (false? (cloud/streaming-response? {}))
+          "an absent body is not a stream; it is an absent body"))))
+
+(deftest a-shape-this-namespace-cannot-read-is-refused-before-the-body
+  (let [plan (assoc inference-plan :aiueos.cloud/response-shape :some-other-api)
+        v (cloud/admit-inference plan {:status 200 :body messages-body})]
+    (is (= :response-shape-unknown (:aiueos.cloud/reason v))
+        "a machine that cannot say what document it asked for cannot judge the
+         one it got")
+    (is (= :some-other-api (:aiueos.cloud/response-shape v)))))
+
+(deftest a-model-that-returned-nothing-is-not-a-completion
+  (let [v (cloud/admit-inference
+           chat-plan
+           {:status 200
+            :body (str "{\"choices\":[{\"finish_reason\":\"length\",\"message\":"
+                       "{\"content\":\"\",\"reasoning_content\":\"thinking about it\"}}]}")})]
+    (is (= :completion-empty (:aiueos.cloud/reason v))
+        "a model that spent its budget thinking produced no completion --
+         measured 2026-08-22 against the live endpoint at max_tokens 8")
+    (is (= "length" (:aiueos.cloud/stop-reason v)) "and it says why"))
+  (testing "the container is there and empty, which is the point"
+    (is (= :completion-empty
+           (:aiueos.cloud/reason (cloud/admit-inference inference-plan
+                                                        {:status 200 :body "{\"content\":[]}"}))))))
+
+(deftest three-outcomes-that-must-not-collapse
+  (is (= :response-unmeasured (:aiueos.cloud/reason (cloud/admit-inference inference-plan {})))
+      "the provider could not measure")
+  (is (= :completion-empty
+         (:aiueos.cloud/reason (cloud/admit-inference inference-plan
+                                                      {:status 200 :body "{\"content\":[]}"})))
+      "the model returned nothing")
+  (is (cloud/allowed?
+       (cloud/admit-inference inference-plan
+                              {:status 200 :body "{\"content\":[{\"text\":\"x\"}]}"}))
+      "it worked"))
+
+(deftest an-uncredentialed-inference-request-lands-as-its-status
+  (let [v (cloud/admit-inference
+           inference-plan
+           {:status 401
+            :body "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}"})]
+    (is (= :response-not-ok (:aiueos.cloud/reason v)))
+    (is (= 401 (:aiueos.cloud/status v))
+        "measured 2026-08-21: POST /v1/messages with no credential")))
+
+(deftest a-body-that-is-not-json-is-not-an-empty-completion
+  (let [v (cloud/admit-inference inference-plan {:status 200 :body "<html>502</html>"})]
+    (is (= :body-unparsable (:aiueos.cloud/reason v)))
+    (is (contains? json/errors (:grant.json/error v)))))
+
+;; -- liveness is less than a completion, on purpose ------------------------
+
+(deftest liveness-asks-the-smallest-question
+  (let [plan (cloud/plan-liveness policy)]
+    (is (cloud/allowed? plan))
+    (is (= "https://api.murakumo.cloud/ready" (get-in plan [:aiueos.cloud/request :url])))
+    (let [v (cloud/admit-liveness plan {:status 200})]
+      (is (cloud/allowed? v))
+      (is (true? (:aiueos.cloud/live? v)))
+      (is (nil? (:aiueos.cloud/completion v))
+          "nothing here may be read as an inference result"))
+    (is (= :response-upstream-fault (:aiueos.cloud/reason (cloud/admit-liveness plan {:status 502}))))
+    (is (= :response-not-ok (:aiueos.cloud/reason (cloud/admit-liveness plan {:status 404})))
+        "a route that is not there is a fact about this machine's configuration")
+    (is (= :response-unmeasured (:aiueos.cloud/reason (cloud/admit-liveness plan {}))))))
+
+;; -- writing a block -------------------------------------------------------
+
+(def write-plan (cloud/plan-block-write policy raw-cid))
+
+(deftest bytes-that-do-not-hash-to-the-cid-never-leave
+  (is (cloud/allowed? (cloud/admit-write-payload write-plan hello-digest)))
+  (let [v (cloud/admit-write-payload write-plan other-digest)]
+    (is (= :payload-digest-mismatch (:aiueos.cloud/reason v))
+        "a CID is a claim about bytes and this request is the machine making it")
+    (is (= hello-digest (:aiueos.cloud/expect-digest v)))
+    (is (= other-digest (:aiueos.cloud/observed-digest v))))
+  (is (= :digest-missing (:aiueos.cloud/reason (cloud/admit-write-payload write-plan nil)))
+      "a provider that did not measure does not get a pass here either")
+  (is (= :plan-not-allowed
+         (:aiueos.cloud/reason (cloud/admit-write-payload
+                                (cloud/plan-block-write no-network raw-cid) hello-digest)))))
+
+(deftest a-store-that-took-the-block-says-so-three-ways
+  (doseq [status [200 201 204]]
+    (is (cloud/allowed? (cloud/admit-write write-plan {:status status}))
+        "stored and already stored are the same outcome, spelled differently")))
+
+(deftest the-three-write-refusals-are-kept-apart
+  (is (= :write-unauthorized (:aiueos.cloud/reason (cloud/admit-write write-plan {:status 401})))
+      "no bearer token, or one the authority does not hold")
+  (is (= :write-forbidden (:aiueos.cloud/reason (cloud/admit-write write-plan {:status 403})))
+      "the authority has the feature switched off; nothing the caller sends helps")
+  (is (= :write-digest-rejected (:aiueos.cloud/reason (cloud/admit-write write-plan {:status 422})))
+      "this machine and the store disagree about what they hashed")
+  (is (= :response-upstream-fault (:aiueos.cloud/reason (cloud/admit-write write-plan {:status 500})))
+      "and a fourth, which is not a refusal at all: the store failed to answer")
+  (is (= :response-not-ok (:aiueos.cloud/reason (cloud/admit-write write-plan {:status 405}))))
+  (is (= :response-unmeasured (:aiueos.cloud/reason (cloud/admit-write write-plan {}))))
+  (is (= 401 (:aiueos.cloud/status (cloud/admit-write write-plan {:status 401})))
+      "and each carries the status, so a receipt does not have to guess"))
+
+;; ── the contract names files, and half of them are in this repository ─────
+;;
+;; `resources/aiueos/cloud_contract.edn` names source files in TWO
+;; repositories: `src/grant/*.cljc` here, and `src/aiueos/*` in
+;; `kotoba-lang/aiueos`, which requires this one and is not required by it. A
+;; test here can only see its own half, and the other half is checked by
+;; `aiueos.cloud-contract-paths-test` in that repository. Two tests, because
+;; neither can reach the other's tree -- and a claim nothing checks is exactly
+;; the shape root ADR-2608136000 is about.
+
+#?(:clj
+   (deftest the-contracts-own-source-files-exist
+     (let [contract (some-> (io/resource "aiueos/cloud_contract.edn")
+                            slurp edn/read-string first)
+           named (:aiueos.cloud/source-files contract)]
+       (is (some? contract) "resources/aiueos/cloud_contract.edn is on the classpath")
+       (is (io/exists? (io/file "deps.edn"))
+           (str "this test reads paths relative to the repository root; it was run "
+                "from " (System/getProperty "user.dir") " and cannot answer from there"))
+       (is (<= 2 (count named))
+           "an evidence floor: zero paths checked must not report the same
+            green as every path checked")
+       (doseq [path named]
+         (is (str/starts-with? path "lib/kotoba.grant/src/grant/")
+             (str path " is not this repository's to check"))
+         (is (io/exists? (io/file path)) (str path " is named by the contract and does not exist"))))))
+
+#?(:clj
+   (deftest the-contract-declares-the-reasons-the-code-produces
+     ;; The same shape as the paths, one field over: the contract states a
+     ;; vocabulary and nothing compared it to the vocabulary. `deny-reasons` is
+     ;; already checked against what the functions emit; this closes the other
+     ;; side of the triangle.
+     (let [contract (some-> (io/resource "aiueos/cloud_contract.edn")
+                            slurp edn/read-string first)]
+       (is (some? contract))
+       (is (= cloud/deny-reasons (:aiueos.cloud/deny-reasons contract))
+           "the contract and the namespace name the same refusals")
+       (is (= cloud/unmeasurable-reasons (:aiueos.cloud/unmeasurable-reasons contract)))
+       (is (every? cloud/deny-reasons cloud/unmeasurable-reasons)))))

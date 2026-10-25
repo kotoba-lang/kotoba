@@ -1,0 +1,263 @@
+(ns grant.signing-test
+  (:require [kotoba.bytes :as kbytes] [grant.signing :as signing]
+            [kotoba.test :refer [deftest is testing]])
+  #?(:clj (:import [java.security KeyPairGenerator Signature])))
+
+;; ───────── JVM test helpers: real Ed25519 keypairs + raw signing ─────────
+;;
+;; `grant.signing/verify` only understands raw 32-byte public keys and
+;; 64-byte signatures (hex-encoded), so tests need a *real* valid signature to
+;; exercise the success path -- a hardcoded fake key/sig pair could never
+;; verify. These helpers use the exact same JDK Ed25519 APIs `grant.signing`
+;; itself uses (see its namespace docstring / `kagi.cacao`), just from the
+;; signer's side (KeyPairGenerator + Signature/initSign) instead of the
+;; verifier's side.
+
+#?(:clj
+   (defn- gen-keypair []
+     (.generateKeyPair (KeyPairGenerator/getInstance "Ed25519"))))
+
+#?(:clj
+   (defn- raw-public-key-hex
+     "A JVM Ed25519 `PublicKey`'s `.getEncoded` is X.509 SubjectPublicKeyInfo:
+     a fixed 12-byte DER header + the raw 32-byte key. Strip the header to get
+     the raw key `grant.signing/verify` expects, hex-encoded."
+     [pub]
+     (signing/hex-encode (drop 12 (seq (.getEncoded pub))))))
+
+#?(:clj
+   (defn- sign-hex
+     "Sign `msg` (a String) with `priv` (a JVM Ed25519 `PrivateKey`), return
+     the raw 64-byte signature hex-encoded."
+     [priv ^String msg]
+     (let [s (doto (Signature/getInstance "Ed25519") (.initSign priv))]
+       (.update s (kbytes/utf8-bytes msg))
+       (signing/hex-encode (.sign s)))))
+
+;; ───────── signed-message shape ─────────
+
+(deftest signed-message-is-id-newline-wasm-sha256
+  (is (= "app/notes\ndeadbeef"
+         (signing/signed-message {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef"})))
+  (is (= "app.notes\ndeadbeef"
+         (signing/signed-message {:aiueos/component "app.notes" :aiueos/wasm-sha256 "deadbeef"}))))
+
+(deftest signed-message-binds-portable-artifact-identity
+  (is (= "app/notes\nkototama/program-v1\nbafkreic6wtrsfonzv25l32xh2os7eoiw2i7jzzjri2y5ul77ndedxhwf64"
+         (signing/signed-message
+          {:aiueos/component :app/notes
+           :aiueos/artifact {:kind :kototama/program-v1 :path "program.dagcbor"
+                             :cid "bafkreic6wtrsfonzv25l32xh2os7eoiw2i7jzzjri2y5ul77ndedxhwf64"}}))))
+
+(deftest signed-message-binds-a-declared-vm-profile
+  (let [base {:aiueos/component :app/notes
+              :aiueos/artifact {:kind :kototama/program-v1
+                                :profile :kototama/core-i64-subset-v1
+                                :path "program.dagcbor"
+                                :cid "bafkreic6wtrsfonzv25l32xh2os7eoiw2i7jzzjri2y5ul77ndedxhwf64"}}
+        changed (assoc-in base [:aiueos/artifact :profile]
+                          :kototama/future-profile-v1)]
+    (is (= (str "app/notes\nkototama/program-v1\n"
+                "kototama/core-i64-subset-v1\n"
+                "bafkreic6wtrsfonzv25l32xh2os7eoiw2i7jzzjri2y5ul77ndedxhwf64")
+           (signing/signed-message base)))
+    (is (not= (signing/signed-message base)
+              (signing/signed-message changed)))))
+
+(deftest signed-message-is-nil-without-wasm-sha256
+  (is (nil? (signing/signed-message {:aiueos/component :app/notes}))))
+
+;; ───────── hex codec ─────────
+
+(deftest hex-decode-encode-round-trip
+  (is (= [0 255 16 32 171] (signing/hex-decode "00ff1020ab")))
+  (is (= "00ff1020ab" (signing/hex-encode (signing/hex-decode "00ff1020AB")))))
+
+#?(:clj
+   (deftest hex-decode-rejects-odd-length
+     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"even length"
+                            (signing/hex-decode "abc")))))
+
+#?(:clj
+   (deftest hex-decode-rejects-an-invalid-digit
+     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid hex digit"
+                            (signing/hex-decode "zz")))))
+
+;; ───────── sha256-hex (ADR-0003 artifact integrity, security fix
+;; 2607131500) -- JVM-only, MessageDigest ─────────
+
+#?(:clj
+   (deftest sha256-hex-matches-a-known-vector
+     (testing "empty input's SHA-256 is a well-known constant -- confirms
+     this isn't accidentally MD5/SHA-1/some other digest"
+       (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              (signing/sha256-hex (byte-array 0)))))))
+
+#?(:clj
+   (deftest sha256-hex-is-deterministic-and-sensitive-to-every-byte
+     (let [a (byte-array (map byte [1 2 3]))
+           b (byte-array (map byte [1 2 3]))
+           c (byte-array (map byte [1 2 4]))]
+       (is (= (signing/sha256-hex a) (signing/sha256-hex b))
+           "same bytes -> same hash, every time")
+       (is (not= (signing/sha256-hex a) (signing/sha256-hex c))
+           "one differing byte -> a completely different hash"))))
+
+;; ───────── verify: pure (host-neutral) deny paths ─────────
+
+(deftest unsigned-manifest-is-unsigned
+  (let [m {:aiueos/component :app/notes :aiueos/kind :app}
+        result (signing/verify m {:aiueos.policy/signers {}})]
+    (is (= {:aiueos.signing/status :unsigned} result))
+    (is (signing/unsigned? result))
+    (is (not (signing/violation? result)))))
+
+(deftest signature-without-signer-is-a-bad-signature-violation
+  (let [m {:aiueos/component :app/notes :aiueos/signature "aabbcc"}
+        result (signing/verify m {:aiueos.policy/signers {}})]
+    (is (signing/violation? result))
+    (is (= :app/notes (:aiueos/component result)))
+    (is (= :bad-signature (:aiueos/kind result)))
+    (is (re-find #":aiueos/signer" (:aiueos/message result)))))
+
+(deftest signed-manifest-without-wasm-sha256-is-a-bad-signature-violation
+  (let [m {:aiueos/component :app/notes :aiueos/signer :signer/alice :aiueos/signature "aabbcc"}
+        result (signing/verify m {:aiueos.policy/signers {:signer/alice "00"}})]
+    (is (signing/violation? result))
+    (is (= :bad-signature (:aiueos/kind result)))
+    (is (re-find #"wasm-sha256" (:aiueos/message result)))))
+
+(deftest unregistered-signer-is-a-bad-signature-violation
+  (let [m {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef"
+           :aiueos/signer :signer/nobody :aiueos/signature "aabbcc"}
+        result (signing/verify m {:aiueos.policy/signers {}})]
+    (is (signing/violation? result))
+    (is (= :bad-signature (:aiueos/kind result)))
+    (is (re-find #"not active: unregistered" (:aiueos/message result)))))
+
+;; ───────── verify: JVM crypto paths (real Ed25519 keypairs) ─────────
+
+#?(:clj
+   (deftest a-valid-signature-verifies
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           base {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef" :aiueos/signer :signer/alice}
+           sig-hex (sign-hex (.getPrivate kp) (signing/signed-message base))
+           m (assoc base :aiueos/signature sig-hex)
+           policy {:aiueos.policy/signers {:signer/alice pub-hex}}
+           result (signing/verify m policy)]
+       (is (signing/verified? result))
+       (is (= {:aiueos.signing/status :verified :aiueos.signing/signer :signer/alice} result)))))
+
+#?(:clj
+   (deftest lifecycle-aware-signer-rotation-revocation-and-expiry-fail-closed
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           base {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef"
+                 :aiueos/signer :signer/alice}
+           manifest (assoc base :aiueos/signature
+                           (sign-hex (.getPrivate kp)
+                                     (signing/signed-message base)))
+           active {:public-key pub-hex :status :active
+                   :not-before-ms 1000 :expires-at-ms 2000}
+           verify-at (fn [entry now]
+                       (signing/verify
+                        manifest
+                        {:aiueos.policy/signers {:signer/alice entry}
+                         :aiueos.policy/now-ms now}))]
+       (is (signing/verified? (verify-at active 1500)))
+       (doseq [[entry now reason]
+               [[(assoc active :status :revoked) 1500 "revoked"]
+                [(assoc active :status :compromised) 1500 "compromised"]
+                [(assoc active :status :suspended) 1500 "suspended"]
+                [active 999 "not-yet-valid"]
+                [active 2000 "expired"]]]
+         (let [result (verify-at entry now)]
+           (is (signing/violation? result))
+           (is (re-find (re-pattern reason) (:aiueos/message result)))))
+       (is (re-find #"missing-policy-clock"
+                    (:aiueos/message
+                     (signing/verify
+                      manifest
+                      {:aiueos.policy/signers {:signer/alice active}})))))))
+
+#?(:clj
+   (deftest a-tampered-manifest-fails-verification-not-downgraded-to-unsigned
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           base {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef" :aiueos/signer :signer/alice}
+           sig-hex (sign-hex (.getPrivate kp) (signing/signed-message base))
+           ;; the wasm bytes changed after signing -> the signed message no
+           ;; longer matches what was actually signed
+           tampered (assoc base :aiueos/wasm-sha256 "cafebabe" :aiueos/signature sig-hex)
+           policy {:aiueos.policy/signers {:signer/alice pub-hex}}
+           result (signing/verify tampered policy)]
+       (is (signing/violation? result))
+       (is (not (signing/unsigned? result)))
+       (is (= :bad-signature (:aiueos/kind result)))
+       (is (re-find #"does not verify" (:aiueos/message result))))))
+
+#?(:clj
+   (deftest a-tampered-vm-profile-fails-signature-verification
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           base {:aiueos/component :app/calc
+                 :aiueos/signer :signer/alice
+                 :aiueos/artifact {:kind :kototama/program-v1
+                                   :profile :kototama/core-i64-subset-v1
+                                   :path "program.dagcbor"
+                                   :cid "bafkreic6wtrsfonzv25l32xh2os7eoiw2i7jzzjri2y5ul77ndedxhwf64"}}
+           sig-hex (sign-hex (.getPrivate kp) (signing/signed-message base))
+           tampered (-> base
+                        (assoc :aiueos/signature sig-hex)
+                        (assoc-in [:aiueos/artifact :profile]
+                                  :kototama/future-profile-v1))
+           result (signing/verify tampered
+                                 {:aiueos.policy/signers {:signer/alice pub-hex}})]
+       (is (signing/violation? result))
+       (is (= :bad-signature (:aiueos/kind result)))
+       (is (re-find #"does not verify" (:aiueos/message result))))))
+
+#?(:clj
+   (deftest a-signature-from-a-different-keypair-fails-verification
+     (let [signer-kp (gen-keypair)
+           attacker-kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic signer-kp))
+           base {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef" :aiueos/signer :signer/alice}
+           wrong-sig-hex (sign-hex (.getPrivate attacker-kp) (signing/signed-message base))
+           m (assoc base :aiueos/signature wrong-sig-hex)
+           policy {:aiueos.policy/signers {:signer/alice pub-hex}}
+           result (signing/verify m policy)]
+       (is (signing/violation? result))
+       (is (= :bad-signature (:aiueos/kind result))))))
+
+#?(:clj
+   (deftest malformed-signature-hex-is-a-violation-not-a-thrown-exception
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           m {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef"
+              :aiueos/signer :signer/alice :aiueos/signature "abc"} ;; odd length
+           policy {:aiueos.policy/signers {:signer/alice pub-hex}}
+           result (signing/verify m policy)]
+       (is (signing/violation? result))
+       (is (= :bad-signature (:aiueos/kind result)))
+       (is (re-find #"malformed" (:aiueos/message result))))))
+
+#?(:clj
+   (deftest malformed-signer-key-hex-is-a-violation
+     (let [m {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef"
+              :aiueos/signer :signer/alice :aiueos/signature "aabbccdd"}
+           policy {:aiueos.policy/signers {:signer/alice "not-hex!!"}}
+           result (signing/verify m policy)]
+       (is (signing/violation? result))
+       (is (= :bad-signature (:aiueos/kind result))))))
+
+#?(:clj
+   (deftest wrong-length-key-is-a-violation
+     (let [m {:aiueos/component :app/notes :aiueos/wasm-sha256 "deadbeef"
+              :aiueos/signer :signer/alice :aiueos/signature "aabbccdd"}
+           policy {:aiueos.policy/signers {:signer/alice "aabbcc"}} ;; 3 bytes, not 32
+           result (signing/verify m policy)]
+       (is (signing/violation? result))
+       (is (= :bad-signature (:aiueos/kind result)))
+       (is (re-find #"32 bytes" (:aiueos/message result))))))

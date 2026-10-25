@@ -1,0 +1,192 @@
+(ns grant.authority-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [grant.authority :as authority]
+            [grant.broker :as broker]
+            [grant.policy :as policy]))
+
+(def principal
+  {:principal/id "did:key:alice"
+   :principal/kind :human
+   :principal/authenticated? true
+   :principal/account :account/alice
+   :principal/tenant :tenant/acme
+   :principal/authn-method :passkey
+   :principal/assurance :high})
+
+(def actor
+  {:actor/id :agent/researcher
+   :actor/kind :agent
+   :actor/code-cid "bafy-code"})
+
+(def intent
+  {:intent/action :object/read
+   :intent/resource [:object/id "bafy-data"]
+   :intent/audience :kotobase})
+
+(def grant
+  {:grant/id "bafy-grant"
+   :grant/subject "did:key:alice"
+   :grant/actions #{:object/read}
+   :grant/resources #{[:object/id "bafy-data"]}
+   :grant/audience :kotobase
+   :grant/tenant :tenant/acme
+   :grant/not-before 100
+   :grant/expires-at 200})
+
+(def base-input
+  {:authority/principal principal
+   :authority/actor actor
+   :authority/intent intent
+   :authority/effects #{:object/read}
+   :authority/grants [grant]
+   :authority/policy {:policy/public #{}
+                      :policy/deny-actions #{}
+                      :policy/min-assurance {:object/read :substantial}
+                      :policy/required-approvals {}}
+   :authority/context {:context/now 150
+                       :context/audience :kotobase
+                       :context/tenant :tenant/acme
+                       :context/approvals #{}
+                       :context/nonce "n-1"
+                       :context/nonce-used? false}})
+
+(deftest exact-grant-allows-a-purpose-bound-capability-spec
+  (let [decision (authority/decide base-input)]
+    (is (= :allow (:decision/status decision)))
+    (is (= ["bafy-grant"] (:decision/grant-ids decision)))
+    (is (= {:capability/principal "did:key:alice"
+            :capability/actor :agent/researcher
+            :capability/action :object/read
+            :capability/resource [:object/id "bafy-data"]
+            :capability/audience :kotobase
+            :capability/tenant :tenant/acme}
+           (:decision/runtime-capability-spec decision)))))
+
+(deftest authority-is-the-intersection-not-the-union
+  (testing "a grant cannot supply an undeclared effect"
+    (is (= :authority/effect-not-declared
+           (:decision/reason
+            (authority/decide (assoc base-input :authority/effects #{}))))))
+  (testing "an effect cannot supply a missing grant"
+    (is (= :authority/grant-missing
+           (:decision/reason
+            (authority/decide (assoc base-input :authority/grants []))))))
+  (testing "resource, audience, tenant, expiry and revocation remain bound"
+    (doseq [bad-grant [(assoc grant :grant/resources #{[:object/id "other"]})
+                       (assoc grant :grant/audience :other-service)
+                       (assoc grant :grant/tenant :tenant/other)
+                       (assoc grant :grant/expires-at 150)
+                       (assoc grant :grant/revoked? true)]]
+      (is (= :authority/grant-missing
+             (:decision/reason
+              (authority/decide (assoc base-input :authority/grants [bad-grant]))))))))
+
+(deftest challenge-is-distinct-from-deny
+  (testing "credential adapter can satisfy authentication"
+    (is (= :challenge
+           (:decision/status
+            (authority/decide
+             (assoc-in base-input
+                       [:authority/principal :principal/authenticated?] false))))))
+  (testing "step-up can satisfy assurance"
+    (is (= :authority/step-up-required
+           (:decision/reason
+            (authority/decide
+             (assoc-in base-input
+                       [:authority/principal :principal/assurance] :low))))))
+  (testing "a different principal must provide a shared approval"
+    (let [input (assoc-in base-input
+                          [:authority/policy :policy/required-approvals]
+                          {:object/read 1})]
+      (is (= :authority/shared-approval-required
+             (:decision/reason (authority/decide input))))
+      (is (= :allow
+             (:decision/status
+              (authority/decide
+               (assoc-in input [:authority/context :context/approvals]
+                         #{"did:key:bob"})))))
+      (is (= :authority/shared-approval-required
+             (:decision/reason
+              (authority/decide
+               (assoc-in input [:authority/context :context/approvals]
+                         #{"did:key:alice"}))))))))
+
+(deftest public-access-is-explicit-policy-not-an-exception
+  (let [public-input (-> base-input
+                         (assoc :authority/grants [])
+                         (assoc-in [:authority/principal :principal/id] :anonymous)
+                         (assoc-in [:authority/principal :principal/kind] :anonymous)
+                         (assoc-in [:authority/principal :principal/authenticated?] false)
+                         (assoc-in [:authority/policy :policy/public]
+                                   #{[:object/read [:object/id "bafy-data"]]}))]
+    (is (= :allow (:decision/status (authority/decide public-input))))
+    (is (= :authority/public-policy
+           (:decision/reason (authority/decide public-input))))))
+
+(deftest replay-and-unknown-fields-fail-closed
+  (is (= :authority/nonce-replayed
+         (:decision/reason
+          (authority/decide
+           (assoc-in base-input [:authority/context :context/nonce-used?] true)))))
+  (is (= :authority/invalid-principal
+         (:decision/reason
+          (authority/decide
+           (assoc-in base-input [:authority/principal :credential/raw]
+                     "must-not-cross-the-edge")))))
+  (is (= :authority/invalid-policy
+         (:decision/reason
+          (authority/decide
+           (assoc-in base-input [:authority/policy :policy/public] 42)))))
+  (is (= :authority/audience-mismatch
+         (:decision/reason
+          (authority/decide
+           (assoc-in base-input [:authority/context :context/audience]
+                     :other-service)))))
+  (is (= :authority/tenant-mismatch
+         (:decision/reason
+          (authority/decide
+           (assoc-in base-input [:authority/context :context/tenant]
+                     :tenant/other))))))
+
+(deftest broker-admission-cannot-be-overridden-by-an-identity-grant
+  (let [manifest {:aiueos/component :agent/researcher
+                  :aiueos/kind :agent
+                  :aiueos/trust :trusted
+                  :aiueos/imports #{:object/read}
+                  :aiueos/effects #{:network}}
+        input (dissoc base-input :authority/effects)
+        decision (broker/decide-authority manifest {} policy/default-policy input)]
+    (is (= :deny (:decision/status decision)))
+    (is (= :authority/code-admission-denied (:decision/reason decision)))))
+
+(deftest broker-supplies-effects-from-the-admitted-manifest
+  (let [manifest {:aiueos/component :agent/researcher
+                  :aiueos/kind :agent
+                  :aiueos/imports #{:object/read}}
+        admission-policy (assoc-in policy/default-policy
+                                   [:aiueos.policy/grants :agent/researcher]
+                                   #{:object/read})
+        input (dissoc base-input :authority/effects)
+        decision (broker/decide-authority manifest {} admission-policy input)]
+    (is (= :allow (:decision/status decision)))
+    (is (= :object/read
+           (get-in decision [:decision/runtime-capability-spec
+                             :capability/action])))))
+
+(deftest receipt-is-closed-and-secret-free
+  (let [decision (authority/decide base-input)
+        receipt {:receipt/intent-cid "bafy-intent"
+                 :receipt/principal "did:key:alice"
+                 :receipt/actor :agent/researcher
+                 :receipt/code-cid "bafy-code"
+                 :receipt/policy-cid "bafy-policy"
+                 :receipt/grant-cids ["bafy-grant"]
+                 :receipt/decision decision
+                 :receipt/outcome {:outcome/status :succeeded
+                                   :outcome/result-cid "bafy-result"}
+                 :receipt/basis 42
+                 :receipt/provider :provider/object-store
+                 :receipt/at 151}]
+    (is (= receipt (authority/receipt receipt)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (authority/receipt (assoc receipt :credential/raw "secret"))))))

@@ -1,0 +1,290 @@
+(ns grant.anchors-test
+  (:require [grant.anchors :as anchors]
+            [grant.cloud :as cloud]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def pin-a (apply str (repeat 64 "a")))
+(def pin-b (apply str (repeat 64 "b")))
+(def pin-c (apply str (repeat 64 "c")))
+
+(def root {:keys #{"k1" "k2" "k3"} :threshold 2})
+(def sigs [{:key-id "k1" :verified? true :status-index 0}
+           {:key-id "k2" :verified? true :status-index 1}])
+(def all-sigs (conj sigs {:key-id "k3" :verified? true :status-index 2}))
+
+(defn- state [& {:as over}]
+  (merge {:installed-anchor-sequence 6 :now-ms 1000 :root root
+          :revocation-bits [0 0 0 0] :current-anchors #{pin-a}}
+         over))
+
+(defn- proposed [& {:as over}]
+  (merge {:set-id "anchors-7" :sequence 7 :anchors #{pin-a pin-b}
+          :signatures sigs :timestamp-ms 1000 :digest-matches? true}
+         over))
+
+;; ── an anchor set is a release, and is admitted like one ──────────────────
+
+(deftest an-overlapping-set-at-a-higher-sequence-is-admitted
+  (let [v (anchors/admit-set (proposed) (state))]
+    (is (anchors/admitted? v))
+    (is (= #{pin-a pin-b} (:aiueos.anchors/anchors v)))
+    (is (= [pin-a] (:aiueos.anchors/overlap v)))
+    (is (false? (:aiueos.anchors/one-way? v)))))
+
+(deftest publisher-reasons-pass-through-unchanged
+  (testing "one signature is below the root's threshold"
+    (let [v (anchors/admit-set (proposed :signatures [(first sigs)]) (state))]
+      (is (= :below-threshold (:aiueos.publisher/reason v)))
+      (is (nil? (:aiueos.anchors/reason v)) "not relabelled")))
+  (testing "a set at or below the installed sequence is a rollback"
+    (is (= :sequence-not-monotonic
+           (:aiueos.publisher/reason (anchors/admit-set (proposed :sequence 6) (state))))))
+  (testing "a revoked signer does not count"
+    (is (= :key-revoked
+           (:aiueos.publisher/reason
+            (anchors/admit-set (proposed) (state :revocation-bits [1 1 0 0]))))))
+  (testing "freeze"
+    (is (= :timestamp-expired
+           (:aiueos.publisher/reason
+            (anchors/admit-set (proposed) (state :now-ms (+ 1000 (* 1000 60 60 48)))))))))
+
+;; ── what is true of anchor sets and of nothing else ───────────────────────
+
+(deftest a-perfectly-signed-empty-set-is-refused
+  (let [v (anchors/admit-set (proposed :anchors #{}) (state))]
+    (is (= :anchor-set-empty (:aiueos.anchors/reason v))
+        "an empty pin set is not permissive, it is a brick")))
+
+(deftest a-set-with-no-identity-is-refused
+  (is (= :set-id-missing (:aiueos.anchors/reason
+                          (anchors/admit-set (proposed :set-id nil) (state))))))
+
+(deftest replacing-every-anchor-at-once-needs-break-glass
+  (let [v (anchors/admit-set (proposed :anchors #{pin-b pin-c}) (state))]
+    (is (= :disjoint-without-break-glass (:aiueos.anchors/reason v)))
+    (is (= [pin-a] (:aiueos.anchors/current v)))
+    (is (= [pin-b pin-c] (:aiueos.anchors/proposed v))
+        "the verdict shows both sets, because the operator has to see the gap")))
+
+(deftest break-glass-needs-every-root-key-not-the-threshold
+  (let [refused (anchors/admit-set (proposed :anchors #{pin-b pin-c} :break-glass? true)
+                                   (state))]
+    (is (= :break-glass-below-threshold (:aiueos.anchors/reason refused)))
+    (is (= 3 (:aiueos.anchors/required refused)))
+    (is (= 2 (:aiueos.anchors/live refused))))
+  (let [admitted (anchors/admit-set (proposed :anchors #{pin-b pin-c} :break-glass? true
+                                              :signatures all-sigs)
+                                    (state))]
+    (is (anchors/admitted? admitted))
+    (is (true? (:aiueos.anchors/one-way? admitted))
+        "the verdict says what this is, so nobody does it by accident")))
+
+;; ── trust on first use is not available ───────────────────────────────────
+
+(deftest a-device-with-no-anchors-refuses-a-set-off-the-network
+  (let [v (anchors/admit-set (proposed) (state :current-anchors #{}))]
+    (is (= :no-current-set (:aiueos.anchors/reason v))
+        "it has no way to judge the connection that delivered it")))
+
+(deftest the-image-carries-the-first-set
+  (let [v (anchors/admit-set (proposed :bootstrap? true) (state :current-anchors #{}))]
+    (is (anchors/admitted? v))
+    (is (true? (:aiueos.anchors/bootstrap? v)))
+    (is (false? (:aiueos.anchors/one-way? v))
+        "there was nothing to strand")))
+
+;; ── rotation is not a flag day ────────────────────────────────────────────
+
+(deftest a-rotation-that-overlaps-can-retire-the-old-key
+  (testing "ship the new key alongside the old one, then retire the old one"
+    (let [s0 (state)
+          add (anchors/admit-set (proposed :anchors #{pin-a pin-b}) s0)
+          s1 (anchors/apply-set s0 add)
+          retire (anchors/admit-set (proposed :set-id "anchors-8" :sequence 8
+                                              :anchors #{pin-b})
+                                    s1)
+          s2 (anchors/apply-set s1 retire)]
+      (is (anchors/admitted? add))
+      (is (anchors/admitted? retire)
+          "retiring pin-a overlaps with the set that introduced pin-b")
+      (is (= #{pin-b} (:current-anchors s2)))
+      (is (= #{pin-a pin-b} (:previous-anchors s2)))
+      (is (= #{pin-a pin-b} (anchors/usable-anchors s2)) "inside the window, both")
+      (is (= #{pin-b} (anchors/usable-anchors
+                       (assoc s2 :now-ms (inc (:accept-previous-until-ms s2)))))
+          "after it, only the current set — a previous set that never expires was never retired")
+      (is (false? (:aiueos.anchors/one-way? retire))
+          "no step of this can strand a device"))))
+
+(deftest retiring-the-only-key-in-one-step-is-not-a-rotation
+  (is (= :disjoint-without-break-glass
+         (:aiueos.anchors/reason (anchors/admit-set (proposed :anchors #{pin-b}) (state))))
+      "going straight from {a} to {b} is the one-way door, whatever it is called"))
+
+(deftest break-glass-drops-the-previous-set-at-once
+  (let [s0 (state)
+        v (anchors/admit-set (proposed :anchors #{pin-b pin-c} :break-glass? true
+                                       :signatures all-sigs)
+                             s0)
+        s1 (anchors/apply-set s0 v)]
+    (is (= #{} (:previous-anchors s1)))
+    (is (nil? (:accept-previous-until-ms s1)))
+    (is (= #{pin-b pin-c} (anchors/usable-anchors s1))
+        "a window in which the stolen key still works is the thing being escaped")))
+
+(deftest a-refused-set-changes-nothing
+  (let [s0 (state)
+        v (anchors/admit-set (proposed :anchors #{}) s0)]
+    (is (= s0 (anchors/apply-set s0 v)))))
+
+;; ── a machine that cannot fetch keeps what it has ─────────────────────────
+
+(deftest an-unreachable-publisher-does-not-empty-the-pin-set
+  (is (true? (anchors/keep-using? (state))))
+  (is (true? (anchors/keep-using? (state :now-ms (+ 1000 (* 1000 60 60 24 30))))))
+  (is (false? (anchors/keep-using? (state :current-anchors #{})))))
+
+;; ── the set this produces is the set grant.cloud consumes ────────────────
+
+(deftest what-anchors-decides-is-what-cloud-checks-against
+  ;; A device-wide set, the release-borne shape: no host field anywhere in the
+  ;; anchor document, so what reaches `grant.cloud` is the flat set ADR-0044
+  ;; shipped. It is accepted, and every verdict says which shape it came from.
+  (let [s0 (state)
+        s1 (anchors/apply-set s0 (anchors/admit-set (proposed :anchors #{pin-a pin-b}) s0))
+        s2 (anchors/apply-set s1 (anchors/admit-set (proposed :set-id "anchors-8" :sequence 8
+                                                              :anchors #{pin-b})
+                                                    s1))
+        policy {:aiueos.cloud/trust-anchors (anchors/usable-anchors s2)}]
+    (is (cloud/allowed? (cloud/admit-peer policy {:spki-sha256 pin-b})) "the new key")
+    (is (cloud/allowed? (cloud/admit-peer policy {:spki-sha256 pin-a})) "the old one, for now")
+    (is (= :unbound (:aiueos.cloud/anchor-binding (cloud/admit-peer policy {:spki-sha256 pin-b})))
+        "and it says on the verdict that no host was bound, because the
+         document it came from has nowhere to put one")
+    (is (= :peer-not-pinned
+           (:aiueos.cloud/reason (cloud/admit-peer policy {:spki-sha256 pin-c}))))
+    (let [after {:aiueos.cloud/trust-anchors
+                 (anchors/usable-anchors
+                  (assoc s2 :now-ms (inc (:accept-previous-until-ms s2))))}]
+      (is (= :peer-not-pinned (:aiueos.cloud/reason (cloud/admit-peer after {:spki-sha256 pin-a})))
+          "once the window closes the retired key is refused by the same function"))))
+
+(deftest the-overlap-rule-a-host-bound-policy-uses-is-this-one
+  ;; The other direction of the same seam. A deployment that knows which host
+  ;; each key came from writes the rotation down per host -- and the question
+  ;; "which keys work today" is still answered by `usable-anchors`, so there is
+  ;; one implementation of the overlap window and not two.
+  (let [s0 (state)
+        s1 (anchors/apply-set s0 (anchors/admit-set (proposed :anchors #{pin-a pin-b}) s0))
+        s2 (anchors/apply-set s1 (anchors/admit-set (proposed :set-id "anchors-8" :sequence 8
+                                                              :anchors #{pin-b})
+                                                    s1))
+        host-policy {:aiueos.cloud/trust-anchors
+                     {"kotobase.net" {:pins (:current-anchors s2)
+                                      :previous (:previous-anchors s2)
+                                      :accept-previous-until-ms (:accept-previous-until-ms s2)}}
+                     :aiueos.cloud/now-ms (:now-ms s2)}
+        peer (fn [pin host] (cloud/admit-peer host-policy {:spki-sha256 pin :host host}))]
+    (is (= (anchors/usable-anchors s2) (cloud/usable-pins host-policy "kotobase.net"))
+        "the same set, from the same function")
+    (is (cloud/allowed? (peer pin-b "kotobase.net")))
+    (is (cloud/allowed? (peer pin-a "kotobase.net")) "the retiring key, inside the window")
+    (is (= :host (:aiueos.cloud/anchor-binding (peer pin-b "kotobase.net"))))
+    (is (= :peer-pinned-to-other-host (:aiueos.cloud/reason
+                                       (cloud/admit-peer
+                                        (assoc-in host-policy
+                                                  [:aiueos.cloud/trust-anchors "evil.example"]
+                                                  {:pins #{pin-c}})
+                                        {:spki-sha256 pin-c :host "kotobase.net"})))
+        "which is the refusal the flat set could not make")))
+
+(deftest every-reason-this-namespace-produces-is-declared
+  (doseq [r [:set-id-missing :anchor-set-empty :no-current-set
+             :disjoint-without-break-glass :break-glass-below-threshold]]
+    (is (contains? anchors/deny-reasons r) (str r " is produced but not declared"))))
+
+;; ── two sequence spaces do not share one key ──────────────────────────────
+
+(deftest a-release-sequence-does-not-block-an-anchor-set
+  (let [s (state :installed-sequence 100)]
+    (is (anchors/admitted? (anchors/admit-set (proposed) s))
+        "releases are at 100 and anchor sets at 6; the higher number must not
+         silently block the other stream")))
+
+(deftest applying-a-set-advances-the-anchor-sequence-only
+  (let [s0 (state :installed-sequence 100)
+        s1 (anchors/apply-set s0 (anchors/admit-set (proposed) s0))]
+    (is (= 7 (:installed-anchor-sequence s1)))
+    (is (= 100 (:installed-sequence s1)) "the release stream is untouched")))
+
+;; ── the first set arrives in the image ────────────────────────────────────
+
+(def anchors-digest "sha256-of-the-anchor-artifact")
+
+(defn- release [& {:as over}]
+  (merge {:manifest-id "release-42" :sequence 42 :signatures sigs
+          :timestamp-ms 1000
+          :artifacts [{:kind :kernel :sha256 "kkk"}
+                      {:kind :anchors :sha256 anchors-digest}]}
+         over))
+
+(defn- carried [& {:as over}]
+  (merge {:release-id "release-42" :sequence 7 :anchors #{pin-a pin-b}}
+         over))
+
+(def observed {:kernel "kkk" :anchors anchors-digest})
+
+(deftest most-releases-carry-no-anchor-set-and-that-is-not-an-error
+  (is (true? (anchors/carries-anchors? (release))))
+  (is (false? (anchors/carries-anchors? (release :artifacts [{:kind :kernel :sha256 "kkk"}]))))
+  (is (= :no-anchors-artifact
+         (:aiueos.anchors/reason
+          (anchors/from-release (release :artifacts [{:kind :kernel :sha256 "kkk"}])
+                                (carried) observed (state))))))
+
+(deftest a-fresh-device-takes-its-first-set-from-the-release-it-boots
+  (let [v (anchors/admit-from-release (release) (carried) observed
+                                      (state :current-anchors #{}))]
+    (is (anchors/admitted? v))
+    (is (true? (:aiueos.anchors/bootstrap? v)))
+    (is (= #{pin-a pin-b} (:aiueos.anchors/anchors v)))
+    (is (= anchors-digest (:aiueos.anchors/set-id v))
+        "the set's identity is the artifact digest the manifest already binds")))
+
+(deftest an-anchor-set-must-name-the-release-it-was-made-for
+  (let [v (anchors/from-release (release) (carried :release-id "release-41")
+                                observed (state))]
+    (is (= :anchors-for-another-release (:aiueos.anchors/reason v)))
+    (is (= "release-42" (:aiueos.anchors/release-id v)))
+    (is (= "release-41" (:aiueos.anchors/carried-release-id v)))))
+
+(deftest bytes-that-are-not-the-artifact-the-manifest-named-are-refused
+  (let [v (anchors/from-release (release) (carried)
+                                (assoc observed :anchors "something-else") (state))]
+    (is (= :anchors-digest-mismatch (:aiueos.anchors/reason v)))
+    (is (= anchors-digest (:aiueos.anchors/expected v)))))
+
+(deftest bootstrap-is-a-fact-about-the-device-not-a-claim-in-the-document
+  (let [v (anchors/from-release (release) (carried) observed (state))]
+    (is (false? (:bootstrap? (:aiueos.anchors/proposed v)))
+        "this device already has anchors, whatever the release says")))
+
+;; ── the update channel gets no shortcut ───────────────────────────────────
+
+(deftest a-release-that-replaces-every-anchor-is-refused-like-any-other-set
+  (let [v (anchors/admit-from-release (release) (carried :anchors #{pin-b pin-c})
+                                      observed (state))]
+    (is (= :disjoint-without-break-glass (:aiueos.anchors/reason v))
+        "a perfectly signed release that strands the fleet is still a stranded fleet")))
+
+(deftest a-release-carrying-an-empty-set-is-refused
+  (is (= :anchor-set-empty
+         (:aiueos.anchors/reason
+          (anchors/admit-from-release (release) (carried :anchors #{}) observed (state))))))
+
+(deftest a-release-may-break-glass-with-every-root-key
+  (let [v (anchors/admit-from-release (release :signatures all-sigs)
+                                      (carried :anchors #{pin-b pin-c} :break-glass? true)
+                                      observed (state))]
+    (is (anchors/admitted? v))
+    (is (true? (:aiueos.anchors/one-way? v)))))
