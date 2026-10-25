@@ -63,6 +63,7 @@ and cannot claim a CID.
 
     docs/SPEC.md                   仕様（設計原理・モジュール契約・検証・次の一段）
     docs/HOST-BINDING.md           kotoba.cloud Worker/host cheat sheet (locale / theme / audit / invoke / receipts)
+    docs/SHELL-BINDING.md          kotoba-shell iOS/Android cheat sheet (carried bundle / locale variants / invoke / deny-all bridge)
     src/shinkansen/publish.cljk    view/document → CID (both planes), fail-closed
     src/shinkansen/state.cljk      db value → CID chain (Unison-style content addressing)
     src/shinkansen/invoke.cljk     invocation envelope (query / action / event) + the authority seam
@@ -148,3 +149,5 @@ ETag = CID and `POST /v1/invoke`. Layouts and render stay the app's.
 
 Host maintainers: [`docs/HOST-BINDING.md`](docs/HOST-BINDING.md) is the cheat
 sheet for using those contracts instead of re-deriving them.
+Mobile apps carried by kotoba-shell: [`docs/SHELL-BINDING.md`](docs/SHELL-BINDING.md)
+(declared; consumers itonami / murakumo / aozora are designs).
