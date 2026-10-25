@@ -146,6 +146,7 @@ The bundled standard libraries live in this repository:
 | `org.dicomstandard.dicom` | `org.dicomstandard.dicom/src` | `dicom.bytes`, `dicom.dataset`, `dicom.dictionary`, `dicom.element` (an external specification, publisher dicomstandard.org) |
 | `org.w3.webcodecs` | `org.w3.webcodecs/src` | `w3.webcodecs`, `w3.webcodecs.codec-string` (an external specification, publisher w3.org) |
 | `org.openstreetmap.overpass` | `org.openstreetmap.overpass/src` | `org-openstreetmap-overpass.core`, `org-openstreetmap-overpass.fetch` (an external specification, publisher openstreetmap.org) |
+| `org.si2.def` | `org.si2.def/src` | `def-format.component`, `def-format.design`, `def-format.net`, `def-format.parser` (an external specification, publisher si2.org) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
 | `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |
 | `com.adobe.tiff` | `com.adobe.tiff/src` | `tiff.bytes`, `tiff.codec`, `tiff.core` (Kotoba project library) |
