@@ -119,6 +119,7 @@ The bundled standard libraries live in this repository:
 | `org.ecmaInternational.ecma262` | `org.ecmaInternational.ecma262/src` | `` (an external specification, publisher ecmaInternational.org) |
 | `org.ieee.du` | `org.ieee.du/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.find` | `org.ieee.find/src` | `` (an external specification, publisher ieee.org) |
+| `org.jsonrpc.core` | `org.jsonrpc.core/src` | `` (an external specification, publisher jsonrpc.org) |
 | `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
 | `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
 | `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |
