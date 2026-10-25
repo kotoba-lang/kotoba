@@ -1,0 +1,96 @@
+(ns kagitaba.broker-test
+  "capability / lease / policy / issuer(ADR-0002)。"
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kagitaba.capability :as cap]
+            [kagitaba.lease :as lease]
+            [kagitaba.policy :as policy]
+            [kagitaba.issuer :as issuer]))
+
+(def read-itonami {:capability/provider :github
+                   :capability/access {:contents :read :metadata :read}
+                   :capability/resources ["cloud-itonami/*"]})
+
+(defn- want [access resources]
+  {:capability/provider :github :capability/access access :capability/resources resources})
+
+(defn- req [capability & {:keys [ttl] :or {ttl 3600}}]
+  {:request/id "req-1" :request/principal "did:key:zNode" :request/capability capability
+   :request/ttl-sec ttl :request/purpose "hermes-cron:p1"})
+
+(deftest levels-and-patterns
+  (is (cap/level-covers? :write :read))
+  (is (not (cap/level-covers? :read :write)))
+  (is (not (cap/level-covers? :read :bogus)) "unknown levels never cover")
+  (is (cap/resource-matches? "*" "a/b"))
+  (is (cap/resource-matches? "cloud-itonami/*" "cloud-itonami/x"))
+  (is (not (cap/resource-matches? "cloud-itonami/*" "cloud-itonami-evil/x")))
+  (is (not (cap/resource-matches? "cloud-itonami/*" "cloud-itonami/x/y")))
+  (is (cap/resource-matches? "a/b" "a/b")))
+
+(deftest covers-and-excess
+  (is (cap/covers? read-itonami (want {:contents :read} ["cloud-itonami/cloud-itonami-isic-0111"])))
+  (testing "a higher level, another org, or 'everything' is not covered"
+    (is (= [{:reason :permission :permission :contents :wanted :write :granted :read}]
+           (cap/excess read-itonami (want {:contents :write} ["cloud-itonami/a"]))))
+    (is (= [{:reason :resource :wanted "kotoba-lang/kagi" :granted ["cloud-itonami/*"]}]
+           (cap/excess read-itonami (want {:contents :read} ["kotoba-lang/kagi"]))))
+    (is (= :all (:wanted (first (cap/excess read-itonami (want {:contents :read} [])))))))
+  (is (= :provider (:reason (first (cap/excess read-itonami (assoc read-itonami :capability/provider :aws)))))))
+
+(deftest requests-and-leases
+  (is (lease/valid-request? (req read-itonami)))
+  (is (= [:request/ttl-sec] (lease/request-errors (req read-itonami :ttl 7200))) "over one hour")
+  (is (= [:request/capability] (lease/request-errors (req (want {} ["x/y"])))) "no permission asked")
+  (let [l (lease/lease {:id "lease-1" :request (req read-itonami :ttl 1800) :issuer "github-app: fleet"
+                        :issued-at 1000 :ttl-sec 3600 :approval {:by :policy :rule 0}})]
+    (testing "the shorter of the request and the grant wins"
+      (is (= 2800 (:lease/expires-at l))))
+    (is (not (contains? l :lease/value)) "a lease never carries the value")
+    (is (= :active (lease/lease-state l 2799)))
+    (is (= :expired (lease/lease-state l 2800)))
+    (is (= :revoked (lease/lease-state (lease/revoke l 1500) 1600)))
+    (is (= 800 (lease/remaining-sec l 2000)))))
+
+(def fleet-policy
+  {:policy/principal "node@joseph" :policy/issuer :github-app
+   :policy/allow [{:capability read-itonami :max-ttl-sec 3600}]
+   :policy/approve [{:capability (want {:contents :write :pull_requests :write} ["cloud-itonami/*"])
+                     :by :passkey}]})
+
+(deftest policy-decisions
+  (is (= {:decision :allow :rule 0}
+         (policy/decide fleet-policy (req (want {:contents :read} ["cloud-itonami/a"]))))
+      "inside allow: issued without waking anyone")
+  (is (= {:decision :approve :rule 0 :by :passkey}
+         (policy/decide fleet-policy (req (want {:contents :write} ["cloud-itonami/a"]))))
+      "writes need a tap")
+  (let [d (policy/decide fleet-policy (req (want {:contents :read} ["kotoba-lang/kagi"])))]
+    (is (= :deny (:decision d)))
+    (is (= "kotoba-lang/kagi" (:wanted (first (:reasons d)))) "the reason names what to narrow"))
+  (testing "a TTL over the rule's limit is a reason too"
+    (let [p (assoc-in fleet-policy [:policy/allow 0 :max-ttl-sec] 600)]
+      (is (= [{:reason :ttl :wanted 3600 :granted 600}]
+             (:reasons (policy/decide (dissoc p :policy/approve)
+                                      (req (want {:contents :read} ["cloud-itonami/a"]))))))))
+  (testing "no policy for the principal means deny"
+    (is (= [{:reason :no-policy}]
+           (:reasons (policy/decide-in [fleet-policy] #{"did:key:zNode"} :github-app
+                                       (req (want {:contents :read} ["cloud-itonami/a"])))))))
+  (is (= :allow (:decision (policy/decide-in [fleet-policy] #{"did:key:zNode" "node@joseph"} :github-app
+                                             (req (want {:contents :read} ["cloud-itonami/a"])))))))
+
+(def app
+  {:item/category :issuer :item/title "github-app: kotoba-fleet" :issuer/kind :github-app
+   :issuer/public {:app-id 1 :slug "kotoba-fleet"
+                   :installations [{:id 789 :account "cloud-itonami"} {:id 790 :account "kotoba-lang"}]
+                   :permissions {:contents :read :metadata :read}}})
+
+(deftest issuers
+  (is (issuer/issuer? app))
+  (is (= [:app-id] (issuer/public-errors (update app :issuer/public dissoc :app-id))))
+  (is (= [:unknown-kind] (issuer/public-errors (assoc app :issuer/kind :mystery))))
+  (is (= ["cloud-itonami/*" "kotoba-lang/*"] (:capability/resources (issuer/ceiling app))))
+  (is (issuer/can-issue? app (want {:contents :read} ["kotoba-lang/kagi"])))
+  (is (not (issuer/can-issue? app (want {:contents :write} ["kotoba-lang/kagi"]))) "beyond the App's own permissions")
+  (is (= 790 (:id (issuer/installation-for app "kotoba-lang/kagi"))))
+  (is (nil? (issuer/installation-for app "other/x"))))
