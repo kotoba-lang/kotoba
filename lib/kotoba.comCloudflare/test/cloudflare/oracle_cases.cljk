@@ -1,0 +1,173 @@
+;; cloudflare.oracle-cases — runtime-neutral case table for the shipped oracle
+;; artifacts, plus the decode/normalize helpers both runtimes share.
+;;
+;; WHY THIS EXISTS (ADR 0019): every gate this repo had was JVM-only, and the
+;; production runtime is JavaScript. A green JVM suite is not evidence about
+;; ClojureScript, in two independent ways -- both because a guest :i64 is a
+;; `long` on the JVM and a `js/BigInt` on cljs:
+;;
+;;   1. `string-substring` at an :i64 offset. kir guarded with `(integer? start)`,
+;;      false for a BigInt -> "string substring indexes are out of bounds".
+;;   2. an :i64 field inside a record. `kir/execute` coerces a top-level :i64
+;;      argument, but a record field is validated by `bounded-typed-value!`,
+;;      which rejects a js/Number -> "value is not a signed i64".
+;;
+;; The nine shipped artifacts had no cljs execution gate at all.
+;;
+;; The fix is one table executed on BOTH runtimes:
+;;   - JVM: cloudflare.oracle-cases-test (runs under `kbb -M:test`)
+;;   - cljs: test/cloudflare/oracle_cljs_gate.cljk (runs under `nbb`)
+;; Divergence between the two runtimes is therefore a test failure, not a
+;; production incident.
+;;
+;; Coverage is enforced, not sampled: `missing-coverage` fails when any export
+;; of any shipped artifact has no case. A new (:export …) entry cannot land
+;; without a case here.
+
+(ns cloudflare.oracle-cases
+  "Shared oracle case table + portable decode/normalize for the JVM and cljs gates."
+  (:require [clojure.edn :as edn]
+            [cloudflare.kotoba.oracle :as oracle]
+            #?(:clj [kotoba.io :as io])))
+
+(def ^:private cases-resource
+  "Classpath path of the checked-in case table."
+  "cloudflare/oracle_cases.edn")
+
+(def ^:private cases-file
+  "Repo-relative path of the case table, for cljs/nbb reads from the repo root."
+  "lib/kotoba.comCloudflare/test/cloudflare/oracle_cases.edn")
+
+#?(:cljs
+   (defn- node-slurp
+     "nbb/node: read `path` relative to process.cwd(), or nil."
+     [path]
+     (try
+       (let [fs (js/require "fs")
+             pmod (js/require "path")
+             full (.resolve pmod (str (.cwd js/process)) path)]
+         (when (.existsSync fs full)
+           (.readFileSync fs full "utf8")))
+       (catch :default _ nil))))
+
+(defn read-cases
+  "Read the checked-in case table as EDN.
+
+  JVM reads it off the classpath (test/ is on :test :extra-paths); cljs reads it
+  from the repo root, the same working-directory assumption `oracle` itself uses."
+  []
+  (let [text #?(:clj (if-let [r (io/resource cases-resource)]
+                       (slurp r)
+                       (throw (ex-info "oracle case table missing from classpath"
+                                       {:path cases-resource})))
+                :cljs (or (node-slurp cases-file)
+                          (throw (ex-info "oracle case table not readable"
+                                          {:path cases-file
+                                           :hint "run nbb from the repo root"}))))]
+    (edn/read-string text)))
+
+(defn normalize
+  "Runtime-neutral view of a guest result.
+
+  The guest i64 is a JVM long and a cljs js/BigInt, so raw = would report a
+  false difference between runtimes; both collapse to a plain number here.
+  Everything else (strings, booleans, keyword type tags, nested records and
+  typed-map payloads) is compared structurally."
+  [v]
+  (cond
+    (vector? v) (mapv normalize v)
+    (sequential? v) (mapv normalize v)
+    (string? v) v
+    (boolean? v) v
+    (keyword? v) v
+    (nil? v) v
+    :else #?(:clj (if (integer? v) (long v) v)
+             ;; cljs: numbers pass through; anything else reaching here is the
+             ;; BigInt the interpreter uses for :i64.
+             :cljs (if (number? v) v (js/Number v)))))
+
+(defn decode-arg
+  "Decode one arg spec into a guest value. `schemas` resolves :rec references.
+
+  Plain strings pass through; vectors tagged with a keyword are directives."
+  [schemas spec]
+  (if (and (vector? spec) (keyword? (first spec)))
+    (case (first spec)
+      ;; [:i64 n] — host number to the guest i64 the ABI expects.
+      :i64 (oracle/as-i64 (second spec))
+      ;; [:rec :schema/id {field arg-spec …}] — native guest record.
+      :rec (let [schema (or (get schemas (second spec))
+                            (throw (ex-info "unknown schema in oracle case"
+                                            {:schema (second spec)})))
+                 fields (nth spec 2)]
+             (oracle/record schema
+                            (into {}
+                                  (map (fn [[k v]]
+                                         ;; Fields whose declared type is not a
+                                         ;; scalar (typed maps) must arrive as a
+                                         ;; real guest value, so decode nested
+                                         ;; specs before `oracle/record` runs.
+                                         [k (if (and (vector? v) (keyword? (first v)))
+                                              (decode-arg schemas v)
+                                              v)]))
+                                  fields)))
+      ;; [:call :oracle-id export [arg-spec …]] — a guest value that only the
+      ;; guest can build (e.g. an empty typed map).
+      :call (oracle/call (second spec) (nth spec 2)
+                         (mapv #(decode-arg schemas %) (nth spec 3)))
+      spec)
+    spec))
+
+(defn run-case
+  "Execute one case through the production seam and return its normalized result.
+
+  Calls `oracle/call`, not `ir/execute`, so the gate covers the loader, the
+  resource read and the ABI projection — the whole path production uses."
+  [schemas {:keys [oracle export args]}]
+  (normalize (oracle/call oracle export (mapv #(decode-arg schemas %) args))))
+
+(defn shipped-exports
+  "Every export of every shipped artifact, as #{[oracle-id export-symbol] …}.
+
+  Read from the artifacts themselves rather than from the .kotoba sources: the
+  artifact is what production executes."
+  []
+  (into #{}
+        (mapcat (fn [id]
+                  (map (fn [e] [id (symbol (name e))])
+                       (:exports (oracle/load-kir id)))))
+        (oracle/catalog-ids)))
+
+(defn covered-exports
+  "Every [oracle-id export] the case table exercises."
+  [cases]
+  (into #{} (map (juxt :oracle #(symbol (name (:export %))))) cases))
+
+(defn missing-coverage
+  "Shipped exports with no case. Non-empty means the gate has a blind spot."
+  [cases]
+  (sort (map vec (remove (covered-exports cases) (shipped-exports)))))
+
+(defn failures
+  "Run every case; return a seq of failure maps.
+
+  Two distinct failure kinds, both fatal:
+    :threw    — the export raised (the ClojureScript i64/substring class of bug)
+    :mismatch — the export returned something other than the recorded value"
+  [{:keys [schemas cases]}]
+  (into []
+        (keep (fn [{:keys [oracle export args expect] :as c}]
+                (let [actual (try {:ok (run-case schemas c)}
+                                  (catch #?(:clj Throwable :cljs :default) e
+                                    {:threw (or #?(:clj (.getMessage e)
+                                                   :cljs (.-message e))
+                                                (pr-str e))}))]
+                  (cond
+                    (:threw actual)
+                    {:kind :threw :oracle oracle :export export :args args
+                     :message (:threw actual)}
+
+                    (not= (normalize expect) (:ok actual))
+                    {:kind :mismatch :oracle oracle :export export :args args
+                     :expected (normalize expect) :actual (:ok actual)}))))
+        cases))

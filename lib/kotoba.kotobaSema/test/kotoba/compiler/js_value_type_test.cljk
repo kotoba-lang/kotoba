@@ -1,0 +1,114 @@
+(ns kotoba.compiler.js-value-type-test
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
+               :cljs [cljs.test :refer [deftest is]])
+            [kotoba.sema :as sema]))
+(defn refusal [source]
+  (try (sema/analyze source) nil
+       (catch #?(:clj Exception :cljs :default) e (ex-message e))))
+(defn refusal-code [source]
+  (try (sema/analyze source) nil
+       (catch #?(:clj Exception :cljs :default) e
+         (:kotoba.error/code (ex-data e)))))
+(deftest opaque-signatures-and-private-calls-remain-typed
+  (let [hir (sema/analyze "(ns host.values (:export [keep])) (defn- helper [v :js-value] :js-value v) (defn keep [v :js-value] :js-value (helper v))")]
+    (is (= :kotoba.hir/v3 (:format hir)))
+    (is (= ['keep] (:exports hir)))
+    (is (nil? (:entry hir)))
+    (is (= [[:js-value] [:js-value]] (mapv :param-types (:functions hir))))
+    (is (= [:js-value :js-value] (mapv :result (:functions hir))))))
+(deftest opaque-type-does-not-erase-result-or-local-mismatches
+  (doseq [source ["(defn main [v :js-value] :i64 v)"
+                  "(ns host.values (:export [keep])) (defn keep [v :i64] :js-value v)"
+                  "(ns host.values (:export [keep])) (defn keep [v :js-value] :js-value (+ v 1))"
+                  "(ns host.values (:export [keep])) (defn keep [v :unknown] :unknown v)"]]
+    (is (some? (refusal source)) source)))
+(deftest opaque-canonical-key-descriptors-refuse-including-nested-values
+  (doseq [type [":js-value" "[:list :js-value]" "[:record :app/key [[:payload :js-value]]]"]]
+    (doseq [outer [(str "[:set " type "]") (str "[:map " type " :i64]")]]
+      (let [source (str "(ns host.values (:export [keep])) (defn keep [v " outer "] " outer " v)")]
+        (is (= :kotoba.error/js-value-unordered (refusal-code source)) source)))))
+(deftest ordinary-js-value-field-label-and-opaque-map-values-remain-valid
+  (doseq [type ["[:set [:record :app/key [[:js-value :string]]]]" "[:map :string :js-value]"]]
+    (is (nil? (refusal (str "(ns host.values (:export [keep])) (defn keep [v " type "] " type " v)"))))))
+
+(deftest opaque-js-predicates-retain-explicit-operand-and-result-types
+  (doseq [[op params body expected] [["js-nullish?" "v :js-value" "v" [:js-value]]
+                            ["js-truthy?" "v :js-value" "v" [:js-value]]
+                            ["js-strict-equal?" "a :js-value b :js-value" "a b" [:js-value :js-value]]]]
+    (let [hir (sema/analyze (str "(ns host.predicates (:export [observe])) "
+                               "(defn observe [" params "] :bool (" op " " body "))"))
+          function (first (:functions hir))]
+      (is (= :kotoba.hir/v3 (:format hir)))
+      (is (= :bool (:result function)))
+      (is (= expected (:param-types function)))
+      (is (= (symbol op) (first (:body function)))))))
+
+(deftest opaque-js-predicates-refuse-scalar-types-and-malformed-arities
+  (doseq [body ["(js-nullish?)" "(js-nullish? v v)" "(js-truthy?)"
+               "(js-strict-equal? v)" "(js-strict-equal? v v v)"]]
+    (is (some? (refusal (str "(ns host.predicates (:export [observe])) "
+                            "(defn observe [v :js-value] :bool " body ")")))))
+  (doseq [type ["i64" "bool" "string"]
+          body ["(js-nullish? v)" "(js-truthy? v)" "(js-strict-equal? v v)"]]
+    (is (some? (refusal (str "(ns host.predicates (:export [observe])) "
+                            "(defn observe [v :" type "] :bool " body ")")))))
+  (is (some? (refusal "(ns host.predicates (:export [observe])) (defn observe [v :js-value] :js-value (js-nullish? v))"))))
+
+(deftest branding-and-injection-retain-explicit-source-types
+  (doseq [[op input result] [["js-typeof" :js-value :string]
+                            ["js-array?" :js-value :bool]
+                            ["js-bool-value" :bool :js-value]]]
+    (let [hir (sema/analyze (str "(ns host.branding (:export [observe])) "
+                               "(defn observe [v " input "] " result " (" op " v))"))
+          function (first (:functions hir))]
+      (is (= :kotoba.hir/v3 (:format hir)))
+      (is (= result (:result function)))
+      (is (= [input] (:param-types function)))
+      (is (= (symbol op) (first (:body function)))))))
+
+(deftest branding-and-injection-refuse-incorrect-types-arities-and-results
+  (doseq [[op input result] [["js-typeof" :js-value :string]
+                            ["js-array?" :js-value :bool]
+                            ["js-bool-value" :bool :js-value]]]
+    (doseq [args ["" "v v"]]
+      (is (some? (refusal (str "(ns host.branding (:export [observe])) "
+                              "(defn observe [v " input "] " result " (" op " " args "))")))))
+    (doseq [wrong (remove #{input} [:i64 :bool :string :js-value])]
+      (is (some? (refusal (str "(ns host.branding (:export [observe])) "
+                              "(defn observe [v " wrong "] " result " (" op " v))")))))
+    (is (some? (refusal (str "(ns host.branding (:export [observe])) "
+                            "(defn observe [v " input "] :i64 (" op " v))"))))))
+
+(deftest branding-composes-with-opaque-conditional-results
+  (let [hir (sema/analyze "(ns host.branding (:export [plain]))
+                           (defn plain [v :js-value] :js-value
+                             (if (js-truthy? v)
+                               (js-bool-value (if (string=? (js-typeof v) \"object\")
+                                                (not (js-array? v)) false)) v))")
+        function (first (:functions hir))
+        heads (set (filter symbol? (tree-seq coll? seq (:body function))))]
+    (is (= :js-value (:result function)))
+    (is (= [:js-value] (:param-types function)))
+    (is (= 'if (first (:body function))))
+    (is (every? heads '[js-typeof js-array? js-bool-value]))))
+
+(deftest branding-heads-remain-reserved-source-operations
+  (doseq [op ["js-typeof" "js-array?" "js-bool-value"]]
+    (is (re-find #"reserved function name"
+                 (or (refusal (str "(defn " op " [v :i64] :i64 v) (defn main [] :i64 1)")) "")))))
+
+(deftest zero-arity-js-undefined-retains-an-opaque-result
+  (let [hir (sema/analyze "(ns host.undefined (:export [noop])) (defn noop [] :js-value (js-undefined))")
+        function (first (:functions hir))]
+    (is (= :kotoba.hir/v3 (:format hir)))
+    (is (= :js-value (:result function)))
+    (is (= [] (:param-types function)))
+    (is (= '(js-undefined) (:body function)))))
+
+(deftest js-undefined-refuses-arguments-result-mismatch-and-name-capture
+  (doseq [body ["(js-undefined 0)" "(js-undefined 0 1)"]]
+    (is (some? (refusal (str "(ns host.undefined (:export [noop])) (defn noop [] :js-value " body ")")))))
+  (doseq [type [":i64" ":bool" ":string"]]
+    (is (some? (refusal (str "(ns host.undefined (:export [noop])) (defn noop [] " type " (js-undefined))")))))
+  (is (re-find #"reserved function name"
+               (or (refusal "(defn js-undefined [] :i64 0) (defn main [] :i64 1)") ""))))

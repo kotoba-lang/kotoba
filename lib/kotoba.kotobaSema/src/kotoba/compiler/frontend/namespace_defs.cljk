@@ -1,0 +1,2724 @@
+(ns kotoba.compiler.frontend.namespace-defs
+  "Module `namespace-defs` of kotoba.compiler.frontend, cut from the original namespace by amu refactor split (95 forms, 1144 lines). Depends on: base, kernel-region, closure-types, expand."
+  ;; the Kotoba-route interface: the names the other frontend modules, kotoba.sema and the native guests use
+  ;; (the linked project export bound is 1024 clauses, ADR 0363 port)
+  #?(:kotoba {:kotoba/export [check-pure-product-source-forms! erase-slice-values expand-defdesugar-forms forbidden-heads grammar-declared-heads heads-kids heterogeneous-vector-index! internal-failure! max-functions max-namespace-capabilities max-namespace-docstring-chars namespace-attr-map->clauses namespace-attr-map-clauses namespace-attr-map-keys namespace-parts refer-clojure-clause? reserved-binding-name? reserved-function-name? reserved-function-names unbound-symbol! unbound-symbol-error unknown-operation! unknown-operation-error]})
+  (:require #?@(:kotoba [] :default [[kotoba.lang.coll :as set]])
+            [kotoba.lang.text :as str]
+            [kotoba.compiler.frontend-tables :as tables]
+            #?@(:kotoba [] :default [[kotoba.kir :as kir]])
+            #?@(:kotoba [[kotoba.form :as form]])
+            #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])
+            [kotoba.compiler.frontend.base :refer [form-span #?@(:kotoba [] :default [reject!]) #?@(:kotoba [fdistinct? fdrop fget fhas? fhead fhead-is? fl-add fl-distinct? fl-drop fl-has? fl-nth fl-slice fmeta-from fname fnamespace frebuild-seq fput fsource-head fsym ftruthy? form-text pr-form simple-symbol-form?] :default [first-truthy])]]
+            [kotoba.compiler.frontend.kernel-region :refer [traceable-base? #?@(:kotoba [] :default [kernel-memory-operations])]]
+            [kotoba.compiler.frontend.closure-types :refer [slice-element-type slice-element-widths slice-type? #?@(:kotoba [fe-error])]]
+            [kotoba.compiler.frontend.expand :refer [kotoba-integer? max-parameters max-symbol-chars valid-name?]])
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                          [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                                 :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
+                                 ;; a refusal: the Kotoba-route `reject!` throws one (ADR 0007)
+                                 :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                                 :fe/namespace-attr-clauses [:record :fe/namespace-attr-clauses [[:clauses [:list [:ref :form/r]]]]]
+                                 ;; the desugar env and its results (docs/selfhost-frontend-typemodel-design.md 1.2)
+                                 :fe/env [:record :fe/env [[:counter :i64] [:result [:ref :form/r]] [:none :bool] [:arities [:ref :form/r]] [:lexical [:ref :form/r]] [:types [:ref :form/r]] [:docfns [:ref :form/r]] [:loop-counter :i64] [:tbl [:ref :form/r]] [:schemas [:ref :form/r]] [:lazy :bool] [:abort-ctx :string] [:used-caps [:ref :form/r]] [:options [:ref :form/r]] [:helpers [:ref :form/r]] [:shapes [:ref :form/r]] [:lambda-counter :i64] [:lambdas [:ref :form/r]] [:loop-result [:ref :form/r]] [:loop-known [:ref :form/r]] [:dispatchers [:ref :form/r]] [:uses-apply :bool] [:uses-lazy :bool] [:contracts [:ref :form/r]]]]
+                                 :fe/dr [:record :fe/dr [[:env [:ref :fe/env]] [:form [:ref :form/r]]]]
+                                 :fe/drs [:record :fe/drs [[:env [:ref :fe/env]] [:forms [:list [:ref :form/r]]]]]})))
+
+;; forward references inside this module (the cut keeps the original form order)
+#?(:kotoba nil :default (declare namespace-attr-map->clauses))
+
+
+#?(:kotoba nil :default
+(defn load-catalog-forbidden
+  "P0: merge catalog forbidden-heads when guest-grammar.edn is on classpath."
+  []
+  #?(:clj
+     (try
+       (let [c (or (clojure.java.io/resource "kotoba/lang/guest-grammar.edn")
+                   (clojure.java.io/resource "lang/guest-grammar.edn"))]
+         (if c
+           (with-open [r (clojure.java.io/reader c)]
+             (let [edn (clojure.edn/read (java.io.PushbackReader. r))
+                   heads (:forbidden-heads edn #{})]
+               (into #{} (map (fn [x] (if (symbol? x) x (symbol (name x))))) heads)))
+           #{}))
+       (catch Exception _ #{}))
+     ;; ClojureScript cannot read the resource, so it answers the embedded copy
+     ;; the Kotoba route uses (frontend-tables, compared with the resource by
+     ;; test): the same forbidden set on every runtime, `binding` included.
+     :cljs tables/forbidden-heads)))
+
+#?(:kotoba nil :default
+(defn load-grammar-declared-heads
+  "Every head the language grammar names, when `guest-grammar.edn` is on the
+  classpath: `:admitted-builtins`, the `:sugar` keys, `:arithmetic`,
+  `:comparisons`, `:predicates` and the float `:arithmetic`. A set of symbols.
+
+  Read for one diagnostic only -- telling a head the grammar declares and this
+  analyser has not lowered (`(min 1 2)`) apart from a misspelling
+  (`(frobnicate 1)`). Nothing is admitted from it. Same runtime shape as
+  `load-catalog-forbidden`: ClojureScript cannot read a classpath resource
+  synchronously, so it answers the empty set there and such a head is reported
+  as unknown, which is what that runtime can honestly say."
+  []
+  #?(:clj
+     (try
+       (let [c (or (clojure.java.io/resource "kotoba/lang/guest-grammar.edn")
+                   (clojure.java.io/resource "lang/guest-grammar.edn"))]
+         (if c
+           (with-open [r (clojure.java.io/reader c)]
+             (let [edn (clojure.edn/read (java.io.PushbackReader. r))]
+               (into #{}
+                     (comp cat (map #(symbol (name %))))
+                     [(:admitted-builtins edn) (keys (:sugar edn))
+                      (:arithmetic edn) (:comparisons edn) (:predicates edn)
+                      (get-in edn [:floating-point :arithmetic])])))
+           #{}))
+       (catch Exception _ #{}))
+     :cljs #{})))
+
+;; Kotoba: an exported constant is a function, and the vendored grammar is not
+;; on a Kotoba module's classpath, so the value the JVM reads from it is the
+;; embedded copy in `frontend-tables` (compared with the resource by a test).
+#?(:kotoba
+   (defn grammar-declared-heads [] [:ref :form/r]
+     (tables/grammar-declared-heads))
+   :default
+   (def grammar-declared-heads
+     "See `load-grammar-declared-heads`. Empty on ClojureScript."
+     (load-grammar-declared-heads)))
+
+#?(:kotoba
+   (defn forbidden-heads [] [:ref :form/r]
+     (tables/forbidden-heads))
+   :default
+(def forbidden-heads
+  ;; `atom` left this set on 2026-09-02: local-state slice 1 (kotoba-lang
+  ;; `lang/local-state.edn`) admits a non-escaping, function-local atom by
+  ;; ELABORATION -- it becomes ordinary let rebindings, so no cell exists at
+  ;; runtime and no ambient state is created. `swap!` / `reset!` were never in
+  ;; this literal set; they were forbidden through the vendored guest grammar,
+  ;; which drops them for the same reason. `ref` / `dosync` / `volatile!` /
+  ;; `set!` / `binding` / `var` / `alter-var-root` stay refused: they have no
+  ;; ability model decided and no widening path.
+  (into '#{load load-file load-string read-string compile
+           require use import ns-resolve resolve alter-var-root
+           future pmap agent send send-off new . .. set! defmacro
+           locking dosync ref volatile!}
+        (load-catalog-forbidden))))
+
+#?(:kotoba nil :default (def arithmetic tables/arithmetic))
+#?(:kotoba nil :default (def i32-operations tables/i32-operations))
+#?(:kotoba nil :default (def i64-operations tables/i64-operations))
+#?(:kotoba nil :default (def comparisons tables/comparisons))
+#?(:kotoba nil :default (def heap-operations tables/heap-operations))
+#?(:kotoba nil :default (def kgraph-operations tables/kgraph-operations))
+
+#?(:kotoba nil :default (def slice-value-operations tables/slice-value-operations))
+
+#?(:kotoba nil :default (def slice-constructor-elements tables/slice-constructor-elements))
+#?(:kotoba nil :default (def kernel-privileged-operations tables/kernel-privileged-operations))
+
+
+#?(:kotoba nil :default (def rodata-literal-operations tables/rodata-literal-operations))
+
+#?(:kotoba nil :default (def image-symbol-operations tables/image-symbol-operations))
+;; boot-lit: end
+
+#?(:kotoba nil :default (def list-operations tables/list-operations))
+#?(:kotoba nil :default (def predicate-operations tables/predicate-operations))
+#?(:kotoba nil :default (def logical-operations tables/logical-operations))
+#?(:kotoba nil :default (def map-operations tables/map-operations))
+#?(:kotoba nil :default (def map-presence-operations tables/map-presence-operations))
+#?(:kotoba nil :default (def set-operations tables/set-operations))
+#?(:kotoba nil :default (def collection-count-operations tables/collection-count-operations))
+#?(:kotoba nil :default (def vector-end-operations tables/vector-end-operations))
+#?(:kotoba nil :default (def map-projection-operations tables/map-projection-operations))
+#?(:kotoba nil :default (def typed-map-operations tables/typed-map-operations))
+#?(:kotoba nil :default (def typed-safe-value-operations tables/typed-safe-value-operations))
+#?(:kotoba nil :default (def parametric-result-operations tables/parametric-result-operations))
+#?(:kotoba nil :default (def variant-operations tables/variant-operations))
+#?(:kotoba nil :default (def generic-option-operations tables/generic-option-operations))
+#?(:kotoba nil :default (def canonical-list-operations tables/canonical-list-operations))
+#?(:kotoba nil :default (def bytes-operations tables/bytes-operations))
+#?(:kotoba nil :default (def heterogeneous-vector-operations tables/heterogeneous-vector-operations))
+#?(:kotoba nil :default (def typed-set-operations tables/typed-set-operations))
+#?(:kotoba nil :default (def canonical-typed-map-operations tables/canonical-typed-map-operations))
+#?(:kotoba nil :default (def record-operations tables/record-operations))
+#?(:kotoba nil :default (def typed-vector-operations tables/typed-vector-operations))
+#?(:kotoba nil :default (def typed-f64-vector-operations tables/typed-f64-vector-operations))
+#?(:kotoba nil :default (def compact-graph-operations tables/compact-graph-operations))
+#?(:kotoba nil :default (def document-fixed-operations tables/document-fixed-operations))
+#?(:kotoba nil :default (def document-variadic-operations tables/document-variadic-operations))
+#?(:kotoba nil :default (def region-operations tables/region-operations))
+#?(:kotoba nil :default (def lazy-sequence-operations tables/lazy-sequence-operations))
+#?(:kotoba nil :default (def string-operations tables/string-operations))
+#?(:kotoba nil :default (def xml-operations tables/xml-operations))
+#?(:kotoba nil :default (def decimal-operations tables/decimal-operations))
+#?(:kotoba nil :default (def f64-operations tables/f64-operations))
+
+#?(:kotoba nil :default (def f32-operations tables/f32-operations))
+#?(:kotoba nil :default (def float-division-heads tables/float-division-heads))
+#?(:kotoba
+   (defn heads-kids [t [:ref :form/r]] [:list [:ref :form/r]]
+     (if (form/is-map? t)
+       (form/kids-of (form/keys-of t))
+       (form/kids-of t))))
+
+#?(:kotoba
+   (defn reserved-function-names [] [:ref :form/r]
+     ;; The same union the host `def` below computes, built from the Form
+     ;; tables. Duplicates across the tables are harmless: a set Form answers
+     ;; membership by scanning its kids.
+     (let [r0 (form/kids-of (forbidden-heads))
+           r1 (form/append-many r0 (heads-kids (tables/arithmetic)))
+           r2 (form/append-many r1 (heads-kids (tables/comparisons)))
+           r3 (form/append-many r2 (heads-kids (tables/float-division-heads)))
+           r4 (form/append-many r3 (heads-kids (tables/heap-operations)))
+           r5 (form/append-many r4 (heads-kids (tables/kgraph-operations)))
+           r6 (form/append-many r5 (heads-kids (tables/kernel-memory-operations)))
+           r7 (form/append-many r6 (heads-kids (tables/slice-value-operations)))
+           r8 (form/append-many r7 (heads-kids (tables/kernel-privileged-operations)))
+           r9 (form/append-many r8 (heads-kids (tables/rodata-literal-operations)))
+           r10 (form/append-many r9 (heads-kids (tables/image-symbol-operations)))
+           r11 (form/append-many r10 (heads-kids (tables/list-operations)))
+           r12 (form/append-many r11 (heads-kids (tables/predicate-operations)))
+           r13 (form/append-many r12 (heads-kids (tables/logical-operations)))
+           r14 (form/append-many r13 (heads-kids (tables/map-operations)))
+           r15 (form/append-many r14 (heads-kids (tables/map-presence-operations)))
+           r16 (form/append-many r15 (heads-kids (tables/set-operations)))
+           r17 (form/append-many r16 (heads-kids (tables/collection-count-operations)))
+           r18 (form/append-many r17 (heads-kids (tables/vector-end-operations)))
+           r19 (form/append-many r18 (heads-kids (tables/map-projection-operations)))
+           r20 (form/append-many r19 (heads-kids (tables/typed-map-operations)))
+           r21 (form/append-many r20 (heads-kids (tables/typed-safe-value-operations)))
+           r22 (form/append-many r21 (heads-kids (tables/parametric-result-operations)))
+           r23 (form/append-many r22 (heads-kids (tables/variant-operations)))
+           r24 (form/append-many r23 (heads-kids (tables/generic-option-operations)))
+           r25 (form/append-many r24 (heads-kids (tables/canonical-list-operations)))
+           r26 (form/append-many r25 (heads-kids (tables/bytes-operations)))
+           r27 (form/append-many r26 (heads-kids (tables/heterogeneous-vector-operations)))
+           r28 (form/append-many r27 (heads-kids (tables/typed-set-operations)))
+           r29 (form/append-many r28 (heads-kids (tables/canonical-typed-map-operations)))
+           r30 (form/append-many r29 (heads-kids (tables/record-operations)))
+           r31 (form/append-many r30 (heads-kids (tables/typed-vector-operations)))
+           r32 (form/append-many r31 (heads-kids (tables/typed-f64-vector-operations)))
+           r33 (form/append-many r32 (heads-kids (tables/compact-graph-operations)))
+           r34 (form/append-many r33 (heads-kids (tables/document-fixed-operations)))
+           r35 (form/append-many r34 (heads-kids (tables/document-variadic-operations)))
+           r36 (form/append-many r35 (heads-kids (tables/string-operations)))
+           r37 (form/append-many r36 (heads-kids (tables/region-operations)))
+           r38 (form/append-many r37 (heads-kids (tables/xml-operations)))
+           r39 (form/append-many r38 (heads-kids (tables/decimal-operations)))
+           r40 (form/append-many r39 (heads-kids (tables/f64-operations)))
+           r41 (form/append-many r40 (heads-kids (tables/f32-operations)))
+           r42 (form/append-many r41 (heads-kids (tables/i32-operations)))
+           r43 (form/append-many r42 (heads-kids (tables/i64-operations)))
+           r44 (form/append-many r43 (heads-kids (tables/lazy-sequence-operations)))
+           r45 (form/append-many r44 (form/kids-of (form/edn-form "#{atom swap! reset! deref let if cap-call typed-cap-call ns defn defn- some some? nil? option-or vector-i64 vector-f64 vector-new vector-f64-new hetero-vector typed-set record match-result match-variant match-option}")))]
+       (form/form-set r45)))
+   :default
+(def reserved-function-names
+  (set/union forbidden-heads arithmetic comparisons float-division-heads
+             (set (keys heap-operations))
+             (set (keys kgraph-operations))
+             (set (keys kernel-memory-operations))
+             ;; slice-value: a function named `slice-get` would shadow the
+             ;; carrier's own head, and the shadowing would be silent -- the
+             ;; erasure pass rewrites by head name, so a user function with
+             ;; that name would have its calls rewritten into memory accesses.
+             (set (keys slice-value-operations))
+             (set (keys kernel-privileged-operations))
+             ;; boot-lit: a function named `guid` would shadow the literal
+             ;; head, and the shadowing would be silent -- `(guid "...")` would
+             ;; become a call with a string argument to a function whose
+             ;; parameter is declared i64.
+             (set (keys rodata-literal-operations))
+             ;; boot-scratch: a function named `kernel-function-address` would
+             ;; shadow the head SILENTLY -- the call would become an ordinary
+             ;; call with a symbol argument to a function whose parameter is
+             ;; declared i64.
+             (set (keys image-symbol-operations))
+             list-operations predicate-operations logical-operations map-operations
+             map-presence-operations set-operations collection-count-operations
+             vector-end-operations map-projection-operations
+             typed-map-operations
+             (set (keys typed-safe-value-operations))
+             (set (keys parametric-result-operations))
+             variant-operations
+             generic-option-operations
+             canonical-list-operations
+             (set (keys bytes-operations))
+             heterogeneous-vector-operations
+             typed-set-operations
+             canonical-typed-map-operations
+             record-operations
+             (set (keys typed-vector-operations))
+             (set (keys typed-f64-vector-operations))
+             (set (keys compact-graph-operations))
+             (set (keys document-fixed-operations)) document-variadic-operations
+             (set (keys string-operations))
+             (set (keys region-operations))
+             (set (keys xml-operations))
+             (set (keys decimal-operations))
+             (set (keys f64-operations))
+             (set (keys f32-operations))
+             (set (keys i32-operations))
+             (set (keys i64-operations))
+             lazy-sequence-operations
+             ;; local-state slice 1: these four are no longer in
+             ;; forbidden-heads, so they have to be reserved here or a program
+             ;; could define `(defn swap! ...)` and shadow the head silently.
+             '#{atom swap! reset! deref}
+             '#{let if cap-call typed-cap-call ns defn defn- some some? nil? option-or vector-i64 vector-f64 vector-new vector-f64-new
+                hetero-vector typed-set record match-result match-variant match-option})))
+
+;; (table-has? (reserved-function-names) k) without building the union (agent ARENA 2026-10-04): the union is a set
+;; of symbols, so k is reserved iff it is a symbol whose name is in one of its tables (the generated allocation-free
+;; tests of frontend-tables). The union was built per definition and was the largest single cost of a native analyze.
+#?(:kotoba
+   (defn reserved-function-name? [k [:ref :form/r]] :bool
+     (if (form/is-symbol? k)
+       (let [s (form/symbol-value k)]
+         (or (tables/forbidden-heads-has-name? s)
+             (tables/arithmetic-has-name? s)
+             (tables/comparisons-has-name? s)
+             (tables/float-division-heads-has-name? s)
+             (tables/heap-operations-has-name? s)
+             (tables/kgraph-operations-has-name? s)
+             (tables/kernel-memory-operations-has-name? s)
+             (tables/slice-value-operations-has-name? s)
+             (tables/kernel-privileged-operations-has-name? s)
+             (tables/rodata-literal-operations-has-name? s)
+             (tables/image-symbol-operations-has-name? s)
+             (tables/list-operations-has-name? s)
+             (tables/predicate-operations-has-name? s)
+             (tables/logical-operations-has-name? s)
+             (tables/map-operations-has-name? s)
+             (tables/map-presence-operations-has-name? s)
+             (tables/set-operations-has-name? s)
+             (tables/collection-count-operations-has-name? s)
+             (tables/vector-end-operations-has-name? s)
+             (tables/map-projection-operations-has-name? s)
+             (tables/typed-map-operations-has-name? s)
+             (tables/typed-safe-value-operations-has-name? s)
+             (tables/parametric-result-operations-has-name? s)
+             (tables/variant-operations-has-name? s)
+             (tables/generic-option-operations-has-name? s)
+             (tables/canonical-list-operations-has-name? s)
+             (tables/bytes-operations-has-name? s)
+             (tables/heterogeneous-vector-operations-has-name? s)
+             (tables/typed-set-operations-has-name? s)
+             (tables/canonical-typed-map-operations-has-name? s)
+             (tables/record-operations-has-name? s)
+             (tables/typed-vector-operations-has-name? s)
+             (tables/typed-f64-vector-operations-has-name? s)
+             (tables/compact-graph-operations-has-name? s)
+             (tables/document-fixed-operations-has-name? s)
+             (tables/document-variadic-operations-has-name? s)
+             (tables/string-operations-has-name? s)
+             (tables/region-operations-has-name? s)
+             (tables/xml-operations-has-name? s)
+             (tables/decimal-operations-has-name? s)
+             (tables/f64-operations-has-name? s)
+             (tables/f32-operations-has-name? s)
+             (tables/i32-operations-has-name? s)
+             (tables/i64-operations-has-name? s)
+             (tables/lazy-sequence-operations-has-name? s)
+             (tables/reserved-extra-heads-has-name? s)))
+       false))
+   :default nil)
+#?(:kotoba
+   (defn max-functions [] :i64 16384)
+   :default
+(def max-functions 16384))
+#?(:kotoba
+   (defn max-namespace-docstring-chars [] :i64 65536)
+   :default
+(def max-namespace-docstring-chars 65536))
+;; ADR-2607182410: bounds an optional `ns` `:capabilities` declaration set.
+;; 256, not max-functions -- matches cap-call's own [0,255] id space (at
+;; most 256 distinct capabilities can ever exist), not the unrelated
+;; function-count limit.
+#?(:kotoba
+   (defn max-namespace-capabilities [] :i64 256)
+   :default
+(def max-namespace-capabilities 256))
+
+#?(:kotoba
+   (defn heterogeneous-vector-index! [index [:ref :form/r] item-types [:ref :form/r]
+                                       form [:ref :form/r]] :i64
+     (if (kotoba-integer? index)
+       (let [host-index (form/int-value index)]
+         (if (and (<= 0 host-index) (< host-index (form/count-of item-types)))
+           host-index
+           (throw (fe-error "heterogeneous vector index must be in range"
+                            "kotoba.error/hetero-vector-index-range" form))))
+       (throw (fe-error "heterogeneous vector index must be an integer literal"
+                        "kotoba.error/hetero-vector-index" form))))
+   :default
+(defn heterogeneous-vector-index!
+  [index item-types form]
+  (when-not (kotoba-integer? index)
+    (reject! "heterogeneous vector index must be an integer literal" form :kotoba.error/hetero-vector-index))
+  (let [host-index #?(:clj index
+                      :cljs (if (i64/bigint-value? index) (js/Number index) index))]
+    (when-not (and (integer? host-index) (<= 0 host-index)
+                   (< host-index (count item-types)))
+      (reject! "heterogeneous vector index must be in range" form :kotoba.error/hetero-vector-index-range))
+    #?(:clj (long host-index) :cljs host-index))))
+
+;; A refusal is an abort (ADR 0007); `require-k` is module-local on purpose (an imported
+;; aborting function is typed [:result T E] here and does not propagate through a plain call).
+#?(:kotoba
+   (defn fe-reject [msg :string code :string form [:ref :form/r]] [:ref :fe/err]
+     (record-new [:ref :fe/err] msg code form "subset" (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn require-k [ok :bool msg :string code :string form [:ref :form/r]] :i64
+     (if ok 0 (throw (fe-reject msg code form))))
+   :default nil)
+
+;; ---- compiler rejections, nearest names, unbound symbols ----
+;; every error on this route is a deliberate refusal (:fe/err); a host error cannot escape as a value
+#?(:kotoba
+   (defn compiler-rejection? [error [:ref :fe/err]] :bool
+     (not (string=? (record-get [:ref :fe/err] error :phase) "")))
+   :default nil)
+
+;; Levenshtein distance between strings A and B, bounded: any distance above LIMIT is answered
+;; as LIMIT + 1. Rows are Form lists of integers.
+#?(:kotoba
+   (defn- nd-int-at [row [:list [:ref :form/r]] j :i64] :i64
+     (form/int-value (fl-nth row j)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-min3 [a :i64 b :i64 c :i64] :i64
+     (let [m (if (< a b) a b)] (if (< m c) m c)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-next-row [a :string b :string i :i64 previous [:list [:ref :form/r]] j :i64 row [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (> j (string-length b))
+       row
+       (let [cost (if (= (string-code-point-at a (- i 1)) (string-code-point-at b (- j 1))) 0 1)
+             v (nd-min3 (+ (nd-int-at previous j) 1)
+                        (+ (nd-int-at row (- j 1)) 1)
+                        (+ (nd-int-at previous (- j 1)) cost))]
+         (nd-next-row a b i previous (+ j 1) (form/append-form row (form/int-form v))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-initial-row [lb :i64 j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (> j lb) acc (nd-initial-row lb (+ j 1) (form/append-form acc (form/int-form j)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-distance-rows [a :string b :string limit :i64 i :i64 previous [:list [:ref :form/r]]] :i64
+     (if (> i (string-length a))
+       (let [d (nd-int-at previous (string-length b))] (if (< d (+ limit 1)) d (+ limit 1)))
+       (nd-distance-rows a b limit (+ i 1) (nd-next-row a b i previous 1 (form/one-form (form/int-form i))))))
+   :default nil)
+
+#?(:kotoba
+   (defn edit-distance [a :string b :string limit :i64] :i64
+     (let [la (string-length a)
+           lb (string-length b)
+           diff (if (< la lb) (- lb la) (- la lb))]
+       (if (> diff limit)
+         (+ limit 1)
+         (nd-distance-rows a b limit 1 (nd-initial-row lb 0 (form/no-forms))))))
+   :default nil)
+
+;; [distance candidate] pairs of CANDIDATES (strings as Form strings) near TEXT
+#?(:kotoba
+   (defn- nd-near-pairs [text :string candidates [:list [:ref :form/r]] i :i64 limit :i64 prefix :string acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count candidates))
+       acc
+       (let [candidate (form/string-value (fl-nth candidates i))
+             skip (or (string=? candidate text) (string-contains? candidate "__"))
+             distance (if skip (+ limit 1) (edit-distance text candidate limit))
+             near (and (not skip)
+                       (or (<= distance limit)
+                           (and (not (string=? prefix "")) (>= (string-length candidate) 5)
+                                (string=? prefix (string-substring candidate 0 5)))))]
+         (nd-near-pairs text candidates (+ i 1) limit prefix
+                        (if near (form/append-form acc (form/vec2 (form/int-form distance) (fl-nth candidates i))) acc)))))
+   :default nil)
+
+;; pair A sorts before pair B: by distance, then by name
+#?(:kotoba
+   (defn- nd-pair-before? [a [:ref :form/r] b [:ref :form/r]] :bool
+     (let [da (form/int-value (form/nth-of a 0))
+           db (form/int-value (form/nth-of b 0))]
+       (if (= da db)
+         (< (string-compare (form/string-value (form/nth-of a 1)) (form/string-value (form/nth-of b 1))) 0)
+         (< da db))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-insert-pair [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] [:list [:ref :form/r]]
+     (if (or (>= i (vector-count xs)) (nd-pair-before? x (fl-nth xs i)))
+       (fl-slice xs i (vector-count xs) (form/append-form (fl-slice xs 0 i (form/no-forms)) x))
+       (nd-insert-pair xs x (+ i 1))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-sort-pairs [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count xs))
+       acc
+       (nd-sort-pairs xs (+ i 1) (nd-insert-pair acc (fl-nth xs i) 0))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-take-names [pairs [:list [:ref :form/r]] i :i64 n :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (or (>= i (vector-count pairs)) (>= i n))
+       acc
+       (nd-take-names pairs (+ i 1) n (form/append-form acc (form/nth-of (fl-nth pairs i) 1)))))
+   :default nil)
+
+;; Up to three of CANDIDATES (Form strings) nearest to NAME (a string), ordered by edit
+;; distance and then by name
+#?(:kotoba
+   (defn nearest-names [text :string candidates [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [limit (if (>= (string-length text) 8) 3 2)
+           prefix (if (>= (string-length text) 5) (string-substring text 0 5) "")
+           pairs (nd-near-pairs text candidates 0 limit prefix (form/no-forms))]
+       (nd-take-names (nd-sort-pairs pairs 0 (form/no-forms)) 0 3 (form/no-forms))))
+   :default nil)
+
+;; the kind of NAME in a Form list of [name kind] entries, "" when absent; later entries win
+#?(:kotoba
+   (defn- nd-kind-of [entries [:list [:ref :form/r]] text :string i :i64 found :string] :string
+     (if (>= i (vector-count entries))
+       found
+       (let [e (fl-nth entries i)]
+         (nd-kind-of entries text (+ i 1)
+                     (if (string=? (form/string-value (form/nth-of e 0)) text) (form/string-value (form/nth-of e 1)) found)))))
+   :default nil)
+
+;; the names of ENTRIES, distinct, as Form strings
+#?(:kotoba
+   (defn- nd-entry-names [entries [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count entries))
+       acc
+       (nd-entry-names entries (+ i 1) (fl-add acc (form/nth-of (fl-nth entries i) 0)))))
+   :default nil)
+
+;; [name kind] entries for the names of a Form map (keys) or collection
+#?(:kotoba
+   (defn- nd-entries-of [names [:ref :form/r] kind :string acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (nd-entries-from (if (form/is-map? names) (ex-map-keys names 0 (form/no-forms)) (form/kids-of names)) kind 0 acc))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-entries-from [xs [:list [:ref :form/r]] kind :string i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count xs))
+       acc
+       (nd-entries-from xs kind (+ i 1)
+                        (form/append-form acc (form/vec2 (form/string-form (form-text (fl-nth xs i))) (form/string-form kind))))))
+   :default nil)
+
+;; the map keys of a map Form, as a list
+#?(:kotoba
+   (defn- ex-map-keys [m [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ j 1) (form/count-of m))
+       acc
+       (ex-map-keys m (+ j 2) (form/append-form acc (form/nth-of m j)))))
+   :default nil)
+
+;; ", " joined `name (kind)` for each nearest name
+#?(:kotoba
+   (defn- nd-nearest-text [nearest [:list [:ref :form/r]] entries [:list [:ref :form/r]] i :i64 acc :string] :string
+     (if (>= i (vector-count nearest))
+       acc
+       (let [n (form/string-value (fl-nth nearest i))]
+         (nd-nearest-text nearest entries (+ i 1)
+                          (string-concat (if (> i 0) (string-concat acc ", ") acc)
+                                         (string-concat n (string-concat " (" (string-concat (nd-kind-of entries n 0 "") ")"))))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-nearest-suffix [text :string entries [:list [:ref :form/r]]] :string
+     (let [nearest (nearest-names text (nd-entry-names entries 0 (form/no-forms)))]
+       (if (> (vector-count nearest) 0)
+         (string-concat "; nearest defined: " (nd-nearest-text nearest entries 0 ""))
+         "")))
+   :default nil)
+
+;; Refuse the unbound SYMBOL with PREFIX as the sentence, naming the symbol and the nearest names
+;; among LOCALS (a set or a map keyed by name) and FUNCTIONS (a map keyed by name)
+#?(:kotoba
+   (defn unbound-symbol-error [prefix :string symbol [:ref :form/r] locals [:ref :form/r] functions [:ref :form/r]] [:ref :fe/err]
+     (let [entries (nd-entries-of locals "local" (nd-entries-of functions "function" (form/no-forms)))
+           suffix (nd-nearest-suffix (form-text symbol) entries)]
+       (fe-reject (str prefix ": " (form-text symbol) " is not a parameter, a let binding, or a "
+                       "function of this module" suffix)
+                  "kotoba.error/unbound-symbol" symbol)))
+   :default nil)
+
+#?(:kotoba
+   (defn unbound-symbol! [prefix :string symbol [:ref :form/r] locals [:ref :form/r] functions [:ref :form/r]] :i64
+     (throw (unbound-symbol-error prefix symbol locals functions)))
+   :default nil)
+
+;; A host error cannot escape as a value on this route: a refusal is already an :fe/err, so it
+;; is re-raised untouched
+#?(:kotoba
+   (defn internal-failure! [error [:ref :fe/err] form [:ref :form/r]] :i64
+     (throw error))
+   :default nil)
+
+#?(:kotoba
+   (defn pure-product-form-head [form [:ref :form/r]] [:ref :form/r]
+     (if (and (form/is-seq? form) (> (form/count-of form) 0) (form/is-symbol? (form/nth-of form 0)))
+       (form/nth-of form 0)
+       (form/nil-form)))
+   :default nil)
+
+;; The head to NAME in a pure-product refusal: the pure spelling the author wrote (`perform`),
+;; otherwise the head now in the tree
+#?(:kotoba
+   (defn pure-product-reported-head [form [:ref :form/r] head [:ref :form/r]] [:ref :form/r]
+     (if (string=? (fsource-head form) "") head (fsym (fsource-head form))))
+   :default nil)
+
+
+;; ---- namespace headers ----
+#?(:kotoba
+   (defn unquote-attr-value [v [:ref :form/r]] [:ref :form/r]
+     (if (and (fhead-is? v "quote") (= 2 (form/count-of v))) (form/nth-of v 1) v))
+   :default nil)
+
+#?(:kotoba
+   (defn namespace-attr-map-keys [] [:ref :form/r]
+     (form/edn-form "{:kotoba/export :export :kotoba/capabilities :capabilities :kotoba/schemas :schemas :kotoba/params :params}"))
+   :default nil)
+
+#?(:kotoba
+   (defn namespace-refused-clauses [] [:ref :form/r]
+     (form/edn-form "{:import \"host interop (a Java / JS class) is outside the language\" :require-macros \"macros are outside the language\" :use \"an unqualified ambient namespace is outside the language\" :load \"loading source at run time is outside the language\" :gen-class \"host interop is outside the language\"}"))
+   :default nil)
+
+#?(:kotoba
+   (defn refer-clojure-option-keys [] [:ref :form/r]
+     (form/edn-form "#{:exclude :only}"))
+   :default nil)
+
+#?(:kotoba
+   (defn refer-clojure-clause? [clause [:ref :form/r]] :bool
+     (and (form/is-seq? clause) (form/eq (form/nth-of clause 0) (form/keyword-form :refer-clojure))))
+   :default nil)
+
+;; the heads of the seq clauses of CLAUSES
+#?(:kotoba
+   (defn- nd-clause-heads [clauses [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count clauses))
+       acc
+       (let [c (fl-nth clauses i)]
+         (nd-clause-heads clauses (+ i 1) (if (form/is-seq? c) (form/append-form acc (form/nth-of c 0)) acc)))))
+   :default nil)
+
+;; the sorted keys of the attr-map key table, as `[k ...]` text (for the refusal sentence)
+#?(:kotoba
+   (defn- nd-sorted-key-text [] :string
+     "[:kotoba/capabilities :kotoba/export :kotoba/params :kotoba/schemas]")
+   :default nil)
+
+;; each key of ATTR-MAP (from J) is admitted and not also written as an explicit clause
+#?(:kotoba
+   (defn- nd-check-attr-keys [attr-map [:ref :form/r] j :i64 explicit-heads [:list [:ref :form/r]]] :i64
+     (if (>= (+ j 1) (form/count-of attr-map))
+       0
+       (let [k (form/nth-of attr-map j)
+             head (form/form-get (namespace-attr-map-keys) k)
+             ok1 (require-k (not (form/is-nil? head))
+                            (str "namespace attr-map key " (pr-form k) " is not admitted; the admitted keys are "
+                                 (nd-sorted-key-text))
+                            "kotoba.error/namespace-attr-map" attr-map)
+             ok2 (require-k (not (fl-has? explicit-heads head 0))
+                            (str "namespace declares " (pr-form head) " twice: attr-map " (pr-form k)
+                                 " and clause (" (pr-form head) " ...)")
+                            "kotoba.error/namespace-clause-duplicate" attr-map)]
+         (nd-check-attr-keys attr-map (+ j 2) explicit-heads))))
+   :default nil)
+
+;; the synthetic clause `(head value)` for each attr-map entry
+#?(:kotoba
+   (defn- nd-attr-clauses [attr-map [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ j 1) (form/count-of attr-map))
+       acc
+       (nd-attr-clauses attr-map (+ j 2)
+                        (form/append-form acc (form/form-seq (form/two-forms (form/form-get (namespace-attr-map-keys) (form/nth-of attr-map j))
+                                                                             (unquote-attr-value (form/nth-of attr-map (+ j 1)))))))))
+   :default nil)
+
+;; Expand without validation so this result can cross a module boundary inside
+;; a typed record. The project parser validates the resulting clauses.
+#?(:kotoba
+   (defn namespace-attr-map-clauses [attr-map [:ref :form/r]
+                                    explicit-clauses [:list [:ref :form/r]]]
+     [:ref :fe/namespace-attr-clauses]
+     (record-new [:ref :fe/namespace-attr-clauses]
+                 (form/append-many (nd-attr-clauses attr-map 0 (form/no-forms))
+                                   explicit-clauses)))
+   :default nil)
+
+;; Rewrite the optional namespace ATTR-MAP into the clauses it stands for, followed by the
+;; explicit ones
+#?(:kotoba
+   (defn namespace-attr-map->clauses [attr-map [:ref :form/r] explicit-clauses [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [ok (nd-check-attr-keys attr-map 0 (nd-clause-heads explicit-clauses 0 (form/no-forms)))]
+       (form/append-many (nd-attr-clauses attr-map 0 (form/no-forms)) explicit-clauses)))
+   :default nil)
+
+;; The clauses of a namespace form -- what follows NAME and DOCSTRING? -- with an ATTR-MAP in its
+;; one position rewritten to the clauses it stands for
+#?(:kotoba
+   (defn namespace-header-clauses [form [:ref :form/r]] [:list [:ref :form/r]]
+     (let [tail0 (fdrop form 2)
+           tail (if (and (> (vector-count tail0) 0) (form/is-string? (fl-nth tail0 0))) (fl-drop tail0 1) tail0)]
+       (if (and (> (vector-count tail) 0) (form/is-map? (fl-nth tail 0)))
+         (namespace-attr-map->clauses (fl-nth tail 0) (fl-drop tail 1))
+         tail)))
+   :default nil)
+
+;; walk FORM and its descendants in order; refuse the first form headed by a forbidden or disallowed head
+#?(:kotoba
+   (defn- nd-pure-product-node [node [:ref :form/r]] :i64
+     (let [head (pure-product-form-head node)
+           ok (require-k (or (form/is-nil? head)
+                             (not (or (tables/forbidden-heads-has? head)
+                                      (tables/pure-product-disallowed-heads-has? head))))
+                         (str "form outside pure-product profile: " (form-text (pure-product-reported-head node head)))
+                         "kotoba.error/pure-product-forbidden" node)]
+       (nd-pure-product-kids (form/kids-of node) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-pure-product-kids [kids [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count kids))
+       0
+       (let [ok (nd-pure-product-node (fl-nth kids i))]
+         (nd-pure-product-kids kids (+ i 1)))))
+   :default nil)
+
+;; a `(:capabilities ...)` clause of the header is refused
+#?(:kotoba
+   (defn- nd-no-capabilities [form [:ref :form/r] clauses [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count clauses))
+       0
+       (let [c (fl-nth clauses i)
+             ok (require-k (not (and (form/is-seq? c) (form/eq (form/nth-of c 0) (form/keyword-form :capabilities))))
+                           "pure-product profile rejects :capabilities (guest must be effect-free)"
+                           "kotoba.error/pure-product-capabilities" form)]
+         (nd-no-capabilities form clauses (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-pure-product-forms [forms [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count forms))
+       0
+       (let [f (fl-nth forms i)
+             ok1 (if (fhead-is? f "ns") (nd-no-capabilities f (namespace-header-clauses f) 0) 0)
+             ok2 (nd-pure-product-node f)]
+         (nd-pure-product-forms forms (+ i 1)))))
+   :default nil)
+
+;; T2.1: writeable pure-product source must not declare capabilities or use disallowed sugar / cap-call
+#?(:kotoba
+   (defn check-pure-product-source-forms! [forms [:list [:ref :form/r]]] :i64
+     (nd-pure-product-forms forms 0))
+   :default nil)
+
+#?(:kotoba
+   (defn reserved-binding-name? [value [:ref :form/r]] :bool
+     (and (simple-symbol-form? value) (= 0 (string-index-of (form-text value) "__kotoba_"))))
+   :default nil)
+
+;; (:refer-clojure ...) clauses: shape-checked, none of their content admitted
+#?(:kotoba
+   (defn- nd-refer-options [clause [:ref :form/r] options [:ref :form/r] j :i64 seen [:list [:ref :form/r]]] :i64
+     (if (>= (+ j 1) (form/count-of options))
+       0
+       (let [k (form/nth-of options j)
+             names (form/nth-of options (+ j 1))
+             ok1 (require-k (not (form/eq k (form/keyword-form :rename)))
+                            "namespace clause :refer-clojure :rename is not admitted: renaming changes name resolution; :exclude and :only are admitted as no-ops"
+                            "kotoba.error/namespace-refer-clojure-clause" clause)
+             ok2 (require-k (tables/table-has? (refer-clojure-option-keys) k)
+                            (str "namespace clause :refer-clojure option " (pr-form k)
+                                 " is not admitted; the admitted options are :exclude and :only")
+                            "kotoba.error/namespace-refer-clojure-clause" clause)
+             ok3 (require-k (not (fl-has? seen k 0)) "namespace clause :refer-clojure repeats an option"
+                            "kotoba.error/namespace-refer-clojure-clause" clause)
+             ok4 (require-k (and (form/is-vec? names) (<= (form/count-of names) (max-functions)) (nd-all-valid? names 0))
+                            (str "namespace clause :refer-clojure " (pr-form k) " takes a bounded vector of simple symbols")
+                            "kotoba.error/namespace-refer-clojure-clause" clause)]
+         (nd-refer-options clause options (+ j 2) (form/append-form seen k)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-all-valid? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (and (valid-name? (form/nth-of xs i)) (nd-all-valid? xs (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-refer-clauses [clauses [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count clauses))
+       0
+       (let [clause (fl-nth clauses i)
+             options (form/form-vec (fdrop clause 1))
+             ok1 (require-k (= 0 (rem (form/count-of options) 2))
+                            "namespace clause :refer-clojure takes :exclude [sym ...] and/or :only [sym ...]"
+                            "kotoba.error/namespace-refer-clojure-clause" clause)
+             ok2 (nd-refer-options clause options 0 (form/no-forms))]
+         (nd-refer-clauses clauses (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn validate-refer-clojure-clauses! [clauses [:list [:ref :form/r]] form [:ref :form/r]] :i64
+     (let [ok (require-k (<= (vector-count clauses) 1) "namespace admits :refer-clojure at most once"
+                         "kotoba.error/namespace-clause-duplicate" form)]
+       (nd-refer-clauses clauses 0)))
+   :default nil)
+
+
+;; ---- namespace-parts ----
+#?(:kotoba
+   (defn- nd-first-map [xs [:list [:ref :form/r]] i :i64] [:ref :form/r]
+     (if (>= i (vector-count xs))
+       (form/nil-form)
+       (if (form/is-map? (fl-nth xs i)) (fl-nth xs i) (nd-first-map xs (+ i 1)))))
+   :default nil)
+
+;; the clauses of CLAUSES (from I) that are / are not (:refer-clojure ...)
+#?(:kotoba
+   (defn- nd-select-refer [clauses [:list [:ref :form/r]] want :bool i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count clauses))
+       acc
+       (let [c (fl-nth clauses i)]
+         (nd-select-refer clauses want (+ i 1) (if (if want (refer-clojure-clause? c) (not (refer-clojure-clause? c))) (form/append-form acc c) acc)))))
+   :default nil)
+
+;; a clause headed by a name the namespace refuses is rejected by name
+#?(:kotoba
+   (defn- nd-refused-clauses [clauses [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count clauses))
+       0
+       (let [c (fl-nth clauses i)
+             head (if (form/is-seq? c) (form/nth-of c 0) (form/nil-form))
+             why (form/form-get (namespace-refused-clauses) head)
+             ok (require-k (or (form/is-nil? head) (form/is-nil? why))
+                           (str "namespace clause " (pr-form head) " is not admitted: " (form/string-value why)
+                                "; the admitted clauses are :export, :capabilities and :schemas"
+                                " (and :require / :params on the project route)")
+                           "kotoba.error/namespace-host-clause" c)]
+         (nd-refused-clauses clauses (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-clause-shape [clause [:ref :form/r]] :i64
+     (let [head (if (form/is-seq? clause) (form/nth-of clause 0) (form/nil-form))
+           ok0 (require-k (form/is-seq? clause) "only a bounded :export vector is admitted in namespace clauses"
+                          "kotoba.error/namespace-export-clause" clause)
+           ok1 (require-k (or (not (form/eq head (form/keyword-form :export)))
+                              (and (= 2 (form/count-of clause)) (form/is-vec? (form/nth-of clause 1))))
+                          "only a bounded :export vector is admitted in namespace clauses"
+                          "kotoba.error/namespace-export-clause" clause)
+           ok2 (require-k (or (not (form/eq head (form/keyword-form :capabilities)))
+                              (and (= 2 (form/count-of clause)) (form/is-set? (form/nth-of clause 1))))
+                          "only a bounded :capabilities set is admitted in namespace clauses"
+                          "kotoba.error/namespace-capabilities-clause" clause)
+           ok3 (require-k (or (not (form/eq head (form/keyword-form :schemas)))
+                              (and (= 2 (form/count-of clause)) (form/is-map? (form/nth-of clause 1))))
+                          "only a closed :schemas map is admitted in namespace clauses"
+                          "kotoba.error/namespace-schemas-clause" clause)
+           known (or (form/eq head (form/keyword-form :export)) (form/eq head (form/keyword-form :capabilities))
+                     (form/eq head (form/keyword-form :schemas)))
+           ;; `:require` and `:params` keep the generic message VERBATIM: amu's diagnostic refine
+           ;; recognises exactly that code + head
+           ok4 (require-k known "only a bounded :export vector is admitted in namespace clauses"
+                          "kotoba.error/namespace-export-clause" clause)]
+       0))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-clause-shapes [clauses [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count clauses))
+       0
+       (let [ok (nd-clause-shape (fl-nth clauses i))]
+         (nd-clause-shapes clauses (+ i 1)))))
+   :default nil)
+
+;; the clause of CLAUSES headed by HEAD (nil when absent)
+#?(:kotoba
+   (defn- nd-clause-named [clauses [:list [:ref :form/r]] head [:ref :form/r] i :i64] [:ref :form/r]
+     (if (>= i (vector-count clauses))
+       (form/nil-form)
+       (if (form/eq (form/nth-of (fl-nth clauses i) 0) head)
+         (fl-nth clauses i)
+         (nd-clause-named clauses head (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-all-namespaced-keywords? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (let [x (form/nth-of xs i)]
+         (and (form/is-keyword? x) (not (string=? (fnamespace x) "")) (nd-all-namespaced-keywords? xs (+ i 1))))))
+   :default nil)
+
+;; Parse the bounded namespace header: a Form map {:namespace :exports :capabilities :schemas
+;; :schema-identities}
+#?(:kotoba
+   (defn namespace-parts [form [:ref :form/r]] [:ref :form/r]
+     (let [namespace-symbol (form/nth-of form 1)
+           ok1 (require-k (and (fhead-is? form "ns") (simple-symbol-form? namespace-symbol)
+                               (> (string-length (form-text namespace-symbol)) 0)
+                               (<= (string-length (form-text namespace-symbol)) (max-symbol-chars)))
+                          "invalid bounded namespace symbol" "kotoba.error/namespace-symbol" form)
+           tail0 (fdrop form 2)
+           has-doc (and (> (vector-count tail0) 0) (form/is-string? (fl-nth tail0 0)))
+           docstring (if has-doc (fl-nth tail0 0) (form/nil-form))
+           tail1 (if has-doc (fl-drop tail0 1) tail0)
+           has-attr (and (> (vector-count tail1) 0) (form/is-map? (fl-nth tail1 0)))
+           attr-map (if has-attr (fl-nth tail1 0) (form/nil-form))
+           tail2 (if has-attr (fl-drop tail1 1) tail1)
+           ok2 (require-k (or (not has-doc) (<= (string-length (form/string-value docstring)) (max-namespace-docstring-chars)))
+                          "namespace docstring exceeds admission limit" "kotoba.error/namespace-docstring-limit" docstring)
+           stray (nd-first-map tail2 0)
+           ok3 (require-k (form/is-nil? stray)
+                          "namespace attr-map must follow the docstring: (ns NAME DOCSTRING? ATTR-MAP? CLAUSE ...)"
+                          "kotoba.error/namespace-attr-map" stray)
+           tail3 (if has-attr (namespace-attr-map->clauses attr-map tail2) tail2)
+           harness (nd-select-refer tail3 true 0 (form/no-forms))
+           tail (nd-select-refer tail3 false 0 (form/no-forms))
+           ok4 (nd-refused-clauses tail 0)
+           ok5 (validate-refer-clojure-clauses! harness form)
+           ok6 (require-k (<= (vector-count tail) 3) "namespace admits at most :export, :capabilities, and :schemas clauses"
+                          "kotoba.error/namespace-clause-count" form)
+           ok7 (nd-clause-shapes tail 0)
+           heads (nd-clause-heads tail 0 (form/no-forms))
+           ok8 (require-k (fl-distinct? heads) "namespace admits each clause at most once"
+                          "kotoba.error/namespace-clause-duplicate" form)
+           export-clause (nd-clause-named tail (form/keyword-form :export) 0)
+           capabilities-clause (nd-clause-named tail (form/keyword-form :capabilities) 0)
+           schemas-clause (nd-clause-named tail (form/keyword-form :schemas) 0)
+           exports (if (form/is-nil? export-clause) (form/nil-form) (form/nth-of export-clause 1))
+           capabilities (if (form/is-nil? capabilities-clause) (form/nil-form) (form/nth-of capabilities-clause 1))
+           ;; the authored schemas table stays raw here: analyze merges the same-module nominal
+           ;; schemas before the closed graph is validated once
+           schemas (if (form/is-nil? schemas-clause) (form/nil-form) (form/nth-of schemas-clause 1))
+           ok9 (require-k (or (form/is-nil? exports)
+                              (and (<= (form/count-of exports) (max-functions)) (fdistinct? exports 0) (nd-all-valid? exports 0)))
+                          "namespace exports must be unique bounded function names" "kotoba.error/namespace-exports" exports)
+           ok10 (require-k (or (form/is-nil? capabilities)
+                               (and (<= (form/count-of capabilities) (max-namespace-capabilities))
+                                    (nd-all-namespaced-keywords? capabilities 0)))
+                           "namespace :capabilities must be a bounded set of namespaced keywords"
+                           "kotoba.error/namespace-capabilities-shape" capabilities)]
+       (fput (fput (fput (fput (fput (form/form-map (form/no-forms)) :namespace namespace-symbol)
+                               :exports exports)
+                         :capabilities capabilities)
+                   :schemas schemas)
+             :schema-identities (form/nil-form))))
+   :default nil)
+
+#?(:kotoba
+   (defn table-heads [table [:ref :form/r]] [:list [:ref :form/r]]
+     (if (form/is-map? table) (ex-map-keys table 0 (form/no-forms)) (form/kids-of table)))
+   :default nil)
+
+;; the builtin tables a nearest-name search covers
+#?(:kotoba
+   (defn- nd-builtin-entries [] [:list [:ref :form/r]]
+     (nd-entries-from
+      (form/append-many
+       (form/append-many
+        (form/append-many
+         (form/append-many
+          (form/append-many
+           (form/append-many
+            (form/append-many
+             (form/append-many
+              (table-heads (tables/arithmetic))
+              (table-heads (tables/comparisons)))
+             (table-heads (tables/float-division-heads)))
+            (form/append-many (table-heads (tables/i64-operations)) (table-heads (tables/i32-operations))))
+           (form/append-many (table-heads (tables/heap-operations)) (table-heads (tables/kgraph-operations))))
+          (form/append-many (table-heads (tables/string-operations)) (table-heads (tables/region-operations))))
+         (form/append-many (table-heads (tables/xml-operations)) (table-heads (tables/decimal-operations))))
+        (form/append-many (table-heads (tables/f64-operations))
+                          (form/append-many (table-heads (tables/f32-operations)) (table-heads (tables/typed-map-operations)))))
+       (form/append-many (form/append-many (table-heads (tables/typed-safe-value-operations)) (table-heads (tables/parametric-result-operations)))
+                         (form/append-many
+                          (form/append-many (table-heads (tables/typed-vector-operations)) (table-heads (tables/typed-f64-vector-operations)))
+                          (form/append-many
+                           (form/append-many (table-heads (tables/compact-graph-operations)) (table-heads (tables/document-fixed-operations)))
+                           (form/append-many
+                            (form/append-many (table-heads (tables/kernel-memory-operations)) (table-heads (tables/kernel-privileged-operations)))
+                            (form/append-many (table-heads (tables/rodata-literal-operations)) (table-heads (tables/image-symbol-operations))))))))
+      "builtin" 0 (form/no-forms))
+     )
+   :default nil)
+
+;; Refuse the call FORM whose head OP no pass admitted, naming WHICH of the two facts that can
+;; mean: declared by the grammar but unlowered, or unknown with the nearest names beside it
+#?(:kotoba
+   (defn unknown-operation-error [op [:ref :form/r] form [:ref :form/r] functions [:ref :form/r]] [:ref :fe/err]
+     (if (tables/grammar-declared-heads-has? op)
+       (fe-reject (str (form-text op) " is named by the language grammar (lang/guest-grammar.edn) "
+                       "but this analyser has no lowering for it -- not implemented on "
+                       "this compile path")
+                  "kotoba.error/unimplemented-grammar-head" form)
+       (let [entries (nd-entries-of functions "function" (nd-builtin-entries))
+             suffix (nd-nearest-suffix (form-text op) entries)]
+         (fe-reject (str "unknown operation: " (form-text op) " is not a builtin, a sugar head, or a "
+                         "function of this module" suffix)
+                    "kotoba.error/unknown-operation" form))))
+   :default nil)
+
+#?(:kotoba
+   (defn unknown-operation! [op [:ref :form/r] form [:ref :form/r] functions [:ref :form/r]] :i64
+     (throw (unknown-operation-error op form functions)))
+   :default nil)
+
+
+;; ---- slice-value: erasing the ADR 0285 carrier ----
+#?(:kotoba
+   (defn slice-erased-base-name [sym [:ref :form/r]] [:ref :form/r]
+     (fsym (str "__kotoba_slice_" (fname sym) "_base")))
+   :default nil)
+
+#?(:kotoba
+   (defn slice-erased-length-name [sym [:ref :form/r]] [:ref :form/r]
+     (fsym (str "__kotoba_slice_" (fname sym) "_len")))
+   :default nil)
+
+;; ELEMENTS to BYTES: folded when the operand is a literal
+#?(:kotoba
+   (defn slice-scale [expr [:ref :form/r] width :i64] [:ref :form/r]
+     (cond
+       (= 1 width) expr
+       (form/is-int? expr) (form/int-form (* (form/int-value expr) width))
+       :else (form/call2 "*" expr (form/int-form width))))
+   :default nil)
+
+#?(:kotoba
+   (defn slice-access-operation [kind :string element [:ref :form/r]] [:ref :form/r]
+     (fsym (str "slice-" kind "-" (fname element))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-uses-slice? [f [:ref :form/r] slice-parameters [:ref :form/r]] :bool
+     (if (and (form/is-seq? f) (> (form/count-of f) 0)
+              (or (tables/slice-value-operations-has? (form/nth-of f 0))
+                  (form/form-has? slice-parameters (form/nth-of f 0))))
+       true
+       (nd-uses-slice-kids? (form/kids-of f) 0 slice-parameters)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-uses-slice-kids? [kids [:list [:ref :form/r]] i :i64 slice-parameters [:ref :form/r]] :bool
+     (if (>= i (vector-count kids))
+       false
+       (if (nd-uses-slice? (fl-nth kids i) slice-parameters) true (nd-uses-slice-kids? kids (+ i 1) slice-parameters))))
+   :default nil)
+
+#?(:kotoba
+   (defn uses-slice-values? [body [:ref :form/r] slice-parameters [:ref :form/r]] :bool
+     (nd-uses-slice? body slice-parameters))
+   :default nil)
+
+;; {index element} for the slice-typed parameters of a function (sorted by index)
+#?(:kotoba
+   (defn- nd-slice-indexed [param-types [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+     (if (>= i (form/count-of param-types))
+       acc
+       (let [t (form/nth-of param-types i)]
+         (nd-slice-indexed param-types (+ i 1)
+                           (if (slice-type? t) (form/assoc-form acc (form/int-form i) (slice-element-type t)) acc)))))
+   :default nil)
+
+;; {function-name {index element}} for the functions with a slice parameter
+#?(:kotoba
+   (defn- nd-slice-parameters [functions [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+     (if (>= i (vector-count functions))
+       acc
+       (let [f (fl-nth functions i)
+             indexed (nd-slice-indexed (fget f :param-types) 0 (form/form-map (form/no-forms)))]
+         (nd-slice-parameters functions (+ i 1)
+                              (if (> (form/count-of indexed) 0) (form/assoc-form acc (fget f :name) indexed) acc)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-source-arities [functions [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+     (if (>= i (vector-count functions))
+       acc
+       (let [f (fl-nth functions i)]
+         (nd-source-arities functions (+ i 1) (form/assoc-form acc (fget f :name) (form/int-form (form/count-of (fget f :params))))))))
+   :default nil)
+
+;; the slice info {:element :base :len}
+#?(:kotoba
+   (defn- nd-info [element [:ref :form/r] base [:ref :form/r] len [:ref :form/r]] [:ref :form/r]
+     (fput (fput (fput (form/form-map (form/no-forms)) :element element) :base base) :len len))
+   :default nil)
+
+;; the expanded parameter list of a function: slice parameters become base and length words;
+;; answers {:params :param-types :env}
+#?(:kotoba
+   (defn- nd-expand-params [params [:ref :form/r] types [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+     (if (>= i (form/count-of params))
+       acc
+       (let [p (form/nth-of params i)
+             t (if (< i (form/count-of types)) (form/nth-of types i) (form/keyword-form :i64))]
+         (nd-expand-params
+          params types (+ i 1)
+          (if (slice-type? t)
+            (let [b (slice-erased-base-name p)
+                  l (slice-erased-length-name p)]
+              (fput (fput (fput acc :params (form/form-vec (form/append-form (form/append-form (form/kids-of (fget acc :params)) b) l)))
+                          :param-types (form/form-vec (form/append-form (form/append-form (form/kids-of (fget acc :param-types)) (form/keyword-form :i64)) (form/keyword-form :i64))))
+                    :env (form/assoc-form (fget acc :env) p (nd-info (slice-element-type t) b l))))
+            (fput (fput acc :params (form/form-vec (form/append-form (form/kids-of (fget acc :params)) p)))
+                  :param-types (form/form-vec (form/append-form (form/kids-of (fget acc :param-types)) t))))))))
+   :default nil)
+
+;; ---- the rewrite proper ----
+;; -> the slice info of EXPR, or nil when EXPR is not slice-valued
+#?(:kotoba
+   (defn- nd-slice-of [expr [:ref :form/r] env [:ref :form/r] scalars [:ref :form/r] ctx [:ref :form/r]] [:ref :form/r]
+     (cond
+       (and (form/is-symbol? expr) (form/form-has? env expr)) (form/form-get env expr)
+
+       (and (form/is-seq? expr) (> (form/count-of expr) 0)
+            (tables/slice-constructor-elements-has? (form/nth-of expr 0)))
+       (let [ok1 (require-k (= 3 (form/count-of expr)) "slice constructor arity mismatch"
+                            "kotoba.error/slice-arity" expr)
+             base (form/nth-of expr 1)
+             length (form/nth-of expr 2)
+             ok2 (require-k (traceable-base? base scalars (fget ctx :ctx))
+                            "slice base must name a region, not compute one"
+                            "kotoba.error/slice-region-provenance" expr)
+             base2 (nd-slice-rewrite base env scalars ctx)
+             len2 (nd-slice-rewrite length env scalars ctx)]
+         (nd-info (form/form-get (tables/slice-constructor-elements) (form/nth-of expr 0)) base2 len2))
+
+       (fhead-is? expr "slice-sub")
+       (let [ok1 (require-k (= 4 (form/count-of expr)) "slice-sub arity mismatch" "kotoba.error/slice-arity" expr)
+             parent (nd-slice-of (form/nth-of expr 1) env scalars ctx)
+             ok2 (require-k (not (form/is-nil? parent)) "slice-sub narrows a slice value" "kotoba.error/slice-operand" expr)
+             element (fget parent :element)
+             base (fget parent :base)
+             len (fget parent :len)
+             width (form/int-value (form/form-get (slice-element-widths) element))
+             offset2 (nd-slice-rewrite (form/nth-of expr 2) env scalars ctx)
+             count2 (nd-slice-rewrite (form/nth-of expr 3) env scalars ctx)]
+         ;; A CHECKED narrowing: `kernel-subregion` traps unless the offset lies inside the parent
+         ;; and the count inside the remainder; the scale is applied here
+         (nd-info element
+                  (form/form-seq (form/append-form (form/append-form (form/append-form (form/two-forms (fsym "kernel-subregion") base)
+                                                                                       (slice-scale len width))
+                                                                     (slice-scale offset2 width))
+                                                   (slice-scale count2 width)))
+                  count2))
+
+       :else (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-require-slice [expr [:ref :form/r] env [:ref :form/r] scalars [:ref :form/r] ctx [:ref :form/r] what :string] [:ref :form/r]
+     (let [info (nd-slice-of expr env scalars ctx)
+           ok (require-k (not (form/is-nil? info)) (str what " requires a slice value")
+                         "kotoba.error/slice-operand" expr)]
+       info))
+   :default nil)
+
+;; the rewritten kids of EXPR from I
+#?(:kotoba
+   (defn- nd-rewrite-kids [kids [:list [:ref :form/r]] i :i64 env [:ref :form/r] scalars [:ref :form/r] ctx [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (let [r (nd-slice-rewrite (fl-nth kids i) env scalars ctx)]
+         (nd-rewrite-kids kids (+ i 1) env scalars ctx (form/append-form acc r)))))
+   :default nil)
+
+;; a slice binding becomes two real bindings so neither half is ever evaluated twice
+#?(:kotoba
+   (defn- nd-let-pairs [raw [:ref :form/r] j :i64 acc [:ref :form/r] ctx [:ref :form/r]] [:ref :form/r]
+     (if (>= (+ j 1) (form/count-of raw))
+       acc
+       (let [binder (form/nth-of raw j)
+             init (form/nth-of raw (+ j 1))
+             env (fget acc :env)
+             scalars (fget acc :scalars)
+             bindings (form/kids-of (fget acc :bindings))
+             info (nd-slice-of init env scalars ctx)]
+         (if (form/is-nil? info)
+           (let [value (nd-slice-rewrite init env scalars ctx)]
+             ;; a non-slice binding SHADOWS an outer slice of the same name
+             (nd-let-pairs raw (+ j 2)
+                           (fput (fput (fput acc :bindings (form/form-vec (form/append-form (form/append-form bindings binder) value)))
+                                       :env (form/dissoc-form env binder))
+                                 :scalars (form/assoc-form scalars binder init))
+                           ctx))
+           (let [b (slice-erased-base-name binder)
+                 l (slice-erased-length-name binder)]
+             (nd-let-pairs raw (+ j 2)
+                           (fput (fput (fput acc :bindings (form/form-vec (form/append-form (form/append-form (form/append-form (form/append-form bindings b) (fget info :base)) l) (fget info :len))))
+                                       :env (form/assoc-form env binder (nd-info (fget info :element) b l)))
+                                 :scalars (form/assoc-form (form/assoc-form scalars b (fget info :base)) l (fget info :len)))
+                           ctx))))))
+   :default nil)
+
+;; the arguments of a call to a function with slice parameters: slice arguments pass base and length
+#?(:kotoba
+   (defn- nd-call-args [op [:ref :form/r] positions [:ref :form/r] args [:list [:ref :form/r]] i :i64 env [:ref :form/r] scalars [:ref :form/r] ctx [:ref :form/r] expr [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count args))
+       acc
+       (let [arg (fl-nth args i)
+             element (form/form-get positions (form/int-form i))]
+         (if (form/is-nil? element)
+           (let [r (nd-slice-rewrite arg env scalars ctx)]
+             (nd-call-args op positions args (+ i 1) env scalars ctx expr (form/append-form acc r)))
+           (let [info (nd-require-slice arg env scalars ctx
+                                        (str "parameter " (string-from-i64 i) " of " (form-text op)))
+                 ok (require-k (form/eq element (fget info :element))
+                               (str "slice element type mismatch: parameter " (string-from-i64 i) " of " (form-text op)
+                                    " takes [:slice " (form-text element) "], not [:slice " (form-text (fget info :element)) "]")
+                               "kotoba.error/slice-element-mismatch" expr)]
+             (nd-call-args op positions args (+ i 1) env scalars ctx expr
+                           (form/append-form (form/append-form acc (fget info :base)) (fget info :len))))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-rewrite-let [expr [:ref :form/r] args [:list [:ref :form/r]] env [:ref :form/r] scalars [:ref :form/r] ctx [:ref :form/r]] [:ref :form/r]
+     (let [raw (fl-nth args 0)
+           ok (require-k (and (form/is-vec? raw) (= 0 (rem (form/count-of raw) 2)))
+                         "let bindings must be an even-length vector" "kotoba.error/subset-reject" expr)
+           acc (nd-let-pairs raw 0 (fput (fput (fput (form/form-map (form/no-forms)) :bindings (form/form-vec (form/no-forms))) :env env) :scalars scalars) ctx)
+           body (nd-rewrite-kids (fl-drop args 1) 0 (fget acc :env) (fget acc :scalars) ctx (form/no-forms))]
+       (form/form-seq (form/cons-onto (fsym "let") (form/cons-onto (fget acc :bindings) body)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-slice-rewrite [expr [:ref :form/r] env [:ref :form/r] scalars [:ref :form/r] ctx [:ref :form/r]] [:ref :form/r]
+     (cond
+       (and (form/is-symbol? expr) (form/form-has? env expr))
+       (let [ok (require-k false "a slice value can only be indexed, narrowed, measured, or passed to a slice parameter"
+                           "kotoba.error/slice-escape" expr)]
+         expr)
+
+       (not (form/is-seq? expr)) expr
+
+       :else
+       (let [op (if (> (form/count-of expr) 0) (form/nth-of expr 0) (form/nil-form))
+             args (fdrop expr 1)
+             head (fhead expr)]
+         (cond
+           (string=? head "let") (nd-rewrite-let expr args env scalars ctx)
+
+           (string=? head "slice-length")
+           (let [ok (require-k (= 1 (vector-count args)) "slice-length arity mismatch" "kotoba.error/slice-arity" expr)
+                 info (nd-require-slice (fl-nth args 0) env scalars ctx "slice-length")]
+             (fget info :len))
+
+           (string=? head "slice-get")
+           (let [ok (require-k (= 2 (vector-count args)) "slice-get arity mismatch" "kotoba.error/slice-arity" expr)
+                 info (nd-require-slice (fl-nth args 0) env scalars ctx "slice-get")
+                 index (nd-slice-rewrite (fl-nth args 1) env scalars ctx)]
+             (form/call3 (str "slice-load-" (fname (fget info :element))) (fget info :base) (fget info :len) index))
+
+           (string=? head "slice-set!")
+           (let [ok (require-k (= 3 (vector-count args)) "slice-set! arity mismatch" "kotoba.error/slice-arity" expr)
+                 info (nd-require-slice (fl-nth args 0) env scalars ctx "slice-set!")
+                 index (nd-slice-rewrite (fl-nth args 1) env scalars ctx)
+                 value (nd-slice-rewrite (fl-nth args 2) env scalars ctx)]
+             (form/form-seq (form/append-form (form/append-form (form/append-form (form/two-forms (fsym (str "slice-store-" (fname (fget info :element)))) (fget info :base))
+                                                                                  (fget info :len))
+                                                                index)
+                                              value)))
+
+           (or (tables/slice-constructor-elements-has? op) (string=? head "slice-sub"))
+           (let [ok (require-k false "a slice value can only be indexed, narrowed, measured, or passed to a slice parameter"
+                               "kotoba.error/slice-escape" expr)]
+             expr)
+
+           (form/form-has? (fget ctx :slice-parameters) op)
+           (let [positions (form/form-get (fget ctx :slice-parameters) op)
+                 expected (form/int-value (form/form-get (fget ctx :source-arity) op))
+                 ok (require-k (= expected (vector-count args)) "call arity does not match the callee's declared parameters"
+                               "kotoba.error/slice-call-arity" expr)
+                 rewritten (nd-call-args op positions args 0 env scalars ctx expr (form/no-forms))]
+             (form/form-seq (form/cons-onto op rewritten)))
+
+           :else
+           (form/form-seq (form/cons-onto op (nd-rewrite-kids args 0 env scalars ctx (form/no-forms))))))))
+   :default nil)
+
+
+;; the info map of a function that needs erasing, or the function itself when it does not
+#?(:kotoba
+   (defn- nd-erase-function [f [:ref :form/r] slice-parameters [:ref :form/r] source-arity [:ref :form/r]] [:ref :form/r]
+     (if (not (or (form/form-has? slice-parameters (fget f :name))
+                  (uses-slice-values? (fget f :body) slice-parameters)))
+       f
+       (let [reported (if (ftruthy? (fget f :source-name)) (fget f :source-name) (fget f :name))
+             result (fget f :result)
+             ok1 (require-k (not (slice-type? result))
+                            (str "a slice value cannot be returned: " (form-text reported) " declares " (pr-form result))
+                            "kotoba.error/slice-result-type" result)
+             params (fget f :params)
+             expanded (nd-expand-params params (fget f :param-types) 0
+                                        (fput (fput (fput (form/form-map (form/no-forms)) :params (form/form-vec (form/no-forms)))
+                                                    :param-types (form/form-vec (form/no-forms)))
+                                              :env (form/form-map (form/no-forms))))
+             ok2 (require-k (<= (form/count-of (fget expanded :params)) (max-parameters))
+                            (str "function parameters exceed ABI-supported arity after slice erasure: "
+                                 (form-text reported) " needs " (string-from-i64 (form/count-of (fget expanded :params)))
+                                 " machine words for " (string-from-i64 (form/count-of params)) " parameters")
+                            "kotoba.error/slice-erased-max-parameters" params)
+             ctx (fput (fput (fput (form/form-map (form/no-forms)) :root-params (form/form-set (form/kids-of params)))
+                             :slice-parameters slice-parameters)
+                       :source-arity source-arity)
+             body (nd-slice-rewrite (fget f :body) (fget expanded :env) (form/form-map (form/no-forms)) ctx)]
+         (fput (fput (fput f :params (fget expanded :params)) :param-types (fget expanded :param-types)) :body body))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-erase-functions [functions [:list [:ref :form/r]] i :i64 slice-parameters [:ref :form/r] source-arity [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count functions))
+       acc
+       (let [f (nd-erase-function (fl-nth functions i) slice-parameters source-arity)]
+         (nd-erase-functions functions (+ i 1) slice-parameters source-arity (form/append-form acc f)))))
+   :default nil)
+
+;; Rewrite every `[:slice T]` parameter, binding and operation into the two i64 words the machine
+;; carries. Answers a Form map {:functions :slice-parameter-functions}: FUNCTIONS with slice
+;; parameters expanded in place, and the names of the functions that take one (the host reads that
+;; from a volatile once the export list is known)
+#?(:kotoba
+   (defn erase-slice-values [functions [:list [:ref :form/r]]] [:ref :form/r]
+     (let [slice-parameters (nd-slice-parameters functions 0 (form/form-map (form/no-forms)))
+           source-arity (nd-source-arities functions 0 (form/form-map (form/no-forms)))
+           erased (nd-erase-functions functions 0 slice-parameters source-arity (form/no-forms))]
+       (fput (fput (form/form-map (form/no-forms)) :functions (form/form-vec erased))
+             :slice-parameter-functions (form/form-vec (ex-map-keys slice-parameters 0 (form/no-forms))))))
+   :default nil)
+
+;; ---- defdesugar: registered pure bounded templates ----
+;; (a Form map {:form :counter} threads the expansion counter the host keeps in a volatile)
+#?(:kotoba
+   (defn- nd-ec [form [:ref :form/r] counter :i64] [:ref :form/r]
+     (fput (fput (form/form-map (form/no-forms)) :form form) :counter (form/int-form counter)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-all-simple? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (and (simple-symbol-form? (form/nth-of xs i)) (nd-all-simple? xs (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-any-reserved-binding? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       false
+       (if (reserved-binding-name? (form/nth-of xs i)) true (nd-any-reserved-binding? xs (+ i 1)))))
+   :default nil)
+
+;; the number of nodes of FORM (itself and its descendants)
+#?(:kotoba
+   (defn- nd-node-count [f [:ref :form/r]] :i64
+     (+ 1 (nd-node-count-kids (form/kids-of f) 0 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-node-count-kids [kids [:list [:ref :form/r]] i :i64 acc :i64] :i64
+     (if (>= i (vector-count kids))
+       acc
+       (nd-node-count-kids kids (+ i 1) (+ acc (nd-node-count (fl-nth kids i))))))
+   :default nil)
+
+;; a seq node headed by a head that can be neither declaration nor function
+#?(:kotoba
+   (defn- nd-has-unspellable? [node [:ref :form/r]] :bool
+     (if (and (form/is-seq? node) (> (form/count-of node) 0)
+              (tables/table-has? (unspellable-definition-heads) (form/nth-of node 0)))
+       true
+       (nd-unspellable-kids? (form/kids-of node) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-unspellable-kids? [kids [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count kids))
+       false
+       (if (nd-has-unspellable? (fl-nth kids i)) true (nd-unspellable-kids? kids (+ i 1)))))
+   :default nil)
+
+;; Read one `(defdesugar name [params] body)` into {:name :params :body}
+#?(:kotoba
+   (defn desugar-template-parts [form [:ref :form/r]] [:ref :form/r]
+     (let [name (form/nth-of form 1)
+           params (form/nth-of form 2)
+           tail (fdrop form 3)
+           ok1 (require-k (simple-symbol-form? name) "desugar template requires a simple name" "kotoba.error/subset-reject" form)
+           ok2 (require-k (not (reserved-binding-name? name)) "symbol uses the reserved __kotoba_ prefix" "kotoba.error/subset-reject" name)
+           ok3 (require-k (not (or (tables/structural-heads-has? name)
+                                   (tables/forbidden-heads-has? name)
+                                   (tables/table-has? (reserved-function-names) name)))
+                          "desugar template may not take a reserved head name" "kotoba.error/subset-reject" name)
+           ok4 (require-k (form/is-vec? params) "desugar template requires a parameter vector" "kotoba.error/subset-reject" form)
+           ok5 (require-k (<= (form/count-of params) (max-desugar-template-parameters))
+                          "desugar template parameter count exceeds limit" "kotoba.error/subset-reject" form)
+           ok6 (require-k (nd-all-simple? params 0) "desugar template parameters must be plain symbols" "kotoba.error/subset-reject" params)
+           ok7 (require-k (not (nd-any-reserved-binding? params 0)) "symbol uses the reserved __kotoba_ prefix" "kotoba.error/subset-reject" params)
+           ok8 (require-k (fdistinct? params 0) "desugar template parameters must be distinct" "kotoba.error/subset-reject" params)
+           ok9 (require-k (= 1 (vector-count tail)) "desugar template requires exactly one body expression" "kotoba.error/subset-reject" form)
+           body (fl-nth tail 0)
+           ok10 (require-k (<= (nd-node-count body) (max-desugar-template-nodes)) "desugar template body exceeds node limit"
+                           "kotoba.error/subset-reject" form)
+           ok11 (require-k (not (nd-has-unspellable? body)) "desugar template body may not contain a reserved head form"
+                           "kotoba.error/subset-reject" form)]
+       (fput (fput (fput (form/form-map (form/no-forms)) :name name) :params (form/form-vec (form/kids-of params))) :body body)))
+   :default nil)
+
+;; Rename PARAMETERS (a symbol -> symbol map) throughout FORM; `quote` is left alone
+#?(:kotoba
+   (defn- nd-substitute-kids [kids [:list [:ref :form/r]] i :i64 parameters [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (nd-substitute-kids kids (+ i 1) parameters (form/append-form acc (substitute-template-parameters (fl-nth kids i) parameters)))))
+   :default nil)
+
+#?(:kotoba
+   (defn substitute-template-parameters [form [:ref :form/r] parameters [:ref :form/r]] [:ref :form/r]
+     (cond
+       (fhead-is? form "quote") form
+       (form/is-symbol? form)
+       (let [renamed (form/form-get parameters form)]
+         (if (form/is-nil? renamed) form renamed))
+       (form/is-seq? form) (frebuild-seq form (nd-substitute-kids (form/kids-of form) 0 parameters (form/no-forms)))
+       (or (form/is-vec? form) (form/is-map? form) (form/is-set? form))
+       (record-assoc [:ref :form/r] form :kids (nd-substitute-kids (form/kids-of form) 0 parameters (form/no-forms)))
+       :else form))
+   :default nil)
+
+;; {parameter renamed} for the template's parameters, under the call's expansion index
+#?(:kotoba
+   (defn- nd-renames [params [:ref :form/r] index :i64 i :i64 acc [:ref :form/r]] [:ref :form/r]
+     (if (>= i (form/count-of params))
+       acc
+       (let [p (form/nth-of params i)]
+         (nd-renames params index (+ i 1)
+                     (form/assoc-form acc p (fsym (str "__kotoba_desugar_" (string-from-i64 index) "_" (fname p))))))))
+   :default nil)
+
+;; the let bindings [renamed argument ...]
+#?(:kotoba
+   (defn- nd-template-bindings [params [:ref :form/r] renamed [:ref :form/r] arguments [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (form/count-of params))
+       acc
+       (nd-template-bindings params renamed arguments (+ i 1)
+                             (form/append-form (form/append-form acc (form/form-get renamed (form/nth-of params i))) (fl-nth arguments i)))))
+   :default nil)
+
+;; the expanded arguments of a call (from index 1), threading the counter; answers {:forms :counter}
+#?(:kotoba
+   (defn- nd-expand-args [kids [:list [:ref :form/r]] i :i64 templates [:ref :form/r] counter :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+     (if (>= i (vector-count kids))
+       (fput (fput (form/form-map (form/no-forms)) :forms (form/form-vec acc)) :counter (form/int-form counter))
+       (let [r (expand-desugar-calls (fl-nth kids i) templates counter)]
+         (nd-expand-args kids (+ i 1) templates (form/int-value (fget r :counter)) (form/append-form acc (fget r :form))))))
+   :default nil)
+
+;; one call of a registered template
+#?(:kotoba
+   (defn- nd-expand-call [form [:ref :form/r] template [:ref :form/r] arguments [:list [:ref :form/r]] counter :i64] [:ref :form/r]
+     (let [ok1 (require-k (= (vector-count arguments) (form/count-of (fget template :params)))
+                          "desugar template call arity does not match its parameters" "kotoba.error/call-arity" form)
+           index (+ counter 1)
+           ok2 (require-k (<= index (max-desugar-expansions)) "desugar expansion count exceeds limit" "kotoba.error/subset-reject" form)
+           renamed (nd-renames (fget template :params) index 0 (form/form-map (form/no-forms)))
+           bindings (nd-template-bindings (fget template :params) renamed arguments 0 (form/no-forms))]
+       (nd-ec (fmeta-from form (form/call2 "let" (form/form-vec bindings) (substitute-template-parameters (fget template :body) renamed)))
+              index)))
+   :default nil)
+
+;; Rewrite every `(template arg ...)` in FORM against TEMPLATES (a symbol -> template map); answers
+;; {:form :counter}
+#?(:kotoba
+   (defn expand-desugar-calls [form [:ref :form/r] templates [:ref :form/r] counter :i64] [:ref :form/r]
+     (cond
+       (fhead-is? form "quote") (nd-ec form counter)
+       (form/is-seq? form)
+       (let [head (form/nth-of form 0)
+             args (nd-expand-args (form/kids-of form) 1 templates counter (form/no-forms))
+             arguments (form/kids-of (fget args :forms))
+             counter1 (form/int-value (fget args :counter))
+             template (if (form/is-symbol? head) (form/form-get templates head) (form/nil-form))]
+         (if (ftruthy? template)
+           (nd-expand-call form template arguments counter1)
+           (let [h (expand-desugar-calls head templates counter1)]
+             (nd-ec (frebuild-seq form (form/cons-onto (fget h :form) arguments)) (form/int-value (fget h :counter))))))
+       (or (form/is-vec? form) (form/is-map? form) (form/is-set? form))
+       (let [r (nd-expand-args (form/kids-of form) 0 templates counter (form/no-forms))]
+         (nd-ec (record-assoc [:ref :form/r] form :kids (form/kids-of (fget r :forms))) (form/int-value (fget r :counter))))
+       :else (nd-ec form counter)))
+   :default nil)
+
+;; A template name outside head position has no expansion
+#?(:kotoba
+   (defn- nd-reject-reference-kids [kids [:list [:ref :form/r]] i :i64 names [:ref :form/r] skip-head :bool] :i64
+     (if (>= i (vector-count kids))
+       0
+       (let [value (fl-nth kids i)
+             head-position (and skip-head (= i 0))
+             ok (require-k (or head-position (not (form/is-symbol? value)) (not (fl-has? (form/kids-of names) value 0)))
+                           "desugar template must be called, not referenced" "kotoba.error/subset-reject" value)
+             ok2 (if (and head-position (form/is-symbol? value)) 0 (reject-template-references! value names))]
+         (nd-reject-reference-kids kids (+ i 1) names skip-head))))
+   :default nil)
+
+#?(:kotoba
+   (defn reject-template-references! [form [:ref :form/r] names [:ref :form/r]] :i64
+     (cond
+       (fhead-is? form "quote") 0
+       (form/is-seq? form) (nd-reject-reference-kids (form/kids-of form) 0 names true)
+       :else (nd-reject-reference-kids (form/kids-of form) 0 names false)))
+   :default nil)
+
+;; the names (symbols) the forms define at top level
+#?(:kotoba
+   (defn- nd-defined-names [forms [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count forms))
+       acc
+       (let [f (fl-nth forms i)
+             h (fhead f)]
+         (nd-defined-names forms (+ i 1)
+                           (if (and (or (string=? h "defn") (string=? h "defn-") (string=? h "def")) (simple-symbol-form? (form/nth-of f 1)))
+                             (form/append-form acc (form/nth-of f 1))
+                             acc)))))
+   :default nil)
+
+;; templates registered in declaration order: each body is expanded against the templates before it
+#?(:kotoba
+   (defn- nd-register [declarations [:list [:ref :form/r]] i :i64 templates [:ref :form/r] counter :i64] [:ref :form/r]
+     (if (>= i (vector-count declarations))
+       (fput (fput (form/form-map (form/no-forms)) :templates templates) :counter (form/int-form counter))
+       (let [declaration (fl-nth declarations i)
+             parts (desugar-template-parts declaration)
+             name (fget parts :name)
+             ok (require-k (not (form/form-has? templates name)) "duplicate desugar template name" "kotoba.error/subset-reject" declaration)
+             expanded (expand-desugar-calls (fget parts :body) templates counter)]
+         (nd-register declarations (+ i 1)
+                      (form/assoc-form templates name
+                                       (fput (fput (fput (form/form-map (form/no-forms)) :name name) :params (fget parts :params)) :body (fget expanded :form)))
+                      (form/int-value (fget expanded :counter))))))
+   :default nil)
+
+;; no template name remains in any body after expansion
+#?(:kotoba
+   (defn- nd-body-names [value [:ref :form/r] names [:list [:ref :form/r]] template-name [:ref :form/r]] :i64
+     (let [ok (require-k (or (not (form/is-symbol? value)) (not (fl-has? names value 0)))
+                         (if (form/eq value template-name)
+                           "desugar template may not call itself"
+                           "desugar template may not call one declared after it")
+                         "kotoba.error/subset-reject" value)]
+       (nd-body-names-kids (form/kids-of value) 0 names template-name)))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-body-names-kids [kids [:list [:ref :form/r]] i :i64 names [:list [:ref :form/r]] template-name [:ref :form/r]] :i64
+     (if (>= i (vector-count kids))
+       0
+       (let [ok (nd-body-names (fl-nth kids i) names template-name)]
+         (nd-body-names-kids kids (+ i 1) names template-name))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-check-bodies [templates [:ref :form/r] j :i64 names [:list [:ref :form/r]]] :i64
+     (if (>= (+ j 1) (form/count-of templates))
+       0
+       (let [t (form/nth-of templates (+ j 1))
+             ok (nd-body-names (fget t :body) (form/kids-of (form/form-vec names)) (fget t :name))]
+         (nd-check-bodies templates (+ j 2) names))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-expand-all [forms [:list [:ref :form/r]] i :i64 templates [:ref :form/r] counter :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count forms))
+       acc
+       (let [r (expand-desugar-calls (fl-nth forms i) templates counter)]
+         (nd-expand-all forms (+ i 1) templates (form/int-value (fget r :counter)) (form/append-form acc (fget r :form))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- nd-reject-all-references [forms [:list [:ref :form/r]] i :i64 names [:ref :form/r]] :i64
+     (if (>= i (vector-count forms))
+       0
+       (let [ok (reject-template-references! (fl-nth forms i) names)]
+         (nd-reject-all-references forms (+ i 1) names))))
+   :default nil)
+
+;; the template names that collide with a definition
+#?(:kotoba
+   (defn- nd-collisions [names [:list [:ref :form/r]] defined [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count names))
+       false
+       (if (fl-has? defined (fl-nth names i) 0) true (nd-collisions names defined (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn expand-defdesugar-forms [forms [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [declarations (ex-select-head forms "defdesugar" 0 (form/no-forms))]
+       (if (= 0 (vector-count declarations))
+         forms
+         (let [ok1 (require-k (<= (vector-count declarations) (max-desugar-templates)) "desugar template count exceeds limit"
+                              "kotoba.error/subset-reject" (form/form-vec declarations))
+               registered (nd-register declarations 0 (form/form-map (form/no-forms)) 0)
+               templates (fget registered :templates)
+               names (ex-map-keys templates 0 (form/no-forms))
+               ok2 (nd-check-bodies templates 0 names)
+               remaining (nd-remove-head forms "defdesugar" 0 (form/no-forms))
+               defined (nd-defined-names remaining 0 (form/no-forms))
+               ok3 (require-k (not (nd-collisions names defined 0)) "desugar template name collides with a definition"
+                              "kotoba.error/subset-reject" (form/form-vec names))
+               ok4 (nd-reject-all-references remaining 0 (form/form-set names))]
+           (nd-expand-all remaining 0 templates (form/int-value (fget registered :counter)) (form/no-forms))))))
+   :default nil)
+
+;; the forms of FORMS (from I) not headed by HEAD
+#?(:kotoba
+   (defn- nd-remove-head [forms [:list [:ref :form/r]] head :string i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count forms))
+       acc
+       (let [f (fl-nth forms i)]
+         (nd-remove-head forms head (+ i 1) (if (fhead-is? f head) acc (form/append-form acc f))))))
+   :default nil)
+
+;; the forms of FORMS (from I) headed by HEAD
+#?(:kotoba
+   (defn- ex-select-head [forms [:list [:ref :form/r]] head :string i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count forms))
+       acc
+       (let [f (fl-nth forms i)]
+         (ex-select-head forms head (+ i 1) (if (fhead-is? f head) (form/append-form acc f) acc)))))
+   :default nil)
+
+#?(:kotoba nil :default
+(defn compiler-rejection?
+  "True for an error this frontend raised deliberately.
+
+  `reject!` is the only producer of a deliberate refusal here, and every one
+  of them carries `:phase`. Anything without it reached the caller by
+  escaping, not by being decided."
+  [error]
+  (some? (:phase (ex-data error)))))
+
+;; --- naming the nearest defined symbol ---------------------------------------
+;;
+;; An unbound symbol used to be refused with a sentence and no name: the
+;; symbol travelled only as `:form`. Measured while porting aiueos
+;; `native/tcp_stream.kotoba`: a local `buffer-index` that survived its rename
+;; to `buffer-idx` cost a debugging round to a typo the checker had already
+;; located -- the parameter one edit away was in the very `locals` set the
+;; refusal was raised from. The two helpers below name the symbol and, when
+;; something in scope is near it, the nearest names. They invent nothing: a
+;; candidate is a name the checker already has in hand at the site.
+
+#?(:kotoba nil :default
+(defn edit-distance
+  "Levenshtein distance between strings A and B, bounded: any distance above
+  LIMIT is answered as LIMIT + 1, so a long name is never fully walked."
+  [a b limit]
+  (let [la (count a) lb (count b)]
+    (if (> #?(:kotoba (if (< la lb) (- lb la) (- la lb)) :default (Math/abs (- la lb))) limit)
+      (inc limit)
+      (loop [i 1 previous (vec (range (inc lb)))]
+        (if (> i la)
+          (min (inc limit) (nth previous lb))
+          (let [ca (nth a (dec i))
+                row (loop [j 1 row [i]]
+                      (if (> j lb)
+                        row
+                        (recur (inc j)
+                               (conj row (min (inc (nth previous j))
+                                              (inc (nth row (dec j)))
+                                              (+ (nth previous (dec j))
+                                                 (if (= ca (nth b (dec j))) 0 1)))))))]
+            (recur (inc i) row))))))))
+
+#?(:kotoba nil :default
+(defn nearest-names
+  "Up to three of CANDIDATES (symbols) nearest to NAME, as strings, ordered by
+  edit distance and then by name so the answer is the same on both runtimes.
+
+  Near means within two edits (three for a name of eight characters or more),
+  or sharing the first five characters -- `buffer-length` is five edits from
+  `buffer-index` and is what a reader recognises. Synthesized names (those
+  carrying `__`) are never offered; the source never wrote them."
+  [name candidates]
+  (let [text (str name)
+        limit (if (>= (count text) 8) 3 2)
+        prefix (when (>= (count text) 5) (subs text 0 5))]
+    (->> candidates
+         (map str)
+         (remove #(or (= % text) (str/includes? % "__")))
+         (keep (fn [candidate]
+                 (let [distance (edit-distance text candidate limit)]
+                   (when (or (<= distance limit)
+                             (and prefix (>= (count candidate) 5)
+                                  (= prefix (subs candidate 0 5))))
+                     [distance candidate]))))
+         sort
+         (map second)
+         (take 3)
+         vec))))
+
+#?(:kotoba nil :default
+(defn unbound-symbol!
+  "Refuse the unbound SYMBOL with PREFIX as the sentence, naming the symbol and
+  the nearest names among LOCALS (a set or a map keyed by name) and FUNCTIONS
+  (a map keyed by name). The kind of each candidate is said beside it, since a
+  local and a function are corrected differently."
+  [prefix symbol locals functions]
+  (let [local-names (if (map? locals) (keys locals) locals)
+        kind-of (-> {}
+                    (into (map (fn [n] [(str n) "function"])) (keys functions))
+                    (into (map (fn [n] [(str n) "local"])) local-names))
+        nearest (nearest-names symbol (keys kind-of))]
+    (reject! (str prefix ": " symbol " is not a parameter, a let binding, or a "
+                  "function of this module"
+                  (when (seq nearest)
+                    (str "; nearest defined: "
+                         (str/join ", " (map #(str % " (" (kind-of %) ")") nearest)))))
+             symbol :kotoba.error/unbound-symbol
+             {:kotoba.error/symbol symbol :kotoba.error/nearest nearest}))))
+
+#?(:kotoba nil :default (def definition-heads tables/definition-heads))
+
+#?(:kotoba nil :default
+(defn internal-failure!
+  "Re-raise a HOST error that escaped a compiler pass, naming what it escaped
+  from. A deliberate rejection is rethrown untouched.
+
+  A raw `TypeError` reaching `kotoba.sema/analyze` carries no `ex-data` at
+  all, so every consumer above it -- amu's CLI included -- could say only
+  `internal compiler error`. Measured 2026-09-03 on amu 6c245f69 / this
+  repository 1a073853: `(option-value-of :i64 (typed-map-get :i64 m 3) 0)`
+  exited 70 and the whole diagnostic was
+
+      {:code :kotoba/internal-error :severity :error :source \"p6.kotoba\"}
+
+  -- no operation, no span, no cause. That is the failure class this
+  workspace keeps finding: an execution that could not produce an answer
+  returns something indistinguishable from one that did.
+
+  What travels is compiler vocabulary and source position, never user data:
+  the operation SYMBOL, the span, and the host exception's own message.
+  The FORM is deliberately not attached. `kotoba.compiler.diagnostic/from-error`
+  copies `:span` into the diagnostic envelope and never `:form`, and this must
+  not become the first place a source fragment leaks into one.
+
+  `:phase :internal` is kept, so the exit code stays 70 -- a compiler that
+  broke is not a caller who typed something wrong, and the two must not
+  collapse into one code. What changes is that 70 now says WHERE.
+
+  The operation also travels in the `:kotoba.error/code`, because that is the
+  ONE field that survives the CLI envelope. `kotoba.compiler.diagnostic/from-error`
+  copies `:code`, `:severity`, `:source` and `:span` into `:diagnostic` and
+  nothing else, and amu's CLI replaces the MESSAGE of an internal error with
+  the fixed words `internal compiler error` on purpose (a host error's message
+  can carry a filesystem path). Keeping that redaction and putting the
+  operation in the code is what makes the crash diagnosable from CLI output
+  alone without loosening it:
+
+      :code :kotoba.error.internal-operation/option-value-of
+
+  Match the NAMESPACE to recognise the class; read the NAME for the operation.
+
+  Only a head in `reserved-function-names` is spelled into the code. That set
+  is the compiler's own closed vocabulary -- a name a program is forbidden to
+  define -- so nothing user-chosen can reach the envelope through it. Any
+  other head falls back to the generic code and stays in `ex-data` only."
+  [error form]
+  (if (or (compiler-rejection? error)
+          ;; Host stack exhaustion is already OWNED, one frame further out:
+          ;; `analyze` recognises it with `kir/host-stack-exhausted?` and
+          ;; refuses with `:kotoba.error/host-nesting-exhausted`, naming the
+          ;; source depth limit the program was inside of. Wrapping it here
+          ;; would hide the RangeError from that predicate and demote a
+          ;; refusal a caller can act on into an internal failure. Measured:
+          ;; `host-nesting-test` went red under nbb the moment this guard
+          ;; landed without this arm -- 64 `case` arms reported
+          ;; `:kotoba.error.internal-operation/=` instead.
+          (kir/host-stack-exhausted? error))
+    (throw error)
+    (let [operation (when (and (seq? form) (symbol? (first form))) (first form))
+          named? (contains? reserved-function-names operation)
+          span (or (get (meta form) :span) (form-span form))
+          cause (ex-message error)]
+      (throw (ex-info (str "internal compiler failure while lowering "
+                           (if operation (str "`" operation "`") "an expression")
+                           (when span (str " at line " (:line span) " column " (:column span)))
+                           ": " cause)
+                      (cond-> {:phase :internal
+                               :kotoba.error/code
+                               (if named?
+                                 (keyword "kotoba.error.internal-operation" (name operation))
+                                 :kotoba.error/internal-operation-failure)
+                               :kotoba.error/cause cause}
+                        operation (assoc :kotoba.error/operation operation)
+                        span (assoc :span span))))))))
+
+#?(:kotoba nil :default (def pure-product-disallowed-heads tables/pure-product-disallowed-heads))
+
+#?(:kotoba nil :default
+(defn pure-product-form-head [form]
+  (when (and (seq? form) (symbol? (first form)))
+    (first form))))
+
+#?(:kotoba nil :default
+(defn pure-product-reported-head
+  "The head to NAME in a pure-product refusal: the pure spelling the author
+  wrote when there was one (`perform`), otherwise the head now in the tree.
+  The set membership is still decided by the real head -- one list, not two."
+  [form head]
+  (or (:kotoba/pure-source-head (meta form)) head)))
+
+#?(:kotoba nil :default
+(defn namespace-header-clauses
+  "The clauses of a namespace form -- what follows NAME and DOCSTRING? --
+  with an ATTR-MAP in its one position rewritten to the clauses it stands
+  for. Shape only: `namespace-parts` validates the values."
+  [form]
+  (let [tail (drop 2 form)
+        tail (if (string? (first tail)) (rest tail) tail)]
+    (if (map? (first tail))
+      (namespace-attr-map->clauses (first tail) (rest tail) reject!)
+      tail))))
+
+#?(:kotoba nil :default
+(defn check-pure-product-source-forms!
+  "T2.1: writeable pure-product source must not declare capabilities or use
+  disallowed sugar / cap-call. Empty effects are checked after analyze."
+  [forms]
+  (doseq [form forms]
+    (when (and (seq? form) (= 'ns (first form)))
+      ;; Both spellings: `(:capabilities ...)` and the attr-map's
+      ;; `:kotoba/capabilities` (see `namespace-attr-map->clauses`).
+      (doseq [clause (namespace-header-clauses form)]
+        (when (and (seq? clause) (= :capabilities (first clause)))
+          (reject! "pure-product profile rejects :capabilities (guest must be effect-free)"
+                   form
+                   :kotoba.error/pure-product-capabilities))))
+    (doseq [node (tree-seq
+                   (fn [x]
+                     (or (sequential? x)
+                         (map? x)
+                         (set? x)))
+                   (fn [x]
+                     (cond
+                       (map? x) (concat (keys x) (vals x))
+                       (set? x) (seq x)
+                       :else (seq x)))
+                   form)]
+      (when-let [head (pure-product-form-head node)]
+        (when (or (contains? forbidden-heads head)
+                  (contains? pure-product-disallowed-heads head))
+          (reject! (str "form outside pure-product profile: "
+                        (pure-product-reported-head node head))
+                   node
+                   :kotoba.error/pure-product-forbidden)))))))
+
+;; The namespace header's ATTR-MAP spelling (kotoba-lang `lang/guest-grammar.edn`
+;; `:ns :attr-map`, 2026-09-11). Clojure's `ns` already admits a map after the
+;; docstring and ignores it, so a module that must ALSO load on nbb / Clojure
+;; -- the compiler's own source, measured 2026-09-11: 83 of amu's 178 files
+;; were refused ONLY for the missing `(:export ...)`, and SCI's `ns` refuses
+;; that clause with "No matching clause: export" -- can carry the declaration
+;; there. Each admitted key means exactly what the clause of the same name
+;; means, and is validated by the same code: the map is rewritten into
+;; synthetic clauses BEFORE the clause loop, so there is one validation path.
+;;
+;; The keys are namespaced on purpose. An `{:author "..."}` or `{:doc "..."}`
+;; attr-map in the wild must not silently become an export, and a namespaced
+;; key nobody declared is not a comment either -- it is refused by name.
+;;
+;; A QUOTED value -- `{:kotoba/export '[main]}`, read as `(quote [main])` --
+;; means exactly the unquoted one (2026-09-25). Correction of the paragraph
+;; above: SCI's `ns` stores the map unevaluated, but JVM Clojure's `ns`
+;; EVALUATES it (the expansion is `(.resetMeta (Namespace/find 'n) {...})`,
+;; run right after `in-ns`, before anything is referred), so a bare vector of
+;; symbols fails to load there with `Unable to resolve symbol: <first name>`
+;; (measured on clojure 1.12.4: `(ns a {:kotoba/export [foo]})` throws,
+;; `(ns a {:kotoba/export '[foo]})` loads and the namespace meta holds
+;; `[foo]`). The quote is the spelling all three hosts accept; it is
+;; unwrapped HERE, once, so the clause loop validates the same value either
+;; way. Only a one-argument `(quote v)` is unwrapped -- any other list goes
+;; to the clause loop as written and is refused there.
+#?(:kotoba nil :default
+(defn unquote-attr-value
+  [v]
+  (if (and (seq? v) (= 'quote (first v)) (= 2 (count v))) (second v) v)))
+
+#?(:kotoba nil :default
+(def namespace-attr-map-keys
+  "attr-map key -> the namespace clause head it stands for."
+  {:kotoba/export :export
+   :kotoba/capabilities :capabilities
+   :kotoba/schemas :schemas
+   :kotoba/params :params}))
+
+#?(:kotoba nil :default
+(defn namespace-attr-map->clauses
+  "Rewrite the optional namespace ATTR-MAP into the clauses it stands for,
+  refusing what it must: an unknown key (named), and a key whose clause is
+  also spelled explicitly (declared twice). Returns the synthetic clauses
+  FOLLOWED by the explicit ones, in source order within each group. A
+  value spelled `'v` (`(quote v)`, the spelling JVM Clojure's `ns` can
+  evaluate) stands for `v`. The values are not validated here -- the caller's clause loop does that, once,
+  for both spellings. `reject-fn` is called with (message data code)."
+  [attr-map explicit-clauses reject-fn]
+  (let [explicit-heads (into #{} (keep #(when (seq? %) (first %))) explicit-clauses)]
+    (doseq [[k v] attr-map]
+      (let [head (get namespace-attr-map-keys k)]
+        (when-not head
+          (reject-fn (str "namespace attr-map key " (pr-str k)
+                          " is not admitted; the admitted keys are "
+                          (pr-str (vec (sort (keys namespace-attr-map-keys)))))
+                     attr-map :kotoba.error/namespace-attr-map))
+        (when (contains? explicit-heads head)
+          (reject-fn (str "namespace declares " (pr-str head) " twice: attr-map "
+                          (pr-str k) " and clause (" (pr-str head) " ...)")
+                     attr-map :kotoba.error/namespace-clause-duplicate))))
+    (into (mapv (fn [[k v]] (list (get namespace-attr-map-keys k) (unquote-attr-value v))) attr-map)
+          explicit-clauses))))
+
+;; Clause heads the namespace form refuses BY NAME (kotoba-lang
+;; `lang/guest-grammar.edn` `:ns-refused-clauses`, 2026-09-11). None is
+;; admitted; naming them lets a census of refusals tell host interop
+;; (`:import`) from a macro harness (`:require-macros`) from a Clojure-only
+;; harness clause (`:refer-clojure`) from a malformed admitted clause, which
+;; the one generic sentence could not. Measured 2026-09-11 over the
+;; compiler's own 178 sources: 18 carry `:import`. `:refer-clojure` left this
+;; set the same day -- see `validate-refer-clojure-clauses!` below.
+#?(:kotoba nil :default
+(def namespace-refused-clauses
+  "clause head -> why it stays outside the language"
+  {:import "host interop (a Java / JS class) is outside the language"
+   :require-macros "macros are outside the language"
+   :use "an unqualified ambient namespace is outside the language"
+   :load "loading source at run time is outside the language"
+   :gen-class "host interop is outside the language"}))
+
+;; `(:refer-clojure :exclude [sym ...])` / `(:refer-clojure :only [sym ...])`
+;; is admitted as a NO-OP (kotoba-lang `lang/guest-grammar.edn` `:ns :clauses
+;; :refer-clojure`, 2026-09-11). On a Clojure host the clause only NARROWS
+;; what `ns` auto-refers from clojure.core; Kotoba refers nothing from
+;; clojure.core, so the clause has no meaning and no effect -- refusing it
+;; bought no safety and cost every dual-runtime module that shadows a core
+;; name (measured 2026-09-11: 19 of the compiler's own 181 sources were
+;; refused on the project route for this clause alone). It is implementation
+;; state, not a property: nothing in the language changes when it is read.
+;;
+;; What stays refused, by name: `:rename` (it DOES change name resolution),
+;; any other option key, a non-symbol entry, and a second `:refer-clojure`.
+;; The clause does not count toward the `:export` / `:capabilities` /
+;; `:schemas` clause count, and `namespace-parts` drops it before the loop
+;; below so no later check ever sees it.
+#?(:kotoba nil :default
+(def refer-clojure-option-keys #{:exclude :only}))
+
+#?(:kotoba nil :default
+(defn refer-clojure-clause? [clause]
+  (and (seq? clause) (= :refer-clojure (first clause)))))
+
+#?(:kotoba nil :default
+(defn validate-refer-clojure-clauses!
+  "Shape-check every `(:refer-clojure ...)` clause of one header; admits
+  none of its content (there is nothing to admit), refuses the rest by name."
+  [clauses form]
+  (when (> (count clauses) 1)
+    (reject! "namespace admits :refer-clojure at most once" form :kotoba.error/namespace-clause-duplicate))
+  (doseq [clause clauses]
+    (let [options (rest clause)]
+      (when-not (even? (count options))
+        (reject! "namespace clause :refer-clojure takes :exclude [sym ...] and/or :only [sym ...]"
+                 clause :kotoba.error/namespace-refer-clojure-clause))
+      (let [pairs (partition 2 options)
+            keys-seen (map first pairs)]
+        (doseq [k keys-seen]
+          (when (= :rename k)
+            (reject! "namespace clause :refer-clojure :rename is not admitted: renaming changes name resolution; :exclude and :only are admitted as no-ops"
+                     clause :kotoba.error/namespace-refer-clojure-clause))
+          (when-not (contains? refer-clojure-option-keys k)
+            (reject! (str "namespace clause :refer-clojure option " (pr-str k)
+                          " is not admitted; the admitted options are :exclude and :only")
+                     clause :kotoba.error/namespace-refer-clojure-clause)))
+        (when (not= (count keys-seen) (count (distinct keys-seen)))
+          (reject! "namespace clause :refer-clojure repeats an option" clause :kotoba.error/namespace-refer-clojure-clause))
+        (doseq [[k names] pairs]
+          (when-not (and (vector? names)
+                         (<= (count names) max-functions)
+                         (every? valid-name? names))
+            (reject! (str "namespace clause :refer-clojure " (pr-str k) " takes a bounded vector of simple symbols")
+                     clause :kotoba.error/namespace-refer-clojure-clause))))))))
+
+#?(:kotoba nil :default
+(defn namespace-parts
+  "Parse the bounded namespace header. `:export` and `:capabilities`
+  (ADR-2607182410) are the only admitted clauses, each at most once (in
+  either order): `:export` grants host visibility but no ambient authority
+  or module loading; `:capabilities` optionally declares the closed set of
+  named capabilities (see capability-registry) the namespace's `cap-call`
+  forms may use -- `analyze`'s `check-namespace-capabilities!` then requires
+  this declared set to exactly match what's actually used (declare-then-
+  check, mirroring the `:aiueos/imports` pattern). Import/require clauses
+  remain fail-closed.
+
+  The clauses may also be spelled as an ATTR-MAP after the docstring
+  (`namespace-attr-map->clauses`); the map is rewritten into clauses here
+  and every check below sees one shape. A `(:refer-clojure :exclude/:only
+  [...])` clause is shape-checked and dropped (a no-op; see
+  `validate-refer-clojure-clauses!`)."
+  [form]
+  (let [[op namespace-symbol & tail] form]
+    (when-not (and (= 'ns op) (symbol? namespace-symbol)
+                   (nil? (namespace namespace-symbol))
+                   (pos? (count (str namespace-symbol)))
+                   (<= (count (str namespace-symbol)) max-symbol-chars))
+      (reject! "invalid bounded namespace symbol" form :kotoba.error/namespace-symbol))
+    (let [[docstring tail] (if (string? (first tail))
+                             [(first tail) (rest tail)] [nil tail])
+          [attr-map tail] (if (map? (first tail))
+                            [(first tail) (rest tail)] [nil tail])]
+      (when (and docstring (> (count docstring) max-namespace-docstring-chars))
+        (reject! "namespace docstring exceeds admission limit" docstring :kotoba.error/namespace-docstring-limit))
+      ;; A map anywhere later is an attr-map out of its one position, not a
+      ;; clause; say so rather than reporting it as a malformed :export.
+      (when-let [stray (first (filter map? tail))]
+        (reject! "namespace attr-map must follow the docstring: (ns NAME DOCSTRING? ATTR-MAP? CLAUSE ...)"
+                 stray :kotoba.error/namespace-attr-map))
+      (let [tail (if attr-map
+                   (namespace-attr-map->clauses attr-map tail reject!)
+                   tail)
+            ;; `(:refer-clojure ...)` is validated and then DROPPED: it is a
+            ;; no-op, counts toward nothing below, and appears at most once.
+            harness (filter refer-clojure-clause? tail)
+            tail (remove refer-clojure-clause? tail)]
+        ;; Before the count: a header that carries `:import` beside three
+        ;; admitted clauses is refused for the `:import`, not for its length.
+        (doseq [clause tail]
+          (when (and (seq? clause) (contains? namespace-refused-clauses (first clause)))
+            (reject! (str "namespace clause " (pr-str (first clause)) " is not admitted: "
+                          (get namespace-refused-clauses (first clause))
+                          "; the admitted clauses are :export, :capabilities and :schemas"
+                          " (and :require / :params on the project route)")
+                     clause :kotoba.error/namespace-host-clause)))
+        (validate-refer-clojure-clauses! harness form)
+        (when (> (count tail) 3)
+          (reject! "namespace admits at most :export, :capabilities, and :schemas clauses" form :kotoba.error/namespace-clause-count))
+        ;; ADR-2607182410: `:export`'s original (pre-existing, test-asserted)
+        ;; rejection message is preserved VERBATIM for every clause shape it
+        ;; already covered pre-`:capabilities` -- a non-`seq?` clause, an
+        ;; unrecognized clause head, or a malformed `(:export ...)` -- so
+        ;; existing callers/tests asserting on that exact string are
+        ;; unaffected. Only a recognized-but-malformed `(:capabilities ...)`
+        ;; clause gets the new, `:capabilities`-specific message (a shape no
+        ;; pre-existing source could ever have produced).
+        (doseq [clause tail]
+          (when-not (seq? clause)
+            (reject! "only a bounded :export vector is admitted in namespace clauses" clause :kotoba.error/namespace-export-clause))
+          (case (first clause)
+            :export (when-not (and (= 2 (count clause)) (vector? (second clause)))
+                      (reject! "only a bounded :export vector is admitted in namespace clauses" clause :kotoba.error/namespace-export-clause))
+            :capabilities (when-not (and (= 2 (count clause)) (set? (second clause)))
+                            (reject! "only a bounded :capabilities set is admitted in namespace clauses" clause :kotoba.error/namespace-capabilities-clause))
+            :schemas (when-not (and (= 2 (count clause)) (map? (second clause)))
+                       (reject! "only a closed :schemas map is admitted in namespace clauses" clause :kotoba.error/namespace-schemas-clause))
+            ;; `:require` and `:params` keep the generic message VERBATIM: amu's
+            ;; `kotoba.compiler.diagnostic/refine` recognises exactly that
+            ;; code + head and renames it to the project-route remedy.
+            (reject! "only a bounded :export vector is admitted in namespace clauses" clause :kotoba.error/namespace-export-clause)))
+        (when (not= (count tail) (count (distinct (map first tail))))
+          (reject! "namespace admits each clause at most once" form :kotoba.error/namespace-clause-duplicate))
+        (let [export-clause (first (filter #(= :export (first %)) tail))
+              capabilities-clause (first (filter #(= :capabilities (first %)) tail))
+              schemas-clause (first (filter #(= :schemas (first %)) tail))
+              exports (when export-clause (vec (second export-clause)))
+              capabilities (when capabilities-clause (set (second capabilities-clause)))
+              ;; Defrecord descriptors are collected by the declaration expansion
+              ;; that precedes this parse. Keep the authored table raw here so
+              ;; analyze can merge those same-module nominal schemas before the
+              ;; closed graph is validated once. Shape checks above still run
+              ;; immediately; no unvalidated table reaches expression analysis.
+              schemas (when schemas-clause (second schemas-clause))]
+          (when (and exports
+                     (or (> (count exports) max-functions)
+                         (not= (count exports) (count (distinct exports)))
+                         (not-every? valid-name? exports)))
+            (reject! "namespace exports must be unique bounded function names" exports :kotoba.error/namespace-exports))
+          (when (and capabilities
+                     (or (> (count capabilities) max-namespace-capabilities)
+                         (not-every? #(and (keyword? %) (namespace %)) capabilities)))
+            (reject! "namespace :capabilities must be a bounded set of namespaced keywords" capabilities :kotoba.error/namespace-capabilities-shape))
+          {:namespace namespace-symbol :exports exports :capabilities capabilities
+           :schemas schemas
+           ;; Populated from the once-validated merged graph in analyze.
+           :schema-identities nil}))))))
+
+#?(:kotoba nil :default
+(defn reserved-binding-name? [value]
+  (and (simple-symbol? value) (= "__kotoba_" (subs (str value) 0 (min 9 (count (str value))))))))
+
+#?(:kotoba nil :default
+(defn table-heads [table] (if (map? table) (keys table) (seq table))))
+
+#?(:kotoba nil :default
+(defn unknown-operation!
+  "Refuse the call FORM whose head OP no pass admitted, naming WHICH of the
+  two facts that can mean. `operation has no admitted lowering` (here) and
+  `operation has no admitted type signature` (inference) were one catch-all
+  over a misspelling, a head the grammar declares and this analyser has not
+  lowered, and -- one family over -- a known head at the wrong arity, which
+  each table already refused but without the head or the count (that half is
+  `reject-operation-arity!`). Measured while porting aiueos
+  `native/tcp_stream.kotoba`.
+
+  A head in `grammar-declared-heads` is named as declared-but-unlowered;
+  anything else is unknown, with the nearest heads among the module's
+  FUNCTIONS and this frontend's builtin tables beside it, the way
+  `unbound-symbol!` does for a value. Candidates are what the checker has in
+  hand; none is invented."
+  [op form functions]
+  (if (contains? grammar-declared-heads op)
+    (reject! (str op " is named by the language grammar (lang/guest-grammar.edn) "
+                  "but this analyser has no lowering for it -- not implemented on "
+                  "this compile path")
+             form :kotoba.error/unimplemented-grammar-head
+             {:kotoba.error/operation op})
+    (let [kind-of (-> {}
+                      (into (map (fn [n] [(str n) "builtin"]))
+                            (mapcat table-heads
+                                    [arithmetic
+                                     comparisons
+                                     float-division-heads
+                                     i64-operations
+                                     i32-operations
+                                     heap-operations
+                                     kgraph-operations
+                                     string-operations
+                                     region-operations
+                                     xml-operations
+                                     decimal-operations
+                                     f64-operations
+                                     f32-operations
+                                     typed-map-operations
+                                     typed-safe-value-operations
+                                     parametric-result-operations
+                                     typed-vector-operations
+                                     typed-f64-vector-operations
+                                     compact-graph-operations
+                                     document-fixed-operations
+                                     kernel-memory-operations
+                                     kernel-privileged-operations
+                                     rodata-literal-operations
+                                     image-symbol-operations]))
+                      (into (map (fn [n] [(str n) "function"])) (keys functions)))
+          nearest (nearest-names op (keys kind-of))]
+      (reject! (str "unknown operation: " op " is not a builtin, a sugar head, or a "
+                    "function of this module"
+                    (when (seq nearest)
+                      (str "; nearest defined: "
+                           (str/join ", " (map #(str % " (" (kind-of %) ")") nearest)))))
+               form :kotoba.error/unknown-operation
+               {:kotoba.error/operation op :kotoba.error/nearest nearest})))))
+
+
+;; ---------------------------------------------------------------------------
+;; slice-value: erasing the ADR 0285 carrier.
+;;
+;; WHERE THE TYPE STOPS EXISTING. `[:slice T]` is a type of this frontend's
+;; source syntax and of nothing else. This pass runs immediately after
+;; parameter types are settled and BEFORE every later pass -- loop-helper
+;; type resolution, absent-parameter and absent-result inference, abort
+;; elaboration, `validate-expr`, `check-value-types!`,
+;; `check-kernel-region-provenance!`, `check-lowering-budget!`, and the HIR
+;; construction that follows all of them. Downstream of this line the program
+;; contains only `:i64` words and the `slice-load-*`/`slice-store-*`/
+;; `kernel-subregion` operations the machine already had, so HIR, KIR, GMIR,
+;; MIR, codegen, both native ISAs and `kotoba.verifier` need no slice value,
+;; no register pair and no new IR key.
+;;
+;; WHAT ENFORCES THE BOUNDARY. Three independent things, in this order:
+;;
+;;   1. This pass refuses, by name, every position a two-word value cannot
+;;      cross: a slice as a result type, inside any structured type, as an
+;;      argument to anything but a declared slice parameter, or bound and then
+;;      mentioned anywhere else. A slice-typed parameter on an exported
+;;      function (or on `main`) is refused where the export list is known,
+;;      because a kernel object's callers spell one machine word per argument
+;;      and there is no ABI in which they could spell two.
+;;   2. If this pass ever failed to erase one, `kotoba.kir`'s
+;;      `native-function-boundary-type?` refuses a `[:slice T]` in
+;;      `:param-types` -- named explicitly there rather than by absence, so
+;;      the message says which invariant broke.
+;;   3. `kotoba.verifier` refuses it again, independently, from its own table.
+;;
+;; WHY ERASURE AND NOT A REGISTER PAIR. kotoba-native's
+;; `docs/lang-authority-diff.md` lists four routes to a carried slice and
+;; names this one -- its route 3 -- as the cheapest. Its routes 1 and 2 (a
+;; second `pilot-expression?` shape and a two-slot spill in the x86-64
+;; fallback) turn out not to be needed AT ALL rather than merely to be
+;; dearer: `pilot-expression?` already answers `:scalar` for a four-operand
+;; `slice-load-u8`, because `kir-kernel-memory-ops` has carried the slice
+;; family since the lowering landed. A pair-shaped SSA value would have been
+;; a second representation for something both backends can already hold.
+#?(:kotoba nil :default
+(def slice-escape-message
+  "a slice value can only be indexed, narrowed, measured, or passed to a slice parameter"))
+
+#?(:kotoba nil :default
+(defn slice-erased-base-name [sym]
+  (symbol (str "__kotoba_slice_" (name sym) "_base"))))
+
+#?(:kotoba nil :default
+(defn slice-erased-length-name [sym]
+  (symbol (str "__kotoba_slice_" (name sym) "_len"))))
+
+#?(:kotoba nil :default
+(defn slice-scale
+  "ELEMENTS to BYTES. Folded when the operand is a literal, so a carried
+  traversal and the same traversal written with the machine operations emit
+  the same bytes rather than merely equivalent ones."
+  [expr width]
+  (cond
+    (= 1 width) expr
+    (integer? expr) (* expr width)
+    :else (list '* expr width))))
+
+#?(:kotoba nil :default
+(defn slice-access-operation [kind element]
+  (symbol (str "slice-" kind "-" (name element)))))
+
+#?(:kotoba nil :default
+(defn uses-slice-values? [body slice-parameters]
+  (boolean (first-truthy #(and (seq? %)
+                       (or (contains? slice-value-operations (first %))
+                           ;; A caller that merely PASSES a slice on has no
+                           ;; slice operation of its own. Without this arm it
+                           ;; would be left untouched and its call would reach
+                           ;; `validate-expr` with the callee's pre-erasure
+                           ;; arity -- a refusal that names arity and not the
+                           ;; slice that caused it.
+                           (contains? slice-parameters (first %))))
+                 (tree-seq coll? seq body)))))
+
+#?(:kotoba nil :default
+(defn erase-slice-values
+  "Rewrite every `[:slice T]` parameter, binding and operation into the two
+  i64 words the machine carries. Returns FUNCTIONS with slice parameters
+  expanded in place; `slice-parameter-functions` is a volatile the caller
+  reads once the export list is known, because the export boundary refusal
+  cannot be made until then.
+
+  A function with no slice parameter and no slice operation in its body is
+  returned untouched -- identical object, not an equal one -- so a module that
+  does not use the carrier cannot change bytes because of it."
+  [functions slice-parameter-functions]
+  (let [slice-parameters
+        (into {}
+              (keep (fn [{:keys [name param-types]}]
+                      (let [indexed (into (sorted-map)
+                                          (keep-indexed
+                                           (fn [i t]
+                                             (when (slice-type? t)
+                                               [i (slice-element-type t)]))
+                                           (or param-types [])))]
+                        (when (seq indexed) [name indexed]))))
+              functions)
+        source-arity (into {} (map (juxt :name (comp count :params))) functions)]
+    (vswap! slice-parameter-functions into (keys slice-parameters))
+    (mapv
+     (fn [{:keys [name source-name params param-types result body] :as function}]
+       (if-not (or (contains? slice-parameters name)
+                   (uses-slice-values? body slice-parameters))
+         function
+         (let [reported (or source-name name)
+               _ (when (slice-type? result)
+                   (reject! (str "a slice value cannot be returned: " reported
+                                 " declares " (pr-str result))
+                            result :kotoba.error/slice-result-type))
+               pairs (map vector params (or param-types (repeat :i64)))
+               expanded
+               (reduce (fn [acc [p t]]
+                         (if (slice-type? t)
+                           (-> acc
+                               (update :params conj
+                                       (slice-erased-base-name p)
+                                       (slice-erased-length-name p))
+                               (update :param-types conj :i64 :i64)
+                               (assoc-in [:env p]
+                                         {:element (slice-element-type t)
+                                          :base (slice-erased-base-name p)
+                                          :len (slice-erased-length-name p)}))
+                           (-> acc
+                               (update :params conj p)
+                               (update :param-types conj t))))
+                       {:params [] :param-types [] :env {}}
+                       pairs)
+               _ (when (> (count (:params expanded)) max-parameters)
+                   (reject! (str "function parameters exceed ABI-supported arity after slice erasure: "
+                                 reported " needs " (count (:params expanded))
+                                 " machine words for " (count params) " parameters")
+                            params :kotoba.error/slice-erased-max-parameters))
+               root-params (set params)]
+           (letfn
+               [(slice-of [expr env scalars]
+                  ;; -> {:element T :base <expr> :len <expr>} or nil when EXPR
+                  ;; is not slice-valued. Never rewrites in place: the caller
+                  ;; decides where the two words go.
+                  (cond
+                    (and (symbol? expr) (contains? env expr)) (get env expr)
+
+                    (and (seq? expr) (contains? slice-constructor-elements (first expr)))
+                    (let [[op & args] expr]
+                      (when-not (= 2 (count args))
+                        (reject! "slice constructor arity mismatch" expr
+                                 :kotoba.error/slice-arity))
+                      (let [[base length] args]
+                        ;; The provenance rule, applied to the base BEFORE it
+                        ;; is buried inside a value. After erasure
+                        ;; `check-kernel-region-provenance!` would catch this
+                        ;; too, by following the `let` it is about to be bound
+                        ;; by -- but it would report the synthesised binding
+                        ;; and the machine operation, naming neither the
+                        ;; constructor nor the slice. This refuses first and
+                        ;; says which.
+                        (when-not (traceable-base? base scalars root-params)
+                          (reject! "slice base must name a region, not compute one"
+                                   expr :kotoba.error/slice-region-provenance))
+                        {:element (get slice-constructor-elements op)
+                         :base (rewrite base env scalars)
+                         :len (rewrite length env scalars)}))
+
+                    (and (seq? expr) (= 'slice-sub (first expr)))
+                    (let [[_ parent offset count'] expr]
+                      (when-not (= 4 (count expr))
+                        (reject! "slice-sub arity mismatch" expr :kotoba.error/slice-arity))
+                      (let [{:keys [element base len]}
+                            (or (slice-of parent env scalars)
+                                (reject! "slice-sub narrows a slice value" expr
+                                         :kotoba.error/slice-operand))
+                            width (get slice-element-widths element)
+                            offset' (rewrite offset env scalars)
+                            count'' (rewrite count' env scalars)]
+                        ;; A CHECKED narrowing: `kernel-subregion` traps
+                        ;; unless the offset lies inside the parent and the
+                        ;; count inside the remainder. The scale is applied
+                        ;; here, so the arithmetic is bytes where
+                        ;; `kernel-subregion` reads bytes and elements
+                        ;; everywhere it is written.
+                        {:element element
+                         :base (list 'kernel-subregion
+                                     base
+                                     (slice-scale len width)
+                                     (slice-scale offset' width)
+                                     (slice-scale count'' width))
+                         :len count''}))
+
+                    :else nil))
+
+                (bind-slice [binder info bindings env scalars]
+                  ;; Give a slice binding two real bindings so neither half is
+                  ;; ever evaluated twice, whatever the initialiser was.
+                  (let [b (slice-erased-base-name binder)
+                        l (slice-erased-length-name binder)]
+                    {:bindings (conj bindings b (:base info) l (:len info))
+                     :env (assoc env binder (assoc info :base b :len l))
+                     :scalars (assoc scalars b (:base info) l (:len info))}))
+
+                (require-slice [expr env scalars what]
+                  (or (slice-of expr env scalars)
+                      (reject! (str what " requires a slice value")
+                               expr :kotoba.error/slice-operand)))
+
+                (rewrite [expr env scalars]
+                  (cond
+                    (and (symbol? expr) (contains? env expr))
+                    (reject! slice-escape-message expr :kotoba.error/slice-escape)
+
+                    (not (seq? expr)) expr
+
+                    :else
+                    (let [[op & args] expr]
+                      (cond
+                        (= op 'let)
+                        (let [[raw & tail] args
+                              _ (when-not (and (vector? raw) (even? (count raw)))
+                                  (reject! "let bindings must be an even-length vector" expr))
+                              {:keys [bindings env scalars]}
+                              (reduce
+                               (fn [acc [binder init]]
+                                 (if-let [info (slice-of init (:env acc) (:scalars acc))]
+                                   (bind-slice binder info (:bindings acc)
+                                               (:env acc) (:scalars acc))
+                                   (let [value (rewrite init (:env acc) (:scalars acc))]
+                                     {:bindings (conj (:bindings acc) binder value)
+                                      ;; a non-slice binding SHADOWS an outer
+                                      ;; slice of the same name
+                                      :env (dissoc (:env acc) binder)
+                                      :scalars (assoc (:scalars acc) binder init)})))
+                               {:bindings [] :env env :scalars scalars}
+                               (partition 2 raw))]
+                          (list* 'let bindings
+                                 (map #(rewrite % env scalars) tail)))
+
+                        (= op 'slice-length)
+                        (do (when-not (= 1 (count args))
+                              (reject! "slice-length arity mismatch" expr
+                                       :kotoba.error/slice-arity))
+                            (:len (require-slice (first args) env scalars "slice-length")))
+
+                        (= op 'slice-get)
+                        (let [_ (when-not (= 2 (count args))
+                                  (reject! "slice-get arity mismatch" expr
+                                           :kotoba.error/slice-arity))
+                              {:keys [element base len]}
+                              (require-slice (first args) env scalars "slice-get")]
+                          (list (slice-access-operation "load" element)
+                                base len (rewrite (second args) env scalars)))
+
+                        (= op 'slice-set!)
+                        (let [_ (when-not (= 3 (count args))
+                                  (reject! "slice-set! arity mismatch" expr
+                                           :kotoba.error/slice-arity))
+                              {:keys [element base len]}
+                              (require-slice (first args) env scalars "slice-set!")]
+                          (list (slice-access-operation "store" element)
+                                base len
+                                (rewrite (second args) env scalars)
+                                (rewrite (nth args 2) env scalars)))
+
+                        (or (contains? slice-constructor-elements op) (= op 'slice-sub))
+                        (reject! slice-escape-message expr :kotoba.error/slice-escape)
+
+                        (contains? slice-parameters op)
+                        (let [positions (get slice-parameters op)
+                              expected (get source-arity op)]
+                          (when-not (= expected (count args))
+                            (reject! "call arity does not match the callee's declared parameters"
+                                     expr :kotoba.error/slice-call-arity))
+                          (cons op
+                                (mapcat
+                                 (fn [[i arg]]
+                                   (if-let [element (get positions i)]
+                                     (let [info (require-slice
+                                                 arg env scalars
+                                                 (str "parameter " i " of " op))]
+                                       (when-not (= element (:element info))
+                                         (reject! (str "slice element type mismatch: parameter "
+                                                       i " of " op " takes [:slice "
+                                                       element "], not [:slice "
+                                                       (:element info) "]")
+                                                  expr :kotoba.error/slice-element-mismatch))
+                                       [(:base info) (:len info)])
+                                     [(rewrite arg env scalars)]))
+                                 (map-indexed vector args))))
+
+                        :else (cons op (map #(rewrite % env scalars) args))))))]
+             (assoc function
+                    :params (:params expanded)
+                    :param-types (:param-types expanded)
+                    :body (rewrite body (:env expanded) {}))))))
+     functions))))
+
+;; ── defdesugar: registered pure bounded templates ───────────────────────────
+;;
+;; `lang/guest-grammar.edn` lists `:defdesugar` in `:sugar`, `surface-status`
+;; records it as `:registered-pure-bounded-template`, `elaboration-pipeline`
+;; names `:registered-defdesugar-only` as a rule of the bounded-pure-desugar
+;; stage, and `lang/conformance/control/match_desugar.kotoba` is a fixture for
+;; it. None of that was reachable: the frontend had no `defdesugar` at all, so
+;; that fixture was rejected by the CLI on both routes with "only ns, def, defn,
+;; and defn- are allowed at top level".
+;;
+;; This matters beyond convenience. ADR-2608301500 classifies the `defmacro`
+;; ban as permanent on the `:code-identity` axis, and rests that permanence on
+;; `defdesugar` being the bounded alternative. A ban whose alternative does not
+;; exist is a ban with no answer.
+;;
+;; What makes this bounded rather than a macro system:
+;;
+;;   - Registered only. A call expands if and only if its head names a
+;;     `defdesugar` in this module. Nothing computes a name.
+;;   - No recursion, structurally. A template body is expanded against the
+;;     templates declared BEFORE it, so a template can never reach itself and
+;;     there is no cycle to detect -- expansion depth is bounded by the
+;;     declaration order, not by a fuel counter that has to be trusted.
+;;   - Substitution only. A template is a form with holes; it does not run.
+;;   - Bounded. Template count, parameter count, body size and total expansion
+;;     count all have limits, and each is a refusal rather than a truncation.
+;;
+;; Arguments are bound once, into synthesized names, rather than substituted
+;; textually. `(defdesugar clamp [x lo hi] (if (< x lo) lo (if (> x hi) hi x)))`
+;; mentions `x` twice, so textual substitution would evaluate the argument
+;; twice -- silently, and visibly only when the argument is a capability call.
+;; The names are synthesized rather than the parameters' own because `let` binds
+;; sequentially: expanding `(clamp a x c)` in a scope that has its own `x` would
+;; otherwise make the second binding read the new `x` instead of the caller's.
+
+#?(:kotoba
+   (defn max-desugar-templates [] :i64 32)
+   :default
+(def max-desugar-templates 32))
+#?(:kotoba
+   (defn max-desugar-template-parameters [] :i64 8)
+   :default
+(def max-desugar-template-parameters 8))
+#?(:kotoba
+   (defn max-desugar-template-nodes [] :i64 512)
+   :default
+(def max-desugar-template-nodes 512))
+#?(:kotoba
+   (defn max-desugar-expansions [] :i64 4096)
+   :default
+(def max-desugar-expansions 4096))
+
+#?(:kotoba nil :default (def structural-heads tables/structural-heads))
+
+#?(:kotoba
+   (defn intersect-heads-from [xs [:list [:ref :form/r]] i :i64 other [:ref :form/r]
+                                acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count xs))
+       acc
+       (let [x (typed-list-nth [:list [:ref :form/r]] xs i)]
+         (intersect-heads-from
+          xs (+ i 1) other
+          (if (tables/table-has? other x)
+            (typed-list-conj [:list [:ref :form/r]] acc x)
+            acc)))))
+   :default nil)
+
+#?(:kotoba
+   (defn unspellable-definition-heads [] [:ref :form/r]
+     (form/form-set
+      (intersect-heads-from (form/kids-of (tables/definition-heads)) 0
+                            (reserved-function-names) (form/no-forms))))
+   :default
+(def unspellable-definition-heads
+  "The declaration heads a TEMPLATE BODY may hold that can be nothing at all.
+
+  `structural-heads` above governs the template's NAME. This governs its body,
+  and it is a much smaller set, because a template body is substituted into an
+  expression position where most declaration heads are ordinary function
+  names. Measured 2026-09-03 at 5917518b: `(defn defrecord [x] (+ x 1))` is an
+  admitted program and `(defdesugar t [y] (defrecord y))` is an admitted CALL
+  to it that computes 5 for `(t 4)`. Nine of the twelve definition heads
+  behave that way, so a blanket `no declaration in a body` would refuse
+  working source.
+
+  What is left is derived rather than chosen: a head in `definition-heads` is
+  not a declaration once it sits in an expression position, and a head in
+  `reserved-function-names` may not be defined as a function, so a head in
+  BOTH can be neither. `#{ns defn defn-}`, today. Written as the intersection
+  so that it follows either vocabulary if one of them moves -- a hand-listed
+  copy would keep refusing a head that had just become spellable."
+  (set/intersection definition-heads reserved-function-names)))
+
+#?(:kotoba nil :default
+(defn desugar-template-parts
+  "Read one `(defdesugar name [params] body)` into `{:name :params :body}`."
+  [form]
+  (let [[_ name params & tail] form]
+    (when-not (simple-symbol? name)
+      (reject! "desugar template requires a simple name" form))
+    (when (reserved-binding-name? name)
+      (reject! "symbol uses the reserved __kotoba_ prefix" name))
+    ;; `reserved-function-names` rather than `forbidden-heads` alone: when
+    ;; `atom` left the forbidden set on 2026-09-02 (local-state slice 1) this
+    ;; check stopped refusing `(defdesugar atom ...)`, which would shadow the
+    ;; head the elaboration reads. A name a program may not DEFINE is a name a
+    ;; template may not take, and that set is the reserved one.
+    (when (or (contains? structural-heads name)
+              (contains? forbidden-heads name)
+              (contains? reserved-function-names name))
+      (reject! "desugar template may not take a reserved head name" name))
+    (when-not (vector? params)
+      (reject! "desugar template requires a parameter vector" form))
+    (when (> (count params) max-desugar-template-parameters)
+      (reject! "desugar template parameter count exceeds limit" form))
+    (when-not (every? simple-symbol? params)
+      (reject! "desugar template parameters must be plain symbols" params))
+    (when (first-truthy reserved-binding-name? params)
+      (reject! "symbol uses the reserved __kotoba_ prefix" params))
+    (when-not (= (count params) (count (set params)))
+      (reject! "desugar template parameters must be distinct" params))
+    (when-not (= 1 (count tail))
+      (reject! "desugar template requires exactly one body expression" form))
+    (let [body (first tail)]
+      (when (> (count (tree-seq coll? seq body)) max-desugar-template-nodes)
+        (reject! "desugar template body exceeds node limit" form))
+      ;; A body holding one of these was ADMITTED and then dropped. Measured
+      ;; 2026-09-03 at 5917518b: `(defdesugar t [] (defn g [] 0))` compiled to
+      ;; a HIR byte-identical to the same program with the line deleted, and
+      ;; CALLING it reached `operation has no admitted lowering` -- a sentence
+      ;; about an operation, naming neither the template nor the declaration
+      ;; written inside it. Refused here instead, where the caller wrote it,
+      ;; and refused whether or not the template is ever called: the form is
+      ;; inert in every program, so there is nothing a later use could make of
+      ;; it. Head position only -- a bare symbol is not a form, and is already
+      ;; answered where unresolved symbols are.
+      (doseq [node (tree-seq coll? seq body)]
+        (when (and (seq? node)
+                   (contains? unspellable-definition-heads (first node)))
+          (reject! "desugar template body may not contain a reserved head form"
+                   form)))
+      {:name name :params (vec params) :body body}))))
+
+#?(:kotoba nil :default
+(defn substitute-template-parameters
+  "Rename `parameters` (a symbol -> symbol map) throughout `form`.
+
+  Consistent renaming is sound even where the body rebinds a parameter's name:
+  `(defdesugar f [x] (let [x 1] x))` becomes `(let [t 1] t)`, which the outer
+  binding of `t` shadows exactly as the source shadowed `x`. `quote` is the one
+  subtree that must be left alone -- its contents are data, not code."
+  [form parameters]
+  (cond
+    (and (seq? form) (= 'quote (first form))) form
+    (symbol? form) (get parameters form form)
+    (seq? form) (with-meta (apply list (map #(substitute-template-parameters % parameters) form))
+                  (meta form))
+    (vector? form) (mapv #(substitute-template-parameters % parameters) form)
+    (map? form) (into (empty form)
+                      (map (fn [[k v]] [(substitute-template-parameters k parameters)
+                                        (substitute-template-parameters v parameters)]))
+                      form)
+    (set? form) (into (empty form) (map #(substitute-template-parameters % parameters)) form)
+    :else form)))
+
+#?(:kotoba nil :default
+(defn expand-desugar-calls
+  "Rewrite every `(template arg ...)` in `form` against `templates`.
+
+  Arguments are expanded first, so a template call inside an argument is
+  handled by the same pass rather than left behind."
+  [form templates counter]
+  (cond
+    (and (seq? form) (= 'quote (first form))) form
+
+    (seq? form)
+    (let [head (first form)
+          arguments (mapv #(expand-desugar-calls % templates counter) (rest form))]
+      (if-let [template (and (symbol? head) (get templates head))]
+        (do
+          (when-not (= (count arguments) (count (:params template)))
+            ;; Text pinned by defdesugar-test; the code and the counts are
+            ;; carried in ex-data so a caller can report the same facts a
+            ;; function call reports.
+            (reject! "desugar template call arity does not match its parameters" form
+                     :kotoba.error/call-arity
+                     {:function head
+                      :expected (count (:params template))
+                      :supplied (count arguments)}))
+          (when (> (vswap! counter inc) max-desugar-expansions)
+            (reject! "desugar expansion count exceeds limit" form))
+          (let [index @counter
+                renamed (into {} (map (fn [parameter]
+                                        [parameter (symbol (str "__kotoba_desugar_" index "_"
+                                                                (name parameter)))]))
+                              (:params template))
+                bindings (vec (mapcat (fn [parameter argument]
+                                        [(get renamed parameter) argument])
+                                      (:params template) arguments))]
+            (with-meta (list 'let bindings
+                             (substitute-template-parameters (:body template) renamed))
+              (meta form))))
+        (with-meta (apply list (cons (expand-desugar-calls head templates counter) arguments))
+          (meta form))))
+
+    (vector? form) (mapv #(expand-desugar-calls % templates counter) form)
+    (map? form) (into (empty form)
+                      (map (fn [[k v]] [(expand-desugar-calls k templates counter)
+                                        (expand-desugar-calls v templates counter)]))
+                      form)
+    (set? form) (into (empty form) (map #(expand-desugar-calls % templates counter)) form)
+    :else form)))
+
+#?(:kotoba nil :default
+(defn reject-template-references!
+  "A template name outside head position has no expansion. Saying so here is
+  the difference between one clear refusal and an unresolved symbol reported
+  from somewhere in lowering."
+  [form names]
+  (cond
+    (and (seq? form) (= 'quote (first form))) nil
+    (seq? form) (doseq [[position value] (map-indexed vector form)]
+                  (if (zero? position)
+                    (when-not (symbol? value) (reject-template-references! value names))
+                    (if (and (symbol? value) (contains? names value))
+                      (reject! "desugar template must be called, not referenced" value)
+                      (reject-template-references! value names))))
+    (coll? form) (doseq [value (if (map? form) (apply concat form) (seq form))]
+                   (if (and (symbol? value) (contains? names value))
+                     (reject! "desugar template must be called, not referenced" value)
+                     (reject-template-references! value names)))
+    :else nil)))
+
+#?(:kotoba nil :default
+(defn expand-defdesugar-forms
+  "Register `defdesugar` templates and expand their calls out of `forms`."
+  [forms]
+  (let [declarations (filter #(and (seq? %) (= 'defdesugar (first %))) forms)]
+    (if (empty? declarations)
+      forms
+      (do
+        (when (> (count declarations) max-desugar-templates)
+          (reject! "desugar template count exceeds limit" declarations))
+        (let [counter (volatile! 0)
+              ;; Declaration order is the whole recursion story: each body is
+              ;; expanded against the templates declared before it, so a
+              ;; template cannot reach itself and no cycle can form.
+              templates
+              (reduce (fn [acc declaration]
+                        (let [{:keys [name params body]} (desugar-template-parts declaration)]
+                          (when (contains? acc name)
+                            (reject! "duplicate desugar template name" declaration))
+                          (assoc acc name
+                                 {:name name :params params
+                                  :body (expand-desugar-calls body acc counter)})))
+                      {} declarations)
+              names (set (keys templates))
+              ;; Declaration order forbids a cycle, but it does not by itself
+              ;; SAY so: a body naming itself, or naming a template declared
+              ;; later, simply fails to expand and survives as a call to a
+              ;; function that does not exist -- reported from lowering, about
+              ;; a name the source never wrote as a function. After expansion
+              ;; no template name can legitimately remain in any body, so one
+              ;; check covers both directions and names the real cause.
+              _ (doseq [template (vals templates)]
+                  (doseq [value (tree-seq coll? seq (:body template))]
+                    (when (and (symbol? value) (contains? names value))
+                      (reject! (if (= value (:name template))
+                                 "desugar template may not call itself"
+                                 "desugar template may not call one declared after it")
+                               (:body template)))))
+              remaining (remove #(and (seq? %) (= 'defdesugar (first %))) forms)
+              defined (into #{} (comp (filter #(and (seq? %) (contains? '#{defn defn- def} (first %))))
+                                      (map second)
+                                      (filter simple-symbol?))
+                            remaining)
+              collisions (set/intersection names defined)]
+          (when (seq collisions)
+            (reject! "desugar template name collides with a definition" (vec (sort collisions))))
+          (doseq [form remaining] (reject-template-references! form names))
+          (mapv #(expand-desugar-calls % templates counter) remaining)))))))

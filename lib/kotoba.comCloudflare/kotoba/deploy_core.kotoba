@@ -1,0 +1,242 @@
+(ns deploy-core
+  (:schemas {;; T5.2 native guest record: multi-arg pure → single record
+             :deploy/account-name [:record :deploy/account-name
+                                   [[:account-id :string] [:name :string]]]
+             :deploy/parts [:record :deploy/parts
+                            [[:part-a :string] [:part-b :string]]]
+             :deploy/parts-close [:record :deploy/parts-close
+                                  [[:parts :string] [:boundary :string]]]
+             :deploy/multipart-part [:record :deploy/multipart-part
+                                     [[:boundary :string] [:name :string]
+                                      [:filename :string] [:content-type :string]
+                                      [:body :string]]]
+             :deploy/wrangler [:record :deploy/wrangler
+                               [[:project :string] [:directory :string]
+                                [:wrangler-bin :string]]]})
+  (:export [max-account-id max-script-name max-script-bytes
+            max-module-name max-modules
+            blank? ws? alnum-char? account-char? account-body-ok?
+            script-body-ok? module-char? module-body-ok?
+            validate-account-id validate-script-name
+            validate-project-name validate-module-name
+            put-content-type module-js-content-type metadata-content-type
+            workers-script-path pages-project-path pages-deployments-path
+            put-method delete-method script-body-ok-size?
+            modules-count-ok? boundary-ok? multipart-content-type
+            multipart-part multipart-close encode-parts encode-parts-close
+            wrangler-pages-deploy-cmd directory-ok?]))
+
+;; W6 cloud-deploy oracle — pure validators + path builders + multipart
+;; encode scalars from cloudflare.deploy (ADR 0003 + 0005).
+;; Plan maps / module map assembly / JSON metadata / *! HTTP stay cljc.
+;; validate-*: empty string ≡ cljc nil (ok); else bare error tag (no :deploy/ ns).
+;; Charset mirrors re-matches policies in deploy.cljc.
+;; Parity: test/cloudflare/deploy_kotoba_parity_test.cljk
+
+(defn max-account-id [] :i64 64)
+(defn max-script-name [] :i64 64)
+(defn max-script-bytes [] :i64 5242880)
+(defn max-module-name [] :i64 128)
+(defn max-modules [] :i64 16)
+
+(defn ws? [c :string] :i64
+  (if (string=? c " ")
+    1
+    (if (string=? c "\n")
+      1
+      (if (string=? c "\t")
+        1
+        (if (string=? c "\r") 1 0)))))
+
+(defn blank? [s :string] :i64
+  ;; cljc clojure.string/blank?
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      1
+      (if (= (ws? (string-substring s 0 1)) 1)
+        (blank? (string-substring s 1 n))
+        0))))
+
+(defn alnum-char? [c :string] :i64
+  (if (string-contains? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" c)
+    1 0))
+
+(defn account-char? [c :string] :i64
+  ;; [A-Za-z0-9_-]
+  (if (string-contains? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" c)
+    1 0))
+
+(defn account-body-ok? [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      1
+      (if (= (account-char? (string-substring s 0 1)) 1)
+        (account-body-ok? (string-substring s 1 n))
+        0))))
+
+(defn script-body-ok? [s :string] :i64
+  ;; remaining chars after first: [A-Za-z0-9_-]*
+  (account-body-ok? s))
+
+(defn validate-account-id [account-id :string] :string
+  (if (= (blank? account-id) 1)
+    "empty-account"
+    (if (< (max-account-id) (string-byte-length account-id))
+      "account-too-long"
+      (if (= (account-body-ok? account-id) 1)
+        ""
+        "bad-account"))))
+
+(defn validate-script-name [script-name :string] :string
+  (if (= (blank? script-name) 1)
+    "empty-script"
+    (if (< (max-script-name) (string-byte-length script-name))
+      "script-too-long"
+      (let [n (string-byte-length script-name)
+            first (string-substring script-name 0 1)
+            rest (string-substring script-name 1 n)]
+        (if (= (alnum-char? first) 1)
+          (if (= (script-body-ok? rest) 1)
+            ""
+            "bad-script")
+          "bad-script")))))
+
+(defn validate-project-name [project-name :string] :string
+  ;; cljc: same policy as script names
+  (validate-script-name project-name))
+
+(defn module-char? [c :string] :i64
+  ;; [A-Za-z0-9_./-]
+  (if (string-contains? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./-" c)
+    1 0))
+
+(defn module-body-ok? [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      1
+      (if (= (module-char? (string-substring s 0 1)) 1)
+        (module-body-ok? (string-substring s 1 n))
+        0))))
+
+(defn validate-module-name [module-name :string] :string
+  ;; cljc: blank / too-long / NUL / .. / absolute / charset
+  (if (= (blank? module-name) 1)
+    "empty-module"
+    (if (< (max-module-name) (string-byte-length module-name))
+      "module-too-long"
+      (if (string-contains? module-name "\0")
+        "null-byte"
+        (if (string-contains? module-name "..")
+          "module-escape"
+          (if (string=? (string-substring module-name 0 1) "/")
+            "module-absolute"
+            (let [n (string-byte-length module-name)
+                  first (string-substring module-name 0 1)
+                  rest (string-substring module-name 1 n)]
+              (if (= (alnum-char? first) 1)
+                (if (= (module-body-ok? rest) 1)
+                  ""
+                  "bad-module")
+                "bad-module"))))))))
+
+(defn put-content-type [] :string
+  "application/javascript")
+
+(defn module-js-content-type [] :string
+  "application/javascript+module")
+
+(defn metadata-content-type [] :string
+  "application/json")
+
+(defn put-method [] :string "put")
+(defn delete-method [] :string "delete")
+
+(defn workers-script-path [x [:ref :deploy/account-name]] :string
+  ;; unvalidated assembly (cljc throws before concat on bad names)
+  ;; T5.2: account-id+script-name on one guest record (:name = script-name)
+  (string-concat
+   "/accounts/"
+   (string-concat (record-get x :account-id)
+                  (string-concat "/workers/scripts/" (record-get x :name)))))
+
+(defn pages-project-path [x [:ref :deploy/account-name]] :string
+  ;; T5.2: account-id+project-name on one guest record (:name = project-name)
+  (string-concat
+   "/accounts/"
+   (string-concat (record-get x :account-id)
+                  (string-concat "/pages/projects/" (record-get x :name)))))
+
+(defn pages-deployments-path [x [:ref :deploy/account-name]] :string
+  (string-concat (pages-project-path x) "/deployments"))
+
+(defn script-body-ok-size? [byte-len :i64] :i64
+  (if (< (max-script-bytes) byte-len) 0 1))
+
+(defn modules-count-ok? [n :i64] :i64
+  ;; cljc: non-empty and ≤ max-modules (caller projects count)
+  (if (< n 1)
+    0
+    (if (< (max-modules) n) 0 1)))
+
+(defn boundary-ok? [boundary :string] :i64
+  ;; cljc: not blank, no space, no double-quote
+  (if (= (blank? boundary) 1)
+    0
+    (if (string-contains? boundary " ")
+      0
+      (if (string-contains? boundary "\"") 0 1))))
+
+(defn multipart-content-type [boundary :string] :string
+  (string-concat "multipart/form-data; boundary=" boundary))
+
+(defn multipart-part [x [:ref :deploy/multipart-part]] :string
+  ;; empty filename / content-type ≡ cljc absent keys
+  ;; T5.2: boundary+name+filename+content-type+body on one guest record
+  (let [boundary (record-get x :boundary)
+        name (record-get x :name)
+        filename (record-get x :filename)
+        content-type (record-get x :content-type)
+        body (record-get x :body)
+        disp (if (string=? filename "")
+               (string-concat "Content-Disposition: form-data; name=\""
+                              (string-concat name "\""))
+               (string-concat "Content-Disposition: form-data; name=\""
+                              (string-concat name
+                                             (string-concat "\"; filename=\""
+                                                            (string-concat filename "\"")))))
+        ct (if (string=? content-type "")
+             ""
+             (string-concat "Content-Type: " (string-concat content-type "\r\n")))
+        head (string-concat "--" (string-concat boundary "\r\n"))
+        mid (string-concat disp (string-concat "\r\n" (string-concat ct "\r\n")))]
+    (string-concat head (string-concat mid (string-concat body "\r\n")))))
+
+(defn multipart-close [boundary :string] :string
+  (string-concat "--" (string-concat boundary "--\r\n")))
+
+(defn encode-parts [x [:ref :deploy/parts]] :string
+  ;; host builds parts via multipart-part, then joins.
+  (string-concat (record-get x :part-a) (record-get x :part-b)))
+
+(defn encode-parts-close [x [:ref :deploy/parts-close]] :string
+  (string-concat (record-get x :parts) (multipart-close (record-get x :boundary))))
+
+(defn directory-ok? [directory :string] :i64
+  ;; cljc: not blank and no NUL
+  (if (= (blank? directory) 1)
+    0
+    (if (string-contains? directory "\0") 0 1)))
+
+(defn wrangler-pages-deploy-cmd [x [:ref :deploy/wrangler]] :string
+  ;; space-joined argv (cljc returns vector). empty bin ⇒ "wrangler".
+  (let [project (record-get x :project)
+        directory (record-get x :directory)
+        wrangler-bin (record-get x :wrangler-bin)
+        bin (if (string=? wrangler-bin "") "wrangler" wrangler-bin)]
+    (string-concat
+     bin
+     (string-concat
+      " pages deploy "
+      (string-concat
+       directory
+       (string-concat " --project-name " project))))))

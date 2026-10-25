@@ -1,0 +1,140 @@
+(ns machine.tlb-cli
+  "`kbb -M:tlb` — measure this machine's address-translation penalty.
+
+  `machine` could validate a `:tlb` fact and `traversal` could consume one,
+  but nothing could produce one, so the numbers in both were hand-copied from
+  a session transcript. That is the same 'declared but unfillable' state the
+  fact itself was added to fix. This closes it: the output is a `:tlb` map
+  that goes straight into a descriptor, and the last thing this prints is
+  whether `machine/valid?` accepts the descriptor it just built."
+  (:require [kotoba.lang.error :as kerror] [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [machine.bench :as b]
+            [machine.core :as m]
+            [machine.probe :as p]))
+
+(defn- platform []
+  (let [os (str/lower (System/getProperty "os.name" ""))]
+    (cond (str/includes? os "mac") :darwin
+          (str/includes? os "linux") :linux
+          :else :unknown)))
+
+(defn -main [& args]
+  (let [reps (or (some-> (first args) parse-long) 7)
+        runs (or (some-> (second args) parse-long) 3)
+        probed (p/probe {:platform (platform)
+                         :run (fn [c a] (:out (apply shell/sh c a)))})
+        base (if (m/heterogeneous? probed) (m/for-cluster probed :performance) probed)
+        page (get-in base [:page :base-bytes])
+        ;; perfgate gates the samples WITHIN a run. Nothing gated whether the
+        ;; emitted fact reproduces ACROSS runs, and it does not: one run
+        ;; qualified with a full curve and the very next refused on a
+        ;; 0.204 arm. A single pass of a noise gate is one sample of a
+        ;; Bernoulli process, not evidence the measurement is stable, so the
+        ;; whole curve is measured `runs` times and every one must qualify.
+        ;; Gate on what the fact CLAIMS. A :tlb fact asserts a penalty ratio,
+        ;; so the thing that must reproduce is the ratio -- not every sample
+        ;; underneath it. Measured on this machine, the emitted figure is
+        ;; markedly steadier than the samples it comes from: at 64 pages the
+        ;; samples spread 0.089 while the mean across six independent batches
+        ;; spread 0.042, and at 512 pages 0.139 against 0.114. Refusing on the
+        ;; sample spread therefore rejects facts that do reproduce.
+        ;;
+        ;; perfgate's per-arm spread is no longer the decision. It is still a
+        ;; real signal about the machine, and surfacing it next to this one is
+        ;; a follow-up -- translation-curve would have to return it.
+        ;; `:max-relative-stdev` is raised for the per-run pass so a noisy run
+        ;; still yields a curve to compare; the decision is the across-run one.
+        attempts (vec (repeatedly runs
+                        #(try {:tlb (b/translation-curve base {:reps reps :max-rsd 1.0})}
+                              (catch kerror/ExceptionInfo e {:refused (ex-data e)}))))
+        curves (vec (keep :tlb attempts))
+        ;; across-run spread of every penalty, which is the decision
+        spreads (when (= runs (count curves))
+                  (for [regime [:dependent :streaming]
+                        p (sort (distinct (mapcat #(keys (get-in % [:penalty-by-pages regime])) curves)))
+                        :let [vs (keep #(get-in % [:penalty-by-pages regime p]) curves)]
+                        :when (seq vs)]
+                    {:regime regime :pages p :values (vec vs)
+                     :across (/ (- (apply max vs) (apply min vs)) (max 1e-9 (apply min vs)))}))
+        unstable (filter #(> (:across %) 0.10) spreads)
+        result (cond
+                 (< (count curves) runs) {:refused (:refused (first (filter :refused attempts)))}
+                 (seq unstable) {:unstable (vec unstable)}
+                 :else {:tlb (first curves)})
+        tlb (:tlb result)
+        with (when tlb (assoc base :tlb tlb))]
+    (println (:machine/id base) "·" page "-byte pages · reps" reps "· runs" runs)
+    (println)
+    (when (seq curves)
+      ;; What perfgate would have said. Printed rather than obeyed, so nobody
+      ;; has to take on trust that the stricter check was considered.
+      (println (format "  runs completed: %d/%d · gate: across-run reproducibility of the ratio"
+                       (count curves) runs))
+      ;; Both criteria, side by side. The per-sample spread is no longer the
+      ;; decision, but hiding the stricter number would leave a reader unable
+      ;; to tell a steady machine from a lucky one.
+      (println "  per-sample spread (perfgate's criterion, reported not obeyed):")
+      (doseq [regime [:dependent :streaming]]
+        (let [worst (apply max 0.0 (for [c curves] (apply max 0.0 (vals (get-in c [:sample-spread regime] {})))))
+              median (let [vs (sort (for [c curves, [_ v] (get-in c [:sample-spread regime] {})] v))]
+                       (if (seq vs) (nth vs (quot (count vs) 2)) 0.0))]
+          (println (format "    %-10s worst %.3f · median %.3f" (name regime) worst median))))
+      (println))
+    (when-let [u (:unstable result)]
+      (println "  REFUSED — the curve does not reproduce across runs.")
+      (println)
+      (doseq [{:keys [regime pages values across]} u]
+        (println (format "    %-10s %6d pages  %s  spread %.0f%%" (name regime) pages
+                         (str/join " " (map #(format "%.2fx" %) values))
+                         (* 100.0 across))))
+      (println)
+      (println "   this is the gate that matters: a fact claims a ratio, so the ratio")
+      (println "   must repeat. Sample-level jitter that averages out is not the threat.")
+      (flush)
+      (System/exit 1))
+    (when-let [r (:refused result)]
+      ;; The useful outcome. An earlier version of this probe emitted a curve
+      ;; whatever the noise, and two runs produced 2.74x and 1.31x for the
+      ;; same arm -- with the summary line flipping its verdict between them.
+      (println "  REFUSED — this machine is too noisy right now to state a fact.")
+      (println)
+      (doseq [{:keys [regime pages relative-stdev allowed]} (:refusals r)]
+        (println (format "    %-10s %6d pages  rel-stdev %.3f  (allowed %.2f)"
+                         (name regime) pages relative-stdev allowed)))
+      (println)
+      (println "  " (:note r))
+      (flush)
+      (System/exit 1))
+    (doseq [regime [:dependent :streaming]]
+      (println (format "  %s" (name regime)))
+      (doseq [[pages penalty] (get-in tlb [:penalty-by-pages regime])]
+        (println (format "    %6d pages  %6.2fx" pages penalty)))
+      (println))
+    (let [d (m/translation-penalty with 512 :dependent)
+          s (m/translation-penalty with 512 :streaming)]
+      (println (format "  at 512 pages: dependent %.2fx · streaming %.2fx · ratio %.2fx"
+                       d s (/ d s)))
+      (println (str "  => " (if (< 1.3 (/ d s))
+                              "the regimes disagree enough that one number would be a lie"
+                              "the regimes agree here; on this machine one number would do"))))
+    (println)
+    ;; Agreement across independent runs, which is the property that makes
+    ;; this a fact rather than a reading.
+    (doseq [regime [:dependent :streaming]]
+      (let [per-run (map #(get-in % [:penalty-by-pages regime]) curves)
+            pages (sort (distinct (mapcat keys per-run)))]
+        (println (format "  %s agreement across %d runs" (name regime) runs))
+        (doseq [p pages]
+          (let [vs (keep #(get % p) per-run)]
+            (when (seq vs)
+              (println (format "    %6d pages  %s  spread %.0f%%" p
+                               (str/join " " (map #(format "%.2fx" %) vs))
+                               (* 100.0 (/ (- (apply max vs) (apply min vs))
+                                           (max 1e-9 (apply min vs)))))))))))
+    (println)
+    ;; The point of the whole exercise: a fact something can actually use.
+    (println "  machine/valid? on the descriptor carrying it:" (m/valid? with))
+    (when-not (m/valid? with)
+      (println "  errors:" (pr-str (m/validation-errors with))))
+    (flush)))

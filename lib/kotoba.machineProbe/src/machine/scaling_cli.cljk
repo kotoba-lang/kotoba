@@ -1,0 +1,115 @@
+(ns machine.scaling-cli
+  "`kbb -M:scaling` — does the AoS/SoA gap widen when cores compete for memory?
+
+  The single-threaded run measured 2.02x against a predicted 16x. This tests
+  the obvious explanation: one core cannot ask for enough bandwidth to make
+  bandwidth the bottleneck. If that is right, the ratio climbs with thread
+  count. If it stays flat, the explanation was wrong and has to be discarded
+  rather than argued around — so the output prints the curve either way, and
+  every point goes through `perfgate` on its own."
+  (:require [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [machine.bench :as b]
+            [machine.core :as m]
+            [machine.probe :as p]
+            [perfgate.core :as g]))
+
+(defn- platform []
+  (let [os (str/lower (System/getProperty "os.name" ""))]
+    (cond (str/includes? os "mac") :darwin
+          (str/includes? os "linux") :linux
+          :else :unknown)))
+
+(defn- ms [ns] (/ (Math/round (/ (double ns) 1000.0)) 1000.0))
+
+(defn -main [& args]
+  (let [n (or (some-> (first args) parse-long) 2000000)
+        width (or (some-> (second args) parse-long) 16)
+        reps (or (some-> (nth args 2 nil) parse-long) 25)
+        probed (p/probe {:platform (platform)
+                         :run (fn [cmd cmd-args] (:out (apply shell/sh cmd cmd-args)))})
+        mach (if (m/heterogeneous? probed) (m/for-cluster probed :performance) probed)
+        cores (get-in mach [:cpu :cores])
+        counts (vec (take-while #(<= % cores) [1 2 4 8 16]))
+        r (b/run-scaling mach {:n n :width width :thread-counts counts
+                               :warmup 10 :reps reps})
+        pred (get-in r [:prediction :predicted-ratio])]
+    (println (:machine/id mach) "· line" (m/line-bytes mach) "B ·" cores "cores ·"
+             "L2 private" (m/private-cache-bytes mach 2 :unified) "B")
+    (println "n =" n "·" width "doubles per AoS element ·"
+             (quot (* 8 width n) 1048576) "MiB AoS vs" (quot (* 8 n) 1048576) "MiB SoA")
+    (println "predicted line ratio:" (format "%.2fx" pred))
+    (println)
+    (println (format "%-7s %9s %9s %8s %9s %9s %8s %s"
+                     "threads" "AoS ms" "SoA ms" "AoS GB/s" "SoA GB/s" "ratio" "realized" "gate"))
+    (doseq [{:keys [threads aos-samples soa-samples]} (:points r)]
+      (let [_ nil
+            base (g/observation {:id (keyword (str "aos-t" threads))
+                                 :plan-id :particle-scan :machine mach
+                                 :metric :wall-ns :unit :ns :samples aos-samples
+                                 :source (str "machine.bench/run-scaling threads=" threads)})
+            cand (g/observation {:id (keyword (str "soa-t" threads))
+                                 :plan-id :particle-scan :machine mach
+                                 :metric :wall-ns :unit :ns :samples soa-samples
+                                 :source (str "machine.bench/run-scaling threads=" threads)})
+            v (g/qualify cand base)
+            am (get-in base [:observation/summary :mean])
+            sm (get-in cand [:observation/summary :mean])
+            ratio (/ am sm)]
+        (println (format "%-7d %9s %9s %8.1f %9.1f %7.2fx %8.1f%% %s"
+                         threads (ms am) (ms sm)
+                         (/ (* 8.0 width n) am)      ; bytes / ns = GB/s
+                         (/ (* 8.0 n) sm)
+                         ratio
+                         (* 100.0 (/ ratio pred))
+                         (if (:qualified? v)
+                           "QUALIFIED"
+                           (str "refused: "
+                                (str/join "," (map (comp name :reason) (:reasons v)))))))))
+    (println)
+    ;; The verdict is gated on the POINTS, not on the ratio between them.
+    ;;
+    ;; The first version of this printed a SUPPORTED/NOT-SUPPORTED line
+    ;; straight off the means -- and two consecutive runs of refused data
+    ;; produced opposite conclusions (+3% then +31%). That is exactly the
+    ;; failure perfgate exists to stop, committed by the tool that consumes
+    ;; perfgate. A conclusion drawn across points is worth no more than the
+    ;; weakest point it rests on.
+    (let [pts (:points r)
+          verdicts (mapv (fn [{:keys [threads aos-samples soa-samples]}]
+                           (let [o (fn [id s] (g/observation
+                                               {:id id :plan-id :particle-scan :machine mach
+                                                :metric :wall-ns :unit :ns :samples s
+                                                :source (str "run-scaling threads=" threads)}))]
+                             (g/qualify (o :soa soa-samples) (o :aos aos-samples))))
+                         pts)
+          ratio-of (fn [{:keys [aos-samples soa-samples]}]
+                     (/ (/ (reduce + 0.0 aos-samples) (count aos-samples))
+                        (/ (reduce + 0.0 soa-samples) (count soa-samples))))
+          first-r (ratio-of (first pts))
+          last-r (ratio-of (last pts))
+          all-qualified? (every? :qualified? verdicts)]
+      (println (format "ratio at 1 thread: %.2fx · at %d threads: %.2fx · change %+.0f%%"
+                       first-r (:threads (last pts)) last-r
+                       (* 100.0 (- (/ last-r first-r) 1.0))))
+      (println
+       (cond
+         (not all-qualified?)
+         (str "=> INCONCLUSIVE: " (count (remove :qualified? verdicts)) " of "
+              (count verdicts) " points did not qualify, so the trend across them"
+              " has no standing. Take more samples or reduce the noise; do not"
+              " read the percentage above as a result.")
+         (> last-r (* 1.15 first-r))
+         "=> bandwidth hypothesis SUPPORTED: contention widens the layout gap."
+         :else
+         "=> bandwidth hypothesis NOT supported: the gap is flat in thread count."))
+      ;; The bandwidth columns are worth reading even when the ratio is not,
+      ;; because they were stable across runs and they say what is actually
+      ;; bounding each arm.
+      (println (format "note: SoA peaked at %.1f GB/s, far under this machine's capability —"
+                       (apply max (map (fn [p] (/ (* 8.0 n)
+                                                  (/ (reduce + 0.0 (:soa-samples p))
+                                                     (count (:soa-samples p)))))
+                                       pts))))
+      (println "      it is bound by the per-element loop, not by memory."))
+    (flush)))

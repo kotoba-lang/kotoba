@@ -1,0 +1,396 @@
+(ns kotoba.compiler.frontend.infer-loop
+  "Kotoba-native loop-helper result inference split from frontend.infer."
+  #?(:kotoba {:kotoba/export [infer-loop-helper-results]})
+  (:require #?@(:kotoba [[kotoba.form :as form]])
+            [kotoba.compiler.frontend.base :refer [#?@(:kotoba [fe-reject-data fget fl-nth fput ftruthy? pr-form] :default [])]]
+            #?@(:kotoba [[kotoba.compiler.frontend.expand :refer [preserve-form-meta]]])
+            #?@(:kotoba [[kotoba.compiler.frontend.infer :refer [a abort-bottom-form absence-kind? absence-type argc empty-fmap fn-signature ie-type-of lenient-branch-join map2 nil-kind-form none-kind-form option-of option-vector-type? same-expression-type? sym-is? tk type-text type-valid! zip-locals]]]))
+
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                          [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                                 :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                                 :ie/ctx [:record :ie/ctx [[:schemas [:ref :form/r]] [:row-schemas [:ref :form/r]] [:handlers [:ref :form/r]] [:final :bool] [:tail :bool] [:names [:ref :form/r]] [:recording :bool] [:recorded [:ref :form/r]] [:collect :bool] [:throws [:list [:ref :form/r]]] [:known [:ref :form/r]] [:tbl [:ref :form/r]] [:rec-limit :i64] [:rec-count :i64]]]})))
+
+;; ── Kotoba route: the loop-helper result and recur-type passes (ported from the host forms above) ──
+;; ---- loop/recur accumulator types (ADR 0027) ----
+#?(:kotoba
+(defn- map1 [k [:ref :form/r] v [:ref :form/r]] [:ref :form/r]
+  (form/form-map (form/append-form (form/append-form (form/no-forms) k) v)))
+   :default nil)
+
+;; The symbol a self-call stands in as while a loop-helper's exits are typed.
+#?(:kotoba
+(defn- loop-recur-marker [] [:ref :form/r]
+  (form/symbol-form "__kotoba_recur_position__"))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-unknown-form [] [:ref :form/r]
+  (form/keyword-form :kotoba.loop/unknown))
+   :default nil)
+
+#?(:kotoba
+(defn- replace-loop-self-calls-kids [form [:ref :form/r] helper-name [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of form))
+    acc
+    (let [kid (replace-loop-self-calls (form/nth-of form i) helper-name)]
+      (replace-loop-self-calls-kids form helper-name (+ i 1) (form/append-form acc kid)))))
+   :default nil)
+
+;; FORM with every call to HELPER-NAME replaced by the marker
+#?(:kotoba
+(defn- replace-loop-self-calls [form [:ref :form/r] helper-name [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (form/is-seq? form) (form/eq helper-name (form/nth-of form 0))) (loop-recur-marker)
+    (form/is-seq? form)
+    (let [kids (replace-loop-self-calls-kids form helper-name 0 (form/no-forms))]
+      (preserve-form-meta form (form/form-seq kids)))
+    (form/is-vec? form) (form/form-vec (replace-loop-self-calls-kids form helper-name 0 (form/no-forms)))
+    :else form))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-exit-pair [form [:ref :form/r] locals [:ref :form/r]] [:list [:ref :form/r]]
+  (form/one-form (form/vec2 form locals)))
+   :default nil)
+
+;; the locals after the bindings of a `let`, each typed in the locals before it (a refused binding refuses)
+#?(:kotoba
+(defn- loop-let-locals [ctx [:ref :ie/ctx] bindings [:ref :form/r] i :i64 current [:ref :form/r] sigs [:ref :form/r]] [:ref :form/r]
+  (if (< (+ i 1) (form/count-of bindings))
+    (let [name (form/nth-of bindings i)
+          value (form/nth-of bindings (+ i 1))
+          t (ie-type-of ctx value current sigs)
+          next-locals (form/assoc-form current name t)]
+      (loop-let-locals ctx bindings (+ i 2) next-locals sigs))
+    current))
+   :default nil)
+
+;; The tail exits of a marked loop-helper body, as `[form locals]` pairs (a marker in tail position is a `recur`)
+#?(:kotoba
+(defn- loop-exit-forms [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] sigs [:ref :form/r]] [:list [:ref :form/r]]
+  (cond
+    (form/eq form (loop-recur-marker)) (form/no-forms)
+    (form/is-seq? form) (loop-exit-seq ctx form locals sigs)
+    :else (loop-exit-pair form locals)))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-exit-seq [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] sigs [:ref :form/r]] [:list [:ref :form/r]]
+  (let [op (form/nth-of form 0)
+        n (argc form)]
+    (cond
+      (and (sym-is? op "if") (= 3 n))
+      (let [then (a form 1)
+            else (a form 2)
+            xs (loop-exit-forms ctx then locals sigs)
+            ys (loop-exit-forms ctx else locals sigs)]
+        (form/append-many xs ys))
+      (and (sym-is? op "do") (> n 0))
+      (let [last-form (form/last-of form)]
+        (loop-exit-forms ctx last-form locals sigs))
+      (and (sym-is? op "let") (form/is-vec? (a form 0)) (= 2 n) (= 0 (rem (form/count-of (a form 0)) 2)))
+      (let [bindings (a form 0)
+            body (a form 1)
+            inner (loop-let-locals ctx bindings 0 locals sigs)]
+        (loop-exit-forms ctx body inner sigs))
+      :else (loop-exit-pair form locals))))
+   :default nil)
+
+;; A tail exit named short enough to read in a one-line refusal.
+#?(:kotoba
+(defn- loop-exit-text [form [:ref :form/r]] :string
+  (let [text (pr-form form)]
+    (if (> (string-length text) 48)
+      (str (string-substring text 0 45) "...")
+      text)))
+   :default nil)
+
+;; the typed exits `[form type]`, an exit that always aborts dropped
+#?(:kotoba
+(defn- loop-typed-exits [ctx [:ref :ie/ctx] exits [:list [:ref :form/r]] i :i64 sigs [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count exits))
+    acc
+    (let [e (fl-nth exits i)
+          f (form/nth-of e 0)
+          fl (form/nth-of e 1)
+          t (ie-type-of ctx f fl sigs)
+          acc2 (if (form/eq t (abort-bottom-form)) acc (form/append-form acc (form/vec2 f t)))]
+      (loop-typed-exits ctx exits (+ i 1) sigs acc2))))
+   :default nil)
+
+;; the entries of TYPED whose type is an absence kind (WANT true) or is not (WANT false)
+#?(:kotoba
+(defn- loop-filter-absence [typed [:list [:ref :form/r]] i :i64 want :bool acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count typed))
+    acc
+    (let [e (fl-nth typed i)
+          hit (absence-kind? (form/nth-of e 1))
+          keep (if want hit (not hit))]
+      (loop-filter-absence typed (+ i 1) want (if keep (form/append-form acc e) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-has-kind? [entries [:list [:ref :form/r]] i :i64 kind [:ref :form/r]] :bool
+  (if (>= i (vector-count entries))
+    false
+    (if (form/eq (form/nth-of (fl-nth entries i) 1) kind)
+      true
+      (loop-has-kind? entries (+ i 1) kind))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-absence-mode [absent [:list [:ref :form/r]]] [:ref :form/r]
+  (cond
+    (loop-has-kind? absent 0 (nil-kind-form)) (tk :nil)
+    (loop-has-kind? absent 0 (none-kind-form)) (tk :none)
+    :else (tk :legacy)))
+   :default nil)
+
+;; the type the non-absent exits agree on (a value of T beside [:option T] is the present answer)
+#?(:kotoba
+(defn- loop-present-type [typed [:list [:ref :form/r]] i :i64 joined [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count typed))
+    joined
+    (let [t (form/nth-of (fl-nth typed i) 1)
+          lenient (lenient-branch-join joined t)
+          next-joined (cond
+                        (form/is-nil? joined) t
+                        (same-expression-type? t joined) joined
+                        (ftruthy? lenient) lenient
+                        :else joined)]
+      (loop-present-type typed (+ i 1) next-joined))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-agrees? [t [:ref :form/r] first-type [:ref :form/r] has-absent :bool] :bool
+  (or (same-expression-type? t first-type)
+      (and has-absent
+           (or (form/eq (option-of t) first-type)
+               (and (option-vector-type? first-type) (form/eq (form/nth-of first-type 1) t))))))
+   :default nil)
+
+;; the first entry of TYPED that does not agree with FIRST-TYPE, or nil
+#?(:kotoba
+(defn- loop-disagreeing [typed [:list [:ref :form/r]] i :i64 first-type [:ref :form/r] has-absent :bool] [:ref :form/r]
+  (if (>= i (vector-count typed))
+    (form/nil-form)
+    (let [e (fl-nth typed i)]
+      (if (loop-agrees? (form/nth-of e 1) first-type has-absent)
+        (loop-disagreeing typed (+ i 1) first-type has-absent)
+        e))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-exit-error [first-type [:ref :form/r] typed [:list [:ref :form/r]] disagreeing [:ref :form/r]] [:ref :fe/err]
+  (let [fexit (form/nth-of (fl-nth typed 0) 0)
+        dform (form/nth-of disagreeing 0)
+        dtype (form/nth-of disagreeing 1)
+        first-text (type-text first-type)
+        fexit-text (loop-exit-text fexit)
+        dtype-text (type-text dtype)
+        dform-text (loop-exit-text dform)
+        msg (str "loop exits with two different value types: " first-text " from " fexit-text " and " dtype-text " from " dform-text)
+        data (map2 (tk :kotoba.error/expected) first-type (tk :kotoba.error/actual) dtype)]
+    (fe-reject-data msg "kotoba.error/loop-exit-type" dform data)))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-exit-decide [ctx [:ref :ie/ctx] marked [:ref :form/r] environment [:ref :form/r] sigs [:ref :form/r] provisional [:ref :form/r] rounds :i64 typed [:list [:ref :form/r]] absent [:list [:ref :form/r]] first-type [:ref :form/r] disagreeing [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (= 0 (vector-count typed)) (= 0 (vector-count absent))) (form/nil-form)
+    (not (form/is-nil? disagreeing)) (throw (loop-exit-error first-type typed disagreeing))
+    (or (form/eq first-type provisional) (>= rounds 4)) first-type
+    :else (loop-exit-round ctx marked environment sigs first-type (+ rounds 1))))
+   :default nil)
+
+;; one round of the fixed point over the marker's own binding
+#?(:kotoba
+(defn- loop-exit-round [ctx [:ref :ie/ctx] marked [:ref :form/r] environment [:ref :form/r] sigs [:ref :form/r] provisional [:ref :form/r] rounds :i64] [:ref :form/r]
+  (let [marker (loop-recur-marker)
+        locals (form/assoc-form environment marker provisional)
+        exits (loop-exit-forms ctx marked locals sigs)
+        typed-all (loop-typed-exits ctx exits 0 sigs (form/no-forms))
+        absent (loop-filter-absence typed-all 0 true (form/no-forms))
+        typed (loop-filter-absence typed-all 0 false (form/no-forms))
+        has-absent (> (vector-count absent) 0)
+        present-type (if has-absent (loop-present-type typed 0 (form/nil-form)) (form/nil-form))
+        first-type (if has-absent
+                     (absence-type present-type (loop-absence-mode absent))
+                     (if (> (vector-count typed) 0) (form/nth-of (fl-nth typed 0) 1) (form/nil-form)))
+        disagreeing (loop-disagreeing typed 0 first-type has-absent)]
+    (loop-exit-decide ctx marked environment sigs provisional rounds typed absent first-type disagreeing)))
+   :default nil)
+
+;; The type a loop-helper leaves through, or nil when nothing here can say.
+#?(:kotoba
+(defn- loop-helper-exit-type [ctx [:ref :ie/ctx] helper [:ref :form/r] sigs [:ref :form/r]] [:ref :form/r]
+  (let [name (fget helper :name)
+        body (fget helper :body)
+        marked (replace-loop-self-calls body name)
+        environment (zip-locals (fget helper :params) (fget helper :param-types))]
+    (loop-exit-round ctx marked environment sigs (tk :i64) 0)))
+   :default nil)
+
+;; a refusal other than the pass's own two reads as "unknown"
+#?(:kotoba
+(defn- loop-recover [e [:ref :fe/err]] [:ref :form/r]
+  (let [code (record-get [:ref :fe/err] e :code)]
+    (if (or (string=? code "kotoba.error/loop-exit-type") (string=? code "kotoba.error/loop-result-type"))
+      (throw e)
+      (loop-unknown-form))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-exit-type-or-unknown [ctx [:ref :ie/ctx] helper [:ref :form/r] sigs [:ref :form/r]] [:ref :form/r]
+  (try (loop-helper-exit-type ctx helper sigs)
+       (catch [:ref :fe/err] e (loop-recover e))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-type-invalid? [inferred [:ref :form/r]] :bool
+  (try (let [_ (type-valid! inferred)] false)
+       (catch [:ref :fe/err] e true)))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-result-error [helper [:ref :form/r] msg :string data [:ref :form/r]] [:ref :fe/err]
+  (fe-reject-data msg "kotoba.error/loop-result-type" (fget helper :body) data))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-result-valid! [helper [:ref :form/r] inferred [:ref :form/r]] :i64
+  (if (loop-type-invalid? inferred)
+    (throw (loop-result-error helper
+                              (str "a loop is lowered to a function and its exits have the type " (type-text inferred)
+                                   ", which cannot cross a function boundary in this profile")
+                              (map1 (tk :kotoba.error/actual) inferred)))
+    0))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-result-declared! [helper [:ref :form/r] declared [:ref :form/r] inferred [:ref :form/r]] :i64
+  (if (and (not (form/is-nil? declared)) (not (same-expression-type? inferred declared)))
+    (throw (loop-result-error helper
+                              (str "loop result was declared " (type-text declared) " and its exits have the type " (type-text inferred))
+                              (map2 (tk :kotoba.error/expected) declared (tk :kotoba.error/actual) inferred)))
+    0))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-result-checked [helper [:ref :form/r] declared [:ref :form/r] inferred [:ref :form/r]] [:ref :form/r]
+  (let [_ (loop-result-valid! helper inferred)
+        _ (loop-result-declared! helper declared inferred)]
+    inferred))
+   :default nil)
+
+;; The result type for one loop-helper, refusing a type that cannot be one.
+#?(:kotoba
+(defn- loop-helper-result [ctx [:ref :ie/ctx] helper [:ref :form/r] declared [:ref :form/r] sigs [:ref :form/r]] [:ref :form/r]
+  (let [inferred (loop-exit-type-or-unknown ctx helper sigs)]
+    (cond
+      (form/eq inferred (loop-unknown-form)) (fget helper :result)
+      (form/is-nil? inferred) (fget helper :result)
+      :else (loop-result-checked helper declared inferred))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-helper-signatures-from [fs [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of fs))
+    acc
+    (let [f (form/nth-of fs i)
+          result (fget f :result)
+          base (fn-signature f)
+          shown (if (ftruthy? result) result (tk :i64))
+          sig (fput base :result shown)
+          name (fget f :name)]
+      (loop-helper-signatures-from fs (+ i 1) (form/assoc-form acc name sig)))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-helper-signatures [functions [:ref :form/r]] [:ref :form/r]
+  (loop-helper-signatures-from functions 0 (empty-fmap)))
+   :default nil)
+
+#?(:kotoba
+(defn- any-loop-helper? [fs [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of fs))
+    false
+    (if (ftruthy? (fget (form/nth-of fs i) :loop-helper?))
+      true
+      (any-loop-helper? fs (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-declared-result [shapes [:ref :form/r] name [:ref :form/r]] [:ref :form/r]
+  (fget (form/form-get shapes name) :declared-result))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-result-of [ctx [:ref :ie/ctx] f [:ref :form/r] sigs [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (let [declared (loop-declared-result shapes (fget f :name))]
+    (loop-helper-result ctx f declared sigs)))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-result-lenient [ctx [:ref :ie/ctx] f [:ref :form/r] sigs [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (try (loop-result-of ctx f sigs shapes)
+       (catch [:ref :fe/err] e (fget f :result))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-update-result [ctx [:ref :ie/ctx] f [:ref :form/r] strict :bool sigs [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (if strict
+    (let [r (loop-result-of ctx f sigs shapes)]
+      (fput f :result r))
+    (let [r (loop-result-lenient ctx f sigs shapes)]
+      (fput f :result r))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-update-function [ctx [:ref :ie/ctx] f [:ref :form/r] strict :bool sigs [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (if (ftruthy? (fget f :loop-helper?))
+    (loop-update-result ctx f strict sigs shapes)
+    f))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-results-round [ctx [:ref :ie/ctx] fs [:ref :form/r] i :i64 strict :bool sigs [:ref :form/r] shapes [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of fs))
+    (form/form-vec acc)
+    (let [f (form/nth-of fs i)
+          g (loop-update-function ctx f strict sigs shapes)]
+      (loop-results-round ctx fs (+ i 1) strict sigs shapes (form/append-form acc g)))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-results-of [fs [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of fs))
+    (form/form-vec acc)
+    (loop-results-of fs (+ i 1) (form/append-form acc (fget (form/nth-of fs i) :result)))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-results-fixpoint [ctx [:ref :ie/ctx] fs [:ref :form/r] rounds :i64 shapes [:ref :form/r]] [:ref :form/r]
+  (let [sigs (loop-helper-signatures fs)
+        next-fs (loop-results-round ctx fs 0 false sigs shapes (form/no-forms))
+        same (form/eq (loop-results-of next-fs 0 (form/no-forms)) (loop-results-of fs 0 (form/no-forms)))]
+    (if (or same (>= rounds 4))
+      (loop-results-final ctx next-fs shapes)
+      (loop-results-fixpoint ctx next-fs (+ rounds 1) shapes))))
+   :default nil)
+
+#?(:kotoba
+(defn- loop-results-final [ctx [:ref :ie/ctx] fs [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (let [sigs (loop-helper-signatures fs)]
+    (loop-results-round ctx fs 0 true sigs shapes (form/no-forms))))
+   :default nil)
+
+;; Give every synthesized loop-helper the result type its exits have (to a fixed point; the last round refuses).
+#?(:kotoba
+(defn infer-loop-helper-results [ctx [:ref :ie/ctx] functions [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (if (any-loop-helper? functions 0)
+    (loop-results-fixpoint ctx functions 0 shapes)
+    functions))
+   :default nil)
+

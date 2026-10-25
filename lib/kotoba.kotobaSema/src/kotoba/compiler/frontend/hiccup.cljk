@@ -1,0 +1,290 @@
+(ns kotoba.compiler.frontend.hiccup
+  "Module `hiccup` of kotoba.compiler.frontend: the hiccup form reading the
+  selfhost error reports write. Preserved from the monolith (a7ef280) as host
+  twins only -- feature wiring and typed twins are follow-ups (see PR notes)."
+  #?(:kotoba {:kotoba/export []})
+  (:require [kotoba.lang.text :as str]
+            #?@(:kotoba [] :default [[kotoba.compiler.frontend.base :refer [first-truthy reject!]]
+                                     [kotoba.compiler.frontend.expand :refer [kotoba-integer?]]])))
+
+;; --- main-only preservation forms (a7ef280 monolith), host twins only ---
+;; defs first, then fns (intra-cluster dependency order).
+
+#?(:kotoba nil :default (def ^:private hiccup-node-ref [:ref :kotoba.hiccup/node]))
+
+#?(:kotoba nil :default (def ^:private hiccup-list-type [:list [:ref :kotoba.hiccup/node]]))
+
+#?(:kotoba nil :default (def ^:private hiccup-elem-type
+  [:record :kotoba.hiccup/elem
+   [[:tag :keyword] [:attrs [:map :keyword :string]] [:children hiccup-list-type]]]))
+
+#?(:kotoba nil :default (def ^:private hiccup-node-type
+  [:variant :kotoba.hiccup/node
+   [[:text :string] [:elem [:ref :kotoba.hiccup/elem]] [:frag hiccup-list-type]]]))
+
+#?(:kotoba nil :default (def ^:private hiccup-schemas
+  {:kotoba.hiccup/node hiccup-node-type :kotoba.hiccup/elem hiccup-elem-type}))
+
+#?(:kotoba nil :default (def ^:private hiccup-cases [:text :elem :frag]))
+
+#?(:kotoba nil :default (def ^:private hiccup-never-predicates
+  '#{map? set? number? integer? int? float? double? keyword? symbol? boolean?
+     true? false? nil? fn? char? some?}))
+
+#?(:kotoba nil :default (def ^:private hiccup-shape-predicates
+  '{string? #{:text} vector? #{:elem} seq? #{:frag} sequential? #{:elem :frag} coll? #{:elem :frag}}))
+
+#?(:kotoba nil :default (defn- hiccup-number? [x] (or (number? x) (kotoba-integer? x))))
+
+#?(:kotoba nil :default (defn- hiccup-show [x] (if (kotoba-integer? x) (str x) (pr-str x))))
+
+#?(:kotoba nil :default (defn- hiccup-node-type? [t] (or (= t hiccup-node-ref) (= t hiccup-node-type))))
+
+#?(:kotoba nil :default (defn- hiccup-type-form? [x]
+  (or (keyword? x) (and (vector? x) (keyword? (first x))))))
+
+#?(:kotoba nil :default (defn- hiccup-param-types
+  "{symbol type} of the annotated simple parameters of a params vector."
+  [params]
+  (loop [items (seq params) out {}]
+    (if-let [[p & more] items]
+      (if (and (simple-symbol? p) (not= '& p) (seq more) (hiccup-type-form? (first more)))
+        (recur (rest more) (assoc out p (first more)))
+        (recur more out))
+      out))))
+
+#?(:kotoba nil :default (defn- hiccup-param-slots
+  "The declared type at each positional parameter, nil where none."
+  [params]
+  (loop [items (seq params) out []]
+    (if-let [[p & more] items]
+      (cond
+        (= '& p) out
+        (and (seq more) (hiccup-type-form? (first more))) (recur (rest more) (conj out (first more)))
+        :else (recur more (conj out nil)))
+      out))))
+
+#?(:kotoba nil :default (defn- hiccup-literal? [form]
+  (and (vector? form) (keyword? (first form)))))
+
+#?(:kotoba nil :default (defn- hiccup-text [form] (list 'variant-new hiccup-node-type :text form)))
+
+#?(:kotoba nil :default (defn- hiccup-env-kind
+  "What the rewrite knows of a value: :node, :string or nil."
+  [sigs env form]
+  (cond
+    (string? form) :string
+    (simple-symbol? form) (get env form)
+    (and (seq? form) (contains? '#{str subs} (first form))) :string
+    (and (seq? form) (symbol? (first form)) (contains? sigs (first form))
+         (not (contains? env (first form))))
+    (let [r (:result (get sigs (first form)))]
+      (cond (hiccup-node-type? r) :node (= :string r) :string))
+    :else nil)))
+
+#?(:kotoba nil :default (defn expand-hiccup-forms
+  "{:forms :schemas}: FORMS with hiccup literals and node shape tests
+  rewritten (ADR 0353 :hiccup-node), and the node schemas when the module
+  names `:kotoba.hiccup/node`. FORMS itself, and no schemas, otherwise."
+  [forms]
+  (if-not (first-truthy #(= :kotoba.hiccup/node %) (tree-seq coll? seq forms))
+    {:forms forms :schemas nil}
+    (let [defn-form? #(and (seq? %) (contains? '#{defn defn-} (first %)) (symbol? (second %)))
+          signature (fn [form]
+                      (let [decl (drop 2 form)
+                            decl (if (string? (first decl)) (rest decl) decl)
+                            params (first decl)]
+                        (when (vector? params)
+                          {:slots (hiccup-param-slots params)
+                           :params params
+                           :result (when (hiccup-type-form? (second decl)) (second decl))})))
+          sigs (into {} (keep (fn [f] (when (defn-form? f)
+                                        (when-let [s (signature f)] [(second f) s]))))
+                     forms)
+          meta-like (fn [new old] (if (and (meta old) (or (seq? new) (vector? new) (map? new)))
+                                    (with-meta new (meta old))
+                                    new))
+          bind-env (fn [env params]
+                     (let [types (hiccup-param-types params)
+                           bound (filter simple-symbol? (tree-seq coll? seq params))]
+                       (reduce (fn [env p]
+                                 (let [t (get types p)]
+                                   (cond (hiccup-node-type? t) (assoc env p :node)
+                                         (= :string t) (assoc env p :string)
+                                         :else (dissoc env p))))
+                               env bound)))]
+      (letfn [(shape-test [env test]
+                ;; [symbol cases] when TEST asks the shape of a known node
+                (when (and (seq? test) (= 2 (count test)) (simple-symbol? (second test))
+                           (= :node (get env (second test))))
+                  (let [[pred x] test]
+                    (cond
+                      (contains? hiccup-shape-predicates pred) [x (get hiccup-shape-predicates pred)]
+                      (contains? hiccup-never-predicates pred)
+                      (reject! (str "(" pred " " x ") asks node " x " a shape a node never has: "
+                                    "a node is :text, :elem or :frag (ADR 0353)")
+                               test :kotoba.error/hiccup-shape-test)
+                      :else nil))))
+              (shape-dispatch [ctx env form clauses]
+                ;; CLAUSES: [[test body] ...]; nil when no test asks a node's shape
+                (let [shaped (keep #(shape-test env (first %)) clauses)]
+                  (when (seq shaped)
+                    (let [x (ffirst shaped)
+                          arms (loop [clauses clauses covered #{} arms {}]
+                                 (if-let [[test body] (first clauses)]
+                                   (let [else? (or (= :else test) (true? test))
+                                         [y cases] (if else? [x (set hiccup-cases)] (shape-test env test))
+                                         _ (when-not (= x y)
+                                             (reject! (str "a cond over the shape of node " x
+                                                           " tests only its shape: " (pr-str test)
+                                                           " is not a shape test of " x " (ADR 0353)")
+                                                      test :kotoba.error/hiccup-shape-test))
+                                         fresh (remove covered (filter cases hiccup-cases))
+                                         _ (when (and (empty? fresh) (not else?))
+                                             (reject! (str (pr-str test) " is unreachable: every case it names "
+                                                           "is covered above it (ADR 0353)")
+                                                      test :kotoba.error/hiccup-shape-test))
+                                         ;; a branch reached by one case only is that case
+                                         narrow? (= 1 (count fresh))
+                                         arms (reduce (fn [arms c]
+                                                        (assoc arms c
+                                                               (if narrow?
+                                                                 [x (walk ctx (cond-> (dissoc env x)
+                                                                                (= :text c) (assoc x :string))
+                                                                          body)]
+                                                                 ['_ (walk ctx env body)])))
+                                                      arms fresh)]
+                                     (recur (rest clauses) (into covered fresh) arms))
+                                   arms))
+                          missing (remove arms hiccup-cases)]
+                      (when (seq missing)
+                        (reject! (str "the shape test over node " x " does not cover "
+                                      (str/join ", " (map str missing))
+                                      ": a shape test over a node is an exhaustive variant-match; "
+                                      "add a branch or :else (ADR 0353)")
+                                 form :kotoba.error/hiccup-shape-test))
+                      (meta-like
+                       (apply list 'match-variant x hiccup-node-type
+                              (map (fn [c] (let [[b body] (get arms c)] (list c b body))) hiccup-cases))
+                       form)))))
+              (attrs [env tag m]
+                (list* 'typed-map-new [:map :keyword :string]
+                       (mapcat (fn [[k v]]
+                                 (when-not (keyword? k)
+                                   (reject! (str "attribute key " (pr-str k) " of " tag
+                                                 " is not a keyword: a node attribute is a keyword and a string (ADR 0353)")
+                                            m :kotoba.error/hiccup-attribute))
+                                 (when-not (or (string? v) (symbol? v) (seq? v))
+                                   (reject! (str "attribute " k " of " tag " is " (hiccup-show v)
+                                                 ", and a node attribute value is a string: no coercion"
+                                                 (when (or (hiccup-number? v) (keyword? v) (boolean? v))
+                                                   (str ", write (str " (hiccup-show v) ")"))
+                                                 " (ADR 0353)")
+                                            m :kotoba.error/hiccup-attribute))
+                                 [k (walk nil env v)])
+                               (sort-by (comp str key) m))))
+              (child [env tag c]
+                (cond
+                  (hiccup-literal? c) (element env c)
+                  (= :string (hiccup-env-kind sigs env c)) (hiccup-text (walk nil env c))
+                  (or (nil? c) (hiccup-number? c) (keyword? c) (boolean? c))
+                  (reject! (str "child " (hiccup-show c) " of " tag " is "
+                                (cond (nil? c) "nil" (hiccup-number? c) "a number"
+                                      (keyword? c) "a keyword" :else "a bool")
+                                ", and a hiccup child is a node or a string: "
+                                (if (nil? c) "absence is not a child, leave it out" "no coercion")
+                                (when-not (nil? c) (str ", write (str " (hiccup-show c) ")"))
+                                " (ADR 0353)")
+                           c :kotoba.error/hiccup-child)
+                  (or (vector? c) (map? c) (set? c))
+                  (reject! (str "child " (pr-str c) " of " tag " is not a node: a hiccup literal "
+                                "is a vector headed by a tag keyword (ADR 0353)")
+                           c :kotoba.error/hiccup-child)
+                  :else (walk :node env c)))
+              (element [env form]
+                (let [[tag & body] form
+                      [a children] (if (map? (first body)) [(first body) (rest body)] [{} body])
+                      kids (apply list 'typed-list-new hiccup-list-type (map #(child env tag %) children))]
+                  (meta-like
+                   (if (= :<> tag)
+                     (do (when (seq a)
+                           (reject! "a fragment [:<> ..] has no attributes (ADR 0353)" form
+                                    :kotoba.error/hiccup-attribute))
+                         (list 'variant-new hiccup-node-type :frag kids))
+                     (list 'variant-new hiccup-node-type :elem
+                           (list 'record-new hiccup-elem-type tag (attrs env tag a) kids)))
+                   form)))
+              (walk-body [ctx env body]
+                (let [body (vec body) n (count body)]
+                  (map-indexed (fn [i f] (walk (when (= i (dec n)) ctx) env f)) body)))
+              (walk-fn [op parts env]
+                ;; (fn name? [params] result? body...) / (defn name doc? [params] result? body...)
+                (let [[head parts] (if (symbol? (first parts)) [[(first parts)] (rest parts)] [[] parts])
+                      [doc parts] (if (and (not= 'fn op) (string? (first parts)))
+                                    [[(first parts)] (rest parts)] [[] parts])]
+                  (if (vector? (first parts))
+                    (let [params (first parts)
+                          [result body] (if (and (seq (rest parts)) (hiccup-type-form? (second parts))
+                                                 (seq (drop 2 parts)))
+                                          [[(second parts)] (drop 2 parts)] [[] (rest parts)])
+                          env (bind-env (reduce dissoc env head) params)
+                          ctx (when (hiccup-node-type? (first result)) :node)]
+                      (concat [op] head doc [params] result (walk-body ctx env body)))
+                    (concat [op] head doc
+                            (map (fn [clause]
+                                   (if (and (seq? clause) (vector? (first clause)))
+                                     (meta-like (apply list (first clause)
+                                                       (walk-body nil (bind-env env (first clause)) (rest clause)))
+                                                clause)
+                                     clause))
+                                 parts)))))
+              (walk [ctx env form]
+                (cond
+                  (and (= :node ctx) (hiccup-literal? form)) (element env form)
+                  (and (= :node ctx) (= :string (hiccup-env-kind sigs env form)))
+                  (hiccup-text (if (seq? form) (walk nil env form) form))
+                  (seq? form)
+                  (let [[op & args] form]
+                    (meta-like
+                     (cond
+                       (= 'quote op) form
+                       (contains? '#{fn defn defn-} op) (apply list (walk-fn op args env))
+                       (and (contains? '#{let loop} op) (vector? (first args)))
+                       (let [[bindings env]
+                             (reduce (fn [[out env] [p init]]
+                                       (let [init' (walk nil env init)
+                                             kind (hiccup-env-kind sigs env init)
+                                             env (reduce dissoc env (filter simple-symbol? (tree-seq coll? seq p)))]
+                                         [(conj out p init')
+                                          (if (and (simple-symbol? p) kind) (assoc env p kind) env)]))
+                                     [[] env] (partition 2 (first args)))]
+                         (apply list op (meta-like bindings (first args)) (walk-body ctx env (rest args))))
+                       (= 'do op) (apply list op (walk-body ctx env args))
+                       (and (= 'if op) (<= 2 (count args) 3))
+                       (or (shape-dispatch ctx env form (cond-> [[(first args) (second args)]]
+                                                         (= 3 (count args)) (conj [:else (nth args 2)])))
+                           (apply list op (walk nil env (first args)) (map #(walk ctx env %) (rest args))))
+                       (and (= 'cond op) (even? (count args)))
+                       (or (shape-dispatch ctx env form (map vec (partition 2 args)))
+                           (apply list op (mapcat (fn [[t b]] [(walk nil env t) (walk ctx env b)])
+                                                  (partition 2 args))))
+                       (and (contains? hiccup-shape-predicates op) (= 1 (count args))
+                            (shape-test env form))
+                       (let [[x cases] (shape-test env form)]
+                         (apply list 'match-variant x hiccup-node-type
+                                (map (fn [c] (list c '_ (contains? cases c))) hiccup-cases)))
+                       (and (contains? hiccup-never-predicates op) (= 1 (count args)))
+                       (do (shape-test env form) (apply list op (map #(walk nil env %) args)))
+                       (and (symbol? op) (contains? sigs op) (not (contains? env op)))
+                       (let [slots (:slots (get sigs op))]
+                         (apply list op (map-indexed (fn [i a]
+                                                       (walk (when (hiccup-node-type? (get slots i)) :node) env a))
+                                                     args)))
+                       :else (apply list op (map #(walk nil env %) args)))
+                     form))
+                  (vector? form) (meta-like (mapv #(walk nil env %) form) form)
+                  (map? form) (meta-like (into {} (map (fn [[k v]] [k (walk nil env v)])) form) form)
+                  :else form))]
+        {:forms (mapv (fn [f] (if (defn-form? f) (meta-like (apply list (walk-fn (first f) (rest f) {})) f) f))
+                      forms)
+         :schemas hiccup-schemas})))))

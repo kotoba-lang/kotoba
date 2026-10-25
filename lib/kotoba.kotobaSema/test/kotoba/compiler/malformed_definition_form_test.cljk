@@ -1,0 +1,327 @@
+(ns kotoba.compiler.malformed-definition-form-test
+  "A top-level `defn` whose NAME position held something that is not a symbol
+  crashed the compiler instead of being refused.
+
+  Measured 2026-09-03 through `amu check --jvm-free` (amu 57ba0ee0) and
+  directly against this repository at 0a5dcc2:
+
+      (defn)            exit 70   internal compiler error
+      (defn main)       exit 65   function parameters must be a vector
+      (defn nil [] 0)   exit 70   internal compiler error
+      (defn 42 [] 0)    exit 70   internal compiler error
+      (defn main [] 0)  exit 0
+
+  The host exception behind the 70s was `Doesn't support name: 42` -- a raw
+  error with no `ex-data` at all, which the CLI can only report as
+  `{:code :kotoba/internal-error :severity :error}`: no operation, no span, no
+  cause. `expand-defn-parts` called `(name source-name)` before anything
+  checked what sat there, and `name` is defined on a symbol, a keyword and a
+  string and nothing else.
+
+  Three things are pinned here.
+
+  1. The SHAPE of the defect, not the instance. Fifteen spellings reached that
+     one call: nil (from `(defn)` and from a literal `nil`), an integer, a
+     float, a boolean, a vector, a map, a set and a list, each under `defn`
+     and `defn-`, plus the multi-arity forms. The sweep at the end is the
+     evidence floor -- every definition head the grammar admits, against every
+     malformed shape, with a count that must not be zero.
+
+     Two spellings did NOT crash: `(defn \"f\" [] 0)` and `(defn :f [] 0)`,
+     only because `name` happens to accept a string and a keyword. They were
+     refused two hundred lines later with `invalid function name`. One arity of
+     the same declaration was guarded and the others were not, which is the
+     same shape as the `option-value-of` crash fixed earlier the same day.
+
+  2. That the refusal reuses that sibling's sentence. `invalid function name`
+     is the fact for every non-symbol in the name position; a second phrasing
+     would only mean the compiler knew two things where there is one. It is
+     raised on the FORM, so the span points somewhere the reader can act --
+     `nil`, `42` and `{}` carry no reader metadata of their own.
+
+  3. The internal-error naming, extended to this layer. `internal-failure!`
+     sits at three per-EXPRESSION chokepoints, all of which run after the
+     definition layer, so nothing named these. `definition-failure!` is the
+     backstop for the host error nobody has measured yet: it keeps exit 70,
+     because a compiler that broke is not a caller who typed something wrong,
+     and adds WHICH declaration it broke reading.
+
+  And the control that says the change refuses only what was already wrong:
+  two correct declaration-dense programs whose HIR and KIR digests are the
+  ones measured before the fix."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.kir :as kir]
+            [kotoba.artifact.core :as artifact]))
+
+(defn- outcome
+  "`nil` when the source is admitted, else the parts of the refusal a caller
+  can act on. `:exit` is what amu's CLI would return: `kotoba.compiler.cli/
+  exit-code` and its nbb twin map `:subset` to 65 and everything unrecognised
+  -- including a raw host error, which arrives with no `:phase` at all -- to
+  70. Asserting the phase without the code it produces would leave the number
+  the report is about unmeasured."
+  [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         (let [data (ex-data e)
+               phase (or (:phase data) :internal)]
+           {:message (ex-message e)
+            :phase phase
+            :code (:kotoba.error/code data)
+            :span (select-keys (or (:span data) {}) [:line :column])
+            :exit (case phase
+                    :usage 64
+                    (:decode :read :subset :admission :verify
+                     :project-link :module-lock) 65
+                    :definition-identity 66
+                    (:signature :trust) 77
+                    :output 74
+                    70)}))))
+
+(def ^:private main "(defn main [] 0)\n")
+
+(defn- unit [declaration] (str "(ns probe.p)\n" declaration "\n" main))
+
+;; --- 1. the reported forms, and the answers they now give ------------------
+
+(deftest the-reported-forms-are-refused-rather-than-crashing
+  ;; The four rows of the report, verbatim, plus the one that was already
+  ;; right. `(defn main)` is the model: it names the part that is wrong.
+  (testing "(defn) -- nothing at all in the name position"
+    (let [r (outcome (unit "(defn)"))]
+      (is (= 65 (:exit r)))
+      (is (= "invalid function name" (:message r)))
+      (is (= :kotoba.error/subset-reject (:code r)))
+      (is (= {:line 2 :column 1} (:span r)))))
+  (testing "(defn nil [] 0)"
+    (let [r (outcome (unit "(defn nil [] 0)"))]
+      (is (= 65 (:exit r)))
+      (is (= "invalid function name" (:message r)))
+      (is (= :kotoba.error/subset-reject (:code r)))
+      (is (= {:line 2 :column 1} (:span r)))))
+  (testing "(defn 42 [] 0)"
+    (let [r (outcome (unit "(defn 42 [] 0)"))]
+      (is (= 65 (:exit r)))
+      (is (= "invalid function name" (:message r)))
+      (is (= :kotoba.error/subset-reject (:code r)))
+      (is (= {:line 2 :column 1} (:span r)))))
+  (testing "(defn main) -- the sibling arity that was already guarded"
+    ;; No filler `main` here: this declaration IS the module's `main`, and
+    ;; `duplicate function name` would answer before the shape check does.
+    (let [r (outcome "(ns probe.p)\n(defn main)\n")]
+      (is (= 65 (:exit r)))
+      (is (= "function parameters must be a vector" (:message r)))
+      (is (= :kotoba.error/subset-reject (:code r)))))
+  (testing "(defn main [] 0) -- admitted, and still admitted"
+    (is (nil? (outcome (str "(ns probe.p)\n" main))))))
+
+;; --- 2. every crashing spelling, one negative each -------------------------
+
+(def ^:private non-symbol-names
+  "Every spelling that reached `(name source-name)` and raised a host error,
+  and the two that did not (a string and a keyword ARE `Named`, so they were
+  already refused -- they belong here because the answer must not depend on
+  which non-symbol was written)."
+  ["nil" "42" "1.5" "true" "[f]" "{}" "#{}" "(f)" "\"f\"" ":f"])
+
+(deftest no-name-position-value-reaches-a-host-error
+  (doseq [head ["defn" "defn-"]
+          spelling non-symbol-names]
+    (let [declaration (str "(" head " " spelling " [] 0)")
+          r (outcome (unit declaration))]
+      (is (= 65 (:exit r)) declaration)
+      (is (= "invalid function name" (:message r)) declaration)
+      (is (= :kotoba.error/subset-reject (:code r)) declaration)
+      (is (= {:line 2 :column 1} (:span r)) declaration)))
+  (testing "the multi-arity spelling reaches the same guard"
+    (doseq [spelling ["nil" "42" "[f]"]]
+      (let [declaration (str "(defn " spelling " ([] 0) ([x] x))")
+            r (outcome (unit declaration))]
+        (is (= 65 (:exit r)) declaration)
+        (is (= "invalid function name" (:message r)) declaration))))
+  (testing "a qualified symbol is the same fact and gets the same sentence"
+    (let [r (outcome (unit "(defn a/f [] 0)"))]
+      (is (= 65 (:exit r)))
+      (is (= "invalid function name" (:message r))))))
+
+;; --- 3. the declarations that were already guarded -------------------------
+;;
+;; Measured, not assumed. Each of these was already a refusal before the
+;; change and must stay one -- a fix to the defn head that quietly moved any
+;; of them would be a regression this file would otherwise not see.
+
+(deftest the-already-guarded-declarations-still-refuse-by-name
+  (doseq [[declaration message code]
+          [["(defn f (x) 0)"        "function parameters must be a vector"
+            :kotoba.error/subset-reject]
+           ["(defn f 7 0)"          "function parameters must be a vector"
+            :kotoba.error/subset-reject]
+           ["(defn f [])"           "function body is empty; a function must contain one result expression (a body that is only a `#?(:clj ...)` with no :kotoba or :default clause reads as nothing)"
+            :kotoba.error/subset-reject]
+           ["(defn f [x x] (+ x x))"
+            "function parameters must be unique bounded symbols with ABI-supported arity"
+            :kotoba.error/subset-reject]
+           ["(def nil 1)"           "invalid constant name"
+            :kotoba.error/subset-reject]
+           ["(def 42 1)"            "invalid constant name"
+            :kotoba.error/subset-reject]
+           ["(def)"                 "constant must contain exactly one literal value"
+            :kotoba.error/subset-reject]
+           ["(defrecord nil [x])"   "defrecord requires a bounded name and field vector"
+            :kotoba.error/record-declaration]
+           ["(defrecord 42 [x])"    "defrecord requires a bounded name and field vector"
+            :kotoba.error/record-declaration]
+           ["(defprotocol nil (m [this]))"
+            "defprotocol requires unique bounded (method [this ...]) signatures"
+            :kotoba.error/protocol-declaration]
+           ["(extend-protocol nil R (m [this] 0))"
+            "extend-protocol requires one declared protocol and bounded type sections"
+            :kotoba.error/protocol-extension]
+           ["(defdesugar nil [x] x)" "desugar template requires a simple name"
+            :kotoba.error/subset-reject]
+           ["(defdesugar 42 [x] x)"  "desugar template requires a simple name"
+            :kotoba.error/subset-reject]
+           ["(defmulti nil kind)"
+            "defmulti requires an unqualified name and one unqualified dispatch function symbol"
+            :kotoba.error/subset-reject]
+           ["42"                    "only ns, def, defn, and defn- are allowed at top level"
+            :kotoba.error/top-level-form]]]
+    (let [r (outcome (unit declaration))]
+      (is (= 65 (:exit r)) declaration)
+      (is (= message (:message r)) declaration)
+      (is (= code (:code r)) declaration)))
+  (testing "the ns form, which cannot carry the filler main"
+    (doseq [spelling ["" " nil" " 42" " \"probe.x\"" " :probe.x" " [probe.x]"]]
+      (let [r (outcome (str "(ns" spelling ")\n" main))]
+        (is (= 65 (:exit r)) spelling)
+        (is (= "invalid bounded namespace symbol" (:message r)) spelling)
+        (is (= :kotoba.error/namespace-symbol (:code r)) spelling)))))
+
+;; --- 4. the internal-error naming, extended to this layer ------------------
+
+(deftest the-definition-head-vocabulary-is-closed-and-covers-the-layer
+  ;; `definition-heads` exists to be the spellable vocabulary for
+  ;; `definition-failure!` -- the reason nothing user-chosen can ride out in a
+  ;; `:kotoba.error/code`. If a head `analyze*` dispatches on is missing from
+  ;; it, a host error escaping that pass falls back to the generic code and
+  ;; the layer has a hole exactly where nobody looked.
+  (is (= '#{ns def defn defn- defrecord defprotocol definterface
+            extend-type extend-protocol defdesugar defmulti defmethod}
+         frontend/definition-heads))
+  (testing "it is a SECOND vocabulary, not an addition to the first"
+    ;; Widening `reserved-function-names` instead would have let a user-chosen
+    ;; function name reach the envelope from the expression chokepoints: a
+    ;; program is not forbidden to name a function `def`.
+    (is (nil? (outcome (unit "(defn def [] 0)"))))
+    (doseq [head '[def defrecord defprotocol definterface extend-type
+                   extend-protocol defdesugar defmulti defmethod]]
+      (is (not (contains? frontend/reserved-function-names head)) (str head)))
+    (doseq [head '[ns defn defn-]]
+      (is (contains? frontend/reserved-function-names head) (str head)))))
+
+;; --- 5. byte identity: only the wrong programs changed ---------------------
+
+(def ^:private declaration-source
+  "Every per-declaration entry point the change guards, in one program:
+  a `def` constant, a `defdesugar` template, a private `defn-`, and a
+  multi-arity `defn` -- the exact form whose name the guard now reads."
+  (str "(ns golden.a)\n"
+       "(def LIMIT 6)\n"
+       "(defdesugar clamp [x lo hi] (if (< x lo) lo (if (> x hi) hi x)))\n"
+       "(defn- twice [x] (* x 2))\n"
+       "(defn scale ([x] (scale x 2)) ([x y] (* x y)))\n"
+       "(defn main [] :i64 (+ (clamp (scale 5) 0 LIMIT) (twice (scale 2 3))))\n"))
+
+(def ^:private record-source
+  "The other half: the three whole-source expansion passes the change wraps
+  (`expand-record-protocol-forms`, and by construction the two beside it)."
+  (str "(ns golden.b)\n"
+       "(defprotocol Area (area [this]))\n"
+       "(defrecord Box [w h])\n"
+       "(extend-type Box Area (area [this] (* (:w this) (:h this))))\n"
+       "(defn main [] :i64 (area (->Box 3 4)))\n"))
+
+(def ^:private goldens
+  "Digests of `(pr-str hir)` and `(pr-str (kir/lower hir))` for the two
+  programs above, taken at 0a5dcc2 BEFORE the guards existed.
+
+  Per runtime, because the digest is over a RENDERING and the two runtimes do
+  not render the same value the same way: a `.kotoba` integer literal is a
+  bigint, which `pr-str` writes as `42` on the JVM and `42n` on ClojureScript.
+  Both pairs were measured pre-fix and both are asserted, so neither runtime's
+  half is a place where nothing is checked."
+  #?(:clj  {:declaration-hir "05f35fc8318fb79fa80741ecbb3ccfddb7abe4c0959dbccd6bc281b2416bbfe7"
+            :declaration-kir "3e7b5dfcbae1dc8fd2634b7ceb5c416acbc13bfaa4ad0cf0a3743365580cc613"
+            :record-hir      "b737d17eefc7c33e1c608390d7d5de5c2e592cddd431532de195cdea908befdf"
+            :record-kir      "8688aababaafc996a2086e2ce922b9a41bca214ff8e6e67c2f6639168fc4180b"}
+     :cljs {:declaration-hir "ef86ef6296b4c8c38b76e1bf28e98e07a62f357d0e549bf3d94e98b7fa74c150"
+            :declaration-kir "07353bc404bd6c22e73fc4442338d664f995574271b6aa4d71e363aa9cf978ea"
+            :record-hir      "11c6f3e74995a2d4011018ec4487a284a0fe786080adb076f780fa69b8b3ee79"
+            :record-kir      "fd3a35d074813f7918d46575a652b61a09ab35b40ff3140dd973f7542b6f0f44"}))
+
+(defn- w [value] #?(:clj value :cljs (js/Number value)))
+
+(deftest a-correct-declaration-emits-the-same-bytes-as-before-the-fix
+  ;; The load-bearing control. The guards run on every top-level declaration
+  ;; of a well-formed program, so if any of them changed what a correct
+  ;; program means, these move. The VALUE is asserted too: `no longer exit 70`
+  ;; would pass for a compiler that had merely learned to refuse everything.
+  (testing "a declaration-dense module"
+    (let [hir (sema/analyze declaration-source)]
+      (is (= (:declaration-hir goldens) (artifact/sha256 (pr-str hir))))
+      (is (= (:declaration-kir goldens) (artifact/sha256 (pr-str (kir/lower hir)))))
+      (is (= 18 (w (kir/execute (kir/lower hir) 'main [] {}))))))
+  (testing "a record / protocol module"
+    (let [hir (sema/analyze record-source)]
+      (is (= (:record-hir goldens) (artifact/sha256 (pr-str hir))))
+      (is (= (:record-kir goldens) (artifact/sha256 (pr-str (kir/lower hir)))))
+      (is (= 12 (w (kir/execute (kir/lower hir) 'main [] {})))))))
+
+;; --- 6. the sweep, with a floor -------------------------------------------
+
+(def ^:private malformed-shapes
+  "The malformed shapes, applied to every definition head. Read as: what goes
+  after the head. Zero arguments, a non-symbol name of every literal kind, a
+  missing parameter vector, a non-vector one, a non-symbol parameter, a
+  duplicate parameter, an empty body, and a nested definition."
+  ["" " nil" " 42" " 1.5" " true" " \"s\"" " :k" " [v]" " {}" " #{}" " (l)"
+   " f" " f (x) 0" " f 7 0" " f {} 0" " f nil 0"
+   " f [1] 0" " f [\"x\"] 0" " f [nil] 0" " f [x x] 0" " f []"
+   " f [] 0 1" " f [] (defn g [] 0)"])
+
+(deftest no-malformed-top-level-form-reaches-a-host-error
+  ;; The evidence floor. Before this change the same sweep found fifteen
+  ;; programs that raised a raw host exception -- each with no `ex-data`, so
+  ;; the CLI could only report `internal compiler error` at exit 70.
+  ;;
+  ;; `scanned` must not be zero, and neither may `refused`: a sweep that
+  ;; measured nothing, and a sweep whose every probe was accidentally
+  ;; ADMITTED, would both otherwise report the same clean answer as a sweep
+  ;; that measured everything.
+  (let [scanned (atom 0)
+        refused (atom 0)
+        raw (atom [])
+        internal (atom [])]
+    (doseq [head '[defn defn- def ns defrecord defprotocol definterface
+                   extend-type extend-protocol defdesugar defmulti defmethod]
+            shape malformed-shapes]
+      (swap! scanned inc)
+      (let [declaration (str "(" head shape ")")
+            source (if (= 'ns head)
+                     (str declaration "\n" main)
+                     (unit declaration))]
+        (try (sema/analyze source)
+             (catch #?(:clj Throwable :cljs :default) e
+               (swap! refused inc)
+               (let [data (ex-data e)]
+                 (cond
+                   (nil? data) (swap! raw conj [declaration (ex-message e)])
+                   (= :internal (:phase data))
+                   (swap! internal conj [declaration (:kotoba.error/code data)])))))))
+    (is (<= 250 @scanned) (str "scanned=" @scanned))
+    (is (<= 200 @refused) (str "refused=" @refused))
+    (is (= [] @raw))
+    (is (= [] @internal))))

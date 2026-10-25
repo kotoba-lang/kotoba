@@ -1,0 +1,145 @@
+(ns kotoba.compiler.set-operations-test
+  "`conj` and `disj` were declared admitted heads with no desugar arm at all.
+
+  `lang/guest-grammar.edn` has carried
+
+    :conj {:desugars-to \"pair prepend after duplicate removal\" :level \"L2\"
+           :backends #{:compiler :kotoba-wasm :kotoba-cljs}}
+    :disj {:desugars-to \"bounded set removal\" :level \"L2\"
+           :backends #{:compiler :kotoba-wasm :kotoba-cljs}}
+
+  since the heads were declared, and `lang/surface-status.edn` `:set-literal`
+  claims `:operations #{contains? conj disj}` on the same three backends.
+  Measured 2026-09-03 against sema `1587f57` / amu `6c245f69`, BEFORE this
+  change:
+
+    (conj #{:a} :b)   operation has no admitted lowering
+    (disj #{:a} :a)   operation has no admitted lowering
+
+  -- the generic refusal for a head nothing rewrote, on every receiver. It is
+  exactly the defect `contains?` and `dissoc` had until earlier the same day,
+  and it is fixed the same way: `typed-set-conj` and `typed-set-disj` already
+  existed, were already lowered on all three backends, and already returned
+  the set type so they nest. Nothing was missing but the dispatch.
+
+  What is pinned here:
+
+  1. positives, run to a value on the KIR interpreter -- not merely admitted;
+  2. the REASON each refusal is raised, by its stable code, so a program that
+     fails for some other reason cannot be counted as this arm discriminating
+     (ADR-2608136000 question 6);
+  3. the receiver refusal in both directions, so the arm is known to say yes
+     and no rather than only one of them;
+  4. `#{...}` is `[:set :keyword]` and nothing else -- a heterogeneous literal
+     is NOT admitted, and the refusal now says so rather than reporting a bare
+     `expected keyword, got i64`."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- unit [body] (str "(ns m.probe)\n(defn main [] :i64 " body ")\n"))
+
+(defn- run [body]
+  (let [value (kir/execute (kir/lower (sema/analyze (unit body))) 'main [] {})]
+    #?(:clj value :cljs (js/Number value))))
+
+(defn- refusal [body]
+  (try (do (sema/analyze (unit body)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+(defn- definition-refusal [head]
+  (try (do (sema/analyze (str "(ns m.probe)\n(defn " head " [a b] :i64 a)\n"
+                              "(defn main [] :i64 0)\n"))
+           nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+;; --- positives, executed ---------------------------------------------------
+
+(deftest conj-and-disj-run-on-the-kir-interpreter
+  (testing "the authority's own fixture shape, keyword-homogeneous"
+    ;; This is lang/conformance/collections/set.kotoba with its one
+    ;; heterogeneous item made a keyword; it is the case the manifest
+    ;; declares, and until this change nothing executed it on either
+    ;; required backend.
+    (is (= 1 (run "(if (typed-set-contains [:set :keyword]
+                         (disj (conj #{:a} :b :c) :a) :b) 1 0)"))))
+  (testing "conj adds"
+    (is (= 3 (run "(typed-set-count [:set :keyword] (conj #{:a} :b :c))"))))
+  (testing "conj is a set: a runtime-equal duplicate does not grow it"
+    (is (= 1 (run "(typed-set-count [:set :keyword] (conj #{:a} :a))"))))
+  (testing "disj removes"
+    (is (= 1 (run "(typed-set-count [:set :keyword] (disj #{:a :b} :a))"))))
+  (testing "disj of an absent item is the same set"
+    (is (= 2 (run "(typed-set-count [:set :keyword] (disj #{:a :b} :c))"))))
+  (testing "they nest, because both return the set type"
+    (is (= 2 (run "(typed-set-count [:set :keyword]
+                     (conj (disj (conj #{:a} :b) :a) :c))"))))
+  (testing "persistent: the receiver is not mutated"
+    (is (= 3 (run "(let [s #{:a}]
+                     (+ (typed-set-count [:set :keyword] (conj s :b))
+                        (typed-set-count [:set :keyword] s)))")))))
+
+(deftest they-run-on-a-set-of-any-admitted-item-type
+  ;; `#{...}` is keyword-only, but `typed-set-new` is not, and `conj`/`disj`
+  ;; take their type from the receiver rather than assuming :keyword.
+  (is (= 2 (run "(typed-set-count [:set :i64]
+                   (conj (typed-set-new [:set :i64] 1) 2))")))
+  (is (= 1 (run "(typed-set-count [:set :i64]
+                   (disj (typed-set-new [:set :i64] 1 2) 1))")))
+  (is (= 1 (run "(typed-set-count [:set :string]
+                   (conj (typed-set-new [:set :string] \"a\") \"a\"))"))))
+
+;; --- the refusals, by the reason they name ---------------------------------
+
+(deftest a-non-set-receiver-is-refused-and-says-what-to-write
+  ;; `conj` on a bounded vector is no longer a refusal (2026-09-25): it
+  ;; appends, see conj-on-a-vector-test. `disj` has no vector meaning in
+  ;; Clojure and is still refused, naming the vector primitive.
+  (testing "disj on a bounded vector is refused and names vector-conj"
+    (let [r (refusal "(typed-set-count [:set :keyword] (disj [1 2] 2))")]
+      (is (= :kotoba.error/set-disj-receiver (:code r)))
+      (is (re-find #"vector-conj" (:message r)))))
+  (testing "disj on a canonical typed map names typed-map-dissoc"
+    (let [r (refusal "(typed-set-count [:set :keyword]
+                       (disj (typed-map-new [:map :i64 :i64]) 1))")]
+      (is (= :kotoba.error/set-disj-receiver (:code r)))
+      (is (re-find #"typed-map-dissoc" (:message r)))))
+  (testing "and an i64 receiver, which names no collection at all"
+    (is (= :kotoba.error/set-conj-receiver
+           (:code (refusal "(typed-set-count [:set :keyword] (conj 1 2))"))))))
+
+(deftest an-item-of-the-wrong-type-is-refused-by-the-set-type-not-by-luck
+  (let [r (refusal "(typed-set-count [:set :keyword] (conj #{:a} 2))")]
+    (is (some? r))
+    (is (re-find #"set item type mismatch" (:message r)))))
+
+(deftest a-set-operation-with-no-item-is-refused-for-its-arity
+  (is (= :kotoba.error/set-operation-arity
+         (:code (refusal "(typed-set-count [:set :keyword] (conj #{:a}))"))))
+  (is (= :kotoba.error/set-operation-arity
+         (:code (refusal "(typed-set-count [:set :keyword] (disj #{:a}))")))))
+
+(deftest conj-and-disj-are-reserved-so-a-definition-cannot-shadow-them
+  ;; The rewrite dispatches on the head name before signatures are consulted,
+  ;; so without reservation `(defn conj ...)` would be shadowed silently.
+  (is (= "reserved function name" (definition-refusal "conj")))
+  (is (= "reserved function name" (definition-refusal "disj"))))
+
+;; --- the heterogeneous set literal -----------------------------------------
+
+(deftest a-set-literal-is-keyword-only-and-the-refusal-says-so
+  (testing "a computed non-keyword item -- the shape the authority's own fixture used"
+    (let [r (refusal "(typed-set-count [:set :keyword] #{:a (+ 1 1)})")]
+      (is (some? r))
+      (is (re-find #"set item type mismatch" (:message r)))
+      (is (re-find #"always \[:set :keyword\]" (:message r)))
+      (is (re-find #"typed-set-new" (:message r))
+          "the refusal must name what the caller should write instead")))
+  (testing "a literal non-keyword item, homogeneous"
+    (let [r (refusal "(typed-set-count [:set :i64] #{1 2})")]
+      (is (some? r))
+      (is (re-find #"always \[:set :keyword\]" (:message r)))))
+  (testing "and the keyword literal itself still runs"
+    (is (= 2 (run "(typed-set-count [:set :keyword] #{:a :b})")))))

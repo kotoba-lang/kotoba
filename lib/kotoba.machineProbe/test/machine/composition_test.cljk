@@ -1,0 +1,113 @@
+(ns machine.composition-test
+  "Does the T5 contract actually compose?
+
+  Every library here has its own tests against its own fixture. None of them
+  answers the question this namespace exists for: hand ONE descriptor to all
+  seven and do they agree, or does each quietly assume a different machine?
+
+  That is not hypothetical. The seven consumers were found pinned to three
+  different revisions of `machine` at once, so a correction landed in the
+  contract reached none of them. Version drift is caught by a pin audit;
+  SEMANTIC drift -- two libraries reading the same fact and meaning different
+  things by it -- is only caught by making them share one.
+
+  Deterministic throughout. No timing, so this says the same thing on a
+  machine at load 84 as on an idle one, which is what let it be written at
+  all today."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [machine.core :as m]
+            [layout.core :as l]
+            [traversal.core :as t]
+            [paging.core :as p]
+            [ioplan.core :as io]
+            [kami.gpu.launch :as g]
+            [perfgate.core :as pg]))
+
+(defn- fields [n]
+  (mapv (fn [i] {:name (keyword (str "f" i)) :bytes 8 :align 8}) (range n)))
+
+(def ^:private m1-max
+  "The machine this stack was developed against, as measured: 128-byte lines,
+  16 KiB pages, a 12 MiB L2 shared by four performance cores, and the WebGPU
+  limits a real Apple M1 Max reports."
+  {:format m/format-id
+   :machine/id "Apple M1 Max/performance"
+   :machine/provenance :measured
+   :machine/source "sysctl + Deno WebGPU, 2026-08-04"
+   :cpu {:arch :aarch64 :cores 10
+         :cache [{:level 1 :kind :data :bytes 131072 :line-bytes 128 :shared-by 1}
+                 {:level 2 :kind :unified :bytes 12582912 :line-bytes 128 :shared-by 4}]}
+   :page {:base-bytes 16384 :huge []}
+   :gpu {:kind :webgpu :max-workgroup 256 :subgroup 32 :shared-bytes 16384}
+   :storage [{:id :nvme0 :kind :nvme :block-bytes 4096 :queue-depth 64
+              :seek-cost :none :max-transfer-bytes 131072}]})
+
+(deftest one-descriptor-satisfies-every-library
+  (testing "each of these throws or refuses on a machine it cannot read, so
+            getting an answer from all seven IS the assertion"
+    (is (m/valid? m1-max))
+    (is (some? (l/aos m1-max (fields 16))))
+    (is (some? (t/tile-plan m1-max {:extents [4096 4096] :element-bytes 8 :arrays 3 :level 2})))
+    (is (some? (p/cache m1-max {:page-bytes 16384
+                                :segments [{:id :default :capacity-pages 64 :policy :lru}]})))
+    (is (some? (io/plan m1-max :nvme0 [{:id :a :op :read :offset 0 :bytes 4096}])))
+    (is (some? (g/workgroup-size m1-max {:shared-bytes-per-invocation 64})))))
+
+(deftest the-libraries-agree-about-the-line
+  (testing "layout counts lines, traversal rounds tiles to whole lines. If they
+            read different fields for it, a tile would straddle and neither
+            test suite alone would notice"
+    (let [line (m/line-bytes m1-max)
+          plan (t/tile-plan m1-max {:extents [4096 4096] :element-bytes 8 :arrays 3 :level 2})
+          cost (l/cost m1-max (l/soa m1-max (fields 16)) 1000
+                       {:access/fields #{:f0} :access/stride 1})]
+      (is (= 128 line))
+      (is (zero? (mod (* (:tile/size plan) 8) line))
+          "the tile's row is a whole number of lines")
+      (is (pos? (:cost/utilization cost))
+          "layout costed the pass against this machine at all")
+      (is (= line (m/line-bytes m1-max))
+          "and both read the line from the same fact"))))
+
+(deftest the-libraries-agree-about-the-page
+  (testing "paging refuses a cache page that is not a whole hardware page, and
+            traversal counts a tile's page footprint. Both must mean the same
+            16384"
+    (let [page (m/page-bytes m1-max)
+          plan (t/tile-plan m1-max {:extents [4096 4096] :element-bytes 8 :arrays 3 :level 2})]
+      (is (= 16384 page))
+      (is (thrown? :default
+                   (p/cache m1-max {:page-bytes 4096
+                                    :segments [{:id :default :capacity-pages 8 :policy :lru}]}))
+          "a 4 KiB cache page on a 16 KiB machine is refused, not rounded")
+      (is (pos-int? (:tile/pages-touched plan))
+          "and the tile reports a page footprint in those same units"))))
+
+(deftest a-planner-cannot-launder-an-assumed-machine-into-a-claim
+  (testing "the mechanism that stops a guess hardening into a fact: perfgate
+            refuses a claim whose provenance is weaker than measured, however
+            confident the planners downstream of it were"
+    (let [guessed (assoc m1-max :machine/provenance :assumed
+                         :machine/id "portable floor")
+          obs (fn [id mach samples]
+                (pg/observation {:id id :plan-id :composition :machine mach
+                                 :metric :ns :unit :ns :samples samples
+                                 :source "composition test, synthetic"}))
+          verdict (pg/qualify (obs :cand guessed [10.0 10.1 9.9])
+                              (obs :base guessed [20.0 20.1 19.9]))]
+      (is (not (:qualified? verdict)))
+      (is (some #(= :provenance-too-weak (:reason %)) (:reasons verdict))
+          "and it names provenance as the reason, not the effect size"))))
+
+(deftest the-stack-refuses-the-same-way-when-a-fact-is-absent
+  (testing "one descriptor with no GPU and no measured curves. Every library
+            must decline rather than substitute a default -- that shared
+            contract is the reason these compose at all"
+    (let [bare (dissoc m1-max :gpu)]
+      (is (nil? (m/bandwidth-at-stride bare 4096)))
+      (is (nil? (m/translation-penalty bare 512 :streaming)))
+      (is (thrown? :default
+                   (g/workgroup-size bare {:shared-bytes-per-invocation 64})))
+      (is (nil? (:tile/translation-penalty
+                 (t/tile-plan bare {:extents [4096 4096] :element-bytes 8
+                                    :arrays 3 :level 2})))))))

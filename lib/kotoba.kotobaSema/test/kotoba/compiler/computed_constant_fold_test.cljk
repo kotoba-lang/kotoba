@@ -1,0 +1,243 @@
+(ns kotoba.compiler.computed-constant-fold-test
+  "A top-level `def` whose value is a pure expression folds at analysis time
+  (adr-2609111900, the selfhost ceiling loop; compiler-side wall measured
+  2026-09-11 at amu a406845e: 9 of the compiler's own 210 sources were
+  refused `constant value must be closed bounded integer/string/...` at a
+  `def` such as `(def supported-targets (set [...]))`, `(def t (* 4 1024))`,
+  `(def m (merge a b))` -- pure expressions over constants).
+
+  CLASSIFICATION, written before the change: the literal-only rule was
+  IMPLEMENTATION STATE. Nothing in the language authority says a module
+  constant must be spelled as a literal; what it forbids at module level is
+  ambient state and effects. So `(def k (* 4 1024))` folds, and
+  `(def cache (atom ...))` stays refused -- as a property, by its own name.
+
+  Pinned here:
+
+  1. positives, each RUN to a value on the KIR interpreter through a
+     function that reads the constant: `(* 4 1024)`, an i64 set built by
+     `conj` (`set` and `merge` are not admitted heads -- measured, and said
+     so at the test), `assoc` onto a map literal, `(str ...)`, and a def
+     that reads an earlier folded def;
+  2. the CID control, which is the whole point: `(def k 4096)` and
+     `(def k (* 4 1024))` produce the SAME analysis for the function that
+     reads `k` -- the folded value is substituted exactly as the literal is,
+     so amu's definition CIDs (a function of that analysis) cannot differ;
+  3. the refusals BY NAME: `atom`, `delay`, an effectful call, a forward
+     reference, self-reference, a call to a module function, an unbounded
+     loop (fuel), and a value with no literal spelling (a closure)."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.lang.text :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]
+            #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
+
+(defn- module [defs result body]
+  (str "(ns m.probe)\n" defs "\n(defn main [] " result " " body ")\n"))
+
+(defn- answer
+  "Analyse, lower and RUN `main`; the value, not the admission."
+  [defs result body]
+  (kir/execute (kir/lower (sema/analyze (module defs result body))) 'main [] {}))
+
+(defn- answer-i64 [defs body]
+  (let [v (answer defs ":i64" body)]
+    #?(:clj (long v) :cljs (js/Number v))))
+
+(defn- refusal [defs]
+  (try (do (sema/analyze (module defs ":i64" "0")) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+(defn- main-function [hir]
+  (some #(when (= 'main (:name %)) %) (:functions hir)))
+
+;; ---------------------------------------------------------------- positives
+
+(deftest arithmetic-over-literals-folds-and-runs
+  (is (= 4096 (answer-i64 "(def k (* 4 1024))" "k")))
+  (is (= 4097 (answer-i64 "(def k (+ (* 4 1024) 1))" "k"))))
+
+(deftest a-set-built-by-conj-folds-and-runs
+  ;; `set` is NOT an admitted head (measured 2026-09-11: `unknown operation:
+  ;; set is not a builtin, a sugar head, or a function of this module`), and
+  ;; `into` takes only a vector-i64 destination; the smallest admitted shape
+  ;; that builds an i64 set is `conj` on a typed set. The folded value has
+  ;; no literal spelling (a set literal is keyword-only), so it is spelled
+  ;; as the canonical constructor `(typed-set-new [:set :i64] 1 2 3)` and
+  ;; reads back with the typed-set operations.
+  (is (= 3 (answer-i64 "(def s (conj (typed-set-new [:set :i64] 1 2) 3))" "(count s)")))
+  (is (= true (answer "(def s (conj (typed-set-new [:set :i64] 1 2) 3))" ":bool" "(typed-set-contains [:set :i64] s 3)")))
+  (is (= false (answer "(def s (conj (typed-set-new [:set :i64] 1 2) 3))" ":bool" "(typed-set-contains [:set :i64] s 7)"))))
+
+(deftest a-keyword-set-folds-back-to-a-set-literal
+  (is (= 2 (answer-i64 "(def s (disj #{:a :b :c} :a))" "(count s)")))
+  (is (= 2 (answer-i64 "(def s (conj #{:a} :b))" "(count s)"))))
+
+(deftest an-empty-set-constant-is-spelled-as-its-constructor
+  ;; `#{}` has no literal that carries a type (the literal rule wants a
+  ;; non-empty keyword set), so the folded empty set is spelled as
+  ;; `(typed-set-new [:set :keyword])` -- the shape a def already admits.
+  ;; Measured 2026-09-12 (selfhost measurement 20): `(def ^:dynamic
+  ;; *linear-returning* #{})` in this repository's own affine.cljk was
+  ;; refused `outside the constant bounds`, a bounds sentence for zero items.
+  (is (= 0 (answer-i64 "(def s #{})" "(count s)")))
+  (is (= 0 (answer-i64 "(def s (disj #{:a} :a))" "(count s)")))
+  (is (= 1 (answer-i64 "(def s #{})" "(count (conj s :a))")))
+  ;; a typed set with items keeps its constructor spelling
+  (is (= 2 (answer-i64 "(def s (typed-set-new [:set :i64] 1 2))" "(count s)"))))
+
+(deftest assoc-onto-a-map-literal-folds-and-runs
+  ;; `merge` is NOT an admitted head (measured 2026-09-11, the same
+  ;; `unknown operation` sentence); `assoc` is the smallest admitted shape
+  ;; that builds a map from two.
+  (is (= 3 (answer-i64 "(def m (assoc {:a 1} :b 2))" "(+ (get m :a 0) (get m :b 0))"))))
+
+(deftest string-concatenation-folds-and-runs
+  ;; `(str 4096)` is refused (`string-concat` takes strings); the integer is
+  ;; spelled through `string-from-i64`
+  (is (= "kotoba-4096" (answer "(def message (str \"kotoba-\" (string-from-i64 4096)))" ":string" "message"))))
+
+(deftest a-def-reads-an-earlier-folded-def
+  (is (= 8192 (answer-i64 "(def page (* 4 1024))\n(def pages (* 2 page))" "pages")))
+  (is (= 8193 (answer-i64 "(def page 4096)\n(def pages (+ page 4096))\n(def limit (+ pages 1))" "limit"))))
+
+(deftest a-docstring-and-private-metadata-are-admitted-on-a-computed-def
+  (is (= 4096 (answer-i64 "(def k \"the page\" (* 4 1024))" "k")))
+  (is (= 4096 (answer-i64 "(def ^:private k (* 4 1024))" "k"))))
+
+;; ------------------------------------------------------------- CID control
+
+(deftest a-folded-def-and-the-literal-are-the-same-constant
+  ;; `(def k 4096)` and `(def k (* 4 1024))` substitute the same value, so
+  ;; the analysis of `main` -- the input amu's definition CID is computed
+  ;; from -- is identical. The two modules' `main` are equal as data.
+  (let [literal (sema/analyze (module "(def k 4096)" ":i64" "(+ k 1)"))
+        folded (sema/analyze (module "(def k (* 4 1024))" ":i64" "(+ k 1)"))]
+    (is (= (main-function literal) (main-function folded)))
+    (is (= literal folded)))
+  (let [literal (sema/analyze (module "(def m {:a 3 :b 2})" ":i64" "(get m :a 0)"))
+        folded (sema/analyze (module "(def m (assoc (assoc {:a 1} :b 2) :a 3))" ":i64" "(get m :a 0)"))]
+    (is (= literal folded)))
+  (let [literal (sema/analyze (module "(def s #{:a :b})" ":i64" "(count s)"))
+        folded (sema/analyze (module "(def s (disj #{:c :b :a} :c))" ":i64" "(count s)"))]
+    (is (= literal folded))))
+
+;; ----------------------------------------------------------------- refusals
+
+(deftest a-stateful-head-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def cache (atom 0))")]
+    (is (= :kotoba.error/def-value-stateful code))
+    (is (= "def value is stateful/effectful: (atom ...) -- move it into a function or a capability" message)))
+  (let [{:keys [message code]} (refusal "(def lazy (delay 1))")]
+    (is (= :kotoba.error/def-value-stateful code))
+    (is (= "def value is stateful/effectful: (delay ...) -- move it into a function or a capability" message)))
+  (let [{:keys [message]} (refusal "(def cell (volatile! 0))")]
+    (is (= "def value is stateful/effectful: (volatile! ...) -- move it into a function or a capability" message))))
+
+(deftest an-effectful-call-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def now (cap-call :clock/now 0))")]
+    (is (= :kotoba.error/def-value-stateful code))
+    (is (= "def value is stateful/effectful: (cap-call ...) -- move it into a function or a capability" message))))
+
+(deftest a-forward-reference-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def a (+ b 1))\n(def b 2)")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (= "def value of a refers to a later constant: b is defined after a -- a constant may read only the constants above it; reorder the definitions" message))))
+
+(deftest a-self-reference-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def a (+ a 1))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (= "def value of a refers to itself: a -- a constant cannot be recursive; write the value out" message))))
+
+(deftest a-call-to-a-module-function-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def a (twice 1))\n(defn twice [x] (* 2 x))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (= "def value of a calls twice, a function of this module -- a constant is evaluated before any function exists; compute it in a function or write the value out" message))))
+
+(deftest a-loop-is-refused-by-name-because-the-fuel-cannot-bound-it
+  ;; Measured 2026-09-11 before this refusal existed: the unbounded loop
+  ;; below ran PAST 100000 fuel on the reference interpreter without a trap
+  ;; -- a `__kotoba_loop_N` self-tail re-entry is zero-charge (kotoba.kir
+  ;; T7.1), so "fuel exhausted" is not the refusal an unbounded loop at a
+  ;; def can ever get; the compiler would hang instead. The loop is refused
+  ;; by name before it runs.
+  (let [{:keys [message code]} (refusal "(def x (loop [i 0] (if (< i 0) i (recur (+ i 1)))))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (str/starts-with? message "def value of x contains a loop (__kotoba_loop_"))
+    (is (str/includes? message "): loop iterations are zero-charge on the reference interpreter, so the compile-time fuel cannot bound it -- write the value out or compute it in a function")))
+  ;; a bounded loop is refused the same way: the refusal is on the shape,
+  ;; not on the count, because the count is what the interpreter cannot see
+  (let [{:keys [message]} (refusal "(def x (loop [i 0] (if (< i 3) (recur (+ i 1)) i)))")]
+    (is (str/starts-with? message "def value of x contains a loop ("))))
+
+(deftest the-fuel-branch-keys-on-the-interpreter-trap-it-names
+  ;; Every shape that would spend the fold's fuel is refused by name BEFORE
+  ;; it runs (a loop, a call to a module function, a closure), so the
+  ;; `exhausted the compile-time fuel` branch is a backstop this suite
+  ;; cannot reach through admitted source. What it can pin is the contract
+  ;; the branch keys on: the reference interpreter names the trap
+  ;; `:budget/fuel` in ex-data (P4 of superproject adr-2609242100 renamed it
+  ;; from `:fuel-exhausted`; this test pinned the old name and passed only
+  ;; while this repo pinned an osaho from before the rename), and a function
+  ;; entry is what it charges.
+  (let [hir (sema/analyze "(ns m.probe {:kotoba/export [f g]})\n(defn g [] :i64 1)\n(defn f [] :i64 (g))\n")
+        trap (try (kir/execute (kir/lower hir) 'f [] {:fuel 1}) nil
+                  (catch #?(:clj Throwable :cljs :default) e (:trap (ex-data e))))]
+    (is (= :budget/fuel trap))))
+
+(deftest a-value-with-no-literal-spelling-is-refused-by-name
+  ;; a closure is an i64 HANDLE into the interpreter's pair arena; the
+  ;; number would type-check as an integer constant and be wrong
+  (let [{:keys [message code]} (refusal "(def f (fn [x] (+ x 1)))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (str/starts-with? message "def value of f evaluates "))
+    (is (str/includes? message "no literal spelling")))
+  (let [{:keys [message code]} (refusal "(def p (pair 1 2))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (str/starts-with? message "def value of p evaluates through a heap handle (pair)"))))
+
+(deftest local-state-inside-a-def-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def x (let [a (atom 1)] (deref a)))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (= "def value of x is stateful/effectful: its effect row is #{:local-state} -- a module-level constant must be effect-free; move it into a function or a capability" message))))
+
+(deftest a-trap-at-compile-time-is-refused-by-name
+  (let [{:keys [message code]} (refusal "(def x (quot 1 0))")]
+    (is (= :kotoba.error/def-value-not-constant code))
+    (is (= "def value of x trapped at compile time: division-by-zero -- the expression does not evaluate; fix it or move it into a function" message))))
+
+(deftest a-literal-def-is-unchanged
+  ;; the closedness sentence is still the answer for quoted data that is not
+  ;; a literal: `'(1 2)` is data the author wrote, never a computation
+  (let [{:keys [message code]} (refusal "(def k '(1 2))")]
+    (is (= :kotoba.error/subset-reject code))
+    (is (str/starts-with? message "constant value must be closed bounded")))
+  ;; Until 2026-09-12 a quoted symbol set (`'#{if let}`) and a quoted
+  ;; symbol (`'kotoba$string-index-find`) were refused here `constant value
+  ;; is quoted data holding symbols: ... spell the entries as keywords`.
+  ;; That refusal is WITHDRAWN (measurement 18: 12 of 225 compiler sources,
+  ;; every one an operation table whose members are symbols): both are
+  ;; constants now, and NOT alias lookups -- pinned, with the CID control
+  ;; and the by-name refusals that remain, in quoted_symbol_constants_test.
+  (is (= 2 (answer-i64 "(def heads '#{if let})" "(count heads)")))
+  (is (= 'kotoba$string-index-find
+         (answer "(def find-name 'kotoba$string-index-find)" ":symbol" "find-name")))
+  ;; a string past the portable byte bound names the bound and the size
+  ;; (measured on kotoba/abi/wit_data.cljk, a 4 KiB+ .wit file as a def:
+  ;; the closedness sentence, about a value that is closed)
+  ;; The bound is osaho's string VALUE bound, 65536 since its 22789c7
+  ;; (4096 -> 65536); this test carried 4096 / 4100 while this repository
+  ;; pinned an osaho from before that, and advancing the pin (2026-09-16,
+  ;; for `arena-scope`) is what made the size follow the authority.
+  (let [{:keys [message code]} (refusal (str "(def big \"" (apply str (repeat 65540 "x")) "\")"))]
+    (is (= :kotoba.error/subset-reject code))
+    (is (= "constant string exceeds the portable string byte limit: 65540 bytes, at most 65536 -- a longer string is a value a function builds, or a file a capability reads" message)))
+  ;; a quoted literal is that literal
+  (is (= 2 (answer-i64 "(def s '#{:a :b})" "(count s)")))
+  (is (= 4096 (answer-i64 "(def k 4096)" "k"))))
+
+(deftest a-collection-literal-holding-a-call-folds
+  (is (= 2 (answer-i64 "(def v [(+ 1 2) 4])" "(count v)")))
+  (is (= 4 (answer-i64 "(def m {:a (* 2 2)})" "(get m :a 0)"))))

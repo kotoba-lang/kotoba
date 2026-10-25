@@ -1,0 +1,178 @@
+(ns kotoba.compiler.let-body-test
+  "A `let` body is an implicit `do`: every form runs, in order, and the last
+  one is the value.
+
+  Until 2026-09-02 it was neither. `desugar-expr` emitted every body form onto
+  a head that takes one, `rewrite-record-projection` then rebuilt the form from
+  the FIRST body form alone, and `validate-expr`'s own one-result-expression
+  check measured the truncated form and passed it. So
+
+      (let [x (f)] (store! a x) (+ x 1))
+
+  compiled with `:ok true`, kept `(store! a x)`, and threw the value away --
+  measured on the QWEN-RUNTIME cursor, where the dropped form carried the high
+  word of a 64-bit offset.
+
+  The tests here are the two halves of that: the VALUE is the last form (a
+  truncating compiler answers the first one), and an earlier EFFECT survives (a
+  compiler that sequenced by nesting `let`s would make it an unused binding and
+  be entitled to drop it)."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- unit [source] (str source "\n(defn main [] :i64 0)"))
+
+(defn- body-of [source function]
+  (some #(when (= function (:name %)) (:body %))
+        (:functions (sema/analyze (unit source)))))
+
+(defn- run
+  ([source function arguments] (run source function arguments {}))
+  ([source function arguments opts]
+   (kir/execute (kir/lower (sema/analyze (unit source))) function arguments opts)))
+
+(defn- refusal [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+;; --- the value is the last form, not the first -----------------------------
+
+(deftest a-two-form-let-body-answers-the-last-form
+  ;; 16 is the pre-fix answer: (+ x 10) with x = 6. 106 is (+ x 100).
+  (is (= 106 (w (run "(defn f [n :i64] :i64 (let [x (+ n 1)] (+ x 10) (+ x 100)))"
+                     'f [5])))))
+
+(deftest a-nested-let-in-non-final-position-is-not-the-value
+  ;; The shape that made the truncation look like a scoping rule rather than a
+  ;; dropped form: the first body form is itself a `let`, so the answer 7 reads
+  ;; like the inner binding leaking out. It was the outer body being cut.
+  (is (= 106 (w (run "(defn f [n :i64] :i64 (let [x (+ n 1)] (let [y (+ x 1)] y) (+ x 100)))"
+                     'f [5])))))
+
+(deftest three-forms-still-answer-the-third
+  (is (= 1006 (w (run "(defn f [n :i64] :i64 (let [x (+ n 1)] (+ x 10) (+ x 100) (+ x 1000)))"
+                      'f [5])))))
+
+;; --- an earlier form's effect survives -------------------------------------
+
+(deftest an-earlier-body-form-still-performs-its-effect
+  ;; Both stores must land. A compiler that keeps only the first writes 65 and
+  ;; not 66; one that sequences by nesting `let`s makes the first store an
+  ;; unused binding and is entitled to drop it, writing 66 and not 65.
+  (let [image {:base 4096 :bytes (volatile! [0 0 0])}
+        source (str "(defn f [base :i64] :i64"
+                    "  (let [n 3]"
+                    "    (kernel-store-u8 base 3 0 65)"
+                    "    (kernel-store-u8 base 3 1 66)))")]
+    (run source 'f [4096] {:memory image})
+    (is (= [65 66 0] (mapv w @(:bytes image)))
+        "SCANNED 2 stores; both bytes written, in source order")))
+
+(deftest the-effect-order-is-source-order
+  (let [image {:base 4096 :bytes (volatile! [0])}
+        source (str "(defn f [base :i64] :i64"
+                    "  (let [n 1]"
+                    "    (kernel-store-u8 base 1 0 11)"
+                    "    (kernel-store-u8 base 1 0 22)"
+                    "    (kernel-store-u8 base 1 0 33)))")]
+    (run source 'f [4096] {:memory image})
+    (is (= [33] (mapv w @(:bytes image)))
+        "the last store wins, so all three ran in order")))
+
+;; --- what the HIR says -----------------------------------------------------
+
+(deftest the-collapse-is-do-and-the-let-keeps-one-body-form
+  (let [body (body-of "(defn f [n :i64] :i64 (let [x (+ n 1)] (+ x 10) (+ x 100)))" 'f)]
+    (is (= 'let (first body)))
+    (is (= 3 (count body)) "binding vector and exactly ONE body expression")
+    (is (= 'do (first (nth body 2))) "the body expression is a `do`")
+    (is (= 3 (count (nth body 2))) "carrying both source forms")))
+
+(deftest a-single-form-body-is-left-alone
+  ;; No `do` where the source did not need one: adding one would change the
+  ;; emitted bytes of every existing program.
+  (let [body (body-of "(defn f [n :i64] :i64 (let [x (+ n 1)] (+ x 10)))" 'f)]
+    (is (= 3 (count body)))
+    (is (not= 'do (first (nth body 2))))))
+
+;; --- refusals, by reason ---------------------------------------------------
+
+(deftest an-empty-let-body-is-refused-by-name
+  (let [{:keys [code message]} (refusal "(defn f [n :i64] :i64 (let [x n]))")]
+    (is (= :kotoba.error/let-body-empty code))
+    (is (re-find #"at least one body expression" message))))
+
+(deftest a-consumer-handed-several-body-forms-refuses-instead-of-truncating
+  ;; No source reaches this: the desugar collapses a well-formed `let`, and a
+  ;; malformed binding vector is refused earlier still by `substitute-bindings`
+  ;; (measured -- `(let [x] a b)` answers "let requires an even binding vector",
+  ;; before and after this change alike, so it does not discriminate and is not
+  ;; the test here).
+  ;;
+  ;; What is being pinned is the SHAPE of the consumer contract, because that
+  ;; is what was wrong: six passes destructured `[bindings body]` and two of
+  ;; them rebuilt the form from `body` alone. `let-body` is the one place that
+  ;; states "one body form", so it is asked directly. Broken deliberately --
+  ;; `(first body)` in place of the refusal, which is exactly the pre-fix
+  ;; behaviour -- this test goes red on the code assertion.
+  (let [args (list '[x 1] '(+ x 10) '(+ x 100))
+        thrown (try (#?(:clj @#'frontend/let-body :cljs frontend/let-body)
+                     args (cons 'let args))
+                    nil
+                    (catch #?(:clj Throwable :cljs :default) e e))]
+    (is (some? thrown) "a two-form body is refused, not shortened to one")
+    (is (= :kotoba.error/let-body-multiple-forms
+           (:kotoba.error/code (ex-data thrown))))
+    (is (re-find #"got 2" (ex-message thrown))))
+  (testing "and the one-form case passes through unchanged"
+    (let [args (list '[x 1] '(+ x 10))]
+      (is (= '(+ x 10) (#?(:clj @#'frontend/let-body :cljs frontend/let-body)
+                        args (cons 'let args)))))))
+
+;; --- the neighbours, so a regression here is not read as a `let` problem ----
+
+(deftest the-heads-that-already-sequenced-still-do
+  (testing "when"
+    (is (= 105 (w (run "(defn f [n :i64] :i64 (when (> n 0) (+ n 10) (+ n 100)))" 'f [5])))))
+  (testing "when-not"
+    (is (= 105 (w (run "(defn f [n :i64] :i64 (when-not (< n 0) (+ n 10) (+ n 100)))" 'f [5])))))
+  (testing "do"
+    (is (= 105 (w (run "(defn f [n :i64] :i64 (do (+ n 10) (+ n 100)))" 'f [5]))))))
+
+(deftest the-heads-that-refuse-a-multi-form-body-still-refuse
+  ;; `loop` takes one body expression and says so. It was never part of this
+  ;; defect -- it failed CLOSED. Pinned here so that teaching `let` to
+  ;; sequence is not read as having taught it to. `defn` and `fn` were pinned
+  ;; here the same way until 2026-09-12, when the grammar moved them to
+  ;; `:implicit-body-forms :sequences` (`defn-body-sequences-test`); they
+  ;; failed closed too, and now sequence as `let` does -- by the SAME collapse
+  ;; to `do`, not by keeping the first form.
+  (testing "defn sequences now, to the LAST form"
+    (is (= 105 (w (run "(defn f [n :i64] :i64 (+ n 10) (+ n 100))" 'f [5])))))
+  (testing "loop"
+    (is (re-find #"exactly one body expression"
+                 (:message (refusal (str "(defn f [n :i64] :i64"
+                                         " (loop [i 0] (+ n 10) (+ n 100)))")))))))
+
+;; --- the same defect class, found next door --------------------------------
+
+(deftest a-four-argument-if-is-refused-rather-than-truncated
+  ;; `if` survived desugaring with whatever arity was written;
+  ;; `elaborate-named-ability` rebuilt it from `[test then else]` and dropped
+  ;; the rest, and validation then measured the rebuilt three. Measured on the
+  ;; pre-fix compiler: this source compiled to wasm32 with :ok true and
+  ;; answered 15.
+  (let [{:keys [code message]} (refusal "(defn f [n :i64] :i64 (if (> n 0) (+ n 10) (+ n 100) (+ n 1000)))")]
+    (is (= :kotoba.error/if-arity code))
+    (is (re-find #"got 4 arguments" message)))
+  (testing "and so is a two-argument one"
+    (is (= :kotoba.error/if-arity
+           (:code (refusal "(defn f [n :i64] :i64 (if (> n 0) (+ n 10)))")))))
+  (testing "while a three-argument if is untouched"
+    (is (= 15 (w (run "(defn f [n :i64] :i64 (if (> n 0) (+ n 10) (+ n 100)))" 'f [5]))))))

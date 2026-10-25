@@ -1,0 +1,100 @@
+(ns machine.perarm-cli
+  "`kbb -M:perarm` — does per-arm bandwidth lookup actually predict better?
+
+  layout 0.5.0 reads the machine's bandwidth curve at each arm's own stride
+  rather than taking one figure for both. The claim was that this fixes the
+  class of error that broke two models. **The claim was made without being
+  measured**, which is the thing this whole ADR has been correcting all day.
+
+  So: one configuration, two predictions, one measurement.
+
+  - **old** — a single bandwidth constant shared by both arms, which is what
+    the API allowed before and still allows via an explicit figure.
+  - **new** — the curve read at each arm's stride.
+
+  If the new one is not closer to the measurement, the change bought nothing
+  and should be said so."
+  (:require [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [layout.core :as l]
+            [machine.bench :as b]
+            [machine.core :as m]
+            [machine.probe :as p]))
+
+(defn- platform []
+  (let [os (str/lower (System/getProperty "os.name" ""))]
+    (cond (str/includes? os "mac") :darwin
+          (str/includes? os "linux") :linux
+          :else :unknown)))
+
+(defn- mean [xs] (/ (reduce + 0.0 xs) (count xs)))
+(defn- ms [ns] (/ (Math/round (/ (double ns) 1000.0)) 1000.0))
+
+(defn -main [& args]
+  (let [n (or (some-> (first args) parse-long) 2000000)
+        width (or (some-> (second args) parse-long) 128)
+        reps (or (some-> (nth args 2 nil) parse-long) 15)
+        probed (p/probe {:platform (platform)
+                         :run (fn [c a] (:out (apply shell/sh c a)))})
+        base (if (m/heterogeneous? probed) (m/for-cluster probed :performance) probed)
+        ;; Measure the curve on this run rather than reusing a pasted one, so
+        ;; the comparison cannot be blamed on a stale constant.
+        curve (b/bandwidth-curve base {:bytes (* 256 1024 1024) :warmup 3 :reps 7})
+        mach (assoc base :bandwidth (select-keys curve [:by-stride :source :runtime]))
+        floor (b/loop-floor-ns {:warmup 5 :reps 8})
+        loop-ns (:ns-per-element floor)
+        fields (b/fields-of width)
+        access {:access/fields #{:f0} :access/stride 1}
+        aos-plan (l/aos mach fields)
+        soa-plan (l/soa mach fields)
+        ;; The single constant the old API would have been given: the
+        ;; line-strided figure, which is the one a reasonable person measures.
+        single (m/bandwidth-at-stride mach (m/line-bytes mach))
+        old (l/achievable-ratio mach {:baseline aos-plan :candidate soa-plan
+                                      :n n :access access
+                                      :loop-ns-per-element loop-ns
+                                      :bandwidth-bytes-per-ns single})
+        new (l/achievable-ratio mach {:baseline aos-plan :candidate soa-plan
+                                      :n n :access access
+                                      :loop-ns-per-element loop-ns})
+        r (b/run-unrolled mach {:n n :width width :warmup 10 :reps reps})
+        act-aos (mean (get-in r [:unrolled :aos]))
+        act-soa (mean (get-in r [:unrolled :soa]))
+        act-ratio (/ act-aos act-soa)
+        err (fn [p a] (Math/abs (* 100.0 (- (/ a p) 1.0))))]
+    (println (:machine/id mach) "· n =" n "·" width "doubles per element ·"
+             (quot (* 8 width n) 1048576) "MiB AoS vs" (quot (* 8 n) 1048576) "MiB SoA")
+    (println (format "loop floor %.3f ns/element · single constant %.1f GB/s (at the %d B line)"
+                     loop-ns single (m/line-bytes mach)))
+    (println)
+    (println (format "  %-22s %10s %10s %9s" "" "AoS ms" "SoA ms" "ratio"))
+    (println (format "  %-22s %10.3f %10.3f %8.2fx" "predicted (one constant)"
+                     (/ (get-in old [:baseline :time-ns]) 1e6)
+                     (/ (get-in old [:candidate :time-ns]) 1e6)
+                     (:achievable-ratio old)))
+    (println (format "  %-22s %10.3f %10.3f %8.2fx" "predicted (per arm)"
+                     (/ (get-in new [:baseline :time-ns]) 1e6)
+                     (/ (get-in new [:candidate :time-ns]) 1e6)
+                     (:achievable-ratio new)))
+    (println (format "  %-22s %10.3f %10.3f %8.2fx" "MEASURED"
+                     (/ act-aos 1e6) (/ act-soa 1e6) act-ratio))
+    (println)
+    (println (format "  per-arm strides: AoS %d B -> %.1f GB/s · SoA %d B -> %.1f GB/s"
+                     (get-in new [:baseline :stride-bytes])
+                     (get-in new [:baseline :bandwidth-bytes-per-ns])
+                     (get-in new [:candidate :stride-bytes])
+                     (get-in new [:candidate :bandwidth-bytes-per-ns])))
+    (println)
+    (let [e-old (err (:achievable-ratio old) act-ratio)
+          e-new (err (:achievable-ratio new) act-ratio)]
+      (println (format "  ratio error: one constant %+.0f%% · per arm %+.0f%%" e-old e-new))
+      (println
+       (cond
+         (< e-new (* 0.8 e-old))
+         (str "=> per-arm lookup is closer. The change bought something.")
+         (> e-new (* 1.2 e-old))
+         (str "=> per-arm lookup is WORSE here. The change did not buy what was claimed.")
+         :else
+         (str "=> no meaningful difference on this configuration. The claim is"
+              " unsupported by this measurement, whatever it does elsewhere."))))
+    (flush)))

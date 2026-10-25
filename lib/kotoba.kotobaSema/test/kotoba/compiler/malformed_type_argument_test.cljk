@@ -1,0 +1,287 @@
+(ns kotoba.compiler.malformed-type-argument-test
+  "A declared type of the wrong SHAPE crashed the compiler instead of being
+  refused.
+
+  Measured 2026-09-03 through `amu check --jvm-free` (amu 6c245f69, which pins
+  this repository at 1a073853 and kotoba-kir at b2e5d9c4):
+
+      (let [m {3 30 1 10}]
+        (option-value-of :i64 (typed-map-get :i64 m 3) 0))   exit 70
+
+  and the whole diagnostic the CLI printed for it was
+
+      {:code :kotoba/internal-error :severity :error :source \"p6.kotoba\"}
+
+  -- no operation, no span, no cause. `typed-map-count` and `typed-map-contains`
+  over the identical map exited 0, which made it read as a defect in
+  `typed-map-get`. It is not. `typed-map-get` refuses a non-map type correctly
+  (`typed map operation requires [:map key-type value-type]`). What crashed is
+  `option-value-of`: its lowering read `(second (first args))` off the declared
+  type without checking the shape first, and `(second :i64)` is a host error.
+
+  Three things are pinned here.
+
+  1. The SHAPE of the defect, not the instance. Six lowering branches
+     destructured a declared type unguarded (`option-some-of`,
+     `option-value-of`, `result-ok-of`, `result-err-of`, `result-value-of`,
+     `result-error-of`), three read a record's field list the same way
+     (`record`, `record-new`, `record-assoc`), and `validate-value-type!`
+     HASHED the type to test set membership, which a `.kotoba` integer
+     literal -- a JS bigint under nbb -- cannot survive. The sweep at the end
+     of this file is the evidence floor: every operation that takes a declared
+     type, against every wrong shape, with a count that must not be zero.
+
+  2. The internal-error path. A host error that escapes a pass is now
+     re-raised naming the operation it escaped from, and the operation reaches
+     the CLI in the one field the envelope copies -- the `:kotoba.error/code`.
+
+  3. The VALUE the well-formed program computes. `no longer exit 70` would
+     pass for a compiler that had merely learned to refuse it."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.kir :as kir]))
+
+(defn- unit [body] (str "(ns m.probe)\n(defn main [] :i64 " body ")\n"))
+
+(defn- run [body]
+  (let [value (kir/execute (kir/lower (sema/analyze (unit body))) 'main [] {})]
+    #?(:clj value :cljs (js/Number value))))
+
+(defn- outcome
+  "`nil` when the source is admitted, else the parts of the refusal a caller
+  can act on."
+  [body]
+  (try (do (sema/analyze (unit body)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         (let [data (ex-data e)]
+           {:message (ex-message e)
+            :phase (:phase data)
+            :code (:kotoba.error/code data)}))))
+
+;; --- 1. the reported program, and the value it computes --------------------
+
+(deftest the-reported-lookup-computes-its-value
+  ;; The program the report meant to write. `typed-map-get` takes the MAP
+  ;; type and `option-value-of` takes the OPTION type; the probe passed the
+  ;; payload type `:i64` to both.
+  (testing "let-bound literal"
+    (is (= 30 (run (str "(let [m {3 30 1 10}] (option-value-of [:option :i64]"
+                        " (typed-map-get [:map :i64 :i64] m 3) 0))")))))
+  (testing "inline literal"
+    (is (= 10 (run (str "(option-value-of [:option :i64]"
+                        " (typed-map-get [:map :i64 :i64] {3 30 1 10} 1) 0)")))))
+  (testing "the fallback arm is reached when the key is absent"
+    (is (= 7 (run (str "(let [m {3 30 1 10}] (option-value-of [:option :i64]"
+                       " (typed-map-get [:map :i64 :i64] m 9) 7))")))))
+  (testing "the operations that already worked still do"
+    (is (= 3 (run "(typed-map-count [:map :i64 :i64] {3 30 1 10 2 20})")))
+    (is (= 7 (run "(if (typed-map-contains [:map :i64 :i64] {3 30 1 10} 3) 7 8)")))))
+
+;; --- 2. a declared type of the wrong shape is refused, by name -------------
+
+(deftest a-wrong-shaped-option-type-is-refused-by-name
+  ;; Was: `:i64 is not ISeqable`, phase :internal, exit 70.
+  (doseq [body ["(option-value-of :i64 (option-none-of [:option :i64]) 0)"
+                "(let [m {3 30 1 10}] (option-value-of :i64 (typed-map-get :i64 m 3) 0))"]]
+    (is (= {:message "option-value-of requires [:option payload-type]"
+            :phase :subset
+            :code :kotoba.error/subset-reject}
+           (outcome body))
+        body))
+  (is (= {:message "generic option operation requires [:option payload-type]"
+          :phase :subset
+          :code :kotoba.error/subset-reject}
+         (outcome "(option-some?-of :i64 (option-some-of :i64 3))"))))
+
+(deftest a-wrong-shaped-result-type-is-refused-by-name
+  ;; `result-ok-of` / `result-value-of` raised `:i64 is not ISeqable`;
+  ;; `result-err-of` / `result-error-of` raised `nth not supported on this
+  ;; type`, whose message went on to print ClojureScript's Keyword
+  ;; CONSTRUCTOR SOURCE into the compiler's own error.
+  (doseq [body ["(result-ok?-of :i64 (result-ok-of :i64 3))"
+                "(result-ok?-of :i64 (result-err-of :i64 3))"
+                "(result-value-of :i64 (result-ok-of [:result :i64 :i64] 3) 0)"
+                "(result-error-of :i64 (result-ok-of [:result :i64 :i64] 3) 0)"]]
+    (is (= {:message "parametric result operation requires [:result ok-type err-type]"
+            :phase :subset
+            :code :kotoba.error/subset-reject}
+           (outcome body))
+        body)))
+
+(deftest a-wrong-shaped-record-type-is-refused-by-name
+  (doseq [body ["(record-new :i64 1)"
+                "(record-new [:map :i64 :i64] 1)"
+                "(record-assoc :i64 0 :a 1)"]]
+    (is (= :subset (:phase (outcome body))) body)
+    (is (= :kotoba.error/subset-reject (:code (outcome body))) body)))
+
+(deftest a-value-written-where-a-type-belongs-is-refused-not-hashed
+  ;; nbb-only before this change, and silent on the JVM: `contains?` over the
+  ;; admitted-type set HASHES its argument, and a `.kotoba` integer literal is
+  ;; a JS bigint, which cannot carry the property ClojureScript's hasher
+  ;; writes. `Cannot create property 'closure_uid_...' on bigint '3'`.
+  (doseq [body ["(typed-set-count 3 0)"
+                "(typed-map-count 3 0)"
+                "(option-none-of 3)"
+                "(typed-list-new 3 0)"]]
+    (is (= :subset (:phase (outcome body))) body)))
+
+;; --- 3. the internal-error path --------------------------------------------
+
+(deftest a-synthesized-internal-error-reports-its-operation
+  ;; The helper the three passes share. A host error carries no `ex-data`, so
+  ;; before this every consumer above could say only `internal compiler
+  ;; error`.
+  (let [host-error #?(:clj (RuntimeException. "synthetic host failure")
+                      :cljs (js/Error. "synthetic host failure"))
+        thrown (try (frontend/internal-failure!
+                     host-error
+                     (with-meta '(option-value-of :i64 x 0) {:line 7 :column 3}))
+                    nil
+                    (catch #?(:clj Throwable :cljs :default) e e))
+        data (ex-data thrown)]
+    (is (some? thrown))
+    (is (= :internal (:phase data)))
+    (is (= 'option-value-of (:kotoba.error/operation data)))
+    (is (= :kotoba.error.internal-operation/option-value-of (:kotoba.error/code data)))
+    (is (= "synthetic host failure" (:kotoba.error/cause data)))
+    (is (= {:line 7 :column 3} (:span data)))
+    (is (= (str "internal compiler failure while lowering `option-value-of` "
+                "at line 7 column 3: synthetic host failure")
+           (ex-message thrown)))))
+
+(deftest a-head-outside-the-compilers-own-vocabulary-is-not-spelled-into-the-code
+  ;; The code is the one field `kotoba.compiler.diagnostic/from-error` copies
+  ;; into the CLI envelope, and the envelope is redacted on purpose. Only a
+  ;; name in `reserved-function-names` -- which a program is forbidden to
+  ;; define -- may be spelled into it, so nothing user-chosen can ride out
+  ;; through the code.
+  (let [host-error #?(:clj (RuntimeException. "boom") :cljs (js/Error. "boom"))
+        thrown (try (frontend/internal-failure! host-error '(my-own-function 1))
+                    nil
+                    (catch #?(:clj Throwable :cljs :default) e e))
+        data (ex-data thrown)]
+    (is (= :kotoba.error/internal-operation-failure (:kotoba.error/code data)))
+    (is (= 'my-own-function (:kotoba.error/operation data)))))
+
+(deftest a-deliberate-refusal-passes-through-the-guard-untouched
+  (let [refusal (try (do (sema/analyze (unit "(option-value-of :i64 0 0)")) nil)
+                     (catch #?(:clj Throwable :cljs :default) e e))
+        again (try (frontend/internal-failure! refusal '(option-value-of :i64 0 0))
+                   nil
+                   (catch #?(:clj Throwable :cljs :default) e e))]
+    (is (true? (frontend/compiler-rejection? refusal)))
+    (is (identical? refusal again))))
+
+(deftest a-host-error-inside-the-admission-pass-names-the-operation
+  ;; End to end through a real pass. `validate-expr` is public and takes the
+  ;; node budget as a volatile; handing it something that is not one makes
+  ;; `charge-node!` fail exactly the way a compiler defect fails -- a host
+  ;; error, raised inside a pass, carrying no ex-data of its own.
+  (let [thrown (try (frontend/validate-expr '(typed-map-get [:map :i64 :i64] m 1)
+                                            #{'m} {} 0 nil)
+                    nil
+                    (catch #?(:clj Throwable :cljs :default) e e))
+        data (ex-data thrown)]
+    (is (some? thrown))
+    (is (= :internal (:phase data)))
+    (is (= 'typed-map-get (:kotoba.error/operation data)))
+    (is (= :kotoba.error.internal-operation/typed-map-get (:kotoba.error/code data)))
+    (is (string? (:kotoba.error/cause data)))))
+
+;; --- 4. the legacy pair-map is a decision, and now says so ------------------
+
+(deftest a-keyword-keyed-literal-still-lowers-to-the-legacy-map
+  ;; ADR 0012 decision 1. This is the BEHAVIOUR half; the byte-identity
+  ;; control lives in `typed-map-key-types-test` and is what would notice a
+  ;; silent change of representation.
+  (is (= 10 (run "(map-get {:a 10 :b 20} :a 0)")))
+  (is (= 20 (run "(get {:a 10 :b 20} :b 0)")))
+  (is (= 30 (run "(get (assoc {:a 10} :c 30) :c 0)"))))
+
+(deftest the-legacy-map-refusal-names-the-decision-rather-than-a-type-error
+  ;; Was: `expression type mismatch: expected [:map :keyword :i64], got map`,
+  ;; which reads as a defect in a program that is written correctly for the
+  ;; representation it actually has.
+  (let [expected (str "this value is the legacy pair-map, whose type is `map` and not "
+                      "[:map :keyword :i64]. A map literal keeps the legacy "
+                      "representation when its keys are keywords and when it is empty; "
+                      "only :i64 and :string literals are retyped. Read and write it "
+                      "through get / assoc / contains? / dissoc, or build the typed map "
+                      "with (typed-map-new [:map :keyword :i64] ...)")]
+    (doseq [body ["(let [m {:a 1 :b 2}] (typed-map-count [:map :keyword :i64] m))"
+                  "(let [m {:a 1 :b 2}] (typed-map-contains [:map :keyword :i64] m :a))"]]
+      (is (= {:message expected :phase :subset :code :kotoba.error/subset-reject}
+             (outcome body))
+          body)))
+  (testing "the empty literal is not the legacy map at all (ADR 0353 :empty-map-literal)"
+    ;; `{}` has no row of its own, and the keyword->i64 map it used to be is
+    ;; retired: with nothing to type it, it is refused by its own name.
+    (is (= (str "an empty map literal {} has no row to extend: it is not a "
+                "keyword->i64 map any more, and nothing here says its type. "
+                "assoc keys into it ((assoc {} :a 1) is the record {:a 1}), "
+                "write the literal with its fields, or give it a record or "
+                "[:map K V] type from context")
+           (:message (outcome "(let [m {}] (typed-map-count [:map :i64 :i64] m))"))))))
+
+(deftest an-integer-keyed-literal-is-still-the-typed-map
+  ;; The other half of the asymmetry, and the half that was already right.
+  (is (= 3 (run "(let [m {3 30 1 10 2 20}] (typed-map-count [:map :i64 :i64] m))")))
+  (is (= 2 (run "(let [m {\"a\" 1 \"b\" 2}] (typed-map-count [:map :string :i64] m))"))))
+
+;; --- 5. the sweep, with a floor -------------------------------------------
+
+(def ^:private type-taking-operations
+  "Every head that takes a declared type as its first argument, read from the
+  frontend's own tables rather than a list kept here -- a second list is a
+  second thing to drift."
+  (letfn [(names [x] (cond (map? x) (set (keys x)) (set? x) x :else #{}))]
+    (sort (reduce into #{}
+                  (map names [frontend/parametric-result-operations
+                              frontend/variant-operations
+                              frontend/generic-option-operations
+                              frontend/canonical-list-operations
+                              frontend/heterogeneous-vector-operations
+                              frontend/typed-set-operations
+                              frontend/canonical-typed-map-operations
+                              frontend/record-operations
+                              frontend/typed-vector-operations
+                              frontend/typed-map-operations
+                              frontend/map-operations
+                              frontend/map-presence-operations
+                              frontend/typed-safe-value-operations
+                              frontend/document-fixed-operations
+                              frontend/document-variadic-operations
+                              frontend/compact-graph-operations
+                              frontend/typed-f64-vector-operations])))))
+
+(def ^:private wrong-shapes
+  [":i64" "[:option :i64]" "[:map :i64 :i64]" "[:result :i64 :i64]" "3" "[:set :i64]"])
+
+(deftest no-declared-type-of-the-wrong-shape-reaches-a-host-error
+  ;; The evidence floor. Before this change the same sweep found 76 programs
+  ;; that raised a raw host exception -- one with no `ex-data`, which the CLI
+  ;; can only report as `internal compiler error`.
+  ;;
+  ;; `scanned` must not be zero: a sweep that measured nothing would otherwise
+  ;; report the same clean answer as a sweep that measured everything.
+  (let [scanned (atom 0)
+        raw (atom [])
+        internal (atom [])]
+    (doseq [op type-taking-operations
+            arity [1 2 3 4 5]
+            shape wrong-shapes]
+      (swap! scanned inc)
+      (let [body (str "(" op " " shape (apply str (repeat (dec arity) " 0")) ")")]
+        (try (sema/analyze (unit body))
+             (catch #?(:clj Throwable :cljs :default) e
+               (let [data (ex-data e)]
+                 (cond
+                   (nil? data) (swap! raw conj [body (ex-message e)])
+                   (= :internal (:phase data))
+                   (swap! internal conj [body (:kotoba.error/code data)])))))))
+    (is (<= 2000 @scanned) (str "scanned=" @scanned))
+    (is (= [] @raw))
+    (is (= [] @internal))))

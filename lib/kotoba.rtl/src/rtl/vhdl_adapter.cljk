@@ -1,0 +1,126 @@
+(ns rtl.vhdl-adapter
+  "Adapts org-ieee-vhdl's entity/architecture model into rtl.hdl's
+  module/port shape, so VHDL sources can drive the same
+  synthesis/simulation/eda-timing pipeline that `rtl.hdl/parse-verilog`
+  drives for Verilog — one shared `rtl-module`/`rtl-port` representation
+  regardless of which HDL frontend produced it.
+
+  Direction vocabulary: `rtl.hdl/port-directions` is a 3-way scheme
+  (`#{:input :output :inout}`), but VHDL entity ports have 4 modes
+  (`:in`/`:out`/`:inout`/`:buffer`, see `vhdl.entity`). `:in`/`:out`/
+  `:inout` map 1:1 to `:input`/`:output`/`:inout`. `:buffer` has no rtl.hdl
+  counterpart, so it collapses to `:output` — see
+  `vhdl-mode->rtl-direction`'s docstring for why `:output` (not `:inout`)
+  is the correct collapse.
+
+  Width: VHDL types carry their width in the type string itself
+  (`vhdl.entity/bus-width`, e.g. \"std_logic_vector(7 downto 0)\" -> 8);
+  `bus-width` already treats any type string without a `(hi downto/to lo)`
+  range — `std_logic`, `boolean`, `integer`, etc. — as scalar width 1, so
+  no extra scalar fallback is needed here beyond calling it directly (see
+  `vhdl-entity->rtl-module`).
+
+  Signal type: VHDL's entity model carries no wire/reg/logic distinction
+  (that's a Verilog net-vs-variable concept). Every converted port is
+  tagged `:signal-type :logic`, matching `rtl.hdl/signal-types`' `:logic`
+  member and `rtl.simulator`'s four-valued IEEE 1164 logic — the same
+  logic system VHDL's own `std_logic` type is named after."
+  (:require [kotoba.lang.text :as str]
+            [vhdl.entity :as vhdl-entity]
+            [vhdl.architecture :as vhdl-arch]
+            [vhdl.parser :as vhdl-parser]
+            [rtl.hdl :as hdl]))
+
+(defn vhdl-mode->rtl-direction
+  "Maps a `vhdl.entity` port `:mode` (`:in`/`:out`/`:inout`/`:buffer`) to
+  the direction keyword `rtl.hdl/rtl-port` expects (a member of
+  `rtl.hdl/port-directions`, `#{:input :output :inout}`).
+
+  `:in` -> `:input`, `:out` -> `:output`, `:inout` -> `:inout` map
+  directly. `:buffer` -> `:output`: a VHDL `buffer` port is still
+  single-driver — driven only by this entity, exactly like `:out` — the
+  only thing that distinguishes it from `:out` is that the architecture
+  body may read back the value it drives (a pre-VHDL-2008 workaround for
+  `:out` ports not being readable internally). That readback is an
+  internal-visibility detail with no bearing on the port's external
+  (synthesis-pin) direction, so it collapses to `:output` rather than
+  `:inout` — `:inout` is reserved for genuinely bidirectional/
+  multi-driver ports, which `buffer` is not."
+  [mode]
+  (case mode
+    :in :input
+    :out :output
+    :inout :inout
+    :buffer :output))
+
+(defn vhdl-entity->rtl-module
+  "Converts a `vhdl.entity`-shaped entity map (`{:name :ports [{:name
+  :mode :type} ...]}`) into an `rtl.hdl/rtl-module`-shaped module, built
+  via `hdl/rtl-module` and `hdl/rtl-port`.
+
+  Each port's `:mode` is translated via `vhdl-mode->rtl-direction` and
+  its `:type` string via `vhdl.entity/bus-width` for `:width` (`bus-width`
+  itself already returns 1 for scalar type strings that carry no
+  `(hi downto/to lo)` range — `std_logic`, `boolean`, `integer`, etc. —
+  so calling it directly is correct and no separate scalar-width fallback
+  is needed). Every port is tagged `:signal-type :logic` (see namespace
+  docstring). The module carries no parameters/instances/always-blocks/
+  assigns yet — entity ports are all this adapter derives from a VHDL
+  entity declaration; architecture body statements are out of scope for
+  this conversion (see `architecture->process-count` for the one piece
+  of architecture-derived info this namespace does expose)."
+  [{:keys [name ports]}]
+  (hdl/rtl-module
+   {:name name
+    :ports (mapv (fn [{p-name :name p-mode :mode p-type :type}]
+                   (hdl/rtl-port {:name p-name
+                                  :direction (vhdl-mode->rtl-direction p-mode)
+                                  :width (vhdl-entity/bus-width p-type)
+                                  :signal-type :logic}))
+                 ports)
+    :parameters []
+    :instances []
+    :always-blocks []
+    :assigns []}))
+
+(defn parse-vhdl-source
+  "Parses `src` as a VHDL entity declaration (via `vhdl.parser/parse-entity`)
+  and converts the result into an `rtl.hdl/rtl-module` (via
+  `vhdl-entity->rtl-module`). Returns `[:ok rtl-module]` or `[:error msg]`
+  — the same success/error tuple shape as `rtl.hdl/parse-verilog`, so
+  callers (synthesis, simulation, eda-timing) can drive either HDL
+  frontend uniformly without branching on which one produced the module.
+
+  Unlike `parse-verilog` (which, given its minimal header-only Verilog
+  parser, can only return a bare `[name port-names]` pair), the VHDL
+  parser already yields each port's mode and type, so this adapter's `:ok`
+  payload is the fully-formed `rtl-module` map rather than a name/ports
+  pair — the richer payload both frontends' callers can converge on.
+
+  `[:error msg]` cases, mirroring `parse-verilog`'s own checks (missing
+  keyword / missing closing keyword):
+  - no entity declaration found (`vhdl.parser/parse-entity` leaves `:name`
+    nil when no `entity <name> is` line matches)
+  - no `end entity` closing the declaration"
+  [src]
+  (let [parsed (vhdl-parser/parse-entity src)]
+    (cond
+      (str/blank? (:name parsed))
+      [:error "missing 'entity' keyword or entity name"]
+
+      (not (re-find #"(?i)end\s+entity\b" src))
+      [:error "missing 'end entity'"]
+
+      :else
+      [:ok (vhdl-entity->rtl-module parsed)])))
+
+(defn architecture->process-count
+  "Given a `vhdl.architecture`-shaped map (with `:processes`), returns
+  `{:combinational n :sequential m}` — n = count of processes for which
+  `vhdl.architecture/combinational?` is true, m = count for which it is
+  false. A small, real piece of derived info (e.g. for synthesis-style
+  reporting: how much of a design's behaviour is combinational logic vs.
+  clocked state)."
+  [{:keys [processes]}]
+  {:combinational (count (filter vhdl-arch/combinational? processes))
+   :sequential (count (remove vhdl-arch/combinational? processes))})

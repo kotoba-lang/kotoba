@@ -1,0 +1,249 @@
+(ns kotoba.compiler.match-test
+  "`match`: the authority's bounded pattern sugar, on both runtimes.
+
+  `lang/surface-status.edn` names `match` under `:bounded-control-and-sugar`
+  with `:safety {:match :single-evaluation-pure-desugar}`, `lang/guest-grammar.edn`
+  lists it under `:sugar`, and the authority shipped a conformance fixture for
+  it -- `lang/conformance/control/match_desugar.kotoba`. The frontend contained
+  no `match` case at all, so that fixture was refused with `unbound symbol has
+  no value type` (the pattern's binder), and a bare `(match n 0 100 :else 200)`
+  with `operation has no admitted lowering`.
+
+  Two of the tests below are the ones that decide whether this is pattern
+  matching or a shape that merely compiles, and both fail loudly on the naive
+  implementation:
+
+  - `the-scrutinee-is-evaluated-once` counts the scrutinee's call in the
+    analyzed body. Substituting the scrutinee into each arm's test puts it
+    there once per arm, which is invisible until the scrutinee is a
+    capability call. `:single-evaluation-pure-desugar` is the authority's
+    stated safety property, not an optimization.
+  - `a-map-pattern-tests-presence-not-projection` matches a key whose value
+    equals the absent-key default. `map-get` answers the default for a missing
+    key, so a map pattern lowered as projection alone is irrefutable: every
+    `match` on a map would take its first arm."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.lang.text]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- run [source function arguments]
+  (#?(:clj long :cljs js/Number)
+   (kir/execute (kir/lower (sema/analyze source)) function arguments)))
+
+(defn- rejection-of [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+(defn- trap-of [source]
+  (try (do (kir/lower (sema/analyze source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e (:trap (ex-data e)))))
+
+;; ---------------------------------------------------------------------------
+;; The authority's own fixture
+
+(def ^:private authority-fixture
+  "(defdesugar clamp [x lo hi]
+     (if (< x lo) lo (if (> x hi) hi x)))
+   (defn main []
+     (+ (loop [n 5 acc 0]
+          (if (= n 0) acc (recur (- n 1) (+ acc n))))
+        (match {:value 9}
+          {:value n} (clamp n 0 6)
+          :else 0)))")
+
+(deftest the-authority-conformance-fixture-runs
+  (testing "lang/conformance/control/match_desugar.kotoba, verbatim"
+    ;; 5+4+3+2+1 = 15, and (clamp 9 0 6) = 6.
+    (is (= 21 (run authority-fixture 'main [])))))
+
+;; ---------------------------------------------------------------------------
+;; Single evaluation -- the stated safety property
+
+(deftest the-scrutinee-is-evaluated-once
+  (testing "a multi-arm match does not substitute its scrutinee per arm"
+    (let [hir (sema/analyze "(defn side [] :i64 7)
+                             (defn f [] :i64 (match (side) 0 10 7 20 9 30 :else 40))
+                             (defn main [] :i64 (f))")
+          body (:body (first (filter #(= 'f (:name %)) (:functions hir))))
+          calls (count (filter #(and (seq? %) (= 'side (first %)))
+                               (tree-seq coll? seq body)))]
+      (is (= 1 calls)
+          (str "the scrutinee appears " calls " times in the analyzed body"))))
+  (testing "and neither does a map pattern, which reads it three times per key"
+    (let [hir (sema/analyze "(defn side [] :map {:a 1 :b 2})
+                             (defn f [] :i64 (match (side)
+                                               {:a x :b y} (+ x y)
+                                               {:a x} x
+                                               :else 0))
+                             (defn main [] :i64 (f))")
+          body (:body (first (filter #(= 'f (:name %)) (:functions hir))))
+          calls (count (filter #(and (seq? %) (= 'side (first %)))
+                               (tree-seq coll? seq body)))]
+      (is (= 1 calls)
+          (str "the scrutinee appears " calls " times in the analyzed body"))))
+  (testing "and it still runs when no arm matches"
+    (is (= 40 (run "(defn side [] :i64 7)
+                    (defn f [] :i64 (match (side) 0 10 1 20 :else 40))
+                    (defn main [] :i64 (f))"
+                   'f [])))))
+
+;; ---------------------------------------------------------------------------
+;; What the patterns mean
+
+(deftest a-literal-pattern-is-an-equality-test
+  (let [source "(defn f [n :i64] :i64 (match n 0 100 5 200 :else 300))
+                (defn main [] :i64 (f 5))"]
+    (is (= 100 (run source 'f [0])))
+    (is (= 200 (run source 'f [5])))
+    (is (= 300 (run source 'f [9]))))
+  (testing "keywords"
+    (let [source "(defn f [k :keyword] :i64 (match k :a 1 :b 2 :else 0))
+                  (defn main [] :i64 (f :b))"]
+      (is (= 2 (run source 'f [:b])))
+      (is (= 0 (run source 'f [:z])))))
+  (testing "booleans"
+    (let [source "(defn f [b :bool] :i64 (match b true 1 :else 0))
+                  (defn main [] :i64 (f true))"]
+      (is (= 1 (run source 'f [true])))
+      (is (= 0 (run source 'f [false])))))
+  (testing "and strings, which test through string=? because = refuses :string"
+    (let [source "(defn f [s :string] :i64 (match s \"hi\" 1 \"yo\" 2 :else 0))
+                  (defn main [] :i64 (f \"yo\"))"]
+      (is (= 2 (run source 'f ["yo"])))
+      (is (= 0 (run source 'f ["zz"]))))))
+
+(defn- on-map
+  "A bounded map literal is written into the source rather than passed as an
+  argument: `kir/execute`'s ClojureScript path wants each map value as the
+  runtime's own integer, and the literal is what a program writes anyway."
+  [literal arms]
+  (run (str "(defn f [] :i64 (match " literal " " arms ")) (defn main [] :i64 (f))")
+       'f []))
+
+(deftest a-map-pattern-binds-its-keys
+  (let [arms "{:a x :b y} (+ x y) {:a x} x :else -1"]
+    (is (= 3 (on-map "{:a 1 :b 2}" arms)))
+    (is (= 1 (on-map "{:a 1}" arms)))
+    (is (= -1 (on-map "{:c 1}" arms)))))
+
+(deftest a-single-test-arm-does-not-wrap-its-test
+  (testing "`(if test true false)` is the wrap this repo calls a stale self-restriction"
+    ;; Every test here is already :bool-typed, so folding a one-test arm through
+    ;; the conjunction builder would add a node and say nothing. Most arms have
+    ;; exactly one test: a literal pattern, or a one-key map pattern.
+    (doseq [source ["(defn main [] :i64 (match {:value 9} {:value n} n :else 0))"
+                    "(defn main [] :i64 (match 5 0 100 5 200 :else 300))"
+                    "(defn main [] :i64 (match {:a 1 :b 2} {:a x :b y} (+ x y) :else 0))"]]
+      (let [body (:body (first (:functions (sema/analyze source))))]
+        (is (not-any? true? (tree-seq coll? seq body)) source)))))
+
+(deftest a-map-pattern-tests-presence-not-projection
+  (testing "an absent key falls through even though `get` would answer 0"
+    (is (= -1 (on-map "{:other 9}" "{:value n} n :else -1"))))
+  (testing "and a key whose value IS the absent-key default still matches"
+    ;; The discriminating case. A presence test written as
+    ;; `(not= (map-get m k 0) 0)` answers -1 here.
+    (is (= 42 (on-map "{:value 0}" "{:value n} 42 :else -1")))))
+
+(deftest a-map-sub-pattern-may-be-a-literal-or-a-wildcard
+  (let [arms "{:a 3} 111 {:a _} 222 :else -1"]
+    (is (= 111 (on-map "{:a 3}" arms)))
+    (is (= 222 (on-map "{:a 4}" arms)))
+    (is (= -1 (on-map "{:b 4}" arms)))))
+
+(deftest an-arm-binding-is-not-visible-to-a-later-arm
+  (testing "a failed arm's binder must not shadow an outer local"
+    ;; Hoisting the user bindings alongside the projection temps -- the
+    ;; obvious way to make the lowering linear -- puts `n` in scope over the
+    ;; whole rest of the match, and this answers 0 (the projection of an
+    ;; absent key) instead of 99.
+    (is (= 99 (run "(defn f [] :i64 (let [n 99] (match {:b 1} {:a n} 5 :else n)))
+                    (defn main [] :i64 (f))"
+                   'f [])))))
+
+(deftest a-wildcard-and-a-symbol-always-match
+  (is (= 55 (run "(defn f [n :i64] :i64 (match n 0 10 _ 55)) (defn main [] :i64 (f 7))"
+                 'f [7])))
+  (is (= 7 (run "(defn f [n :i64] :i64 (match n 0 10 x x)) (defn main [] :i64 (f 7))"
+                'f [7]))))
+
+(deftest a-miss-with-no-else-traps
+  (testing "the same convention case and condp already use in this profile"
+    (is (= :division-by-zero
+           (trap-of "(defn main [] :i64 (match 7 0 100 1 200))")))))
+
+;; ---------------------------------------------------------------------------
+;; What it refuses, and with what message
+
+(deftest patterns-outside-the-admitted-set-are-refused-by-name
+  (is (= "match does not admit vector patterns"
+         (rejection-of "(defn main [] :i64 (match 1 [a b] 1 :else 0))")))
+  (is (= "match does not admit set patterns"
+         (rejection-of "(defn main [] :i64 (match 1 #{1} 1 :else 0))")))
+  (is (= "match does not admit list patterns or guards"
+         (rejection-of "(defn main [] :i64 (match 1 (a) 1 :else 0))")))
+  (is (= "match binding pattern must be an unqualified symbol"
+         (rejection-of "(defn main [] :i64 (match 1 x/y 5 :else 0))")))
+  (is (= "match map pattern keys must be keywords"
+         (rejection-of "(defn main [] :i64 (match {:a 1} {1 n} 5 :else 0))")))
+  (is (= "match map pattern requires at least one key"
+         (rejection-of "(defn main [] :i64 (match {:a 1} {} 5 :else 0))")))
+  (testing "a map inside a map, which no bounded map literal can hold"
+    (is (= "match map pattern values admit `_`, an unqualified symbol, or a bounded literal"
+           (rejection-of "(defn main [] :i64 (match {:a 1} {:a {:b v}} 1 :else 0))")))))
+
+(deftest the-match-form-itself-is-checked
+  (is (= "match requires a scrutinee expression"
+         (rejection-of "(defn main [] :i64 (match))")))
+  (is (= "match requires at least one pattern/result pair"
+         (rejection-of "(defn main [] :i64 (match 1))")))
+  (is (= "match requires pattern/result pairs"
+         (rejection-of "(defn main [] :i64 (match 1 0))")))
+  (is (= "match :else clause must be last"
+         (rejection-of "(defn main [] :i64 (match 1 :else 0 1 2))")))
+  (is (= "match admits at most one :else clause"
+         (rejection-of "(defn main [] :i64 (match 1 :else 0 :else 1))")))
+  (is (= "match pattern binds the same symbol twice"
+         (rejection-of "(defn main [] :i64 (match {:a 1 :b 2} {:a n :b n} n :else 0))"))))
+
+(deftest an-unreachable-clause-is-refused-rather-than-dropped
+  (testing "after a wildcard"
+    (is (= "match clause after an irrefutable pattern is unreachable"
+           (rejection-of "(defn main [] :i64 (match 1 _ 5 2 6))"))))
+  (testing "and a binder followed by :else"
+    (is (= "match clause after an irrefutable pattern is unreachable"
+           (rejection-of "(defn main [] :i64 (match 1 x 5 :else 6))")))))
+
+(deftest the-admission-limits-discriminate
+  (testing "clause count"
+    (let [arms (fn [n] (kotoba.lang.text/join " " (map #(str % " " %) (range n))))
+          source (fn [n] (str "(defn f [n :i64] :i64 (match n " (arms n) "))"
+                              " (defn main [] :i64 (f 1))"))]
+      (is (nil? (rejection-of (source 32))))
+      (is (= "match clause count exceeds admission limit"
+             (rejection-of (source 33))))))
+  (testing "and map pattern key count"
+    (let [literal (str "{" (kotoba.lang.text/join " " (map #(str ":k" % " " %) (range 9))) "}")
+          pattern (fn [n] (str "{" (kotoba.lang.text/join " " (map #(str ":k" % " v" %) (range n))) "}"))
+          source (fn [n] (str "(defn main [] :i64 (match " literal " " (pattern n) " v0 :else -1))"))]
+      (is (nil? (rejection-of (source 8))))
+      (is (= "match map pattern key count exceeds admission limit"
+             (rejection-of (source 9)))))))
+
+(deftest map-patterns-name-the-receiver-they-do-not-admit
+  (testing "a record is read, its presence decided by its type (ADR 0353 :empty-map-literal)"
+    (is (nil? (rejection-of
+               (str "(ns m (:schemas {:m/p [:record :m/p [[:a :i64]]]}))"
+                    " (defn g [r [:ref :m/p]] :i64 (match r {:a n} n :else 0))"
+                    " (defn main [] :i64 (g (record-new [:ref :m/p] 1)))")))))
+  (testing "and so does a canonical typed map"
+    (is (= "match map patterns admit the bounded map only; this scrutinee is a canonical typed map"
+           (rejection-of
+            (str "(defn g [m [:map :keyword :i64]] :i64 (match m {:a n} n :else 0))"
+                 " (defn main [] :i64 (g (typed-map-new [:map :keyword :i64] :a 1)))"))))))
+
+(deftest a-module-without-match-is-untouched
+  (testing "the sugar is inert when nothing uses it"
+    (is (= 2 (run "(defn f [x :i64] :i64 (+ x 1)) (defn main [] :i64 (f 1))" 'f [1])))))

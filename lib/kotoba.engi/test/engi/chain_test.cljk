@@ -1,0 +1,161 @@
+(ns engi.chain-test
+  "The production half of superproject ADR-2608038000 H1: an engi entry,
+  addressed so a consensus proposal can name it, landing as committed state
+  in a real `inga.state` machine.
+
+  `inga` is a test dependency here on purpose. What is worth proving is that
+  an engi chain and an inga-committed head are the SAME chain — a stub inga
+  would only prove the stub agrees with this file."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [engi.chain :as chain]
+            [engi.core :as engi]
+            [inga.chain :as inga-chain]
+            [inga.state :as state]))
+
+(def alice "did:key:zAlice")
+
+(defn- entries
+  "A three-entry chain for one agent, linked by `entry-cid` — the point of
+  the whole namespace: engi's `prev-hash` IS the CID inga will read."
+  []
+  (let [e0 (engi/next-entry {:seq -1} nil
+                            {:id "tx0" :kind "credit" :counterparty "did:key:zBob"
+                             :amount 10 :transfer-id "cid-body-0" :ts 1})
+        e1 (engi/next-entry {:seq 0} (chain/entry-cid e0)
+                            {:id "tx1" :kind "debit" :counterparty "did:key:zCarol"
+                             :amount 4 :transfer-id "cid-body-1" :ts 2})
+        e2 (engi/next-entry {:seq 1} (chain/entry-cid e1)
+                            {:id "tx2" :kind "credit" :counterparty "did:key:zBob"
+                             :amount 7 :transfer-id "cid-body-2" :ts 3})]
+    [e0 e1 e2]))
+
+;; ── addressing ─────────────────────────────────────────────────────────────
+
+(deftest an-entry-addresses-to-a-cid-deterministically
+  (let [[e0] (entries)]
+    (is (= (chain/entry-cid e0) (chain/entry-cid e0)))
+    (is (re-find #"^b" (chain/entry-cid e0))
+        "CIDv1 base32 — what inga's actor tree will hold in :state")
+    (testing "and the id it was stored under is not part of what it addresses"
+      (is (= (chain/entry-cid e0) (chain/entry-cid (assoc e0 :db/id "somewhere/else")))
+          "an entity id is a storage detail, excluded here for the same reason
+           canonical-entry excludes it"))
+    (testing "every signed field is an addressed field"
+      (doseq [[k _] chain/entry-fields]
+        (is (not= (chain/entry-cid e0) (chain/entry-cid (assoc e0 k "tampered")))
+            (str "changing " k " must change the CID"))))))
+
+(deftest the-block-is-the-entry
+  (let [[e0] (entries)
+        node (chain/entry-node e0)]
+    (is (= "credit" (get node "kind")))
+    (is (= 0 (get node "seq")))
+    (is (= "genesis" (get node "prev-hash")))
+    (is (nil? (get node "db/id")) "no entity id in the block")))
+
+;; ── one link, not two ──────────────────────────────────────────────────────
+
+(deftest engis-own-chain-check-passes-with-the-same-function-inga-orders-by
+  (testing "this is the whole design: prev-hash IS the CID"
+    (let [es (entries)
+          folded (engi/fold-balance (conj es (engi/genesis {:credit-limit -100 :created-at 0}))
+                                    {:hash-fn chain/entry-cid})]
+      (is (empty? (filter #(= :prev-hash-mismatch (:type %)) (:violations folded)))
+          "fold-balance's continuity check and inga's :forked check are now
+           checking one thing")
+      (is (= 13 (:balance folded)) "10 - 4 + 7"))))
+
+(deftest a-tampered-link-is-caught-by-engis-own-fold
+  (let [[e0 e1 e2] (entries)
+        broken (assoc e1 :engi/prev-hash (chain/entry-cid e2))
+        folded (engi/fold-balance [e0 broken e2] {:hash-fn chain/entry-cid})]
+    (is (seq (filter #(= :prev-hash-mismatch (:type %)) (:violations folded))))))
+
+;; ── the advance ────────────────────────────────────────────────────────────
+
+(deftest genesis-is-the-one-advance-with-no-parent
+  (let [[e0 e1] (entries)]
+    (is (= {:author alice :seq 0 :prev nil :entry (chain/entry-cid e0)}
+           (chain/advance alice e0))
+        "engi writes the literal \"genesis\"; inga expresses it as no parent")
+    (is (= (chain/entry-cid e0) (:prev (chain/advance alice e1)))
+        "and every later advance names the previous entry's CID")))
+
+(deftest every-advance-this-namespace-builds-is-one-inga-would-vote-for
+  (testing "the predicate the apply path uses, applied at the point of production"
+    (doseq [e (entries)]
+      (is (inga-chain/valid-advance? (chain/advance alice e))))))
+
+(deftest the-mirrored-predicate-cannot-drift-from-ingas
+  (testing "engi.pool admits against engi's copy and inga halts against its
+            own; a rule added to either side has to show up here"
+    (let [grid (for [author [nil "" "  " alice 7]
+                     seq* [nil -1 0 1 1.5 "0"]
+                     prev [nil "bafyparent" 9]
+                     entry [nil "" "bafyentry" 9]]
+                 {:author author :seq seq* :prev prev :entry entry})
+          disagreements (remove (fn [a] (= (chain/valid-advance? a)
+                                           (inga-chain/valid-advance? a)))
+                                grid)]
+      (is (= [] (vec disagreements))
+          "every combination of the grid, not a hand-picked handful")
+      (is (< 100 (count grid)) "and the grid is worth calling one")
+      (testing "the check is not vacuous — both say yes to some and no to others"
+        (is (some chain/valid-advance? grid))
+        (is (some (complement chain/valid-advance?) grid))))))
+
+;; ── end to end: an engi transfer becomes committed state ───────────────────
+
+(defn- committed
+  "Run `blocks` through a real inga machine whose proposals are entry CIDs."
+  [es block-groups]
+  (let [store (atom {})
+        by-cid (into {} (map (fn [e] [(chain/entry-cid e) {:author alice :entry e}])) es)
+        m (state/machine
+           {:decode-block (inga-chain/decode-block (chain/resolver by-cid))
+            :put! (fn [cid bytes] (swap! store assoc cid bytes))
+            :get-fn (fn [cid] (get @store cid))
+            :blind-fn pr-str
+            :encrypt-fn identity
+            :authority {}
+            :height-fn :height})]
+    (reduce (:apply-fn m) ((:init-fn m))
+            (map-indexed (fn [i ids] {:height (inc i) :inga.block/proposals ids})
+                         block-groups))))
+
+(deftest an-engi-chain-lands-as-an-inga-committed-head
+  (let [[e0 e1 e2 :as es] (entries)
+        st (committed es [[(chain/entry-cid e0)]
+                          [(chain/entry-cid e1) (chain/entry-cid e2)]])]
+    (is (= {:entry (chain/entry-cid e2) :seq 2}
+           (inga-chain/head (state/actors st) alice))
+        "three engi entries, two consensus blocks, one committed head")
+    (testing "and the head is the entry a reader can fetch by CID"
+      (is (= (chain/entry-cid e2) (:state (get (state/actors st) alice)))))))
+
+(deftest a-forked-engi-chain-cannot-land
+  (testing "two entries authored from one head — only the first in the
+            committed order moves the head"
+    (let [[e0 e1] (entries)
+          fork (engi/next-entry {:seq 0} (chain/entry-cid e0)
+                                {:id "tx1-fork" :kind "debit"
+                                 :counterparty "did:key:zMallory"
+                                 :amount 99 :transfer-id "cid-body-fork" :ts 2})
+          st (committed [e0 e1 fork]
+                        [[(chain/entry-cid e0)]
+                         [(chain/entry-cid e1) (chain/entry-cid fork)]])]
+      (is (= (chain/entry-cid e1) (:entry (inga-chain/head (state/actors st) alice))))
+      (is (= #{[1]} (state/query st {:find '[?v]
+                                     :where '[["inga.refusal/block/2"
+                                               "inga.refusal/forked" ?v]]}))
+          "and the fork is counted, which is what a warrant is built from"))))
+
+(deftest the-resolver-refuses-to-be-built-without-a-lookup
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (chain/resolver nil))))
+
+(deftest a-proposal-nobody-can-resolve-stops-the-replica
+  (let [[e0] (entries)]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (committed [e0] [["bafyabsent"]]))
+        "syncing is the answer, not inventing a state")))

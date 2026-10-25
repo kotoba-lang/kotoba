@@ -1,0 +1,212 @@
+(ns cloudflare.stream-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [cloudflare.stream :as stream]))
+
+(def account "acct1")
+
+;; ---------------------------------------------------------------------------
+;; Destinations
+;; ---------------------------------------------------------------------------
+
+(deftest destination-urls
+  (is (= "rtmps://a.rtmps.youtube.com/live2" (stream/destination-url :youtube)))
+  (is (= "rtmp://a.rtmp.youtube.com/live2" (stream/destination-url :youtube :rtmp)))
+  (is (= "rtmps://live.twitch.tv/app" (stream/destination-url :twitch)))
+  (is (nil? (stream/destination-url :nicovideo)))
+  (is (nil? (stream/destination-url :youtube :srt)))
+  (testing "a string platform works as well as a keyword"
+    (is (= "rtmps://live.twitch.tv/app" (stream/destination-url "twitch")))))
+
+;; ---------------------------------------------------------------------------
+;; Validation -- the checks that keep a broadcast credential from silently
+;; producing an output that never connects
+;; ---------------------------------------------------------------------------
+
+(deftest output-validation
+  (is (= [] (stream/validate-output {:url "rtmps://a.rtmps.youtube.com/live2" :stream-key "abcd-efgh"})))
+  (is (= [] (stream/validate-output {:url "rtmp://live.twitch.tv/app" :stream-key "live_1_x"})))
+  (is (= [:missing-url :missing-stream-key] (stream/validate-output {})))
+  (testing "only RTMP schemes -- Cloudflare live outputs push RTMP, nothing else"
+    (is (= [:bad-scheme] (stream/validate-output {:url "https://a.rtmps.youtube.com/live2" :stream-key "k"})))
+    (is (= [:bad-scheme] (stream/validate-output {:url "srt://example.net" :stream-key "k"}))))
+  (testing "whitespace in a key -- the copy-paste trailing newline that breaks the RTMP handshake"
+    (is (= [:whitespace-in-key] (stream/validate-output {:url "rtmps://x/y" :stream-key "abcd\n"})))
+    (is (= [:whitespace-in-key] (stream/validate-output {:url "rtmps://x/y" :stream-key "ab cd"})))
+    (is (= [:whitespace-in-key] (stream/validate-output {:url "rtmps://x/y" :stream-key "\tabcd"}))))
+  (testing "key already pasted into the URL"
+    (is (= [:key-embedded-in-url]
+           (stream/validate-output {:url "rtmps://a.rtmps.youtube.com/live2/abcd-efgh"
+                                    :stream-key "abcd-efgh"})))))
+
+(deftest redaction-never-echoes-a-whole-key
+  (is (= "abcd…<9 chars>" (stream/redact-key "abcd-efgh")))
+  (is (= "<blank>" (stream/redact-key "")))
+  (is (= "<blank>" (stream/redact-key nil)))
+  (is (= "<3 chars>" (stream/redact-key "abc")))
+  (testing "no rendering of a key ever contains the key itself"
+    (let [k "super-secret-stream-key"]
+      (is (not (str/includes? (stream/redact-key k) "secret"))))))
+
+;; ---------------------------------------------------------------------------
+;; Pure request builders
+;; ---------------------------------------------------------------------------
+
+(deftest create-live-input-request-shape
+  (let [req (stream/create-live-input-request account {:name "babiniku-stage"})]
+    (is (= :post (:method req)))
+    (is (= "/accounts/acct1/stream/live_inputs" (:path req)))
+    (is (= "https://api.cloudflare.com/client/v4/accounts/acct1/stream/live_inputs" (:url req)))
+    (is (= "babiniku-stage" (get-in req [:body :meta :name])))
+    (testing "recording is off unless asked for -- stored minutes keep billing after the stream ends"
+      (is (= "off" (get-in req [:body :recording :mode])))))
+  (let [req (stream/create-live-input-request account {:name "n" :recording-mode "automatic"
+                                                      :timeout-seconds 10
+                                                      :delete-recording-after-days 30})]
+    (is (= "automatic" (get-in req [:body :recording :mode])))
+    (is (= 10 (get-in req [:body :recording :timeoutSeconds])))
+    (is (= 30 (get-in req [:body :deleteRecordingAfterDays])))))
+
+(deftest live-input-crud-request-shapes
+  (is (= {:method :get :path "/accounts/acct1/stream/live_inputs"
+          :url "https://api.cloudflare.com/client/v4/accounts/acct1/stream/live_inputs"}
+         (stream/list-live-inputs-request account)))
+  (is (= :get (:method (stream/live-input-request account "in1"))))
+  (is (= "/accounts/acct1/stream/live_inputs/in1" (:path (stream/live-input-request account "in1"))))
+  (is (= :delete (:method (stream/delete-live-input-request account "in1"))))
+  (testing "a GET carries no body key at all"
+    (is (not (contains? (stream/list-live-inputs-request account) :body)))))
+
+(deftest create-live-output-request-shape
+  (let [req (stream/create-live-output-request account "in1" {:platform :youtube :stream-key "abcd-efgh"})]
+    (is (= :post (:method req)))
+    (is (= "/accounts/acct1/stream/live_inputs/in1/outputs" (:path req)))
+    (is (= {:url "rtmps://a.rtmps.youtube.com/live2" :streamKey "abcd-efgh" :enabled true} (:body req))))
+  (testing "an explicit URL wins over :platform"
+    (is (= "rtmp://custom.example.net/app"
+           (get-in (stream/create-live-output-request account "in1"
+                                                      {:url "rtmp://custom.example.net/app" :stream-key "k"})
+                   [:body :url]))))
+  (testing ":variant selects rtmp vs rtmps"
+    (is (= "rtmp://a.rtmp.youtube.com/live2"
+           (get-in (stream/create-live-output-request account "in1"
+                                                      {:platform :youtube :variant :rtmp :stream-key "k"})
+                   [:body :url]))))
+  (testing "disabled output"
+    (is (false? (get-in (stream/create-live-output-request account "in1"
+                                                           {:platform :twitch :stream-key "k" :enabled false})
+                        [:body :enabled])))))
+
+(deftest create-live-output-request-refuses-an-output-that-could-never-connect
+  (testing "an unknown platform resolves to no URL and is rejected, not silently posted"
+    (is (thrown? js/Error
+                 (stream/create-live-output-request account "in1" {:platform :nicovideo :stream-key "k"}))))
+  (is (thrown? js/Error
+               (stream/create-live-output-request account "in1" {:platform :youtube :stream-key "abcd\n"})))
+  (testing "the thrown data carries the problems but never the key"
+    (let [data (try (stream/create-live-output-request account "in1" {:platform :youtube :stream-key "secret \n"})
+                    nil
+                    (catch js/Error e
+                      (ex-data e)))]
+      (is (= [:whitespace-in-key] (:problems data)))
+      (is (not (str/includes? (str data) "secret "))))))
+
+;; ---------------------------------------------------------------------------
+;; Pure response readers
+;; ---------------------------------------------------------------------------
+
+(def live-input-result
+  {:uid "in1"
+   :webRTC {:url "https://customer-x.cloudflarestream.com/in1/webRTC/publish"}
+   :webRTCPlayback {:url "https://customer-x.cloudflarestream.com/in1/webRTC/play"}
+   :rtmps {:url "rtmps://live.cloudflare.com:443/live/" :streamKey "cf-stream-key-value"}
+   :srt {:url "srt://live.cloudflare.com:778"}
+   :meta {:name "babiniku-stage"}
+   :status nil
+   :created "2026-07-25T00:00:00Z"})
+
+(deftest parse-live-input-flattens-cloudflares-per-protocol-nesting
+  (let [parsed (stream/parse-live-input live-input-result)]
+    (is (= "in1" (:uid parsed)))
+    (is (= "https://customer-x.cloudflarestream.com/in1/webRTC/publish" (:whip-url parsed)))
+    (is (= "https://customer-x.cloudflarestream.com/in1/webRTC/play" (:whep-url parsed)))
+    (is (= "rtmps://live.cloudflare.com:443/live/" (:rtmps-url parsed)))
+    (is (= "cf-stream-key-value" (:rtmps-stream-key parsed)))
+    (is (= "babiniku-stage" (:name parsed)))
+    (is (= live-input-result (:raw parsed)) "nothing modelled here is lost"))
+  (is (nil? (stream/parse-live-input nil)))
+  (is (nil? (stream/parse-live-input "not-a-map"))))
+
+(deftest live-input-summary-is-safe-to-print
+  (let [s (stream/live-input-summary (stream/parse-live-input live-input-result))]
+    (is (str/includes? s "live-input in1"))
+    (is (str/includes? s "babiniku-stage"))
+    (is (str/includes? s "webRTC/publish"))
+    (is (not (str/includes? s "cf-stream-key-value"))
+        "the RTMPS key is itself a publish credential for this input")))
+
+(deftest parse-live-output-shape
+  (is (= {:uid "out1" :url "rtmps://a.rtmps.youtube.com/live2" :enabled true
+          :raw {:uid "out1" :url "rtmps://a.rtmps.youtube.com/live2" :enabled true :streamKey "k"}}
+         (stream/parse-live-output {:uid "out1" :url "rtmps://a.rtmps.youtube.com/live2"
+                                    :enabled true :streamKey "k"}))))
+
+;; ---------------------------------------------------------------------------
+;; :clj convenience layer, against a stub transport
+;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (defn- stub-http-fn [captured body]
+     (fn [req] (swap! captured conj req) {:status 200 :body body})))
+
+#?(:clj
+   (deftest create-live-input!-calls-the-right-endpoint-and-parses
+     (let [captured (atom [])
+           body (str "{\"success\":true,\"result\":{\"uid\":\"in1\","
+                     "\"webRTC\":{\"url\":\"https://c.example/in1/webRTC/publish\"},"
+                     "\"rtmps\":{\"url\":\"rtmps://live.cloudflare.com:443/live/\",\"streamKey\":\"sk\"},"
+                     "\"meta\":{\"name\":\"n\"}}}")
+           parsed (stream/create-live-input! account {:name "n"}
+                                             {:http-fn (stub-http-fn captured body) :token "t"})
+           req (first @captured)]
+       (is (= "https://api.cloudflare.com/client/v4/accounts/acct1/stream/live_inputs" (:url req)))
+       (is (= :post (:method req)))
+       (is (re-find #"\"mode\":\"off\"" (:body req)))
+       (is (= "in1" (:uid parsed)))
+       (is (= "https://c.example/in1/webRTC/publish" (:whip-url parsed))))))
+
+#?(:clj
+   (deftest create-live-output!-sends-the-key-once-in-the-body
+     (let [captured (atom [])
+           body "{\"success\":true,\"result\":{\"uid\":\"out1\",\"url\":\"rtmps://a.rtmps.youtube.com/live2\",\"enabled\":true}}"
+           parsed (stream/create-live-output! account "in1" {:platform :youtube :stream-key "abcd-efgh"}
+                                              {:http-fn (stub-http-fn captured body) :token "t"})
+           req (first @captured)]
+       (is (= "https://api.cloudflare.com/client/v4/accounts/acct1/stream/live_inputs/in1/outputs" (:url req)))
+       (is (re-find #"\"streamKey\":\"abcd-efgh\"" (:body req)))
+       (is (= "out1" (:uid parsed))))))
+
+#?(:clj
+   (deftest listing-and-deleting
+     (let [captured (atom [])
+           inputs (stream/live-inputs account {:http-fn (stub-http-fn captured "{\"success\":true,\"result\":[{\"uid\":\"in1\"},{\"uid\":\"in2\"}]}")
+                                               :token "t"})]
+       (is (= ["in1" "in2"] (mapv :uid inputs))))
+     (let [captured (atom [])]
+       (is (true? (stream/delete-live-input! account "in1"
+                                             {:http-fn (stub-http-fn captured "{\"success\":true,\"result\":null}")
+                                              :token "t"})))
+       (is (= :delete (:method (first @captured)))))
+     (let [captured (atom [])]
+       (is (true? (stream/delete-live-output! account "in1" "out1"
+                                              {:http-fn (stub-http-fn captured "{\"success\":true,\"result\":null}")
+                                               :token "t"})))
+       (is (str/ends-with? (:url (first @captured)) "/live_inputs/in1/outputs/out1")))))
+
+#?(:clj
+   (deftest a-cloudflare-level-failure-throws-rather-than-returning-a-half-input
+     (is (thrown? clojure.lang.ExceptionInfo
+                  (stream/create-live-input!
+                   account {:name "n"}
+                   {:http-fn (fn [_] {:status 403 :body "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}"})
+                    :token "t"})))))

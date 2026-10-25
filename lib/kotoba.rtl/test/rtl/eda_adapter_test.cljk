@@ -1,0 +1,96 @@
+(ns rtl.eda-adapter-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [rtl.synthesis :as synthesis]
+            [rtl.eda-adapter :as adapter]))
+
+;; and(a,b)->n1 -> not(n1)->out, purely combinational, no :dff.
+(def ^:private comb-netlist
+  (-> (synthesis/gate-netlist)
+      (assoc :primary-inputs ["a" "b"] :primary-outputs ["out"])
+      (update :gates conj
+              (synthesis/gate :and ["a" "b"] "n1")
+              (synthesis/gate :not ["n1"] "out"))))
+
+;; and(a,b)->n1 -> dff(n1)->q : one register, D pin fed by combinational
+;; logic, Q pin is a primary output.
+(def ^:private seq-netlist
+  (-> (synthesis/gate-netlist)
+      (assoc :primary-inputs ["a" "b"] :primary-outputs ["q"])
+      (update :gates conj
+              (synthesis/gate :and ["a" "b"] "n1")
+              (synthesis/gate :dff ["n1"] "q"))))
+
+(deftest netlist->timing-edges-applies-documented-delay-model
+  (testing "each gate becomes real input-net -> output-net edges at its gate-type delay"
+    (let [delay-model {:and 0.25 :not 0.5 :default 0.15}
+          edges (adapter/netlist->timing-edges comb-netlist delay-model)]
+      (is (= [{:from "a" :to "n1" :delay-ns 0.25}
+              {:from "b" :to "n1" :delay-ns 0.25}
+              {:from "n1" :to "out" :delay-ns 0.5}]
+             edges)))))
+
+(deftest netlist->timing-edges-treats-dff-as-clock-launch-boundary
+  (testing "a :dff gate gets one clock-launch->Q edge, not a D->Q combinational edge"
+    (let [delay-model {:and 1.0 :dff 2.0 :default 0.15}
+          edges (adapter/netlist->timing-edges seq-netlist delay-model)]
+      ;; the AND gate's two real input->output edges are unaffected
+      (is (= {:from "a" :to "n1" :delay-ns 1.0} (first edges)))
+      (is (= {:from "b" :to "n1" :delay-ns 1.0} (second edges)))
+      ;; the DFF contributes exactly one edge, sourced from the synthetic
+      ;; clock-launch node (not from "n1", its D input)
+      (is (= 3 (count edges)))
+      (let [dff-edge (nth edges 2)]
+        (is (= adapter/clock-launch (:from dff-edge)))
+        (is (= "q" (:to dff-edge)))
+        (is (= 2.0 (:delay-ns dff-edge))))))
+  (testing "the D input net becomes a timing endpoint (setup check), not a source of Q's arrival"
+    (let [endpoints (adapter/netlist->timing-endpoints seq-netlist)]
+      (is (= #{"q" "n1"} (set endpoints))))))
+
+(deftest netlist->timing-nodes-includes-every-net-plus-clock-launch-when-sequential
+  (testing "combinational-only netlist has no clock-launch node"
+    (let [nodes (adapter/netlist->timing-nodes comb-netlist)]
+      (is (= #{"a" "b" "n1" "out"} (set nodes)))
+      (is (not (some #{adapter/clock-launch} nodes)))))
+  (testing "a netlist with a :dff gate gains the synthetic clock-launch node"
+    (let [nodes (adapter/netlist->timing-nodes seq-netlist)]
+      (is (= #{"a" "b" "n1" "q" adapter/clock-launch} (set nodes))))))
+
+(deftest analyze-netlist-timing-produces-well-formed-passing-evidence
+  (testing "a slow clock comfortably passes"
+    (let [result (adapter/analyze-netlist-timing
+                  comb-netlist
+                  {:clock-period-ns 5.0
+                   :delay-model {:and 0.25 :not 0.5 :default 0.15}})]
+      (is (= :signoff/timing-pvt (:eda.signoff/type result)))
+      (is (= :sw/opensta (:eda.signoff/tool result)))
+      (is (= :op/analyze-timing (:eda.signoff/operation result)))
+      (is (contains? result :eda.signoff/status))
+      (is (contains? result :eda.signoff/metrics))
+      (is (string? (:eda.signoff/evidence-cid result)))
+      (is (= :passed (:eda.signoff/status result)))
+      ;; arrival(out) = arrival(a|b=0) + 0.25 (and) + 0.5 (not) = 0.75ns
+      (is (= 4.25 (get-in result [:eda.signoff/metrics :worst-slack-ns]))))))
+
+(deftest analyze-netlist-timing-fails-when-clock-period-too-tight
+  (testing "a clock period shorter than the combinational arrival fails signoff"
+    (let [result (adapter/analyze-netlist-timing
+                  comb-netlist
+                  {:clock-period-ns 0.1
+                   :delay-model {:and 0.25 :not 0.5 :default 0.15}})]
+      (is (contains? result :eda.signoff/status))
+      (is (= :failed (:eda.signoff/status result)))
+      (is (neg? (get-in result [:eda.signoff/metrics :worst-slack-ns]))))))
+
+(deftest analyze-netlist-timing-honours-sequential-boundary-in-registered-design
+  (testing "the registered design's endpoints (Q output + D input) both pass a comfortable period"
+    (let [result (adapter/analyze-netlist-timing
+                  seq-netlist
+                  {:clock-period-ns 10.0
+                   :delay-model {:and 1.0 :dff 2.0 :default 0.15}})]
+      (is (= :passed (:eda.signoff/status result)))
+      ;; endpoints: "q" arrives at 2.0ns (clock-to-Q only, D->Q not
+      ;; propagated combinationally); "n1" (the D pin) arrives at 1.0ns
+      ;; (max(a,b)=0 + and-delay 1.0). Worst of the two is q at 2.0ns,
+      ;; so worst-slack = 10.0 - 2.0 = 8.0ns.
+      (is (= 8.0 (get-in result [:eda.signoff/metrics :worst-slack-ns]))))))

@@ -1,0 +1,262 @@
+(ns engi.metrics
+  "Transfer-loop telemetry for ENGI/EN — the funnel that turns \"the EN loop
+  has never fired\" from an assertion into a measurement.
+
+  Why this exists (com-junkawasaki/root adr-ledger seq 66, 2026-07-25): a
+  system-dynamics pass scored every archetype in `kotoba-lang/dynamics`'
+  catalog on the same formula and found `:engi-en-mutual-credit-current`
+  carrying `instrumentation-completeness 0` — the LOWEST in a catalog where
+  every incumbent money system (Visa 0.95, Ethereum 0.98, commercial bank
+  credit creation 0.95) sits at 0.90-0.98. A loop nobody measures cannot be
+  diagnosed, only asserted about, and `dynamics.core/loop-structural-strength`
+  returns nil rather than a number for exactly that reason. Instrumentation
+  ranked ABOVE every currency-design change in that pass (6.30 vs 5.95/5.25)
+  because it is the precondition for knowing whether any later change worked.
+
+  This mirrors `kotobase.x402-metrics` (gftdcojp/net-kotobase), which did the
+  same job for the agent-payment funnel one day earlier — deliberately the
+  same shape (ordered stages, event->stage map, monotonic counters, rates that
+  are nil rather than fake-0 when their denominator is 0) so the two funnels
+  read alike and a single collector can consume both.
+
+  ── The EN transfer funnel, in protocol order (ADR-2607101100 Decision #2) ──
+
+    proposals       -- a spender built and self-signed a TransferBody
+                       (`engi.protocol/propose-transfer!`). Intent. NOTHING is
+                       written to any graph at this step.
+    validations     -- a receiver independently re-derived the spender's state
+                       and every invariant held (`validate-proposal!` =>
+                       :valid? true). Acceptance.
+    rejections      -- `validate-proposal!` => :valid? false. Friction, and the
+                       single most diagnostic stage: :reason tells you WHICH
+                       invariant is costing transfers (stale-prev vs
+                       credit-limit-exceeded vs bad-signature are entirely
+                       different problems with entirely different fixes).
+    counter-commits -- the receiver wrote its credit entry to its OWN graph
+                       (`counter-commit!`). First durable write.
+    finalizations   -- the spender wrote its debit entry (`finalize!` =>
+                       :finalized? true). CONVERSION: the transfer now exists
+                       bilaterally and nets to zero.
+
+  So `finalizations / proposals` is the transfer completion rate, and
+  `rejections / (validations + rejections)` is the validation failure rate.
+
+  ── Two halves, with an honest asymmetry between them ──
+
+  1. EMITTED (this ns's counter half). Steps 1-2 perform no writes, so
+     proposals/validations/rejections exist ONLY if something counts them as
+     they happen. `engi.protocol` now takes an optional `:on-event` callback
+     for exactly this. If nobody passes one, the top of the funnel is simply
+     unobserved — and it is reported as unobserved, never as 0.
+
+  2. PERSISTED (`funnel-from-entities`). counter-commits and finalizations
+     ARE durable: they are credit and debit entries in the two agents' own
+     kotobase graphs. So the BOTTOM of the funnel can be recomputed by anyone
+     with read access, from data they did not have to trust the emitter for.
+     This is the auditable half, and it is what `bin/engi_metrics.cljk`
+     reports against live kotobase.net.
+
+  Keeping the two halves distinguishable is the point: an emitted count is an
+  assertion by the process that emitted it, a persisted count is a fact about
+  the ledger. Do not merge them into one number.
+
+  Pure `.cljc` — no js interop, no I/O, no wall clock — so the counter shape
+  and the response body are unit-testable on every runtime and shared
+  byte-for-byte with whatever hosts them, the same discipline `engi.core` and
+  `engi.stake` already hold."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── stages ───────────────────────────────────────────────────────────────────
+
+(def stages
+  "The five funnel stages, in protocol order. `:validations` and `:rejections`
+  are the two terminal outcomes of validating a `:proposal`; `:counter-commits`
+  and `:finalizations` are the two durable writes that follow a validation."
+  [:proposals :validations :rejections :counter-commits :finalizations])
+
+(def persisted-stages
+  "The subset of `stages` recoverable from the ledger itself, with no trust in
+  whoever emitted the events. See `funnel-from-entities`."
+  [:counter-commits :finalizations])
+
+(def emitted-only-stages
+  "The subset of `stages` that leaves NO trace in any graph — steps 1 and 2 of
+  the protocol perform no writes by design. Absent an `:on-event` emitter these
+  are unobserved, which `counts->response` reports as :unobserved, not 0."
+  [:proposals :validations :rejections])
+
+(def event->stage
+  "Protocol lifecycle events (emitted by `engi.protocol`'s `:on-event`
+  callback) -> the stage counter each bumps."
+  {:proposal       :proposals
+   :validation     :validations
+   :rejection      :rejections
+   :counter-commit :counter-commits
+   :finalization   :finalizations})
+
+(defn valid-stage? [stage] (boolean (some #{stage} stages)))
+
+(defn stage-of
+  "Resolve a protocol lifecycle event keyword to the stage counter it bumps,
+  or nil for an unknown event."
+  [event]
+  (get event->stage event))
+
+(defn counter-key
+  "Storage key for a stage counter, namespaced under `engi:` so it never
+  collides with the `x402:`, `funnel:` or `tenant:` keyspaces if it ever shares
+  a KV binding with kotobase.net's own counters."
+  [stage]
+  (str "engi:" (name stage)))
+
+;; ── monotonic counters ───────────────────────────────────────────────────────
+;; Same semantics as kotobase.funnel/parse-count deliberately (absent,
+;; malformed and negative all normalize to 0, so a corrupt value can never
+;; inflate a count). Reimplemented rather than depended on: engi must not take
+;; a dependency on net-kotobase's edge sources to count its own transfers.
+
+(defn parse-count
+  "Parse a stored counter value (string | number | nil) into a non-negative
+  integer. Absent / malformed / negative values normalize to 0, so the funnel
+  never reports a bogus count."
+  [raw]
+  (if (or (nil? raw) (and (string? raw) (str/blank? raw)))
+    0
+    (let [s (str/trim (str raw))]
+      (if (re-matches #"\d+" s)
+        (let [n #?(:clj (try (Long/parseLong s) (catch Exception _ 0))
+                   :cljs (js/parseInt s 10))]
+          (if (and (number? n) (>= n 0)) n 0))
+        0))))
+
+(defn next-count
+  "The stored string for the incremented counter, given the current raw value."
+  [raw]
+  (str (inc (parse-count raw))))
+
+;; ── response assembly ────────────────────────────────────────────────────────
+
+(defn- rate
+  "num/den as a double, or nil when den is 0. Never 0.0 for an empty
+  denominator — a rate with no trials is unknown, not zero, the same
+  distinction `dynamics.core/loop*` encodes as :unmeasured."
+  [num den]
+  (when (pos? den) (double (/ num den))))
+
+(defn counts->response
+  "Assemble the EN funnel body from a map of stage -> raw stored count.
+
+  `observed` (optional) is the set of stages an emitter is actually wired for.
+  Stages outside it are reported as :unobserved rather than 0 — the difference
+  between 'we counted and there were none' and 'nobody was counting' is the
+  whole reason this funnel exists, and collapsing it would reproduce the
+  instrumentation-0 problem in a new place. Omitting `observed` means every
+  stage is treated as observed (the caller asserts it wired all of them)."
+  ([counts] (counts->response counts (set stages)))
+  ([counts observed]
+   (let [obs (set observed)
+         c (reduce (fn [m s] (assoc m s (if (contains? obs s)
+                                          (parse-count (get counts s))
+                                          :unobserved)))
+                   {} stages)
+         n (fn [s] (let [v (get c s)] (when (number? v) v)))
+         proposals (n :proposals)
+         validations (n :validations)
+         rejections (n :rejections)
+         finalizations (n :finalizations)
+         attempted (when (and validations rejections) (+ validations rejections))]
+     {:engi (assoc c
+                   :completion-rate (when (and finalizations proposals)
+                                      (rate finalizations proposals))
+                   :validation-failure-rate (when (and rejections attempted)
+                                              (rate rejections attempted)))
+      :observed (vec (filter obs stages))
+      :unobserved (vec (remove obs stages))})))
+
+;; ── the persisted half — recomputed from the ledger, trusting no emitter ─────
+
+(defn funnel-from-entities
+  "Recompute the durable half of the funnel from ONE agent's own graph
+  entities (the shape `engi.store/fetch-entities!` returns).
+
+  A debit entry is that agent's own `finalize!`; a credit entry is its own
+  `counter-commit!`. Both carry a `:engi/transfer-id`, so counting DISTINCT
+  transfer-ids (not entries) is what makes this idempotent under a replayed or
+  double-read graph.
+
+  Returns only `persisted-stages` plus the distinct counterparties seen, and
+  deliberately does NOT fill in proposals/validations/rejections — from a graph
+  alone those are unknowable, and guessing them is exactly the fabrication this
+  ns exists to prevent. Merge with an emitted counter map only via
+  `counts->response`'s `observed` argument, so the provenance stays visible.
+
+  ── `:affiliated-dids` and why it has no default (corrected 2026-07-25) ──
+
+  The question this loop actually turns on is not `has any transfer happened`
+  but `has one happened between two agents the operator does not control`. The
+  first version of this fn answered that by excluding a single operator DID,
+  and that was WRONG in a way worth spelling out, because it is the failure
+  mode this whole funnel exists to prevent.
+
+  This repo's own live test mints two fresh throwaway `did:key`s and drives a
+  real transfer between them against production kotobase.net. Neither is the
+  operator DID, so both would be reported as `:external-counterparties` --
+  making the trigger look like it fired when nothing independent happened. A
+  measurement that can be tripped by its own test suite is worse than no
+  measurement, because it is trusted.
+
+  Independence is NOT cryptographically provable: a `did:key` is just a
+  keypair, and the operator can mint as many as it likes. So this fn does not
+  try to infer it. `:affiliated-dids` must be supplied EXPLICITLY -- every DID
+  whose key the operator controls, including ephemeral test agents. With no
+  such set, `:external-counterparties` is `:affiliation-unknown`, never a
+  confident-looking list. The metric is exactly as good as the set it is given,
+  and it now says so instead of pretending otherwise."
+  ([entities] (funnel-from-entities entities {}))
+  ([entities {:keys [affiliated-dids]}]
+   (let [entries (filter #(contains? #{"debit" "credit"} (:engi/kind %)) entities)
+         ids-of (fn [kind] (into #{} (comp (filter #(= kind (:engi/kind %)))
+                                           (keep :engi/transfer-id))
+                                 entries))
+         debits (ids-of "debit")
+         credits (ids-of "credit")
+         counterparties (into #{} (keep :engi/counterparty) entries)]
+     {:counter-commits (count credits)
+      :finalizations (count debits)
+      :distinct-transfer-ids (count (into debits credits))
+      :counterparties (vec (sort counterparties))
+      :external-counterparties (if (nil? affiliated-dids)
+                                 :affiliation-unknown
+                                 (vec (sort (remove (set affiliated-dids) counterparties))))
+      :affiliated-dids (if (nil? affiliated-dids)
+                         :not-supplied
+                         (vec (sort affiliated-dids)))
+      :provenance :persisted-ledger})))
+
+(defn trigger-fired?
+  "Has the `:ordering` bond-floor trigger fired -- i.e. has this graph ever
+  transacted with a counterparty the operator does not control?
+
+  Returns `true`, `false`, or `:affiliation-unknown`. The third value is the
+  point: a caller that has not declared which DIDs it controls cannot get a
+  `false` here and mistake it for evidence of nothing, nor a `true` and act on
+  it. `engi.stake`'s bootstrap-ordering-min-bond docstring names this trigger;
+  raising a real bond floor off an `:affiliation-unknown` would be raising it
+  off a guess."
+  [funnel]
+  (let [ext (:external-counterparties funnel)]
+    (if (keyword? ext) ext (boolean (seq ext)))))
+
+(defn merge-funnel
+  "Combine a persisted funnel (`funnel-from-entities`) with an emitted counter
+  map into the argument pair `counts->response` expects, keeping provenance
+  explicit: persisted stages always win over emitted ones for the same stage,
+  because a ledger fact outranks a process's own claim about itself.
+
+  Returns `[counts observed]`."
+  [persisted emitted]
+  (let [emitted-observed (into #{} (filter #(and (valid-stage? %) (some? (get emitted %))))
+                               (keys emitted))
+        counts (merge (select-keys emitted stages)
+                      (select-keys persisted persisted-stages))]
+    [counts (into (set persisted-stages) emitted-observed)]))

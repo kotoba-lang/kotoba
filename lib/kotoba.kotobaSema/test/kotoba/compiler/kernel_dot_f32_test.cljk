@@ -1,0 +1,130 @@
+(ns kotoba.compiler.kernel-dot-f32-test
+  "The frontend's half of `kernel-dot-f32` (kotoba-gmir ADR 0010), and the one
+  thing about it that is not inherited: it has TWO regions.
+
+  Every other operation in `kernel-memory-operations` has its base in argument
+  0, and the provenance walk was written as the literal `(first args)`. An
+  operation with a second base would have had that base flow past the walk
+  entirely -- an untraceable pointer in a position nothing looked at, which is
+  exactly the hole `traceable-base?` exists to close, reopened for one
+  operation. `kernel-base-positions` is the fix, and this namespace is what
+  would fail if the walk went back to reading argument 0."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.hir :as hir]
+            [kotoba.sema :as sema]))
+
+(defn- beside-main [src] (str src "\n(defn main [] 0)"))
+
+(def ^:private call
+  "(defn p [a al b bl n] (kernel-dot-f32 a al b bl n))")
+
+(deftest the-operation-is-in-the-table-at-arity-five
+  (is (= 5 (get frontend/kernel-memory-operations 'kernel-dot-f32)))
+  (testing "and is a reserved name, so no user function can shadow it"
+    (is (contains? frontend/reserved-function-names 'kernel-dot-f32)))
+  (testing "arity is checked, and BY ARITY"
+    ;; An operation absent from the table would fall through to "unknown
+    ;; function" instead, which is a different failure -- so the message is
+    ;; pinned rather than merely asserting that something threw.
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"kernel memory operation arity mismatch"
+         (sema/analyze
+          (beside-main "(defn p [a al b bl] (kernel-dot-f32 a al b bl))"))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"kernel memory operation arity mismatch"
+         (sema/analyze
+          ;; A sixth ARGUMENT, not a sixth parameter: five is the ABI's own
+         ;; parameter ceiling and a six-parameter function is refused before
+         ;; the operation is reached at all, which would test the wrong rule.
+         (beside-main
+           "(defn p [a al b bl n] (kernel-dot-f32 a al b bl n 0))"))))))
+
+(deftest it-analyses-to-i64
+  ;; The word it answers with IS an i64 -- the binary32 pattern of the sum,
+  ;; sign-extended. The f32 reading of that word is what `f32-from-bits` is
+  ;; for, and this operation is not typed `:f32` any more than
+  ;; `kernel-load-u32` is.
+  (let [result (sema/analyze (beside-main call))]
+    (is (hir/valid? result))
+    (is (= :i64 (->> (:functions result) (filter #(= 'p (:name %))) first :result)))))
+
+(deftest both-bases-are-declared-region-positions
+  (is (= [0 2] (frontend/kernel-base-argument-positions 'kernel-dot-f32)))
+  (testing "and every other operation keeps argument 0"
+    (doseq [op '[kernel-load-u8 kernel-store-u64-64k slice-load-u32
+                 kernel-subregion kernel-try-lock-u32]]
+      (is (= [0] (frontend/kernel-base-argument-positions op)) op))))
+
+(deftest both-bases-are-tainted-as-regions
+  ;; `:tainted` maps a function to the parameter INDEXES used as a region
+  ;; base. Reading only argument 0 gives `#{0}` here, and that is the whole
+  ;; defect: parameter 2 is a pointer the C kernel hands in, and it would be
+  ;; reported as an ordinary integer.
+  (let [report (sema/kernel-region-report
+                (:functions (sema/analyze (beside-main call))))]
+    (is (= #{0 2} (get (:tainted report) 'p))
+        "both bases taint their parameters")
+    (is (= '[a b] (get (:abi-boundary report) 'p))
+        "and both are reported as unverifiable ABI boundaries")))
+
+(deftest a-computed-base-is-refused-in-either-position
+  ;; The provenance rule's teeth. The SECOND row is the one that fails if the
+  ;; walk reads argument 0 only -- and it fails by compiling, which is the
+  ;; quietest possible way for a pointer check to stop working.
+  (doseq [[label src]
+          [["first base"
+            "(defn p [a b n] (kernel-dot-f32 (+ a 1) 8 b 8 n))"]
+           ["second base"
+            "(defn p [a b n] (kernel-dot-f32 a 8 (+ b 1) 8 n))"]
+           ["both bases"
+            "(defn p [a b n] (kernel-dot-f32 (+ a 1) 8 (+ b 1) 8 n))"]]]
+    (testing label
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"kernel memory base must name a region, not compute one"
+           (sema/analyze (beside-main src))))))
+  (testing "a load laundered through a base position is refused in either slot"
+    (doseq [src ["(defn p [a al b bl n] (kernel-dot-f32 (kernel-load-u8 a al 0) al b bl n))"
+                 "(defn p [a al b bl n] (kernel-dot-f32 a al (kernel-load-u8 b bl 0) bl n))"]]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"kernel memory base must name a region, not compute one"
+           (sema/analyze (beside-main src)))))))
+
+(deftest a-checked-narrowing-is-admitted-in-either-position
+  ;; `kernel-subregion` is the checked form, so it is rooted AND bounded and
+  ;; both slots must accept it. The control for the test above: if the walk
+  ;; refused everything in position 2 the negative rows would pass for the
+  ;; wrong reason.
+  (doseq [src ["(defn p [a al b bl n]
+                  (kernel-dot-f32 (kernel-subregion a al 0 8) 8 b bl n))"
+               "(defn p [a al b bl n]
+                  (kernel-dot-f32 a al (kernel-subregion b bl 0 8) 8 n))"]]
+    (is (hir/valid? (sema/analyze (beside-main src))) src)))
+
+(deftest literal-bases-are-reported-from-both-positions
+  (let [report (sema/kernel-region-report
+                (:functions
+                 (sema/analyze "(defn main [] (kernel-dot-f32 4096 8 8192 8 2))")))]
+    (is (contains? (set (:literal-bases report)) 4096))
+    (is (contains? (set (:literal-bases report)) 8192)
+        "the second literal base is a physical address this module can reach too")))
+
+(deftest a-base-passed-into-a-callee-second-region-is-checked-at-the-caller
+  ;; The taint fixpoint: `q`'s parameter 2 is a base, so `p` must hand it
+  ;; something traceable. Reading argument 0 only would leave this caller free
+  ;; to compute the pointer.
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"kernel memory base must name a region, not compute one"
+       (sema/analyze
+        (beside-main
+         "(defn q [a al b bl n] (kernel-dot-f32 a al b bl n))
+          (defn p [a b n] (q a 8 (+ b 1) 8 n))"))))
+  (testing "and a traceable one is admitted"
+    (is (hir/valid?
+         (sema/analyze
+          (beside-main
+           "(defn q [a al b bl n] (kernel-dot-f32 a al b bl n))
+            (defn p [a b n] (q a 8 b 8 n))"))))))

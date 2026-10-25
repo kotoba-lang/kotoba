@@ -1,0 +1,158 @@
+(ns engi.core-test
+  "Pure-logic unit tests for `engi.core` — no crypto, no I/O, runs identically
+  under `kbb -M:test` (JVM) and shadow-cljs :node-test."
+  (:require [engi.core :as core]
+            #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])))
+
+;; ── canonical serialization determinism ────────────────────────────────────
+
+(deftest canonical-transfer-body-deterministic
+  (let [body {:spender "did:key:zA" :receiver "did:key:zB" :amount 10
+              :spender-prev "genesis" :nonce "abc" :ts 1000}]
+    (testing "same input -> identical string, every time"
+      (is (= (core/canonical-transfer-body body) (core/canonical-transfer-body body))))
+    (testing "changing any single field changes the output"
+      (is (not= (core/canonical-transfer-body body)
+                (core/canonical-transfer-body (assoc body :amount 11))))
+      (is (not= (core/canonical-transfer-body body)
+                (core/canonical-transfer-body (assoc body :spender-prev "somethingelse"))))
+      (is (not= (core/canonical-transfer-body body)
+                (core/canonical-transfer-body (assoc body :nonce "xyz")))))))
+
+(deftest canonical-entry-deterministic
+  (let [entry {:engi/kind "debit" :engi/seq 0 :engi/prev-hash "genesis"
+               :engi/counterparty "did:key:zB" :engi/amount 5 :engi/memo nil
+               :engi/transfer-id "cid1" :engi/self-sig "sigA" :engi/counter-sig "sigB"
+               :engi/ts 1000}]
+    (is (= (core/canonical-entry entry) (core/canonical-entry entry)))
+    (is (not= (core/canonical-entry entry) (core/canonical-entry (assoc entry :engi/amount 6))))))
+
+;; ── genesis / current-head ─────────────────────────────────────────────────
+
+(deftest genesis-rejects-positive-credit-limit
+  (is (thrown? #?(:clj Exception :cljs js/Error) (core/genesis {:credit-limit 5 :created-at 0}))))
+
+(deftest current-head-empty-chain
+  (let [g (core/genesis {:credit-limit -1000 :created-at 0})]
+    (is (= {:seq -1 :last-entry nil :credit-limit -1000} (core/current-head [g])))))
+
+;; ── next-entry seq/prev-hash chaining ───────────────────────────────────────
+
+(deftest next-entry-chains-seq-and-prev-hash
+  (let [g (core/genesis {:credit-limit -1000 :created-at 0})
+        head0 (core/current-head [g])
+        e0 (core/next-entry head0 "genesis" {:id "engi/tx/0" :kind "debit"
+                                              :counterparty "did:key:zB" :amount 10
+                                              :transfer-id "t0" :ts 1})]
+    (is (= 0 (:engi/seq e0)))
+    (is (= "genesis" (:engi/prev-hash e0)))
+    (let [head1 (core/current-head [g e0])
+          e1 (core/next-entry head1 "hash-of-e0" {:id "engi/tx/1" :kind "credit"
+                                                   :counterparty "did:key:zC" :amount 3
+                                                   :transfer-id "t1" :ts 2})]
+      (is (= 1 (:engi/seq e1)))
+      (is (= "hash-of-e0" (:engi/prev-hash e1))))))
+
+(deftest next-entry-rejects-bad-kind
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (core/next-entry {:seq -1} "genesis" {:kind "genesis" :amount 1}))))
+
+;; ── fold-balance arithmetic ──────────────────────────────────────────────────
+
+(defn- mk-entry [seq kind amount prev-hash]
+  {:db/id (str "engi/tx/" seq) :engi/kind kind :engi/seq seq :engi/prev-hash prev-hash
+   :engi/counterparty "did:key:zPeer" :engi/amount amount :engi/memo nil
+   :engi/transfer-id (str "t" seq) :engi/self-sig "s" :engi/counter-sig "c" :engi/ts seq})
+
+(deftest fold-balance-arithmetic
+  (let [g (core/genesis {:credit-limit -1000 :created-at 0})
+        ;; +10 credit, -3 debit, +7 credit -> balance 14
+        entries [g
+                 (mk-entry 0 "credit" 10 "genesis")
+                 (mk-entry 1 "debit" 3 "h0")
+                 (mk-entry 2 "credit" 7 "h1")]
+        {:keys [balance spendable-balance violations]} (core/fold-balance entries)]
+    (is (= 14 balance))
+    (is (= 14 spendable-balance))
+    (is (empty? violations))))
+
+(deftest fold-balance-detects-seq-gap
+  (let [g (core/genesis {:credit-limit -1000 :created-at 0})
+        entries [g (mk-entry 0 "credit" 10 "genesis") (mk-entry 2 "credit" 5 "h1")]
+        {:keys [violations]} (core/fold-balance entries)]
+    (is (some #(= :seq-gap (:type %)) violations))))
+
+(deftest fold-balance-detects-missing-genesis
+  (let [entries [(mk-entry 0 "credit" 10 "genesis")]
+        {:keys [violations]} (core/fold-balance entries)]
+    (is (some #(= :missing-genesis (:type %)) violations))))
+
+(deftest fold-balance-credit-limit-breach
+  (let [g (core/genesis {:credit-limit -10 :created-at 0})
+        ;; spend 15 with nothing received first -> balance -15, breaches -10 floor
+        entries [g (mk-entry 0 "debit" 15 "genesis")]
+        {:keys [balance violations]} (core/fold-balance entries)]
+    (is (= -15 balance))
+    (is (some #(= :credit-limit-breach (:type %)) violations))))
+
+(deftest fold-balance-within-credit-limit-is-clean
+  (let [g (core/genesis {:credit-limit -10 :created-at 0})
+        entries [g (mk-entry 0 "debit" 10 "genesis")]
+        {:keys [balance violations]} (core/fold-balance entries)]
+    (is (= -10 balance))
+    (is (empty? violations))))
+
+(deftest fold-balance-pending-credit-excluded-from-spendable
+  (let [g (core/genesis {:credit-limit -1000 :created-at 0})
+        c0 (mk-entry 0 "credit" 20 "genesis")
+        entries [g c0]
+        {:keys [balance spendable-balance]}
+        (core/fold-balance entries {:pending-transfer-ids #{(:engi/transfer-id c0)}})]
+    (is (= 20 balance) "raw balance counts every recorded credit")
+    (is (= 0 spendable-balance) "unconfirmed credit must not count toward spendable")))
+
+(deftest fold-balance-prev-hash-chain-check-with-hash-fn
+  (let [g (core/genesis {:credit-limit -1000 :created-at 0})
+        e0 (mk-entry 0 "credit" 10 "genesis")
+        ;; e1 claims a WRONG prev-hash (should be "hash(e0)", claims "genesis" again)
+        e1 (mk-entry 1 "credit" 5 "genesis")
+        hash-fn (fn [e] (str "hash(" (:db/id e) ")"))
+        {:keys [violations]} (core/fold-balance [g e0 e1] {:hash-fn hash-fn})]
+    (is (some #(= :prev-hash-mismatch (:type %)) violations))))
+
+;; ── fork detection ─────────────────────────────────────────────────────────
+
+(deftest detect-fork-positive-same-seq-different-content
+  (let [a (mk-entry 0 "debit" 10 "genesis")
+        b (assoc (mk-entry 0 "debit" 999 "genesis") :db/id "engi/tx/0b" :engi/transfer-id "different")
+        forks (core/detect-fork [a b])]
+    (is (seq forks) "two entries at the same seq with different content must be flagged")
+    (is (some #(= :seq-fork (:kind %)) forks))))
+
+(deftest detect-fork-negative-clean-advancing-chain
+  (let [entries [(mk-entry 0 "credit" 10 "genesis")
+                 (mk-entry 1 "debit" 3 "h0")
+                 (mk-entry 2 "credit" 7 "h1")]]
+    (is (= [] (core/detect-fork entries)))))
+
+(deftest detect-fork-tolerates-identical-resend
+  ;; a retried write of the EXACT same entry (append-only log has no dedup)
+  ;; is not a fork.
+  (let [a (mk-entry 0 "debit" 10 "genesis")
+        a-resend (mk-entry 0 "debit" 10 "genesis")]
+    (is (= [] (core/detect-fork [a a-resend])))))
+
+;; ── bilateral confirmation ───────────────────────────────────────────────────
+
+(deftest unconfirmed-credit-with-no-matching-debit
+  (let [credit (mk-entry 0 "credit" 10 "genesis")]
+    (is (true? (core/unconfirmed-credit? credit [])))
+    (is (true? (core/unconfirmed-credit? credit [(mk-entry 0 "credit" 10 "genesis")]))
+        "a credit on the counterparty side (not a debit) still doesn't confirm it")))
+
+(deftest unconfirmed-credit-with-matching-debit-is-confirmed
+  (let [transfer-id "shared-transfer-id"
+        credit (assoc (mk-entry 0 "credit" 10 "genesis") :engi/transfer-id transfer-id)
+        matching-debit (assoc (mk-entry 4 "debit" 10 "h3") :engi/transfer-id transfer-id)]
+    (is (false? (core/unconfirmed-credit? credit [matching-debit])))))

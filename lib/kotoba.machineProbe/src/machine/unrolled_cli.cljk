@@ -1,0 +1,95 @@
+(ns machine.unrolled-cli
+  "`kbb -M:unrolled` — make the loop cheap enough for memory to be visible.
+
+  Three experiments in this repo have now failed for the same reason: the
+  per-element loop cost dwarfs the per-element memory cost, so no layout and
+  no tile can move the total. That is not a property of the machine, it is a
+  property of a summation loop that runs at floating-point add *latency*
+  because every add waits on the previous one.
+
+  Four independent accumulators break the chain. This measures what that buys,
+  and — the part that matters — whether it moves the AoS/SoA ratio toward the
+  16x the byte model predicts. If it does, the models become testable here. If
+  it does not, the next lever is a cheaper runtime, not a cheaper loop."
+  (:require [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [layout.core :as l]
+            [machine.bench :as b]
+            [machine.core :as m]
+            [machine.probe :as p]
+            [perfgate.core :as g]))
+
+(defn- platform []
+  (let [os (str/lower (System/getProperty "os.name" ""))]
+    (cond (str/includes? os "mac") :darwin
+          (str/includes? os "linux") :linux
+          :else :unknown)))
+
+(defn- mean [xs] (/ (reduce + 0.0 xs) (count xs)))
+(defn- ms [ns] (/ (Math/round (/ (double ns) 1000.0)) 1000.0))
+
+(defn -main [& args]
+  (let [n (or (some-> (first args) parse-long) 2000000)
+        width (or (some-> (second args) parse-long) 16)
+        reps (or (some-> (nth args 2 nil) parse-long) 30)
+        probed (p/probe {:platform (platform)
+                         :run (fn [cmd cmd-args] (:out (apply shell/sh cmd cmd-args)))})
+        mach (if (m/heterogeneous? probed) (m/for-cluster probed :performance) probed)
+        r (b/run-unrolled mach {:n n :width width :warmup 15 :reps reps})
+        pred (get-in r [:prediction :predicted-ratio])
+        obs (fn [id s] (g/observation {:id id :plan-id :particle-scan :machine mach
+                                       :metric :wall-ns :unit :ns :samples s
+                                       :source (str "machine.bench/run-unrolled n=" n)}))]
+    (println (:machine/id mach) "· line" (m/line-bytes mach) "B · n =" n "·"
+             width "doubles per AoS element")
+    (println "predicted byte ratio:" (format "%.2fx" pred))
+    (println)
+    (println (format "%-10s %10s %10s %10s %9s %9s"
+                     "variant" "AoS ms" "SoA ms" "ratio" "ns/elem" "SoA GB/s"))
+    (doseq [[label arms] [["serial" (:serial r)] ["unrolled x4" (:unrolled r)]]]
+      (let [am (mean (:aos arms)) sm (mean (:soa arms))]
+        (println (format "%-10s %10s %10s %9.2fx %9.2f %9.1f"
+                         label (ms am) (ms sm) (/ am sm)
+                         (/ sm (double n))
+                         (/ (* 8.0 n) sm)))))
+    (println)
+    ;; The interesting comparison is not AoS against SoA. It is the SoA arm
+    ;; against itself: did the loop get out of the memory system's way?
+    (let [v (g/qualify (obs :soa-unrolled (get-in r [:unrolled :soa]))
+                       (obs :soa-serial (get-in r [:serial :soa])))]
+      (println "loop change (SoA unrolled vs serial):")
+      (doseq [line (g/explain v)] (println line)))
+    (println)
+    ;; The headline: with the loop out of the way, does the layout choice
+    ;; itself now clear the gate?
+    (let [v (g/qualify (obs :soa-unrolled-layout (get-in r [:unrolled :soa]))
+                       (obs :aos-unrolled-layout (get-in r [:unrolled :aos])))]
+      (println "layout choice at the unrolled loop (SoA vs AoS):")
+      (doseq [line (g/explain v)] (println line))
+      (when (:qualified? v)
+        (let [c (g/claim v (obs :soa-unrolled-layout (get-in r [:unrolled :soa]))
+                         (obs :aos-unrolled-layout (get-in r [:unrolled :aos])))]
+          (println "  claim sealed · fingerprint" (:claim/fingerprint c)))))
+    (println)
+    (let [serial-ratio (/ (mean (get-in r [:serial :aos])) (mean (get-in r [:serial :soa])))
+          unrolled-ratio (/ (mean (get-in r [:unrolled :aos])) (mean (get-in r [:unrolled :soa])))
+          loop-ns (/ (mean (get-in r [:unrolled :soa])) (double n))
+          bw (/ (* 8.0 width n) (mean (get-in r [:unrolled :aos])))
+          fields (b/fields-of width)
+          roof (l/achievable-ratio mach {:baseline (l/aos mach fields)
+                                         :candidate (l/soa mach fields)
+                                         :n n
+                                         :access {:access/fields #{:f0} :access/stride 1}
+                                         :loop-ns-per-element loop-ns
+                                         :bandwidth-bytes-per-ns bw})]
+      (println (format "AoS/SoA ratio: %.2fx serial -> %.2fx unrolled (byte model says %.2fx)"
+                       serial-ratio unrolled-ratio pred))
+      (println (format "roofline on the new numbers (loop %.2f ns/elem, %.1f GB/s): %.2fx · both-memory-bound? %s"
+                       loop-ns bw (:achievable-ratio roof) (:both-memory-bound? roof)))
+      (println)
+      (println (if (:both-memory-bound? roof)
+                 "=> memory now dominates both arms: the layout and tiling experiments are testable here."
+                 (str "=> the " (name (get-in roof [:candidate :bound-by]))
+                      " still bounds the SoA arm. A cheaper loop is not enough;"
+                      " the next lever is a cheaper runtime."))))
+    (flush)))
