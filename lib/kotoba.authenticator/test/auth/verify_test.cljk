@@ -1,0 +1,109 @@
+(ns auth.verify-test
+  "Accepting a code, on the JVM.
+
+  Every case here is a way a second factor fails in production without
+  erroring: a window too narrow to tolerate a real phone's clock, a window
+  wide enough to be a replay window, a correct code refused because a password
+  manager pasted a space."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [auth.otp :as otp]
+            [auth.verify :as verify]))
+
+(def ^:private secret (mapv int (map #(bit-and (int %) 0xff) "12345678901234567890")))
+
+(defn- codes-at
+  "The window's codes, computed the ordinary synchronous way — so these tests
+  exercise the SAME arithmetic the async host will, and a divergence between
+  them shows up as a failure here rather than as a customer who cannot sign in."
+  [unix-seconds window]
+  (let [c (otp/counter-for unix-seconds)]
+    (into {} (map (fn [n] [n (otp/hotp secret n)]) (verify/window-counters c window)))))
+
+(deftest window-is-counted-in-steps
+  (testing "the default admits one step either side"
+    (is (= [99 100 101] (vec (verify/window-counters 100)))))
+  (testing "zero means only the current step"
+    (is (= [100] (vec (verify/window-counters 100 0)))))
+  (testing "a wider window is symmetric"
+    (is (= [97 98 99 100 101 102 103] (vec (verify/window-counters 100 3)))))
+  (testing "nonsense falls back to the default rather than opening the window"
+    ;; A window that widens when its config is wrong is the one failure mode a
+    ;; drift window must not have.
+    (is (= [99 100 101] (vec (verify/window-counters 100 -5))))
+    (is (= [99 100 101] (vec (verify/window-counters 100 nil))))
+    (is (= [99 100 101] (vec (verify/window-counters 100 "2"))))))
+
+(deftest normalize-accepts-what-people-actually-type
+  (is (= "123456" (verify/normalize "123 456")) "authenticator apps show a space")
+  (is (= "123456" (verify/normalize "123-456")))
+  (is (= "123456" (verify/normalize " 123456\n")))
+  (is (= "123456" (verify/normalize "123 456")) "a pasted non-breaking space")
+  (is (nil? (verify/normalize nil)))
+  (is (= "" (verify/normalize "abcdef")) "letters are not digits"))
+
+(deftest a-current-code-is-accepted
+  (let [t 1111111109
+        codes (codes-at t 1)
+        counter (otp/counter-for t)]
+    (is (= {:ok? true :counter counter}
+           (verify/verdict {:presented (get codes counter) :codes codes})))))
+
+(deftest drift-is-tolerated-in-both-directions
+  (let [t 1111111109
+        codes (codes-at t 1)
+        counter (otp/counter-for t)]
+    (testing "a phone 30 seconds slow"
+      (is (= {:ok? true :counter (dec counter)}
+             (verify/verdict {:presented (get codes (dec counter)) :codes codes}))))
+    (testing "a phone 30 seconds fast"
+      (is (= {:ok? true :counter (inc counter)}
+             (verify/verdict {:presented (get codes (inc counter)) :codes codes}))))
+    (testing "two steps out is outside the default window"
+      (is (= {:ok? false :reason :no-match}
+             (verify/verdict {:presented (otp/hotp secret (+ counter 2)) :codes codes}))))))
+
+(deftest a-spent-counter-is-never-accepted-again
+  (let [t 1111111109
+        codes (codes-at t 1)
+        counter (otp/counter-for t)]
+    (testing "the same code inside its own step"
+      ;; 30 seconds is long enough to read a code over a shoulder or to
+      ;; capture one on a phishing page. Without this, a wider drift window is
+      ;; a longer replay window.
+      (is (= {:ok? false :reason :replayed :counter counter}
+             (verify/verdict {:presented (get codes counter) :codes codes
+                              :last-used counter}))))
+
+    (testing "and an older one that drift would otherwise admit"
+      (is (= {:ok? false :reason :replayed :counter (dec counter)}
+             (verify/verdict {:presented (get codes (dec counter)) :codes codes
+                              :last-used counter}))))
+
+    (testing "but the next step is fine"
+      (is (= {:ok? true :counter (inc counter)}
+             (verify/verdict {:presented (get codes (inc counter)) :codes codes
+                              :last-used counter}))))
+
+    (testing "replay is distinguishable from a wrong code"
+      ;; Both are refusals and must look identical to the person typing. They
+      ;; are not the same event: a replay is a code that WAS valid.
+      (is (= :replayed (:reason (verify/verdict {:presented (get codes counter)
+                                                 :codes codes :last-used counter}))))
+      (is (= :no-match (:reason (verify/verdict {:presented "000000" :codes codes
+                                                 :last-used counter})))))))
+
+(deftest malformed-is-refused-before-any-comparison
+  (let [codes (codes-at 1111111109 1)]
+    (is (= :malformed (:reason (verify/verdict {:presented "12345" :codes codes}))))
+    (is (= :malformed (:reason (verify/verdict {:presented "1234567" :codes codes}))))
+    (is (= :malformed (:reason (verify/verdict {:presented "" :codes codes}))))
+    (is (= :malformed (:reason (verify/verdict {:presented nil :codes codes}))))
+    (is (= :malformed (:reason (verify/verdict {:presented "abcdef" :codes codes}))))
+    (testing "an empty window matches nothing rather than everything"
+      (is (= :no-match (:reason (verify/verdict {:presented "123456" :codes {}})))))))
+
+(deftest a-code-matching-two-counters-resolves-to-the-newest
+  ;; Only reachable with a degenerate secret, but the tie has to break
+  ;; somewhere, and the newest is the one a replay check can bound.
+  (is (= {:ok? true :counter 101}
+         (verify/verdict {:presented "111111" :codes {99 "111111" 101 "111111"}}))))

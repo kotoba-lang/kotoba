@@ -1,0 +1,149 @@
+(ns kekkai.cli
+  "CLI operations for Kekkai status and signed netmap distribution.
+
+  `status` is a minimal `kekkai.query` read against an EDN-seeded MemStore —
+  no StateGraph/checkpointer/advisor spun up — for process-boundary consumers
+  such as Murakumo. Fleet consumers use the portable `kekkai.status-cli`
+  batch entrypoint. `netmap-publish`, `netmap-pull`, and `netmap-watch` bridge
+  the signed control-plane record to the signed netmap file consumed by a
+  resident Kekkai node."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kekkai.cacao :as cacao]
+            [kekkai.desired-state :as desired]
+            [kekkai.envelope :as envelope]
+            [kekkai.netmap-distribution :as distribution]
+            [kekkai.query :as query]
+            [kekkai.store :as store]))
+
+(defn- status! [ledger-path node-id]
+  (let [data (edn/read-string (slurp ledger-path))
+        st (store/->MemStore (atom (merge {:ledger [] :assessments {}} data)))
+        status (query/status-of st node-id)]
+    (println status)
+    (System/exit (if (= "authorized" status) 0 1))))
+
+(defn- roots [csv]
+  (let [values (->> (str/split csv #",") (remove str/blank?) vec)]
+    (when-not (seq values)
+      (throw (ex-info "at least one desired-state root is required"
+                      {:type :kekkai/missing-desired-root})))
+    values))
+
+(defn- publish-netmap!
+  [[netmap-path identity-path roots-csv subject epoch previous-cid min-copies]]
+  (when-not (every? some? [netmap-path identity-path roots-csv subject epoch])
+    (throw (ex-info "usage: netmap-publish NETMAP IDENTITY ROOTS SUBJECT EPOCH [PREVIOUS_CID] [MIN_COPIES]"
+                    {:type :kekkai/invalid-cli-arguments})))
+  (let [identity (cacao/load-or-create-identity! identity-path)
+        mirror-roots (roots roots-csv)
+        result (distribution/publish!
+                {:roots mirror-roots
+                 :min-copies (if min-copies (parse-long min-copies) (count mirror-roots))
+                 :netmap (edn/read-string (slurp netmap-path))
+                 :subject subject
+                 :epoch (parse-long epoch)
+                 :previous-cid (when-not (str/blank? previous-cid) previous-cid)}
+                identity)]
+    (println (pr-str (assoc result :desired/authority-spki-b64
+                           (desired/authority-spki-b64 identity))))))
+
+(defn- install-newer-netmap! [output-path authority node-envelope netmap]
+  (let [file (java.io.File. output-path)
+        current (when (.exists file)
+                  (let [text (slurp file)
+                        current-envelope (edn/read-string text)
+                        current-netmap (envelope/verify current-envelope authority)]
+                    {:envelope current-envelope :netmap current-netmap}))
+        current-version (get-in current [:netmap :netmap/version])
+        new-version (:netmap/version netmap)]
+    (cond
+      (nil? current)
+      (do (distribution/write-node-file! output-path node-envelope) true)
+
+      (> new-version current-version)
+      (do (distribution/write-node-file! output-path node-envelope) true)
+
+      (= new-version current-version)
+      (if (= node-envelope (:envelope current))
+        false
+        (throw (ex-info "different signed netmap already occupies this version"
+                        {:type :kekkai/netmap-version-conflict
+                         :version new-version})))
+
+      :else
+      (throw (ex-info "netmap pull would roll back the installed version"
+                      {:type :kekkai/netmap-version-rollback
+                       :installed current-version :received new-version})))))
+
+(defn- pull-netmap!
+  [[roots-csv subject authority min-epoch previous-cid output-path]]
+  (when-not (every? some? [roots-csv subject authority])
+    (throw (ex-info "usage: netmap-pull ROOTS SUBJECT AUTHORITY_SPKI [MIN_EPOCH] [PREVIOUS_CID] [OUTPUT_FILE]"
+                    {:type :kekkai/invalid-cli-arguments})))
+  (let [result (distribution/pull
+                {:roots (roots roots-csv)
+                 :subject subject
+                 :authority-spki-b64 authority
+                 :min-epoch (some-> min-epoch parse-long)
+                 :previous-cid (when-not (str/blank? previous-cid) previous-cid)})
+        node-envelope (:desired/payload result)
+        netmap (envelope/verify node-envelope authority)
+        installed (when output-path
+                    (when (install-newer-netmap! output-path authority
+                                                 node-envelope netmap)
+                      (.getAbsolutePath (java.io.File. output-path))))
+        result (cond-> (assoc result :netmap/version (:netmap/version netmap))
+                 installed (assoc :netmap/file installed))]
+    (println (pr-str result))))
+
+(defn- watch-netmap!
+  [[roots-csv subject authority output-path poll-ms]]
+  (when-not (every? some? [roots-csv subject authority output-path])
+    (throw (ex-info "usage: netmap-watch ROOTS SUBJECT AUTHORITY_SPKI OUTPUT_FILE [POLL_MS]"
+                    {:type :kekkai/invalid-cli-arguments})))
+  (let [mirror-roots (roots roots-csv)
+        interval (if poll-ms (parse-long poll-ms) 5000)
+        last-error (atom nil)]
+    (when-not (and interval (<= 250 interval 3600000))
+      (throw (ex-info "netmap-watch POLL_MS must be in 250..3600000"
+                      {:type :kekkai/invalid-poll-interval :value poll-ms})))
+    (println (pr-str {:event :netmap-watch-started
+                      :subject subject :output output-path
+                      :poll-ms interval}))
+    (while true
+      (try
+        (let [result (distribution/pull
+                      {:roots mirror-roots
+                       :subject subject
+                       :authority-spki-b64 authority})
+              node-envelope (:desired/payload result)
+              netmap (envelope/verify node-envelope authority)
+              updated? (install-newer-netmap! output-path authority
+                                              node-envelope netmap)]
+          (when updated?
+            (println (pr-str {:event :netmap-installed
+                              :subject subject
+                              :desired-cid (:desired/cid result)
+                              :desired-epoch (:desired/epoch result)
+                              :netmap-version (:netmap/version netmap)
+                              :output output-path})))
+          (reset! last-error nil))
+        (catch Exception error
+          (let [message (or (.getMessage error) "netmap watch failed")]
+            (when-not (= message @last-error)
+              (println (pr-str {:event :netmap-watch-error :reason message})))
+            (reset! last-error message))))
+      (Thread/sleep interval))))
+
+(defn -main [& args]
+  (case (first args)
+    "status" (apply status! (rest args))
+    "netmap-publish" (publish-netmap! (rest args))
+    "netmap-pull" (pull-netmap! (rest args))
+    "netmap-watch" (watch-netmap! (rest args))
+    ;; Backward-compatible status form.
+    (if (= 2 (count args))
+      (apply status! args)
+      (throw (ex-info "usage: kekkai.cli [status LEDGER NODE | netmap-publish ... | netmap-pull ... | netmap-watch ...]"
+                      {:type :kekkai/invalid-cli-command :args args})))))

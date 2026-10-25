@@ -1,0 +1,165 @@
+(ns ichiran.resend
+  "Opt-in REAL email Distributor for `ichiran.tallyport/publish!`, wired to
+  Resend (the same provider `cloud-itonami.mail` already depends on — see
+  that ns for the proven `jvm-http-fn`/`send-message-via-resend!`/
+  `resend-api-key` shape this namespace mirrors).
+
+  `ichiran.tallyport/mock-tallyport` stays the actor's DEFAULT — this ns is
+  never reached unless a caller explicitly constructs and injects
+  `(resend-tallyport store {:from ...})` via `ichiran.operation/build`'s
+  `:tallyport` opt (ADR-2607062030 Consequences: real Distributor clients
+  need per-provider API tokens/live binding, closed here for Resend only).
+
+  Attachment format: `kotoba-lang/sheets` has no CSV/xlsx export (checked
+  directly — `sheets.model`/`sheets.wire` only offer the Transit JSON wire
+  envelope). `publish!` therefore attaches the same best-effort
+  `sheets.wire/workbook-envelope` Kotoba Transit JSON `ichiran.tallyport`'s
+  `mock-tallyport` already produces for its wire preview — here it becomes
+  the actual delivered attachment instead of a preview, base64-encoded per
+  Resend's `attachments[].content` contract. The email BODY is a small
+  human-readable text summary of the workbook's tabs/cells (built from
+  `sheets.model`'s own public accessors) so a recipient can read the report
+  without opening the attachment.
+
+  JSON: `mail.message`/`mailer.core` are provider-agnostic and never touch
+  JSON; this ns is the one place (like `cloud_itonami.mail`) that actually
+  encodes/decodes the wire body and touches the network. It uses
+  `kotoba-lang/json` (`kotoba.lang.json`, the pure-Clojure encode/decode at
+  the sha ichiran already pulls in transitively via `langgraph`→
+  `langchain`) rather than adding a new third-party JSON dep — same 'stays
+  dependency-free' reasoning `ichiran.kotoba`'s docstring gives for
+  injecting JSON fns instead of hard-depending on one. Unlike
+  `cloud_itonami.mail`'s cheshire, `kotoba.lang.json/decode` returns STRING
+  keys (`(get resp-body \"id\")`, not `(:id resp-body)`) — see its own
+  docstring.
+
+  Ledger: on a successful send, the Resend message id is recorded on the
+  artifact's `:draft` store record as `:tool (str \"resend:\" id)` — the
+  ichiran analog of `cloud_itonami.mail`'s `:itonami.effect/tool
+  (str \"resend:\" id)` pattern — plus a `:delivered` ichiran ledger fact,
+  both via the SAME `store` the actor already writes through
+  (`ichiran.store/record-datom!`/`append-ledger!`). This ns does NOT touch
+  `ichiran.operation`'s shared StateGraph commit path — the mock default's
+  behavior (and its tests) are completely unaffected either way; only a
+  caller that actually injects `resend-tallyport` gets these extra facts."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kotoba.lang.json :as json]
+            [mail.message :as message]
+            [mailer.core :as mailer]
+            [sheets.wire :as wire]
+            [ichiran.kotoba :as kotoba]
+            [ichiran.store :as store]
+            [ichiran.tallyport :as tallyport]))
+
+(defn- resend-api-key []
+  (or (System/getenv "RESEND_API_KEY")
+      (throw (ex-info "RESEND_API_KEY is not set" {}))))
+
+(defn- b64-encode ^String [^String s]
+  (kbytes/base64-encode (kbytes/utf8-bytes s)))
+
+(defn- transit-attachment
+  "Best-effort Transit JSON attachment (same defensive shape as
+  `ichiran.tallyport`'s private `try-export-transit`: a malformed/nil
+  workbook, or any encoding failure, degrades to nil — publish! must not
+  fail the actual delivery just because the richer attachment couldn't be
+  built) — a Resend `attachments[]` entry, base64-encoded."
+  [content]
+  (when content
+    (when-let [envelope (try (wire/workbook-envelope content)
+                              (catch Exception _ nil))]
+      {:filename (str (or (:sheets/id content) "workbook") ".transit.json")
+       :content_type "application/json"
+       :content (b64-encode (json/encode (:body envelope)))})))
+
+(defn- cell-text [[[row col] cell]]
+  (str "  R" row "C" col ": "
+       (cond
+         (contains? cell :sheets/value) (str (:sheets/value cell))
+         (contains? cell :sheets/formula) (str "=" (:sheets/formula cell))
+         :else "")))
+
+(defn- tab-text [t]
+  (str (or (:sheets/title t) (:sheets/id t)) ":\n"
+       (str/join "\n" (map cell-text (sort-by first (:sheets/cells t))))))
+
+(defn workbook-summary-text
+  "A simple human-readable text summary of a sheets.model workbook's tabs
+  and cells — the email BODY fallback (kotoba-lang/sheets has no CSV/xlsx
+  export to render instead; the richer Transit JSON goes as the attachment,
+  see `transit-attachment`)."
+  [content]
+  (if content
+    (str "Workbook: " (or (:sheets/id content) "(untitled)") "\n\n"
+         (str/join "\n\n" (map tab-text (sort-by :sheets/id (vals (:sheets/tabs content))))))
+    "(no workbook content)"))
+
+(defn send-tally-email!
+  "POST a `mail.message/message` `m` (with `attachments`, a vector of
+  Resend `{:filename :content_type :content}` maps) to Resend via `http-fn`
+  (default `ichiran.kotoba/jvm-http-fn`, a real network call — the same
+  `{:url :method :headers :body} -> {:status :body}` contract
+  `cloud_itonami.mail/jvm-http-fn` uses). Returns the parsed JSON response
+  body (STRING keys, `kotoba.lang.json/decode`). Throws on a non-2xx status
+  or a missing RESEND_API_KEY (via `token`)."
+  ([m attachments] (send-tally-email! m attachments {}))
+  ([m attachments {:keys [http-fn token]}]
+   ;; `(or http-fn kotoba/jvm-http-fn)` rather than a `:or` destructuring
+   ;; default -- `:or` only fires when the key is ABSENT, not when a caller
+   ;; forwards an explicit `nil` (e.g. resend-tallyport passing through its
+   ;; own unset :http-fn opt) -- a real NPE hit during this ns's own live
+   ;; verification, fixed here rather than left as a latent footgun.
+   (let [http-fn (or http-fn kotoba/jvm-http-fn)
+         request (-> (mailer/request :resend {:mail.effect/type :mail/send :mail.effect/message m})
+                     (update :http/json assoc :attachments (or attachments [])))
+         resp (http-fn {:url (:http/url request)
+                        :method :post
+                        :headers {"Authorization" (str "Bearer " (or token (resend-api-key)))
+                                  "Content-Type" "application/json"}
+                        :body (json/encode (:http/json request))})
+         resp-body (json/decode (:body resp))]
+     (when-not (< (:status resp) 300)
+       (throw (ex-info "Resend send failed" {:status (:status resp) :body resp-body})))
+     resp-body)))
+
+(defn resend-tallyport
+  "A REAL email-delivery `ichiran.tallyport/TallyTarget`: `publish!` sends
+  the human-approved draft's workbook content to `target` (a recipient
+  email address) via Resend. `fetch-workbook`/`propose-revision!` delegate
+  to an inner `mock-tallyport` (same deterministic in-memory bookkeeping
+  the default target already has) — this ns only replaces the REAL
+  DELIVERY half of the port; injecting it still gets the usual
+  propose-revision!/fetch-workbook behavior for the `:tally/draft` flow,
+  only `publish!` (`:tally/publish`) touches the network.
+
+  opts:
+    :from     REQUIRED verified Resend sender address — no convention to
+              default to (this actor has none of its own; see
+              `cloud_itonami.mail/send-marketing-outreach!` for the same
+              caller-supplies-it requirement), so this throws rather than
+              guessing/hardcoding one.
+    :http-fn  override transport (default `ichiran.kotoba/jvm-http-fn`, a
+              real network call) — inject a stub for tests.
+    :token    override RESEND_API_KEY (default: read the env var lazily,
+              only at send time, so constructing/testing this needs no
+              credential at all)."
+  [store {:keys [from http-fn token]}]
+  (when (str/blank? from)
+    (throw (ex-info "resend-tallyport requires :from (a verified Resend sender address)" {})))
+  (let [inner (tallyport/mock-tallyport)]
+    (reify tallyport/TallyTarget
+      (fetch-workbook [_ activity] (tallyport/fetch-workbook inner activity))
+      (propose-revision! [_ activity content] (tallyport/propose-revision! inner activity content))
+      (publish! [_ activity target draft]
+        (let [content (:content draft)
+              m (message/message {:from from :to target
+                                  :subject (str "Tally report: " (:title activity (:id activity)))
+                                  :text (workbook-summary-text content)})
+              attachment (transit-attachment content)
+              resp-body (send-tally-email! m (if attachment [attachment] [])
+                                          {:http-fn http-fn :token token})
+              msg-id (get resp-body "id")]
+          (store/record-datom! store {:kind :draft :id (:id activity) :value {:tool (str "resend:" msg-id)}})
+          (store/append-ledger! store {:t :delivered :op :tally/publish :subject (:id activity)
+                                       :disposition :delivered :tool (str "resend:" msg-id) :target target})
+          (tallyport/publish! inner activity target draft))))))

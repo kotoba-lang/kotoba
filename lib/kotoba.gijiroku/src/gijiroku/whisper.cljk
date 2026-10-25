@@ -1,0 +1,84 @@
+(ns gijiroku.whisper
+  "Transcriber backed by an OpenAI-compatible Whisper transcription endpoint
+  (`POST /v1/audio/transcriptions`, multipart/form-data, response_format
+  verbose_json for segment timestamps) — the STT the bot-join Platform path
+  needs, since browser-captured audio carries no platform-native transcript.
+  I/O is injected (:http-fn), same host-caps discipline as the rest of
+  gijiroku; jvm-http-fn is provided for convenience. Verbose_json has no
+  speaker field — segments come back with :speaker nil (see
+  gijiroku.transcriber docstring)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [kotoba.lang.text :as str]
+            [gijiroku.transcriber :as t])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.nio.file Paths]
+           [java.util UUID]))
+
+(defn jvm-http-fn
+  "host-caps :http-fn backed by the JDK HTTP client (no dependency)."
+  [{:keys [url method headers body-bytes]}]
+  (let [b (HttpRequest/newBuilder (URI/create url))]
+    (doseq [[k v] headers] (.header b k v))
+    (let [req (-> b (.method (str/upper (name (or method :post)))
+                            (HttpRequest$BodyPublishers/ofByteArray body-bytes))
+                  (.build))
+          resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp) :body (.body resp)})))
+
+;; ───────────────────────── multipart/form-data ─────────────────────────
+
+(defn- boundary [] (str "gijiroku-" (UUID/randomUUID)))
+
+(defn- field-part [boundary name value]
+  (str "--" boundary "\r\n"
+       "Content-Disposition: form-data; name=\"" name "\"\r\n\r\n"
+       value "\r\n"))
+
+(defn- file-part-header [boundary field-name filename content-type]
+  (str "--" boundary "\r\n"
+       "Content-Disposition: form-data; name=\"" field-name "\"; filename=\"" filename "\"\r\n"
+       "Content-Type: " content-type "\r\n\r\n"))
+
+(defn- multipart-body
+  "Build the raw bytes of a multipart/form-data body carrying `fields`
+  ({name value}) plus one file field reading `audio-path`."
+  ^bytes [bnd fields audio-path]
+  (let [out (java.io.ByteArrayOutputStream.)
+        write! (fn [^String s] (.write out (kbytes/utf8-bytes s)))]
+    (doseq [[k v] fields] (write! (field-part bnd (name k) (str v))))
+    (write! (file-part-header bnd "file" (.getFileName (Paths/get audio-path (into-array String []))) "audio/wav"))
+    (.write out ^bytes (kio/read-all-bytes audio-path))
+    (write! "\r\n")
+    (write! (str "--" bnd "--\r\n"))
+    (.toByteArray out)))
+
+;; ───────────────────────── normalization ─────────────────────────
+
+(defn segment->model
+  "Normalize one Whisper verbose_json segment into a gijiroku.model segment."
+  [{:keys [id text start end]}]
+  {:seg-id (str id) :speaker nil :t0 (long start) :t1 (long end)
+   :text (str/trim (or text "")) :sensitive #{}})
+
+(defrecord WhisperTranscriber [cfg]
+  t/Transcriber
+  (-transcribe [_ audio-path]
+    (let [{:keys [http-fn json-read url model api-key lang]
+           :or   {url "https://api.openai.com/v1/audio/transcriptions" model "whisper-1"}} cfg
+          bnd  (boundary)
+          body (multipart-body bnd (cond-> {:model model :response_format "verbose_json"}
+                                     lang (assoc :language lang))
+                                audio-path)
+          resp (http-fn {:method :post :url url :body-bytes body
+                         :headers {"Authorization" (str "Bearer " api-key)
+                                   "Content-Type" (str "multipart/form-data; boundary=" bnd)}})
+          parsed (json-read (:body resp))]
+      {:id (str "t-" (hash audio-path)) :meeting-id nil :source :stt-generated
+       :lang (or lang "ja") :segments (mapv segment->model (:segments parsed))})))
+
+(defn whisper-transcriber
+  "cfg: {:url (default OpenAI) :model (default \"whisper-1\") :api-key :lang
+         :http-fn (default jvm-http-fn) :json-read}"
+  [{:keys [http-fn] :as cfg}]
+  (->WhisperTranscriber (assoc cfg :http-fn (or http-fn jvm-http-fn))))

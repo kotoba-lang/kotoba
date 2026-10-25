@@ -1,0 +1,116 @@
+(ns comfyui.clip.encoder-test
+  (:require [kotoba.test :refer [deftest is]]
+            [comfyui.clip.encoder :as clip]
+            [num.array :as arr]
+            [num.cpu :as cpu]))
+
+(def backend (cpu/cpu-backend))
+
+(defn- matrix [rows columns f]
+  (arr/from-vec backend
+                (vec (for [row (range rows) column (range columns)]
+                       (double (f row column))))
+                [rows columns]))
+
+(defn- vector* [values] (arr/from-vec backend values [(count values)]))
+
+(deftest checkpoint-backed-causal-clip-transformer-encodes-tokens
+  (let [identity4 (matrix 4 4 #(if (= %1 %2) 1.0 0.0))
+        zero4 (vector* [0 0 0 0])
+        one4 (vector* [1 1 1 1])
+        arrays
+        {"token" (matrix 6 4 #(* 0.05 (+ 1 (* %1 4) %2)))
+         "position" (matrix 5 4 #(* 0.01 (+ %1 %2)))
+         "n1.w" one4 "n1.b" zero4
+         "q.w" identity4 "q.b" zero4
+         "k.w" identity4 "k.b" zero4
+         "v.w" identity4 "v.b" zero4
+         "o.w" identity4 "o.b" zero4
+         "n2.w" one4 "n2.b" zero4
+         "fc1.w" (matrix 8 4 #(if (= (mod %1 4) %2) 0.5 0.0))
+         "fc1.b" (vector* (repeat 8 0.0))
+         "fc2.w" (matrix 4 8 #(if (or (= %2 %1) (= %2 (+ 4 %1))) 0.25 0.0))
+         "fc2.b" zero4
+         "final.w" one4 "final.b" zero4}
+        reads (atom 0)
+        component {:comfyui/read-tensor
+                   (fn [_ name] (swap! reads inc) (get arrays name))}
+        layer {:norm1-weight "n1.w" :norm1-bias "n1.b"
+               :query-weight "q.w" :query-bias "q.b"
+               :key-weight "k.w" :key-bias "k.b"
+               :value-weight "v.w" :value-bias "v.b"
+               :output-weight "o.w" :output-bias "o.b"
+               :norm2-weight "n2.w" :norm2-bias "n2.b"
+               :fc1-weight "fc1.w" :fc1-bias "fc1.b"
+               :fc2-weight "fc2.w" :fc2-bias "fc2.b"}
+        spec {:token-embedding "token" :position-embedding "position"
+              :layers [layer] :heads 2
+              :final-norm-weight "final.w" :final-norm-bias "final.b"}
+        encode (clip/compile-encoder component backend spec)
+        tokens {:input-ids [1 2 3 4 0] :attention-mask [1 1 1 1 0]}
+        result (encode tokens)]
+    (is (= [1 5 4] (:shape (:tensor result))))
+    (is (= [1 4] (:shape (:pooled result))))
+    (is (every? #(Double/isFinite %) (arr/->vec (:tensor result))))
+    (is (= 20 @reads))
+    (encode tokens)
+    (is (= 20 @reads) "all transformer weights remain cached")))
+
+(deftest dual-encoder-concatenates-conditioning-and-uses-second-pool
+  (let [left {:tensor (arr/from-vec backend (range 24) [1 3 8])
+              :pooled (arr/from-vec backend (range 8) [1 8])}
+        right {:tensor (arr/from-vec backend (range 12) [1 3 4])
+               :pooled (arr/from-vec backend [9 8 7 6] [1 4])}
+        released (atom [])]
+    (with-redefs [clip/compile-encoder
+                  (fn [_ _ spec] (fn [_] (if (= :left (:id spec)) left right)))
+                  arr/release! (fn [tensor] (swap! released conj tensor))]
+      (let [encode (clip/compile-dual-encoder {} backend
+                                               {:mode :dual
+                                                :encoders [{:id :left} {:id :right}]})
+            result (encode {:input-ids [1 2 3]})]
+        (is (= [1 3 12] (:shape (:tensor result))))
+        (is (= [1 4] (:shape (:pooled result))))
+        (is (= [9.0 8.0 7.0 6.0] (arr/->vec (:pooled result))))
+        (is (nil? (:clip-l result)))
+        (is (= #{(:handle (:tensor left)) (:handle (:tensor right))
+                 (:handle (:pooled left))}
+               (set (map :handle @released))))))))
+
+(deftest openclip-fused-qkv-penultimate-and-projection-execute
+  (let [identity2 (matrix 2 2 #(if (= %1 %2) 1.0 0.0))
+        zero2 (vector* [0 0])
+        one2 (vector* [1 1])
+        arrays-f32 {"token" (matrix 6 2 #(* 0.1 (+ 1 %1 %2)))
+                "position" (matrix 3 2 #(* 0.01 (+ %1 %2)))
+                "n1.w" one2 "n1.b" zero2
+                "in.w" (matrix 6 2 #(if (= (mod %1 2) %2) 1.0 0.0))
+                "in.b" (vector* (repeat 6 0.0))
+                "out.w" identity2 "out.b" zero2
+                "n2.w" one2 "n2.b" zero2
+                "fc1.w" (matrix 4 2 #(if (= (mod %1 2) %2) 0.5 0.0))
+                "fc1.b" (vector* (repeat 4 0.0))
+                "fc2.w" (matrix 2 4 #(if (= (mod %2 2) %1) 0.25 0.0))
+                "fc2.b" zero2 "final.w" one2 "final.b" zero2
+                "projection" identity2}
+        arrays (into {} (map (fn [[name tensor]] [name (arr/cast tensor :f16)]))
+                     arrays-f32)
+        component {:comfyui/read-tensor (fn [_ name] (get arrays name))}
+        layer {:norm1-weight "n1.w" :norm1-bias "n1.b"
+               :in-proj-weight "in.w" :in-proj-bias "in.b"
+               :output-weight "out.w" :output-bias "out.b"
+               :norm2-weight "n2.w" :norm2-bias "n2.b"
+               :fc1-weight "fc1.w" :fc1-bias "fc1.b"
+               :fc2-weight "fc2.w" :fc2-bias "fc2.b"}
+        encode (clip/compile-encoder
+                component backend
+                {:token-embedding "token" :position-embedding "position"
+                 :layers [layer] :heads 1 :final-norm-weight "final.w"
+                 :final-norm-bias "final.b" :return-penultimate? true
+                 :text-projection "projection"})
+        result (encode {:input-ids [1 2 0] :attention-mask [1 1 0]})]
+    (is (= [1 3 2] (:shape (:tensor result))))
+    (is (= [1 2] (:shape (:pooled result))))
+    (is (= :f16 (:dtype (:tensor result))))
+    (is (= :f16 (:dtype (:pooled result))))
+    (is (every? #(Double/isFinite %) (arr/->vec (:tensor result))))))

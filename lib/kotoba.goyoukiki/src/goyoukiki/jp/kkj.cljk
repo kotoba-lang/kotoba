@@ -1,0 +1,157 @@
+(ns goyoukiki.jp.kkj
+  "Real ingestion connector for 官公需情報ポータルサイト (kkj.go.jp, operated by
+  中小企業庁/the SME Agency) — a live search API aggregating 入札公告 (open
+  tender announcements) sourced from national ministries, independent
+  administrative agencies, universities, and local governments — 全省庁 AND
+  団体 in one feed, exactly the breadth ADR-2607070200 scoped goyoukiki's
+  ingest side to. Verified against the real, documented API (検索APIガイド
+  V1.1) 2026-07: a live query against http://www.kkj.go.jp/api/ returned
+  343,405 real hits including e.g. 国立大学法人岡山大学 (a 独立行政法人-class
+  body, not a central ministry) publishing a tender whose eligibility clause
+  literally cites 全省庁統一資格 category/rank — confirming this feed's shape
+  matches goyoukiki's opportunity/candidate eligibility model directly.
+
+  This namespace is JVM-only (java.net.http + a minimal DOM XML parse) — it
+  is NOT loaded by the .cljc control-plane core; it is an ingest-side
+  adapter that turns real API results into goyoukiki.model/opportunity
+  ground facts and registers them via goyoukiki.operation/register! (no
+  LLM, no governor — ingest is always-on observe, per the actor's charter).
+
+  Usage terms: this connector only ever fetches PUBLIC tender announcements
+  through the official documented search API, using only the parameters the
+  API guide itself documents — no scraping outside the API, no exceeding
+  documented Count limits. Use is subject to kkj.go.jp's own 利用規約 (terms
+  of use), which callers must independently accept — this namespace does not
+  bundle or route around it."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [goyoukiki.model :as model]
+            [goyoukiki.operation :as op]
+            [kotoba.ontology.connector :as connector])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+           [javax.xml.parsers DocumentBuilderFactory]
+           [org.w3c.dom Element NodeList]
+           [java.io ByteArrayInputStream]))
+
+(def ^:private base-url "http://www.kkj.go.jp/api/")
+
+(defn- url-encode [s] (form-urlencoded/form-encode (str s)))
+
+(defn- query-string [params]
+  (str/join "&" (for [[k v] params :when (some? v)] (str (name k) "=" (url-encode v)))))
+
+(defn fetch-xml
+  "GET the kkj.go.jp search API with `params` (e.g. {:Query \"...\"
+  :Organization_Name \"...\" :Category 3 :Certification \"A,B,C\"
+  :Count 100}). At least one of Query/Project_Name/Organization_Name/LG_Code
+  is required by the API (検索APIガイド §3) — this fn does not validate that,
+  the API itself returns an <Error> which parse-results surfaces as an
+  ex-info. Returns the raw XML response body."
+  [params]
+  (let [req  (-> (HttpRequest/newBuilder (URI/create (str base-url "?" (query-string params))))
+                 (.GET) (.build))
+        resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))]
+    (.body resp)))
+
+(defn- text [^Element el ^String tag]
+  (let [^NodeList nl (.getElementsByTagName el tag)]
+    (when (pos? (.getLength nl))
+      (not-empty (.getTextContent (.item nl 0))))))
+
+(defn parse-results
+  "Parse a kkj.go.jp API XML response body (検索APIガイド §4) into a seq of
+  raw maps, one per <SearchResult>. Throws ex-info on an <Error> response
+  (surfaces the government API's own error message rather than silently
+  returning nothing — 'search disabled'/'invalid sort'/etc are real
+  operational signals a caller should see, not swallow)."
+  [xml-body]
+  (let [doc  (-> (DocumentBuilderFactory/newInstance) .newDocumentBuilder
+                 (.parse (ByteArrayInputStream. (kbytes/utf8-bytes ^String xml-body))))
+        root (.getDocumentElement doc)]
+    (when-let [err (text root "Error")]
+      (throw (ex-info (str "kkj.go.jp API error: " err) {:error err})))
+    (let [nodes (.getElementsByTagName root "SearchResult")]
+      (vec (for [i (range (.getLength nodes))]
+             (let [^Element el (.item nodes i)]
+               {:key (text el "Key")
+                :external-uri (text el "ExternalDocumentURI")
+                :project-name (text el "ProjectName")
+                :organization-name (text el "OrganizationName")
+                :prefecture-name (text el "PrefectureName")
+                :city-name (text el "CityName")
+                :cft-issue-date (text el "CftIssueDate")
+                :period-end-time (text el "PeriodEndTime")
+                :category (text el "Category")
+                :procedure-type (text el "ProcedureType")
+                :location (text el "Location")
+                :certification (text el "Certification")
+                :item-code (text el "ItemCode")}))))))
+
+(def ^:private category->keyword
+  {"物品" :物品 "役務" :役務 "工事" :工事})
+
+(def ^:private rank-order {"A" 4 "B" 3 "C" 2 "D" 1})
+
+(defn- min-rank-of
+  "`Certification` lists every rank the tender ACCEPTS (e.g. \"A B C\" means
+  A, B, or C all qualify, D does not) — the eligibility floor goyoukiki.model
+  wants is the LOWEST accepted rank (a D-rank candidate must still fail
+  goyoukiki.policy/rank-satisfies? against a floor of C), so this picks the
+  minimum-graded token, not the maximum."
+  [certification]
+  (when (seq certification)
+    (let [ranks (->> (str/split certification #"[\s,]+") (filter rank-order))]
+      (when (seq ranks)
+        (keyword (apply min-key rank-order ranks))))))
+
+(defn ->opportunity
+  "Map one raw kkj.go.jp result (from parse-results) into a
+  goyoukiki.model/opportunity ground fact. This is direct, raw ingest — no
+  LLM, no governor; goyoukiki.matchllm only ever reasons over what this
+  produced, never over the live API response itself."
+  [{:keys [key project-name organization-name cft-issue-date period-end-time
+           category certification external-uri location item-code
+           procedure-type prefecture-name city-name]}]
+  (model/opportunity (str "kkj-" key) organization-name :tender
+    {:title project-name
+     :deadline period-end-time
+     :required-categories (if-let [c (category->keyword category)] #{c} #{})
+     :min-rank (min-rank-of certification)
+     :status :open
+     :source :kkj.go.jp
+     :external-uri external-uri
+     :location location
+     :item-code item-code
+     :procedure-type procedure-type
+     :prefecture prefecture-name
+     :city city-name
+     :cft-issue-date cft-issue-date}))
+
+(defn ingest!
+  "Fetch + parse + register each kkj.go.jp result as an :opportunity/register
+  ground fact against `store` (via goyoukiki.operation/register! — no
+  checkpointer thread per item, see its docstring). The registered :value is
+  tagged with kotoba.ontology.connector provenance (:ontology/type :tender
+  :ontology/source :jp.kkj) before it lands in the store, so downstream
+  readers can tell a kkj.go.jp fact apart from any other source without
+  re-deriving it. Returns the count registered. This performs a REAL network
+  call — not part of any test or the default `:run` demo; invoke explicitly
+  (e.g. from a REPL or -main)."
+  [store params]
+  (let [results (parse-results (fetch-xml params))]
+    (doseq [raw results]
+      (let [opp (connector/tag :jp.kkj (->opportunity raw))]
+        (op/register! store {:op :opportunity/register :opportunity (:id opp) :value opp})))
+    (count results)))
+
+(defn -main
+  "kbb -M -m goyoukiki.jp.kkj <query> [count] — real, live ingest run
+  against a fresh MemStore, printing what was registered. Manual/ops
+  entrypoint, not wired into CI."
+  [query & [count]]
+  (require 'goyoukiki.store)
+  (let [store ((resolve 'goyoukiki.store/seed-db))
+        n (ingest! store (cond-> {:Query query} count (assoc :Count (Long/parseLong count))))]
+    (println n "opportunities registered from kkj.go.jp")
+    (doseq [o ((resolve 'goyoukiki.store/all-opportunities) store)]
+      (println " " (:id o) "-" (:agency o) "-" (:title o)))))

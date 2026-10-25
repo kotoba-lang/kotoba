@@ -1,0 +1,182 @@
+(ns gijiroku.store
+  "SSoT for gijiroku, behind a `Store` protocol so the backend is a swap
+  (MemStore default ‖ DatomicStore via langchain.db, itself swappable to real
+  Datomic Local / kotoba-server). Mirrors kekkai.store's shape exactly.
+
+    meeting    — a scheduled/held call: platform/external-id/title/host/tenant/
+                 participants/status (gijiroku.model/meeting)
+    consent    — recording-announced?/participant-consents/legal-basis, keyed
+                 by meeting id — a ground fact, never inferred by the LLM
+    recording  — asset-ref (object-storage key or platform URL), never raw bytes
+    transcript — normalized segments, keyed by meeting id
+    minutes    — the committed assessment for a meeting (summary/decisions/
+                 action-items/cites/redactions/by)
+
+  Charter: the append-only **ledger is the meeting-record audit trail** — who
+  consented, what was drafted, who approved distribution, to whom. There is
+  intentionally no raw-audio/video namespace here — that lives in object
+  storage (B2 etc.) referenced by `:asset-ref`, never duplicated into the
+  store or git (see AGENTS.md 大容量バイナリ節)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (meeting [s id])
+  (all-meetings [s])
+  (consent-of [s meeting-id])
+  (recording-of [s meeting-id])
+  (transcript-of [s meeting-id])
+  (minutes-of [s meeting-id]     "committed minutes assessment for a meeting, or nil")
+  (ledger [s])
+  (record-datom! [s record]      "append/merge a meeting-record ground fact to the SSoT")
+  (append-ledger! [s fact]       "append one immutable audit-trail fact")
+  (seed! [s data]                "bulk-seed entity collections (idempotent upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+
+(def demo-now 1751500000) ; fixed clock for deterministic sim/tests
+
+(defn demo-data
+  "One clean meeting (m-weekly, consent on file, no sensitive segments) and one
+  meeting with a sensitive citation risk (m-perf, contains a health-tagged
+  segment) — the PrivacyGovernor must hold the latter's minutes unless the
+  scribe-LLM declares a redaction."
+  []
+  {:meetings
+   {"m-weekly" {:id "m-weekly" :platform :mock :external-id "m-weekly"
+                :title "週次すり合わせ" :host "p-jun" :tenant "cloud-itonami"
+                :participants [{:id "p-jun" :email "jun@gftd.group"}
+                               {:id "p-guest" :email "guest@example.com"}]
+                :status :ended :scheduled-start demo-now}
+    "m-perf"   {:id "m-perf" :platform :mock :external-id "m-perf"
+                :title "評価面談" :host "p-jun" :tenant "cloud-itonami"
+                :participants [{:id "p-jun" :email "jun@gftd.group"}
+                               {:id "p-emp" :email "emp@gftd.group"}]
+                :status :ended :scheduled-start demo-now}}
+   :consents
+   {"m-weekly" {:meeting-id "m-weekly" :recording-announced? true
+                :participant-consents {"p-jun" true "p-guest" true}
+                :legal-basis "contract" :jurisdiction "JP"}}
+   :recordings
+   {"m-weekly" {:id "r-m-weekly" :meeting-id "m-weekly" :platform :mock
+                :asset-ref "b2://gijiroku/m-weekly.mp4" :duration-s 1800 :format "mp4"}
+    "m-perf"   {:id "r-m-perf" :meeting-id "m-perf" :platform :mock
+                :asset-ref "b2://gijiroku/m-perf.mp4" :duration-s 2100 :format "mp4"}}
+   :transcripts
+   {"m-weekly" {:id "t-m-weekly" :meeting-id "m-weekly" :source :platform-native :lang "ja"
+                :segments [{:seg-id "s1" :speaker "p-jun" :t0 0 :t1 15
+                            :text "来週リリースの進捗を確認します。" :sensitive #{}}
+                           {:seg-id "s2" :speaker "p-guest" :t0 15 :t1 40
+                            :text "QAは金曜完了予定です。" :sensitive #{}}]}
+    "m-perf"   {:id "t-m-perf" :meeting-id "m-perf" :source :platform-native :lang "ja"
+                :segments [{:seg-id "s1" :speaker "p-jun" :t0 0 :t1 20
+                            :text "半期の目標達成状況を振り返ります。" :sensitive #{}}
+                           {:seg-id "s2" :speaker "p-emp" :t0 20 :t1 55
+                            :text "実は通院で数週欠勤していました。" :sensitive #{:health}}]}}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (meeting [_ id] (get-in @a [:meetings id]))
+  (all-meetings [_] (sort-by :id (vals (:meetings @a))))
+  (consent-of [_ id] (get-in @a [:consents id]))
+  (recording-of [_ id] (get-in @a [:recordings id]))
+  (transcript-of [_ id] (get-in @a [:transcripts id]))
+  (minutes-of [_ id] (get-in @a [:minutes id]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :meeting    (swap! a update-in [:meetings id] merge value)
+      :consent    (swap! a assoc-in [:consents id] value)
+      :recording  (swap! a assoc-in [:recordings id] value)
+      :transcript (swap! a assoc-in [:transcripts id] value)
+      :minutes    (swap! a assoc-in [:minutes id] value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data] (swap! a merge (select-keys data
+                                              [:meetings :consents :recordings :transcripts])) s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :minutes {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:meeting/id    {:db/unique :db.unique/identity}
+   :consent/id    {:db/unique :db.unique/identity}
+   :recording/id  {:db/unique :db.unique/identity}
+   :transcript/id {:db/unique :db.unique/identity}
+   :minutes/id    {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC) both implement it, so
+;; the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (meeting [this id] (-> (pull* this [:meeting/edn] [:meeting/id id]) :meeting/edn dec*))
+  (all-meetings [this]
+    (->> (q* this '[:find [?id ...] :where [?e :meeting/id ?id]])
+         (map #(meeting this %)) (sort-by :id)))
+  (consent-of [this id] (-> (pull* this [:consent/edn] [:consent/id id]) :consent/edn dec*))
+  (recording-of [this id] (-> (pull* this [:recording/edn] [:recording/id id]) :recording/edn dec*))
+  (transcript-of [this id] (-> (pull* this [:transcript/edn] [:transcript/id id]) :transcript/edn dec*))
+  (minutes-of [this id] (-> (pull* this [:minutes/edn] [:minutes/id id]) :minutes/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :meeting    (tx* s [{:meeting/id id :meeting/edn (enc (merge (meeting s id) value))}])
+      :consent    (tx* s [{:consent/id id :consent/edn (enc value)}])
+      :recording  (tx* s [{:recording/id id :recording/edn (enc value)}])
+      :transcript (tx* s [{:transcript/id id :transcript/edn (enc value)}])
+      :minutes    (tx* s [{:minutes/id id :minutes/edn (enc value)}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id m] (:meetings data)]    (record-datom! s {:kind :meeting :id id :value m}))
+    (doseq [[id c] (:consents data)]    (record-datom! s {:kind :consent :id id :value c}))
+    (doseq [[id r] (:recordings data)]  (record-datom! s {:kind :recording :id id :value r}))
+    (doseq [[id t] (:transcripts data)] (record-datom! s {:kind :transcript :id id :value t}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see gijiroku.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op meeting-id disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "meeting=" meeting-id) (str "basis=" (pr-str basis))]))

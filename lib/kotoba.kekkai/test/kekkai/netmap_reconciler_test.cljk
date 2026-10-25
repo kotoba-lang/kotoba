@@ -1,0 +1,138 @@
+(ns kekkai.netmap-reconciler-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kekkai.netmap-reconciler :as reconciler]
+            [kekkai.store :as store]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(defn- temp-root []
+  (.mkdtempSync fs (path/join (.tmpdir os) "kekkai-reconcile-test-")))
+
+(defn- identity-in! [root]
+  (let [pair (.generateKeyPairSync crypto "ed25519")
+        private-der (.export (.-privateKey pair)
+                             #js {:format "der" :type "pkcs8"})
+        public-der (.export (.-publicKey pair)
+                            #js {:format "der" :type "spki"})
+        file (path/join root "authority.edn")
+        saved {:private-b64 (.toString private-der "base64")
+               :public-b64 (.toString public-der "base64")}]
+    (.writeFileSync fs file (pr-str saved) #js {:encoding "utf8" :mode 384})
+    (reconciler/load-identity! file)))
+
+(defn- outcome-for [result node-id]
+  (first (filter #(= node-id (:node %)) (:outcomes result))))
+
+(defn- netmap-for [roots identity subject]
+  (:netmap (reconciler/pull-netmap roots subject identity)))
+
+(defn- netmap-version-for [roots identity tailnet node-id]
+  (:netmap/version (netmap-for roots identity (str tailnet "/" node-id))))
+
+(defn- relay-fixture []
+  {:name "test-relay" :region "test" :host "127.0.0.1" :port 41642
+   :key (apply str (repeat 64 "a"))})
+
+(deftest raw-cid-matches-ipfs-vector
+  (is (= "bafkreicysg23kiwv34eg2d7qweipxwosdo2py4ldv42nbauguluen5v6am"
+         (reconciler/cidv1-raw (.from js/Buffer "hello\n" "utf8")))))
+
+(deftest reconciler-publishes-idempotently-and-removes-revoked-peer
+  (testing "candidate changes advance the signed map, repeated snapshots do not"
+    (let [root (temp-root)
+          roots [(path/join root "mirror-a") (path/join root "mirror-b")]
+          identity (identity-in! root)
+          st (store/seed-db)
+          options {:store st :identity identity :roots roots :min-copies 2
+                   :relays [(relay-fixture)]}
+          _ (store/record-datom!
+             st {:kind :heartbeat :id "n-server"
+                 :value {:endpoints ["198.51.100.20:41641"]}})
+          first-pass (reconciler/reconcile! options)
+          first-map (netmap-for roots identity "default/n-laptop")
+          unchanged-pass (reconciler/reconcile! options)]
+      (is (= :published (:status (outcome-for first-pass "n-laptop"))))
+      (is (= 1 (:netmap/version first-map)))
+      (is (= [1 1 1]
+             (mapv #(netmap-version-for roots identity "default" %)
+                   ["n-laptop" "n-server" "n-gw"])))
+      (is (= [{:kind :reflexive :host "198.51.100.20" :port 41641}]
+             (:node/endpoints (first (filter #(= "n-server" (:node/id %))
+                                             (:netmap/peers first-map))))))
+      (is (= :unchanged (:status (outcome-for unchanged-pass "n-laptop"))))
+      (is (every? #(= :unchanged (:status (outcome-for unchanged-pass %)))
+                  ["n-laptop" "n-server" "n-gw"]))
+      (is (= 1 (:netmap/version
+                (netmap-for roots identity "default/n-laptop"))))
+      (store/record-datom!
+       st {:kind :heartbeat :id "n-server"
+           :value {:endpoints ["198.51.100.21:41641"]}})
+      (let [changed-pass (reconciler/reconcile! options)
+            changed-map (netmap-for roots identity "default/n-laptop")]
+        (is (= :published (:status (outcome-for changed-pass "n-laptop"))))
+        (is (every? #(= :published (:status (outcome-for changed-pass %)))
+                    ["n-laptop" "n-server" "n-gw"]))
+        (is (= [2 2 2]
+               (mapv #(netmap-version-for roots identity "default" %)
+                     ["n-laptop" "n-server" "n-gw"])))
+        (is (= [1 1]
+               (mapv #(netmap-version-for roots identity "acme" %)
+                     ["a-server" "a-cache"])))
+        (is (= 2 (:netmap/version changed-map)))
+        (is (= [{:kind :reflexive :host "198.51.100.21" :port 41641}]
+               (:node/endpoints (first (filter #(= "n-server" (:node/id %))
+                                               (:netmap/peers changed-map))))))
+        (store/record-datom! st {:kind :node :id "n-server"
+                                 :value {:status "revoked"}})
+        (let [revoked-pass (reconciler/reconcile! options)
+              revoked-map (netmap-for roots identity "default/n-laptop")]
+          (is (= :published (:status (outcome-for revoked-pass "n-laptop"))))
+          (is (= [3 3 3]
+                 (mapv #(netmap-version-for roots identity "default" %)
+                       ["n-laptop" "n-server" "n-gw"])))
+          (is (= 3 (:netmap/version revoked-map)))
+          (is (= "revoked"
+                 (:node/status (first (filter #(= "n-server" (:node/id %))
+                                              (:netmap/peers revoked-map)))))))))))
+
+(deftest reconciler-repairs-tailnet-version-skew
+  (let [root (temp-root)
+        roots [(path/join root "mirror")]
+        identity (identity-in! root)
+        options {:store (store/seed-db) :identity identity :roots roots
+                 :relays [(relay-fixture)]}
+        _ (reconciler/reconcile! options)
+        current (reconciler/pull-netmap roots "default/n-server" identity)]
+    ;; Model a prior per-node reconciler advancing one peer independently.
+    (reconciler/publish-netmap!
+     roots 1 "default/n-server" (inc (:desired/epoch current))
+     (:desired/cid current)
+     (assoc (:netmap current) :netmap/version 2) identity)
+    (let [repaired (reconciler/reconcile! options)]
+      (is (every? #(= :published (:status (outcome-for repaired %)))
+                  ["n-laptop" "n-server" "n-gw"]))
+      (is (= [3 3 3]
+             (mapv #(netmap-version-for roots identity "default" %)
+                   ["n-laptop" "n-server" "n-gw"]))))))
+
+(deftest relayless-publication-requires-explicit-direct-only-opt-in
+  (let [root (temp-root)
+        identity (identity-in! root)
+        roots [(path/join root "mirror")]
+        error (try
+                (reconciler/reconcile!
+                 {:store (store/seed-db)
+                  :identity identity
+                  :roots roots
+                  :relays []})
+                nil
+                (catch :default error error))
+        result (reconciler/reconcile!
+                {:store (store/seed-db) :identity identity :roots roots
+                 :relays [] :allow-relayless? true})
+        laptop-map (netmap-for roots identity "default/n-laptop")]
+    (is (= :kekkai/missing-relay-config (-> error ex-data :type)))
+    (is (pos? (:published result)))
+    (is (empty? (:netmap/relays laptop-map)))))

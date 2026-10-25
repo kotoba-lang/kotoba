@@ -1,0 +1,101 @@
+(ns gmail-read
+  "Read recent Gmail for the operator via a computer-use-clj agent.
+
+  Unlike the other examples this agent does NOT drive the desktop — it
+  uses the `fetch_mail` tool (computeruse.mail), which retrieves INBOX
+  over IMAP with the operator's Gmail app password. Why not screen-drive
+  the browser: ADR-0009 forbids the agent from performing Google password
+  sign-in (even via computer-use / 1Password), and an app password is a
+  non-interactive IMAP credential, not a browser sign-in. The password
+  lives in the kagi vault (computeruse.vault/kagi-vault) and is resolved
+  inside the tool's :fn — it never reaches the model, the message
+  history, or the Datomic action log.
+
+  `:computer` is a mock (the loop requires one, but the system prompt
+  forbids screen actions); the only tool that does I/O is `fetch_mail`.
+
+  Runs on a LOCAL model by default — Ollama serving gemma 4 QAT (see
+  jvm-host), so mail content stays on the machine.
+
+     kbb -M:dev:examples -e \\
+       \"(require 'gmail-read) (gmail-read/-main)\"
+
+  Env:
+    GMAIL_ACCOUNT             (required) the Gmail address to read
+    GMAIL_APP_PASSWORD_ITEM   kagi item holding the app password
+                              (default gmail-app-password)
+    GMAIL_MAILBOX             (default INBOX)
+    GMAIL_SEARCH              IMAP search criteria (default UNSEEN; ALL to list all)
+    GMAIL_LIMIT               (default 10)
+    VAULT                     kagi | op | bw   (default kagi; must be unlocked)
+
+  Prereqs (one-time, in the Google account):
+    - 2-Step Verification ON; an App Password generated.
+    - Gmail Settings → Forwarding and POP/IMAP → IMAP access: ENABLED.
+    - `kagi add gmail-app-password -c mail` (stdin) to store the app password."
+  (:require [computeruse.computer :as c]
+            [computeruse.vault :as vault]
+            [computeruse.mail :as mail]
+            [computeruse.agent :as agent]
+            [jvm-host :as host]
+            [langchain.db :as db]))
+
+(def system-prompt
+  (str "You are a mail-reading agent for the operator's Gmail.\n"
+       "You have one tool, `fetch_mail`, which retrieves recent messages via "
+       "IMAP and returns them as EDN: [{:from :subject :date :body}].\n"
+       "HARD RULES (scope):\n"
+       "- Use `fetch_mail` ONLY. Do NOT use the `computer` tool — no "
+       "screenshots, clicks, typing, or any screen action.\n"
+       "- `fetch_mail` is READ-ONLY. Never send, reply, delete, archive, mark "
+       "read/unread, or change any setting. (There is no tool to do so.)\n"
+       "- Call `fetch_mail` once (or a few times with different :limit), read "
+       "the returned messages, then summarize for the operator: each "
+       "message's sender, subject, and the gist of the body.\n"
+       "When you have the summary, call `done` with it. If `fetch_mail` "
+       "returns an error, call `done` success=false and report the error."))
+
+(defn make-vault []
+  (case (or (System/getenv "VAULT") "kagi")
+    "kagi" (vault/kagi-vault)
+    "op"   (vault/op-vault {:account (System/getenv "OP_ACCOUNT")})
+    "bw"   (vault/bw-vault {})
+    (throw (ex-info "VAULT must be kagi, op or bw" {}))))
+
+(defn task [account mailbox limit search]
+  (str "Read my recent Gmail (" mailbox ", " search ", latest " limit
+       ") for " account " and summarize each message: sender, subject, "
+       "and a one-line gist of the body. Use `fetch_mail`, then `done`."))
+
+(defn -main []
+  (let [account (or (System/getenv "GMAIL_ACCOUNT")
+                    (throw (ex-info "GMAIL_ACCOUNT env is required" {})))
+        item (or (System/getenv "GMAIL_APP_PASSWORD_ITEM") "gmail-app-password")
+        mailbox (or (System/getenv "GMAIL_MAILBOX") "INBOX")
+        search (or (System/getenv "GMAIL_SEARCH") "UNSEEN")
+        limit (Integer/parseInt (or (System/getenv "GMAIL_LIMIT") "10"))
+        vlt (make-vault)
+        mail-impl (mail/curl-imap-mail {:mailbox mailbox})
+        secret-ref {:item item}
+        tool (mail/fetch-mail-tool
+              {:mail mail-impl :vault vlt :secret-ref secret-ref
+               :account account :mailbox mailbox :limit limit :search search})
+        conn (db/create-conn agent/log-schema)
+        {:keys [result done steps]}
+        (agent/run {:model (host/make-model)
+                    :computer (c/mock-computer {:size [1280 800] :windows []})
+                    :vault vlt
+                    :tools [tool]
+                    :system system-prompt
+                    :task (task account mailbox limit search)
+                    :history-conn conn
+                    :session-id "gmail-read"
+                    :max-steps 15})]
+    (println "done:" done "| steps:" steps)
+    (println "result:" result)
+    (println "audit:"
+             (sort-by first
+                      (db/q '[:find ?step ?t
+                              :where [?e :caction/step ?step]
+                                     [?e :caction/tool ?t]]
+                            (db/db conn))))))

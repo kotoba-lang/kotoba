@@ -1,0 +1,80 @@
+(ns comfyui.convert-safetensors-f16
+  "Streaming validation utility: quantize floating safetensors entries to F16."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [comfyui.safetensors :as safe]
+            [num.array :as arr]
+            [num.cpu :as cpu]
+            [num.dtype :as dtype])
+  (:import [java.io RandomAccessFile]
+           [java.nio ByteBuffer ByteOrder]
+           [java.nio.channels FileChannel]))
+
+(def ^:private floating? #{"F16" "BF16" "F32" "F64"})
+
+(defn- write-all! [^FileChannel channel ^ByteBuffer buffer]
+  (while (.hasRemaining buffer) (.write channel buffer)))
+
+(defn- copy-window! [^FileChannel source position length ^FileChannel output]
+  (let [buffer (ByteBuffer/allocate (min length (* 1024 1024)))]
+    (loop [position (long position) remaining (long length)]
+      (when (pos? remaining)
+        (.clear buffer)
+        (.limit buffer (int (min remaining (.capacity buffer))))
+        (let [n (.read source buffer position)]
+          (when (neg? n) (throw (ex-info "truncated source tensor" {:position position})))
+          (.flip buffer)
+          (write-all! output buffer)
+          (recur (+ position n) (- remaining n)))))))
+
+(defn- f16-buffer [values]
+  (let [buffer (doto (ByteBuffer/allocate (* 2 (count values)))
+                 (.order ByteOrder/LITTLE_ENDIAN))]
+    (doseq [value values]
+      (.putShort buffer (short (dtype/f32->f16-bits value))))
+    (.flip buffer)
+    buffer))
+
+(defn convert! [source-path output-path]
+  (with-open [source (safe/open-file source-path)
+              output-file (RandomAccessFile. output-path "rw")]
+    (.setLength output-file 0)
+    (let [names (safe/tensor-names source)
+          entries
+          (loop [remaining names offset 0 result []]
+            (if-let [name (first remaining)]
+              (let [{:strs [dtype shape data_offsets] :as info}
+                    (safe/tensor-info source name)
+                    bytes (if (floating? dtype)
+                            (* 2 (reduce * 1 shape))
+                            (- (second data_offsets) (first data_offsets)))
+                    entry (assoc info "dtype" (if (floating? dtype) "F16" dtype)
+                                      "data_offsets" [offset (+ offset bytes)])]
+                (recur (next remaining) (+ offset bytes) (conj result [name entry])))
+              result))
+          header-map (cond-> (into (sorted-map) entries)
+                       (seq (:metadata source))
+                       (assoc "__metadata__" (:metadata source)))
+          header (kbytes/utf8-bytes (json/write-str header-map))
+          prefix (doto (ByteBuffer/allocate (+ 8 (alength header)))
+                   (.order ByteOrder/LITTLE_ENDIAN)
+                   (.putLong (long (alength header)))
+                   (.put header)
+                   (.flip))
+          output (.getChannel output-file)
+          backend (cpu/cpu-backend)]
+      (write-all! output prefix)
+      (doseq [[name _] entries]
+        (let [{:strs [dtype data_offsets]} (safe/tensor-info source name)
+              [start end] data_offsets]
+          (if (floating? dtype)
+            (write-all! output (f16-buffer
+                                (arr/->vec (safe/read-tensor source backend name))))
+            (copy-window! (:channel source) (+ (:data-start source) start)
+                          (- end start) output))))
+      {:source source-path :output output-path :tensors (count entries)
+       :bytes (.size output)})))
+
+(defn -main [& [source output]]
+  (when-not output
+    (throw (ex-info "usage: SOURCE.safetensors OUTPUT.safetensors" {})))
+  (println (pr-str (convert! source output))))

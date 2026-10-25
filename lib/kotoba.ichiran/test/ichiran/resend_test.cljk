@@ -1,0 +1,87 @@
+(ns ichiran.resend-test
+  "Offline verification of the REAL Resend Distributor's request-building +
+  ledger recording, with a stubbed `:http-fn` (mirrors
+  cloud_itonami.mail_test's `stub-http-fn`/captured-request convention) —
+  zero real network/credentials needed. The ONE live send this actor
+  actually proves end-to-end delivery is a separate manual step (see the
+  ADR/PR description), never part of this offline suite."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [ichiran.resend :as resend]
+            [ichiran.store :as store]
+            [ichiran.tallyport :as tallyport]
+            [sheets.model :as sm]))
+
+(defn- captured-http-fn [captured id]
+  (fn [req] (reset! captured req) {:status 200 :body (str "{\"id\":\"" id "\"}")}))
+
+(defn- test-workbook []
+  (-> (sm/workbook "wb-live-test")
+      (sm/add-tab (-> (sm/tab "smoke" {:sheets/title "Smoke Test"})
+                      (sm/put-cell 1 1 "Metric")
+                      (sm/put-cell 1 2 "Value")
+                      (sm/put-cell 2 1 "Revenue")
+                      (sm/put-cell 2 2 12345)))))
+
+(deftest send-tally-email-posts-the-right-request-with-a-stubbed-transport
+  (let [captured (atom nil)
+        m {:mail/type :mail/message
+           :mail/from {:mail.address/email "ops@example.com"}
+           :mail/to [{:mail.address/email "cfo@example.com"}]
+           :mail/cc [] :mail/bcc [] :mail/reply-to nil
+           :mail/subject "Tally report: Q3"
+           :mail/parts [{:mail.part/content-type "text/plain; charset=utf-8" :mail.part/body "body text"}]
+           :mail/headers {} :mail/tags #{} :mail/metadata {}}
+        resp (resend/send-tally-email! m [{:filename "wb.transit.json" :content_type "application/json" :content "eyJ9"}]
+                                       {:http-fn (captured-http-fn captured "resend-msg-1") :token "test-token"})]
+    (is (= "resend-msg-1" (get resp "id")))
+    (is (= "https://api.resend.com/emails" (:url @captured)))
+    (is (= :post (:method @captured)))
+    (is (= "Bearer test-token" (get (:headers @captured) "Authorization")))
+    (is (re-find #"cfo@example\.com" (:body @captured)))
+    (is (re-find #"wb\.transit\.json" (:body @captured)) "the Transit attachment made it into the request body")))
+
+(deftest send-tally-email-throws-on-non-2xx
+  (let [m {:mail/type :mail/message
+           :mail/from {:mail.address/email "ops@example.com"}
+           :mail/to [{:mail.address/email "cfo@example.com"}]
+           :mail/cc [] :mail/bcc [] :mail/reply-to nil
+           :mail/subject "x"
+           :mail/parts [{:mail.part/content-type "text/plain; charset=utf-8" :mail.part/body "y"}]
+           :mail/headers {} :mail/tags #{} :mail/metadata {}}]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"Resend send failed"
+         (resend/send-tally-email! m []
+                                   {:http-fn (fn [_] {:status 422 :body "{\"message\":\"invalid\"}"})
+                                    :token "t"})))))
+
+(deftest resend-tallyport-requires-a-from-address
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"requires :from"
+       (resend/resend-tallyport (store/seed-db) {}))))
+
+(deftest resend-tallyport-publish-sends-the-workbook-and-records-the-message-id-on-the-ledger
+  (let [captured (atom nil)
+        st (store/seed-db)
+        _ (store/record-datom! st {:kind :draft :id "act-finance-q3" :value {:status :proposed}})
+        content (test-workbook)
+        tp (resend/resend-tallyport st {:from "ops@example.com"
+                                        :http-fn (captured-http-fn captured "resend-live-1")
+                                        :token "test-token"})
+        art (store/artifact st "act-finance-q3")]
+    (is art "the demo artifact exists")
+    (tallyport/publish! tp art "cfo@example.com" {:content content})
+    (testing "the request actually went out with the recipient + workbook body"
+      (is (re-find #"cfo@example\.com" (:body @captured)))
+      (is (re-find #"Revenue" (:body @captured)) "the human-readable tab/cell summary is in the body")
+      (is (re-find #"wb-live-test\.transit\.json" (:body @captured)) "the Transit envelope attachment is present"))
+    (testing "the Resend message id is recorded on the draft (ichiran's :itonami.effect/tool analog)"
+      (is (= "resend:resend-live-1" (:tool (store/draft-of st "act-finance-q3")))))
+    (testing "a :delivered ledger fact is appended"
+      (let [f (last (store/ledger st))]
+        (is (= :delivered (:t f)))
+        (is (= :tally/publish (:op f)))
+        (is (= "act-finance-q3" (:subject f)))
+        (is (= "resend:resend-live-1" (:tool f)))
+        (is (= "cfo@example.com" (:target f)))))))

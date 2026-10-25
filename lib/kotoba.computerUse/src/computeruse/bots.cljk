@@ -1,0 +1,552 @@
+(ns computeruse.bots
+  "The multi-bot resident layer (ADR-0003).
+
+  A roster is a vector of bot entries. One bot = one session = one
+  backend + one goal + one deterministic gate + one receipt. The gate
+  runs BEFORE every act!, and a refusal is RECORDED with its reason
+  literal — never dropped, never retried silently. Negative tests pin
+  the literal, because a test that asserts only that something failed
+  cannot tell a gate refusal apart from a crash.
+
+  Validation is fail-closed, mirroring cloud-itonami's grok_bot_runtime
+  normalize-config discipline: an entry that does not typecheck is a
+  problem with a named reason, and a roster with any problem is
+  :could-not-measure — never \"zero bots are due\".
+
+  Three-valued outcome, kept three-valued all the way to the CLI's exit
+  code:
+    :done               the session ran and finished
+    :failed             the session ran and did not reach its goal
+    :could-not-measure  the session could not be run at all"
+  (:require [computeruse.backend :as b]
+            [computeruse.backends :as impl]
+            [computeruse.computer :as c]
+            [computeruse.hostfs :as fs]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+;; ───────────────────────── roster validation ─────────────────────────
+
+(def id-re #"^[a-z0-9][a-z0-9-]{0,63}$")
+
+(def gateable-action-kinds
+  "The kinds a bot may be allowed to perform. :noop is always permitted
+  (it is how a session says \"look again\") and is not listed here."
+  #{:pointer :key :type :script})
+
+(def max-steps-ceiling 24)
+
+(def validation-reasons
+  "Pinned validation literals. Assert these exact keywords in tests."
+  #{:roster/unreadable :roster/not-vector :roster/empty :roster/duplicate-id
+    :bot/not-a-map :bot/bad-id :bot/blank-goal :bot/unknown-backend
+    :bot/bad-target :bot/bad-interval :bot/bad-max-steps
+    :bot/max-steps-above-ceiling :bot/bad-allowed-actions :bot/bad-budget
+    :bot/not-found})
+
+(defn- problem [reason bot-id detail]
+  {:reason reason :bot bot-id :detail detail})
+
+(defn entry-problems
+  "One roster entry → a vector of {:reason :bot :detail}. `known?` is a
+  predicate on a backend id (so the registry stays the single source of
+  truth for which ids exist — a copy of the id list here would start
+  lying the day the registry grows)."
+  [known? e]
+  (if-not (map? e)
+    [(problem :bot/not-a-map nil (pr-str e))]
+    (let [id (:bot/id e)
+          n? (fn [v] (and (integer? v) (pos? v)))]
+      (cond-> []
+        (not (and (string? id) (re-matches id-re id)))
+        (conj (problem :bot/bad-id id
+                       (str ":bot/id must match " id-re ", got " (pr-str id))))
+
+        (not (and (string? (:bot/goal e)) (not (str/blank? (:bot/goal e)))))
+        (conj (problem :bot/blank-goal id ":bot/goal must be a non-blank string"))
+
+        (not (and (keyword? (:bot/backend e)) (known? (:bot/backend e))))
+        (conj (problem :bot/unknown-backend id
+                       (str ":bot/backend must be a registered backend id, got "
+                            (pr-str (:bot/backend e)))))
+
+        (not (map? (:bot/target e)))
+        (conj (problem :bot/bad-target id ":bot/target must be a map"))
+
+        (not (n? (:bot/interval-s e)))
+        (conj (problem :bot/bad-interval id ":bot/interval-s must be a positive int"))
+
+        (not (n? (:bot/max-steps e)))
+        (conj (problem :bot/bad-max-steps id ":bot/max-steps must be a positive int"))
+
+        (and (n? (:bot/max-steps e)) (> (:bot/max-steps e) max-steps-ceiling))
+        (conj (problem :bot/max-steps-above-ceiling id
+                       (str ":bot/max-steps must be ≤ " max-steps-ceiling
+                            ", got " (:bot/max-steps e))))
+
+        (not (and (set? (:bot/allowed-actions e))
+                  (every? gateable-action-kinds (:bot/allowed-actions e))))
+        (conj (problem :bot/bad-allowed-actions id
+                       (str ":bot/allowed-actions must be a subset of "
+                            (pr-str gateable-action-kinds) ", got "
+                            (pr-str (:bot/allowed-actions e)))))
+
+        (not (n? (:bot/budget-tokens e)))
+        (conj (problem :bot/bad-budget id ":bot/budget-tokens must be a positive int"))))))
+
+(defn roster-problems
+  "Whole roster → a vector of problems. Empty means valid."
+  [known? roster]
+  (cond
+    (nil? roster) [(problem :roster/unreadable nil "roster is nil or unreadable")]
+    (not (vector? roster)) [(problem :roster/not-vector nil "roster must be a vector")]
+    (empty? roster) [(problem :roster/empty nil "roster is empty")]
+    :else
+    (let [per-entry (vec (mapcat #(entry-problems known? %) roster))
+          ids (keep :bot/id (filter map? roster))
+          dups (sort (for [[id n] (frequencies ids) :when (> n 1)] id))]
+      (cond-> per-entry
+        (seq dups) (conj (problem :roster/duplicate-id nil
+                                  (str "duplicate :bot/id: " (str/join ", " dups))))))))
+
+(defn read-roster
+  "Path → roster vector, or nil when unreadable. nil is distinguishable
+  from an empty roster on purpose."
+  [path]
+  (when (fs/path-exists? path)
+    (try (edn/read-string (fs/read-file path))
+         (catch #?(:clj Exception :cljs :default) _ nil))))
+
+(defn find-bot [roster bot-id]
+  (first (filter #(= bot-id (:bot/id %)) roster)))
+
+;; ───────────────────────── target resolution ─────────────────────────
+
+(defn resolve-target-cwd
+  "A roster's :cwd may be relative — the roster lives in a superproject's
+  manifest/ while the CLI runs from a child checkout, so \"relative to
+  the process\" is meaningless. Resolve against the roster's own
+  directory, then its parent. Returns {:cwd abs :resolved-from …} or
+  {:error …}; it never guesses a directory that does not exist."
+  [roster-path cwd]
+  (cond
+    (nil? cwd) {:cwd nil}
+    (str/starts-with? (str cwd) "/")
+    (if (fs/directory? cwd) {:cwd cwd :resolved-from :absolute}
+        {:error (str "absolute :cwd does not exist: " cwd)})
+    :else
+    (let [dir (fs/dirname roster-path)
+          candidates [[(str dir "/" cwd) :roster-dir]
+                      [(str dir "/../" cwd) :roster-parent]
+                      [(str (fs/cwd) "/" cwd) :process-cwd]]]
+      (if-let [[p from] (first (filter (fn [[p _]] (fs/directory? p)) candidates))]
+        {:cwd p :resolved-from from}
+        {:error (str "relative :cwd " (pr-str cwd)
+                     " does not exist under the roster dir, its parent, or the process cwd")}))))
+
+(defn bot-backend
+  "Constructs the backend for a bot, with its :bot/target resolved.
+  → {:backend b :target t} or {:error …}."
+  [{:keys [bot roster-path sh]}]
+  (let [target (or (:bot/target bot) {})
+        {:keys [cwd resolved-from error]} (resolve-target-cwd roster-path (:cwd target))]
+    (if error
+      {:error error}
+      (let [target (cond-> target cwd (assoc :cwd cwd))
+            backend (b/create-backend (:bot/backend bot) target {:sh sh})]
+        (if (nil? backend)
+          {:error (str "no backend for " (pr-str (:bot/backend bot)))}
+          {:backend backend :target target :cwd-resolved-from resolved-from})))))
+
+;; ───────────────────────── the action gate ─────────────────────────
+
+(def gate-reasons
+  "Pinned gate literals. A refusal is recorded with one of these; tests
+  assert the exact keyword."
+  #{:gate/malformed-action
+    :gate/action-kind-not-allowed
+    :gate/frame-dimensions-unknown
+    :gate/coordinate-outside-frame
+    :gate/step-ceiling-reached
+    :gate/budget-exhausted})
+
+(defn gate
+  "Deterministic admission check, run before EVERY act!.
+
+  ctx: {:bot entry :frame observation :step n :tokens-used n}
+  → {:verdict :allow} | {:verdict :refuse :reason <literal> :detail …}
+
+  Order matters and is part of the contract: ceilings first (they are
+  about the session, not the action), then the action itself."
+  [{:keys [bot frame step tokens-used]} action]
+  (let [allowed (or (:bot/allowed-actions bot) #{})
+        max-steps (:bot/max-steps bot)
+        budget (:bot/budget-tokens bot)]
+    (cond
+      (and max-steps (>= (or step 0) max-steps))
+      {:verdict :refuse :reason :gate/step-ceiling-reached
+       :detail {:step step :max-steps max-steps}}
+
+      (and budget (>= (or tokens-used 0) budget))
+      {:verdict :refuse :reason :gate/budget-exhausted
+       :detail {:tokens-used tokens-used :budget budget}}
+
+      (not (and (map? action) (keyword? (:kind action))
+                (contains? b/action-kinds (:kind action))))
+      {:verdict :refuse :reason :gate/malformed-action
+       :detail {:action action :known-kinds b/action-kinds}}
+
+      ;; :noop needs no grant — it is how a session says "observe again".
+      (= :noop (:kind action)) {:verdict :allow}
+
+      (not (contains? allowed (:kind action)))
+      {:verdict :refuse :reason :gate/action-kind-not-allowed
+       :detail {:kind (:kind action) :allowed allowed}}
+
+      (= :pointer (:kind action))
+      (let [{:keys [width height]} frame
+            [x y] (:coordinate action)]
+        (cond
+          (not (and (number? x) (number? y)))
+          {:verdict :refuse :reason :gate/malformed-action
+           :detail {:why ":pointer needs :coordinate [x y]" :coordinate (:coordinate action)}}
+
+          (not (and (number? width) (number? height)))
+          ;; Refuse rather than guess. An unmeasured frame is not a
+          ;; permissive one; a full-screen backend that does not report
+          ;; its size must not get unbounded clicks by omission.
+          {:verdict :refuse :reason :gate/frame-dimensions-unknown
+           :detail {:why "the observation did not report :width/:height, so a coordinate cannot be bounded"}}
+
+          (not (and (<= 0 x width) (<= 0 y height)))
+          {:verdict :refuse :reason :gate/coordinate-outside-frame
+           :detail {:coordinate [x y] :frame [width height]}}
+
+          :else {:verdict :allow}))
+
+      :else {:verdict :allow})))
+
+;; ───────────────────────── the session prompt ─────────────────────────
+
+(def action-vocabulary-doc
+  {:pointer "{:kind :pointer :button :left|:right|:middle|:double :coordinate [x y]}"
+   :key "{:kind :key :combo \"cmd+l\"}"
+   :type "{:kind :type :text \"…\"}"
+   :script (str "{:kind :script :applescript \"tell application \\\"X\\\" to …\"}\n"
+                "        APP SCRIPTING ONLY. A script that calls System Events\n"
+                "        `keystroke` / `key code` / `key down` / `click at`, or\n"
+                "        `do shell script` / `run script`, is refused by the backend —\n"
+                "        synthetic global input goes to whatever window has OS focus,\n"
+                "        not to your target. Use the application's own scripting\n"
+                "        dictionary instead (Google Chrome: `execute javascript \\\"…\\\"\n"
+                "        in active tab`).")
+   :noop "{:kind :noop}  — look again without acting"})
+
+(defn build-prompt
+  "The interpretation prompt for one step. The reply protocol is a
+  single EDN map on the last line — EDN because the reply is then a
+  value the gate can inspect before anything happens, rather than a
+  string that has to be believed."
+  [{:keys [bot step observation history]}]
+  (let [allowed (or (:bot/allowed-actions bot) #{})
+        vocab (select-keys action-vocabulary-doc (conj (vec allowed) :noop))
+        w (:window observation)]
+    (str "You are a computer-use bot. Work toward ONE goal and stop.\n\n"
+         "GOAL: " (:bot/goal bot) "\n\n"
+         "Step " (inc step) " of at most " (:bot/max-steps bot) ".\n\n"
+         ;; Which application the frame belongs to is not visible in the
+         ;; pixels. Measured 2026-08-29: without this block the model
+         ;; scripted Safari for eight straight steps while looking at a
+         ;; Chrome window, and every step was a legitimate, gate-allowed
+         ;; action that simply addressed the wrong app.
+         (when w
+           (str "TARGET WINDOW: application " (pr-str (:app w))
+                ", title " (pr-str (:title w))
+                ", " (:w w) "x" (:h w) " (CGWindowID " (:id w) ").\n"
+                "Any :script you write runs through `osascript`. Address THIS "
+                "application by name — scripting a different application will "
+                "not change what you are looking at.\n"))
+         (when-let [extra (seq (dissoc (:bot/target bot) :app :window-id :title-substr
+                                       :cmd :cwd :timeout-ms))]
+           (str "TARGET DETAIL from the roster: " (pr-str (into {} extra)) "\n"))
+         (if (:png-path observation)
+           "The screenshot above is your current observation of the target.\n"
+           (str "OBSERVATION (this backend has no screen; this is the verdict of a "
+                "deterministic probe command):\n"
+                (pr-str (select-keys observation [:exit :observation :cmd :cwd])) "\n"
+                (when-let [raw (:raw observation)]
+                  (str "\nLast output:\n" (subs (str raw) (max 0 (- (count (str raw)) 1500))) "\n"))))
+         (when (seq history)
+           (str "\nWHAT HAS HAPPENED SO FAR:\n"
+                (str/join "\n" (map-indexed (fn [i h] (str "  " (inc i) ". " h)) history))
+                "\n"))
+         ;; Steps are the scarce resource and running out of them is
+         ;; recorded as a FAILURE, so the model has to know both that
+         ;; the budget is small and that a partial honest answer beats
+         ;; one more action. Measured 2026-08-29: without this, a
+         ;; session with a fully rendered page in front of it spent all
+         ;; eight steps navigating and scrolling and never concluded.
+         "\nYou have " (- (:bot/max-steps bot) step) " step(s) left. Running out of "
+         "steps is recorded as a FAILED session, so as soon as the observation "
+         "lets you answer the goal — even partially — reply :done and say what "
+         "you actually saw and what you could not see. Do not spend a step on an "
+         "action unless it is required to answer the goal.\n"
+         "\nYou may reply with EXACTLY ONE of these, as a single EDN map on the LAST line:\n"
+         "  {:done true :text \"<your finding / answer>\" :success true|false}\n"
+         (if (seq allowed)
+           (str "  {:action <one of the action maps below> :note \"<why>\"}\n\n"
+                "ALLOWED ACTIONS (anything else is refused by a deterministic gate before it runs):\n"
+                (str/join "\n" (map (fn [[k v]] (str "  " k "  " v)) vocab)) "\n")
+           "  {:action {:kind :noop} :note \"<why>\"}\n\n(This bot is allowed no acting actions at all — only observation. Reach a conclusion and reply :done.)\n")
+         "\nDo not wrap the EDN in code fences. The last line of your reply must be the EDN map.")))
+
+(defn parse-decision
+  "Model text → {:done …} / {:action …} / {:error …}. Scans lines from
+  the end for the first that reads as an EDN map with :done or :action —
+  a model that also wrote prose still gets understood, and a model that
+  wrote no decision gets an explicit error rather than a silent :noop."
+  [text]
+  (let [lines (->> (str/split-lines (str text))
+                   (map str/trim)
+                   (remove str/blank?)
+                   (remove #(str/starts-with? % "```"))
+                   reverse)]
+    (or (some (fn [l]
+                (let [v (try (edn/read-string l)
+                             (catch #?(:clj Exception :cljs :default) _ nil))]
+                  (when (and (map? v) (or (contains? v :done) (contains? v :action)))
+                    v)))
+              lines)
+        {:error "no EDN decision map found in the model reply"
+         :reply-tail (str/join "\n" (take 3 lines))})))
+
+;; ───────────────────────── the session ─────────────────────────
+
+(def outcomes #{:done :failed :could-not-measure})
+
+(defn- history-line [{:keys [action verdict reason result]}]
+  (str (pr-str action) " → "
+       (if (= :allow verdict)
+         (str "executed: " (pr-str result))
+         (str "REFUSED by the gate (" reason ")"))))
+
+(defn run-session!
+  "Runs one bot session and returns its receipt.
+
+  opts: {:bot roster-entry
+         :backend IBackend
+         :interpret adapter-fn      ; computeruse.model-adapters
+         :now-fn (fn [] iso-string)
+         :max-wall-steps override}
+
+  The loop is observe → interpret → GATE → act, and every act is gated.
+  A refusal is fed back to the model as history so the next step can
+  adapt, and is recorded in the receipt with its reason literal."
+  [{:keys [bot backend interpret now-fn]}]
+  (let [now (or now-fn fs/now-iso)
+        started (now)
+        max-steps (:bot/max-steps bot)
+        budget (:bot/budget-tokens bot)]
+    (loop [step 0
+           tokens 0
+           frames []
+           actions []
+           history []]
+      (let [finish (fn [outcome extra]
+                     (merge {:bot-id (:bot/id bot)
+                             :backend (:bot/backend bot)
+                             :goal (:bot/goal bot)
+                             :frames frames
+                             :actions actions
+                             :outcome outcome
+                             :started started
+                             :finished (now)
+                             :steps step
+                             :tokens-used tokens
+                             :budget-tokens budget}
+                            extra))]
+        (cond
+          (>= step max-steps)
+          (finish :failed {:why :step-ceiling-reached
+                           :detail {:max-steps max-steps}})
+
+          (>= tokens budget)
+          (finish :failed {:why :budget-exhausted
+                           :detail {:tokens-used tokens :budget budget}})
+
+          :else
+          (let [obs (b/observe! backend)]
+            (if (b/refused? obs)
+              ;; The environment could not be observed at all. That is
+              ;; not a failed goal — it is an unmeasured one.
+              (finish :could-not-measure
+                      {:why :observe-refused
+                       :refusal (select-keys obs [:reason :why :backend :host :target])})
+              (let [frames (cond-> frames (:png-path obs) (conj (:png-path obs)))
+                    blank? (get-in obs [:frame-stats :blank?])]
+                (if (true? blank?)
+                  (finish :could-not-measure
+                          {:why :frame-blank
+                           :detail (:frame-stats obs)
+                           :frames frames})
+                  (let [reply (interpret {:prompt (build-prompt {:bot bot :step step
+                                                                 :observation obs
+                                                                 :history history})
+                                          :image-path (:png-path obs)})]
+                    (if (:error reply)
+                      (finish :could-not-measure
+                              {:why :model-adapter-failed
+                               :detail (select-keys reply [:error :adapter])
+                               :frames frames})
+                      (let [tokens (+ tokens (or (:tokens reply) 0))
+                            decision (parse-decision (:text reply))]
+                        (cond
+                          (:error decision)
+                          (let [entry {:step step :action nil :verdict :refuse
+                                       :reason :gate/malformed-action
+                                       :detail decision}
+                                actions (conj actions entry)]
+                            (if (>= (inc step) max-steps)
+                              (finish :failed {:why :no-decision-from-model
+                                               :frames frames :actions actions
+                                               :tokens-used tokens})
+                              (recur (inc step) tokens frames actions
+                                     (conj history (str "model produced no EDN decision ("
+                                                        (:error decision) ")")))))
+
+                          (:done decision)
+                          (assoc (finish (if (false? (:success decision)) :failed :done)
+                                         {:frames frames :tokens-used tokens
+                                          :result (:text decision)})
+                                 :model-adapter (:adapter reply))
+
+                          :else
+                          (let [action (:action decision)
+                                verdict (gate {:bot bot :frame obs :step step
+                                               :tokens-used tokens}
+                                              action)
+                                entry (merge {:step step :action action
+                                              :verdict (:verdict verdict)
+                                              :note (:note decision)}
+                                             (when (= :refuse (:verdict verdict))
+                                               (select-keys verdict [:reason :detail])))]
+                            (if (= :refuse (:verdict verdict))
+                              (let [actions (conj actions entry)]
+                                (if (>= (inc step) max-steps)
+                                  (finish :failed {:why :gate-refused-final-step
+                                                   :frames frames :actions actions
+                                                   :tokens-used tokens})
+                                  (recur (inc step) tokens frames actions
+                                         (conj history (history-line
+                                                        {:action action :verdict :refuse
+                                                         :reason (:reason verdict)})))))
+                              (let [result (b/act! backend action)
+                                    refused? (b/refused? result)
+                                    entry (assoc entry
+                                                 :result (if refused?
+                                                           (select-keys result [:reason :why])
+                                                           result)
+                                                 :backend-refused? refused?)
+                                    actions (conj actions entry)]
+                                (recur (inc step) tokens frames actions
+                                       (conj history (history-line
+                                                      {:action action :verdict :allow
+                                                       :result (if refused?
+                                                                 (str "backend REFUSED ("
+                                                                      (:reason result) ")")
+                                                                 result)})))))))))))))))))))
+
+;; ───────────────────────── receipts ─────────────────────────
+
+(defn receipt-path [receipts-dir bot-id at]
+  (str receipts-dir "/" bot-id "-"
+       (-> (str at) (str/replace ":" "") (str/replace "." "-")) ".edn"))
+
+(defn write-receipt!
+  "Writes the receipt EDN and returns the path. Screenshots stay OUT of
+  git — the receipt records their paths, and .gitignore keeps captures
+  out of the tree."
+  [receipts-dir receipt]
+  (let [p (receipt-path receipts-dir (:bot-id receipt) (:started receipt))]
+    (fs/write-file! p (with-out-str (pr receipt)))
+    p))
+
+(defn outcome->exit
+  "The three-valued outcome, kept three-valued. Collapsing
+  :could-not-measure into :failed is the exact defect this workspace
+  names: a check that could not run must not return the value of a
+  check that ran and was fine — nor the value of one that ran and
+  failed."
+  [outcome]
+  (case outcome
+    :done 0
+    :failed 1
+    2))
+
+;; ───────────────────────── langgraph bridge ─────────────────────────
+
+(defn backend->computer
+  "An IComputer over a backend + the gate, so the langgraph tool-calling
+  loop in computeruse.agent can be bound to ANY backend on the JVM.
+
+  The resident CLI does not use this path — it uses run-session! above,
+  because langgraph/langchain are tools.deps git dependencies that nbb
+  cannot resolve from a bare checkout, and the resident bot must run
+  under nbb. This bridge exists so the two layers select from the same
+  registry rather than growing two notions of \"where the screen is\".
+
+  Gate refusals are returned to the model as text (a tool result cannot
+  refuse structurally) AND recorded in the `refusals` atom, so a caller
+  can assert on the reason literal instead of on prose."
+  [{:keys [backend bot refusals]}]
+  (let [refusals (or refusals (atom []))
+        step (atom 0)
+        last-frame (atom nil)
+        guard (fn [action f]
+                (let [v (gate {:bot bot :frame @last-frame :step @step :tokens-used 0} action)]
+                  (swap! step inc)
+                  (if (= :allow (:verdict v))
+                    (let [r (f)]
+                      (if (b/refused? r)
+                        (do (swap! refusals conj {:action action :reason (:reason r)
+                                                  :source :backend})
+                            (str "REFUSED by the backend: " (:reason r) " — " (:why r)))
+                        (str r)))
+                    (do (swap! refusals conj {:action action :reason (:reason v)
+                                              :source :gate})
+                        (str "REFUSED by the gate: " (:reason v) " — "
+                             (pr-str (:detail v)))))))]
+    {:refusals refusals
+     :computer
+     (reify c/IComputer
+       (-screenshot [_]
+         (let [obs (b/observe! backend)]
+           (if (b/refused? obs)
+             (str "OBSERVE FAILED: " (:reason obs) " — " (:why obs))
+             (do (reset! last-frame obs)
+                 (or (:png-path obs) (pr-str (select-keys obs [:exit :observation])))))))
+       (-key! [_ combo] (guard {:kind :key :combo combo}
+                               #(b/act! backend {:kind :key :combo combo})))
+       (-type! [_ text] (guard {:kind :type :text text}
+                               #(b/act! backend {:kind :type :text text})))
+       (-mouse-move! [_ x y] (guard {:kind :pointer :button :left :coordinate [x y] :move true}
+                                    #(b/act! backend {:kind :pointer :button :left
+                                                      :coordinate [x y] :move true})))
+       (-click! [_ button x y] (guard {:kind :pointer :button button :coordinate [x y]}
+                                      #(b/act! backend {:kind :pointer :button button
+                                                        :coordinate [x y]})))
+       (-scroll! [_ _x _y direction amount]
+         (guard {:kind :key :combo (if (= :up direction) "pageup" "pagedown")}
+                #(b/act! backend {:kind :key
+                                  :combo (if (= :up direction) "pageup" "pagedown")
+                                  :amount amount})))
+       (-cursor-position [_] [0 0]))}))
+
+;; ───────────────────────── convenience ─────────────────────────
+
+(defn registry-known?
+  "Predicate over a loaded registry: is this a registered backend id?"
+  [registry]
+  (fn [id] (b/known-id? registry id)))
+
+(def implemented-backend-ids impl/implemented-ids)

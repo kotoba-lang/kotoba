@@ -1,0 +1,267 @@
+(ns nintendo-loop
+  "The *Nintendo Loop* — a ReAct quality-improvement loop, in langgraph-clj.
+
+   It treats a kami/EDN game (e.g. network-isekai `gftd/yoro`) as the *environment*
+   and iterates  Observe → Judge → Gate → Reason → Act → Observe …  until every
+   dimension of a measurable 'Nintendo bar' rubric is cleared (or a budget runs out).
+
+   ReAct mapping:
+     • Reason  = the `reason` node — an LLM critiques the weakest rubric dimension and
+                 proposes ONE concrete, minimal, testable edit (a tool call / patch).
+     • Act     = the `act` node — applies the patch to the game's EDN/CLJ, rebuilds, and
+                 smoke-checks it (the patched logic still compiles to wasm, no soft-lock).
+     • Observe = the `perceive` node — the *visual test*: it runs a deterministic wasm
+                 playtester (objective game-feel metrics) AND captures real screenshots.
+     • Judge   = the `evaluate` node — scores Observe against the rubric: harness metrics
+                 give the objective dims, a vision model scores the visual dims from the
+                 screenshots, and an SFX audit scores audio.
+     • Gate    = a conditional edge — pass ⇒ END, regressed ⇒ rollback (checkpoint
+                 time-travel), else ⇒ another Reason→Act iteration.
+
+   The library does NO I/O (WASM premise). Everything that touches the world — the
+   playtester, the browser screenshotter, the LLM, the file editor/builder — is an
+   INJECTED host capability (`caps`). `-main` wires deterministic MOCK caps so the whole
+   loop runs offline and you can watch the quality trajectory converge; the `(comment …)`
+   at the bottom shows the real wiring (Claude vision + headless browser + the wasm
+   playtest harness in network-isekai/quality/playtest_harness.mjs)."
+  (:require [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [langgraph.viz :as viz]
+            [langchain.db :as db]))
+
+;; ───────────────────────────── the Nintendo bar ─────────────────────────────
+;; Each dimension is 0‑100 with a HOW it is measured. :harness dims come from the
+;; deterministic wasm playtester (objective, flake‑free); :vision dims come from a
+;; vision model reading real screenshots; :audit dims from a static scene scan.
+
+(def nintendo-rubric
+  {:threshold 85                       ;; every dimension must clear this to ship
+   :margin    6                        ;; a drop of > margin in the worst dim ⇒ regression
+   :dimensions
+   [{:key :game-feel   :how :harness :desc "jump apex/airtime, coyote‑time, hit‑stop, float curve in target ranges"}
+    {:key :responsive  :how :harness :desc "input→action ≤ 1 frame; no dropped/eaten inputs; stable step cost"}
+    {:key :difficulty  :how :harness :desc "every hazard fairly avoidable; no soft‑lock; deaths/section in band"}
+    {:key :readability :how :vision  :desc "player vs foe vs hazard contrast & silhouette clarity; HUD never hides play"}
+    {:key :juice       :how :vision  :desc "squash&stretch, landing dust, particles, screen‑shake, screen transitions"}
+    {:key :composition :how :vision  :desc "palette harmony, parallax depth, framing/look‑ahead"}
+    {:key :audio       :how :audit   :desc "a distinct SFX per game event + music bed; no silent feedback"}]})
+
+(defn- dim-keys [rubric] (mapv :key (:dimensions rubric)))
+
+(defn- worst-dim
+  "The lowest‑scoring rubric dimension {:key :score :desc} — what Reason should attack."
+  [rubric scores]
+  (->> (:dimensions rubric)
+       (map (fn [d] (assoc d :score (get scores (:key d) 0))))
+       (sort-by :score)
+       first))
+
+(defn- nintendo? [rubric scores]
+  (every? (fn [k] (>= (get scores k 0) (:threshold rubric))) (dim-keys rubric)))
+
+(defn nintendo-bar?
+  "Public: have all rubric dimensions cleared the threshold?"
+  [rubric scores] (nintendo? rubric scores))
+
+(defn- min-score [rubric scores]
+  (reduce min 100 (map #(get scores % 0) (dim-keys rubric))))
+
+(defn- regressed?
+  "Did the last patch make the worst dimension meaningfully worse than our best?"
+  [rubric scores best]
+  (and best
+       (< (min-score rubric scores)
+          (- (min-score rubric (:scores best)) (:margin rubric)))))
+
+;; ───────────────────────────── the loop graph ─────────────────────────────
+;; caps (injected host capabilities):
+;;   :observe  (fn [target]                 -> {:metrics .. :frames .. :playthrough ..})  ; wasm playtester + screenshots
+;;   :judge    (fn [observation rubric]     -> {:scores {dim->0..100} :defects [..]})      ; harness scoring + vision + audit
+;;   :reason   (fn [{:keys [worst scores defects target history]}] -> {:rationale .. :patch ..})
+;;   :apply    (fn [patch]                  -> {:applied? b :build-ok? b :smoke {..} :backup id})
+;;   :rollback (fn [backup]                 -> {:restored? b})
+
+(defn make-graph
+  "Build the compiled Nintendo Loop graph. opts: {:checkpointer cp :max-iter n
+   :interrupt-before #{:act}}  (interrupt-before :act ⇒ human approves each patch)."
+  [caps rubric {:keys [checkpointer max-iter recursion-limit interrupt-before]
+                :or {max-iter 14 recursion-limit 120}}]
+  (let [perceive
+        (fn [s]
+          {:obs ((:observe caps) (:target s))
+           :messages [[:observe (str "iter " (:iter s) " — ran playtester + captured frames")]]})
+
+        evaluate
+        (fn [s]
+          (let [{:keys [scores defects]} ((:judge caps) (:obs s) rubric)
+                improved? (or (nil? (:best s))
+                              (> (min-score rubric scores)
+                                 (min-score rubric (:scores (:best s)))))
+                w (worst-dim rubric scores)]
+            (cond-> {:scores scores
+                     :defects defects
+                     :history [{:iter (:iter s) :scores scores
+                                :min (min-score rubric scores) :worst (:key w)}]
+                     :messages [[:judge (str "min=" (min-score rubric scores)
+                                             " worst=" (:key w) "(" (:score w) ") "
+                                             (count defects) " defect(s)")]]}
+              improved? (assoc :best {:scores scores :backup (get-in s [:patch :backup])}))))
+
+        gate
+        (fn [s]
+          (cond
+            (nintendo? rubric (:scores s))            g/END        ; shipped 🎉
+            (>= (:iter s) max-iter)                   g/END        ; budget spent — best effort
+            (regressed? rubric (:scores s) (:best s)) :rollback    ; bad patch → time‑travel
+            :else                                     :reason))
+
+        reason
+        (fn [s]
+          (let [w (worst-dim rubric (:scores s))
+                plan ((:reason caps) {:worst w :scores (:scores s) :defects (:defects s)
+                                      :target (:target s) :history (:history s)})]
+            {:plan plan
+             :messages [[:reason (str "attack " (:key w) " → " (:rationale plan))]]}))
+
+        act
+        (fn [s]
+          (let [r ((:apply caps) (:plan s))]
+            {:patch r
+             :iter (inc (:iter s))
+             :messages [[:act (str (get-in s [:plan :patch :summary] "patch")
+                                   (if (:build-ok? r) " ✓built" " ✗build")
+                                   (when-let [sm (:smoke r)] (str " smoke=" (:ok sm))))]]}))
+
+        rollback
+        (fn [s]
+          (let [r ((:rollback caps) (get-in s [:best :backup]))]
+            {:messages [[:rollback (str "regression — restored best checkpoint (" (:restored? r) ")")]]}))]
+    (-> (g/state-graph
+         {:channels {:target   {:default nil}
+                     :iter     {:default 0}
+                     :obs      {:default nil}
+                     :scores   {:default {}}
+                     :defects  {:default []}
+                     :plan     {:default nil}
+                     :patch    {:default nil}
+                     :best     {:default nil}
+                     :history  {:reducer (fnil into []) :default []}
+                     :messages {:reducer (fnil into []) :default []}}})
+        (g/add-node :perceive perceive)
+        (g/add-node :evaluate evaluate)
+        (g/add-node :reason reason)
+        (g/add-node :act act)
+        (g/add-node :rollback rollback)
+        (g/set-entry-point :perceive)
+        (g/add-edge :perceive :evaluate)
+        (g/add-conditional-edges :evaluate gate)   ; the Gate: END | :reason | :rollback
+        (g/add-edge :reason :act)
+        (g/add-edge :act :perceive)                ; the loop
+        (g/add-edge :rollback :reason)
+        (g/compile-graph (cond-> {:recursion-limit recursion-limit}
+                           checkpointer     (assoc :checkpointer checkpointer)
+                           interrupt-before (assoc :interrupt-before interrupt-before))))))
+
+;; ───────────────────────── offline demo (mock host caps) ─────────────────────────
+;; A deterministic stand‑in 'environment': a truth vector of per‑dimension quality the
+;; agent improves. `:apply` raises the targeted dim (and on one scripted step ships a bad
+;; patch that drops a dim, to exercise the rollback / time‑travel path). No LLM, no
+;; browser — just enough to watch the graph converge and the Gate fire at the bar.
+
+(defn- mock-caps []
+  (let [truth (atom {:game-feel 70 :responsive 76 :difficulty 64
+                     :readability 58 :juice 52 :composition 61 :audio 55})
+        bumped (atom 14)]
+    {:observe (fn [_target] {:metrics @truth :frames [:title :play1 :play2] :playthrough {:soft-lock false}})
+     :judge   (fn [_obs rubric]
+                (let [sc @truth]
+                  {:scores sc
+                   :defects (->> (dim-keys rubric)
+                                 (remove #(>= (get sc %) (:threshold rubric)))
+                                 (mapv (fn [k] {:dim k :score (get sc k)})))}))
+     :reason  (fn [{:keys [worst]}]
+                {:rationale (str "raise " (name (:key worst)) " (now " (:score worst) ")")
+                 :patch {:dim (:key worst)
+                         :summary (str "tune:" (name (:key worst)))
+                         ;; scripted regression on the 4th patch to show rollback
+                         :regress? (= 14 @bumped)}})
+     :apply   (fn [{:keys [patch]}]
+                (let [backup @truth]
+                  (if (:regress? patch)
+                    (do (swap! truth update :composition - 22)   ; a bad patch
+                        (reset! bumped 16)
+                        {:applied? true :build-ok? true :smoke {:ok true} :backup backup})
+                    (do (swap! truth update (:dim patch) #(min 100 (+ % @bumped)))
+                        {:applied? true :build-ok? true :smoke {:ok true} :backup backup}))))
+     :rollback (fn [backup] (when backup (reset! truth backup)) {:restored? (boolean backup)})}))
+
+(defn -main [& _]
+  (let [conn (db/create-conn cp/checkpoint-schema)
+        cpr  (cp/datomic-checkpointer conn)
+        graph (make-graph (mock-caps) nintendo-rubric
+                          {:checkpointer cpr :max-iter 16})]
+    (println "── Nintendo Loop ──────────────────────────────────────────────")
+    (println (viz/mermaid graph))
+    (println)
+    (let [{:keys [state status]} (g/run* graph
+                                         {:target {:game "gftd/yoro"
+                                                   :files {:scene "public/games/gftd/yoro/scene.edn"
+                                                           :logic "public/games/gftd/yoro/logic.clj"}}}
+                                         {:thread-id "yoro-polish"})]
+      (println "quality trajectory (min dimension per iteration):")
+      (doseq [h (:history state)]
+        (println (format "  iter %2d   min %3d   worst %-12s"
+                         (:iter h) (:min h) (name (:worst h)))))
+      (println)
+      (println "final scores:" (into (sorted-map) (:scores state)))
+      (println "status:" status
+               "| nintendo‑bar:" (nintendo? nintendo-rubric (:scores state))
+               "| iterations:" (:iter state))
+      (println "checkpoints (queryable datoms / time‑travel):"
+               (count (cp/list-checkpoints cpr "yoro-polish")))
+      (println "── ReAct transcript ──")
+      (doseq [[tag line] (:messages state)]
+        (println (format "  %-9s %s" (str tag) line))))))
+
+(comment
+  ;; ───────────────────────── REAL host wiring (JVM or Node) ─────────────────────────
+  ;; The three world‑touching caps, injected. The loop graph above is unchanged.
+  (require '[langchain.model :as model] '[langchain.message :as msg])
+
+  ;; (1) Observe — the *visual test*. Drive a headless browser to run the deterministic
+  ;;     wasm playtester (network-isekai/quality/playtest_harness.mjs) for objective
+  ;;     game‑feel metrics, then screenshot the title + N gameplay frames.
+  (defn observe [target]
+    (let [metrics (browser-eval (slurp-harness) target)        ; jump apex, airtime, pit‑crossable,
+          frames  (browser-screenshots target [:title :play1 :play2 :play3])] ; foe TTK, soft‑locks…
+      {:metrics metrics :frames frames
+       :playthrough (:scripted-runs metrics)}))
+
+  ;; (2) Judge — harness metrics → objective dims; a VISION model scores the visual dims
+  ;;     from the screenshots; a scene scan scores audio. One Claude call does vision.
+  (def vision (model/anthropic-model {:api-key (System/getenv "ANTHROPIC_API_KEY")
+                                      :model "claude-opus-4-8" :http-fn jvm-http
+                                      :json-write json/write-str :json-read #(json/read-str % :key-fn keyword)}))
+  (defn judge [obs rubric]
+    (let [feel  (score-from-metrics (:metrics obs))             ; :game-feel :responsive :difficulty
+          seen  (model/-generate vision
+                   [(msg/system "You are a Nintendo‑bar game‑art reviewer. Score 0‑100 and name concrete defects.")
+                    (msg/user (vision-prompt rubric) (:frames obs))] {})  ; :readability :juice :composition
+          aud   (audit-audio (:target obs))]                    ; :audio
+      {:scores (merge feel (parse-scores seen) aud)
+       :defects (parse-defects seen)}))
+
+  ;; (3) Reason + Act — a ReAct sub‑agent: the model proposes ONE edit tool‑call against the
+  ;;     EDN/CLJ source, `apply` writes it, rebuilds, and smoke‑checks via the same wasm harness.
+  (def edit-tools
+    [{:name "tune_param"  :description "change one numeric tuning constant in scene.edn/logic.clj"
+      :schema {:type "object" :properties {:file {:type "string"} :path {:type "string"} :value {:type "number"}}}
+      :fn (fn [a] (edit-number! a))}
+     {:name "edit_sprite" :description "replace a sprite's primitive vector for better readability/juice"
+      :schema {:type "object" :properties {:tag {:type "string"} :prims {:type "array"}}} :fn edit-sprite!}
+     {:name "add_fx"      :description "add screen‑shake / particles / squash for juice (host :fx)"
+      :schema {:type "object" :properties {:event {:type "string"} :fx {:type "object"}}} :fn add-fx!}])
+  ;; Reason = prebuilt/create-react-agent over edit-tools, prompted with the worst dim + defects.
+  ;; Apply  = run the agent's chosen tool, `amu compile --target wasm32-browser` if kami touched, then
+  ;;          harness‑smoke (compiles? no soft‑lock?) — return {:build-ok? :smoke :backup git-stash-id}.
+  )

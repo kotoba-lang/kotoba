@@ -1,0 +1,109 @@
+(ns comfyui.clip.tokenizer
+  "OpenAI CLIP byte-level BPE tokenizer. Loads the standard encoder.json and
+  merges.txt artifacts and emits fixed-length token IDs/masks."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [kotoba.lang.text :as str])
+  (:import
+           [java.nio.file Files Paths]))
+
+(def ^:private token-pattern
+  #"(?iu)<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+")
+
+(defn- codepoint-string [codepoint]
+  (String. (Character/toChars (int codepoint))))
+
+(defn byte-encoder
+  "The reversible GPT-2/CLIP mapping from each byte 0..255 to a printable
+  Unicode symbol. Public for exact tokenizer contract tests."
+  []
+  (let [visible (vec (concat (range (int \!) (inc (int \~)))
+                             (range 0xA1 (inc 0xAC))
+                             (range 0xAE (inc 0xFF))))
+        visible-set (set visible)
+        [codes _]
+        (reduce (fn [[out extra] byte]
+                  (if (contains? visible-set byte)
+                    [(assoc out byte byte) extra]
+                    [(assoc out byte (+ 256 extra)) (inc extra)]))
+                [{} 0] (range 256))]
+    (into {} (map (fn [[byte codepoint]] [byte (codepoint-string codepoint)]) codes))))
+
+(defn- pairs [symbols]
+  (map vector symbols (rest symbols)))
+
+(defn- bpe-token [token merge-ranks]
+  (loop [symbols (if (= 1 (count token))
+                   [(str token "</w>")]
+                   (conj (mapv str (butlast token)) (str (last token) "</w>")))]
+    (let [ranked (keep (fn [pair]
+                         (when-let [rank (get merge-ranks pair)] [rank pair]))
+                       (pairs symbols))]
+      (if (empty? ranked)
+        symbols
+        (let [[_ [left right]] (apply min-key first ranked)]
+          (recur
+           (loop [remaining symbols out []]
+             (if-let [symbol (first remaining)]
+               (if (and (= symbol left) (= (second remaining) right))
+                 (recur (nnext remaining) (conj out (str left right)))
+                 (recur (next remaining) (conj out symbol)))
+               out))))))))
+
+(defn tokenizer
+  "Build a tokenizer from an encoder token->id map and ordered merge pairs.
+  Options default to OpenAI CLIP's special tokens and context length 77."
+  ([encoder merges] (tokenizer encoder merges {}))
+  ([encoder merges {:keys [start-token end-token pad-token context-length]
+                    :or {start-token "<|startoftext|>"
+                         end-token "<|endoftext|>" context-length 77}}]
+   (let [merge-ranks (into {} (map-indexed (fn [rank pair] [pair rank]) merges))
+         bytes (byte-encoder)
+         cache (atom {})
+         start-id (get encoder start-token)
+         end-id (get encoder end-token)
+         pad-id (if pad-token (get encoder pad-token) 0)]
+     (when-not (and (integer? start-id) (integer? end-id)
+                    (integer? pad-id)
+                    (pos-int? context-length))
+       (throw (ex-info "CLIP vocabulary lacks special tokens or context is invalid"
+                       {:start-token start-token :end-token end-token
+                        :context-length context-length})))
+     (fn [text]
+       (let [pieces (re-seq token-pattern (str/lower (str/trim (str text))))
+             token-strings
+             (mapcat
+              (fn [piece]
+                (let [encoded (apply str
+                                     (map #(get bytes (bit-and 0xff (int %)))
+                                          (kbytes/utf8-bytes piece)))]
+                  (or (get @cache encoded)
+                      (let [result (bpe-token encoded merge-ranks)]
+                        (swap! cache assoc encoded result)
+                        result))))
+              pieces)
+             ids (mapv (fn [token]
+                         (or (get encoder token)
+                             (throw (ex-info "CLIP BPE token absent from vocabulary"
+                                             {:token token :text text}))))
+                       token-strings)
+             content-limit (- context-length 2)
+             content (subvec ids 0 (min content-limit (count ids)))
+             unpadded (into [start-id] (conj content end-id))
+             padding (- context-length (count unpadded))]
+         {:input-ids (into unpadded (repeat padding pad-id))
+          :attention-mask (into (vec (repeat (count unpadded) 1))
+                                (repeat padding 0))
+          :truncated? (> (count ids) content-limit)})))))
+
+(defn load-tokenizer
+  "Load a standard CLIP `encoder.json` and `merges.txt` from filesystem paths."
+  ([encoder-path merges-path] (load-tokenizer encoder-path merges-path {}))
+  ([encoder-path merges-path options]
+   (let [encoder (json/read-str
+                  (Files/readString (Paths/get (str encoder-path) (make-array String 0))))
+         lines (str/split-lines
+                (Files/readString (Paths/get (str merges-path) (make-array String 0))))
+         merges (->> lines
+                     (remove #(or (str/blank? %) (str/starts-with? % "#")))
+                     (mapv #(vec (str/split % #"\s+"))))]
+     (tokenizer encoder merges options))))

@@ -1,0 +1,1773 @@
+(ns kotoba-code.main-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is]]
+            [kotoba-code.durable :as durable]
+            [kotoba-code.main :as main]
+            [langchain.message :as msg]))
+
+(defn- temp-dir []
+  (kio/temp-dir
+            "kotoba-code-main-test"))
+
+(defn- runtime [root model-id]
+  {:root (.getPath (io/file root))
+   :model-id model-id
+   :raw-host {:git-status (constantly "")}
+   :loop-state (atom (durable/new-loop "main-test" {:session "main-test"}))
+   :store nil
+   :checkpointer nil})
+
+(defn- with-stderr-str* [f]
+  (let [w (java.io.StringWriter.)]
+    (binding [*err* w]
+      (f)
+      (str w))))
+
+(defn- runtime-with-loop [root model-id loop-state]
+  (assoc (runtime root model-id) :loop-state (atom loop-state)))
+
+(deftest doctor-report-treats-openrouter-key-as-readiness-state
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/openrouter-key (constantly nil)}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime dir "moonshotai/kimi-k2.7-code"))
+              credentials (some #(when (= "model credentials" (:label %)) %)
+                                (:checks report))]
+          (is (false? (:ready? report)))
+          (is (= false (:ok? credentials)))
+          (is (= "missing OR_KEY/OPENROUTER_API_KEY" (:detail credentials))))))))
+
+(deftest capabilities-readiness-labels-match-doctor-report
+  (let [dir (temp-dir)
+        doctor (#'main/doctor-report (runtime dir "murakumo:gemma3:4b"))
+        capabilities (#'main/capabilities-report)]
+    (is (= (mapv :label (:checks doctor))
+           (get-in capabilities [:catalogs :readiness-report :labels])))))
+
+(deftest command-catalog-matches-usage-and-arity-guard
+  (let [commands @#'main/command-report
+        finite-commands (remove :open-ended-args? commands)]
+    (is (= (set (map :name commands)) @#'main/command-names))
+    (is (= (set (map :name finite-commands))
+           (set (keys @#'main/cli-max-args))))
+    (doseq [{:keys [name usage]} commands]
+      (is (str/includes? (#'main/usage-line name) name)
+          (str "missing usage line for " name))
+      (is (= (#'main/usage-line name) usage)
+          (str "command catalog usage drift for " name))
+      (is (= {:enabled? true
+              :max-distance 4
+              :prefix (#'main/command-prefix name)
+              :prefix-isolated? true}
+             (:suggestion (some #(when (= name (:name %)) %)
+                                commands)))
+          (str "command catalog suggestion drift for " name)))))
+
+(deftest unknown-command-suggestions-use-command-catalog
+  (is (= "--history" (#'main/command-suggestion "--histroy")))
+  (is (= "--interactive-commands-edn"
+         (#'main/command-suggestion "--interactive-command-edn")))
+  (is (nil? (#'main/command-suggestion ":histroy")))
+  (is (nil? (#'main/command-suggestion "--totally-different-command"))))
+
+(deftest interactive-command-catalog-exposes-usage
+  (is (= (set (mapcat (fn [{:keys [name aliases]}]
+                        (cons name aliases))
+                      @#'main/interactive-command-report))
+         @#'main/interactive-command-names))
+  (doseq [{:keys [name usage]} @#'main/interactive-command-report]
+    (is (= (#'main/usage-for-interactive-command name) usage)
+        (str "interactive command catalog usage drift for " name))
+    (is (= {:enabled? true
+            :max-distance 4
+            :prefix ":"
+            :prefix-isolated? true}
+           (:suggestion (some #(when (= name (:name %)) %)
+                              @#'main/interactive-command-report)))
+        (str "interactive command catalog suggestion drift for " name))
+    (is (str/starts-with? usage "usage: ")
+        (str "missing interactive usage for " name))))
+
+(deftest unknown-interactive-command-suggestions-use-command-catalog
+  (is (= ":history" (#'main/interactive-command-suggestion ":histroy")))
+  (is (= ":reset-budget" (#'main/interactive-command-suggestion ":reset-budegt")))
+  (is (nil? (#'main/interactive-command-suggestion "--histroy")))
+  (is (nil? (#'main/interactive-command-suggestion ":totally-different-command"))))
+
+(deftest unexpected-error-message-is-redacted-and-bounded
+  (let [message (#'main/unexpected-error-message
+                 (ex-info (str "local log failed token=abc123 password=hunter2 "
+                               (apply str (repeat 400 "x")))
+                          {}))]
+    (is (str/starts-with? message "ERROR: unexpected failure:"))
+    (is (str/includes? message "[REDACTED]"))
+    (is (<= (count message) (+ (count "ERROR: unexpected failure: ") 243)))
+    (is (not (re-find #"abc123|hunter2" message)))))
+
+(deftest interactive-help-renders-catalog-usage
+  (let [out (with-out-str (#'main/print-help!))]
+    (is (str/includes? out "usage: :help aliases=:h,/help [help]"))
+    (is (str/includes? out "usage: :clear [NAME] aliases=/clear,/reset,/new [session]"))
+    (is (str/includes? out "usage: :compact [INSTRUCTIONS] aliases=/compact [session]"))
+    (is (str/includes? out "usage: :config [KEY=VALUE] aliases=/config [session]"))
+    (is (str/includes? out "usage: :model [MODEL] aliases=/model [session]"))
+    (is (str/includes? out "usage: :permissions [RULE=VALUE] aliases=/permissions [session]"))
+    (is (str/includes? out "usage: :sandbox [KEY=VALUE] aliases=/sandbox [session]"))
+    (is (str/includes? out "usage: :history [N] [supervisor]"))
+    (is (str/includes? out "usage: :read PATH [START] [END] [inspect]"))
+    (is (str/includes? out "/clear starts fresh"))
+    (is (str/includes? out "Any other non-command input is treated as a coding task."))))
+
+(deftest capabilities-exit-code-policy-matches-command-catalog
+  (let [commands (set (map :name @#'main/command-report))
+        policy (:exit-code-policy (#'main/capabilities-report))
+        policy-commands (set (filter commands (mapcat :commands (vals policy))))]
+    (is (= {:ok 0
+            :not-ready-or-not-green 1
+            :unexpected-failure 1
+            :usage-or-configuration-error 2}
+           (:exit-codes (#'main/capabilities-report))))
+    (is (= 0 (get-in policy [:doctor :not-ready])))
+    (is (= 1 (get-in policy [:check :not-ready])))
+    (is (= commands policy-commands))
+    (doseq [command (mapcat :commands (vals policy))
+            :when (str/starts-with? command "-")]
+      (is (contains? commands command)
+          (str "exit-code policy references unknown command " command)))))
+
+(deftest capabilities-report-catalog-matches-capabilities-shape
+  (let [report (#'main/capabilities-report)
+        catalog (get-in report [:catalogs :capabilities-report])]
+    (is (= (set (:top-level catalog)) (set (keys report))))
+    (is (= (set (:catalogs catalog)) (set (keys (:catalogs report)))))
+    (is (= (set (:interactive catalog)) (set (keys (:interactive report)))))
+    (is (= (set (:exit-codes catalog)) (set (keys (:exit-codes report)))))
+    (is (= (set (:limits catalog)) (set (keys (:limits report)))))
+    (is (= (set (:defaults catalog)) (set (keys (:defaults report)))))
+    (is (= (set (:environment catalog)) (set (keys (:environment report)))))
+    (is (= @#'main/max-local-log-line-chars
+           (get-in report [:limits :local-log :max-line-chars])))))
+
+(deftest capabilities-environment-declares-validated-boolean-toggles
+  (let [environment (:environment (#'main/capabilities-report))]
+    (is (= @#'main/boolean-env-keys (:boolean-toggles environment)))
+    (is (= ["true" "false"] (:boolean-values environment)))))
+
+(deftest doctor-report-allows-murakumo-without-provider-key
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/openrouter-key (constantly nil)}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime dir "murakumo:gemma3:4b"))
+              credentials (some #(when (= "model credentials" (:label %)) %)
+                                (:checks report))]
+          (is (true? (:ready? report)))
+          (is (= true (:ok? credentials)))
+          (is (= "murakumo.cloud Anthropic gateway selected" (:detail credentials))))))))
+
+(deftest check-output-includes-next-action-and-keeps-ready-last
+  (let [dir (temp-dir)
+        git-calls (atom 0)
+        runtime (assoc (runtime dir "murakumo:gemma3:4b")
+                       :raw-host {:git-status (fn []
+                                                (swap! git-calls inc)
+                                                "")})]
+    (let [out (with-out-str (#'main/print-check! runtime))
+          lines (str/split-lines out)]
+      (is (= 1 @git-calls))
+      (is (some #(str/starts-with? % "NEXT {:action :run-task") lines))
+      (is (= "READY true" (last lines))))))
+
+(deftest check-edn-report-includes-next-action-from-same-state
+  (let [dir (temp-dir)
+        report (#'main/check-report (runtime dir "murakumo:gemma3:4b"))]
+    (is (true? (:ready? report)))
+    (is (= {:action :run-task
+            :reason :ready
+            :command "kbb -M -m kotoba-code.main \"<task>\" <project-root> [model-id]"
+            :interactive "<task>"}
+           (:next-action report)))))
+
+(deftest doctor-report-requires-a-durable-persistence-path
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG" "false"
+                                    nil))}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime dir "murakumo:gemma3:4b"))
+              local-log (some #(when (= "local log" (:label %)) %)
+                              (:checks report))]
+          (is (false? (:ready? report)))
+          (is (= false (:ok? local-log)))
+          (is (= "disabled" (:detail local-log))))))))
+
+(deftest state-report-next-action-includes-local-log-repair-context
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG" "false"
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime dir "murakumo:gemma3:4b"))]
+          (is (= {:action :repair-local-log
+                  :reason :local-log-unhealthy
+                  :detail "disabled"
+                  :path nil
+                  :corrupt-lines 0
+                  :errors []
+                  :env ["KC_LOCAL_LOG_DIR" "KC_LOCAL_LOG"]
+                  :command "kbb -M -m kotoba-code.main --state-edn <project-root> [model-id]"}
+                 (:next-action report))))))))
+
+(deftest doctor-report-allows-disabled-local-log-with-kotoba-checkpointer
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG" "false"
+                                    nil))}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (assoc (runtime dir "murakumo:gemma3:4b")
+                             :checkpointer ::checkpointer
+                             :store {:conn ::conn}))
+              kotoba (some #(when (= "kotoba datom" (:label %)) %)
+                            (:checks report))]
+          (is (true? (:ready? report)))
+          (is (= true (:ok? kotoba))))))))
+
+(deftest doctor-report-treats-bad-numeric-env-as-readiness-state
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_RUN_TIMEOUT_MS" "soon"
+                                    "KC_MODEL_RETRY_BACKOFF_MS" "-1"
+                                    nil))
+                     #'main/openrouter-key (constantly nil)}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime dir "murakumo:gemma3:4b"))
+              configuration (some #(when (= "configuration" (:label %)) %)
+                                  (:checks report))]
+          (is (false? (:ready? report)))
+          (is (= false (:ok? configuration)))
+          (is (re-find #"KC_RUN_TIMEOUT_MS=\"soon\"" (:detail configuration)))
+          (is (re-find #"KC_MODEL_RETRY_BACKOFF_MS=\"-1\"" (:detail configuration))))))))
+
+(deftest doctor-report-treats-bad-boolean-env-as-readiness-state
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_TOOL_TRANSCRIPT" "nope"
+                                    nil))}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime dir "murakumo:gemma3:4b"))
+              configuration (some #(when (= "configuration" (:label %)) %)
+                                  (:checks report))]
+          (is (false? (:ready? report)))
+          (is (= false (:ok? configuration)))
+          (is (re-find #"KC_TOOL_TRANSCRIPT=\"nope\"" (:detail configuration)))
+          (is (re-find #"expected true or false" (:detail configuration))))))))
+
+(deftest doctor-report-redacts-sensitive-env-derived-details
+  (let [dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_TEST_CMD" "echo token=abc123 password=hunter2 sk-or-secret"
+                                    "KC_MURAKUMO_URL" "not-a-url?token=abc123"
+                                    nil))}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime dir "murakumo:gemma3:4b"))
+              test-command (some #(when (= "test command" (:label %)) %)
+                                 (:checks report))
+              configuration (some #(when (= "configuration" (:label %)) %)
+                                  (:checks report))
+              rendered (pr-str [(:detail test-command) (:detail configuration)])]
+          (is (str/includes? rendered "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2|sk-or-secret" rendered))))))))
+
+(deftest doctor-report-redacts-git-status-exceptions
+  (let [dir (temp-dir)
+        runtime (assoc (runtime dir "murakumo:gemma3:4b")
+                       :raw-host {:git-status (fn []
+                                                (throw (ex-info "git failed token=abc123 password=hunter2" {})))})]
+    (let [report (#'main/doctor-report runtime)
+          git-check (some #(when (= "git" (:label %)) %)
+                          (:checks report))]
+      (is (false? (:ready? report)))
+      (is (= false (:ok? git-check)))
+      (is (str/includes? (:detail git-check) "[REDACTED]"))
+      (is (not (re-find #"abc123|hunter2" (:detail git-check)))))))
+
+(deftest human-runtime-identifiers-are-redacted-without-changing-loop-state
+  (let [dir (temp-dir)
+        loop-id "token=abc123 sk-or-secret"
+        loop (durable/new-loop loop-id {:session "password=hunter2"})
+        runtime (runtime-with-loop dir "murakumo:gemma3:4b" loop)
+        filename (#'main/safe-file-name loop-id)
+        out (with-out-str (#'main/print-budget! runtime))]
+    (is (= loop-id (:agent.loop/id @(:loop-state runtime))))
+    (is (str/includes? filename "REDACTED"))
+    (is (not (re-find #"abc123|sk-or-secret" filename)))
+    (is (str/includes? out "[REDACTED]"))
+    (is (not (re-find #"abc123|sk-or-secret" out)))))
+
+(deftest session-metadata-is-redacted-before-new-loop-persistence
+  (let [dir (temp-dir)
+        log-dir (temp-dir)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_SESSION" "operator token=abc123 password=hunter2 sk-or-secret"
+                                    "KC_LOOP_ID" "safe-loop"
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                    #'main/kotoba-store (constantly nil)}
+      (fn []
+        (let [runtime (#'main/build-runtime (.getPath dir) "murakumo:gemma3:4b")
+              loop @(:loop-state runtime)
+              rendered (pr-str loop)]
+          (is (= "safe-loop" (:agent.loop/id loop)))
+          (is (str/includes? (:agent.loop/session loop) "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2|sk-or-secret" rendered))))))))
+
+(deftest local-log-report-paths-redact-sensitive-directory-values
+  (let [dir (temp-dir)
+        secret-dir (io/file dir "token=abc123")
+        runtime (runtime dir "murakumo:gemma3:4b")]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath secret-dir)
+                                    nil))}
+      (fn []
+        (let [state (#'main/state-report runtime)
+              log (#'main/log-report runtime)
+              doctor (#'main/doctor-report runtime)
+              local-log (some #(when (= "local log" (:label %)) %)
+                              (:checks doctor))
+              rendered (pr-str [(:log state)
+                                (:next-action state)
+                                log
+                                (:detail local-log)])]
+          (is (str/includes? rendered "[REDACTED]"))
+          (is (not (re-find #"abc123" rendered))))))))
+
+(deftest numeric-env-falls-back-after-doctor-reports-invalid-config
+  (with-redefs-fn {#'main/env (fn [k]
+                                (case k
+                                  "KC_GATE_ROUNDS" "many"
+                                  nil))}
+    (fn []
+      (is (= 1 (#'main/numeric-env "KC_GATE_ROUNDS" 1)))
+      (is (= [{:key "KC_GATE_ROUNDS"
+               :value "many"
+               :error "expected integer for KC_GATE_ROUNDS"}]
+             (#'main/config-errors))))))
+
+(deftest model-retry-options-come-from-validated-env
+  (with-redefs-fn {#'main/env (fn [k]
+                                (case k
+                                  "KC_MODEL_RETRY_ATTEMPTS" "2"
+                                  "KC_MODEL_RETRY_BACKOFF_MS" "0"
+                                  nil))}
+    (fn []
+      (is (= {:attempts 2 :backoff-ms 0}
+             (#'main/model-retry-opts))))))
+
+(deftest budget-report-exposes-governor-decision
+  (let [dir (temp-dir)
+        loop (durable/new-loop "main-test" {:budget {:rounds 0}})
+        report (#'main/budget-report
+                (runtime-with-loop dir "murakumo:gemma3:4b" loop))]
+    (is (= :hold (:decision report)))
+    (is (= :budget-exhausted (:reason report)))))
+
+(deftest doctor-report-treats-exhausted-budget-as-not-ready
+  (let [dir (temp-dir)
+        loop (durable/new-loop "main-test" {:budget {:rounds 0}})]
+    (with-redefs-fn {#'main/openrouter-key (constantly nil)}
+      (fn []
+        (let [report (#'main/doctor-report
+                      (runtime-with-loop dir "murakumo:gemma3:4b" loop))
+              loop-check (some #(when (= "loop" (:label %)) %)
+                               (:checks report))]
+          (is (false? (:ready? report)))
+          (is (= false (:ok? loop-check)))
+          (is (re-find #"decision=hold" (:detail loop-check)))
+          (is (re-find #"reason=budget-exhausted" (:detail loop-check))))))))
+
+(deftest state-report-combines-readiness-budget-and-log-metadata
+  (let [dir (temp-dir)
+        log-dir (temp-dir)
+        runtime (runtime-with-loop
+                 dir
+                 "murakumo:gemma3:4b"
+                 (durable/new-loop "main-test-state"
+                                   {:session "main-test"}))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    "KC_LOCAL_LOG" "true"
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report runtime)]
+          (is (= (.getPath (io/file dir)) (:root report)))
+          (is (= "murakumo:gemma3:4b" (:model report)))
+          (is (= {:loop-id "main-test-state"
+                  :session "main-test"
+                  :worker-id "local"
+                  :model "murakumo:gemma3:4b"}
+                 (:runtime report)))
+          (is (true? (:ready? report)))
+          (is (= :continue (get-in report [:budget :decision])))
+          (is (= {:action :run-task
+                  :reason :ready
+                  :command "kbb -M -m kotoba-code.main \"<task>\" <project-root> [model-id]"
+                  :interactive "<task>"}
+                 (:next-action report)))
+          (is (contains? report :doctor))
+          (is (contains? report :latest))
+          (is (= {:ticks 0
+                  :by-status {}
+                  :events {}
+                  :latest-run-summary nil
+                  :latest-tool-error nil
+                  :latest-error nil
+                  :latest-refusal nil
+                  :latest-control nil}
+                 (:metrics report)))
+          (is (= {:present? false
+                  :owner nil
+                  :current-owner "local"
+                  :expires-at nil
+                  :valid? false
+                  :stale? false
+                  :conflict? false
+                  :takeover? false}
+                 (:lease-status report)))
+          (is (integer? (get-in report [:log :entries]))))))))
+
+(deftest state-report-next-action-inspects-dirty-worktree-before-run
+  (let [dir (temp-dir)
+        runtime (assoc (runtime dir "murakumo:gemma3:4b")
+                       :raw-host {:git-status (constantly " M src/x.clj\n?? tmp/generated.clj\n")})
+        report (#'main/state-report runtime)]
+    (is (true? (:ready? report)))
+    (is (= {:action :inspect-worktree
+            :reason :pre-existing-worktree-changes
+            :detail "M src/x.clj ?? tmp/generated.clj"
+            :command "kbb -M -m kotoba-code.main --status <project-root>"
+            :interactive ":status"
+            :then "run the task after committing, stashing, or intentionally accepting the existing changes"}
+           (:next-action report)))))
+
+(deftest state-report-next-action-redacts-dirty-worktree-detail
+  (let [dir (temp-dir)
+        runtime (assoc (runtime dir "murakumo:gemma3:4b")
+                       :raw-host {:git-status (constantly " M token=abc123.clj\n?? api_key=sk-or-secret\n")})
+        action (:next-action (#'main/state-report runtime))]
+    (is (= :inspect-worktree (:action action)))
+    (is (str/includes? (:detail action) "[REDACTED]"))
+    (is (not (re-find #"abc123|sk-or-secret" (:detail action))))
+    (is (<= (count (:detail action)) 143))))
+
+(deftest capabilities-state-report-catalog-matches-state-report-shape
+  (let [dir (temp-dir)
+        report (#'main/state-report
+                (runtime dir "murakumo:gemma3:4b"))
+        catalog (get-in (#'main/capabilities-report)
+                        [:catalogs :state-report])
+        metric-keys (set (keys (:metrics report)))
+        catalog-metric-keys (set (concat (get-in catalog [:metrics :counters])
+                                         (get-in catalog [:metrics :maps])
+                                         (get-in catalog [:metrics :latest])))]
+    (is (= (set (:sections catalog)) (set (keys report))))
+    (is (= catalog-metric-keys metric-keys))))
+
+(deftest capabilities-log-report-catalog-matches-log-report-shape
+  (let [dir (temp-dir)
+        report (#'main/log-report
+                (runtime dir "murakumo:gemma3:4b"))
+        catalog (get-in (#'main/capabilities-report)
+                        [:catalogs :log-report])
+        metric-keys (set (keys (:metrics report)))
+        catalog-metric-keys (set (concat (get-in catalog [:metrics :counters])
+                                         (get-in catalog [:metrics :maps])
+                                         (get-in catalog [:metrics :latest])))]
+    (is (= (set (keys (:shape catalog))) (set (keys report))))
+    (is (= catalog-metric-keys metric-keys))
+    (is (= [:tick-seq
+            :tick-status
+            :loop-status
+            :decision
+            :lease-owner
+            :lease-expires-at]
+           (:latest-summary catalog)))))
+
+(deftest state-report-detects-active-lease-owned-by-another-worker
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")]
+    (spit log-file
+          (str (pr-str {:loop (durable/new-loop "main-test")
+                        :tick {:agent.tick/seq 1}
+                        :lease {:agent.lease/loop "main-test"
+                                :agent.lease/owner "worker-a"
+                                :agent.lease/expires-at 5000}})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/now-ms (constantly 1000)
+                     #'main/worker-id (constantly "worker-b")}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              lease-check (some #(when (= "lease" (:label %)) %)
+                                (get-in report [:doctor :checks]))]
+          (is (false? (:ready? report)))
+          (is (= :wait-for-lease (get-in report [:next-action :action])))
+          (is (= :active-lease-conflict (get-in report [:next-action :reason])))
+          (is (= "worker-a" (get-in report [:next-action :owner])))
+          (is (= {:present? true
+                  :owner "worker-a"
+                  :current-owner "worker-b"
+                  :expires-at 5000
+                  :valid? true
+                  :stale? false
+                  :conflict? true
+                  :takeover? false}
+                 (:lease-status report)))
+          (is (= false (:ok? lease-check)))
+          (is (re-find #"conflict=true" (:detail lease-check))))))))
+
+(deftest state-report-marks-stale-lease-takeover
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")]
+    (spit log-file
+          (str (pr-str {:loop (durable/new-loop "main-test")
+                        :tick {:agent.tick/seq 1}
+                        :lease {:agent.lease/loop "main-test"
+                                :agent.lease/owner "worker-a"
+                                :agent.lease/expires-at 1000}})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/now-ms (constantly 5000)
+                     #'main/worker-id (constantly "worker-b")}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              lease-check (some #(when (= "lease" (:label %)) %)
+                                (get-in report [:doctor :checks]))]
+          (is (true? (:ready? report)))
+          (is (= {:present? true
+                  :owner "worker-a"
+                  :current-owner "worker-b"
+                  :expires-at 1000
+                  :valid? false
+                  :stale? true
+                  :conflict? false
+                  :takeover? true}
+                 (:lease-status report)))
+          (is (= true (:ok? lease-check)))
+          (is (re-find #"takeover=true" (:detail lease-check))))))))
+
+(deftest state-report-next-action-guides-common-blockers
+  (let [dir (temp-dir)
+        stopped (durable/new-loop "main-test" {:status :stopped})
+        exhausted (durable/new-loop "main-test" {:budget {:rounds 0}})
+        interrupted (durable/new-loop "main-test" {:status :interrupted})]
+    (with-redefs-fn {#'main/openrouter-key (constantly nil)}
+      (fn []
+        (is (= {:action :set-provider-key
+                :reason :missing-provider-key
+                :detail "missing OR_KEY/OPENROUTER_API_KEY"
+                :env ["OR_KEY" "OPENROUTER_API_KEY"]
+                :alternative "use a murakumo:<model> model id"}
+               (:next-action
+                (#'main/state-report
+                 (runtime dir "moonshotai/kimi-k2.7-code")))))))
+    (is (= {:action :reset-budget
+            :reason :budget-exhausted
+            :command "kbb -M -m kotoba-code.main --reset-budget <project-root> [model-id] [reason]"
+            :interactive ":reset-budget [REASON]"}
+           (:next-action
+            (#'main/state-report
+             (runtime-with-loop dir "murakumo:gemma3:4b" exhausted)))))
+    (is (= {:action :resume
+            :reason :status-stopped
+            :command "kbb -M -m kotoba-code.main --resume <project-root> [model-id]"
+            :interactive ":resume"}
+           (:next-action
+            (#'main/state-report
+             (runtime-with-loop dir "murakumo:gemma3:4b" stopped)))))
+    (is (= {:action :resume
+            :reason :interrupted
+            :command "kbb -M -m kotoba-code.main --resume <project-root> [model-id]"
+            :interactive ":resume"}
+           (:next-action
+            (#'main/state-report
+             (runtime-with-loop dir "murakumo:gemma3:4b" interrupted)))))))
+
+(deftest capabilities-next-action-fields-match-representative-reports
+  (let [dir (temp-dir)
+        stopped (durable/new-loop "main-test" {:status :stopped})
+        exhausted (durable/new-loop "main-test" {:budget {:rounds 0}})
+        interrupted (durable/new-loop "main-test" {:status :interrupted})
+        dirty-runtime (assoc (runtime dir "murakumo:gemma3:4b")
+                             :raw-host {:git-status (constantly " M src/x.clj\n")})
+        catalog (->> (get-in (#'main/capabilities-report)
+                             [:catalogs :next-actions])
+                     (map (juxt :action :fields))
+                     (into {}))
+        reports [(#'main/state-report
+                  (runtime dir "murakumo:gemma3:4b"))
+                 (#'main/state-report
+                  (runtime-with-loop dir "murakumo:gemma3:4b" stopped))
+                 (#'main/state-report
+                  (runtime-with-loop dir "murakumo:gemma3:4b" exhausted))
+                 (#'main/state-report
+                  (runtime-with-loop dir "murakumo:gemma3:4b" interrupted))
+                 (#'main/state-report dirty-runtime)]]
+    (with-redefs-fn {#'main/openrouter-key (constantly nil)}
+      (fn []
+        (doseq [action (map :next-action
+                            (conj reports
+                                  (#'main/state-report
+                                   (runtime dir "moonshotai/kimi-k2.7-code"))))]
+          (is (= (set (get catalog (:action action)))
+                 (set (keys action)))
+              (str "catalog fields mismatch for " (:action action))))))))
+
+(deftest state-report-next-action-points-at-history-after-tool-errors
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")
+        interrupted (durable/new-loop "main-test" {:status :interrupted})]
+    (spit log-file
+          (str (pr-str {:loop interrupted
+                        :tick {:agent.tick/seq 1
+                               :agent.tick/status :interrupted}
+                        :events [{:agent.event/type :run-summary
+                                  :agent.event/payload {:status :interrupted
+                                                        :elapsed-ms 120
+                                                        :tool-calls 3
+                                                        :tool-errors 2
+                                                        :task "fix"}}
+                                 {:agent.event/type :tool-call
+                                  :agent.event/payload {:name "replace_text"
+                                                        :error? true
+                                                        :result-tail "TOOL_ERROR: replace_text: missing required argument"}}]})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime-with-loop root "murakumo:gemma3:4b" interrupted))]
+          (is (= {:action :inspect-history
+                  :reason :tool-errors-observed
+                  :status :interrupted
+                  :task "fix"
+                  :tool-errors 2
+                  :tool "replace_text"
+                  :result-tail "TOOL_ERROR: replace_text: missing required argument"
+                  :command "kbb -M -m kotoba-code.main --history-edn <project-root> [model-id] 10"
+                  :interactive ":history-edn 10"
+                  :then "resume after reviewing the latest run"}
+                 (:next-action report))))))))
+
+(deftest state-report-next-action-points-at-history-after-incomplete-run
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")
+        interrupted (durable/new-loop "main-test" {:status :interrupted})]
+    (spit log-file
+          (str (pr-str {:loop interrupted
+                        :tick {:agent.tick/seq 1
+                               :agent.tick/status :interrupted}
+                        :events [{:agent.event/type :run-summary
+                                  :agent.event/payload {:status :interrupted
+                                                        :green? false
+                                                        :elapsed-ms 120
+                                                        :tool-calls 0
+                                                        :tool-errors 0
+                                                        :task "fix failing test"
+                                                        :timeout? true}}]})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime-with-loop root "murakumo:gemma3:4b" interrupted))]
+          (is (= {:action :inspect-history
+                  :reason :latest-run-incomplete
+                  :status :interrupted
+                  :task "fix failing test"
+                  :tool-errors 0
+                  :tool nil
+                  :result-tail nil
+                  :command "kbb -M -m kotoba-code.main --history-edn <project-root> [model-id] 10"
+                  :interactive ":history-edn 10"
+                  :then "resume after reviewing the latest run"}
+                 (:next-action report))))))))
+
+(deftest run-once-refuses-active-lease-owned-by-another-worker-without-writing-log
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::must-not-run
+                       :host {}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (spit log-file
+          (str (pr-str {:loop (durable/new-loop "main-test")
+                        :tick {:agent.tick/seq 1}
+                        :lease {:agent.lease/loop "main-test"
+                                :agent.lease/owner "worker-a"
+                                :agent.lease/expires-at 5000}})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/now-ms (constantly 1000)
+                     #'main/worker-id (constantly "worker-b")}
+      (fn []
+        (let [out (with-out-str
+                    (is (nil? (#'main/run-once! runtime "do work"))))
+              summary (#'main/local-log-summary "main-test")]
+          (is (re-find #"active lease is owned by worker-a" out))
+          (is (= 1 (:entries summary)))
+          (is (= 1 (get-in summary [:latest :tick :agent.tick/seq]))))))))
+
+(deftest run-once-claims-lease-before-starting-gated-run
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host ::host
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       {:green? true
+                        :test-out "0 failures, 0 errors"
+                        :answer "DONE"
+                        :rounds 1
+                        :final nil})}
+      (fn []
+        (let [out (with-out-str
+                    (is (true? (#'main/run-once! runtime "do work"))))
+              tail (#'main/local-log-tail "main-test" 10)]
+          (is (re-find #"lease-claimed" out))
+          (is (= [:lease :run-summary :gate :answer]
+                 (vec (mapcat (fn [entry]
+                                (map :agent.event/type (:events entry)))
+                              (:entries tail)))))
+          (is (= {:status :done
+                  :green? true
+                  :elapsed-ms 2000
+                  :task "do work"
+                  :tool-calls 0
+                  :tool-errors 0
+                  :rounds 1
+	                  :timeout? false
+	                  :exception? false
+	                  :rolled-back? false
+	                  :rollback-error? false
+	                  :git-dirty? false
+	                  :git-status-error? false
+	                  :git-status-tail nil}
+                 (->> (:entries tail)
+                      second
+                      :events
+                      (some #(when (= :run-summary (:agent.event/type %))
+                               (:agent.event/payload %))))))
+          (is (= [:lease-claimed :done]
+                 (mapv #(get-in % [:tick :agent.tick/status])
+                       (:entries tail))))
+          (is (= ["worker-a" "worker-a"]
+                 (mapv #(get-in % [:lease :agent.lease/owner])
+                       (:entries tail))))
+          (is (> (get-in (first (:entries tail)) [:lease :agent.lease/expires-at])
+                 (get-in (second (:entries tail)) [:lease :agent.lease/expires-at]))))))))
+
+(deftest capabilities-history-entry-catalog-matches-local-log-entry-shape
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host ::host
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       {:green? true
+                        :test-out "0 failures, 0 errors"
+                        :answer "DONE"
+                        :rounds 1
+                        :final nil})}
+      (fn []
+        (with-out-str (#'main/run-once! runtime "do work"))
+        (let [entry (second (:entries (#'main/local-log-tail "main-test" 10)))
+              event (first (:events entry))
+              catalog (get-in (#'main/capabilities-report)
+                              [:catalogs :history-entry])]
+          (is (= (set (:entry catalog)) (set (keys entry))))
+          (is (= (set (:loop catalog)) (set (keys (:loop entry)))))
+          (is (= (set (:tick catalog)) (set (keys (:tick entry)))))
+          (is (= (set (:lease catalog)) (set (keys (:lease entry)))))
+          (is (= (set (:event catalog)) (set (keys event))))
+          (is (= (set (:governor catalog)) (set (keys (:governor entry))))))))))
+
+(deftest durable-run-result-redacts-secrets-before-persisting-events
+  (let [result (#'main/run->durable-result
+                {:green? false
+                 :test-out "failure token=abc123"
+                 :answer "api_key=sk-or-secret"
+                 :error "Authorization: Bearer sk-or-secret"
+                 :rounds 1
+                 :final nil
+                 :elapsed-ms 12
+                 :task "fix with password=hunter2"
+                 :git-status "M secret.clj\napi_key=sk-or-secret"
+                 :rolled-back? true})
+        payloads (map :payload (:events result))
+        rendered (pr-str payloads)]
+    (is (re-find #"\[REDACTED\]" rendered))
+    (is (not (re-find #"abc123|sk-or-secret|hunter2" rendered)))))
+
+(deftest control-reasons-are-redacted-and-clipped-before-persisting
+  (let [dir (temp-dir)
+        runtime (runtime dir "murakumo:gemma3:4b")
+        secret-reason (str "operator pasted token=abc123 password=hunter2 "
+                           (apply str (repeat 400 "x")))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath dir)
+                                    nil))}
+      (fn []
+        (with-out-str
+          (#'main/persist-control! runtime :stop secret-reason)
+          (#'main/persist-reset-budget! runtime secret-reason))
+        (let [entries (:entries (#'main/local-log-tail "main-test" 10))
+              payloads (mapcat (fn [entry]
+                                  (map :agent.event/payload (:events entry)))
+                                entries)
+              reasons (keep :reason payloads)
+              rendered (pr-str reasons)
+              history-out (with-out-str (#'main/print-history! runtime 10))]
+          (is (seq reasons))
+          (is (every? #(<= (count %) 243) reasons))
+          (is (str/includes? rendered "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2" rendered)))
+          (is (str/includes? history-out "control stop effective?=true reason=operator pasted"))
+          (is (str/includes? history-out "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2" history-out))))))))
+
+(deftest worker-id-is-redacted-before-persisting-lease-owner
+  (let [dir (temp-dir)
+        runtime (runtime dir "murakumo:gemma3:4b")]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath dir)
+                                    "KC_WORKER_ID" "worker token=abc123 password=hunter2"
+                                    nil))}
+      (fn []
+        (with-out-str
+          (#'main/persist-control! runtime :stop "operator stop"))
+        (let [report (#'main/state-report runtime)
+              rendered (pr-str [(:lease report)
+                                (:lease-status report)
+                                (get-in report [:log :latest])
+                                (get-in report [:metrics :latest-control])])]
+          (is (= "worker token=[REDACTED] password=[REDACTED]"
+                 (get-in report [:lease :agent.lease/owner])))
+          (is (str/includes? rendered "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2" rendered))))))))
+
+(deftest durable-run-summary-counts-tool-errors
+  (let [final {:messages [(msg/user "task")
+                          (msg/ai "" {:tool-calls [{:id "ok"
+                                                    :name "read_file"
+                                                    :input {:path "src/x.clj"}}
+                                                   {:id "bad"
+                                                    :name "replace_text"
+                                                    :input {:path "src/x.clj"}}]})
+                          (msg/tool-result "ok" "(ns x)")
+                          (msg/tool-result "bad" "TOOL_ERROR: replace_text: missing required argument")]}
+        result (#'main/run->durable-result
+                {:green? false
+                 :test-out "1 failures, 0 errors"
+                 :rounds 1
+                 :final final
+                 :elapsed-ms 12
+                 :task "fix"})
+        summary (some #(when (= :run-summary (:type %))
+                         (:payload %))
+                      (:events result))
+        tool-events (filter #(= :tool-call (:type %)) (:events result))]
+    (is (= 2 (:tool-calls summary)))
+    (is (= 1 (:tool-errors summary)))
+    (is (= [false true] (mapv #(get-in % [:payload :error?]) tool-events)))))
+
+(deftest capabilities-run-summary-catalog-matches-durable-payload
+  (let [result (#'main/run->durable-result
+                {:green? false
+                 :test-out "1 failures, 0 errors"
+                 :rounds 2
+                 :final nil
+                 :elapsed-ms 12
+                 :task "fix"
+                 :git-status "ERROR: git unavailable"
+                 :rolled-back? true
+                 :rollback-error "rollback failed"
+                 :timeout? true
+                 :exception? false})
+        summary (some #(when (= :run-summary (:type %))
+                         (:payload %))
+                      (:events result))
+        catalog (get-in (#'main/capabilities-report)
+                        [:catalogs :history-entry :bounded-payloads :run-summary])]
+    (is (= (set catalog) (set (keys summary))))))
+
+(deftest human-history-summary-shows-tool-error-count
+  (is (= "run error elapsed-ms=12 tools=2 tool-errors=1 timeout?=false exception?=true rolled-back?=true rollback-error?=true git-dirty?=false git-status-error?=true"
+         (#'main/event-summary
+          {:agent.event/type :run-summary
+           :agent.event/payload {:status :error
+                                 :elapsed-ms 12
+                                 :tool-calls 2
+                                 :tool-errors 1
+                                 :timeout? false
+                                 :exception? true
+                                 :rolled-back? true
+                                 :rollback-error? true
+                                 :git-dirty? false
+                                 :git-status-error? true}})))
+  (is (= "run done elapsed-ms=12 tools=2 tool-errors=0"
+         (#'main/event-summary
+          {:agent.event/type :run-summary
+           :agent.event/payload {:status :done
+                                 :elapsed-ms 12
+                                 :tool-calls 2}}))))
+
+(deftest durable-run-result-clips-large-answer-and-error-events
+  (let [huge (apply str (repeat 2000 "x"))
+        result (#'main/run->durable-result
+                {:green? false
+                 :test-out ""
+                 :answer huge
+                 :error huge
+                 :rounds 1
+                 :final nil
+                 :elapsed-ms 12
+                 :task "task"})
+        answer-text (some #(when (= :answer (:type %))
+                             (get-in % [:payload :text]))
+                          (:events result))
+        error-message (some #(when (= :error (:type %))
+                               (get-in % [:payload :message]))
+                            (:events result))]
+    (is (= 1203 (count answer-text)))
+    (is (= 1203 (count error-message)))
+    (is (str/ends-with? answer-text "..."))
+    (is (str/ends-with? error-message "..."))))
+
+(deftest run-once-records-working-tree-status-in-run-summary
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host {:git-status (constantly " M src/x.clj\n?? tmp/generated.clj\n")}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       {:green? true
+                        :test-out "0 failures, 0 errors"
+                        :answer "DONE"
+                        :rounds 1
+                        :final nil})}
+      (fn []
+        (with-out-str
+          (is (true? (#'main/run-once! runtime "do dirty work"))))
+        (let [summary (->> (#'main/local-log-tail "main-test" 10)
+                           :entries
+                           second
+                           :events
+                           (some #(when (= :run-summary (:agent.event/type %))
+                                    (:agent.event/payload %))))]
+	  (is (= true (:git-dirty? summary)))
+	  (is (= false (:git-status-error? summary)))
+	  (is (= " M src/x.clj ?? tmp/generated.clj "
+		 (:git-status-tail summary))))))))
+
+(deftest run-once-records-git-status-errors-in-run-summary
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host {:git-status (constantly "ERROR: git command failed exit=128 not a repo")}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       {:green? true
+                        :test-out "0 failures, 0 errors"
+                        :answer "DONE"
+                        :rounds 1
+                        :final nil})}
+      (fn []
+        (with-out-str
+          (is (true? (#'main/run-once! runtime "do work"))))
+        (let [summary (->> (#'main/local-log-tail "main-test" 10)
+                           :entries
+                           second
+                           :events
+                           (some #(when (= :run-summary (:agent.event/type %))
+                                    (:agent.event/payload %))))]
+          (is (= false (:git-dirty? summary)))
+          (is (= true (:git-status-error? summary)))
+          (is (re-find #"ERROR: git command failed" (:git-status-tail summary))))))))
+
+(deftest run-once-clears-rollback-journal-after-committed-result
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        cleared? (atom false)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host {:git-status (constantly "")
+                              :clear-rollback-journal (fn []
+                                                        (reset! cleared? true)
+                                                        {:src true})}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       {:green? true
+                        :test-out "0 failures, 0 errors"
+                        :answer "DONE"
+                        :rounds 1
+                        :final nil})}
+      (fn []
+        (with-out-str
+          (is (true? (#'main/run-once! runtime "do work"))))
+        (is (true? @cleared?))))))
+
+(deftest run-once-rolls-back-and-skips-result-commit-when-lease-is-lost
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        rolled-back? (atom false)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host {:rollback (fn [] (reset! rolled-back? true))}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       (#'main/append-local-supervisor-log!
+                        "main-test"
+                        (durable/lease-claim-step
+                         @(:loop-state runtime)
+                         {:now-ms 9000
+                          :owner "worker-b"
+                          :ttl-ms 60000
+                          :task "other work"}))
+                       {:green? true
+                        :test-out "0 failures, 0 errors"
+                        :answer "DONE"
+                        :rounds 1
+                        :final nil})}
+      (fn []
+        (let [out (with-out-str
+                    (is (false? (#'main/run-once! runtime "do work"))))
+              tail (#'main/local-log-tail "main-test" 10)]
+          (is @rolled-back?)
+          (is (re-find #"lost lease before commit" out))
+          (is (= [:lease-claimed :lease-claimed]
+                 (mapv #(get-in % [:tick :agent.tick/status])
+                       (:entries tail))))
+          (is (= ["worker-a" "worker-b"]
+                 (mapv #(get-in % [:lease :agent.lease/owner])
+                       (:entries tail)))))))))
+
+(deftest run-once-records-error-and-releases-lease-when-gated-run-throws
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        rolled-back? (atom false)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host {:rollback (fn [] (reset! rolled-back? true))}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       (throw (ex-info "model exploded" {})))}
+      (fn []
+        (let [out (with-out-str
+                    (is (false? (#'main/run-once! runtime "do work"))))
+              tail (#'main/local-log-tail "main-test" 10)]
+          (is @rolled-back?)
+          (is (re-find #"model exploded" out))
+          (is (= [:lease-claimed :error]
+                 (mapv #(get-in % [:tick :agent.tick/status])
+                       (:entries tail))))
+          (is (= [:lease :run-summary :gate :error]
+                 (vec (mapcat (fn [entry]
+                                (map :agent.event/type (:events entry)))
+                              (:entries tail)))))
+          (is (= :error
+                 (->> (:entries tail)
+                      second
+                      :events
+                      (some #(when (= :run-summary (:agent.event/type %))
+                               (get-in % [:agent.event/payload :status]))))))
+          (is (= true
+                 (->> (:entries tail)
+                      second
+                      :events
+                      (some #(when (= :run-summary (:agent.event/type %))
+                               (get-in % [:agent.event/payload :rolled-back?]))))))
+          (let [summary (->> (:entries tail)
+                             second
+                             :events
+                             (some #(when (= :run-summary (:agent.event/type %))
+                                      (:agent.event/payload %))))]
+            (is (= true (:exception? summary)))
+            (is (= false (:timeout? summary))))
+          (is (> (get-in (first (:entries tail)) [:lease :agent.lease/expires-at])
+                 (get-in (second (:entries tail)) [:lease :agent.lease/expires-at]))))))))
+
+(deftest run-once-records-rollback-failure-in-error-tick
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :agent ::agent
+                       :host {:rollback (fn []
+                                          (throw (ex-info "rollback exploded token=abc123" {})))}
+                       :gate-rounds 1
+                       :aborting (atom false))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                     #'main/worker-id (constantly "worker-a")
+                     #'main/now-ms (let [clock (atom 1000)]
+                                     (fn [] (swap! clock + 1000)))
+                     #'kotoba-code.gate/run-gated
+                     (fn [_ _ _ _]
+                       (throw (ex-info "model exploded password=hunter2" {})))}
+      (fn []
+        (let [out (with-out-str
+                    (is (false? (#'main/run-once! runtime "do work"))))
+              tail (#'main/local-log-tail "main-test" 10)
+              latest (last (:entries tail))
+              summary-event (some #(when (= :run-summary (:agent.event/type %)) %)
+                                   (:events latest))
+              error-event (some #(when (= :error (:agent.event/type %)) %)
+                                (:events latest))]
+          (is (re-find #"rollback failed: rollback exploded" out))
+          (is (str/includes? out "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2" out)))
+          (is (= :error (get-in latest [:tick :agent.tick/status])))
+          (is (= true (get-in summary-event [:agent.event/payload :rolled-back?])))
+          (is (= true (get-in summary-event [:agent.event/payload :rollback-error?])))
+          (is (str/includes? (get-in error-event [:agent.event/payload :message])
+                             "model exploded"))
+          (is (str/includes? (get-in error-event [:agent.event/payload :message])
+                             "rollback failed: rollback exploded"))
+          (is (str/includes? (get-in error-event [:agent.event/payload :message])
+                             "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2"
+                            (get-in error-event [:agent.event/payload :message])))))))))
+
+(deftest state-report-surfaces-corrupt-local-log-lines
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")]
+    (spit log-file (str (pr-str {:loop (durable/new-loop "main-test")
+                                 :tick {:agent.tick/seq 1}})
+                        "\n"
+                        (pr-str {:loop (durable/new-loop "main-test")
+                                 :tick {:agent.tick/seq 2}})
+                        "\n"
+                        "{:broken\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              local-log (some #(when (= "local log" (:label %)) %)
+                              (get-in report [:doctor :checks]))]
+          (is (false? (:ready? report)))
+          (is (= 2 (get-in report [:log :entries])))
+          (is (= 1 (get-in report [:log :corrupt-lines])))
+          (is (= 2 (get-in report [:latest :tick :agent.tick/seq])))
+          (is (= :repair-local-log (get-in report [:next-action :action])))
+          (is (= (.getPath log-file) (get-in report [:next-action :path])))
+          (is (= 1 (get-in report [:next-action :corrupt-lines])))
+          (is (= [3] (mapv :line (get-in report [:next-action :errors]))))
+          (is (every? seq (map :message (get-in report [:next-action :errors]))))
+          (is (= false (:ok? local-log)))
+          (is (re-find #"corrupt-lines=1" (:detail local-log))))))))
+
+(deftest local-log-readers-bound-oversized-corrupt-lines
+  (let [log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")]
+    (spit log-file
+          (str (pr-str {:tick {:agent.tick/seq 1}})
+               "\n"
+               (apply str (repeat 40 "x"))
+               "\n"
+               (pr-str {:tick {:agent.tick/seq 2}})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                    #'main/max-local-log-line-chars 32}
+      (fn []
+        (let [summary (#'main/local-log-summary "main-test")
+              tail (#'main/local-log-tail "main-test" 10)
+              metrics (#'main/local-log-metrics "main-test")
+              error-message (:message (first (:errors summary)))]
+          (is (= 2 (:entries summary)))
+          (is (= 2 (get-in summary [:latest :tick :agent.tick/seq])))
+          (is (= [1 2] (mapv #(get-in % [:tick :agent.tick/seq])
+                             (:entries tail))))
+          (is (= 1 (count (:errors tail))))
+          (is (= 2 (:ticks metrics)))
+          (is (= 1 (count (:errors metrics))))
+          (is (str/includes? error-message "local supervisor log line exceeds")))))))
+
+(deftest local-log-corrupt-line-errors-are-redacted-before-reporting
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")]
+    (spit log-file "{:broken\n")
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))
+                    #'edn/read-string (fn [_]
+                                         (throw (ex-info "Invalid token token=abc123 password=hunter2 sk-or-secret" {})))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              rendered (pr-str [(get-in report [:log :errors])
+                                (get-in report [:next-action :errors])])]
+          (is (str/includes? rendered "[REDACTED]"))
+          (is (not (re-find #"abc123|hunter2|sk-or-secret" rendered))))))))
+
+(deftest state-report-includes-streaming-log-metrics
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")
+        l0 (durable/new-loop "main-test")
+        l1 (assoc l0 :agent.loop/tick-seq 1)
+        l2 (assoc l1 :agent.loop/tick-seq 2)]
+    (spit log-file
+          (str (pr-str {:loop l1
+                        :tick {:agent.tick/seq 1
+                               :agent.tick/status :done}
+                        :events [{:agent.event/type :run-summary
+                                  :agent.event/payload {:status :done
+                                                        :elapsed-ms 120
+                                                        :tool-calls 2
+                                                        :tool-errors 0
+                                                        :task "first"}}
+                                 {:agent.event/type :gate
+                                  :agent.event/payload {:green? true}}]})
+               "\n"
+               "{:broken\n"
+               (pr-str {:loop l2
+                        :tick {:agent.tick/seq 2
+                               :agent.tick/status :error}
+                        :events [{:agent.event/type :run-summary
+                                  :agent.event/payload {:status :error
+                                                        :elapsed-ms 300
+                                                        :tool-calls 3
+                                                        :tool-errors 1
+                                                        :task "second"}}
+                                 {:agent.event/type :error
+                                  :agent.event/payload {:message "model failed"}}
+                                 {:agent.event/type :tool-call
+                                  :agent.event/payload {:name "read_file"
+                                                        :error? false
+                                                        :result-tail "ok"}}
+                                 {:agent.event/type :tool-call
+                                  :agent.event/payload {:name "replace_text"
+                                                        :error? true
+                                                        :result-tail "TOOL_ERROR: replace_text: missing required argument"}}
+                                 {:agent.event/type :refusal
+                                  :agent.event/payload {:reason :budget-exhausted}}]})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              metrics (:metrics report)]
+          (is (= 2 (:ticks metrics)))
+          (is (= {:done 1 :error 1} (:by-status metrics)))
+          (is (= {:run-summary 2 :gate 1 :error 1 :tool-call 2 :refusal 1}
+                 (:events metrics)))
+          (is (= {:status :error
+                  :elapsed-ms 300
+                  :tool-calls 3
+                  :tool-errors 1
+                  :task "second"}
+                 (:latest-run-summary metrics)))
+          (is (= {:name "replace_text"
+                  :error? true
+                  :result-tail "TOOL_ERROR: replace_text: missing required argument"}
+                 (:latest-tool-error metrics)))
+          (is (= {:message "model failed"} (:latest-error metrics)))
+          (is (= {:reason :budget-exhausted} (:latest-refusal metrics)))
+          (is (nil? (:latest-control metrics)))
+          (is (= 1 (get-in report [:log :corrupt-lines]))))))))
+
+(deftest state-report-bounds-latest-tool-error-payload
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")
+        huge-tail (str "TOOL_ERROR: replace_text: " (apply str (repeat 1000 "x")))]
+    (spit log-file
+          (str (pr-str {:loop (durable/new-loop "main-test")
+                        :tick {:agent.tick/seq 1
+                               :agent.tick/status :error}
+                        :events [{:agent.event/type :tool-call
+                                  :agent.event/payload {:id "bad-call"
+                                                        :name "replace_text"
+                                                        :error? true
+                                                        :input {:content (apply str (repeat 1000 "y"))}
+                                                        :result-tail huge-tail}}]})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              tool-error (get-in report [:metrics :latest-tool-error])]
+          (is (= {:id "bad-call"
+                  :name "replace_text"
+                  :error? true}
+                 (dissoc tool-error :result-tail)))
+          (is (<= (count (:result-tail tool-error)) 243))
+          (is (not (contains? tool-error :input))))))))
+
+(deftest supervisor-persist-is-local-first-when-kotoba-persist-fails
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        runtime (assoc (runtime root "murakumo:gemma3:4b")
+                       :store {:conn :conn
+                               :db-api {:transact! (fn [_ _]
+                                                     (throw (ex-info "remote down" {})))}})]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [out (with-out-str
+                    (#'main/persist-supervisor!
+                     runtime
+                     {:status :done
+                      :usage {:tokens 0 :tool-calls 0 :rounds 0}
+                      :events [{:type :gate :payload {:green? true}}]}))
+              report (#'main/state-report runtime)]
+          (is (re-find #"WARN kotoba datom persist failed" out))
+          (is (= 1 (get-in report [:log :entries])))
+          (is (= :done (get-in report [:latest :tick :agent.tick/status])))
+          (is (= "local" (get-in report [:lease :agent.lease/owner])))
+          (is (= false (get-in report [:lease-status :valid?])))
+          (is (= true (get-in report [:lease-status :stale?])))
+          (is (= false (get-in report [:lease-status :conflict?])))
+          (is (= false (get-in report [:lease-status :takeover?])))
+          (is (= "main-test" (get-in report [:latest :lease :agent.lease/loop])))
+          (is (= :continue (get-in report [:budget :decision]))))))))
+
+(deftest local-log-append-writes-complete-edn-lines
+  (let [log-dir (temp-dir)
+        l0 (durable/new-loop "main-test")
+        s1 (durable/supervisor-step l0 {:now-ms 1000
+                                        :owner "worker-a"
+                                        :run-result {:status :done}})
+        s2 (durable/supervisor-step (:loop s1) {:now-ms 2000
+                                                :owner "worker-a"
+                                                :run-result {:status :done}})]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (#'main/append-local-supervisor-log! "main-test" s1)
+        (#'main/append-local-supervisor-log! "main-test" s2)
+        (let [summary (#'main/local-log-summary "main-test")
+              tail (#'main/local-log-tail "main-test" 10)]
+          (is (= 2 (:entries summary)))
+          (is (empty? (:errors summary)))
+          (is (= ["worker-a" "worker-a"]
+                 (mapv #(get-in % [:lease :agent.lease/owner])
+                       (:entries tail))))
+          (is (= [1 2] (mapv #(get-in % [:tick :agent.tick/seq])
+                             (:entries tail)))))))))
+
+(deftest local-log-write-failure-prevents-in-memory-commit
+  (let [root (temp-dir)
+        not-dir (doto (io/file (temp-dir) "token=abc123-not-a-dir")
+                  (spit "file, not directory"))
+        runtime (runtime root "murakumo:gemma3:4b")
+        before @(:loop-state runtime)]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath not-dir)
+                                    nil))}
+      (fn []
+        (try
+          (#'main/persist-supervisor!
+           runtime
+           {:status :done
+            :usage {:tokens 0 :tool-calls 0 :rounds 0}
+            :events [{:type :gate :payload {:green? true}}]})
+          (is false "expected local log write failure")
+          (catch kerror/ExceptionInfo e
+            (is (re-find #"local supervisor log write failed" (ex-message e)))
+            (is (str/includes? (ex-message e) "[REDACTED]"))
+            (is (not (re-find #"abc123" (ex-message e))))
+            (is (= before @(:loop-state runtime)))))))))
+
+(deftest state-report-detects-unwritable-local-log-path-before-commit
+  (let [root (temp-dir)
+        not-dir (doto (io/file (temp-dir) "not-a-dir")
+                  (spit "file, not directory"))]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath not-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/state-report
+                      (runtime root "murakumo:gemma3:4b"))
+              local-log (some #(when (= "local log" (:label %)) %)
+                              (get-in report [:doctor :checks]))]
+          (is (false? (:ready? report)))
+          (is (= false (get-in report [:log :writable?])))
+          (is (= "log parent path exists but is not a directory"
+                 (get-in report [:log :error])))
+          (is (= false (:ok? local-log)))
+          (is (re-find #"writable=false" (:detail local-log))))))))
+
+(deftest local-log-tail-keeps-only-requested-valid_entries
+  (let [log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")]
+    (spit log-file
+          (str (pr-str {:tick {:agent.tick/seq 1}}) "\n"
+               "{:broken\n"
+               (pr-str {:tick {:agent.tick/seq 2}}) "\n"
+               (pr-str {:tick {:agent.tick/seq 3}}) "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [tail (#'main/local-log-tail "main-test" 2)]
+          (is (= [2 3] (mapv #(get-in % [:tick :agent.tick/seq])
+                             (:entries tail))))
+          (is (= 1 (count (:errors tail))))
+          (is (= 2 (:line (first (:errors tail))))))))))
+
+(deftest human-history-warns-about-corrupt-local-log-lines
+  (let [root (temp-dir)
+        log-dir (temp-dir)
+        log-file (io/file log-dir "main-test.edn")
+        runtime (runtime root "murakumo:gemma3:4b")]
+    (spit log-file
+          (str "{:broken token=abc123\n"
+               (pr-str {:loop (durable/new-loop "main-test")
+                        :tick {:agent.tick/seq 2
+                               :agent.tick/status :done}
+                        :decision :continue
+                        :events []})
+               "\n"))
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [out (with-out-str (#'main/print-history! runtime 5))
+              history-edn-out (atom nil)
+              history-edn-err (with-stderr-str*
+                                #(reset! history-edn-out
+                                         (with-out-str (#'main/print-history-edn! runtime 5))))
+              last-edn-out (atom nil)
+              last-edn-err (with-stderr-str*
+                             #(reset! last-edn-out
+                                      (with-out-str (#'main/print-last-edn! runtime))))]
+          (is (str/includes? out "WARN local supervisor history has corrupt-lines=1"))
+          (is (str/includes? out "inspect --log-edn or --state-edn"))
+          (is (str/includes? out "WARN corrupt-line line=1"))
+          (is (str/includes? out "tick=2 status=done"))
+          (is (not (re-find #"abc123" out)))
+          (is (str/starts-with? @history-edn-out "["))
+          (is (not (str/includes? @history-edn-out "WARN")))
+          (is (str/includes? history-edn-err "WARN local supervisor history has corrupt-lines=1"))
+          (is (not (re-find #"abc123" history-edn-err)))
+          (is (str/starts-with? @last-edn-out "{"))
+          (is (not (str/includes? @last-edn-out "WARN")))
+          (is (str/includes? last-edn-err "WARN local supervisor history has corrupt-lines=1"))
+          (is (not (re-find #"abc123" last-edn-err))))))))
+
+(deftest interactive-history-count-validates-input-without-fallback
+  (is (= {:n 5}
+         (#'main/interactive-history-count ":history" 5)))
+  (is (= {:n 7}
+         (#'main/interactive-history-count ":history 7" 5)))
+  (is (= {:error "history count must be an integer: nope"}
+         (#'main/interactive-history-count ":history nope" 5)))
+  (is (= {:error "history count must be >= 1"}
+         (#'main/interactive-history-count ":history 0" 5)))
+  (is (= {:error "history count must be <= 10000"}
+         (#'main/interactive-history-count ":history 10001" 5))))
+
+(deftest interactive-read-args-validates-before-host-call
+  (is (= {:error "usage: :read PATH [START] [END]"}
+         (#'main/interactive-read-args ":read")))
+  (is (= {:error "too many arguments for :read; usage: :read PATH [START] [END]"}
+         (#'main/interactive-read-args ":read src/a.clj 1 2 extra")))
+  (is (= {:error "start line must be an integer: nope"}
+         (#'main/interactive-read-args ":read src/a.clj nope")))
+  (is (= {:error "end line must be >= start line"}
+         (#'main/interactive-read-args ":read src/a.clj 10 3")))
+  (is (= {:path "src/a.clj" :start "1" :end "3"}
+         (#'main/interactive-read-args ":read src/a.clj 1 3"))))
+
+(deftest control-cli-args-preserve-free-form-reasons
+  (is (= {:model-id nil :reason nil}
+         (#'main/control-cli-args ["--stop" "root"])))
+  (is (= {:model-id nil :reason "operator stop for review"}
+         (#'main/control-cli-args ["--stop" "root" "operator" "stop" "for" "review"])))
+  (is (= {:model-id "murakumo:test-model" :reason "operator stop"}
+         (#'main/control-cli-args ["--stop" "root" "murakumo:test-model" "operator" "stop"])))
+  (is (= {:model-id "moonshotai/kimi-k2.7-code" :reason "operator stop"}
+         (#'main/control-cli-args ["--stop" "root" "moonshotai/kimi-k2.7-code" "operator" "stop"])))
+  (is (= {:model-id nil :reason "operator stop"}
+         (#'main/control-cli-args ["--stop" "root" "--" "operator" "stop"])))
+  (is (= {:model-id "custom-model" :reason "operator stop"}
+         (#'main/control-cli-args ["--stop" "root" "custom-model" "--" "operator" "stop"]))))
+
+(deftest read-cli-args-validates-before-host-call
+  (is (= {:error "usage: kbb -M -m kotoba-code.main --read <project-root> <path> [start] [end]"}
+         (#'main/read-cli-args nil "src/a.clj" nil nil nil)))
+  (is (= {:error "usage: kbb -M -m kotoba-code.main --read <project-root> <path> [start] [end]"}
+         (#'main/read-cli-args "root" nil nil nil nil)))
+  (is (= {:error "too many arguments for --read; usage: kbb -M -m kotoba-code.main --read <project-root> <path> [start] [end]"}
+         (#'main/read-cli-args "root" "src/a.clj" "1" "2" ["extra"])))
+  (is (= {:error "start line must be an integer: nope"}
+         (#'main/read-cli-args "root" "src/a.clj" "nope" nil nil)))
+  (is (= {:error "start line must be >= 1"}
+         (#'main/read-cli-args "root" "src/a.clj" "0" nil nil)))
+  (is (= {:error "end line must be >= start line"}
+         (#'main/read-cli-args "root" "src/a.clj" "10" "3" nil)))
+  (is (= {:path "src/a.clj" :start "1" :end "3"}
+         (#'main/read-cli-args "root" "src/a.clj" "1" "3" nil))))
+
+(deftest log-report-is-machine-readable-for-interactive-supervisors
+  (let [log-dir (temp-dir)
+        runtime (runtime log-dir "murakumo:gemma3:4b")
+        step (durable/supervisor-step
+              (durable/new-loop "main-test")
+              {:now-ms 1000
+               :owner "worker-a"
+               :run-result {:status :done}})]
+    (with-redefs-fn {#'main/env (fn [k]
+                                  (case k
+                                    "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+                                    nil))}
+      (fn []
+        (let [report (#'main/log-report runtime)]
+          (is (= true (:enabled? report)))
+          (is (= true (:writable? report)))
+          (is (str/includes? (:path report) "main-test.edn"))
+          (is (= 0 (:entries report)))
+          (is (= 0 (:corrupt-lines report)))
+          (is (nil? (:latest-summary report)))
+          (is (nil? (:latest report))))
+        (#'main/append-local-supervisor-log! "main-test" step)
+        (let [report (#'main/log-report runtime)]
+          (is (= 1 (:entries report)))
+          (is (= {:tick-seq 1
+                  :tick-status :done
+                  :loop-status :active
+                  :decision :continue
+                  :lease-owner "worker-a"
+                  :lease-expires-at 1000}
+                 (:latest-summary report)))
+          (is (= :done (get-in report [:latest :tick :agent.tick/status]))))))))
+
+(deftest interactive-command-errors-do-not-exit-loop
+  (let [dir (temp-dir)
+        runtime (runtime dir "murakumo:gemma3:4b")
+        session-state (atom {:label "kotoba-code" :history []})
+        host {:git-status (fn []
+                            (throw (ex-info "git unavailable token=abc123" {})))}]
+    (let [out (with-out-str
+                (is (= :continue
+                       (#'main/run-interactive-command! runtime session-state host ":status"))))]
+      (is (re-find #"ERROR: interactive command failed for \":status\"" out))
+      (is (re-find #"git unavailable" out))
+      (is (str/includes? out "[REDACTED]"))
+      (is (not (re-find #"abc123" out)))))
+  (let [dir (temp-dir)
+        runtime (runtime dir "murakumo:gemma3:4b")
+        session-state (atom {:label "kotoba-code" :history []})]
+    (let [out (with-out-str
+                (is (= :quit
+                       (#'main/run-interactive-command! runtime session-state {} ":quit"))))]
+      (is (re-find #"bye" out)))))
+
+(deftest interactive-command-slash-prefixes-work-like-colon-prefixes
+  (let [dir (temp-dir)
+        runtime (runtime dir "murakumo:gemma3:4b")
+        session-state (atom {:label "kotoba-code" :history []})]
+    (let [out (with-out-str
+                (is (= :continue
+                       (#'main/run-interactive-command! runtime session-state {} "/help"))))]
+      (is (re-find #"Commands:" out))
+      (is (re-find #"Use /help or :help for commands" out)))
+    (is (= ":history-edn 10"
+           (#'main/normalize-interactive-line "/history-edn 10")))
+    (is (= ":quit"
+           (#'main/normalize-interactive-line ":quit")))))
+
+(deftest interactive-session-commands-cover-clear-compact-rename-and-context
+  (let [dir (temp-dir)
+        runtime-state (atom (runtime dir "murakumo:gemma3:4b"))
+        session-state (atom {:label "kotoba-code" :history []})]
+    (with-redefs-fn {#'main/run-once! (fn [& _] true)}
+      (fn []
+        (with-out-str
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/rename review-loop")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/config verbose=true")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/model murakumo:gemma3:9b")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/permissions allow=git_status")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/sandbox mode=restricted")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/context")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/compact focus on tests")))
+          (is (= :continue (#'main/run-interactive-command! runtime-state session-state {} "/clear restored-session"))))))
+    (is (= "murakumo:gemma3:9b" (:model-id @runtime-state)))
+    (is (= "restored-session" (:label @session-state)))
+    (is (= {"verbose" "true" "model" "murakumo:gemma3:9b"} (:config @session-state)))
+    (is (= {"allow" "git_status"} (:permissions @session-state)))
+    (is (= {"mode" "restricted"} (:sandbox @session-state)))
+    (is (= "restored-session" (:label @session-state)))
+    (is (empty? (:history @session-state)))))
+
+(deftest interactive-command-prefix-typos-do-not-run-control-or-model
+  (let [dir (temp-dir)
+        runtime (assoc (runtime dir "murakumo:gemma3:4b")
+                       :host {}
+                       :agent ::agent
+                       :gate-rounds 1
+                       :aborting (atom false))
+        session-state (atom {:label "kotoba-code" :history []})
+        tasks (atom [])]
+    (with-redefs-fn {#'main/run-once! (fn [_ task]
+                                        (swap! tasks conj task)
+                                        true)
+                     #'main/persist-control! (fn [& _]
+                                               (throw (ex-info "control must not run" {})))
+                     #'main/persist-reset-budget! (fn [& _]
+                                                    (throw (ex-info "reset must not run" {})))}
+	      (fn []
+	        (let [out (with-out-str
+	                    (is (= :continue
+	                           (#'main/run-interactive-command! runtime session-state {} ":stop-now")))
+	                    (is (= :continue
+	                           (#'main/run-interactive-command! runtime session-state {} ":interrupting")))
+	                    (is (= :continue
+	                           (#'main/run-interactive-command! runtime session-state {} ":reset-budgeted")))
+	                    (is (= :continue
+	                           (#'main/run-interactive-command! runtime session-state {} "--stop")))
+	                    (is (= :continue
+	                           (#'main/run-interactive-command! runtime session-state {} "--histroy"))))]
+	          (is (re-find #"unknown interactive command \":stop-now\"" out))
+	          (is (re-find #"Did you mean :stop\\?" out))
+	          (is (re-find #"unknown interactive command \":interrupting\"" out))
+	          (is (re-find #"Did you mean :interrupt\\?" out))
+	          (is (re-find #"unknown interactive command \":reset-budgeted\"" out))
+	          (is (re-find #"Did you mean :reset-budget\\?" out))
+	          (is (re-find #"one-shot command is not valid inside interactive mode: \"--stop\"" out))
+	          (is (re-find #"one-shot command is not valid inside interactive mode: \"--histroy\"" out))
+	          (is (re-find #"Did you mean --history\\?" out))
+	          (is (= [] @tasks)))))))

@@ -1,0 +1,218 @@
+(ns langchain.db-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langchain.db :as db]))
+
+(def schema
+  {:person/id     {:db/unique :db.unique/identity}
+   :person/emails {:db/cardinality :db.cardinality/many}
+   :person/friend {:db/valueType :db.type/ref}})
+
+(defn- conn-with-people []
+  (let [conn (db/create-conn schema)]
+    (db/transact! conn
+                  [{:db/id -1 :person/id "alice" :person/name "Alice" :person/age 30
+                    :person/emails ["a@x.com" "alice@y.com"]}
+                   {:db/id -2 :person/id "bob" :person/name "Bob" :person/age 25
+                    :person/friend -1}])
+    conn))
+
+(deftest transact-and-query
+  (let [conn (conn-with-people)
+        dbv (db/db conn)]
+    (testing "basic join"
+      (is (= #{["Bob" "Alice"]}
+             (db/q '[:find ?n ?fn
+                     :where [?e :person/friend ?f]
+                            [?e :person/name ?n]
+                            [?f :person/name ?fn]]
+                   dbv))))
+    (testing "scalar find + predicate"
+      (is (= "Alice"
+             (db/q '[:find ?n .
+                     :where [?e :person/age ?a]
+                            [(> ?a 28)]
+                            [?e :person/name ?n]]
+                   dbv))))
+    (testing "collection find"
+      (is (= #{"a@x.com" "alice@y.com"}
+             (set (db/q '[:find [?em ...]
+                          :where [_ :person/emails ?em]]
+                        dbv)))))
+    (testing "function binding"
+      (is (= #{[30 31]}
+             (db/q '[:find ?a ?b
+                     :in $ ?name
+                     :where [?e :person/name ?name]
+                            [?e :person/age ?a]
+                            [(inc ?a) ?b]]
+                   dbv "Alice"))))
+    (testing "in collection binding"
+      (is (= #{["Alice"] ["Bob"]}
+             (db/q '[:find ?n
+                     :in $ [?id ...]
+                     :where [?e :person/id ?id]
+                            [?e :person/name ?n]]
+                   dbv ["alice" "bob"]))))
+    (testing "aggregates"
+      (is (= 2 (db/q '[:find (count ?e) .
+                       :where [?e :person/name _]] dbv)))
+      (is (= 30 (db/q '[:find (max ?a) .
+                        :where [_ :person/age ?a]] dbv))))))
+
+(deftest upsert-and-cardinality
+  (let [conn (conn-with-people)]
+    (testing "unique identity upsert merges instead of duplicating"
+      (db/transact! conn [{:person/id "alice" :person/age 31}])
+      (let [dbv (db/db conn)]
+        (is (= 1 (db/q '[:find (count ?e) .
+                         :where [?e :person/id "alice"]] dbv)))
+        (is (= 31 (db/q '[:find ?a .
+                          :where [?e :person/id "alice"]
+                                 [?e :person/age ?a]] dbv)))))
+    (testing "cardinality-one replaces, cardinality-many accumulates"
+      (db/transact! conn [{:person/id "alice" :person/emails "third@z.com"}])
+      (is (= 3 (count (db/q '[:find [?em ...]
+                              :where [?e :person/id "alice"]
+                                     [?e :person/emails ?em]]
+                            (db/db conn))))))))
+
+(deftest lookup-refs-and-retract
+  (let [conn (conn-with-people)]
+    (testing "lookup ref entid + entity"
+      (let [e (db/entid (db/db conn) [:person/id "bob"])]
+        (is (number? e))
+        (is (= "Bob" (:person/name (db/entity (db/db conn) e))))))
+    (testing "retractEntity removes incoming refs too"
+      (db/transact! conn [[:db/retractEntity [:person/id "alice"]]])
+      (let [dbv (db/db conn)]
+        (is (nil? (db/entid dbv [:person/id "alice"])))
+        (is (empty? (db/q '[:find ?f
+                            :where [?e :person/friend ?f]] dbv)))))))
+
+(deftest pull-test
+  (let [conn (conn-with-people)
+        dbv (db/db conn)]
+    (testing "attrs, refs, nested, reverse"
+      (let [bob (db/pull dbv '[:person/name {:person/friend [:person/name]}]
+                         [:person/id "bob"])]
+        (is (= "Bob" (:person/name bob)))
+        (is (= "Alice" (get-in bob [:person/friend :person/name]))))
+      (let [alice (db/pull dbv '[:person/name :person/_friend]
+                           [:person/id "alice"])]
+        (is (= 1 (count (:person/_friend alice))))))
+    (testing "wildcard includes db/id and many-attrs as vectors"
+      (let [alice (db/pull dbv '[*] [:person/id "alice"])]
+        (is (number? (:db/id alice)))
+        (is (vector? (:person/emails alice)))))))
+
+(deftest not-or-clauses
+  (let [conn (conn-with-people)
+        dbv (db/db conn)]
+    (is (= #{["Bob"]}
+           (db/q '[:find ?n
+                   :where [?e :person/name ?n]
+                          (not [?e :person/id "alice"])]
+                 dbv)))
+    (is (= #{["Alice"] ["Bob"]}
+           (db/q '[:find ?n
+                   :where [?e :person/name ?n]
+                          (or [?e :person/id "alice"]
+                              [?e :person/id "bob"])]
+                 dbv)))))
+
+(deftest malformed-query-with-adjacent-markers-throws-instead-of-silently-misparsing
+  (testing "a :find/:in/:where/:with marker immediately followed by another
+            marker (a realistic typo -- e.g. forgetting the var) used to
+            silently parse to an INCOMPLETE query map instead of erroring:
+            partition-by's predicate returns the matched keyword itself,
+            so two adjacent markers split into separate single-element
+            groups, breaking the intended [marker value marker value ...]
+            alternation and yielding an odd group count -- `(partition 2
+            ...)` then silently dropped the last unpaired group, so
+            `[:find :where [?x :attr ?v]]` used to parse to `{:find
+            [:where]}` with :where never assoc'd at all, and eval-clauses
+            over a nil :where was a silent no-op returning a bogus result
+            instead of erroring"
+    (let [conn (conn-with-people)
+          dbv (db/db conn)]
+      (is (thrown-with-msg? js/Error
+                            #"malformed query"
+                            (db/q '[:find :where [?e :person/name ?n]] dbv))))))
+
+#?(:clj
+   (deftest transact!-does-not-lose-writes-under-concurrent-contention
+     (testing "transact! used to precompute its tx report against a stale
+               `@conn` read, then install it unconditionally inside swap! --
+               swap!'s CAS-retry-on-conflict only reruns the SWAP FUNCTION,
+               and a function that unconditionally returns a precomputed
+               value is not actually retry-safe: the losing side of a race
+               would silently overwrite the winning side's :db-after with a
+               report computed from the pre-collision (stale) db, discarding
+               the winning caller's writes with no error at all. Reproduced
+               under real JVM thread contention (not a single-threaded
+               simulation) to make sure this isn't just a theoretical
+               concern -- N threads each transact! one uniquely-identified
+               datom onto a SHARED conn; every single one must land."
+       (let [n 50
+             conn (db/create-conn {:thread/id {:db/unique :db.unique/identity}})
+             threads (mapv (fn [i]
+                             (Thread. (fn [] (db/transact! conn [{:thread/id (str "t" i)}]))))
+                           (range n))]
+         (run! #(.start ^Thread %) threads)
+         (run! #(.join ^Thread %) threads)
+         (is (= n (count (:datoms (:db @conn))))
+             "every concurrent transact! must land -- none silently lost to the race")))))
+
+(deftest as-of-test
+  (let [conn (db/create-conn schema)
+        r1 (db/transact! conn [{:person/id "alice" :person/age 30}])
+        _r2 (db/transact! conn [{:person/id "alice" :person/age 31}])
+        old (db/as-of conn (:tx r1))]
+    (is (= 30 (db/q '[:find ?a . :where [_ :person/age ?a]] old)))
+    (is (= 31 (db/q '[:find ?a . :where [_ :person/age ?a]] (db/db conn))))))
+
+;; ── schema-from-tx-data ──
+;; A Datomic schema is installed as transaction data; this store reads a
+;; DataScript-style map. Consumers used to write the same attributes twice,
+;; once per dialect, and the two copies drifted. These fix the one-way
+;; conversion so a single canonical schema value can drive both.
+
+(def ^:private datomic-schema
+  [{:db/ident :account/id :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity
+    :db/doc "Canonical account identity."}
+   {:db/ident :account/owner :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :account/tags :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many}
+   {:db/ident :account/key :db/valueType :db.type/tuple
+    :db/tupleAttrs [:account/id :account/owner]
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   ;; a bare enum ident is a value, not an attribute
+   {:db/ident :account.status/active}])
+
+(deftest schema-from-tx-data-test
+  (let [schema (db/schema-from-tx-data datomic-schema)]
+    (testing ":db/ident becomes the key, the rest of the attribute map carries over"
+      (is (= {:db/valueType :db.type/string
+              :db/cardinality :db.cardinality/one
+              :db/unique :db.unique/identity
+              :db/doc "Canonical account identity."}
+             (:account/id schema))))
+    (testing "declarations this store ignores survive for hosts that read them"
+      (is (= [:account/id :account/owner] (get-in schema [:account/key :db/tupleAttrs]))))
+    (testing "bare enum idents are not attributes"
+      (is (not (contains? schema :account.status/active))))
+    (testing "the converted map drives this store's own schema behaviour"
+      (let [conn (db/create-conn schema)]
+        (db/transact! conn [{:account/id "a1" :account/tags ["x" "y"]}])
+        (db/transact! conn [{:account/id "a1" :account/tags ["z"]}])
+        (is (= 1 (db/q '[:find (count ?e) . :where [?e :account/id]] (db/db conn)))
+            ":db.unique/identity upserts rather than duplicating")
+        (is (= #{"x" "y" "z"}
+               (set (db/q '[:find [?t ...] :where [_ :account/tags ?t]] (db/db conn))))
+            ":db.cardinality/many accumulates")))))
+
+(deftest schema-from-tx-data-is-empty-for-empty-input
+  (is (= {} (db/schema-from-tx-data [])))
+  (is (= {} (db/schema-from-tx-data nil))))

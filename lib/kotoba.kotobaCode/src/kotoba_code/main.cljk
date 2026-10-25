@@ -1,0 +1,2811 @@
+(ns kotoba-code.main
+  "Leftover JVM library dispatch — not operator start.
+
+  Working operator start is compile + instantiateKotoba
+  (scripts/kotoba-compile.sh then scripts/kotoba-run.sh).
+  kotoba run kotoba/main.kotoba is the intended public command and a
+  CLI source-run gap until the CLI accepts this guest.
+  There is no kotoba -M. :run is gone (not leftover-jvm-run-path exit 2),
+  including :jvm-opts --enable-native-access=ALL-UNNAMED.
+  Do not wrap Datalevin/LMDB JNI as a C .so.
+
+  Leftover library invocation (workflow_dispatch leftover-jvm.yml only):
+
+    kbb -M -m kotoba-code.main \"<task>\" <project-root> [model-id]
+    kbb -M -m kotoba-code.main --help
+    kbb -M -m kotoba-code.main -h
+    kbb -M -m kotoba-code.main --interactive <project-root> [model-id]
+    kbb -M -m kotoba-code.main --doctor <project-root> [model-id]
+    kbb -M -m kotoba-code.main --doctor-edn <project-root> [model-id]
+    kbb -M -m kotoba-code.main --check <project-root> [model-id]
+    kbb -M -m kotoba-code.main --check-edn <project-root> [model-id]
+    kbb -M -m kotoba-code.main --state-edn <project-root> [model-id]
+    kbb -M -m kotoba-code.main --next-action-edn <project-root> [model-id]
+    kbb -M -m kotoba-code.main --budget <project-root> [model-id]
+    kbb -M -m kotoba-code.main --budget-edn <project-root> [model-id]
+    kbb -M -m kotoba-code.main --version
+    kbb -M -m kotoba-code.main --version-edn
+    kbb -M -m kotoba-code.main --tools
+    kbb -M -m kotoba-code.main --tools-edn
+    kbb -M -m kotoba-code.main --commands-edn
+    kbb -M -m kotoba-code.main --interactive-commands-edn
+    kbb -M -m kotoba-code.main --capabilities-edn
+    kbb -M -m kotoba-code.main --log <project-root> [model-id]
+    kbb -M -m kotoba-code.main --history <project-root> [model-id] [N]
+    kbb -M -m kotoba-code.main --history-edn <project-root> [model-id] [N]
+    kbb -M -m kotoba-code.main --last <project-root> [model-id]
+    kbb -M -m kotoba-code.main --last-edn <project-root> [model-id]
+    kbb -M -m kotoba-code.main --read <project-root> <path> [start] [end]
+    kbb -M -m kotoba-code.main --status <project-root>
+    kbb -M -m kotoba-code.main --diff <project-root>
+    kbb -M -m kotoba-code.main --test <project-root>
+    kbb -M -m kotoba-code.main --interrupt <project-root> [model-id] [reason]
+    kbb -M -m kotoba-code.main --resume <project-root> [model-id]
+    kbb -M -m kotoba-code.main --reset-budget <project-root> [model-id] [reason]
+    kbb -M -m kotoba-code.main --stop <project-root> [model-id] [reason]
+
+  Model selection (model-neutral; pick the backend that fits):
+    - OpenRouter (default): set OR_KEY; model-id e.g. z-ai/glm-5.2
+    - Murakumo gateway:     model-id starting with 'murakumo:' (murakumo.cloud internal inference gateway)
+                            override with KC_MURAKUMO_URL
+
+  Optional kotoba-Datom session persistence (resumable, as-of):
+    KOTOBA_URL + KOTOBA_GRAPH (+ KOTOBA_TOKEN) → checkpoints land on the kotoba node.
+    KC_SESSION sets the session/thread id (default \"kotoba-code\")."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba-code.host :as host]
+            [kotoba-code.agent :as agent]
+            [kotoba-code.gate :as gate]
+            [kotoba-code.durable :as durable]
+            [kotoba-code.resilience :as resilience]
+            [kotoba-code.tools :as tools]
+            [kotoba-code.transcript :as transcript]
+            [langchain.model :as model]
+            [langchain.kotoba-db :as kdb]
+            [langgraph.checkpoint :as cp])
+  (:import [java.io File]
+           [java.net URI]
+           [java.nio ByteBuffer]
+           [java.nio.channels FileChannel]
+           [java.nio.file StandardOpenOption])
+  (:gen-class))
+
+(def default-model "z-ai/glm-5.2")
+
+(def ^:private kotoba-code-version
+  (or (System/getProperty "kotoba-code.version") "dev"))
+
+(def ^:private capabilities-schema-version 10)
+
+(def ^:private max-history-count 10000)
+
+(def ^:private max-local-log-line-chars 1048576)
+
+(defn- env [k] (System/getenv k))
+
+(defn- openrouter-key []
+  (or (env "OR_KEY") (env "OPENROUTER_API_KEY")))
+
+(defn- murakumo-model? [model-id]
+  (str/starts-with? (or model-id "") "murakumo:"))
+
+(defn- effective-model-id [model-id]
+  (or model-id default-model))
+
+(defn- murakumo-url []
+  (or (not-empty (env "KC_MURAKUMO_URL"))
+      "https://murakumo.cloud/api/v1/messages"))
+
+(defn- ensure-root! [root]
+  (cond
+    (nil? root)
+    (do (println "ERROR: project root is required")
+        (System/exit 2))
+
+    :else
+    (let [root-file (io/file root)]
+      (when-not (.isDirectory root-file)
+        (println (str "ERROR: project root is not a directory: " root))
+        (System/exit 2)))))
+
+(defn- ensure-model-credentials! [model-id]
+  (let [model-id* (effective-model-id model-id)]
+    (when
+      (and (not (murakumo-model? model-id*))
+           (str/blank? (openrouter-key)))
+      (do (println (str "ERROR: OR_KEY or OPENROUTER_API_KEY is required for OpenRouter model " model-id*))
+          (System/exit 2)))))
+
+(def ^:private numeric-env-specs
+  {"KC_MAX_TOKENS" {:kind :int :min 1}
+   "KC_RECURSION_LIMIT" {:kind :int :min 1}
+   "KC_GATE_ROUNDS" {:kind :int :min 1}
+   "KC_LOOP_ROUNDS" {:kind :int :min 1}
+   "KC_LEASE_TTL_MS" {:kind :long :min 1}
+   "KC_RUN_TIMEOUT_MS" {:kind :long :min 1}
+   "KC_HTTP_TIMEOUT_MS" {:kind :long :min 1}
+   "KC_PROCESS_TIMEOUT_MS" {:kind :long :min 1}
+   "KC_MODEL_RETRY_ATTEMPTS" {:kind :int :min 1}
+   "KC_MODEL_RETRY_BACKOFF_MS" {:kind :long :min 0}})
+
+(defn- parse-numeric-env-value [k raw {:keys [kind min]}]
+  (try
+    (let [n (Long/parseLong (str/trim raw))]
+      (cond
+        (< n min)
+        {:error (str "expected " k " >= " min)}
+
+        (and (= kind :int) (> n Integer/MAX_VALUE))
+        {:error (str "expected " k " <= " Integer/MAX_VALUE)}
+
+        :else
+        {:value (if (= kind :int) (int n) n)}))
+    (catch Exception _
+      {:error (str "expected integer for " k)})))
+
+(defn- parse-url-env-value [k raw]
+  (try
+    (let [uri (URI. (str/trim raw))
+          scheme (.getScheme uri)]
+      (cond
+        (str/blank? scheme)
+        {:error (str "expected absolute URL for " k)}
+
+        (not (#{"http" "https"} (str/lower scheme)))
+        {:error (str "expected http or https URL for " k)}
+
+        (str/blank? (.getHost uri))
+        {:error (str "expected URL host for " k)}
+
+        :else
+        {:value (str uri)}))
+    (catch Exception _
+      {:error (str "expected URL for " k)})))
+
+(def ^:private boolean-env-keys
+  ["KC_LOCAL_LOG"
+   "KC_TOOL_TRANSCRIPT"
+   "KC_LIVE_TOOLS"])
+
+(defn- parse-boolean-env-value [k raw]
+  (let [v (str/lower (str/trim raw))]
+    (cond
+      (#{"true" "false"} v)
+      {:value (= "true" v)}
+
+      :else
+      {:error (str "expected true or false for " k)})))
+
+(defn- numeric-env [k default]
+  (let [raw (env k)]
+    (if (str/blank? raw)
+      default
+      (let [{:keys [value]} (parse-numeric-env-value k raw (get numeric-env-specs k))]
+        (or value default)))))
+
+(defn- config-errors []
+  (let [numeric-errors
+        (->> numeric-env-specs
+             (keep (fn [[k spec]]
+                     (let [raw (env k)]
+                       (when-not (str/blank? raw)
+                         (let [{:keys [error]} (parse-numeric-env-value k raw spec)]
+                           (when error
+                             {:key k :value raw :error error})))))))
+        url-errors
+        (keep (fn [k]
+                (let [raw (env k)]
+                  (when-not (str/blank? raw)
+                    (let [{:keys [error]} (parse-url-env-value k raw)]
+                      (when error
+                        {:key k :value raw :error error})))))
+              ["KC_MURAKUMO_URL"])
+        boolean-errors
+        (keep (fn [k]
+                (let [raw (env k)]
+                  (when-not (str/blank? raw)
+                    (let [{:keys [error]} (parse-boolean-env-value k raw)]
+                      (when error
+                        {:key k :value raw :error error})))))
+              boolean-env-keys)]
+    (concat numeric-errors url-errors boolean-errors)))
+
+(declare clipped)
+
+(defn- format-config-error [{:keys [key value error]}]
+  (str key "=" (pr-str (clipped value 160)) " (" error ")"))
+
+(defn- ensure-config! []
+  (when-let [errors (seq (config-errors))]
+    (println (str "ERROR: invalid configuration: "
+                  (str/join "; " (map format-config-error errors))))
+    (System/exit 2)))
+
+(defn- ensure-runtime-prereqs! [root model-id]
+  (ensure-root! root)
+  (ensure-config!)
+  (ensure-model-credentials! model-id))
+
+(defn- build-model [model-id]
+  ;; KC_MAX_TOKENS lets the caller raise the per-response output cap so a large
+  ;; module (e.g. 600L+) can be written without truncation. Murakumo (local LiteLLM)
+  ;; stays modest; the OpenRouter/kimi path defaults high (kimi-k2.7 has a large
+  ;; context + completion budget).
+  (let [env-max (numeric-env "KC_MAX_TOKENS" nil)]
+    (cond
+      (murakumo-model? model-id)
+      (model/anthropic-model (merge {:url (murakumo-url)
+                                     :model (subs model-id (count "murakumo:"))
+                                     :max-tokens (or env-max 8000)
+                                     :http-fn host/http-fn}
+                                    host/json-caps))
+      :else
+      (model/openai-model (merge {:url "https://openrouter.ai/api/v1/chat/completions"
+                                  :model (effective-model-id model-id)
+                                  :api-key (openrouter-key)
+                                  :max-tokens (or env-max 16000) :http-fn host/http-fn}
+                                 host/json-caps)))))
+
+(defn- model-retry-opts []
+  {:attempts (numeric-env "KC_MODEL_RETRY_ATTEMPTS" 4)
+   :backoff-ms (numeric-env "KC_MODEL_RETRY_BACKOFF_MS" 1500)})
+
+(defn- kotoba-store
+  "Builds kotoba-Datom handles from env, or nil if KOTOBA_URL is unset."
+  []
+  (when-let [url (System/getenv "KOTOBA_URL")]
+    (let [graph (System/getenv "KOTOBA_GRAPH")
+          token (System/getenv "KOTOBA_TOKEN")
+          conn  (kdb/kotoba-conn url graph {:token token})
+          api   (kdb/kotoba-api host/http+json)]
+      {:conn conn
+       :db-api api
+       :checkpointer (cp/datomic-checkpointer conn {:db-api api})})))
+
+(defn- now-ms [] (System/currentTimeMillis))
+
+(defn- elapsed-ms [start-ms]
+  (- (now-ms) start-ms))
+
+(defn- enabled? [env-key]
+  (not= "false" (str/lower (or (env env-key) ""))))
+
+(defn- clipped
+  ([x] (clipped x 180))
+  ([x n]
+   (let [s (cond
+	     (nil? x) ""
+	     (string? x) x
+	     :else (pr-str x))
+         s* (str/replace (transcript/redact-text s) #"\s+" " ")]
+     (if (> (count s*) n)
+       (str (subs s* 0 n) "...")
+       s*))))
+
+(defn- display-id [x]
+  (clipped x 120))
+
+(defn- display-path [x]
+  (clipped x 240))
+
+(defn- control-reason-payload [reason]
+  (some-> reason (clipped 240) not-empty))
+
+(defn- worker-id []
+  (let [raw (env "KC_WORKER_ID")]
+    (if (str/blank? raw)
+      "local"
+      (clipped raw 120))))
+
+(defn- current-session []
+  (or (env "KC_SESSION") "kotoba-code"))
+
+(defn- durable-session-payload []
+  (some-> (current-session) (clipped 120) not-empty))
+
+(defn- current-loop-id []
+  (or (env "KC_LOOP_ID") (current-session)))
+
+(defn- safe-file-name [s]
+  (let [s* (str/replace (transcript/redact-text (or s "kotoba-code"))
+                        #"[^A-Za-z0-9._-]+"
+                        "_")]
+    (subs s* 0 (min 120 (count s*)))))
+
+(defn- local-log-file [loop-id]
+  (when-not (= "false" (str/lower (or (env "KC_LOCAL_LOG") "")))
+    (io/file (or (env "KC_LOCAL_LOG_DIR")
+                 (str (System/getProperty "user.home") File/separator ".kotoba-code" File/separator "sessions"))
+             (str (safe-file-name loop-id) ".edn"))))
+
+(defonce ^:private local-log-jvm-locks (atom {}))
+
+(defn- local-log-jvm-lock [^File f]
+  (let [path (.getCanonicalPath f)]
+    (get (swap! local-log-jvm-locks
+                (fn [locks]
+                  (if (contains? locks path)
+                    locks
+                    (assoc locks path (Object.)))))
+         path)))
+
+(defn- write-buffer! [^FileChannel ch ^ByteBuffer buf]
+  (while (.hasRemaining buf)
+    (.write ch buf)))
+
+(defn- append-local-supervisor-log! [loop-id step]
+  (when-let [f (local-log-file loop-id)]
+    (try
+      (io/make-parents f)
+      (let [entry (str (pr-str {:at-ms (now-ms)
+                                :decision (:decision step)
+                                :loop (:loop step)
+                                :tick (:tick step)
+                                :lease (:lease step)
+                                :events (:events step)
+                                :governor (:governor step)})
+                       "\n")
+            bytes (kbytes/utf8-bytes entry)]
+        (locking (local-log-jvm-lock f)
+          (with-open [ch (FileChannel/open (.toPath f)
+                                           (into-array StandardOpenOption
+                                                       [StandardOpenOption/CREATE
+                                                        StandardOpenOption/WRITE
+                                                        StandardOpenOption/APPEND]))
+                      lock (.lock ch)]
+            (write-buffer! ch (ByteBuffer/wrap bytes)))))
+      f
+      (catch Exception e
+        (throw (ex-info (str "local supervisor log write failed: "
+                             (display-path (.getPath f))
+                             " - "
+                             (clipped (.getMessage ^Throwable e) 240))
+                        {:path (display-path (.getPath f))}
+                        e))))))
+
+(defn- parse-local-log-line [line]
+  (cond
+    (> (count (or line "")) max-local-log-line-chars)
+    {:error (str "local supervisor log line exceeds "
+                 max-local-log-line-chars
+                 " characters")}
+
+    :else
+    (try
+      {:entry (edn/read-string line)}
+      (catch Exception e
+        {:error (clipped (.getMessage ^Throwable e) 240)}))))
+
+(defn- latest-local-loop [loop-id]
+  (when-let [f (local-log-file loop-id)]
+    (when (.isFile f)
+      (try
+        (with-open [r (io/reader f)]
+          (reduce (fn [latest line]
+                    (if-let [entry (:entry (parse-local-log-line line))]
+                      (or (:loop entry) latest)
+                      latest))
+                  nil
+                  (line-seq r)))
+        (catch Exception _ nil)))))
+
+(defn- reduce-log-lines [^File f init rf]
+  (with-open [r (io/reader f)]
+    (loop [idx 0
+           acc init
+           lines (line-seq r)]
+      (if (seq lines)
+        (recur (inc idx) (rf acc idx (first lines)) (next lines))
+        acc))))
+
+(defn- local-log-read [loop-id]
+  (when-let [f (local-log-file loop-id)]
+    (when (.isFile f)
+      (try
+        (reduce-log-lines
+         f
+         {:entries [] :errors []}
+         (fn [acc idx line]
+           (let [{:keys [entry error]} (parse-local-log-line line)]
+             (if error
+               (update acc :errors conj {:line (inc idx)
+                                         :message error})
+               (update acc :entries conj entry)))))
+        (catch Exception e
+          {:entries []
+           :errors [{:line nil :message (clipped (.getMessage ^Throwable e) 240)}]})))))
+
+(defn- local-log-entries [loop-id]
+  (:entries (local-log-read loop-id)))
+
+(defn- keep-tail [xs n x]
+  (let [xs* (conj xs x)]
+    (if (> (count xs*) n)
+      (vec (subvec xs* (- (count xs*) n)))
+      xs*)))
+
+(defn- local-log-tail [loop-id n]
+  (let [n (max 0 (long (or n 0)))]
+    (when-let [f (local-log-file loop-id)]
+      (when (.isFile f)
+        (try
+          (reduce-log-lines
+           f
+           {:entries [] :errors []}
+           (fn [acc idx line]
+             (let [{:keys [entry error]} (parse-local-log-line line)]
+               (if error
+                 (update acc :errors conj {:line (inc idx)
+                                           :message error})
+                 (update acc :entries keep-tail n entry)))))
+          (catch Exception e
+            {:entries []
+             :errors [{:line nil :message (clipped (.getMessage ^Throwable e) 240)}]}))))))
+
+(defn- local-log-summary [loop-id]
+  (when-let [f (local-log-file loop-id)]
+    (if (.isFile f)
+      (try
+        (reduce-log-lines
+         f
+         {:entries 0 :errors [] :latest nil}
+         (fn [acc idx line]
+           (let [{:keys [entry error]} (parse-local-log-line line)]
+             (if error
+               (update acc :errors conj {:line (inc idx)
+                                         :message error})
+               (-> acc
+                   (update :entries inc)
+                   (assoc :latest entry))))))
+        (catch Exception e
+          {:entries 0
+           :errors [{:line nil :message (clipped (.getMessage ^Throwable e) 240)}]
+           :latest nil}))
+      {:entries 0 :errors [] :latest nil})))
+
+(defn- inc-count [m k]
+  (update m k (fnil inc 0)))
+
+(defn- latest-event-payload [entry event-type]
+  (some (fn [event]
+          (when (= event-type (:agent.event/type event))
+            (:agent.event/payload event)))
+        (:events entry)))
+
+(defn- summarize-tool-error-payload [payload]
+  (when payload
+    (cond-> {:name (:name payload)
+             :error? true}
+      (:id payload) (assoc :id (:id payload))
+      (:result-tail payload) (assoc :result-tail (transcript/tail (:result-tail payload) 240)))))
+
+(defn- latest-tool-error-payload [entry]
+  (some (fn [event]
+          (let [payload (:agent.event/payload event)]
+            (when (and (= :tool-call (:agent.event/type event))
+                       (:error? payload))
+              (summarize-tool-error-payload payload))))
+        (reverse (:events entry))))
+
+(defn- local-log-metrics [loop-id]
+  (let [empty-metrics {:ticks 0
+                       :by-status {}
+                       :events {}
+                       :latest-run-summary nil
+                       :latest-tool-error nil
+                       :latest-error nil
+                       :latest-refusal nil
+                       :latest-control nil}]
+    (when-let [f (local-log-file loop-id)]
+      (if (.isFile f)
+        (try
+          (reduce-log-lines
+           f
+           (assoc empty-metrics :errors [])
+           (fn [acc idx line]
+             (let [{:keys [entry error]} (parse-local-log-line line)]
+               (if error
+                 (update acc :errors conj {:line (inc idx)
+                                           :message error})
+                 (let [status (get-in entry [:tick :agent.tick/status])]
+                    (cond-> (-> acc
+                                (update :ticks inc)
+                                (update :by-status inc-count status)
+                                (update :events
+                                        (fn [events]
+                                          (reduce (fn [m event]
+                                                    (inc-count m (:agent.event/type event)))
+                                                  (or events {})
+                                                  (:events entry)))))
+                      (latest-event-payload entry :run-summary)
+                      (assoc :latest-run-summary (latest-event-payload entry :run-summary))
+
+                      (latest-tool-error-payload entry)
+                      (assoc :latest-tool-error (latest-tool-error-payload entry))
+
+                      (latest-event-payload entry :error)
+                      (assoc :latest-error (latest-event-payload entry :error))
+
+                      (latest-event-payload entry :refusal)
+                      (assoc :latest-refusal (latest-event-payload entry :refusal))
+
+                      (latest-event-payload entry :control)
+                      (assoc :latest-control (latest-event-payload entry :control))))))))
+          (catch Exception e
+            (assoc empty-metrics
+                   :errors [{:line nil :message (clipped (.getMessage ^Throwable e) 240)}])))
+        (assoc empty-metrics :errors [])))))
+
+(defn- lease-status
+  ([lease] (lease-status lease (now-ms) (worker-id)))
+  ([lease now-ms owner]
+   (let [lease-owner (:agent.lease/owner lease)
+         valid? (boolean (and lease (durable/lease-valid? lease now-ms)))
+         stale? (boolean (and lease (durable/stale-lease? lease now-ms)))
+         conflict? (boolean (and valid?
+                                 (seq (str lease-owner))
+                                 (not= lease-owner owner)))
+         takeover? (boolean (and stale?
+                                  (seq (str lease-owner))
+                                  (not= lease-owner owner)))]
+     {:present? (boolean lease)
+      :owner lease-owner
+      :current-owner owner
+      :expires-at (:agent.lease/expires-at lease)
+      :valid? valid?
+      :stale? stale?
+      :conflict? conflict?
+      :takeover? takeover?})))
+
+(defn- latest-lease-status [loop-id]
+  (lease-status (:lease (:latest (local-log-summary loop-id)))))
+
+(defn- current-lease-claim? [claim-step]
+  (let [loop-id (get-in claim-step [:loop :agent.loop/id])
+        tick-id (get-in claim-step [:tick :agent.tick/id])
+        owner (get-in claim-step [:lease :agent.lease/owner])
+        latest (:latest (local-log-summary loop-id))]
+    (and (= tick-id (get-in latest [:tick :agent.tick/id]))
+         (= owner (get-in latest [:lease :agent.lease/owner])))))
+
+(defn- nearest-existing-parent [^File f]
+  (loop [p (.getParentFile f)]
+    (cond
+      (nil? p) nil
+      (.exists p) p
+      :else (recur (.getParentFile p)))))
+
+(defn- local-log-health [loop-id]
+  (if-let [^File f (local-log-file loop-id)]
+    (let [parent (.getParentFile f)
+          existing-parent (nearest-existing-parent f)
+          file-ok? (or (not (.exists f)) (.isFile f))
+          parent-ok? (or (nil? parent)
+                         (and (or (not (.exists parent)) (.isDirectory parent))
+                              (some-> existing-parent .isDirectory)))
+          writable? (and file-ok?
+                         parent-ok?
+                         (if (.exists f)
+                           (.canWrite f)
+                           (boolean (some-> existing-parent .canWrite))))
+          error (cond
+                  (not file-ok?) "log path exists but is not a file"
+                  (not parent-ok?) "log parent path exists but is not a directory"
+                  (not writable?) "log path is not writable")]
+      {:enabled? true
+       :path (display-path (.getPath f))
+       :writable? (boolean writable?)
+       :error error})
+    {:enabled? false
+     :path nil
+     :writable? false
+     :error "disabled"}))
+
+(defn- run->durable-result [{:keys [green? test-out answer error rounds final elapsed-ms task git-status
+                                    rolled-back? rollback-error timeout? exception?]}]
+  (let [tool-events (transcript/tool-events final)
+        tool-error-count (count (filter #(get-in % [:payload :error?]) tool-events))
+        git-status-text (str/trim (or git-status ""))
+        git-status-error? (str/starts-with? git-status-text "ERROR:")
+        status (cond
+                 error :error
+                 green? :done
+                 :else :interrupted)]
+    {:status status
+     :usage {:tokens 0 :tool-calls (count tool-events) :rounds (or rounds 1)}
+     :events (cond-> (into [{:type :run-summary
+                             :payload {:status status
+                                       :green? (boolean green?)
+                                       :elapsed-ms elapsed-ms
+                                       :task (when task (clipped task 200))
+                                       :tool-calls (count tool-events)
+                                       :tool-errors tool-error-count
+                                       :rounds (or rounds 1)
+                                       :timeout? (boolean timeout?)
+                                       :exception? (boolean exception?)
+                                       :rolled-back? (boolean rolled-back?)
+                                       :rollback-error? (boolean (seq rollback-error))
+                                       :git-dirty? (boolean (and (seq git-status-text)
+                                                                 (not git-status-error?)))
+                                       :git-status-error? git-status-error?
+                                       :git-status-tail (when (seq git-status-text)
+                                                          (clipped git-status 1200))}}
+	     {:type :gate
+	      :payload {:green? (boolean green?)
+			:rounds (or rounds 1)
+			:test-tail (when (seq test-out)
+				     (transcript/tail test-out 1200))}}]
+	    tool-events)
+       answer (conj {:type :answer :payload {:text (clipped answer 1200)}})
+       error (conj {:type :error :payload {:message (clipped error 1200)}}))}))
+
+(defn- persist-kotoba! [store step]
+  (when store
+    (try
+      (durable/persist! (:db-api store) (:conn store) step)
+      (catch Exception e
+        (println (str "WARN kotoba datom persist failed - "
+                      (clipped (.getMessage ^Throwable e) 240)))))))
+
+(defn- commit-step! [loop-state store step]
+  (append-local-supervisor-log! (:agent.loop/id (:loop step)) step)
+  (reset! loop-state (:loop step))
+  (persist-kotoba! store step)
+  step)
+
+(defn- persist-supervisor! [{:keys [store loop-state session]} run-result]
+  (let [step (durable/supervisor-step
+              @loop-state
+              {:now-ms (now-ms)
+               :owner (worker-id)
+               :ttl-ms (numeric-env "KC_LEASE_TTL_MS" 60000)
+               :run-result run-result})]
+    (commit-step! loop-state store step)
+    (when (= :hold (:decision step))
+      (println (str "\n-- supervisor -- HOLD for session " (display-id session)
+                    " (" (name (get-in step [:governor :agent.governor/reason])) ")")))
+    step))
+
+(defn- persist-lease-claim! [{:keys [store loop-state session]} task]
+  (let [step (durable/lease-claim-step
+              @loop-state
+              {:now-ms (now-ms)
+               :owner (worker-id)
+               :ttl-ms (numeric-env "KC_LEASE_TTL_MS" 60000)
+               :task (clipped task 200)})]
+    (commit-step! loop-state store step)
+    (println (str "-- supervisor -- lease-claimed"
+                  " session=" (display-id session)
+                  " owner=" (display-id (get-in step [:lease :agent.lease/owner]))
+                  " expires-at=" (get-in step [:lease :agent.lease/expires-at])))
+    step))
+
+(defn- persist-control! [{:keys [store loop-state session]} action reason]
+  (let [step (durable/control-step
+              @loop-state
+              {:now-ms (now-ms)
+               :owner (worker-id)
+               :ttl-ms (numeric-env "KC_LEASE_TTL_MS" 60000)
+               :action action
+               :reason (control-reason-payload reason)})]
+    (commit-step! loop-state store step)
+    (println (str "-- supervisor -- "
+                  (name action)
+                  " session=" (display-id session)
+                  " status=" (name (get-in step [:loop :agent.loop/status]))
+                  " decision=" (name (:decision step))))
+    step))
+
+(defn- durable-loop-budget []
+  {:rounds (numeric-env "KC_LOOP_ROUNDS" 1000)})
+
+(defn- persist-reset-budget! [{:keys [store loop-state session]} reason]
+  (let [step (durable/reset-budget-step
+              @loop-state
+              {:now-ms (now-ms)
+               :owner (worker-id)
+               :ttl-ms (numeric-env "KC_LEASE_TTL_MS" 60000)
+               :budget (durable-loop-budget)
+               :reason (control-reason-payload reason)})]
+    (commit-step! loop-state store step)
+    (println (str "-- supervisor -- reset-budget"
+                  " session=" (display-id session)
+                  " status=" (name (get-in step [:loop :agent.loop/status]))
+                  " budget=" (pr-str (get-in step [:loop :agent.loop/budget]))
+                  " decision=" (name (:decision step))))
+    step))
+
+(defn- persist-refusal! [{:keys [store loop-state]} task reason]
+  (let [step (durable/refusal-step
+              @loop-state
+              {:now-ms (now-ms)
+               :owner (worker-id)
+               :ttl-ms (numeric-env "KC_LEASE_TTL_MS" 60000)
+               :reason reason
+               :task (clipped task 200)})]
+    (commit-step! loop-state store step)
+    step))
+
+(def ^:private traced-tool-keys
+  {:read-file :read_file
+   :read-file-numbered :read_file_numbered
+   :write-file :write_file
+   :apply-patch :apply_patch
+   :replace-text :replace_text
+   :replace-range :replace_range
+   :run-clojure :run_clojure
+   :run-tests :run_tests
+   :list-dir :list_dir
+   :search :search
+   :git-status :git_status
+   :git-diff :git_diff
+   :shell :shell})
+
+(defn- summarize-tool-args [k args]
+  (case k
+    :read-file {:path (first args)}
+    :read-file-numbered {:path (first args) :start (second args) :end (nth args 2 nil)}
+    :write-file {:path (first args) :bytes (count (str (second args)))}
+    :apply-patch {:bytes (count (str (first args)))}
+    :replace-text {:path (first args) :old (clipped (second args) 60) :new-bytes (count (str (nth args 2 nil)))}
+    :replace-range {:path (first args) :start (second args) :end (nth args 2 nil)
+                    :replacement-bytes (count (str (nth args 3 nil)))}
+    :run-clojure {:forms (clipped (first args) 80)}
+    :list-dir {:path (first args)}
+    :search {:pattern (first args)}
+    :shell {:command (first args)}
+    {}))
+
+(defn- trace-host [h]
+  (if-not (enabled? "KC_LIVE_TOOLS")
+    h
+    (reduce-kv
+     (fn [m k tool-name]
+       (if-let [f (get m k)]
+         (assoc m k
+                (fn [& args]
+                  (let [start (now-ms)
+                        _ (println (str "[tool:start] " (name tool-name)
+                                        " " (pr-str (summarize-tool-args k args))))
+                        result (apply f args)
+                        ms (elapsed-ms start)]
+                    (println (str "[tool:end] " (name tool-name)
+                                  " " ms "ms"
+                                  (when (seq (str result))
+                                    (str " -> " (clipped result 160)))))
+                    result)))
+         m))
+     h
+     traced-tool-keys)))
+
+(defn- build-runtime [root model-id]
+  (let [h0    (host/fs-host root)
+        h     (trace-host h0)
+        aborting (atom false)
+        retry-opts (model-retry-opts)
+        model (resilience/retrying-model
+               (build-model model-id)
+               (assoc retry-opts
+                      :on-retry (fn [n e]
+                                  (when-not @aborting
+                                    (println (format "  [retry %d/%d] transient model call failed (%s); backing off..."
+                                                     n (:attempts retry-opts)
+                                                     (clipped (.getMessage ^Throwable e) 240)))))))
+        store (kotoba-store)
+        cpr   (:checkpointer store)
+        rlim  (numeric-env "KC_RECURSION_LIMIT" nil)
+        a     (agent/build-agent (cond-> {:model model :host h :checkpointer cpr}
+                                   rlim (assoc :recursion-limit rlim)))
+        sess  (current-session)
+        durable-session (durable-session-payload)
+        gate-rounds (numeric-env "KC_GATE_ROUNDS" 1)
+        loop-id (current-loop-id)
+        loop-state (atom (or (latest-local-loop loop-id)
+                             (durable/new-loop loop-id {:session durable-session
+                                                       :budget (durable-loop-budget)})))]
+    {:root root :model-id (effective-model-id model-id) :raw-host h0
+     :host h :agent a :session sess :gate-rounds gate-rounds :aborting aborting
+     :store store :checkpointer cpr :loop-state loop-state}))
+
+(declare interactive-command-report)
+
+(defn- print-help! []
+  (println "Commands:")
+  (doseq [{:keys [usage aliases kind]} interactive-command-report]
+    (println (str "  "
+                  usage
+                  (when (seq aliases)
+                    (str " aliases=" (str/join "," aliases)))
+                  " ["
+                  (name kind)
+                  "]")))
+  (println "Use /help or :help for commands. /clear starts fresh, /compact summarizes, and /context or /usage shows session state. Any other non-command input is treated as a coding task."))
+
+(def ^:private tool-report
+  (tools/tool-catalog))
+
+(defn- print-tools! []
+  (println "Tools:")
+  (doseq [{tool-name :name kind :kind restricted? :restricted?} tool-report]
+    (println (str " "
+                  tool-name
+                  " ["
+                  (name kind)
+                  "]"
+                  (when restricted? " restricted")))))
+
+(defn- print-tools-edn! []
+  (prn tool-report))
+
+(defn- version-report []
+  {:agent "kotoba-code"
+   :version kotoba-code-version
+   :schema-version capabilities-schema-version
+   :default-model default-model})
+
+(defn- print-version! []
+  (let [{:keys [agent version schema-version default-model]} (version-report)]
+    (println (str agent
+                  " " version
+                  " schema-version=" schema-version
+                  " default-model=" default-model))))
+
+(defn- print-version-edn! []
+  (prn (version-report)))
+
+(def ^:private exit-code-report
+  {:ok 0
+   :not-ready-or-not-green 1
+   :unexpected-failure 1
+   :usage-or-configuration-error 2})
+
+(def ^:private exit-code-policy
+  {:doctor {:commands ["--doctor" "--doctor-edn"]
+            :ready 0
+            :not-ready 0
+            :usage-or-configuration-error 2
+            :note "Diagnostic only; inspect :ready? or checks for readiness."}
+   :check {:commands ["--check" "--check-edn"]
+           :ready 0
+           :not-ready 1
+           :usage-or-configuration-error 2
+           :note "Readiness gate for scripts and supervisors."}
+   :agent-run {:commands ["<task>" "--interactive"]
+               :green 0
+               :not-green-or-refused 1
+               :usage-or-configuration-error 2}
+   :help {:commands ["--help" "-h"]
+          :ok 0
+          :usage-or-configuration-error 2}
+   :catalog {:commands ["--version" "--version-edn" "--tools" "--tools-edn"
+                        "--commands-edn" "--interactive-commands-edn"
+                        "--capabilities-edn"]
+             :ok 0}
+   :inspect {:commands ["--state-edn" "--next-action-edn" "--budget" "--budget-edn"
+                        "--log" "--log-edn" "--history" "--history-edn" "--last" "--last-edn"
+                        "--read" "--status" "--diff"]
+             :ok 0
+             :usage-or-configuration-error 2}
+   :verify {:commands ["--test"]
+            :green 0
+            :not-green 1
+            :usage-or-configuration-error 2}
+   :control {:commands ["--interrupt" "--resume" "--reset-budget" "--stop"]
+             :ok 0
+             :usage-or-configuration-error 2}})
+
+(def ^:private default-task-usage
+  "usage: kbb -M -m kotoba-code.main \"<task>\" <project-root> [model-id]")
+
+(def ^:private command-usage-lines
+  {"--help" "usage: kbb -M -m kotoba-code.main --help"
+   "-h" "usage: kbb -M -m kotoba-code.main -h"
+   "--interactive" "usage: kbb -M -m kotoba-code.main --interactive <project-root> [model-id]"
+   "--doctor" "usage: kbb -M -m kotoba-code.main --doctor <project-root> [model-id]"
+   "--doctor-edn" "usage: kbb -M -m kotoba-code.main --doctor-edn <project-root> [model-id]"
+   "--check" "usage: kbb -M -m kotoba-code.main --check <project-root> [model-id]"
+   "--check-edn" "usage: kbb -M -m kotoba-code.main --check-edn <project-root> [model-id]"
+   "--state-edn" "usage: kbb -M -m kotoba-code.main --state-edn <project-root> [model-id]"
+   "--next-action-edn" "usage: kbb -M -m kotoba-code.main --next-action-edn <project-root> [model-id]"
+   "--budget" "usage: kbb -M -m kotoba-code.main --budget <project-root> [model-id]"
+   "--budget-edn" "usage: kbb -M -m kotoba-code.main --budget-edn <project-root> [model-id]"
+   "--log" "usage: kbb -M -m kotoba-code.main --log <project-root> [model-id]"
+   "--log-edn" "usage: kbb -M -m kotoba-code.main --log-edn <project-root> [model-id]"
+   "--history" "usage: kbb -M -m kotoba-code.main --history <project-root> [model-id] [N]"
+   "--history-edn" "usage: kbb -M -m kotoba-code.main --history-edn <project-root> [model-id] [N]"
+   "--last" "usage: kbb -M -m kotoba-code.main --last <project-root> [model-id]"
+   "--last-edn" "usage: kbb -M -m kotoba-code.main --last-edn <project-root> [model-id]"
+   "--read" "usage: kbb -M -m kotoba-code.main --read <project-root> <path> [start] [end]"
+   "--status" "usage: kbb -M -m kotoba-code.main --status <project-root>"
+   "--diff" "usage: kbb -M -m kotoba-code.main --diff <project-root>"
+   "--test" "usage: kbb -M -m kotoba-code.main --test <project-root>"
+   "--interrupt" "usage: kbb -M -m kotoba-code.main --interrupt <project-root> [model-id] [reason]"
+   "--resume" "usage: kbb -M -m kotoba-code.main --resume <project-root> [model-id]"
+   "--reset-budget" "usage: kbb -M -m kotoba-code.main --reset-budget <project-root> [model-id] [reason]"
+   "--stop" "usage: kbb -M -m kotoba-code.main --stop <project-root> [model-id] [reason]"
+   "--version" "usage: kbb -M -m kotoba-code.main --version"
+   "--version-edn" "usage: kbb -M -m kotoba-code.main --version-edn"
+   "--tools" "usage: kbb -M -m kotoba-code.main --tools"
+   "--tools-edn" "usage: kbb -M -m kotoba-code.main --tools-edn"
+   "--commands-edn" "usage: kbb -M -m kotoba-code.main --commands-edn"
+   "--interactive-commands-edn" "usage: kbb -M -m kotoba-code.main --interactive-commands-edn"
+   "--capabilities-edn" "usage: kbb -M -m kotoba-code.main --capabilities-edn"})
+
+(defn- usage-for-command [task]
+  (get command-usage-lines task default-task-usage))
+
+(def ^:private suggestion-max-distance 4)
+
+(defn- command-prefix [s]
+  (cond
+    (str/starts-with? (or s "") "--") "--"
+    (str/starts-with? (or s "") "-") "-"
+    (str/starts-with? (or s "") ":") ":"
+    :else ""))
+
+(defn- suggestion-policy [command]
+  {:enabled? true
+   :max-distance suggestion-max-distance
+   :prefix (command-prefix command)
+   :prefix-isolated? true})
+
+(def ^:private command-report
+  (mapv #(assoc %
+                :usage (usage-for-command (:name %))
+                :suggestion (suggestion-policy (:name %)))
+        [{:name "--help" :kind :help :args []
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "-h" :kind :help :args []
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--interactive" :kind :interactive :args ["project-root" "model-id?"]
+    :requires-root? true :requires-credentials? true
+    :side-effect :agent-run :exit-codes [0 1 2]}
+   {:name "--doctor" :kind :diagnostic :args ["project-root" "model-id?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--doctor-edn" :kind :diagnostic :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--check" :kind :diagnostic :args ["project-root" "model-id?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 1 2]}
+   {:name "--check-edn" :kind :diagnostic :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 1 2]}
+   {:name "--version" :kind :catalog :args []
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--version-edn" :kind :catalog :args [] :machine-readable? true
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--state-edn" :kind :diagnostic :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--next-action-edn" :kind :diagnostic :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--budget" :kind :supervisor :args ["project-root" "model-id?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--budget-edn" :kind :supervisor :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--tools" :kind :catalog :args []
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--tools-edn" :kind :catalog :args [] :machine-readable? true
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--commands-edn" :kind :catalog :args [] :machine-readable? true
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--interactive-commands-edn" :kind :catalog :args [] :machine-readable? true
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--capabilities-edn" :kind :catalog :args [] :machine-readable? true
+    :side-effect :read-only :exit-codes [0]}
+   {:name "--log" :kind :supervisor :args ["project-root" "model-id?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--log-edn" :kind :supervisor :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--history" :kind :supervisor :args ["project-root" "model-id?" "N?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--history-edn" :kind :supervisor :args ["project-root" "model-id?" "N?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--last" :kind :supervisor :args ["project-root" "model-id?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--last-edn" :kind :supervisor :args ["project-root" "model-id?"]
+    :requires-root? true :machine-readable? true
+    :side-effect :read-only :exit-codes [0 2]}
+   {:name "--read" :kind :inspect :args ["project-root" "path" "start?" "end?"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--status" :kind :inspect :args ["project-root"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--diff" :kind :inspect :args ["project-root"]
+    :requires-root? true :side-effect :read-only :exit-codes [0 2]}
+   {:name "--test" :kind :verify :args ["project-root"]
+    :requires-root? true :side-effect :process :exit-codes [0 1 2]}
+   {:name "--interrupt" :kind :control :args ["project-root" "model-id?" "reason?"]
+    :open-ended-args? true
+    :requires-root? true :side-effect :control-log-write :exit-codes [0 2]}
+   {:name "--resume" :kind :control :args ["project-root" "model-id?"]
+    :requires-root? true :side-effect :control-log-write :exit-codes [0 2]}
+   {:name "--reset-budget" :kind :control :args ["project-root" "model-id?" "reason?"]
+    :open-ended-args? true
+    :requires-root? true :side-effect :control-log-write :exit-codes [0 2]}
+   {:name "--stop" :kind :control :args ["project-root" "model-id?" "reason?"]
+    :open-ended-args? true
+    :requires-root? true :side-effect :control-log-write :exit-codes [0 2]}]))
+
+(def ^:private command-names
+  (set (map :name command-report)))
+
+(defn- edit-distance [a b]
+  (let [a (vec (or a ""))
+        b (vec (or b ""))]
+    (loop [i 0
+           prev (vec (range (inc (count b))))]
+      (if (= i (count a))
+        (peek prev)
+        (let [curr (reduce
+                    (fn [row j]
+                      (let [insert-cost (inc (peek row))
+                            delete-cost (inc (nth prev (inc j)))
+                            replace-cost (+ (nth prev j)
+                                            (if (= (nth a i) (nth b j)) 0 1))]
+                        (conj row (min insert-cost delete-cost replace-cost))))
+                    [(inc i)]
+                    (range (count b)))]
+          (recur (inc i) curr))))))
+
+(defn- closest-suggestion [candidates task]
+  (let [prefix (command-prefix task)
+        candidates* (filter #(= prefix (command-prefix %)) candidates)
+        ranked (sort-by (juxt second first)
+                        (map (fn [candidate]
+                               [candidate (edit-distance task candidate)])
+                             candidates*))
+        [candidate distance] (first ranked)]
+    (when (and candidate
+               (<= distance suggestion-max-distance))
+      candidate)))
+
+(defn- command-suggestion [task]
+  (closest-suggestion command-names task))
+
+(def ^:private interactive-command-usage-lines
+  {":help" "usage: :help"
+   ":clear" "usage: :clear [NAME]"
+   ":compact" "usage: :compact [INSTRUCTIONS]"
+   ":context" "usage: :context"
+   ":config" "usage: :config [KEY=VALUE]"
+   ":model" "usage: :model [MODEL]"
+   ":permissions" "usage: :permissions [RULE=VALUE]"
+   ":sandbox" "usage: :sandbox [KEY=VALUE]"
+   ":usage" "usage: :usage"
+   ":rename" "usage: :rename NAME"
+   ":version" "usage: :version"
+   ":version-edn" "usage: :version-edn"
+   ":tools" "usage: :tools"
+   ":tools-edn" "usage: :tools-edn"
+   ":commands" "usage: :commands"
+   ":capabilities" "usage: :capabilities"
+   ":budget" "usage: :budget"
+   ":budget-edn" "usage: :budget-edn"
+   ":doctor" "usage: :doctor"
+   ":doctor-edn" "usage: :doctor-edn"
+   ":check" "usage: :check"
+   ":check-edn" "usage: :check-edn"
+   ":state" "usage: :state"
+   ":next-action" "usage: :next-action"
+   ":log" "usage: :log"
+   ":log-edn" "usage: :log-edn"
+   ":history" "usage: :history [N]"
+   ":history-edn" "usage: :history-edn [N]"
+   ":last" "usage: :last"
+   ":last-edn" "usage: :last-edn"
+   ":interrupt" "usage: :interrupt [REASON]"
+   ":resume" "usage: :resume"
+   ":reset-budget" "usage: :reset-budget [REASON]"
+   ":stop" "usage: :stop [REASON]"
+   ":read" "usage: :read PATH [START] [END]"
+   ":status" "usage: :status"
+   ":diff" "usage: :diff"
+   ":test" "usage: :test"
+   ":exit" "usage: :exit"
+   ":quit" "usage: :quit"})
+
+(defn- usage-for-interactive-command [command]
+  (get interactive-command-usage-lines command (str "usage: " command)))
+
+(def ^:private interactive-command-report
+  (mapv #(assoc %
+                :usage (usage-for-interactive-command (:name %))
+                :suggestion (suggestion-policy (:name %)))
+        [{:name ":help" :aliases [":h" "/help"] :kind :help :args []
+   :side-effect :read-only :matching :exact-token}
+   {:name ":clear" :aliases ["/clear" "/reset" "/new"] :kind :session :args ["name?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":compact" :aliases ["/compact"] :kind :session :args ["instructions?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":context" :aliases ["/context"] :kind :session :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":config" :aliases ["/config"] :kind :session :args ["key=value?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":model" :aliases ["/model"] :kind :session :args ["model?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":permissions" :aliases ["/permissions"] :kind :session :args ["rule=value?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":sandbox" :aliases ["/sandbox"] :kind :session :args ["key=value?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":usage" :aliases ["/usage" "/stats"] :kind :session :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":rename" :aliases ["/rename"] :kind :session :args ["name"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":version" :kind :catalog :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":version-edn" :kind :catalog :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":tools" :kind :catalog :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":tools-edn" :kind :catalog :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":commands" :kind :catalog :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":capabilities" :kind :catalog :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":budget" :kind :supervisor :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":budget-edn" :kind :supervisor :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":doctor" :kind :diagnostic :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":doctor-edn" :kind :diagnostic :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":check" :kind :diagnostic :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":check-edn" :kind :diagnostic :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":state" :kind :diagnostic :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":next-action" :kind :diagnostic :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":log" :kind :supervisor :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":log-edn" :kind :supervisor :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":history" :kind :supervisor :args ["N?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":history-edn" :kind :supervisor :args ["N?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":last" :kind :supervisor :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":last-edn" :kind :supervisor :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":interrupt" :kind :control :args ["reason?"]
+    :side-effect :control-log-write :matching :exact-token}
+   {:name ":resume" :kind :control :args []
+    :side-effect :control-log-write :matching :exact-token}
+   {:name ":reset-budget" :kind :control :args ["reason?"]
+    :side-effect :control-log-write :matching :exact-token}
+   {:name ":stop" :kind :control :args ["reason?"]
+    :side-effect :control-log-write :matching :exact-token}
+   {:name ":read" :kind :inspect :args ["path" "start?" "end?"]
+    :side-effect :read-only :matching :exact-token}
+   {:name ":status" :kind :inspect :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":diff" :kind :inspect :args []
+    :side-effect :read-only :matching :exact-token}
+   {:name ":test" :kind :verify :args []
+    :side-effect :process :matching :exact-token}
+   {:name ":exit" :aliases [":quit" ":q" "/exit" "/quit"] :kind :exit :args []
+    :side-effect :exit :matching :exact-token}
+   {:name ":quit" :aliases [":q"] :kind :exit :args []
+    :side-effect :exit :matching :exact-token}]))
+
+(def ^:private interactive-command-names
+  (set (mapcat (fn [{:keys [name aliases]}]
+                 (cons name aliases))
+               interactive-command-report)))
+
+(defn- interactive-command-suggestion [command]
+  (closest-suggestion interactive-command-names command))
+
+(def ^:private next-action-catalog
+  [{:action :run-task :kind :ready
+    :fields [:action :reason :command :interactive]
+    :description "The loop is ready for a new task."}
+   {:action :fix-root :kind :configuration
+    :fields [:action :reason :detail]
+    :description "The supplied project root is missing or invalid."}
+   {:action :fix-configuration :kind :configuration
+    :fields [:action :reason :detail]
+    :description "One or more KC_* settings are invalid."}
+   {:action :set-provider-key :kind :configuration
+    :fields [:action :reason :detail :env :alternative]
+    :description "OpenRouter credentials are missing for the selected model."}
+   {:action :wait-for-lease :kind :coordination
+    :fields [:action :reason :owner :expires-at :alternative]
+    :description "Another worker owns a still-valid lease for this loop."}
+   {:action :repair-local-log :kind :supervisor
+    :fields [:action :reason :detail :path :corrupt-lines :errors :env :command]
+    :description "The local supervisor log is unreadable, corrupt, or unwritable."}
+   {:action :inspect-git :kind :repository
+    :fields [:action :reason :detail]
+    :description "Git status/diff checks are unavailable for the project."}
+   {:action :inspect-worktree :kind :repository
+    :fields [:action :reason :detail :command :interactive :then]
+    :description "The project has pre-existing git status output; inspect it before starting a rollback-protected run."}
+   {:action :reset-budget :kind :control
+    :fields [:action :reason :command :interactive]
+    :description "The durable loop budget is exhausted."}
+   {:action :resume :kind :control
+    :fields [:action :reason :command :interactive]
+    :description "The durable loop is stopped or interrupted."}
+   {:action :inspect-history :kind :diagnostic
+    :fields [:action :reason :status :task :tool-errors :tool :result-tail :command :interactive :then]
+    :description "Inspect recent history before resuming after a failed, interrupted, timed-out, or tool-error run."}
+   {:action :inspect-state :kind :diagnostic
+    :fields [:action :reason :command :interactive]
+    :description "No direct remediation is known; inspect the full state report."}])
+
+(def ^:private state-report-catalog
+  {:sections [:root
+              :model
+              :runtime
+              :ready?
+              :doctor
+              :budget
+              :next-action
+              :log
+              :metrics
+              :lease
+              :lease-status
+              :latest]
+   :metrics {:counters [:ticks]
+             :maps [:by-status :events]
+             :latest [:latest-run-summary
+                      :latest-tool-error
+                      :latest-error
+                      :latest-refusal
+                      :latest-control]}
+   :bounded-payloads {:latest-tool-error [:id :name :error? :result-tail]
+                      :run-summary [:status :green? :elapsed-ms :task
+                                    :tool-calls :tool-errors :rounds
+                                    :timeout? :exception? :rolled-back?
+                                    :rollback-error? :git-dirty?
+                                    :git-status-error? :git-status-tail]
+                      :error [:message]}})
+
+(def ^:private history-entry-catalog
+  {:container {:history-edn :vector
+               :last-edn :entry-or-nil}
+   :entry [:at-ms :decision :loop :tick :lease :events :governor]
+   :loop [:agent.loop/id
+          :agent.loop/session
+          :agent.loop/status
+          :agent.loop/tick-seq
+          :agent.loop/budget]
+   :tick [:agent.tick/id
+          :agent.tick/loop
+          :agent.tick/seq
+          :agent.tick/status
+          :agent.tick/at-ms
+          :agent.tick/usage]
+   :lease [:agent.lease/loop
+           :agent.lease/owner
+           :agent.lease/expires-at]
+   :event [:agent.event/id
+           :agent.event/loop
+           :agent.event/tick
+           :agent.event/type
+           :agent.event/payload]
+   :governor [:agent.governor/id
+              :agent.governor/loop
+              :agent.governor/tick
+              :agent.governor/decision
+              :agent.governor/reason]
+   :bounded-payloads {:tool-call [:id :name :input :result-tail :error?]
+                      :run-summary [:status :green? :elapsed-ms :task
+                                    :tool-calls :tool-errors :rounds
+                                    :timeout? :exception? :rolled-back?
+                                    :rollback-error? :git-dirty?
+                                    :git-status-error? :git-status-tail]
+                      :answer [:text]
+                      :error [:message]}})
+
+(def ^:private readiness-report-catalog
+  {:commands ["--doctor-edn" "--check-edn"]
+   :shape {:ready? :boolean
+           :checks :vector
+           :next-action :map-when-check-edn}
+   :check [:label :ok? :detail]
+   :labels ["root"
+            "model"
+            "configuration"
+            "model credentials"
+            "loop"
+            "local log"
+            "lease"
+            "kotoba datom"
+            "git"
+            "timeouts"
+            "test command"]})
+
+(def ^:private log-report-catalog
+  {:commands ["--log-edn" ":log-edn"]
+   :shape {:enabled? :boolean
+           :path :string-or-nil
+           :writable? :boolean
+           :error :string-or-nil
+           :entries :integer
+           :corrupt-lines :integer
+           :errors :vector
+           :metrics :map
+           :latest-summary :map-or-nil
+           :latest :entry-or-nil}
+   :latest-summary [:tick-seq
+                    :tick-status
+                    :loop-status
+                    :decision
+                    :lease-owner
+                    :lease-expires-at]
+   :metrics {:counters [:ticks]
+             :maps [:by-status :events]
+             :latest [:latest-run-summary
+                      :latest-tool-error
+                      :latest-error
+                      :latest-refusal
+                      :latest-control]}
+   :bounded-payloads {:latest :history-entry
+                      :errors [:line :message]}})
+
+(def ^:private capabilities-report-catalog
+  {:top-level [:schema-version
+               :agent
+               :version
+               :default-model
+               :catalogs
+               :interactive
+               :exit-codes
+               :exit-code-policy
+               :limits
+               :defaults
+               :environment]
+   :catalogs [:tools
+              :commands
+              :interactive-commands
+              :next-actions
+              :state-report
+              :history-entry
+              :readiness-report
+              :log-report
+              :capabilities-report]
+   :interactive [:unknown-colon-input
+                 :unknown-dash-input
+                 :non-command-input]
+   :exit-codes [:ok
+                :not-ready-or-not-green
+                :unexpected-failure
+                :usage-or-configuration-error]
+   :limits [:tools
+            :transcript
+            :local-log]
+   :defaults [:history-count
+              :max-history-count
+              :loop-rounds
+              :lease-ttl-ms
+              :http-timeout-ms
+              :process-timeout-ms
+              :model-retry-attempts
+              :model-retry-backoff-ms]
+   :environment [:provider-keys
+                 :model-routing
+                 :local-log-dir
+                 :loop-id
+                 :session
+                 :boolean-toggles
+                 :boolean-values
+                 :model-retry]})
+
+(defn- print-commands-edn! []
+  (prn command-report))
+
+(defn- print-interactive-commands-edn! []
+  (prn interactive-command-report))
+
+(defn- capabilities-report []
+  {:schema-version capabilities-schema-version
+   :agent "kotoba-code"
+   :version kotoba-code-version
+   :default-model default-model
+   :catalogs {:tools tool-report
+              :commands command-report
+              :interactive-commands interactive-command-report
+              :next-actions next-action-catalog
+              :state-report state-report-catalog
+              :history-entry history-entry-catalog
+              :readiness-report readiness-report-catalog
+              :log-report log-report-catalog
+              :capabilities-report capabilities-report-catalog}
+   :interactive {:unknown-colon-input :reject
+                 :unknown-dash-input :reject
+                 :non-command-input :agent-task}
+   :exit-codes exit-code-report
+   :exit-code-policy exit-code-policy
+   :limits {:tools host/tool-limits
+            :transcript transcript/summary-limits
+            :local-log {:max-line-chars max-local-log-line-chars}}
+   :defaults {:history-count 10
+              :max-history-count max-history-count
+              :loop-rounds 1000
+              :lease-ttl-ms 60000
+              :http-timeout-ms 120000
+              :process-timeout-ms 120000
+              :model-retry-attempts 4
+              :model-retry-backoff-ms 1500}
+   :environment {:provider-keys ["OR_KEY" "OPENROUTER_API_KEY"]
+                 :model-routing ["OpenRouter" "murakumo:"]
+                 :local-log-dir "KC_LOCAL_LOG_DIR"
+                 :loop-id "KC_LOOP_ID"
+                 :session "KC_SESSION"
+                 :boolean-toggles boolean-env-keys
+                 :boolean-values ["true" "false"]
+                 :model-retry ["KC_MODEL_RETRY_ATTEMPTS"
+                               "KC_MODEL_RETRY_BACKOFF_MS"]}})
+
+(defn- print-capabilities-edn! []
+  (prn (capabilities-report)))
+
+(defn- print-budget! [{:keys [loop-state]}]
+  (let [loop @loop-state
+        governor (durable/governor-decision loop)]
+    (println (str "loop=" (display-id (:agent.loop/id loop))
+                  " status=" (name (:agent.loop/status loop))
+                  " tick=" (:agent.loop/tick-seq loop)
+                  " budget=" (pr-str (:agent.loop/budget loop))
+                  " decision=" (name (:agent.governor/decision governor))
+                  " reason=" (name (:agent.governor/reason governor))))))
+
+(defn- budget-report [{:keys [loop-state]}]
+  (let [loop @loop-state
+        governor (durable/governor-decision loop)]
+    {:loop (:agent.loop/id loop)
+     :status (:agent.loop/status loop)
+     :tick (:agent.loop/tick-seq loop)
+     :budget (:agent.loop/budget loop)
+     :decision (:agent.governor/decision governor)
+     :reason (:agent.governor/reason governor)}))
+
+(defn- print-budget-edn! [runtime]
+  (prn (budget-report runtime)))
+
+(defn- ok-line [label ok? detail]
+  (println (str (if ok? "OK  " "WARN ")
+                label
+                (when (seq (str detail)) (str " - " detail)))))
+
+(defn- doctor-report [{:keys [root model-id raw-host host loop-state store checkpointer]}]
+  (let [loop @loop-state
+        log-file (local-log-file (:agent.loop/id loop))
+        log-health (local-log-health (:agent.loop/id loop))
+        log-summary (or (local-log-summary (:agent.loop/id loop))
+                        {:entries 0 :errors []})
+        log-errors (or (:errors log-summary) [])
+        lease-state (lease-status (:lease (:latest log-summary)))
+        config-errors* (config-errors)
+        git-status (try ((:git-status (or raw-host host)))
+                        (catch Exception e
+                          (str "ERROR: " (clipped (.getMessage ^Throwable e) 240))))
+        openrouter? (not (murakumo-model? model-id))
+        root-ok? (.isDirectory (io/file root))
+        config-ok? (empty? config-errors*)
+        credentials-ok? (or (not openrouter?) (not (str/blank? (openrouter-key))))
+        governor (durable/governor-decision loop)
+        loop-ok? (= :continue (:agent.governor/decision governor))
+        log-ok? (and (:enabled? log-health)
+                     (:writable? log-health)
+                     (empty? log-errors))
+        persistence-ok? (or log-ok? (boolean checkpointer))
+        lease-ok? (not (:conflict? lease-state))
+        git-ok? (not (str/starts-with? git-status "ERROR:"))]
+    {:ready? (and root-ok? config-ok? credentials-ok? loop-ok? persistence-ok? lease-ok? git-ok?)
+     :checks [{:label "root" :ok? root-ok? :detail root}
+              {:label "model" :ok? true :detail model-id}
+              {:label "configuration"
+               :ok? config-ok?
+               :detail (if config-ok?
+                         "ok"
+                         (str/join "; " (map format-config-error config-errors*)))}
+              {:label "model credentials"
+               :ok? credentials-ok?
+               :detail (if openrouter?
+                         (if credentials-ok? "OpenRouter key present" "missing OR_KEY/OPENROUTER_API_KEY")
+                         "murakumo.cloud Anthropic gateway selected")}
+              {:label "loop"
+               :ok? loop-ok?
+               :detail (str "status=" (name (:agent.loop/status loop))
+                            " tick=" (:agent.loop/tick-seq loop)
+                            " budget=" (pr-str (:agent.loop/budget loop))
+                            " decision=" (name (:agent.governor/decision governor))
+                            " reason=" (name (:agent.governor/reason governor)))}
+              {:label "local log"
+               :ok? (and (some? log-file) log-ok?)
+               :detail (if log-file
+                         (str (:path log-health)
+                              " entries=" (:entries log-summary)
+                              " corrupt-lines=" (count log-errors)
+                              " writable=" (:writable? log-health)
+                              (when-let [error (:error log-health)]
+                                (str " error=" error)))
+                         "disabled")}
+              {:label "lease"
+               :ok? lease-ok?
+               :detail (if (:present? lease-state)
+                         (str "owner=" (display-id (:owner lease-state))
+                              " current-owner=" (display-id (:current-owner lease-state))
+                              " valid=" (:valid? lease-state)
+                              " stale=" (:stale? lease-state)
+                              " conflict=" (:conflict? lease-state)
+                              " takeover=" (:takeover? lease-state)
+                              " expires-at=" (:expires-at lease-state))
+                         "none")}
+              {:label "kotoba datom"
+               :ok? (boolean checkpointer)
+               :detail (if store "enabled" "disabled")}
+              {:label "git"
+               :ok? git-ok?
+               :detail (clipped git-status 140)}
+              {:label "timeouts"
+               :ok? true
+               :detail (str "http=" (or (env "KC_HTTP_TIMEOUT_MS") "120000")
+                            " run=" (or (env "KC_RUN_TIMEOUT_MS") "off")
+                            " process=" (or (env "KC_PROCESS_TIMEOUT_MS") "120000")
+                            " model-retry-attempts=" (or (env "KC_MODEL_RETRY_ATTEMPTS") "4")
+                            " model-retry-backoff=" (or (env "KC_MODEL_RETRY_BACKOFF_MS") "1500"))}
+              {:label "test command"
+               :ok? true
+               :detail (clipped (or (env "KC_TEST_CMD") "kbb -X:test") 240)}]}))
+
+(defn- print-doctor-report! [{:keys [checks]}]
+  (println "Doctor:")
+  (doseq [{:keys [label ok? detail]} checks]
+    (ok-line label ok? detail)))
+
+(defn- print-doctor! [runtime]
+  (print-doctor-report! (doctor-report runtime)))
+
+(defn- check-by-label [doctor label]
+  (some #(when (= label (:label %)) %) (:checks doctor)))
+
+(defn- check-ok? [doctor label]
+  (true? (:ok? (check-by-label doctor label))))
+
+(defn- incomplete-run-summary? [summary]
+  (boolean (and summary
+                (or (not= :done (:status summary))
+                    (false? (:green? summary))
+                    (:timeout? summary)
+                    (:exception? summary)
+                    (:rollback-error? summary)))))
+
+(defn- inspect-history-action [reason latest-run latest-tool-error tool-errors]
+  {:action :inspect-history
+   :reason reason
+   :status (:status latest-run)
+   :task (:task latest-run)
+   :tool-errors tool-errors
+   :tool (:name latest-tool-error)
+   :result-tail (:result-tail latest-tool-error)
+   :command "kbb -M -m kotoba-code.main --history-edn <project-root> [model-id] 10"
+   :interactive ":history-edn 10"
+   :then "resume after reviewing the latest run"})
+
+(defn- next-action-report [{:keys [doctor budget lease-status metrics log]}]
+  (let [reason (:reason budget)
+        latest-run (:latest-run-summary metrics)
+        latest-tool-error (:latest-tool-error metrics)
+        tool-errors (long (or (:tool-errors latest-run) 0))
+        git-detail (:detail (check-by-label doctor "git"))
+        worktree-detail (let [detail (str/trim (or git-detail ""))]
+                          (when (and (seq detail)
+                                     (not (str/starts-with? (str/lower detail) "error:")))
+                            detail))]
+    (cond
+      (not (check-ok? doctor "root"))
+      {:action :fix-root
+       :reason :invalid-root
+       :detail (:detail (check-by-label doctor "root"))}
+
+      (not (check-ok? doctor "configuration"))
+      {:action :fix-configuration
+       :reason :invalid-configuration
+       :detail (:detail (check-by-label doctor "configuration"))}
+
+      (not (check-ok? doctor "model credentials"))
+      {:action :set-provider-key
+       :reason :missing-provider-key
+       :detail (:detail (check-by-label doctor "model credentials"))
+       :env ["OR_KEY" "OPENROUTER_API_KEY"]
+       :alternative "use a murakumo:<model> model id"}
+
+      (:conflict? lease-status)
+      {:action :wait-for-lease
+       :reason :active-lease-conflict
+       :owner (:owner lease-status)
+       :expires-at (:expires-at lease-status)
+       :alternative "use a distinct KC_LOOP_ID"}
+
+      (not (check-ok? doctor "local log"))
+      {:action :repair-local-log
+       :reason :local-log-unhealthy
+       :detail (:detail (check-by-label doctor "local log"))
+       :path (:path log)
+       :corrupt-lines (:corrupt-lines log)
+       :errors (vec (take 3 (or (:errors log) [])))
+       :env ["KC_LOCAL_LOG_DIR" "KC_LOCAL_LOG"]
+       :command "kbb -M -m kotoba-code.main --state-edn <project-root> [model-id]"}
+
+      (not (check-ok? doctor "git"))
+      {:action :inspect-git
+       :reason :git-unavailable
+       :detail (:detail (check-by-label doctor "git"))}
+
+      (and (:ready? doctor) worktree-detail)
+      {:action :inspect-worktree
+       :reason :pre-existing-worktree-changes
+       :detail worktree-detail
+       :command "kbb -M -m kotoba-code.main --status <project-root>"
+       :interactive ":status"
+       :then "run the task after committing, stashing, or intentionally accepting the existing changes"}
+
+      (:ready? doctor)
+      {:action :run-task
+       :reason :ready
+       :command "kbb -M -m kotoba-code.main \"<task>\" <project-root> [model-id]"
+       :interactive "<task>"}
+
+      (= reason :budget-exhausted)
+      {:action :reset-budget
+       :reason reason
+       :command "kbb -M -m kotoba-code.main --reset-budget <project-root> [model-id] [reason]"
+       :interactive ":reset-budget [REASON]"}
+
+      (= reason :status-stopped)
+      {:action :resume
+       :reason reason
+       :command "kbb -M -m kotoba-code.main --resume <project-root> [model-id]"
+       :interactive ":resume"}
+
+      (and (= reason :interrupted) (pos? tool-errors))
+      (inspect-history-action :tool-errors-observed latest-run latest-tool-error tool-errors)
+
+      (and (= reason :interrupted) (incomplete-run-summary? latest-run))
+      (inspect-history-action :latest-run-incomplete latest-run latest-tool-error tool-errors)
+
+      (= reason :interrupted)
+      {:action :resume
+       :reason reason
+       :command "kbb -M -m kotoba-code.main --resume <project-root> [model-id]"
+       :interactive ":resume"}
+
+      :else
+      {:action :inspect-state
+       :reason (or reason :not-ready)
+       :command "kbb -M -m kotoba-code.main --state-edn <project-root> [model-id]"
+       :interactive ":state"})))
+
+(declare state-report)
+
+(defn- check-report [runtime]
+  (let [{:keys [doctor next-action]} (state-report runtime)]
+    (assoc doctor :next-action next-action)))
+
+(defn- print-check! [runtime]
+  (let [{:keys [ready? next-action] :as report} (check-report runtime)]
+    (print-doctor-report! report)
+    (println (str "NEXT " (pr-str next-action)))
+    (println (str "READY " ready?))
+    ready?))
+
+(defn- print-doctor-edn! [runtime]
+  (prn (doctor-report runtime)))
+
+(defn- print-check-edn! [runtime]
+  (let [{:keys [ready?] :as report} (check-report runtime)]
+    (prn report)
+    ready?))
+
+(defn- state-report [{:keys [root model-id loop-state] :as runtime}]
+  (let [loop-id (:agent.loop/id @loop-state)
+        log-file (local-log-file loop-id)
+        log-health (local-log-health loop-id)
+        log-summary (or (local-log-summary loop-id)
+                        {:entries 0 :errors [] :latest nil})
+        log-metrics (or (local-log-metrics loop-id)
+                        {:ticks 0 :by-status {} :events {} :errors []})
+        log-errors (or (:errors log-summary) [])
+        lease-state (lease-status (:lease (:latest log-summary)))
+        doctor (doctor-report runtime)
+        budget (budget-report runtime)]
+    {:root root
+     :model model-id
+     :runtime {:loop-id loop-id
+               :session (:agent.loop/session @loop-state)
+               :worker-id (worker-id)
+               :model model-id}
+     :ready? (:ready? doctor)
+     :doctor doctor
+     :budget budget
+     :next-action (next-action-report {:doctor doctor
+                                       :budget budget
+                                       :lease-status lease-state
+                                       :metrics log-metrics
+                                       :log {:enabled? (:enabled? log-health)
+                                             :path (:path log-health)
+                                             :corrupt-lines (count log-errors)
+                                             :errors log-errors}})
+     :log {:enabled? (:enabled? log-health)
+           :path (:path log-health)
+           :writable? (:writable? log-health)
+           :error (:error log-health)
+           :entries (:entries log-summary)
+           :corrupt-lines (count log-errors)
+           :errors log-errors}
+     :metrics (dissoc log-metrics :errors)
+     :lease (:lease (:latest log-summary))
+     :lease-status lease-state
+     :latest (:latest log-summary)}))
+
+(defn- print-state-edn! [runtime]
+  (prn (state-report runtime)))
+
+(defn- print-next-action-edn! [runtime]
+  (prn (:next-action (state-report runtime))))
+
+(defn- print-log! [{:keys [loop-state]}]
+  (if-let [f (local-log-file (:agent.loop/id @loop-state))]
+    (println (display-path (.getPath f)))
+    (println "local supervisor log disabled by KC_LOCAL_LOG=false")))
+
+(defn- latest-log-summary [entry]
+  (when entry
+    {:tick-seq (get-in entry [:tick :agent.tick/seq])
+     :tick-status (get-in entry [:tick :agent.tick/status])
+     :loop-status (get-in entry [:loop :agent.loop/status])
+     :decision (:decision entry)
+     :lease-owner (get-in entry [:lease :agent.lease/owner])
+     :lease-expires-at (get-in entry [:lease :agent.lease/expires-at])}))
+
+(defn- log-report [{:keys [loop-state]}]
+  (let [loop-id (:agent.loop/id @loop-state)
+        log-health (local-log-health loop-id)
+        log-summary (or (local-log-summary loop-id)
+                        {:entries 0 :errors [] :latest nil})
+        log-metrics (or (local-log-metrics loop-id)
+                        {:ticks 0 :by-status {} :events {} :errors []})]
+    {:enabled? (:enabled? log-health)
+     :path (:path log-health)
+     :writable? (:writable? log-health)
+     :error (:error log-health)
+     :entries (:entries log-summary)
+     :corrupt-lines (count (or (:errors log-summary) []))
+     :errors (or (:errors log-summary) [])
+     :metrics (dissoc log-metrics :errors)
+     :latest-summary (latest-log-summary (:latest log-summary))
+     :latest (:latest log-summary)}))
+
+(defn- print-log-edn! [runtime]
+  (prn (log-report runtime)))
+
+(defn- event-summary [event]
+  (let [type (:agent.event/type event)
+        payload (:agent.event/payload event)]
+    (case type
+      :gate (str "gate green=" (:green? payload) " rounds=" (:rounds payload))
+      :run-summary (str "run " (name (:status payload))
+                        " elapsed-ms=" (:elapsed-ms payload)
+                        " tools=" (:tool-calls payload)
+                        " tool-errors=" (or (:tool-errors payload) 0)
+                        (when (contains? payload :timeout?)
+                          (str " timeout?=" (:timeout? payload)))
+                        (when (contains? payload :exception?)
+                          (str " exception?=" (:exception? payload)))
+                        (when (contains? payload :rolled-back?)
+                          (str " rolled-back?=" (:rolled-back? payload)))
+                        (when (contains? payload :rollback-error?)
+                          (str " rollback-error?=" (:rollback-error? payload)))
+                        (when (contains? payload :git-dirty?)
+                          (str " git-dirty?=" (:git-dirty? payload)))
+                        (when (contains? payload :git-status-error?)
+                          (str " git-status-error?=" (:git-status-error? payload))))
+      :tool-call (str "tool " (:name payload) (when (:error? payload) " error"))
+      :answer "answer"
+      :error (str "error " (clipped (:message payload) 80))
+      :control (str "control " (name (:action payload))
+                    (when (contains? payload :effective?)
+                      (str " effective?=" (:effective? payload)))
+                    (when-let [reason (not-empty (:reason payload))]
+                      (str " reason=" (clipped reason 80))))
+      :refusal (str "refusal " (name (:status payload)))
+      (name type))))
+
+(defn- print-history-errors! [errors]
+  (when (seq errors)
+    (println (str "WARN local supervisor history has corrupt-lines="
+                  (count errors)
+                  "; inspect --log-edn or --state-edn before trusting history"))
+    (doseq [{:keys [line message]} (take 3 errors)]
+      (println (str "WARN corrupt-line"
+                    (when line (str " line=" line))
+                    (when (seq message) (str " message=" (clipped message 120))))))))
+
+(defn- print-history! [{:keys [loop-state]} n]
+  (let [loop-id (:agent.loop/id @loop-state)
+        {:keys [entries errors]} (or (local-log-tail loop-id n)
+                                     {:entries [] :errors []})]
+    (print-history-errors! errors)
+    (if (seq entries)
+      (doseq [entry entries]
+        (println (str "tick=" (get-in entry [:tick :agent.tick/seq])
+                      " status=" (name (get-in entry [:tick :agent.tick/status]))
+                      " loop=" (name (get-in entry [:loop :agent.loop/status]))
+                      " decision=" (name (:decision entry))
+                      " events=[" (str/join ", " (map event-summary (:events entry))) "]")))
+      (println "no local supervisor history"))))
+
+(defn- print-history-edn! [{:keys [loop-state]} n]
+  (let [loop-id (:agent.loop/id @loop-state)
+        {:keys [entries errors]} (or (local-log-tail loop-id n)
+                                     {:entries [] :errors []})]
+    (binding [*out* *err*]
+      (print-history-errors! errors))
+    (prn (vec (or entries [])))))
+
+(defn- print-last-edn! [{:keys [loop-state]}]
+  (let [loop-id (:agent.loop/id @loop-state)
+        {:keys [entries errors]} (or (local-log-tail loop-id 1)
+                                     {:entries [] :errors []})]
+    (binding [*out* *err*]
+      (print-history-errors! errors))
+    (prn (last (or entries [])))))
+
+(defn- parse-longish [s]
+  (try
+    (some-> s str/trim Long/parseLong)
+    (catch Exception _ nil)))
+
+(defn- validate-history-count [raw-n default-n]
+  (let [n (if (nil? raw-n) default-n (parse-longish raw-n))]
+    (cond
+      (and raw-n (nil? n))
+      {:error (str "history count must be an integer: " raw-n)}
+
+      (not (pos? n))
+      {:error "history count must be >= 1"}
+
+      (> n max-history-count)
+      {:error (str "history count must be <= " max-history-count)}
+
+      :else
+      {:n n})))
+
+(defn- interactive-history-count [line default-n]
+  (let [[_ raw-n] (str/split line #"\s+" 2)]
+    (validate-history-count (some-> raw-n str/trim not-empty) default-n)))
+
+(defn- history-cli-args [model-id maybe-n default-n]
+  (let [count-only? (and (nil? maybe-n) (some? (parse-longish model-id)))
+        model-id* (if count-only? nil model-id)
+        raw-n (if count-only? model-id maybe-n)
+        parsed (validate-history-count raw-n default-n)]
+    (if (:error parsed)
+      parsed
+      (assoc parsed :model-id model-id*))))
+
+(defn- print-interactive-history! [runtime line default-n]
+  (let [{:keys [error n]} (interactive-history-count line default-n)]
+    (if error
+      (println (str "ERROR: " error))
+      (print-history! runtime n))))
+
+(defn- print-interactive-history-edn! [runtime line default-n]
+  (let [{:keys [error n]} (interactive-history-count line default-n)]
+    (if error
+      (println (str "ERROR: " error))
+      (print-history-edn! runtime n))))
+
+(defn- ensure-history-cli-args! [model-id maybe-n default-n]
+  (let [{:keys [error] :as parsed} (history-cli-args model-id maybe-n default-n)]
+    (when error
+      (println (str "ERROR: " error))
+      (System/exit 2))
+    parsed))
+
+(defn- explicit-control-model? [s]
+  (let [s* (or s "")]
+    (or (murakumo-model? s*)
+        (str/includes? s* "/")
+        (str/includes? s* ":"))))
+
+(defn- control-cli-args [args]
+  (let [parts (vec (drop 2 args))
+        [head & more] parts
+        delimiter-index (first (keep-indexed #(when (= "--" %2) %1) parts))
+        reason (fn [xs] (when (seq xs) (str/join " " xs)))]
+    (cond
+      (empty? parts)
+      {:model-id nil :reason nil}
+
+      (= 0 delimiter-index)
+      {:model-id nil :reason (reason (subvec parts 1))}
+
+      delimiter-index
+      {:model-id head :reason (reason (subvec parts (inc delimiter-index)))}
+
+      (explicit-control-model? head)
+      {:model-id head :reason (reason more)}
+
+      :else
+      {:model-id nil :reason (reason parts)})))
+
+(defn- parse-read-line-number [label raw]
+  (let [n (parse-longish raw)]
+    (cond
+      (nil? n)
+      {:error (str label " must be an integer: " raw)}
+
+      (< n 1)
+      {:error (str label " must be >= 1")}
+
+      :else
+      {:value n})))
+
+(defn- read-args [usage too-many-prefix path start end extra]
+  (cond
+    (str/blank? (or path ""))
+    {:error usage}
+
+    (seq extra)
+    {:error (str too-many-prefix "; " usage)}
+
+    :else
+    (let [{start-error :error start-line :value} (when start (parse-read-line-number "start line" start))
+          {end-error :error end-line :value} (when end (parse-read-line-number "end line" end))]
+      (cond
+        start-error {:error start-error}
+        end-error {:error end-error}
+        (and start-line end-line (< end-line start-line))
+        {:error "end line must be >= start line"}
+        :else {:path path :start start :end end}))))
+
+(defn- interactive-read-args [line]
+  (let [tokens (str/split (str/trim (or line "")) #"\s+")
+        [_ path start end & extra] tokens]
+    (read-args (usage-for-interactive-command ":read")
+               "too many arguments for :read"
+               path
+               start
+               end
+               extra)))
+
+(defn- read-cli-args [root path start end extra]
+  (cond
+    (str/blank? (or root ""))
+    {:error (usage-for-command "--read")}
+
+    :else
+    (read-args (usage-for-command "--read")
+               "too many arguments for --read"
+               path
+               start
+               end
+               extra)))
+
+(defn- read-command! [host line]
+  (let [{:keys [error path start end]} (interactive-read-args line)]
+    (if error
+      (println (str "ERROR: " error))
+      (println ((:read-file-numbered host) path start end)))))
+
+(declare run-once!)
+
+(defn- interactive-command-token [line]
+  (first (str/split (str/trim (or line "")) #"\s+" 2)))
+
+(defn- normalize-interactive-line [line]
+  (let [line* (str/trim (or line ""))]
+    (if (and (str/starts-with? line* "/")
+             (not (str/starts-with? line* "//")))
+      (str ":" (subs line* 1))
+      line*)))
+
+(defn- interactive-command? [line command]
+  (= command (interactive-command-token line)))
+
+(defn- interactive-command-args [line command]
+  (when (interactive-command? line command)
+    (str/trim (subs line (count command)))))
+
+(defn- command-error-message [^Throwable e]
+  (clipped (or (.getMessage e)
+               (some-> e class .getName)
+               "unknown error")
+           240))
+
+(defn- update-session-history! [session-state line]
+  (swap! session-state update :history (fnil conj []) line))
+
+(defn- interactive-runtime [runtime-state]
+  (if (instance? clojure.lang.IAtom runtime-state)
+    @runtime-state
+    runtime-state))
+
+(defn- set-interactive-runtime-model! [runtime-state new-model-id]
+  (if (instance? clojure.lang.IAtom runtime-state)
+    (let [current @runtime-state
+          root (:root current)
+          loop-state (:loop-state current)
+          rebuilt (assoc (build-runtime root new-model-id)
+                         :loop-state loop-state)]
+      (reset! runtime-state rebuilt)
+      rebuilt)
+    runtime-state))
+
+(defn- session-label [session-state]
+  (or (:label @session-state) "kotoba-code"))
+
+(defn- set-session-label! [session-state label]
+  (swap! session-state assoc :label (str/trim (or label ""))))
+
+(defn- parse-key-value [s]
+  (when-let [[_ k v] (re-matches #"([^=]+)=(.*)" (str/trim (or s "")))]
+    [(str/lower (str/trim k)) (str/trim v)]))
+
+(defn- update-session-map! [session-state key-value]
+  (when-let [[k v] (parse-key-value key-value)]
+    (swap! session-state update k (fn [current]
+                                    (cond
+                                      (vector? current) (conj (vec current) v)
+                                      (map? current) (assoc current k v)
+                                      (nil? current) v
+                                      :else v)))
+    true))
+
+(defn- clear-session-context! [session-state label]
+  (swap! session-state
+         (fn [state]
+           (-> state
+               (assoc :history []
+                      :compact-summary nil)
+               (cond-> (not (str/blank? label))
+                 (assoc :label (str/trim label)))))))
+
+(defn- compact-session-context! [session-state instructions]
+  (let [summary (str "summary="
+                     (clipped (str/join " | " (take-last 5 (or (:history @session-state) []))) 180)
+                     (when (seq (str/trim (or instructions "")))
+                       (str " focus=" (clipped (str/trim instructions) 120))))]
+    (swap! session-state assoc
+           :history [summary]
+           :compact-summary summary)
+    summary))
+
+(defn- session-context-report [runtime session-state]
+  (let [state @session-state
+        history (or (:history state) [])
+        compact-summary (:compact-summary state)]
+    {:label (session-label session-state)
+     :history-count (count history)
+     :recent (vec (take-last 5 history))
+     :compact-summary compact-summary
+     :config (or (:config state) {})
+     :permissions (or (:permissions state) {})
+     :sandbox (or (:sandbox state) {})
+     :runtime {:model (:model-id runtime)
+               :session (:session runtime)
+               :loop-id (display-id (:agent.loop/id @(:loop-state runtime)))} }))
+
+(defn- session-usage-report [runtime session-state]
+  (merge (budget-report runtime)
+         {:session-label (session-label session-state)
+          :prompt-history-count (count (or (:history @session-state) []))
+          :compact-summary (:compact-summary @session-state)
+          :config (or (:config @session-state) {})
+          :permissions (or (:permissions @session-state) {})
+          :sandbox (or (:sandbox @session-state) {})}))
+
+(defn- run-interactive-command! [runtime-state session-state host line]
+  (try
+    (let [line* (normalize-interactive-line line)
+          runtime (interactive-runtime runtime-state)]
+      (when-not (str/blank? line*)
+        (update-session-history! session-state line*))
+      (cond
+        (or (= line* ":quit") (= line* ":q"))
+        (do (println "bye") :quit)
+
+        (or (= line* ":help") (= line* ":h"))
+        (do (print-help!) :continue)
+
+        (or (interactive-command? line* ":clear")
+            (interactive-command? line* ":reset")
+            (interactive-command? line* ":new"))
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (clear-session-context! session-state args)
+          (println (str "cleared session context"
+                        (when (seq (session-label session-state))
+                          (str " label=" (session-label session-state)))))
+          :continue)
+
+        (interactive-command? line* ":compact")
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (println (str "compacted context: "
+                        (compact-session-context! session-state args)))
+          :continue)
+
+        (= line* ":context")
+        (do (prn (session-context-report runtime session-state))
+            :continue)
+
+        (interactive-command? line* ":config")
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (if (str/blank? args)
+            (do (prn {:config (or (:config @session-state) {})
+                      :model (:model-id runtime)
+                      :session (:session runtime)})
+                :continue)
+            (if-let [[k v] (parse-key-value args)]
+              (do (swap! session-state update :config (fnil assoc {}) k v)
+                  (when (= k "model")
+                    (set-interactive-runtime-model! runtime-state v)
+                    (swap! session-state update :config assoc "model" v))
+                  (println (str "config " k "=" v))
+                  :continue)
+              (do (println "ERROR: :config expects KEY=VALUE")
+                  :continue))))
+
+        (interactive-command? line* ":model")
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (if (str/blank? args)
+            (do (println (str "model " (:model-id runtime))) :continue)
+            (do (set-interactive-runtime-model! runtime-state args)
+                (swap! session-state update :config assoc "model" args)
+                (println (str "model " (effective-model-id args)))
+                :continue)))
+
+        (interactive-command? line* ":permissions")
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (if (str/blank? args)
+            (do (prn {:permissions (or (:permissions @session-state) {})
+                      :model (:model-id runtime)})
+                :continue)
+            (if-let [[k v] (parse-key-value args)]
+              (do (swap! session-state update :permissions (fnil assoc {}) k v)
+                  (println (str "permissions " k "=" v))
+                  :continue)
+              (do (println "ERROR: :permissions expects RULE=VALUE")
+                  :continue))))
+
+        (interactive-command? line* ":sandbox")
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (if (str/blank? args)
+            (do (prn {:sandbox (or (:sandbox @session-state) {})
+                     :model (:model-id runtime)})
+                :continue)
+            (if-let [[k v] (parse-key-value args)]
+              (do (swap! session-state update :sandbox (fnil assoc {}) k v)
+                  (println (str "sandbox " k "=" v))
+                  :continue)
+              (do (println "ERROR: :sandbox expects KEY=VALUE")
+                  :continue))))
+
+        (or (= line* ":usage") (= line* ":stats"))
+        (do (prn (session-usage-report runtime session-state))
+            :continue)
+
+        (interactive-command? line* ":rename")
+        (let [args (str/trim (subs line* (count (interactive-command-token line*))))]
+          (if (str/blank? args)
+            (do (println "ERROR: :rename requires a session name")
+                :continue)
+            (do (set-session-label! session-state args)
+                (println (str "session renamed to " (session-label session-state)))
+                :continue)))
+
+        (= line* ":version")
+        (do (print-version!) :continue)
+
+        (= line* ":version-edn")
+        (do (print-version-edn!) :continue)
+
+        (= line* ":tools")
+        (do (print-tools!) :continue)
+
+        (= line* ":tools-edn")
+        (do (print-tools-edn!) :continue)
+
+        (= line* ":commands")
+        (do (print-interactive-commands-edn!) :continue)
+
+        (= line* ":capabilities")
+        (do (print-capabilities-edn!) :continue)
+
+        (= line* ":budget")
+        (do (print-budget! runtime) :continue)
+
+        (= line* ":budget-edn")
+        (do (print-budget-edn! runtime) :continue)
+
+        (= line* ":doctor")
+        (do (print-doctor! runtime) :continue)
+
+        (= line* ":doctor-edn")
+        (do (print-doctor-edn! runtime) :continue)
+
+        (= line* ":check")
+        (do (print-check! runtime) :continue)
+
+        (= line* ":check-edn")
+        (do (print-check-edn! runtime) :continue)
+
+        (= line* ":state")
+        (do (print-state-edn! runtime) :continue)
+
+        (= line* ":next-action")
+        (do (print-next-action-edn! runtime) :continue)
+
+        (= line* ":log")
+        (do (print-log! runtime) :continue)
+
+        (= line* ":log-edn")
+        (do (print-log-edn! runtime) :continue)
+
+        (interactive-command? line* ":history")
+        (do (print-interactive-history! runtime line* 5) :continue)
+
+        (interactive-command? line* ":history-edn")
+        (do (print-interactive-history-edn! runtime line* 5) :continue)
+
+        (= line* ":last")
+        (do (print-history! runtime 1) :continue)
+
+        (= line* ":last-edn")
+        (do (print-last-edn! runtime) :continue)
+
+        (interactive-command? line* ":interrupt")
+        (do (persist-control! runtime :interrupt (interactive-command-args line* ":interrupt"))
+            :continue)
+
+        (= line* ":resume")
+        (do (persist-control! runtime :resume nil)
+            :continue)
+
+        (interactive-command? line* ":reset-budget")
+        (do (persist-reset-budget! runtime (interactive-command-args line* ":reset-budget"))
+            :continue)
+
+        (interactive-command? line* ":stop")
+        (do (persist-control! runtime :stop (interactive-command-args line* ":stop"))
+            :continue)
+
+        (interactive-command? line* ":read")
+        (do (read-command! host line*) :continue)
+
+        (= line* ":status")
+        (do (println ((:git-status host))) :continue)
+
+        (= line* ":diff")
+        (do (println ((:git-diff host))) :continue)
+
+        (= line* ":test")
+        (do (println ((:run-tests host))) :continue)
+
+        (str/blank? line*)
+        :continue
+
+        (str/starts-with? line* ":")
+        (do (println (str "ERROR: unknown interactive command " (pr-str (interactive-command-token line*))))
+            (when-let [suggestion (interactive-command-suggestion (interactive-command-token line*))]
+              (println (str "Did you mean " suggestion "?")))
+            (println "Use :help to list commands.")
+            :continue)
+
+        (str/starts-with? line* "-")
+        (do (println (str "ERROR: one-shot command is not valid inside interactive mode: "
+                          (pr-str (interactive-command-token line*))))
+            (when-let [suggestion (command-suggestion (interactive-command-token line*))]
+              (println (str "Did you mean " suggestion "?")))
+            (println "Use :help to list interactive commands, or run one-shot commands outside --interactive.")
+            :continue)
+
+        :else
+        (do (run-once! runtime line*) :continue)))
+    (catch Throwable e
+      (println (str "ERROR: interactive command failed"
+                    (when-not (str/blank? line) (str " for " (pr-str line)))
+                    ": "
+                    (command-error-message e)))
+      :continue)))
+
+(defn- print-transcript! [result]
+  (when-not (= "false" (str/lower (or (env "KC_TOOL_TRANSCRIPT") "")))
+    (let [lines (transcript/lines (:final result))]
+      (when (seq lines)
+        (println "\n-- tools --")
+        (doseq [line lines] (println line))))))
+
+(defn- timeout-result [timeout-ms elapsed-ms]
+  {:green? false
+   :test-out ""
+   :final nil
+   :answer nil
+   :rounds 1
+   :error (str "run timed out after " timeout-ms "ms")
+   :timeout? true
+   :elapsed-ms elapsed-ms})
+
+(defn- safe-rollback [host]
+  (when-let [rollback (:rollback host)]
+    (try
+      (rollback)
+      nil
+      (catch Throwable e
+        (command-error-message e)))))
+
+(defn- safe-git-status [host]
+  (try
+    (when-let [git-status (:git-status host)]
+      (git-status))
+    (catch Throwable e
+      (str "ERROR: git status failed: " (command-error-message e)))))
+
+(defn- clear-rollback-journal! [host]
+  (when-let [clear! (:clear-rollback-journal host)]
+    (try
+      (clear!)
+      (catch Throwable e
+        (println (str "WARN rollback journal clear failed - "
+                      (command-error-message e)))))))
+
+(defn- with-rollback-error [result rollback-error]
+  (if (seq rollback-error)
+    (assoc result
+           :green? false
+           :error (str (or (:error result) "run failed")
+                       "; rollback failed: "
+                       rollback-error)
+           :rollback-error rollback-error)
+    result))
+
+(defn- exception-result [^Throwable e elapsed-ms]
+  {:green? false
+   :test-out ""
+   :final nil
+   :answer nil
+   :rounds 1
+   :error (command-error-message e)
+   :exception? true
+   :elapsed-ms elapsed-ms})
+
+(defn- run-gated-with-timeout [agent task host opts aborting]
+  (let [timeout-ms (numeric-env "KC_RUN_TIMEOUT_MS" nil)]
+    (if (and timeout-ms (pos? timeout-ms))
+      (let [start (now-ms)
+            fut (future (gate/run-gated agent task host opts))
+            result (deref fut timeout-ms ::timeout)]
+        (if (= ::timeout result)
+          (do
+            (reset! aborting true)
+            (future-cancel fut)
+            (with-rollback-error
+              (assoc (timeout-result timeout-ms (elapsed-ms start))
+                     :rolled-back? true)
+              (safe-rollback host)))
+          result))
+      (gate/run-gated agent task host opts))))
+
+(defn- refusal-advice [governor]
+  (case (:agent.governor/reason governor)
+    :budget-exhausted "Start a new KC_LOOP_ID or raise the durable loop budget."
+    :status-stopped "Use :resume to continue."
+    :interrupted "Use :resume to continue."
+    "Inspect --budget-edn and --history-edn before retrying."))
+
+(defn- require-runnable-loop! [{:keys [loop-state] :as runtime} task]
+  (let [loop @loop-state
+        lease-state (latest-lease-status (:agent.loop/id loop))
+        governor (durable/governor-decision loop)]
+    (cond
+      (:conflict? lease-state)
+      (do
+        (println (str "-- supervisor -- refusing task: active lease is owned by "
+                      (display-id (:owner lease-state))
+                      " current-owner=" (display-id (:current-owner lease-state))
+                      " expires-at=" (:expires-at lease-state)
+                      ". Wait for the lease to expire or use a distinct KC_LOOP_ID."))
+        false)
+
+      (= :continue (:agent.governor/decision governor))
+      true
+
+      :else
+      (do
+        (persist-refusal! runtime task (:agent.governor/reason governor))
+        (println (str "-- supervisor -- refusing task: loop status is "
+                      (name (:agent.loop/status loop))
+                      " decision=" (name (:agent.governor/decision governor))
+                      " reason=" (name (:agent.governor/reason governor))
+                      ". " (refusal-advice governor)))
+        false))))
+
+(defn- run-once! [runtime task]
+  (when (require-runnable-loop! runtime task)
+    (let [claim-step (persist-lease-claim! runtime task)]
+    (let [start (now-ms)
+          {:keys [agent host session gate-rounds aborting] :as runtime} runtime
+        {:keys [green? test-out answer error rounds] :as result}
+        (do
+          (println (str "-- run -- start session=" (display-id session)
+                        " gate-rounds=" gate-rounds))
+          (reset! aborting false)
+          (try
+            (run-gated-with-timeout agent task host {:session-id session :rounds gate-rounds} aborting)
+            (catch Throwable e
+              (with-rollback-error
+                (assoc (exception-result e (elapsed-ms start))
+                       :rolled-back? true)
+                (safe-rollback host)))))]
+      (if-not (current-lease-claim? claim-step)
+        (do
+          (when-let [rollback-error (safe-rollback host)]
+            (println (str "-- supervisor -- rollback failed after lost lease: "
+                          rollback-error)))
+          (println (str "-- supervisor -- lost lease before commit; rolled back local changes and skipped result commit"
+                        " session=" (display-id session)))
+          false)
+        (do
+          (print-transcript! result)
+          (println "\n-- agent --\n" (or answer ""))
+          (when error (println "\n-- error --" error "(working tree rolled back)"))
+          (println "\n-- gate --" (if green? "GREEN" "NOT GREEN (working tree rolled back)")
+                   (when rounds (str "[" rounds "/" gate-rounds " rounds]")))
+          (when (seq test-out) (println (subs test-out (max 0 (- (count test-out) 600)))))
+          (println (str "\n-- run -- done " (elapsed-ms start) "ms"))
+          (persist-supervisor! runtime (run->durable-result
+                                        (assoc result
+                                               :task task
+                                               :elapsed-ms (elapsed-ms start)
+                                               :git-status (safe-git-status host))))
+          (clear-rollback-journal! host)
+          green?))))))
+
+(defn- interactive! [root model-id]
+  (let [runtime-state (atom (build-runtime root model-id))
+        {:keys [host session checkpointer]} @runtime-state
+        session-state (atom {:label "kotoba-code"
+                             :config {:model (effective-model-id model-id)}
+                             :permissions {}
+                             :sandbox {}
+                             :history []
+                             :compact-summary nil})]
+    (println (str "-- kotoba-code interactive -- root=" root
+                  " model=" (effective-model-id model-id)
+                  (when checkpointer " kotoba-Datom=on")
+                  " session=" (display-id session)))
+    (println "Enter a task. Commands: /help, /clear, /compact, /context, /config, /model, /permissions, /sandbox, /usage, /rename, /version, /tools, /budget, /doctor, /check, /state, /next-action, /log, /history, /last, /interrupt, /resume, /reset-budget, /stop, /read, /status, /diff, /test, /exit")
+    (loop []
+      (print (str (session-label session-state) "> "))
+      (flush)
+      (when-let [line (read-line)]
+        (when (= :continue (run-interactive-command! runtime-state session-state host (str/trim line)))
+          (recur))))))
+
+(def ^:private cli-max-args
+  {"--help" 1
+   "-h" 1
+   "--interactive" 3
+   "--doctor" 3
+   "--doctor-edn" 3
+   "--check" 3
+   "--check-edn" 3
+   "--state-edn" 3
+   "--next-action-edn" 3
+   "--budget" 3
+   "--budget-edn" 3
+   "--tools" 1
+   "--tools-edn" 1
+   "--commands-edn" 1
+   "--interactive-commands-edn" 1
+   "--capabilities-edn" 1
+   "--log" 3
+   "--log-edn" 3
+   "--history" 4
+   "--history-edn" 4
+   "--last" 3
+   "--last-edn" 3
+   "--read" 5
+   "--status" 2
+   "--diff" 2
+   "--test" 2
+   "--version" 1
+   "--version-edn" 1
+   "--resume" 3})
+
+(defn- usage-line [task]
+  (usage-for-command task))
+
+(defn- print-cli-help! []
+  (println (usage-line nil))
+  (doseq [{:keys [name]} command-report]
+    (println (str "   or: " (usage-line name)))))
+
+(defn- ensure-cli-arity! [task argc]
+  (when (and task
+             (str/starts-with? task "-")
+             (not (contains? command-names task)))
+    (println (str "ERROR: unknown command " task))
+    (when-let [suggestion (command-suggestion task)]
+      (println (str "Did you mean " suggestion "?")))
+    (println "Use --help to list commands.")
+    (System/exit 2))
+  (when-let [max-args (get cli-max-args task)]
+    (when (> argc max-args)
+      (println (str "ERROR: too many arguments for " task))
+      (println (usage-line task))
+      (System/exit 2)))
+  (when (and task
+             (not (str/starts-with? task "--"))
+             (> argc 3))
+    (println "ERROR: too many arguments for task run")
+    (println (usage-line task))
+    (System/exit 2)))
+
+(defn- unexpected-error-message [^Throwable e]
+  (str "ERROR: unexpected failure: "
+       (clipped (command-error-message e) 240)))
+
+(defn- exit-unexpected! [^Throwable e]
+  (println (unexpected-error-message e))
+  (System/exit 1))
+
+(defn -main [& args]
+  (try
+    (let [[task root model-id maybe-n maybe-end] args]
+    (ensure-cli-arity! task (count args))
+    (cond
+      (or (= task "--help") (= task "-h"))
+      (do (print-cli-help!)
+          (System/exit 0))
+
+      (= task "--version")
+      (do (print-version!)
+          (System/exit 0))
+
+      (= task "--version-edn")
+      (do (print-version-edn!)
+          (System/exit 0))
+
+      (= task "--interactive")
+      (if root
+        (do (ensure-runtime-prereqs! root model-id)
+            (interactive! root model-id)
+            (System/exit 0))
+        (do (println (usage-line "--interactive"))
+            (System/exit 2)))
+
+      (= task "--doctor")
+      (if root
+        (do (ensure-root! root)
+            (print-doctor! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--doctor"))
+            (System/exit 2)))
+
+      (= task "--doctor-edn")
+      (if root
+        (do (ensure-root! root)
+            (print-doctor-edn! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--doctor-edn"))
+            (System/exit 2)))
+
+      (= task "--check")
+      (if root
+        (do (ensure-root! root)
+            (System/exit (if (print-check! (build-runtime root model-id)) 0 1)))
+        (do (println (usage-line "--check"))
+            (System/exit 2)))
+
+      (= task "--check-edn")
+      (if root
+        (do (ensure-root! root)
+            (System/exit (if (print-check-edn! (build-runtime root model-id)) 0 1)))
+        (do (println (usage-line "--check-edn"))
+            (System/exit 2)))
+
+      (= task "--state-edn")
+      (if root
+        (do (ensure-root! root)
+            (print-state-edn! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--state-edn"))
+            (System/exit 2)))
+
+      (= task "--next-action-edn")
+      (if root
+        (do (ensure-root! root)
+            (print-next-action-edn! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--next-action-edn"))
+            (System/exit 2)))
+
+      (= task "--budget")
+      (if root
+        (do (ensure-root! root)
+            (print-budget! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--budget"))
+            (System/exit 2)))
+
+      (= task "--budget-edn")
+      (if root
+        (do (ensure-root! root)
+            (print-budget-edn! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--budget-edn"))
+            (System/exit 2)))
+
+      (= task "--tools")
+      (do (print-tools!)
+          (System/exit 0))
+
+      (= task "--tools-edn")
+      (do (print-tools-edn!)
+          (System/exit 0))
+
+      (= task "--commands-edn")
+      (do (print-commands-edn!)
+          (System/exit 0))
+
+      (= task "--interactive-commands-edn")
+      (do (print-interactive-commands-edn!)
+          (System/exit 0))
+
+      (= task "--capabilities-edn")
+      (do (print-capabilities-edn!)
+          (System/exit 0))
+
+      (= task "--log")
+      (if root
+        (do (ensure-root! root)
+            (if-let [f (local-log-file (current-loop-id))]
+              (println (display-path (.getPath f)))
+              (println "local supervisor log disabled by KC_LOCAL_LOG=false"))
+            (System/exit 0))
+        (do (println (usage-line "--log"))
+            (System/exit 2)))
+
+      (= task "--log-edn")
+      (if root
+        (do (ensure-root! root)
+            (print-log-edn! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--log-edn"))
+            (System/exit 2)))
+
+      (= task "--history")
+      (if root
+        (let [{model-id* :model-id n :n} (ensure-history-cli-args! model-id maybe-n 10)]
+          (ensure-root! root)
+          (print-history! (build-runtime root model-id*) n)
+          (System/exit 0))
+        (do (println (usage-line "--history"))
+            (System/exit 2)))
+
+      (= task "--history-edn")
+      (if root
+        (let [{model-id* :model-id n :n} (ensure-history-cli-args! model-id maybe-n 10)]
+          (ensure-root! root)
+          (print-history-edn! (build-runtime root model-id*) n)
+          (System/exit 0))
+        (do (println (usage-line "--history-edn"))
+            (System/exit 2)))
+
+      (= task "--last")
+      (if root
+        (do (ensure-root! root)
+            (print-history! (build-runtime root model-id) 1)
+            (System/exit 0))
+        (do (println (usage-line "--last"))
+            (System/exit 2)))
+
+      (= task "--last-edn")
+      (if root
+        (do (ensure-root! root)
+            (print-last-edn! (build-runtime root model-id))
+            (System/exit 0))
+        (do (println (usage-line "--last-edn"))
+            (System/exit 2)))
+
+      (= task "--read")
+      (let [{:keys [error path start end]} (read-cli-args root model-id maybe-n maybe-end (drop 5 args))]
+        (if error
+          (do (println (str "ERROR: " error))
+              (System/exit 2))
+          (do (ensure-root! root)
+              (println ((:read-file-numbered (host/fs-host root)) path start end))
+              (System/exit 0))))
+
+      (= task "--status")
+      (if root
+        (do (ensure-root! root)
+            (println ((:git-status (host/fs-host root))))
+            (System/exit 0))
+        (do (println (usage-line "--status"))
+            (System/exit 2)))
+
+      (= task "--diff")
+      (if root
+        (do (ensure-root! root)
+            (println ((:git-diff (host/fs-host root))))
+            (System/exit 0))
+        (do (println (usage-line "--diff"))
+            (System/exit 2)))
+
+      (= task "--test")
+      (if root
+        (do (ensure-root! root)
+            (ensure-config!)
+            (let [test-out ((:run-tests (host/fs-host root)))]
+              (println test-out)
+              (System/exit (if (gate/green? test-out) 0 1))))
+        (do (println (usage-line "--test"))
+            (System/exit 2)))
+
+      (= task "--interrupt")
+      (if root
+        (let [{model-id* :model-id reason :reason} (control-cli-args args)]
+          (ensure-root! root)
+          (persist-control! (build-runtime root model-id*) :interrupt reason)
+          (System/exit 0))
+        (do (println (usage-line "--interrupt"))
+            (System/exit 2)))
+
+      (= task "--resume")
+      (if root
+        (do (ensure-root! root)
+            (persist-control! (build-runtime root model-id) :resume nil)
+            (System/exit 0))
+        (do (println (usage-line "--resume"))
+            (System/exit 2)))
+
+      (= task "--reset-budget")
+      (if root
+        (let [{model-id* :model-id reason :reason} (control-cli-args args)]
+          (ensure-root! root)
+          (ensure-config!)
+          (persist-reset-budget! (build-runtime root model-id*) reason)
+          (System/exit 0))
+        (do (println (usage-line "--reset-budget"))
+            (System/exit 2)))
+
+      (= task "--stop")
+      (if root
+        (let [{model-id* :model-id reason :reason} (control-cli-args args)]
+          (ensure-root! root)
+          (persist-control! (build-runtime root model-id*) :stop reason)
+          (System/exit 0))
+        (do (println (usage-line "--stop"))
+            (System/exit 2)))
+
+      (or (nil? task) (nil? root))
+      (do (print-cli-help!)
+          (System/exit 2))
+
+      :else
+      (do
+        (ensure-runtime-prereqs! root model-id)
+        (let [{:keys [session checkpointer] :as runtime} (build-runtime root model-id)
+            _ (println (str "-- kotoba-code -- root=" root
+                            " model=" (effective-model-id model-id)
+                            (when checkpointer " kotoba-Datom=on") " session=" (display-id session)))
+            green? (run-once! runtime task)]
+          (System/exit (if green? 0 1))))))
+    (catch Throwable e
+      (exit-unexpected! e))))

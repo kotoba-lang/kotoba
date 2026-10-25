@@ -1,0 +1,160 @@
+(ns langchain.db-contract-test
+  "The `langchain.db` invariants every consumer stands on and that no test
+  looked at.
+
+  `db-test` covers the API surface: a query joins, an upsert merges, a pull
+  nests, `as-of` rewinds. Each of those was written alongside the code it
+  covers, so each passes for the reason its author had in mind. This
+  namespace asks the other question — **what would still be green if
+  `db.cljc` regressed?** — and pins the answers.
+
+  It matters more here than in most places. `langchain.db` is not one of
+  this library's leaves; it is the store `langchain-store` wraps and, through
+  it, the 316 `cloud-itonami` repositories that depend on that wrapper. A
+  silent change here does not fail: it writes a second entity, or replays a
+  history that disagrees with the process that wrote it.
+
+  Each test below was watched go red against a deliberately broken copy of
+  `db.cljc` before it landed — the mutation is named in each docstring and
+  recorded in the superproject's `scripts/maturity-loop/mutations.edn`
+  (suite `orgs/kotoba-lang/langchain`). All three mutations were first
+  confirmed to leave the pre-existing suite entirely green: 153 tests / 535
+  assertions, 0 failures, once per mutation. A test whose mutation the old
+  suite already caught is not closing a gap, and saying which is the point
+  of writing them down."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langchain.db :as db]))
+
+(def ^:private schema
+  {:person/id {:db/unique :db.unique/identity}})
+
+(defn- ages [dbv]
+  (set (db/q '[:find [?a ...]
+               :where [?e :person/id "alice"] [?e :person/age ?a]]
+             dbv)))
+
+;; ═════════════ 1. the unique attribute resolves from anywhere ═════════════
+
+(deftest upsert-resolves-through-the-unique-attr-wherever-it-sits-in-the-map
+  "`expand-entity-map` sorts a map's attributes so unique ones are emitted
+  first, because a tempid is bound by the FIRST op that mentions it — and
+  only a unique attribute can resolve that op onto an existing entity.
+  Drop the sort and the tempid is bound by whichever attribute the map
+  happens to yield first; if that one is not unique, the transaction
+  allocates a fresh eid and the `:db.unique/identity` attribute is written
+  onto a SECOND entity carrying the same identity value.
+
+  Nothing raises. Both entities are well-formed, this store never enforces
+  uniqueness at the datom level (its ns docstring says so), and every
+  scalar query keeps answering — with whichever of the two it reaches
+  first.
+
+  `db-test`'s upsert test cannot see this. It writes
+  `{:person/id \"alice\" :person/age 31}`, where the unique attribute is
+  already first in the literal's insertion order, so the sort has nothing
+  to do and removing it changes nothing. The map has to be written the
+  other way round for the sort to be load-bearing — which is the ordinary
+  case, not the exotic one: `langchain-store/map->tx` builds its tx map
+  with `reduce-kv` over a field spec, so the order is the spec author's
+  domain order and the identity attribute lands wherever they wrote it.
+
+  Mutation: `:langchain/entity-map-loses-unique-first-ordering`."
+  (let [conn (db/create-conn schema)]
+    (db/transact! conn [{:person/id "alice" :person/age 30}])
+    ;; the identity attribute written LAST, as a field spec would emit it
+    (db/transact! conn [{:person/age 31 :person/id "alice"}])
+    (let [dbv (db/db conn)]
+      (testing "the second write resolved onto the existing entity"
+        (is (= 1 (db/q '[:find (count ?e) . :where [?e :person/id "alice"]] dbv))))
+      (testing "and replaced its value rather than sitting beside it"
+        (is (= #{31} (ages dbv)))))))
+
+;; ═══════ 2. a replacement is a retraction plus an add, in tx-data ═══════
+
+(deftest replacing-a-value-retracts-the-old-one-in-tx-data
+  "Overwriting a cardinality-one attribute retracts the previous datom, and
+  the retraction has to appear in `:tx-data` — not just in `:datoms`.
+
+  `:tx-data` is not a diagnostic here, it is what `as-of` replays. `as-of`
+  folds each logged transaction's `:tx-data` straight into `:datoms`
+  (`:db/add` conj, `:db/retract` disj); it does not go back through
+  `apply-add`, so it cannot re-derive a retraction that was never written
+  down. Drop the retraction from `:tx-data` while still applying it to
+  `:datoms` and the live process stays correct while `as-of`, replayed
+  THROUGH the replacement, returns a cardinality-one attribute holding both
+  values — a db no writer could have produced.
+
+  **The PERSIST path does not share this exposure, and this test says so
+  rather than leaving it implied.** `create-conn`'s persist arity replays
+  each event through `with`, which runs `apply-add`, which recomputes the
+  retraction against the db it is rebuilding. Measured against the mutation
+  below: the persist assertion here stays GREEN while the `as-of` one goes
+  red. It is kept because the asymmetry is the fact worth having — the two
+  replay paths are not interchangeable, and only one of them depends on
+  tx-data fidelity — but on this mutation it is a passenger, not a second
+  detector. Writing it down beats a later reader assuming the coverage is
+  symmetric because both lines are here.
+
+  `as-of-test` comes close and cannot see it: it does replace a value, then
+  reads `as-of` the tx BEFORE the replacement, which replays only the add
+  that is still there. Reading at the later tx is the whole difference.
+  `persist-test` replays a log that only ever ADDS, so it has no retraction
+  to lose either way.
+
+  Mutation: `:langchain/tx-data-drops-the-retraction` — 2 of these 4
+  assertions go red, the tx-data one and the as-of one."
+  (let [log (atom [])
+        persist {:append (fn [event] (swap! log conj event))
+                 :read (fn [_since] @log)}
+        conn (db/create-conn schema persist)
+        _ (db/transact! conn [{:person/id "alice" :person/age 30}])
+        r2 (db/transact! conn [{:person/id "alice" :person/age 31}])]
+    (testing "the retraction is in the transaction report"
+      (is (some #{[:db/retract (db/entid (db/db conn) [:person/id "alice"]) :person/age 30]}
+                (:tx-data r2))))
+    (testing "the live db holds exactly one age"
+      (is (= #{31} (ages (db/db conn)))))
+    (testing "a conn rebuilt from the persisted log agrees with it"
+      (is (= #{31} (ages (db/db (db/create-conn schema persist))))))
+    (testing "and so does as-of replayed THROUGH the replacement"
+      (is (= #{31} (ages (db/as-of conn (:tx r2))))))))
+
+;; ═════ 3. only a unique attribute may claim an existing entity ═════
+
+(deftest an-entity-with-no-unique-attribute-gets-a-fresh-identity
+  "A tempid is resolved onto an existing entity only when the attribute
+  binding it is declared `:db/unique`. Widen that to any attribute — an
+  inviting change, since `entid` will happily match any `[a v]` pair — and
+  every entity that has no unique attribute at all silently merges into the
+  first existing entity that shares its leading attribute value.
+
+  Chat memory is exactly that shape. `langchain.memory/append!` writes
+  `{:msg/thread <e> :msg/index n :msg/content .. :msg/data ..}`, which
+  declares no unique attribute, so every message in a thread leads with the
+  same `:msg/thread` value. Under the widened rule the second message
+  resolves onto the first, the third onto the first, and a conversation
+  collapses into a single entity that holds only its most recent turn. The
+  transaction succeeds and the history is simply shorter than it was.
+
+  This test uses the message shape rather than the store's own fixture
+  because that is where the invariant is load-bearing, and asserts on
+  entity identity rather than on a count of readable messages — a count
+  alone cannot say whether two rows are two entities or one entity read
+  twice.
+
+  Mutation: `:langchain/tempid-upserts-on-any-attribute`."
+  (let [conn (db/create-conn {:msg/thread {:db/valueType :db.type/ref}})]
+    (db/transact! conn [{:db/id -1 :thread/id "t-1"}])
+    (let [t (db/entid (db/db conn) [:thread/id "t-1"])]
+      (db/transact! conn [{:msg/thread t :msg/index 0 :msg/data "first"}])
+      (db/transact! conn [{:msg/thread t :msg/index 1 :msg/data "second"}])
+      (let [dbv (db/db conn)
+            eids (set (db/q '[:find [?m ...] :in $ ?t
+                              :where [?m :msg/thread ?t]] dbv t))]
+        (testing "two appends are two entities, not one written twice"
+          (is (= 2 (count eids))))
+        (testing "and both turns survive"
+          (is (= #{"first" "second"}
+                 (set (db/q '[:find [?d ...] :in $ ?t
+                              :where [?m :msg/thread ?t] [?m :msg/data ?d]]
+                            dbv t)))))))))

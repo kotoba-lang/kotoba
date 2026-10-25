@@ -1,0 +1,159 @@
+(ns kotoba-code.inference
+  "CLJC inference boundary for Kotoba/Murakumo.
+
+  This namespace does not implement GPU kernels itself. It selects the right
+  runtime family, loads weight bytes in CLJ/CLJS, and calls an injected backend
+  such as Kotoba WASM, ONNX Runtime Web, llama.cpp, Candle, or Murakumo."
+  #?(:clj
+     (:import [java.io ByteArrayOutputStream]
+              [java.net URI]))
+  (:require [kotoba.io :as kio]))
+
+(def target-profiles
+  {:web
+   {:target :web
+    :inference [:kotoba-wasm :onnxruntime-webgpu :onnxruntime-wasm]
+    :training [:onnxruntime-web-training :remote-murakumo]
+    :weight-formats [:kotoba-fp8 :onnx :safetensors]
+    :notes ["Prefer Kotoba WASM for compiled safe-clj components."
+            "Use WebGPU through the browser runtime when available; fall back to WASM CPU."]}
+
+   :mac
+   {:target :mac
+    :inference [:candle-metal :llama-cpp-metal :kotoba-wasm :murakumo-http]
+    :training [:mlx :pytorch-mps :remote-murakumo]
+    :weight-formats [:safetensors :gguf :kotoba-fp8]
+    :notes ["Metal is the native GPU path on Apple Silicon."
+            "Kotoba WASM remains useful for confined component execution."]}
+
+   :windows-intel-arc
+   {:target :windows-intel-arc
+    :inference [:onnxruntime-directml :openvino :llama-cpp-sycl :llama-cpp-vulkan :kotoba-wasm]
+    :training [:openvino-npu-gpu :pytorch-xpu :remote-murakumo]
+    :weight-formats [:onnx :openvino-ir :gguf :safetensors :kotoba-fp8]
+    :notes ["DirectML/OpenVINO/SYCL are the practical Intel Arc routes."
+            "WebGPU is viable in-browser, but native inference should prefer vendor stacks."]}
+
+   :linux-cuda
+   {:target :linux-cuda
+    :inference [:vllm-cuda :llama-cpp-cuda :candle-cuda :murakumo-http :kotoba-wasm]
+    :training [:pytorch-cuda :burn-cuda :remote-murakumo]
+    :weight-formats [:safetensors :gguf :onnx :kotoba-fp8]
+    :notes ["CUDA should use vLLM/llama.cpp/Candle for high-throughput native inference."
+            "Murakumo can expose this through an OpenAI-compatible gateway."]}})
+
+(def default-target-order [:web :mac :windows-intel-arc :linux-cuda])
+
+(defn target-profile
+  "Returns the static runtime profile for a target keyword."
+  [target]
+  (or (get target-profiles target)
+      (throw (ex-info "unknown inference target" {:target target
+                                                  :known (vec (keys target-profiles))}))))
+
+(defn select-plan
+  "Build a deterministic model execution plan.
+
+  opts:
+  - :target one of :web, :mac, :windows-intel-arc, :linux-cuda
+  - :mode   :inference or :training
+  - :prefer optional ordered backend keywords
+  - :model  logical model id or CID
+  - :format weight format keyword"
+  [{:keys [target mode prefer model format]
+    :or {target :web mode :inference}}]
+  (let [profile (target-profile target)
+        choices (vec (get profile mode))
+        preferred (seq (filter (set choices) prefer))
+        backend (first (or preferred choices))]
+    {:target target
+     :mode mode
+     :backend backend
+     :model model
+     :format (or format (first (:weight-formats profile)))
+     :candidates choices
+     :profile profile}))
+
+#?(:clj
+   (defn- read-all-bytes [in]
+     (with-open [input in
+                 out (ByteArrayOutputStream.)]
+       (let [buf (byte-array 16384)]
+         (loop []
+           (let [n (.read input buf)]
+             (when (pos? n)
+               (.write out buf 0 n)
+               (recur)))))
+       (.toByteArray out))))
+
+#?(:clj
+   (defn- url-like? [s]
+     (boolean (re-find #"^[a-zA-Z][a-zA-Z0-9+.-]*://" s))))
+
+(defn load-weights!
+  "Loads model weights from a URL/path into memory.
+
+  CLJ returns a map with a JVM byte-array under :bytes.
+  CLJS returns a Promise resolving to a map with an ArrayBuffer under :bytes."
+  [source]
+  #?(:cljs
+     (-> (js/fetch source)
+         (.then (fn [resp]
+                  (when-not (.-ok resp)
+                    (throw (js/Error. (str "weight fetch failed: " (.-status resp)))))
+                  (-> (.arrayBuffer resp)
+                      (.then (fn [buf]
+                               {:source source
+                                :bytes buf
+                                :byte-length (.-byteLength buf)
+                                :content-type (some-> (.-headers resp) (.get "content-type"))}))))))
+     :clj
+     (let [bytes (if (url-like? source)
+                   (read-all-bytes (.openStream (.toURL (URI/create source))))
+                   (kio/read-all-bytes source))]
+       {:source source
+        :bytes bytes
+        :byte-length (alength bytes)})))
+
+(defn kotoba-wasm-backend
+  "Creates a backend wrapper around an injected Kotoba WASM host.
+
+  The host may be:
+  - a Clojure map containing :infer
+  - a JS object containing .infer in CLJS
+
+  The infer function receives {:plan ... :weights ... :prompt ... :opts ...}."
+  [host]
+  {:kind :kotoba-wasm
+   :infer (fn [request]
+            (cond
+              (and (map? host) (:infer host))
+              ((:infer host) request)
+
+              #?(:cljs (and host (.-infer host))
+                 :clj false)
+              #?(:cljs (.infer host (clj->js request))
+                 :clj nil)
+
+              :else
+              (throw (ex-info "Kotoba WASM host must provide infer"
+                              {:host-type (type host)}))))})
+
+(defn infer!
+  "Runs inference through an injected backend.
+
+  This keeps kotoba-code model-neutral: the backend owns actual runtime details
+  such as WebGPU, WASM CPU, Metal, CUDA, DirectML, OpenVINO, or remote Murakumo."
+  [{:keys [backend plan weights prompt opts]}]
+  (when-not (and backend (:infer backend))
+    (throw (ex-info "backend with :infer is required" {:backend backend})))
+  ((:infer backend) {:plan plan
+                     :weights weights
+                     :prompt prompt
+                     :opts (or opts {})}))
+
+(defn aot-kotoba-wasm?
+  "Kotoba/CLJ programs are compiled ahead-of-time into WASM component bytes.
+  Model weights are still loaded at runtime."
+  []
+  true)

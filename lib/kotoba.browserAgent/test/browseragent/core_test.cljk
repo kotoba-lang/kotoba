@@ -1,0 +1,104 @@
+(ns browseragent.core-test
+  "End-to-end: a genspark-style run on mocks. A task is planned into
+  web → research → author steps; the MoA supervisor delegates each to a
+  sub-agent (the web step driving the agent's *owned* browser); and the
+  whole run — plan, delegations, the browser session, facts and the
+  generated artifact — is asserted straight out of the Datomic store."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [browseragent.run :as run]
+            [browseragent.memory :as mem]
+            [browseragent.browser.session :as session]
+            [browseragent.events :as events]
+            [langchain.db :as db]
+            [langchain.message :as msg]
+            [langchain.model :as model]))
+
+(def site
+  {"https://shop.example"
+   {:title "Example Shop"
+    :elements [{:tag "a" :text "Pricing" :nav "https://shop.example/pricing"}]}
+   "https://shop.example/pricing"
+   {:title "Pricing — $29/mo" :elements []}})
+
+;; Per-sub-agent scripted models (deterministic, offline).
+(defn web-model []
+  (model/mock-model
+   [(msg/ai "" {:tool-calls [{:id "1" :name "click_element" :input {:index 0}}]})
+    (msg/ai "" {:tool-calls [{:id "2" :name "done"
+                              :input {:text "The price is $29/mo" :success true}}]})]))
+
+(defn research-model []
+  (model/mock-model
+   [(msg/ai "" {:tool-calls [{:id "1" :name "web_search" :input {:query "Example Shop price"}}]})
+    (msg/ai "" {:tool-calls [{:id "2" :name "fetch_url"
+                              :input {:url "https://shop.example/pricing"}}]})
+    (msg/ai "Synthesis: Example Shop costs $29/mo (source: shop.example/pricing).")]))
+
+(defn author-model []
+  (model/mock-model
+   [(msg/ai "" {:tool-calls [{:id "1" :name "render_artifact"
+                              :input {:kind "doc" :title "Pricing Report"
+                                      :body "# Pricing\nExample Shop: $29/mo."}}]})
+    (msg/ai "Artifact done.")]))
+
+(def plan-fn
+  (constantly
+   [{:goal "Find the product price on the shop" :assignee :web}
+    {:goal "Synthesize a sourced summary of the price" :assignee :research}
+    {:goal "Write a short pricing report" :assignee :author}]))
+
+(defn run-task []
+  (run/run
+   {:task "Research the price of Example Shop and write a one-page report."
+    :task-id "t1"
+    :models {:web (web-model) :research (research-model) :author (author-model)}
+    :browser {:kind :mock :site site :start-url "https://shop.example"}
+    :plan-fn plan-fn
+    :search-fn (fn [_q] "Top result: Example Shop pricing page.")
+    :fetch-fn  (fn [url] (str "Fetched " url " — Pricing — $29/mo"))}))
+
+(deftest end-to-end-super-agent
+  (let [{:keys [result plan results delegations facts artifacts urls conn task-id]} (run-task)
+        db-api db/api]
+    (testing "planner produced the three-step plan"
+      (is (= 3 (count plan)))
+      (is (= [:web :research :author] (mapv :assignee plan))))
+
+    (testing "supervisor delegated every step (MoA datoms)"
+      (is (= 3 (count delegations)))
+      (is (= [:web :research :author] (mapv second delegations))))
+
+    (testing "results were aggregated into a final answer"
+      (is (= 3 (count results)))
+      (is (string? result))
+      (is (re-find #"\$29/mo" result)))
+
+    (testing "owned browser navigated and its session is persisted"
+      (is (some #{"https://shop.example/pricing"} urls))
+      (let [s (session/session conn db-api "browser/t1")]
+        (is (= "https://shop.example/pricing" (:browser/current s)))
+        (is (= :open (:browser/status s)))))
+
+    (testing "research recorded a source + a fact in semantic memory"
+      (let [keys (set (map first facts))]
+        (is (contains? keys "https://shop.example/pricing"))  ; :source
+        (is (contains? keys "research"))))                    ; :fact
+
+    (testing "author produced an artifact datom"
+      (is (= 1 (count artifacts)))
+      (is (= "Pricing Report" (-> artifacts first second))))
+
+    (testing "task marked done"
+      (is (= :done (:task/status
+                    ((:pull db-api) ((:db db-api) conn)
+                     [:task/status] [:task/id task-id])))))
+
+    (testing "time-travel: as-of the first tx (task created), no artifacts yet"
+      (let [early (db/as-of conn 1)]
+        (is (empty? (db/q '[:find ?a :where [?a :artifact/title _]] early)))
+        (is (seq (db/q '[:find ?t :where [?t :task/id _]] early)))))
+
+    (testing "events project for the UI"
+      (let [evs (events/run->events {:plan plan :results results :result result})]
+        (is (= 3 (count (filter #(= :plan (:channel %)) evs))))
+        (is (= :answer (-> evs last :kind)))))))

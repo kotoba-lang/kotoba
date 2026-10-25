@@ -1,0 +1,112 @@
+(ns browseruse.capsolver
+  "CapSolver adapter for browseruse.captcha/CaptchaProvider.
+
+  HTTP is injected to keep this namespace portable. The client key is closed
+  over by the provider and is never included in jobs, results or exceptions."
+  (:require [browseruse.captcha :as captcha]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.coll :as walk]))
+
+(def default-base-url "https://api.capsolver.com")
+
+(defn- redact [value secret]
+  (walk/postwalk (fn [x]
+                   (if (and (string? x) (seq secret))
+                     (str/replace x secret "[REDACTED]")
+                     x))
+                 value))
+
+(defn- required! [challenge key]
+  (or (get challenge key)
+      (throw (ex-info (str "CapSolver challenge requires " (name key))
+                      {:type :capsolver/invalid-challenge
+                       :challenge-type (:type challenge)
+                       :missing key}))))
+
+(defn task-for
+  "Map a public browser-use challenge to a CapSolver proxyless token task.
+
+  Required challenge keys are `:url` and `:site-key` (or `:website-key`).
+  reCAPTCHA supports optional `:version` (`:v2`/`:v3`), `:action`,
+  `:is-enterprise?`, `:api-domain`, and `:page-action`. Provider-specific
+  optional fields belong under `:task-options`."
+  [challenge]
+  (let [url (required! challenge :url)
+        site-key (or (:site-key challenge)
+                     (:website-key challenge)
+                     (required! challenge :site-key))
+        common {:websiteURL url :websiteKey site-key}
+        kind (:type challenge)
+        task-type (case kind
+                    :recaptcha (cond
+                                 (:is-enterprise? challenge) "ReCaptchaV2EnterpriseTaskProxyLess"
+                                 (= :v3 (:version challenge)) "ReCaptchaV3TaskProxyLess"
+                                 :else "ReCaptchaV2TaskProxyLess")
+                    :hcaptcha "HCaptchaTaskProxyLess"
+                    :turnstile "AntiTurnstileTaskProxyLess"
+                    (throw (ex-info "Unsupported CapSolver CAPTCHA type"
+                                    {:type :capsolver/unsupported-challenge
+                                     :challenge-type kind})))]
+    (merge {:type task-type}
+           common
+           (when-let [api-domain (:api-domain challenge)] {:apiDomain api-domain})
+           (when-let [action (:action challenge)] {:pageAction action})
+           (:task-options challenge))))
+
+(defn- request-ok! [request! base-url secret path body]
+  (let [response (request! {:method :post
+                            :url (str base-url path)
+                            :path path
+                            :headers {"Content-Type" "application/json"}
+                            :body (assoc body :clientKey secret)})
+        provider-body (:body response)]
+    (when-not (and (integer? (:status response))
+                   (<= 200 (:status response) 299))
+      (throw (ex-info "CapSolver HTTP request failed"
+                      {:type :capsolver/http-error :status (:status response)
+                       :path path :response (redact provider-body secret)})))
+    (when-not (zero? (or (:errorId provider-body) 0))
+      (throw (ex-info "CapSolver API request failed"
+                      {:type :capsolver/provider-error :path path
+                       :error-code (redact (:errorCode provider-body) secret)
+                       :error-description (redact (:errorDescription provider-body) secret)})))
+    provider-body))
+
+(defn provider
+  "Create a CapSolver CaptchaProvider.
+
+  `request!` consumes a portable request map and returns
+  `{:status integer :body map}`. Use `browseruse.capsolver-http/request!` on
+  the JVM. The returned provider deliberately does not expose its client key."
+  [{:keys [client-key request! base-url app-id]
+    :or {base-url default-base-url}}]
+  (when-not (and (string? client-key) (seq client-key))
+    (throw (ex-info "CapSolver client key is required"
+                    {:type :capsolver/invalid-config})))
+  (when-not (fn? request!)
+    (throw (ex-info "CapSolver request transport is required"
+                    {:type :capsolver/invalid-config})))
+  (reify
+    captcha/CaptchaProvider
+    (-submit! [_ challenge _]
+      (let [body (cond-> {:task (task-for challenge)} app-id (assoc :appId app-id))
+            response (request-ok! request! base-url client-key "/createTask" body)
+            task-id (:taskId response)]
+        (when-not (and (string? task-id) (seq task-id))
+          (throw (ex-info "CapSolver createTask returned no taskId"
+                          {:type :capsolver/invalid-response})))
+        {:job-id task-id :provider :capsolver}))
+    (-poll! [_ job _]
+      (let [response (request-ok! request! base-url client-key "/getTaskResult"
+                                  {:taskId (:job-id job)})]
+        (case (:status response)
+          "processing" {:status :pending}
+          "ready" {:status :solved :solution (:solution response)}
+          "failed" {:status :failed}
+          (throw (ex-info "Unknown CapSolver task status"
+                          {:type :capsolver/invalid-response
+                           :status (:status response)})))))
+    (-cancel! [_ job _]
+      ;; CapSolver does not publish a cancel-task endpoint. Core orchestration
+      ;; still invokes this hook so adapters can record local abandonment.
+      {:status :cancelled-locally :job-id (:job-id job)})))

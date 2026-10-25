@@ -1,0 +1,106 @@
+(ns stripe-ops.governor
+  "StripeOpsGovernor -- the independent censor that earns stripe-ops-LLM the
+  right to *propose* a Stripe read or a new Payment Link. The LLM has no
+  notion of which prices this actor is actually allowed to sell against, or
+  Stripe's own idempotency discipline, so this MUST be a separate system
+  (rules over the store's ground facts) able to *reject* a proposal and fall
+  back to HOLD -- the stripe-ops analog of koyomi.governor/tosmonitor.governor.
+
+  The actor's ONLY actuation is :stripe/payment-link-create, and it ALWAYS
+  routes to a human (mirrors koyomi's always-human :event/share /
+  tosmonitor's always-human :tos/change-proposal) -- it is never in any
+  phase's :auto set. :stripe/lookup has no external write effect at all, so
+  it may auto-commit at higher phases (see stripe-ops.phase).
+
+  HARD invariants:
+    :stripe/lookup
+      1. Unrecognized-kind -- :kind must be one of
+         stripe-ops.advisor/known-lookup-kinds. Fail-closed: a lookup kind
+         this actor doesn't recognize must never silently pass through to a
+         real (or even mock) StripePort call.
+    :stripe/payment-link-create
+      1. Missing-known-price -- :price-id must already be in the store's
+         known-prices whitelist (stripe-ops.store/known-price). This is the
+         actor's core boundary: it can create links ONLY for prices someone
+         already vetted and seeded into the catalog, never a price-id an
+         LLM (or an attacker prompting it) invents or copies from elsewhere.
+      2. Missing-idempotency-key -- every payment-link-create proposal must
+         carry a caller-supplied idempotency key. Without one, a retried
+         request (network blip, human re-approving twice) could create TWO
+         live Payment Links for the same intent (mirrors ADR-2607161745's own
+         idempotency discipline for the original 3 flagship Payment Links).
+      3. Custom-amount-attempted -- a proposal must not carry any
+         amount/unit-amount/price-data-style override key (:unit-amount
+         :amount :price-data :custom-amount) -- this actor only ever resells
+         an EXISTING price verbatim, never an inline custom price. Structural
+         defense-in-depth on top of stripeport's own fixed argument list
+         (create-payment-link! doesn't even accept an amount param).
+      4. Quantity-not-one -- if :quantity is present it must be exactly 1
+         (flat managed-hosting pricing, not per-seat -- ADR-2607161745).
+    (any other op) -- an unrecognized :op is itself a hard violation
+      (fail-closed, mirrors every other actor in this fleet).
+  SOFT:
+    Confidence floor -> escalate.
+    :stripe/payment-link-create is ALWAYS high-stakes -> human, at every
+      phase, regardless of cleanliness (this actor's only actuation)."
+  (:require [kotoba.lang.text :as str]
+            [stripe-ops.advisor :as advisor]
+            [stripe-ops.store :as store]))
+
+(def confidence-floor 0.6)
+
+(def ^:private custom-amount-keys #{:unit-amount :amount :price-data :custom-amount})
+
+;; ───────────────────────── invariant checks ─────────────────────────
+
+(defn- unrecognized-lookup-kind-violations [kind]
+  (when-not (contains? advisor/known-lookup-kinds kind)
+    [{:rule :unrecognized-lookup-kind :detail (str "未対応の lookup 種別: " kind)}]))
+
+(defn- missing-known-price-violations [st price-id]
+  (when (nil? (store/known-price st price-id))
+    [{:rule :missing-known-price :detail (str "既知カタログに存在しない price-id: " price-id)}]))
+
+(defn- missing-idempotency-key-violations [idempotency-key]
+  (when (str/blank? (str idempotency-key))
+    [{:rule :missing-idempotency-key :detail "idempotency-key が未指定"}]))
+
+(defn- custom-amount-violations [proposal]
+  (let [present (filterv #(contains? proposal %) custom-amount-keys)]
+    (when (seq present)
+      [{:rule :custom-amount-attempted
+        :detail (str "既存 price の金額を上書きする key を検出: " present)}])))
+
+(defn- quantity-not-one-violations [{:keys [quantity]}]
+  (when (and (some? quantity) (not= 1 quantity))
+    [{:rule :quantity-not-one :detail (str "quantity=" quantity " (must be 1 -- flat pricing)")}]))
+
+(defn check
+  "Censors a stripe-ops-LLM proposal. Returns
+   {:ok? :violations :confidence :hard? :escalate? :high-stakes?}."
+  [request proposal st]
+  (let [op   (:op request)
+        hard (vec (case op
+                    :stripe/lookup
+                    (unrecognized-lookup-kind-violations (:kind request))
+                    :stripe/payment-link-create
+                    (concat (missing-known-price-violations st (:price-id request))
+                            (missing-idempotency-key-violations (:idempotency-key request))
+                            (custom-amount-violations proposal)
+                            (quantity-not-one-violations proposal))
+                    [{:rule :unrecognized-op :detail (str "未対応 op: " op)}]))
+        conf    (:confidence proposal 0.0)
+        low?    (< conf confidence-floor)
+        stakes? (= :stripe/payment-link-create op)
+        hard?   (boolean (seq hard))]
+    {:ok?          (and (not hard?) (not low?) (not stakes?))
+     :violations   hard
+     :confidence   conf
+     :hard?        hard?
+     :escalate?    (and (not hard?) (or low? stakes?))
+     :high-stakes? stakes?}))
+
+(defn hold-fact [request verdict]
+  {:t :stripe-ops-hold :op (:op request) :subject (or (:price-id request) (:kind request))
+   :disposition :hold :basis (mapv :rule (:violations verdict))
+   :violations (:violations verdict) :confidence (:confidence verdict)})

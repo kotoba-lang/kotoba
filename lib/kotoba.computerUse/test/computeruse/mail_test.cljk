@@ -1,0 +1,110 @@
+(ns computeruse.mail-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [computeruse.mail :as mail]
+            [computeruse.vault :as vault]))
+
+(def sample-messages
+  [{:uid "10" :from "alice@example.com" :subject "Hello"
+    :date "Thu, 1 Jan 2026 00:00:00 +0000" :message-id "<a@x>"
+    :body "World"}
+   {:uid "11" :from "bob@example.com" :subject "Re: Hello"
+    :date "Fri, 2 Jan 2026 00:00:00 +0000" :message-id "<b@x>"
+    :body "Hi there"}])
+
+(deftest parse-message-extracts-headers-and-body
+  (let [blob (str "From: bob@example.com\r\n"
+                  "Subject: Ping\r\n"
+                  "Date: Fri, 2 Jan 2026 12:00:00 +0000\r\n"
+                  "Message-ID: <m@x>\r\n\r\n"
+                  "Body line 1\r\nBody line 2")
+        m (mail/parse-message blob "7")]
+    (is (= "7" (:uid m)))
+    (is (= "bob@example.com" (:from m)))
+    (is (= "Ping" (:subject m)))
+    (is (= "Fri, 2 Jan 2026 12:00:00 +0000" (:date m)))
+    (is (= "<m@x>" (:message-id m)))
+    (is (str/includes? (:body m) "Body line 1"))
+    (is (str/includes? (:body m) "Body line 2"))))
+
+(deftest parse-message-case-insensitive-headers
+  (let [m (mail/parse-message "from: a@b\nsubject: Lo\ndate: D\n\nB")]
+    (is (= "a@b" (:from m)))
+    (is (= "Lo" (:subject m)))
+    (is (= "D" (:date m)))
+    (is (= "B" (:body m)))))
+
+(deftest mock-mail-returns-scripted-and-honors-limit
+  (let [{:keys [mail state]} (mail/mock-mail sample-messages)]
+    (is (= sample-messages (mail/-fetch! mail {:password "x"})))
+    (is (= (take 1 sample-messages)
+           (mail/-fetch! mail {:password "x" :limit 1})))
+    (is (= 2 (count (:calls @state))))))
+
+(deftest fetch-mail-tool-returns-edn-and-drops-uid
+  (let [{:keys [mail]} (mail/mock-mail sample-messages)
+        v (vault/mock-vault {"gmail-app-password" "the-secret"})
+        tool (mail/fetch-mail-tool {:mail mail :vault v
+                                    :secret-ref "gmail-app-password"
+                                    :account "a@b" :limit 10})
+        result ((:fn tool) {})]
+    (testing "returns parsed mail as EDN"
+      (is (str/includes? result "Hello"))
+      (is (str/includes? result "alice@example.com")))
+    (testing ":uid / :message-id are dropped from the model's view"
+      (is (not (str/includes? result ":uid")))
+      (is (not (str/includes? result ":message-id"))))
+    (testing "the model's :limit input is honored"
+      (let [r ((:fn tool) {:limit 1})]
+        (is (str/includes? r "Hello"))
+        (is (not (str/includes? r "Re: Hello")))))))
+
+(deftest fetch-mail-tool-never-leaks-the-password
+  "Mirrors vault-test/type-secret-injects-without-leaking: the secret
+  reaches the IMail impl (as :password) but neither the tool result nor
+  the pr-str of the model's input contain it — so the Datomic action log
+  (which records pr-str input + str result) stays secret-free."
+  (let [{:keys [mail state]} (mail/mock-mail sample-messages)
+        v (vault/mock-vault {"gmail-app-password" "SUPER-SECRET-PW"})
+        tool (mail/fetch-mail-tool {:mail mail :vault v
+                                    :secret-ref "gmail-app-password"
+                                    :account "user@example.com" :limit 10})
+        model-input {}                          ; what the model passes
+        result ((:fn tool) model-input)]
+    (testing "the password reached -fetch! (it has to, for IMAP auth)"
+      (is (= "SUPER-SECRET-PW" (-> @state :calls first :password))))
+    (testing "the tool result never echoes the password"
+      (is (not (str/includes? result "SUPER-SECRET-PW"))))
+    (testing "the logged model input never contains the password"
+      (is (not (str/includes? (pr-str model-input) "SUPER-SECRET-PW"))))
+    (testing "the logged result (str of result) never contains the password"
+      (is (not (str/includes? (str result) "SUPER-SECRET-PW"))))))
+
+#?(:clj
+   (deftest curl-imap-mail-parses-and-hides-password
+     "Drives the JVM curl path with a fake :sh (no network). Asserts the
+     SEARCH→FETCH flow parses messages and the IMAP password never appears
+     in any returned field."
+     (let [blob10 (str "From: alice@example.com\r\nSubject: Hello\r\n"
+                       "Date: Thu, 1 Jan 2026 00:00:00 +0000\r\n\r\nWorld")
+           blob11 (str "From: bob@example.com\r\nSubject: Hi\r\n"
+                       "Date: Fri, 2 Jan 2026 00:00:00 +0000\r\n\r\nBody2")
+           fake (fn [& args]
+                  (let [url (some #(when (str/starts-with? % "imaps://") %) args)]
+                    (cond
+                      (str/includes? url "?UNSEEN")  {:exit 0 :out "* SEARCH 10 11"}
+                      (str/includes? url ";UID=10")  {:exit 0 :out blob10}
+                      (str/includes? url ";UID=11")  {:exit 0 :out blob11}
+                      :else                          {:exit 0 :out ""})))
+           m (mail/curl-imap-mail {:sh fake})
+           msgs (mail/-fetch! m {:account "user@example.com"
+                                 :password "SUPER-SECRET-PW"
+                                 :limit 5})]
+       (testing "SEARCH → per-UID FETCH → parsed messages"
+         (is (= 2 (count msgs)))
+         (is (= "10" (:uid (first msgs))))
+         (is (= "alice@example.com" (:from (first msgs))))
+         (is (= "Hello" (:subject (first msgs))))
+         (is (= "World" (:body (first msgs)))))
+       (testing "the IMAP password appears in no returned field"
+         (is (not (some #(str/includes? (str (vals %)) "SUPER-SECRET-PW") msgs)))))))

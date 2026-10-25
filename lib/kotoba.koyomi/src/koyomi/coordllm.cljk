@@ -1,0 +1,126 @@
+(ns koyomi.coordllm
+  "schedule-LLM — the contained intelligence node. It reads an activity's and
+  event's ground facts (the itonami activity driving the request, the
+  already-registered `calendar.model` event) and returns a PROPOSAL: a
+  drafted/decorated event (title/agenda over the mechanically-registered
+  start/end/attendees), or (for :event/share) a pass-through recommendation
+  over the already-committed draft. It NEVER shares/invites anyone — every
+  output is censored by `koyomi.governor` before anything is recorded, and
+  sharing always routes to a human (charter: propose→draft only, no
+  actuation).
+
+  Advisor is injected (mock | real LLM via langchain.model), same as
+  kekkai.coordllm/tayori.replyllm.
+
+  Proposal shape:
+    {:recommendation kw   ; :draft | :share
+     :content {...}       ; a calendar.model event EDN (:tenant-tagged)
+     :summary str :rationale str :cites [kw ..] :redactions [kw ..]
+     :effect kw           ; :draft | :share
+     :confidence 0..1}"
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.model :as model]
+            [koyomi.store :as store]))
+
+;; ───────────────────────── deterministic mock ─────────────────────────
+
+(defn- assess-draft
+  "Decorate the already-registered event (ingest: :event/register mechanically
+  recorded it from the activity's due-at) with a title/agenda derived from the
+  activity's own facts — the mock never invents start/end/attendees, so a
+  clean activity+event yields a confident draft and a missing one yields a
+  low-confidence noop."
+  [st {:keys [event activity]}]
+  (let [ev  (store/event st event)
+        act (store/activity st activity)]
+    (if (and ev act)
+      {:recommendation :draft
+       :content    (assoc ev
+                          :tenant (:repo act)
+                          :calendar/title (str (:calendar/title ev) " — " (name (:kind act))))
+       :summary    (str event " 予定下書き: " (:calendar/title ev))
+       :rationale  (str activity " (" (name (:kind act)) ") の事実に基づく提案。due-at=" (:due-at act))
+       :cites      [:activity :event]
+       :redactions []
+       :effect     :draft
+       :confidence 0.9}
+      {:recommendation :draft :content nil
+       :summary    "未登録の活動/イベント"
+       :rationale  (str "activity=" activity " event=" event)
+       :cites [] :redactions [] :effect :draft :confidence 0.2})))
+
+(defn- assess-share
+  "For :event/share there is nothing new to generate — the recommendation is
+  simply 'share the already-committed draft', carrying its content/
+  confidence/cites/redactions forward so the governor evaluates the SAME
+  facts twice (draft-time and share-time)."
+  [st {:keys [event]}]
+  (let [d (store/draft-of st event)]
+    (if d
+      {:recommendation :share :content (:content d)
+       :summary (str event " のドラフトを共有") :rationale "承認済みドラフトの共有"
+       :cites (:cites d []) :redactions (:redactions d []) :effect :share
+       :confidence (:confidence d 0.0)}
+      {:recommendation :share :content nil :summary "ドラフト未作成" :rationale (str event)
+       :cites [] :redactions [] :effect :share :confidence 0.0})))
+
+(defn infer [st {:keys [op] :as req}]
+  (case op
+    :event/draft (assess-draft st req)
+    :event/share (assess-share st req)
+    {:recommendation :unknown :content nil :summary "未対応" :rationale (str op)
+     :cites [] :redactions [] :effect :noop :confidence 0.0}))
+
+;; ───────────────────────── Advisor protocol ─────────────────────────
+
+(defprotocol Advisor
+  (-advise [advisor store request]))
+
+(defn mock-advisor [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+(def ^:private system-prompt
+  (str "あなたは予定共有(カレンダーイベント)の下書き助言者です。"
+       "与えられた事実(活動/イベント)のみに基づき、提案を1つ EDN マップで返します。"
+       "EDN だけを出力。\n"
+       "キー: :recommendation(:draft|:share) :content(calendar.model event EDN、"
+       ":tenant含む) :summary :rationale :cites :redactions "
+       ":effect(:draft 固定 — :share は自称しない) :confidence(0..1)。\n"
+       "重要: あなたは招待を送信しない(propose→draft のみ)。start/end/attendees は"
+       "既に記録済みのイベント事実から離れて捏造しない。"))
+
+(defn- facts-for [st {:keys [event activity]}]
+  {:activity (store/activity st activity) :event (store/event st event)
+   :draft (store/draft-of st event)})
+
+(defn- parse-proposal [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p (update :cites #(vec (or % [])))
+            (update :redactions #(vec (or % [])))
+            (update :confidence #(if (number? %) (double %) 0.0))
+            (update :effect #(or % :noop)))
+      {:recommendation :unknown :content nil :summary "LLM応答を解釈できません" :rationale (str content)
+       :cites [] :redactions [] :effect :noop :confidence 0.0})))
+
+(defn llm-advisor
+  "Advisor backed by a langchain.model/ChatModel (Anthropic / OpenAI-compatible
+  / mock-model). Output is parsed defensively → an unparseable response is a
+  confidence-0 noop the governor will hold/escalate."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ st req]
+       (let [resp (model/-generate chat-model
+                    [{:role :system :content system-prompt}
+                     {:role :user :content (str "操作:" (:op req)
+                                                "\n事実:" (pr-str (facts-for st req)))}]
+                    gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace [request proposal]
+  {:t :coordllm-proposal :op (:op request) :subject (:event request)
+   :recommendation (:recommendation proposal) :summary (:summary proposal)
+   :rationale (:rationale proposal) :cites (:cites proposal) :confidence (:confidence proposal)})

@@ -1,0 +1,90 @@
+(ns kekkai.treasury-contract-test
+  "End-to-end :treasury/release through the full CoordinationActor
+  StateGraph (ADR-2607110300 Phase 3, completing the 'further integration
+  step' both kekkai#2 and kekkai#3 left as a scope note) -- parity with
+  governor_contract_test.clj's :node/admit-style contract tests, not just
+  the governor.cljc-level unit tests in governor_treasury_test.clj. Proves
+  three things unit tests on governor/check alone cannot: (1) the
+  StateGraph actually reaches :interrupted for a clean proposal (2) the
+  hold-fact for a rejected verdict actually lands in the ledger through
+  the :hold node's :t filter (3) :treasury/release is NOT gated by the
+  tailnet rollout phase, unlike :node/admit."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [kekkai.store :as store]
+            [kekkai.operation :as op]))
+
+(defn- fresh [] (let [s (store/seed-db)] [s (op/build s)]))
+(defn- ctx [phase] {:phase phase})
+
+(defn- run [actor tid req proposal phase]
+  (g/run* actor {:request req :proposal proposal :context (ctx phase)} {:thread-id tid}))
+
+(defn- witnessed [] {:kind :witnessed :verdict :accept})
+(defn- rejected [] {:kind :rejected :verdict :reject})
+
+(deftest clean-release-requires-human-signoff-then-commits
+  (testing "even a maximally-clean release never auto-commits (real money, always human)"
+    (let [[s actor] (fresh)
+          proposal {:effect :treasury-release :witness-verdict (witnessed)
+                    :amount 100 :recipient "acct:vendor" :confidence 1.0}
+          r1 (run actor "t1" {:op :treasury/release :node "n-server"} proposal 3)]
+      (is (= :interrupted (:status r1)))
+      (is (nil? (store/assessment-of s "n-server")) "nothing committed before sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "admin-alice"}}
+                       {:thread-id "t1" :resume? true})
+            committed (store/assessment-of s "n-server")]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :treasury-release (:type committed)))
+        (is (= "released" (:status committed)))
+        (is (= "admin-alice" (:approved-by committed)))
+        (is (= 100 (:amount committed)))
+        (is (= "acct:vendor" (:recipient committed)))))))
+
+(deftest missing-witness-verdict-holds-and-the-hold-fact-reaches-the-ledger
+  (testing "regression guard for the :hold node's :t filter -- before this
+            session's fix, a :treasury-hold fact was silently dropped
+            (the filter only matched :tailnet-hold/:signoff-rejected)"
+    (let [[s actor] (fresh)
+          proposal {:effect :treasury-release :confidence 1.0} ;; no :witness-verdict
+          r (run actor "t2" {:op :treasury/release :node "n-server"} proposal 3)
+          last-fact (last (store/ledger s))]
+      (is (= :hold (get-in r [:state :disposition])))
+      (is (nil? (store/assessment-of s "n-server")))
+      (is (= :hold (:disposition last-fact)) "the hold fact actually landed in the ledger")
+      (is (some #{:no-witness-verdict} (:basis last-fact))))))
+
+(deftest rejected-witness-verdict-holds
+  (let [[s actor] (fresh)
+        proposal {:effect :treasury-release :witness-verdict (rejected) :confidence 1.0}
+        r (run actor "t3" {:op :treasury/release :node "n-server"} proposal 3)]
+    (is (= :hold (get-in r [:state :disposition])))
+    (is (some #{:witness-quorum-not-reached} (:basis (last (store/ledger s)))))))
+
+(deftest invalid-actor-holds-regardless-of-witness-verdict
+  (let [[s actor] (fresh)
+        proposal {:effect :treasury-release :witness-verdict (witnessed) :confidence 1.0}
+        r (run actor "t4" {:op :treasury/release :node "n-rogue"} proposal 3)]
+    (is (= :hold (get-in r [:state :disposition])))
+    (is (some #{:expired-key} (:basis (last (store/ledger s)))))))
+
+(deftest reject-signoff-holds-without-committing
+  (let [[s actor] (fresh)
+        proposal {:effect :treasury-release :witness-verdict (witnessed)
+                  :amount 50 :recipient "acct:x" :confidence 1.0}
+        _ (run actor "t5" {:op :treasury/release :node "n-server"} proposal 3)
+        r2 (g/run* actor {:approval {:status :rejected :by "admin-alice"}}
+                   {:thread-id "t5" :resume? true})]
+    (is (= :hold (get-in r2 [:state :disposition])))
+    (is (nil? (store/assessment-of s "n-server")))))
+
+(deftest treasury-release-is-not-gated-by-the-tailnet-rollout-phase
+  (testing "unlike :node/admit/:access/assess/:route/approve, value governance
+            is active even at phase 0 (observe-only) -- fund release has
+            nothing to do with network rollout maturity"
+    (let [[_ actor] (fresh)
+          proposal {:effect :treasury-release :witness-verdict (witnessed)
+                    :amount 10 :recipient "acct:x" :confidence 1.0}
+          r (run actor "t6" {:op :treasury/release :node "n-server"} proposal 0)]
+      (is (= :interrupted (:status r))
+          "still reaches human sign-off at phase 0, not silently held as :phase-disabled"))))

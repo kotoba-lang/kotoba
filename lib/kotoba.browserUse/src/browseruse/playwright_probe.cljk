@@ -1,0 +1,125 @@
+(ns browseruse.playwright-probe
+  "Live proxy/fingerprint and persistent-profile verification.
+
+  The probe deliberately reports only credential-redacted configuration.  A
+  caller may use an external IP echo page, or the deterministic local server
+  provided here for CI and pre-flight verification."
+  (:require [kotoba.bytes :as kbytes] [browseruse.browser-profile :as profile]
+            [browseruse.playwright-browser :as playwright]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str])
+  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+           [java.net InetSocketAddress]
+           [java.util UUID]))
+
+(def ^:private probe-script
+  "() => { const raw = document.body.innerText.trim(); let payload = {}; try { payload = JSON.parse(raw); } catch (_) {} return {ip: payload.ip || payload.query || payload.address || null, locale: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, cookie: document.cookie, localStorage: localStorage.getItem('browseruse-probe')}; }")
+
+(defn- embedded-userinfo? [url]
+  (boolean (and (string? url) (re-find #"^[A-Za-z][A-Za-z0-9+.-]*://[^/@]+@" url))))
+
+(defn validate-probe-config
+  "Validate without launching a browser. Returns a credential-free plan."
+  [{:keys [probe-url user-data-dir expected] :as opts}]
+  (when (str/blank? probe-url)
+    (throw (ex-info ":probe-url must be non-blank" {:type :invalid-probe-config
+                                                     :field :probe-url})))
+  (when (embedded-userinfo? probe-url)
+    (throw (ex-info "Credentials in :probe-url are forbidden"
+                    {:type :invalid-probe-config :field :probe-url})))
+  (when (embedded-userinfo? (get-in opts [:proxy :server]))
+    (throw (ex-info "Put proxy credentials in :username/:password, not :server"
+                    {:type :invalid-probe-config :field [:proxy :server]})))
+  (when (str/blank? user-data-dir)
+    (throw (ex-info ":user-data-dir must be non-blank for reopen verification"
+                    {:type :invalid-probe-config :field :user-data-dir})))
+  (when-not (or (nil? expected) (map? expected))
+    (throw (ex-info ":expected must be a map" {:type :invalid-probe-config
+                                                :field :expected})))
+  (profile/validate-profile opts)
+  {:valid? true
+   :probe-url probe-url
+   :profile-mode :persistent-profile
+   :expected (select-keys expected [:ip :locale :timezone])
+   :capabilities (profile/capability-report opts)})
+
+(defn- observe [session]
+  ((:evaluate session) probe-script))
+
+(defn- expected-checks [expected observed]
+  (into {}
+        (map (fn [[k wanted]]
+               [k {:expected wanted :observed (get observed k)
+                   :pass? (= wanted (get observed k))}]))
+        (select-keys expected [:ip :locale :timezone])))
+
+(defn run-probe!
+  "Run proxy/geo observation and verify a cookie plus localStorage survive a
+  persistent-profile reopen. `:dry-run?` performs validation only.
+
+  Relevant options are the normal `playwright-session` options plus
+  `:probe-url`, `:user-data-dir`, `:expected`, and `:dry-run?`. Every opened
+  browser is closed in `finally`."
+  [{:keys [probe-url expected dry-run?] :as opts}]
+  (let [plan (validate-probe-config opts)]
+    (if dry-run?
+      {:status :dry-run :plan plan}
+      (let [token (str (UUID/randomUUID))
+            browser-opts (dissoc opts :probe-url :expected :dry-run?)
+            first-session* (atom nil)
+            second-session* (atom nil)]
+        (try
+          (reset! first-session* (playwright/playwright-session probe-url browser-opts))
+          (let [initial (observe @first-session*)]
+            ((:set-cookies @first-session*)
+             [{:name "browseruse-probe" :value token :url probe-url
+               :expires (+ (quot (System/currentTimeMillis) 1000) 3600)}])
+            ((:evaluate @first-session*)
+             "token => localStorage.setItem('browseruse-probe', token)"
+             token)
+            ((:close @first-session*))
+            (reset! first-session* nil)
+            (reset! second-session* (playwright/playwright-session probe-url browser-opts))
+            (let [reopened (observe @second-session*)
+                  persistence {:cookie? (str/includes? (or (:cookie reopened) "")
+                                                      (str "browseruse-probe=" token))
+                               :local-storage? (= token (:localStorage reopened))}
+                  checks (expected-checks expected initial)]
+              {:status (if (and (every? :pass? (vals checks))
+                                (every? true? (vals persistence)))
+                         :passed :failed)
+               :observed (select-keys initial [:ip :locale :timezone])
+               :checks checks
+               :persistence persistence
+               :capabilities (:capabilities @second-session*)}))
+          (finally
+            (when-let [session @second-session*] ((:close session)))
+            (when-let [session @first-session*] ((:close session)))))))))
+
+(defn start-deterministic-server!
+  "Start a loopback-only JSON endpoint. Returns `:url` and idempotent `:close`."
+  ([] (start-deterministic-server! {:ip "127.0.0.1"}))
+  ([payload]
+   (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+         body (kbytes/utf8-bytes (str "{\"ip\":\"" (:ip payload) "\"}"))
+         handler (reify HttpHandler
+                   (^void handle [_ ^HttpExchange exchange]
+                     (try
+                       (.add (.getResponseHeaders exchange) "Content-Type" "application/json; charset=utf-8")
+                       (.sendResponseHeaders exchange 200 (long (alength body)))
+                       (with-open [out (.getResponseBody exchange)] (.write out body))
+                       (finally (.close exchange)))))
+         closed? (atom false)]
+     (.createContext server "/probe" handler)
+     (.start server)
+     {:url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/probe")
+      :close (fn [] (when (compare-and-set! closed? false true) (.stop server 0)))})))
+
+(defn -main [& args]
+  (let [config-path (first args)]
+    (when-not config-path
+      (throw (ex-info "Usage: kbb -M:playwright-probe CONFIG.edn" {:type :usage})))
+    (let [opts (edn/read-string (slurp config-path))
+          result (run-probe! opts)]
+      (prn result)
+      (when (= :failed (:status result)) (System/exit 2)))))

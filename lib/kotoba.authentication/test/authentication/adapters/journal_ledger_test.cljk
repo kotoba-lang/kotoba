@@ -1,0 +1,126 @@
+(ns authentication.adapters.journal-ledger-test
+  (:require [authentication.adapters.decision-ledger :as ledger]
+            [authentication.adapters.journal-ledger :as jl]
+            [authentication.model :as m]
+            [kotoba.test :refer [deftest is testing]]
+            [journal.fs :as journal.fs]
+            [langchain.db :as db]))
+
+(defn- without-eids
+  "Pull results carry `:db/id`; the ledger's contract is about attributes,
+  not about which integers the store happened to allocate."
+  [m]
+  (cond-> (dissoc m :db/id)
+    (:authn.decision/factors m)
+    (update :authn.decision/factors #(mapv (fn [f] (dissoc f :db/id)) %))))
+
+(defn- alice-decision
+  ([request-id] (alice-decision request-id :authenticated))
+  ([request-id verdict]
+   (let [req (m/request request-id "did:web:example.com:alice" {:required-level :multi-factor})
+         factors [(m/factor (str request-id "-f1") :totp true
+                            {:subject "did:web:example.com:alice" :assurance :single-factor})
+                  (m/factor (str request-id "-f2") :webauthn true
+                            {:subject "did:web:example.com:alice" :assurance :phishing-resistant})]]
+     (m/decision req verdict factors {:level :phishing-resistant
+                                      :issued-at "2026-07-01T00:00:00Z"}))))
+
+(deftest persists-a-decision-with-its-factors
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})]
+    (is (= {:tx/id "tx-1" :tx/datoms 3 :tx/request-id "authn-r1" :tx/at nil}
+           (ledger/persist-decision! l (alice-decision "authn-r1") {:request-id "authn-r1"})))
+    (testing "the decision reads back with its factors nested, not as bare ids"
+      (is (= {:authn.decision/request-id "authn-r1"
+              :authn.decision/subject "did:web:example.com:alice"
+              :authn.decision/decision :authenticated
+              :authn.decision/level :phishing-resistant
+              :authn.decision/issued-at "2026-07-01T00:00:00Z"
+              :authn.decision/factors
+              [{:authn.factor/id "authn-r1-f1" :authn.factor/type :totp
+                :authn.factor/ok? true :authn.factor/subject "did:web:example.com:alice"
+                :authn.factor/assurance :single-factor}
+               {:authn.factor/id "authn-r1-f2" :authn.factor/type :webauthn
+                :authn.factor/ok? true :authn.factor/subject "did:web:example.com:alice"
+                :authn.factor/assurance :phishing-resistant}]}
+             (without-eids (jl/decision l "authn-r1")))))))
+
+(deftest rejects-a-replayed-request-id
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+        decision (alice-decision "authn-r2")]
+    (ledger/persist-decision! l decision {:request-id "authn-r2"})
+    (is (= :authn.decision/replay
+           (:error (ex-data (try (ledger/persist-decision! l decision {:request-id "authn-r2"})
+                                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e
+                                   e))))))
+    (testing "and the rejection did not write anything"
+      (is (= 1 (count (jl/decisions l)))))))
+
+(deftest allow-replay-lets-a-decision-through-without-duplicating-it
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+        decision (alice-decision "authn-r3")]
+    (ledger/persist-decision! l decision {:request-id "authn-r3"})
+    (ledger/persist-decision! l decision {:request-id "authn-r3" :allow-replay? true})
+    (is (= 1 (count (jl/decisions l)))
+        ":authn.decision/request-id is :db.unique/identity, so the second write upserts")))
+
+(deftest a-request-id-identifies-one-entity-across-transactions
+  (testing "a string :db/id is a tempid scoped to one transaction; the unique
+            attribute is what makes the second write about the same decision"
+    (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})]
+      (ledger/persist-decision! l (alice-decision "authn-r4" :challenge) {})
+      (ledger/persist-decision! l (alice-decision "authn-r4" :authenticated) {:allow-replay? true})
+      (is (= 1 (count (jl/decisions l))))
+      (is (= :authenticated (:authn.decision/decision (jl/decision l "authn-r4")))))))
+
+(deftest a-new-ledger-over-the-same-journal-answers-the-same-queries
+  (let [io (journal.fs/memory-io)]
+    (ledger/persist-decision! (jl/journal-decision-ledger {:io io})
+                              (alice-decision "authn-r5") {:request-id "authn-r5"})
+    (testing "a restarted process replays the journal rather than starting empty"
+      (let [l (jl/journal-decision-ledger {:io io})]
+        (is (= :authenticated (:authn.decision/decision (jl/decision l "authn-r5"))))
+        (is (= 2 (count (:authn.decision/factors (jl/decision l "authn-r5")))))))
+    (testing "including the replay invariant, which is a query and not in-memory bookkeeping"
+      (let [l (jl/journal-decision-ledger {:io io})]
+        (is (= :authn.decision/replay
+               (:error (ex-data (try (ledger/persist-decision! l (alice-decision "authn-r5")
+                                                               {:request-id "authn-r5"})
+                                     (catch #?(:clj clojure.lang.ExceptionInfo
+                                               :cljs cljs.core/ExceptionInfo) e
+                                       e))))))))))
+
+(deftest the-history-is-readable-as-what-happened
+  (let [io (journal.fs/memory-io)
+        l (jl/journal-decision-ledger {:io io})]
+    (ledger/persist-decision! l (alice-decision "authn-r6") {:request-id "authn-r6"})
+    (ledger/persist-decision! l (alice-decision "authn-r7") {:request-id "authn-r7"})
+    (let [events (jl/history io)]
+      (is (= [1 2] (mapv :tx events)))
+      (is (every? #(seq (:tx-data %)) events)))))
+
+(deftest a-decisions-factors-resolve-to-the-factor-entities-themselves
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})]
+    (ledger/persist-decision! l (alice-decision "authn-r8") {:request-id "authn-r8"})
+    (let [d (db/db (:conn l))
+          decision-eid (db/q '[:find ?e . :where [?e :authn.decision/request-id "authn-r8"]] d)
+          via-ref (set (db/q '[:find [?fid ...] :in $ ?d
+                               :where [?d :authn.decision/factors ?f] [?f :authn.factor/id ?fid]]
+                             d decision-eid))]
+      (is (= #{"authn-r8-f1" "authn-r8-f2"} via-ref)
+          "the join is a real reference, so the factors are reachable from the decision"))))
+
+(deftest persist-factor-alone-still-works
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})]
+    (ledger/persist-factor! l (m/factor "lone-factor" :touchid true {:subject "did:web:example.com:bob"}))
+    (is (= ["lone-factor"] (mapv :authn.factor/id (jl/factors l))))))
+
+(deftest needs-a-sink
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+               (jl/journal-decision-ledger {}))))
+
+(deftest absent-attributes-are-not-asserted-as-nil
+  (testing "a real transactor rejects nil; the pull should not show it either"
+    (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})]
+      (ledger/persist-factor! l (m/factor "bare" :touchid true {}))
+      (is (= {:authn.factor/id "bare" :authn.factor/type :touchid :authn.factor/ok? true}
+             (dissoc (first (jl/factors l)) :db/id))))))

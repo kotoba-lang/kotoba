@@ -1,0 +1,354 @@
+(ns langchain.kotoba-db-async-test
+  "Mirrors `langchain.kotoba-db-test`'s coverage of `kotoba-api`, but for
+  `kotoba-api-async` -- proves the async variant has the SAME wire
+  semantics/gotchas (map-shaped query_edn, always-wildcard pattern_edn,
+  :result_edn/:entity_id field names, write-scope/read-scope split,
+  double-EDN-encoded cells) while threading every op through a
+  promise-like `:http-fn`/return value instead of a plain one.
+
+  JVM-only. It asserts on `:clj`, where `kotoba-db.cljc`'s private
+  `p-then` is `(f p)` -- synchronous -- so `mock-async-caps`'s `:http-fn`
+  (itself wrapped in `p-resolved`, i.e. identity on `:clj`) makes every
+  `(:q api)`/`(:pull api)`/etc. call below return its final projected
+  value directly, no promise/then machinery needed in the assertions
+  themselves; only the reader-conditional `:cljs` branches document what
+  a real `js/Promise`-based host would see."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.kotoba-db :as kdb]))
+
+;; Not on the kbb engine: `kbb -M:test` runs this suite as `:cljs` (SCI on
+;; Node), where every `(:q api)` below returns a `js/Promise` and each `is`
+;; would compare against the promise, not its value (13 of 18 failed so,
+;; 2026-09-24). Covering the `:cljs` branch needs `cljs.test/async` tests,
+;; which this file does not have yet.
+#?(:clj (do
+
+;; ─── mock ASYNC host-caps ─────────────────────────────────────────────────────
+
+(defn- nsid-from-url [url]
+  (last (str/split url #"/xrpc/")))
+
+(defn- p-resolved
+  "Local, test-only mirror of `kotoba-db.cljc`'s own private `p-resolved`
+  duality (real `js/Promise` under `:cljs`, plain value under `:clj`) --
+  used here only to make `mock-async-caps`'s `:http-fn` genuinely
+  ASYNC-shaped (returns a promise-like, never a bare map), exactly the
+  contract `kotoba-api-async` requires and `kotoba-api`'s mock (`kotoba-
+  db-test`'s `mock-caps`) deliberately does NOT satisfy."
+  [v]
+  #?(:cljs (js/Promise.resolve v)
+     :clj  v))
+
+(defn- mock-async-caps
+  "Like `kotoba-db-test`'s `mock-caps`, but `:http-fn` returns a
+  promise-like of the response instead of the response map directly --
+  the one contract difference `kotoba-api-async` requires over
+  `kotoba-api`.
+
+  respond-fn: (fn [nsid parsed-body] => response-clj-map-with-keyword-keys)
+  captured:   atom that collects {:nsid :body} per call."
+  [captured respond-fn]
+  {:http-fn
+   (fn [{:keys [url body]}]
+     (let [nsid   (nsid-from-url url)
+           parsed (edn/read-string body)
+           resp   (respond-fn nsid parsed)]
+       (swap! captured conj {:nsid nsid :body parsed})
+       (p-resolved {:status 200 :body (pr-str resp)})))
+   :json-write pr-str
+   :json-read  edn/read-string})
+
+(def ^:private test-conn
+  (kdb/kotoba-conn "http://kotoba.test:8080" "k51testgraph" {:token "test-token"}))
+
+;; ─── transact! ───────────────────────────────────────────────────────────────
+
+(deftest async-transact!-sends-correct-xrpc
+  (let [captured (atom [])
+        caps     (mock-async-caps captured
+                                  (fn [_nsid _body]
+                                    {:status "ok" :graph "k51testgraph"
+                                     :tx_cid "cid1" :commit_cid "cid2"
+                                     :ipns_name "k51testgraph" :ipns_sequence 1
+                                     :ipns_valid_until "2099-01-01"
+                                     :index_roots {} :datom_count 2
+                                     :journal_cids [] :tempids {} :datoms []}))
+        api      (kdb/kotoba-api-async caps)
+        tx-data  [{:db/id "-1" :checkpoint/key "t1/0"
+                   :checkpoint/step 0 :checkpoint/thread "t1"
+                   :checkpoint/state "{}" :checkpoint/frontier "[]"
+                   :checkpoint/status :running}]
+        result   ((:transact! api) test-conn tx-data)]
+    (testing "posts to correct NSID"
+      (is (= "ai.gftd.apps.kotobase.datomic.transact" (:nsid (first @captured)))))
+    (testing "sends graph and tx_edn"
+      (let [body (:body (first @captured))]
+        (is (= "k51testgraph" (:graph body)))
+        (is (string? (:tx_edn body)))))
+    (testing "returns (a promise-like of) the tx-report stub -- on :clj this
+             IS the plain value already, no unwrapping needed"
+      (is (= tx-data (:tx-data result))))))
+
+;; ─── :db is a promise-like of conn ────────────────────────────────────────────
+
+(deftest async-db-returns-a-promise-like-of-conn
+  (let [api (kdb/kotoba-api-async (mock-async-caps (atom []) (fn [_ _] {})))]
+    (is (= test-conn ((:db api) test-conn))
+        "on :clj, p-resolved is identity, so this is the plain conn directly")))
+
+;; ─── q scalar/collection/relation find ────────────────────────────────────────
+
+(deftest async-q-scalar-find
+  (let [captured (atom [])
+        caps     (mock-async-caps captured
+                                  (fn [_nsid _body]
+                                    {:graph "k51testgraph" :basis_t nil
+                                     :rows_edn [["5"]]}))
+        api  (kdb/kotoba-api-async caps)
+        step ((:q api) '[:find (max ?step) .
+                         :in $ ?tid
+                         :where [?e :checkpoint/thread ?tid]
+                                [?e :checkpoint/step ?step]]
+                       test-conn "thread-1")]
+    (testing "posts to datomic.q"
+      (is (= "ai.gftd.apps.kotobase.datomic.q" (:nsid (first @captured)))))
+    (testing "sends graph, query_edn, inputs_edn"
+      (let [body (:body (first @captured))]
+        (is (= "k51testgraph" (:graph body)))
+        (is (string? (:query_edn body)))
+        (is (= ["\"thread-1\""] (:inputs_edn body)))))
+    (testing "projects scalar result"
+      (is (= 5 step)))))
+
+(deftest async-q-collection-find
+  (let [caps (mock-async-caps (atom [])
+                              (fn [_nsid _body]
+                                {:graph "k51testgraph" :basis_t nil
+                                 :rows_edn [["\"eid-1\""] ["\"eid-2\""]]}))
+        api  (kdb/kotoba-api-async caps)
+        eids ((:q api) '[:find [?e ...]
+                         :in $ ?tid
+                         :where [?e :checkpoint/thread ?tid]]
+                       test-conn "thread-1")]
+    (testing "projects collection result"
+      (is (= ["eid-1" "eid-2"] eids)))))
+
+(deftest async-q-relation-find
+  (let [caps (mock-async-caps (atom [])
+                              (fn [_nsid _body]
+                                {:graph "k51testgraph" :basis_t nil
+                                 :rows_edn [["1" ":a"] ["2" ":b"]]}))
+        api  (kdb/kotoba-api-async caps)
+        res  ((:q api) '[:find ?e ?a :where [?e ?a _]] test-conn)]
+    (testing "projects relation as set of tuples"
+      (is (= #{[1 :a] [2 :b]} res)))))
+
+(deftest async-q-sends-a-map-shaped-query-edn-even-when-called-with-a-vector-query
+  (let [captured (atom [])
+        caps     (mock-async-caps captured
+                                  (fn [_nsid _body] {:graph "k51testgraph" :basis_t nil :rows_edn []}))
+        api      (kdb/kotoba-api-async caps)]
+    ((:q api) '[:find ?e ?a :where [?e ?a _]] test-conn)
+    (let [sent (edn/read-string (:query_edn (:body (first @captured))))]
+      (testing "wire query_edn is a map, not the original vector -- same
+               normalize-query fix kotoba-api's :q already relies on"
+        (is (map? sent)))
+      (testing "the map has the equivalent :find/:where"
+        (is (= '[?e ?a] (:find sent)))
+        (is (= '[[?e ?a _]] (:where sent)))))))
+
+(deftest async-q-with-malformed-marker-sequence-throws-instead-of-silently-misparsing
+  (let [caps (mock-async-caps (atom [])
+                              (fn [_nsid _body]
+                                {:graph "k51testgraph" :basis_t nil :rows_edn [["1"]]}))
+        api  (kdb/kotoba-api-async caps)]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"malformed query"
+                          ((:q api) '[:find :where [?e :checkpoint/thread ?tid]] test-conn)))))
+
+;; ─── pull ────────────────────────────────────────────────────────────────────
+
+(defn- wire-pull-result [m]
+  (pr-str (into {} (map (fn [[k v]] [(pr-str k) #{(pr-str v)}])) m)))
+
+(deftest async-pull-lookup-ref
+  (let [captured    (atom [])
+        wire-result (wire-pull-result {:checkpoint/key "t1/5"
+                                       :checkpoint/thread "t1"
+                                       :checkpoint/step 5
+                                       :checkpoint/status :running})
+        caps        (mock-async-caps captured
+                                     (fn [_nsid _body]
+                                       {:graph "k51testgraph" :basis_t nil
+                                        :entity "t1/5"
+                                        :result_edn wire-result}))
+        api    (kdb/kotoba-api-async caps)
+        result ((:pull api) test-conn '[*] [:checkpoint/key "t1/5"])]
+    (testing "posts to datomic.pull"
+      (is (= "ai.gftd.apps.kotobase.datomic.pull" (:nsid (first @captured)))))
+    (testing "sends entity as the lookup ref's bare VALUE half"
+      (is (= "t1/5" (:entity (:body (first @captured))))))
+    (testing "always requests [*] over the wire"
+      (is (= "[*]" (:pattern_edn (:body (first @captured))))))
+    (testing "un-wraps the string-key/set-value wire format to a plain map"
+      (is (= 5 (:checkpoint/step result)))
+      (is (= "t1" (:checkpoint/thread result)))
+      (is (= :running (:checkpoint/status result))))))
+
+(deftest async-pull-plain-eid-coerced-to-string
+  (let [captured (atom [])
+        caps     (mock-async-caps captured
+                                  (fn [_nsid _body] {:graph "k51testgraph" :basis_t nil :result_edn "{}"}))
+        api      (kdb/kotoba-api-async caps)]
+    ((:pull api) test-conn '[*] "debug-rep-1")
+    (is (= "debug-rep-1" (:entity (:body (first @captured)))))))
+
+(deftest async-pull-lookup-ref-backfills-the-identity-attribute-when-absent-from-the-wire-result
+  (let [wire-result (wire-pull-result {:rep/name "Acme" :rep/discount-tier :tier/rep})
+        caps     (mock-async-caps (atom [])
+                                  (fn [_nsid _body]
+                                    {:graph "k51testgraph" :basis_t nil :result_edn wire-result}))
+        api      (kdb/kotoba-api-async caps)
+        result   ((:pull api) test-conn '[*] [:rep/id "acct-1"])]
+    (is (= "acct-1" (:rep/id result)))
+    (is (= "Acme" (:rep/name result)))))
+
+(deftest async-pull-with-a-narrower-pattern-still-requests-wildcard-and-filters-client-side
+  (let [captured    (atom [])
+        wire-result (wire-pull-result {:rep/name "Acme" :rep/discount-tier :tier/rep})
+        caps        (mock-async-caps captured
+                                     (fn [_nsid _body]
+                                       {:graph "k51testgraph" :basis_t nil :result_edn wire-result}))
+        api    (kdb/kotoba-api-async caps)
+        result ((:pull api) test-conn [:rep/name] "acct-1")]
+    (testing "still requests [*] over the wire despite the narrower pattern"
+      (is (= "[*]" (:pattern_edn (:body (first @captured))))))
+    (testing "only the requested attribute is present in the result"
+      (is (= {:rep/name "Acme"} result)))))
+
+;; ─── entid ───────────────────────────────────────────────────────────────────
+
+(deftest async-entid-lookup
+  (let [caps   (mock-async-caps (atom [])
+                                (fn [_nsid _body]
+                                  {:graph "k51testgraph" :basis_t nil :entity_id "bafyeid123"}))
+        api    (kdb/kotoba-api-async caps)
+        result ((:entid api) test-conn :checkpoint/key)]
+    (is (= "bafyeid123" result))))
+
+;; ─── error propagation ───────────────────────────────────────────────────────
+
+(deftest async-error-on-non-200
+  (let [caps {:http-fn   (fn [_] (p-resolved {:status 401 :body "{\"error\":\"unauthorized\"}"}))
+              :json-write pr-str
+              :json-read  edn/read-string}
+        api  (kdb/kotoba-api-async caps)]
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+         #"kotoba XRPC error 401"
+         ((:transact! api) test-conn [])))))
+
+;; ─── authorization header + CACAO ─────────────────────────────────────────────
+
+(deftest async-bearer-token-forwarded
+  (let [captured (atom [])
+        caps     {:http-fn   (fn [req]
+                               (swap! captured conj req)
+                               (p-resolved
+                                {:status 200
+                                 :body   (pr-str {:status "ok" :tx_cid "x"
+                                                  :commit_cid "y" :graph "g"
+                                                  :ipns_name "k" :ipns_sequence 0
+                                                  :ipns_valid_until "" :index_roots {}
+                                                  :datom_count 0 :journal_cids []
+                                                  :tempids {} :datoms []})}))
+                 :json-write pr-str
+                 :json-read  edn/read-string}
+        api (kdb/kotoba-api-async caps)]
+    ((:transact! api) test-conn [])
+    (is (= "Bearer test-token"
+           (get-in (first @captured) [:headers "authorization"])))))
+
+(deftest async-cacao-auth-forwarded
+  (let [captured (atom [])
+        cacao-conn (kdb/kotoba-conn "http://kotoba.test:8080" "k51testgraph"
+                                    {:cacao "base64cacaoABC" :did "did:key:zABC"})
+        caps {:http-fn   (fn [req]
+                           (swap! captured conj req)
+                           (p-resolved
+                            {:status 200
+                             :body   (pr-str {:status "ok" :tx_cid "x"
+                                              :commit_cid "y" :graph "g"
+                                              :ipns_name "k" :ipns_sequence 0
+                                              :ipns_valid_until "" :index_roots {}
+                                              :datom_count 0 :journal_cids []
+                                              :tempids {} :datoms []})}))
+              :json-write pr-str
+              :json-read  edn/read-string}
+        api (kdb/kotoba-api-async caps)]
+    ((:transact! api) cacao-conn [])
+    (testing "sends CACAO authorization header"
+      (is (= "CACAO base64cacaoABC"
+             (get-in (first @captured) [:headers "authorization"]))))
+    (testing "sends x-kotoba-did header"
+      (is (= "did:key:zABC"
+             (get-in (first @captured) [:headers "x-kotoba-did"]))))
+    (testing "sends cacao_b64 in request body"
+      (let [body (edn/read-string (:body (first @captured)))]
+        (is (= "base64cacaoABC" (:cacao_b64 body)))))))
+
+;; ─── tenant db-name addressing (kotoba-conn*) ────────────────────────────────
+
+(deftest async-db-name-conn-sends-db-name-not-graph
+  (let [captured (atom [])
+        caps     (mock-async-caps captured
+                                  (fn [_nsid _body]
+                                    {:status "ok" :graph "irrelevant"
+                                     :tx_cid "cid1" :commit_cid "cid2"
+                                     :ipns_name "k" :ipns_sequence 1
+                                     :ipns_valid_until "2099-01-01"
+                                     :index_roots {} :datom_count 0
+                                     :journal_cids [] :tempids {} :datoms []}))
+        conn     (kdb/kotoba-conn* "http://kotoba.test:8080" "manga"
+                                   {:cacao "b64cacao" :did "did:key:zTsumugu"})
+        api      (kdb/kotoba-api-async caps)]
+    ((:transact! api) conn [])
+    (testing "sends db_name, not graph"
+      (let [body (:body (first @captured))]
+        (is (= "manga" (:db_name body)))
+        (is (not (contains? body :graph)))))))
+
+(deftest async-existing-graph-callers-unaffected
+  (let [captured (atom [])
+        caps     (mock-async-caps captured
+                                  (fn [_nsid _body]
+                                    {:graph "k51testgraph" :basis_t nil :rows_edn []}))
+        api      (kdb/kotoba-api-async caps)]
+    ((:q api) '[:find ?e :where [?e]] test-conn)
+    (let [body (:body (first @captured))]
+      (is (= "k51testgraph" (:graph body)))
+      (is (not (contains? body :db_name))))))
+
+;; ─── async-vs-sync parity: same wire body for the same call ─────────────────
+
+(deftest async-and-sync-apis-produce-identical-wire-bodies-for-transact
+  (testing "kotoba-api-async is a pure async-plumbing wrapper -- it must not
+           change any wire semantics vs. the original synchronous kotoba-api"
+    (let [sync-captured  (atom [])
+          async-captured (atom [])
+          canned {:status "ok" :graph "k51testgraph" :tx_cid "c" :commit_cid "c2"
+                  :ipns_name "k" :ipns_sequence 1 :ipns_valid_until "2099-01-01"
+                  :index_roots {} :datom_count 1 :journal_cids [] :tempids {} :datoms []}
+          tx-data [{:db/id "-1" :checkpoint/key "t1/0"}]
+          sync-caps  {:http-fn (fn [{:keys [url body]}]
+                                 (swap! sync-captured conj {:nsid (nsid-from-url url) :body (edn/read-string body)})
+                                 {:status 200 :body (pr-str canned)})
+                      :json-write pr-str :json-read edn/read-string}
+          async-caps (mock-async-caps async-captured (fn [_nsid _body] canned))]
+      ((:transact! (kdb/kotoba-api sync-caps)) test-conn tx-data)
+      ((:transact! (kdb/kotoba-api-async async-caps)) test-conn tx-data)
+      (is (= (:body (first @sync-captured)) (:body (first @async-captured)))))))
+))

@@ -1,0 +1,118 @@
+(ns langchain.openai-model-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langchain.model :as model]
+            [langchain.tool :as tool]))
+
+;; identity json fns: the mock http-fn returns a Clojure map directly, so
+;; json-write/json-read are pass-through and we can assert on the raw request.
+(def jw identity)
+(def jr identity)
+
+(deftest tool->openai-shape
+  (is (= {:type "function"
+          :function {:name "get_weather" :description "w"
+                     :parameters {:type "object" :properties {:loc {:type "string"}}}}}
+         (tool/->openai {:name "get_weather" :description "w"
+                         :schema {:type "object" :properties {:loc {:type "string"}}}}))))
+
+(deftest request-body-basics
+  (let [b (model/openai-request-body jw
+            [{:role :user :content "hi"}]
+            {:model "gemma" :system "you are X"})]
+    (is (= "gemma" (:model b)))
+    (is (= [{:role "system" :content "you are X"}
+            {:role "user" :content "hi"}] (:messages b)))
+    (is (not (contains? b :tools)))))
+
+(deftest request-body-hoists-system-message-once
+  (let [b (model/openai-request-body jw
+            [{:role :system :content "sys"} {:role :user :content "hi"}]
+            {})]
+    (is (= 1 (count (filter #(= "system" (:role %)) (:messages b)))))
+    (is (= "system" (-> b :messages first :role)))))
+
+(deftest assistant-tool-call-serialized
+  (let [b (model/openai-request-body jw
+            [{:role :user :content "go"}
+             {:role :assistant :content ""
+              :tool-calls [{:id "c1" :name "screenshot" :input {:x 1}}]}]
+            {:tools [{:name "screenshot" :description "" :schema {:type "object"}}]})
+        asst (some #(when (= "assistant" (:role %)) %) (:messages b))
+        call (-> asst :tool_calls first)]
+    (is (= "function" (:type call)))
+    (is (= "screenshot" (-> call :function :name)))
+    (is (= {:x 1} (jr (-> call :function :arguments))) "arguments JSON-serialized via json-write")
+    (is (= 1 (count (:tools b))))
+    (is (= "function" (-> b :tools first :type)))))
+
+(deftest tool-result-text-passthrough
+  (let [b (model/openai-request-body jw
+            [{:role :tool :tool-call-id "c1" :content "ok done"}] {})]
+    (is (= [{:role "tool" :tool_call_id "c1" :content "ok done"}] (:messages b)))))
+
+(deftest image-tool-result-splits-into-ack-plus-user-image
+  (let [b (model/openai-request-body jw
+            [{:role :tool :tool-call-id "c1"
+              :content [{:type "image"
+                         :source {:type "base64" :media_type "image/png" :data "ABC123"}}]}]
+            {})
+        msgs (:messages b)]
+    (is (= 2 (count msgs)) "image tool result → tool ack + user image message")
+    (is (= "tool" (:role (first msgs))))
+    (is (= "c1" (:tool_call_id (first msgs))))
+    (is (string? (:content (first msgs))) "OpenAI tool content must be text")
+    (let [user (second msgs)
+          part (-> user :content first)]
+      (is (= "user" (:role user)))
+      (is (= "image_url" (:type part)))
+      (is (= "data:image/png;base64,ABC123" (-> part :image_url :url))))))
+
+(deftest parse-response-text-and-tool-calls
+  (let [r (model/parse-openai-response jr
+            {:choices [{:finish_reason "tool_calls"
+                        :message {:role "assistant" :content "thinking"
+                                  :tool_calls [{:id "c9"
+                                                :function {:name "left_click"
+                                                           :arguments {:coordinate [10 20]}}}]}}]
+             :usage {:total_tokens 42}})]
+    (is (= :assistant (:role r)))
+    (is (= "thinking" (:content r)))
+    (is (= "tool_calls" (:stop-reason r)))
+    (is (= [{:id "c9" :name "left_click" :input {:coordinate [10 20]}}] (:tool-calls r)))
+    (is (= {:total_tokens 42} (:usage r)))))
+
+(deftest parse-response-plain-text
+  (let [r (model/parse-openai-response jr
+            {:choices [{:finish_reason "stop"
+                        :message {:role "assistant" :content "all done"}}]})]
+    (is (= "all done" (:content r)))
+    (is (not (contains? r :tool-calls)))))
+
+(deftest openai-model-round-trip
+  (testing "builds a request, posts via injected http-fn, parses the response"
+    (let [captured (atom nil)
+          http (fn [req] (reset! captured req)
+                 {:status 200
+                  :body {:choices [{:finish_reason "stop"
+                                    :message {:role "assistant" :content "pong"}}]}})
+          m (model/openai-model {:url "http://localhost:11434/v1/chat/completions"
+                                 :model "gemma" :http-fn http :json-write jw :json-read jr})
+          out (model/-generate m [{:role :user :content "ping"}] {})]
+      (is (= "pong" (:content out)))
+      (is (= "http://localhost:11434/v1/chat/completions" (:url @captured)))
+      (is (= :post (:method @captured)))
+      (is (nil? (get-in @captured [:headers "authorization"])) "no auth header without :api-key (local Ollama)")
+      (is (= "gemma" (-> @captured :body :model))))))
+
+(deftest openai-model-sends-bearer-when-api-key
+  (let [captured (atom nil)
+        http (fn [req] (reset! captured req)
+               {:status 200 :body {:choices [{:message {:content "x"}}]}})
+        m (model/openai-model {:api-key "sk-test" :model "gpt" :http-fn http
+                               :json-write jw :json-read jr})]
+    (model/-generate m [{:role :user :content "hi"}] {})
+    (is (= "Bearer sk-test" (get-in @captured [:headers "authorization"])))))
+
+(deftest openai-model-requires-http-fn
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (model/openai-model {:json-write jw :json-read jr}))))

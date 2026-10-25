@@ -1,0 +1,229 @@
+(ns langgraph.agent-loop-contract-test
+  "The promises `langgraph.agent-loop` makes to a host, one deftest each.
+
+  `agent_loop_test.cljc` walks ONE happy path (two calls, both approved,
+  both succeed) and checks the phases it passes through. That is the
+  right shape for showing the loop works. It is the wrong shape for the
+  reason this reducer exists, which is to refuse things: to hold a
+  destructive call until a human approves it, to fail closed on a call
+  whose risk nobody declared, to stop when a budget is spent, to reject
+  an event that arrives in the wrong phase.
+
+  Measured 2026-08-22 by mutating `agent_loop.cljc` against the suite as
+  it then stood (48 tests / 172 assertions, green): SEVENTEEN mutations
+  left it green. Among them — a call awaiting approval could be handed a
+  `:tool/execute` effect anyway; a call with no `:tool/risk` could run
+  without approval; a DENIED call could still be executed; `max-turns`
+  could be removed entirely; the tool-call budget could stop accumulating
+  across turns; tool results could stop being returned in call order
+  (the docstring's one stated promise); a terminal state could accept
+  further events. None of those is a corner case. They are the contract.
+
+  So each deftest below pins one promise, names the literal rejection
+  reason where there is one (a host dispatches on it), and is registered
+  in the superproject's `scripts/maturity-loop/mutations.edn` against the
+  exact mutation that it — and only it — turns red."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.agent-loop :as loop]))
+
+;; ── fixture ──────────────────────────────────────────────────────────
+
+(defn- started
+  "A fresh loop in `:await-model`, with the given budget overrides."
+  ([] (started {}))
+  ([opts]
+   (:state (loop/start (merge {:thread-id "th" :task-id "tk" :ts "t0"} opts) "go"))))
+
+(defn- completed
+  "The model answered with `calls` (a `:model/completed` input)."
+  ([calls] (completed calls "resp-1"))
+  ([calls resp-id]
+   {:event/type :model/completed :ts "t" :response-id resp-id
+    :content "…" :tool-calls (vec calls)}))
+
+(defn- ro [id] {:call/id id :tool/name :read-file :tool/risk :read-only})
+(defn- rw [id] {:call/id id :tool/name :apply-patch :tool/risk :destructive})
+
+(defn- effects-of [kind out]
+  (filterv #(= kind (:effect %)) (:effects out)))
+
+(defn- executed-ids [out]
+  (mapv (comp :call/id :call) (effects-of :tool/execute out)))
+
+(defn- rejection [out]
+  (let [[e & more] (:events out)]
+    (when (and (nil? more) (= :event/rejected (:event/kind e))) (:reason e))))
+
+;; ── approval gate ────────────────────────────────────────────────────
+
+(deftest a-call-awaiting-approval-is-never-handed-to-the-executor
+  (testing "the only reason `:awaiting-approval` exists is so the host does
+            NOT run the call yet. A turn mixing a read-only call with a
+            destructive one must emit `:tool/execute` for the first only,
+            and `:approval/request` for the second only."
+    (let [out (loop/step (started) (completed [(ro "read-1") (rw "edit-1")]))]
+      (is (= ["read-1"] (executed-ids out)))
+      (is (= ["edit-1"] (mapv (comp :call/id :call) (effects-of :approval/request out))))
+      (is (= :awaiting-approval (get-in out [:state :tool-calls "edit-1" :call/status]))))))
+
+(deftest a-call-with-no-declared-risk-fails-closed-to-approval
+  (testing "`:tool/risk` is the model's word, and a model that says nothing
+            has not said `:read-only`. An undeclared call waits for a
+            human exactly as a destructive one does."
+    (let [out (loop/step (started) (completed [{:call/id "x" :tool/name :shell}]))]
+      (is (= :await-tools-and-approval (get-in out [:state :loop/phase])))
+      (is (= :awaiting-approval (get-in out [:state :tool-calls "x" :call/status])))
+      (is (= [] (executed-ids out)))
+      (is (= 1 (count (effects-of :approval/request out)))))))
+
+(deftest a-denied-call-is-not-executed-and-its-denial-reaches-the-model
+  (testing "with another call still running, denial must produce NO
+            `:tool/execute` — only the checkpoint. The call's terminal
+            status is `:denied` and the error text is the one the model
+            will read back when the turn continues."
+    (let [s1   (:state (loop/step (started) (completed [(ro "read-1") (rw "edit-1")])))
+          out  (loop/step s1 {:event/type :approval/resolved :ts "t"
+                              :call-id "edit-1" :approved? false})
+          call (get-in out [:state :tool-calls "edit-1"])]
+      (is (= [:checkpoint/write] (mapv :effect (:effects out))))
+      (is (= :denied (:call/status call)))
+      (is (= "human approval denied" (:tool/error call)))
+      (testing "…and once the open call lands, the model sees the denial as a result"
+        (let [out2 (loop/step (:state out) {:event/type :tool/completed :ts "t"
+                                            :call-id "read-1" :ok? true :output "o"})
+              items (take-last 2 (get-in out2 [:state :items]))]
+          (is (= [["read-1" :succeeded] ["edit-1" :denied]]
+                 (mapv (juxt :call-id :status) items))))))))
+
+;; ── budgets ──────────────────────────────────────────────────────────
+
+(deftest max-turns-ends-the-task-as-a-budget-error
+  (testing "max-turns 2: turn 0 and turn 1 may each ask for tools; when
+            turn 1's tools land there is no turn 2 to start."
+    (let [s0   (started {:max-turns 2})
+          s1   (:state (loop/step s0 (completed [(ro "a")])))
+          s2   (:state (loop/step s1 {:event/type :tool/completed :ts "t" :call-id "a" :ok? true}))
+          _    (is (= 1 (:turn/index s2)))
+          s3   (:state (loop/step s2 (completed [(ro "b")] "resp-2")))
+          out  (loop/step s3 {:event/type :tool/completed :ts "t" :call-id "b" :ok? true})]
+      (is (= :error (get-in out [:state :loop/phase])))
+      (is (= :budget/max-turns (get-in out [:state :error/kind])))
+      (is (loop/terminal? (:state out)))
+      (is (= [] (:effects out)) "nothing left for the host to do")
+      (is (= [[:task/failed :budget/max-turns]]
+             (mapv (juxt :event/kind :reason) (:events out)))))))
+
+(deftest the-tool-call-budget-accumulates-across-turns
+  (testing "max-tool-calls 3: two calls in turn 0 spend 2; two more in
+            turn 1 would make 4. The budget is for the task, not the turn."
+    (let [s0  (started {:max-tool-calls 3})
+          s1  (:state (loop/step s0 (completed [(ro "a") (ro "b")])))
+          _   (is (= 2 (:budget/tool-calls s1)))
+          s2  (:state (loop/step s1 {:event/type :tool/completed :ts "t" :call-id "a" :ok? true}))
+          s3  (:state (loop/step s2 {:event/type :tool/completed :ts "t" :call-id "b" :ok? true}))
+          out (loop/step s3 (completed [(ro "c") (ro "d")] "resp-2"))]
+      (is (= :budget/max-tool-calls (get-in out [:state :error/kind])))
+      (is (= [] (executed-ids out))))))
+
+;; ── correlation ──────────────────────────────────────────────────────
+
+(deftest tool-results-are-returned-in-call-order-whatever-order-they-arrive
+  (testing "the ns docstring's one stated promise. Ten calls, so the
+            call table is a hash map whose own order is not call order;
+            completed in reverse."
+    (let [ids (mapv #(str "call-" %) (range 10))
+          s1  (:state (loop/step (started) (completed (map ro ids))))
+          out (reduce (fn [st id]
+                        (:state (loop/step st {:event/type :tool/completed :ts "t"
+                                               :call-id id :ok? true :output id})))
+                      s1 (reverse ids))]
+      (is (= :await-model (:loop/phase out)))
+      (is (= ids (mapv :call-id (take-last 10 (:items out))))))))
+
+(deftest duplicate-call-ids-in-one-turn-are-rejected
+  (let [out (loop/step (started) (completed [(ro "same") (ro "same")]))]
+    (is (= :duplicate-tool-call-id (rejection out)))
+    (is (= :await-model (get-in out [:state :loop/phase])) "the turn did not start")))
+
+(deftest a-blank-call-id-is-rejected-as-invalid
+  (testing "a result could never be correlated back to it"
+    (is (= :invalid-tool-call (rejection (loop/step (started) (completed [(ro "   ")])))))
+    (is (= :invalid-tool-call (rejection (loop/step (started) (completed [(ro "")])))))))
+
+(deftest a-completed-turn-leaves-no-open-calls-behind
+  (testing "the state a host checkpoints after a turn must not still list
+            last turn's calls as if they were pending"
+    (let [s1  (:state (loop/step (started) (completed [(ro "a")])))
+          out (loop/step s1 {:event/type :tool/completed :ts "t" :call-id "a" :ok? true})]
+      (is (= :await-model (get-in out [:state :loop/phase])))
+      (is (= {} (get-in out [:state :tool-calls]))))))
+
+(deftest the-next-model-turn-is-chained-to-the-previous-response
+  (testing "`:model/respond` after tools carries `:previous-response-id`
+            so a Responses-style host continues the conversation rather
+            than starting one"
+    (let [s1  (:state (loop/step (started) (completed [(ro "a")] "resp-1")))
+          out (loop/step s1 {:event/type :tool/completed :ts "t" :call-id "a" :ok? true})
+          [respond] (effects-of :model/respond out)]
+      (is (= "resp-1" (:previous-response-id respond)))
+      (is (= 1 (:turn-index respond))))))
+
+(deftest a-failed-tool-is-recorded-as-failed-and-the-loop-goes-on
+  (let [s1   (:state (loop/step (started) (completed [(ro "a")])))
+        out  (loop/step s1 {:event/type :tool/completed :ts "t"
+                            :call-id "a" :ok? false :error "boom"})
+        item (last (get-in out [:state :items]))]
+    (is (= [:tool-result :failed "boom"] ((juxt :item/type :status :error) item)))
+    (is (= :await-model (get-in out [:state :loop/phase])) "a failed tool is the model's problem, not the task's")
+    (is (not (loop/terminal? (:state out))))))
+
+;; ── phase discipline ─────────────────────────────────────────────────
+
+(deftest a-terminal-state-rejects-every-further-event-as-terminal
+  (testing "once done, even an interrupt is refused — and with the
+            literal reason `:terminal`, not whatever the phase check
+            would have said"
+    (let [done (:state (loop/step (started) (completed [])))
+          _    (is (loop/terminal? done))
+          out  (loop/step done {:event/type :task/interrupted :ts "t" :reason :user})]
+      (is (= :terminal (rejection out)))
+      (is (= done (:state out)) "and the state is untouched")
+      (is (= [] (:effects out))))))
+
+(deftest a-model-result-while-awaiting-tools-is-rejected
+  (let [s1  (:state (loop/step (started) (completed [(ro "a")])))
+        out (loop/step s1 (completed [] "resp-2"))]
+    (is (= :unexpected-model-result (rejection out)))
+    (is (= s1 (:state out)))))
+
+(deftest approving-a-call-that-is-not-awaiting-approval-is-rejected
+  (testing "a read-only call is already running; an approval for it is
+            a correlation error, not a no-op"
+    (let [s1  (:state (loop/step (started) (completed [(ro "a")])))
+          out (loop/step s1 {:event/type :approval/resolved :ts "t" :call-id "a" :approved? true})]
+      (is (= :unexpected-approval (rejection out)))
+      (is (= [] (executed-ids out)) "and it is not executed a second time"))))
+
+(deftest an-interrupt-moves-the-task-to-interrupted-and-checkpoints-it
+  (let [s1  (:state (loop/step (started) (completed [(ro "a")])))
+        out (loop/step s1 {:event/type :task/interrupted :ts "t" :reason :user})]
+    (is (= :interrupted (get-in out [:state :loop/phase])))
+    (is (loop/terminal? (:state out)))
+    (is (= :interrupted (get-in (first (effects-of :checkpoint/write out)) [:state :loop/phase]))
+        "what gets checkpointed is the interrupted state, not the one before")))
+
+(deftest an-unknown-event-type-is-rejected-not-swallowed
+  (let [s   (started)
+        out (loop/step s {:event/type :host/made-this-up :ts "t"})]
+    (is (= :unknown-event (rejection out)))
+    (is (= s (:state out)))))
+
+(deftest every-event-names-its-thread-and-turn
+  (testing "events are what hosts persist; an event without its thread
+            cannot be filed"
+    (let [{s0 :state ev0 :events} (loop/start {:thread-id "th-9" :task-id "tk" :ts "t0"} "go")
+          out (loop/step s0 (completed [(ro "a")]))
+          evs (concat ev0 (:events out))]
+      (is (= 4 (count evs)))
+      (is (every? #(= "th-9" (:thread/id %)) evs))
+      (is (every? #(integer? (:turn/index %)) evs)))))

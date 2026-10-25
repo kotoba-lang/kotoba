@@ -1,0 +1,155 @@
+(ns stripe-ops.operation
+  "StripeOpsActor -- one lookup/payment-link-create operation = one
+  supervised actor run, a langgraph-clj StateGraph:
+
+    intake -> advise -> govern -> decide -> commit | hold | approval
+
+  stripe-ops-LLM (sealed) proposes a Stripe read or a new-Payment-Link
+  request; StripeOpsGovernor enforces the known-price whitelist / idempotency
+  / no-custom-amount invariants; the phase gate adds caution for lookups;
+  :stripe/payment-link-create ALWAYS routes to a human (interrupt-before
+  :request-approval) -- this actor's only actuation, never auto-committed at
+  any phase.
+
+  Single invariant (this actor's analog of koyomi's no-share-without-
+  governance / tosmonitor's never-auto :tos/change-proposal):
+    the actor never calls stripeport/create-payment-link! for anything the
+    governor would reject, and stripe-ops-LLM never actuates directly --
+    proposing is data; only a human approval turns it into a real Stripe
+    write."
+  (:require [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [stripe-ops.advisor :as advisor]
+            [stripe-ops.governor :as gov]
+            [stripe-ops.phase :as phase]
+            [stripe-ops.stripeport :as stripeport]
+            [stripe-ops.store :as store]))
+
+(defn- subject [{:keys [op price-id kind]}]
+  (case op
+    :stripe/payment-link-create price-id
+    :stripe/lookup (name (or kind :unknown))
+    (str op)))
+
+(defn- do-lookup [port {:keys [kind query]}]
+  (case kind
+    :customer               (stripeport/get-customer port query)
+    :customer-by-email      (stripeport/search-customers-by-email port query)
+    :subscription            (stripeport/get-subscription port query)
+    :customer-subscriptions (stripeport/list-subscriptions-for-customer port query)
+    :product                (stripeport/get-product port query)
+    :price                   (stripeport/get-price port query)
+    nil))
+
+(defn- commit-effects!
+  "Perform the op's REAL Stripe effect BEFORE anything durable is written --
+  if the StripePort call throws, no store mutation and no :committed ledger
+  fact happen, so the store never durably claims a Payment Link that didn't
+  actually get created (mirrors koyomi.operation/commit-effects!'s own
+  effect-before-store-write ordering).
+
+  Returns {:result .. :store-record (optional {:kind :id :value})}. For
+  :stripe/lookup there is no durable store write beyond the ledger -- a read
+  has no ground fact of its own to keep. For :stripe/payment-link-create the
+  returned record is the created Payment Link, keyed by the id Stripe (or
+  mock-stripeport) actually returned -- never a caller-guessed id."
+  [port {:keys [op price-id idempotency-key metadata] :as request}]
+  (case op
+    :stripe/lookup
+    {:result (do-lookup port request)}
+    :stripe/payment-link-create
+    (let [result (stripeport/create-payment-link! port price-id
+                   {:idempotency-key idempotency-key :metadata metadata})]
+      {:result result
+       :store-record {:kind :payment-link :id (:id result) :value result}})))
+
+(defn build
+  "Compiles a StripeOpsActor bound to `store` (any stripe-ops.store/Store).
+  opts: :advisor (default mock), :stripeport (default mock), :checkpointer
+  (default in-mem)."
+  [store & [{:keys [advisor stripeport checkpointer]
+             :or   {advisor      (stripe-ops.advisor/mock-advisor)
+                    stripeport   (stripe-ops.stripeport/mock-stripeport)
+                    checkpointer (cp/mem-checkpointer)}}]]
+  (-> (g/state-graph
+       {:channels
+        {:request     {:default nil}
+         :context     {:default nil}   ; :phase + (future) authn
+         :proposal    {:default nil}
+         :verdict     {:default nil}
+         :disposition {:default nil}
+         :record      {:default nil}   ; {:result .. :store-record ..}
+         :approval    {:default nil}
+         :audit       {:reducer into :default []}}})
+
+      (g/add-node :intake (fn [s] s))
+
+      (g/add-node :advise
+        (fn [{:keys [request]}]
+          (let [p (advisor/-advise advisor store request)]
+            {:proposal p :audit [(advisor/trace request p)]})))
+
+      (g/add-node :govern
+        (fn [{:keys [request proposal]}]
+          {:verdict (gov/check request proposal store)}))
+
+      (g/add-node :decide
+        (fn [{:keys [request context proposal verdict]}]
+          (let [base (phase/verdict->disposition verdict)
+                ph   (:phase context phase/default-phase)
+                {:keys [disposition reason]} (phase/gate ph request base)
+                subj (subject request)]
+            (case disposition
+              :hold
+              {:disposition :hold
+               :audit [(cond-> (gov/hold-fact request verdict)
+                         reason (assoc :phase-reason reason :phase ph))]}
+              :escalate
+              {:disposition :escalate
+               :audit [{:t :approval-requested :op (:op request) :subject subj
+                        :reason (or reason (if (:high-stakes? verdict) :human-signoff :low-confidence))
+                        :summary (:summary proposal)
+                        :phase ph :confidence (:confidence verdict)}]}
+              :commit
+              {:disposition :commit}))))
+
+      (g/add-node :request-approval
+        (fn [{:keys [request approval]}]
+          (let [subj (subject request)]
+            (if (= :approved (:status approval))
+              {:disposition :commit
+               :audit [{:t :human-signoff :op (:op request) :subject subj :by (:by approval)}]}
+              {:disposition :hold
+               :audit [{:t :signoff-rejected :op (:op request) :subject subj
+                        :disposition :hold :basis [:human-rejected]}]}))))
+
+      (g/add-node :commit
+        (fn [{:keys [request]}]
+          (let [{:keys [result store-record]} (commit-effects! stripeport request)]
+            (when store-record (store/record-datom! store store-record))
+            (let [f {:t :committed :op (:op request) :subject (subject request)
+                     :disposition :commit}]
+              (store/append-ledger! store f)
+              {:record {:result result :store-record store-record} :audit [f]}))))
+
+      (g/add-node :hold
+        (fn [{:keys [audit]}]
+          (when-let [hf (last (filter #(#{:stripe-ops-hold :signoff-rejected} (:t %)) audit))]
+            (store/append-ledger! store (assoc hf :disposition :hold)))
+          {}))
+
+      (g/set-entry-point :intake)
+      (g/add-edge :intake :advise)
+      (g/add-edge :advise :govern)
+      (g/add-edge :govern :decide)
+      (g/add-conditional-edges :decide
+        (fn [{:keys [disposition]}]
+          (case disposition :commit :commit, :escalate :request-approval, :hold)))
+      (g/add-conditional-edges :request-approval
+        (fn [{:keys [disposition]}] (if (= :commit disposition) :commit :hold)))
+
+      (g/set-finish-point :commit)
+      (g/set-finish-point :hold)
+
+      (g/compile-graph
+       {:checkpointer checkpointer :interrupt-before #{:request-approval}})))

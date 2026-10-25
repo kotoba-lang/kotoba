@@ -1,0 +1,117 @@
+(ns kekkai.heartbeat
+  "Authenticated, replay-resistant node heartbeat payloads.
+
+  A heartbeat carries the node's complete current candidate set. It is signed
+  by the Ed25519 key enrolled as that node's `:did`; its Noise/X25519 transport
+  key remains a separate identity. The control plane timestamps receipt and
+  accepts only a fresh, strictly increasing sequence from an authorized node."
+  (:require [ed25519.core :as ed25519]))
+
+(def max-clock-skew-seconds 300)
+(def max-endpoints 16)
+(def max-endpoint-length 512)
+(def ^:private signing-domain "kekkai.node-heartbeat.v1")
+(def ^:private netmap-read-signing-domain "kekkai.netmap-read.v1")
+
+(defn- netmap-read-payload-bytes [node-id issued-at]
+  (let [payload (pr-str [netmap-read-signing-domain node-id issued-at])]
+    #?(:clj (.getBytes ^String payload "UTF-8")
+       :cljs (.encode (js/TextEncoder.) payload))))
+
+(defn sign-netmap-read
+  "Sign a read-only bootstrap request with the node's enrolled heartbeat key.
+
+  The signed material binds the operation, node ID, and timestamp. Reads do
+  not advance the heartbeat sequence or mutate control-plane state."
+  [node-id issued-at seed]
+  (when-not (and (string? node-id) (seq node-id) (integer? issued-at))
+    (throw (ex-info "invalid netmap-read signing input"
+                    {:type :kekkai/invalid-netmap-read})))
+  (ed25519/hexify
+   (ed25519/sign seed (netmap-read-payload-bytes node-id issued-at))))
+
+(defn netmap-read-signature-valid?
+  [node-id node issued-at signature-hex]
+  (try
+    (and (string? (:did node))
+         (integer? issued-at)
+         (string? signature-hex)
+         (= 128 (count signature-hex))
+         (ed25519/verify-did (:did node)
+                             (netmap-read-payload-bytes node-id issued-at)
+                             (ed25519/unhex signature-hex)))
+    (catch #?(:clj Exception :cljs :default) _ false)))
+
+(defn now-seconds []
+  #?(:clj (quot (System/currentTimeMillis) 1000)
+     :cljs (quot (.now js/Date) 1000)))
+
+(defn- payload-bytes [node-id {:keys [heartbeat/sequence heartbeat/issued-at endpoints]}]
+  ;; A fixed ordered vector avoids relying on map iteration order for the
+  ;; cross-runtime signed bytes. The domain tag prevents reuse as another
+  ;; Kekkai protocol message.
+  (let [payload (pr-str [signing-domain node-id sequence issued-at endpoints])]
+    #?(:clj (.getBytes ^String payload "UTF-8")
+       :cljs (.encode (js/TextEncoder.) payload))))
+
+(defn sign
+  "Sign a complete candidate set with a raw 32-byte Ed25519 seed.
+
+  `seed` is local key material; callers must keep it out of the returned
+  heartbeat and logs. The signature is lowercase hex so the message remains
+  portable EDN across the JVM and node runtimes."
+  [node-id sequence issued-at endpoints seed]
+  (let [message {:heartbeat/sequence sequence
+                 :heartbeat/issued-at issued-at
+                 :endpoints (vec endpoints)}]
+    (assoc message :heartbeat/signature-hex
+           (ed25519/hexify (ed25519/sign seed (payload-bytes node-id message))))))
+
+(defn signature-valid?
+  [node-id node heartbeat]
+  (try
+    (and (string? (:did node))
+         (string? (:heartbeat/signature-hex heartbeat))
+         (= 128 (count (:heartbeat/signature-hex heartbeat)))
+         (ed25519/verify-did (:did node)
+                             (payload-bytes node-id heartbeat)
+                             (ed25519/unhex (:heartbeat/signature-hex heartbeat))))
+    (catch #?(:clj Exception :cljs :default) _ false)))
+
+(defn validation-problems
+  "Return named rejection reasons for one heartbeat.
+
+  `last-sequence` comes from the durable heartbeat log. The caller must run
+  this check and append while holding the store's heartbeat-ingest lock, so
+  concurrent requests cannot both accept the same sequence."
+  [node-id node heartbeat now last-sequence]
+  (let [sequence (:heartbeat/sequence heartbeat)
+        issued-at (:heartbeat/issued-at heartbeat)
+        endpoints (:endpoints heartbeat)]
+    (cond-> []
+      (nil? node)
+      (conj :unknown-node)
+
+      (and node (not= "authorized" (:status node)))
+      (conj :node-not-authorized)
+
+      (not (and (integer? sequence) (pos? sequence)))
+      (conj :invalid-sequence)
+
+      (and (integer? sequence) (<= sequence (or last-sequence 0)))
+      (conj :replayed-sequence)
+
+      (not (and (integer? issued-at)
+                (integer? now)
+                (<= (- now max-clock-skew-seconds) issued-at
+                    (+ now max-clock-skew-seconds))))
+      (conj :heartbeat-outside-clock-window)
+
+      (not (and (vector? endpoints)
+                (<= (count endpoints) max-endpoints)
+                (every? #(and (string? %) (<= 1 (count %) max-endpoint-length))
+                        endpoints)))
+      (conj :invalid-endpoint-set)
+
+      (not (signature-valid? node-id node heartbeat))
+      (conj :invalid-signature))))

@@ -1,0 +1,385 @@
+(ns kekkai.netmap
+  "The wire netmap: the one artifact this control plane hands the data plane.
+
+  The charter says the actor *publishes reachability and the node applies it*,
+  and `kekkai-node`'s README states the handoff format as
+  `:netmap/{version,tailnet,self,peers,edges,relays}` EDN. Until this namespace
+  existed **nothing produced that shape** — the control plane emitted `:netmap`
+  control-plane records and assessments, the node read a file, and the two
+  repositories were joined only by prose. A node therefore trusted whoever
+  could write its netmap file, which is the same hole `kekkai.node.netmap`'s
+  own docstring calls out about `fleet.edn`.
+
+  This is the projection, and it is pure: `{:nodes :plane :relays :heartbeats}`
+  in, one node's netmap out. Signing it is `kekkai.envelope`; the two are
+  separate because the projection must be testable without a key, and because
+  the byte-exactness the signature depends on belongs to the encoder rather
+  than to the thing being encoded.
+
+  ## Three readings that are decisions, not details
+
+  **A peer with no edge in either direction is not published at all.** Not
+  published-and-denied: absent. Deny-by-default is about what may be reached,
+  but a netmap listing every node in the tailnet would hand each node a roster
+  of an organization it has no grant into, and the node cannot un-learn it.
+
+  **A peer that IS edged but is expired or unadmitted is published, marked.**
+  The node keeps it and denies it by status, which is what lets it log
+  `judah: :key-expired` instead of silently failing to connect —
+  `kekkai.node.netmap/peer-table` is explicit that 'exists and is not
+  authorized' and 'unknown' are different operational states. Filtering here
+  would collapse them and make revocation indistinguishable from a typo.
+
+  **Cross-tailnet peers are excluded even when an active peering allows the
+  edge.** This one is a limitation, not a preference, and it is reported rather
+  than hidden (`excluded`, reason `:cross-tailnet-not-carriable`). The reason is
+  structural: `kekkai.node.netmap/prologue-string` binds the *publisher's*
+  tailnet into the Noise prologue, so two nodes in peered-but-different tailnets
+  derive different prologues and the handshake fails — loudly, but with a
+  message about authentication rather than about peering. Publishing a peer that
+  provably cannot handshake is worse than omitting it and saying so. Carrying
+  peered traffic needs the prologue to bind the peering for cross-tailnet
+  sessions, which is a data-plane protocol change.
+
+  ## Funnels (public ingress) ride the same netmap, to two nodes only
+
+  An approved funnel (`kekkai.funnel`) is published as `:netmap/funnels` in the
+  netmaps of exactly two nodes — its `:funnel/edge`, which opens the public
+  listener, and its `:funnel/node`, which accepts the forwarded connections —
+  plus a `:funnel` capability edge `edge → node` scoped to the one port, in
+  both. A LOCAL funnel (edge = node, `kekkai.funnel/local?`) is published
+  only in that node's netmap and adds no edge and no peer: it is served from
+  the node's own listener, so nothing crosses the overlay and nobody is
+  granted anything. Every other node's netmap is untouched, byte for byte: a funnel is not
+  a fact the rest of the tailnet needs, and publishing it tailnet-wide would
+  hand every node a map of which of its peers face the internet."
+  (:require [kotoba.lang.text :as str]
+            [kekkai.acl :as acl]
+            [kekkai.funnel :as funnel]))
+
+(def wire-any
+  "The port wildcard the node side understands.
+
+  The control-plane policy language writes a wildcard as the string `\"*\"`
+  (`kekkai.acl` grants) and `kekkai.node.netmap/permitted?` tests for the
+  keyword `:any`. Neither is wrong; they were written apart. The translation
+  lives here, in the one place that crosses the boundary, so that a policy is
+  never silently narrowed to a literal port named `\"*\"` that nothing matches."
+  :any)
+
+(defn- port->wire [p]
+  (if (= "*" p) wire-any p))
+
+(defn- ports->wire [ports]
+  (mapv port->wire ports))
+
+(defn- ipv4-literal? [host]
+  (let [parts (str/split host #"\.")]
+    (and (= 4 (count parts))
+         (every? (fn [part]
+                   (and (re-matches #"\d{1,3}" part)
+                        (let [n (parse-long part)]
+                          (and n (<= 0 n 255)))))
+                 parts))))
+
+(defn- hostname? [host]
+  (let [host (if (.endsWith host ".") (subs host 0 (dec (count host))) host)
+        labels (str/split host #"\.")]
+    (and (<= 1 (count host) 253)
+         (every? (fn [label]
+                   (and (<= 1 (count label) 63)
+                        (re-matches #"(?i)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                                    label)))
+                 labels))))
+
+(defn- ipv6-literal? [host]
+  (let [compression (.indexOf host "::")
+        compressed? (not (neg? compression))
+        second-compression (when compressed?
+                             (.indexOf host "::" (+ compression 2)))
+        left (if compressed? (subs host 0 compression) host)
+        right (if compressed? (subs host (+ compression 2)) "")
+        groups (concat (if (empty? left) [] (str/split left #":"))
+                       (if (empty? right) [] (str/split right #":")))]
+    (and (not (str/blank? host))
+         (or (not compressed?) (neg? second-compression))
+         (or (not compressed?) (not (str/includes? host ":::")))
+         (or (.startsWith host "::") (not (.startsWith host ":")))
+         (or (.endsWith host "::") (not (.endsWith host ":")))
+         (or (empty? left)
+             (and (not (.startsWith left ":"))
+                  (not (.endsWith left ":"))))
+         (or (empty? right)
+             (and (not (.startsWith right ":"))
+                  (not (.endsWith right ":"))))
+         (if compressed? (< (count groups) 8) (= 8 (count groups)))
+         (every? #(and (<= 1 (count %) 4)
+                       (re-matches #"(?i)[0-9a-f]+" %))
+                 groups))))
+
+(defn- valid-host? [host bracketed-ipv6?]
+  (if bracketed-ipv6?
+    (ipv6-literal? host)
+    (and (not (str/includes? host ":"))
+         (or (ipv4-literal? host) (hostname? host)))))
+
+(defn- parse-endpoint
+  "`\"203.0.113.7:41641\"` or `\"[2001:db8::7]:41641\"` ->
+  `{:kind :reflexive :host … :port …}`, or nil.
+
+  A heartbeat endpoint is what the node last observed about itself, so it is
+  published as `:reflexive`: a hint for `kekkai.node.disco` to probe, never a
+  fact. Anything unparseable yields nil rather than a partial candidate."
+  [endpoint]
+  (when (string? endpoint)
+    (let [endpoint (str/trim endpoint)
+          bracketed? (.startsWith endpoint "[")
+          close (when bracketed? (.indexOf endpoint "]"))
+          separator (if bracketed?
+                      (when (and close (pos? close)
+                                 (< close (dec (count endpoint)))
+                                 (= ":" (subs endpoint (inc close) (+ close 2))))
+                        (+ close 1))
+                      (let [idx (str/last-index-of endpoint ":")]
+                        (when (and idx (not (neg? idx))
+                                   (not (str/includes? (subs endpoint 0 idx) ":")))
+                          idx)))
+          host (when separator
+                 (if bracketed?
+                   (subs endpoint 1 close)
+                   (subs endpoint 0 separator)))
+          port-text (when separator (subs endpoint (inc separator)))
+          port (when (and port-text (re-matches #"\d{1,5}" port-text))
+                 (parse-long port-text))]
+      (when (and (seq host)
+                 (valid-host? host bracketed?)
+                 port (<= 1 port 65535))
+        {:kind :reflexive :host host :port port}))))
+
+(defn- endpoints-of
+  "Candidates from the node's most recent heartbeat. Store heartbeats are
+  ordered oldest-to-newest; older reflexive mappings are hints from an earlier
+  NAT state and must never survive a newer heartbeat that clears or replaces
+  them."
+  [heartbeats node-id]
+  (let [latest (last (get heartbeats node-id))
+        candidates (cond
+                     (contains? latest :endpoints) (:endpoints latest)
+                     (:endpoint latest) [(:endpoint latest)]
+                     :else [])]
+    (into []
+          (comp (keep parse-endpoint) (distinct))
+          candidates)))
+
+(defn- node->wire [node heartbeats]
+  (cond-> {:node/id (:id node)
+           :node/key (:static-pub node)
+           :node/overlay-ip (:overlay-ip node)
+           :node/status (:status node)
+           :node/expires-at (:key-expiry node)}
+    (seq (endpoints-of heartbeats (:id node)))
+    (assoc :node/endpoints (endpoints-of heartbeats (:id node)))))
+
+(defn- relay->wire [relay]
+  {:relay/name (:name relay)
+   :relay/region (:region relay)
+   :relay/host (:host relay)
+   :relay/port (:port relay)
+   :relay/key (:key relay)})
+
+(defn data-plane-problems
+  "Fields a node needs before it can appear in any netmap, as a vector of
+  problems.
+
+  The control plane admits a *device*; the data plane dials a *key*. Those are
+  different facts and the store historically carried only the first, so a node
+  can be perfectly admitted and still be unpublishable. Reported as a named
+  problem at publish time rather than emitted as a netmap with a blank
+  `:node/key`, which the node would reject with `:peer-missing-key` — true, but
+  attributed to the wrong side of the boundary."
+  [node]
+  (cond-> []
+    (str/blank? (str (:static-pub node)))
+    (conj {:problem :missing-static-pub :node (:id node)})
+    (str/blank? (str (:overlay-ip node)))
+    (conj {:problem :missing-overlay-ip :node (:id node)})))
+
+(defn- edge-entry [from-id to-id decision]
+  {:edge/from from-id
+   :edge/to to-id
+   :edge/capabilities (:capabilities decision)
+   :edge/ports (ports->wire (:ports decision))})
+
+(defn- funnel-edge-entry
+  "The `:funnel` capability edge a funnel implies. A SEPARATE entry from any
+  ACL edge between the same two nodes, never folded into it: an edge entry's
+  ports apply to all of its capabilities (`kekkai.node.netmap/permitted?`), so
+  merging `[:funnel] [8080]` into an `[:overlay :ssh] [22]` grant would widen
+  ssh to 8080 and funnel to 22. Two entries for one pair is already how the
+  node reads edges (`edge-index` unions them)."
+  [{:keys [edge node port]}]
+  {:edge/from edge
+   :edge/to node
+   :edge/capabilities [funnel/capability]
+   :edge/ports [port]})
+
+(defn- funnel->wire [{:keys [host edge node service port]}]
+  {:funnel/host host
+   :funnel/edge edge
+   :funnel/node node
+   :funnel/service service
+   :funnel/port port})
+
+(defn- funnels-for
+  "The approved funnels `self` is an endpoint of, in publish order.
+
+  Defensive about its input even though the governor already refused all of
+  this at approval time, because the input is a snapshot of a store and a
+  store can hold state no governor produced (a hand-seeded fixture, a node
+  revoked after its funnel was approved):
+
+  - only status \"active\" — fail-closed, like `store/funnel-active?`;
+  - both endpoints must exist in this snapshot, in `self`'s tailnet (a
+    cross-tailnet funnel could not handshake — see 'Three readings' — and
+    would not be the org's to publish);
+  - both endpoints must have status \"authorized\". Revocation is a status
+    change, and a revoked target must stop being reachable from the internet
+    at the next publish rather than rely on the edge to notice. KEY EXPIRY is
+    not checked here: the projector has no clock (`version` is the caller's
+    for the same reason), so the edge must still apply
+    `kekkai.node.netmap/authorized?` to the target peer before forwarding;
+  - a LOCAL funnel (edge = target) is kept: it names self twice.
+
+  Sorted by host, ties broken by the rest of the spec, so the signed bytes
+  never depend on the order the store returned records in."
+  [{:keys [nodes funnels]} self]
+  (let [by-id (into {} (map (juxt :id identity)) nodes)
+        tn (acl/tailnet-of self)
+        ok? (fn [id] (let [n (get by-id id)]
+                       (and n (= "authorized" (:status n)) (= tn (acl/tailnet-of n)))))]
+    (->> funnels
+         (filter #(= "active" (:status %)))
+         (filter #(or (= (:id self) (:edge %)) (= (:id self) (:node %))))
+         (filter #(and (ok? (:edge %)) (ok? (:node %))))
+         (sort-by (juxt :host :edge :node :service :port))
+         vec)))
+
+(defn- funnel-peer-ids
+  "The counterpart of each funnel `self` is an endpoint of. A funnel's edge and
+  target must be able to open a session with each other even when no ACL grant
+  joins them — the funnel IS the grant — so each is published as the other's
+  peer. A local funnel has no counterpart and contributes none."
+  [self fs]
+  (into #{} (comp (remove funnel/local?)
+                  (map #(if (= (:id self) (:edge %)) (:node %) (:edge %))))
+        fs))
+
+(defn- candidate-decisions
+  "For one candidate: `{:node … :out decision :in decision}`."
+  [plane self node]
+  {:node node
+   :out (acl/edge-decision plane self node)
+   :in (acl/edge-decision plane node self)})
+
+(defn excluded
+  "Why each node other than `self-id` is absent from the netmap.
+
+  Exists because `kekkai.node.netmap/denials` has a counterpart obligation on
+  this side: a node that cannot see why it was left out of a netmap cannot tell
+  a revoked grant from a publisher bug."
+  [{:keys [nodes plane] :as inputs} self-id]
+  (let [self (first (filter #(= self-id (:id %)) nodes))
+        self-tailnet (acl/tailnet-of self)
+        via-funnel (funnel-peer-ids self (funnels-for inputs self))]
+    (into []
+          (comp
+           (keep (fn [node]
+                  (when-not (= self-id (:id node))
+                    (let [{:keys [out in]} (candidate-decisions plane self node)]
+                      (cond
+                        (not= self-tailnet (acl/tailnet-of node))
+                        {:node (:id node)
+                         :excluded :cross-tailnet-not-carriable
+                         :peering-would-allow? (boolean (or (:allowed? out)
+                                                            (:allowed? in)))
+                         :tailnet (acl/tailnet-of node)}
+
+                        (and (not (:allowed? out)) (not (:allowed? in))
+                             (not (contains? via-funnel (:id node))))
+                        {:node (:id node)
+                         :excluded :no-edge-either-direction
+                         :outbound-reason (:reason out)
+                         :inbound-reason (:reason in)}))))))
+          (sort-by :id nodes))))
+
+(defn publish
+  "One node's netmap, in the shape `kekkai-node` consumes.
+
+  `version` is the caller's: it is the value both ends bind into the Noise
+  prologue, so it has to be monotonic across a rollout and only the thing
+  driving the rollout knows that. Deriving it here from content would make two
+  publishers disagree about ordering the moment they were run out of step.
+
+  **Peers and edges are sorted by id, not left in input order.** The netmap is
+  signed as a byte string (`kekkai.envelope`), so ordering is part of what gets
+  signed: a projector that preserved input order would give the same logical
+  netmap two different signatures depending on whether the nodes arrived from
+  `all-nodes` (sorted) or from a map's seq (not). Found by a test comparing a
+  store-fed publish against a hand-assembled one — they agreed on every fact
+  and disagreed on the bytes.
+
+  **`:netmap/funnels` is emitted only when non-empty**, as the last key. A
+  netmap for a node that is no funnel's endpoint is therefore the exact byte
+  string it was before funnels existed (pinned by the signed fixture), so the
+  feature costs every other node nothing — not even a signature change on
+  rollout. Funnels are sorted by host; each funnel's `:funnel` edge joins
+  `:netmap/edges` as its own entry (see `funnel-edge-entry`), and the edges
+  vector keeps its (from, to) order with ACL entries ahead of funnel entries
+  for the same pair."
+  [{:keys [nodes plane relays heartbeats version] :as inputs} self-id]
+  (let [self (first (filter #(= self-id (:id %)) nodes))]
+    (when-not self
+      (throw (ex-info "netmap requested for an unknown node"
+                      {:type :kekkai/unknown-node :node self-id})))
+    (when-not (int? version)
+      (throw (ex-info "netmap version must be an integer"
+                      {:type :kekkai/invalid-netmap-version :version version})))
+    (let [self-tailnet (acl/tailnet-of self)
+          fs (funnels-for inputs self)
+          via-funnel (funnel-peer-ids self fs)
+          published (->> nodes
+                         (remove #(= self-id (:id %)))
+                         (filter #(= self-tailnet (acl/tailnet-of %)))
+                         (map #(candidate-decisions plane self %))
+                         (filter #(or (:allowed? (:out %)) (:allowed? (:in %))
+                                      (contains? via-funnel (:id (:node %)))))
+                         (sort-by #(:id (:node %)))
+                         vec)
+          problems (into (data-plane-problems self)
+                         (mapcat #(data-plane-problems (:node %)))
+                         published)]
+      (when (seq problems)
+        (throw (ex-info "netmap cannot be published: nodes lack data-plane facts"
+                        {:type :kekkai/unpublishable-nodes :problems problems})))
+      (cond-> {:netmap/version version
+               :netmap/tailnet self-tailnet
+               :netmap/self {:node/id (:id self)
+                             :node/key (:static-pub self)
+                             :node/overlay-ip (:overlay-ip self)}
+               :netmap/peers (mapv #(node->wire (:node %) heartbeats) published)
+               ;; `sort-by` is stable, so ACL entries (concatenated first)
+               ;; stay ahead of funnel entries for the same (from, to) pair.
+               :netmap/edges (->> (concat
+                                   (->> published
+                                        (mapcat (fn [{:keys [node out in]}]
+                                                  (cond-> []
+                                                    (:allowed? out)
+                                                    (conj (edge-entry self-id (:id node) out))
+                                                    (:allowed? in)
+                                                    (conj (edge-entry (:id node) self-id in))))))
+                                   ;; remote funnels only: a local one crosses no overlay
+                                   (distinct (map funnel-edge-entry (remove funnel/local? fs))))
+                                  (sort-by (juxt :edge/from :edge/to))
+                                  vec)
+               :netmap/relays (mapv relay->wire relays)}
+        (seq fs) (assoc :netmap/funnels (mapv funnel->wire fs))))))

@@ -1,0 +1,235 @@
+;; langgraph.core -- StateGraph: the Pregel-style superstep loop of
+;; langgraph.graph (the .cljk oracle), as a Kotoba template module over the
+;; application's STATE record, admitted by amu for the native (aarch64/x86_64)
+;; targets as well as wasm32 / js / the KIR interpreter.
+;;
+;; Written to what native-aot admits today (2026-09-16, amu conformance
+;; `native-aot`): i64 / keyword / bool words, scalar records (nested), closures
+;; whose parameters and results are those, and `:vector-i64` as a parameter or
+;; loop value but NOT as a record field. That is IMPLEMENTATION STATE, not the
+;; language (ADR-2608650000): the ceilings below are named so they can be
+;; removed when the backend admits typed collections in records.
+;;
+;;   node ids     0 .. 126, END = 127
+;;   a frontier   at most 8 nodes, packed into one i64 (base-128 digits over a
+;;                4-bit count) -- `pack-*`; more than 8 successors in one
+;;                superstep is refused as :frontier-overflow, never truncated
+;;   interrupt-before / interrupt-after: the same packed lists (<= 8 nodes each)
+;;
+;; Frontend shapes this module is written around (all measured 2026-09-16 on
+;; kotoba-sema cac05453 + #80, through amu's project linker; each is a
+;; temporary constraint, not a property -- remove the workaround when the
+;; frontend no longer needs it):
+;;   - a keyword projection of a record PARAMETER (`(:step ck)`) that stands
+;;     outside a loop body in a function that has a loop is typed i64
+;;     (`record-get without a type descriptor requires a record value`);
+;;     a typed accessor function (`ck-step`) is typed. So every loop-bearing
+;;     function here reads its record parameters through accessors or inside
+;;     the loop body only.
+;;   - a closure call inside a loop whose value is a record leaves the loop
+;;     typed i64; a closure call standing directly as a `record-new` argument
+;;     is not desugared. Closure calls live in `run-one`, bound by `let`.
+;;   - a loop helper takes at most 5 words (its variables plus what it closes
+;;     over): `Sup` carries the frontier and the step for that reason.
+;;   - `state` stands only in a type position, so the two records that carry
+;;     one are spelled as types at each `record-new`, not declared.
+;;
+;; What the app supplies (there is no ambient graph and no protocol here):
+;;   node   [:fn [[:i64 :i64 state] state]]  (id, step, state) -> next state.
+;;          The oracle's node returns a partial update folded through channel
+;;          reducers; here the node returns the folded state. The oracle's
+;;          :on-event sees {:node :updates :state :step}: the node closure
+;;          sees the same (id, step, state-before) and returns state-after.
+;;          Write the lambda as `(fn [id step s] (my-node id step s))` over a
+;;          named, typed function.
+;;   route  [:fn [[:i64 state] :i64]]         (id, state') -> packed targets,
+;;          END included, or `no-route` (-1) when the node has no conditional
+;;          edge -- then the static `edges` apply.
+;;   edges  :vector-i64  [from to from to ...], `to` may be END.
+;;
+;; Checkpoints are DATA in and out (`Ckpt`): the oracle's checkpointer stores
+;; are host adapters; persistence is the host's, the superstep is the guest's.
+;; A thrown ex-info in the oracle ("Recursion limit reached", "Unknown node",
+;; "No entry point") is a `:status` here: :recursion-limit :unknown-node
+;; :no-entry.
+(ns langgraph.core
+  (:params [state])
+  (:export [end-id no-route
+            pack-empty pack-count pack-at pack-conj pack-contains?
+            graph start run with-state
+            ck-st ck-step ck-frontier ck-status
+            static-successors]))
+
+;; ---------------------------------------------------------------- packing
+
+(defn end-id [] :i64 127)
+(defn no-route [] :i64 -1)
+
+(defn pack-empty [] :i64 0)
+
+(defn pack-count [p :i64] :i64 (- p (* 16 (quot p 16))))
+
+(defn- pow128 [k :i64] :i64
+  (loop [i 0 acc 1]
+    (if (>= i k) acc (recur (+ i 1) (* acc 128)))))
+
+(defn pack-at [p :i64 i :i64] :i64
+  (let [digits (quot p 16)
+        q (quot digits (pow128 i))]
+    (- q (* 128 (quot q 128)))))
+
+(defn pack-contains? [p :i64 id :i64] :i64
+  (let [n (pack-count p)]
+    (loop [i 0]
+      (if (>= i n) 0
+          (if (= (pack-at p i) id) 1 (recur (+ i 1)))))))
+
+;; distinct-preserving append (the oracle's `(vec (distinct ...))` keeps the
+;; first occurrence); -1 when the 8-slot ceiling is hit
+(defn pack-conj [p :i64 id :i64] :i64
+  (if (= 1 (pack-contains? p id))
+    p
+    (let [n (pack-count p)]
+      (if (>= n 8)
+        -1
+        (+ (+ p 1) (* 16 (* id (pow128 n))))))))
+
+;; ---------------------------------------------------------------- records
+
+(defrecord Graph [entry :i64 limit :i64 ibefore :i64 iafter :i64 node-count :i64])
+
+(defn graph [entry :i64 limit :i64 ibefore :i64 iafter :i64 node-count :i64] [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]]
+  (->Graph entry limit ibefore iafter node-count))
+
+;; Ckpt {st step frontier status} -- the oracle's checkpoint map
+(defn ck-st [ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] state (:st ck))
+(defn ck-step [ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] :i64 (:step ck))
+(defn ck-frontier [ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] :i64 (:frontier ck))
+(defn ck-status [ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] :keyword (:status ck))
+
+;; Sup {st nf ih fr step} -- one superstep's fold: state so far, next
+;; frontier, `ih` = 2 * index-into-the-frontier + interrupt-after-hit (one
+;; word: a record has at most 5 fields, its constructor being a function of
+;; the ABI's 5 parameters; an unknown node id marks ih = -2 - id), the
+;; frontier, step
+(defn- sup-st [sup [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]] state (:st sup))
+(defn- sup-i [sup [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]] :i64 (quot (:ih sup) 2))
+(defn- sup-hit [sup [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]] :i64 (- (:ih sup) (* 2 (quot (:ih sup) 2))))
+
+(defn start [g [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]] s state] [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]
+  (if (= 0 (pack-count (:entry g)))
+    (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] s 0 0 :no-entry)
+    (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] s 0 (:entry g) :running)))
+
+;; the oracle's update-state!: a new checkpoint one step later with the edited
+;; state; the frontier and status are kept
+(defn with-state [ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] s state] [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]
+  (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] s (+ (:step ck) 1) (:frontier ck) (:status ck)))
+
+;; ---------------------------------------------------------------- edges
+
+;; static successors of `id` appended to the packed list `nf`, END dropped;
+;; -1 on overflow
+(defn static-successors [edges :vector-i64 id :i64 nf :i64] :i64
+  (let [n (vector-count edges)]
+    (loop [j 0 nf nf]
+      (if (or (>= (+ j 1) n) (< nf 0))
+        nf
+        (if (= id (vector-at edges j))
+          (let [to (vector-at edges (+ j 1))]
+            (recur (+ j 2) (if (= to 127) nf (pack-conj nf to))))
+          (recur (+ j 2) nf))))))
+
+;; packed targets `p` appended to `nf`, END dropped; -1 on overflow
+(defn- merge-targets [nf :i64 p :i64] :i64
+  (let [n (pack-count p)]
+    (loop [k 0 nf nf]
+      (if (or (>= k n) (< nf 0))
+        nf
+        (let [to (pack-at p k)]
+          (recur (+ k 1) (if (= to 127) nf (pack-conj nf to))))))))
+
+(defn- any-in? [fr :i64 set :i64] :i64
+  (let [n (pack-count fr)]
+    (loop [i 0]
+      (if (>= i n) 0
+          (if (= 1 (pack-contains? set (pack-at fr i))) 1 (recur (+ i 1)))))))
+
+;; ---------------------------------------------------------------- superstep
+
+;; one node of the superstep: the node at index i of the frontier, its
+;; successors merged into nf; i = -1 - id marks an unknown node id
+(defn- run-one [g [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]] edges :vector-i64 node [:fn [[:i64 :i64 state] state]] route [:fn [[:i64 state] :i64]] sup [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]] [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]
+  (let [id (pack-at (:fr sup) (sup-i sup))]
+    (if (or (< id 0) (>= id (:node-count g)))
+      (record-new [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]] (sup-st sup) (:nf sup) (- -2 id) (:fr sup) (:step sup))
+      (let [s2 (node id (:step sup) (sup-st sup))
+            routed (route id s2)
+            nf (if (< routed 0)
+                 (static-successors edges id (:nf sup))
+                 (merge-targets (:nf sup) routed))
+            hit (if (= 1 (pack-contains? (:iafter g) id)) 1 (sup-hit sup))]
+        (record-new [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]] s2 nf (+ (* 2 (+ (sup-i sup) 1)) hit) (:fr sup) (:step sup))))))
+
+;; the fold's initial value: the checkpoint's state, an empty next frontier,
+;; no hit, index 0, the checkpoint's frontier and step. A function of its own
+;; because a loop's initial value is analysed in the helper's scope: a record
+;; parameter read there is one more captured word (and, read by keyword, an
+;; untyped one).
+(defn- sup-init [ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]
+  (record-new [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]] (ck-st ck) 0 0 (:frontier ck) (:step ck)))
+
+;; run every node of the frontier in order from the fold `sup0`, folding the
+;; state; returns the Sup fold (hit = 1 when a node in this superstep is in
+;; `iafter`, nf = -1 on overflow, i < 0 on an unknown node id)
+(defn- superstep [g [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]] edges :vector-i64 node [:fn [[:i64 :i64 state] state]] route [:fn [[:i64 state] :i64]] sup0 [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]] [:record :langgraph.core/Sup [[:st state] [:nf :i64] [:ih :i64] [:fr :i64] [:step :i64]]]
+  (loop [sup sup0]
+    (if (or (>= (sup-i sup) (pack-count (:fr sup))) (< (:ih sup) 0) (< (:nf sup) 0))
+      sup
+      (recur (run-one g edges node route sup)))))
+
+;; One iteration of the oracle's run-loop: the checkpoint after this
+;; superstep, :running when the loop goes on. A resumed checkpoint arrives as
+;; :resuming for exactly this one iteration: its frontier is the node we
+;; stopped before, so interrupt-before is not re-triggered on it (the oracle's
+;; skip-before?). Not the loop body itself: a loop whose value is a record
+;; may only leave through its own variable (a `record-new` in the exit branch
+;; leaves the loop typed i64, measured 2026-09-16), so every exit is a status
+;; the loop stops on.
+(defn- step-ck [g [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]] edges :vector-i64 node [:fn [[:i64 :i64 state] state]] route [:fn [[:i64 state] :i64]] ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]
+  (if (= 0 (pack-count (ck-frontier ck)))
+    (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (ck-st ck) (ck-step ck) 0 :done)
+    (if (> (ck-step ck) (:limit g))
+      (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (ck-st ck) (ck-step ck) (ck-frontier ck) :recursion-limit)
+      (if (and (not (= :resuming (ck-status ck)))
+               (= 1 (any-in? (ck-frontier ck) (:ibefore g))))
+        (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (ck-st ck) (ck-step ck) (ck-frontier ck) :interrupted)
+        (let [sup (superstep g edges node route (sup-init ck))]
+          (if (< (:ih sup) 0)
+            (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (sup-st sup) (ck-step ck) (ck-frontier ck) :unknown-node)
+            (if (< (:nf sup) 0)
+              (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (sup-st sup) (ck-step ck) (ck-frontier ck) :frontier-overflow)
+              (if (= 1 (sup-hit sup))
+                (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (sup-st sup) (+ (ck-step ck) 1) (:nf sup) :interrupted)
+                (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (sup-st sup) (+ (ck-step ck) 1) (:nf sup) :running)))))))))
+
+(defn- run-loop [g [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]] edges :vector-i64 node [:fn [[:i64 :i64 state] state]] route [:fn [[:i64 state] :i64]] ck0 [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]
+  (loop [ck ck0]
+    (if (or (= :running (:status ck)) (= :resuming (:status ck)))
+      (recur (step-ck g edges node route ck))
+      ck)))
+
+;; A :running checkpoint starts; a :done one continues from the entry with its
+;; state and step (the oracle's run* on a finished thread); an :interrupted
+;; one resumes. Any other status is returned unchanged -- a refused run is
+;; not re-run.
+(defn run [g [:record :langgraph.core/Graph [[:entry :i64] [:limit :i64] [:ibefore :i64] [:iafter :i64] [:node-count :i64]]] edges :vector-i64 node [:fn [[:i64 :i64 state] state]] route [:fn [[:i64 state] :i64]] ck [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]] [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]]
+  (if (= :done (ck-status ck))
+    (if (= 0 (pack-count (:entry g)))
+      (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (ck-st ck) (ck-step ck) 0 :no-entry)
+      (run-loop g edges node route (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (ck-st ck) (ck-step ck) (:entry g) :running)))
+    (if (= :running (ck-status ck))
+      (run-loop g edges node route ck)
+      (if (= :interrupted (ck-status ck))
+        (run-loop g edges node route (record-new [:record :langgraph.core/Ckpt [[:st state] [:step :i64] [:frontier :i64] [:status :keyword]]] (ck-st ck) (ck-step ck) (ck-frontier ck) :resuming))
+        ck))))

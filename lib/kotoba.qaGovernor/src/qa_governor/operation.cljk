@@ -1,0 +1,135 @@
+(ns qa-governor.operation
+  "OperationActor — one repo QA pass = one supervised actor run, expressed as
+  a langgraph-clj StateGraph (ADR-2607031100's remaining open question: real
+  StateGraph wiring, not just the pure rubric/governor/ledger core).
+
+  Mirrors the containment + independent-governor + append-only-ledger
+  topology every other actor in this codebase uses (minidrama.operation /
+  tashikame.operation / tsumugu.operation / sng.synthesis): the proposal-
+  producing node is sealed into :collect, its output is ALWAYS routed through
+  qa-governor.governor (:govern) before anything commits to the score ledger.
+
+  Node here is `qa-governor.collectors.repo/collect` — today that means the
+  5 DETERMINISTIC, LLM-free evidence collectors (no self-reported score to
+  distrust), not yet the qualitative LLM-scoring node ADR-2607031100's Open
+  Questions still flag as future work. The governor's evidence/score
+  consistency check stays valuable even here: it's a regression guard against
+  a collector computing a score its own evidence contradicts, not only a
+  defense against an untrusted LLM. Swapping in a real LLM-advisor node later
+  is exactly the kind of injected swap this topology is built for — it would
+  slot in as an additional proposal source feeding the SAME :govern node,
+  no other node needs to change.
+
+  Everything the actor depends on is injected (each a swap, not a rewrite):
+    - collect-fn   (real qa-governor.collectors.repo/collect | a test double)
+    - rubric       (default-rubric | extend-rubric result)          — :rubric opt
+    - ledger-get/-put! (in-memory atom | a future durable store)    — :ledger opt
+    - now-ms-fn    (System/currentTimeMillis | a fixed clock in tests)
+
+  This is JVM-only (.clj, not .cljc): collect-fn's real implementation shells
+  out to `kbb -M:test`/`:lint` (qa-governor.collectors.clojure-project-shell),
+  which has no cljs/SCI equivalent — matching collectors.repo's own scope."
+  (:require [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [qa-governor.rubric :as rubric]
+            [qa-governor.governor :as governor]
+            [qa-governor.ledger :as ledger]))
+
+(defn mem-ledger-store
+  "An in-memory ledger store: {:ledger-get (fn []) :ledger-put! (fn [ledger])}
+  backed by a single atom — the MemStore-equivalent default every actor in
+  this codebase offers before a durable backend is wired in."
+  []
+  (let [a (atom ledger/empty-ledger)]
+    {:ledger-get (fn [] @a)
+     :ledger-put! (fn [ledger'] (reset! a ledger'))}))
+
+(defn build
+  "Compiles the qa-governor OperationActor graph. opts:
+    :collect-fn   — (fn [project-dir]) -> proposal (default:
+                     qa-governor.collectors.repo/collect, requires that ns —
+                     kept as a lazy default so tests can inject a pure double
+                     without shelling out)
+    :rubric       — a qa-governor.rubric map (default: rubric/default-rubric)
+    :ledger-get   / :ledger-put! — injected ledger store (default: a fresh
+                     mem-ledger-store)
+    :now-ms-fn    — (fn []) -> epoch-ms, for the ledger's required timestamp
+                     (default: System/currentTimeMillis; pure/deterministic
+                     in tests via a fixed-value fn)
+    :checkpointer — langgraph checkpointer (default: in-mem)"
+  [& [{:keys [collect-fn rubric ledger-get ledger-put! now-ms-fn checkpointer]}]]
+  (let [collect-fn (or collect-fn
+                        (requiring-resolve 'qa-governor.collectors.repo/collect))
+        rubric (or rubric rubric/default-rubric)
+        {default-get :ledger-get default-put! :ledger-put!} (mem-ledger-store)
+        ledger-get (or ledger-get default-get)
+        ledger-put! (or ledger-put! default-put!)
+        now-ms-fn (or now-ms-fn (fn [] (System/currentTimeMillis)))
+        checkpointer (or checkpointer (cp/mem-checkpointer))]
+    (-> (g/state-graph
+         {:channels
+          {:request     {:default nil}   ; {:repo :project-dir}
+           :proposal    {:default nil}   ; collect-fn's evidence-backed entries
+           :verdict     {:default nil}   ; governor/evaluate-proposal result
+           :disposition {:default nil}   ; :commit | :hold
+           :record      {:default nil}   ; the ledger entry to commit
+           :audit       {:reducer into :default []}}})
+
+        (g/add-node :intake (fn [s] s))
+
+        ;; The evidence-producing node — deterministic collectors today, an
+        ;; LLM-advisor node's proposal could feed the SAME :govern node later.
+        (g/add-node :collect
+          (fn [{:keys [request]}]
+            (let [proposal (collect-fn (:project-dir request))]
+              {:proposal proposal
+               :audit [{:t :collected :repo (:repo request) :proposal proposal}]})))
+
+        ;; qa-governor.governor — independent evidence/score consistency check.
+        (g/add-node :govern
+          (fn [{:keys [proposal]}]
+            {:verdict (governor/evaluate-proposal proposal)}))
+
+        ;; Decide: any rejected entry -> :hold; else :commit. now-ms-fn is
+        ;; closed over from `build`'s bindings, not graph state -- the
+        ;; ledger's timestamp is this run's own concern, not something a
+        ;; caller passes through :request.
+        (g/add-node :decide
+          (fn [{:keys [request verdict]}]
+            (if (:all-approved? verdict)
+              (let [scores (into {} (map (juxt :category :score) (:approved verdict)))
+                    total (rubric/weighted-score rubric scores)]
+                {:disposition :commit
+                 :record {:repo (:repo request)
+                          :timestamp-ms (now-ms-fn)
+                          :scores scores
+                          :total total
+                          :grade (rubric/grade total)
+                          :verdict :approved}})
+              {:disposition :hold})))
+
+        ;; Commit — the ONLY node that writes the score ledger (append-only,
+        ;; qa-governor.ledger's own contract: approved results only).
+        (g/add-node :commit
+          (fn [{:keys [record]}]
+            (ledger-put! (ledger/record (ledger-get) record))
+            {:audit [{:t :committed :record record}]}))
+
+        ;; Hold — no ledger write (qa-governor.ledger records approved scores
+        ;; only, by design); the rejection is still visible in this run's
+        ;; :audit channel for the caller to inspect/log elsewhere.
+        (g/add-node :hold
+          (fn [{:keys [request verdict]}]
+            {:audit [{:t :held :repo (:repo request) :rejected (:rejected verdict)}]}))
+
+        (g/set-entry-point :intake)
+        (g/add-edge :intake :collect)
+        (g/add-edge :collect :govern)
+        (g/add-edge :govern :decide)
+        (g/add-conditional-edges :decide
+          (fn [{:keys [disposition]}]
+            (case disposition :commit :commit :hold)))
+        (g/set-finish-point :commit)
+        (g/set-finish-point :hold)
+
+        (g/compile-graph {:checkpointer checkpointer}))))

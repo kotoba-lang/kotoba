@@ -1,0 +1,192 @@
+(ns epo-ops-register
+  "Register for EPO Open Patent Services (OPS) — the free 'Non-paying' developer
+  tier (3.5 GB/week) — via computer use, to obtain a Consumer Key + Consumer
+  Secret for OAuth2. Drives the frontmost browser through developers.epo.org:
+  create account → (email confirmation, handled out-of-band) → log in → My Apps
+  → Add a new App → read the Consumer Key/Secret and store them in 1Password.
+
+  Runs on a LOCAL model by default — Ollama serving gemma 4 QAT (see jvm-host) —
+  so nothing leaves the machine. Model backend: LLM=ollama|gemini|anthropic.
+
+     kbb -M:dev:examples -e \\
+       \"(require 'epo-ops-register) (epo-ops-register/-main)\"
+
+  Vault: the account password is typed via `type_secret` (resolved at the host
+  from 1Password item `epo.ops/developer-account`, field `password`) — the model
+  never sees it. The Consumer Key/Secret the agent READS off the My Apps page are
+  written back into that same item by the `save_credentials` tool.
+
+  Two-stage reality: EPO emails a confirmation link mid-registration and may show
+  a CAPTCHA. A single agent run cannot click an email link or solve a CAPTCHA —
+  on either it calls `done success=false` and you (a) confirm via the email that
+  lands in jun784@gmail.com (etzhayyim.com catch-all) / solve the CAPTCHA, then
+  (b) re-run; on the second pass the account exists, so the agent logs in and
+  creates the app. STAGE=register | createapp selects which half to run.
+
+  Env:
+    EPO_REG_NAME    registrant full name        (required for STAGE=register)
+    EPO_REG_EMAIL   account email               (default epo@etzhayyim.com)
+    EPO_VAULT_ITEM  1Password item              (default \"epo.ops/developer-account\")
+    EPO_VAULT       1Password vault name        (default \"gftdcojp\")
+    EPO_APP_NAME    app name to create          (default \"hirameki-patent-mirror\")
+    STAGE           register | createapp        (default register)
+    VAULT           op | bw                     (default op; op must be signed in)"
+  (:require [computeruse.macos :as macos]
+            [computeruse.computer :as c]
+            [computeruse.vault :as vault]
+            [computeruse.agent :as agent]
+            [jvm-host :as host]
+            [langchain.db :as db])
+  (:import [java.util List]))
+
+(def register-url "https://developers.epo.org/")
+(def register-start-url
+  (or (System/getenv "EPO_REGISTER_URL")
+      "https://developers.epo.org/en/register/start-process"))
+
+(defn- sh [& args]
+  (let [p (.start (ProcessBuilder. ^List (vec args)))
+        out (slurp (.getInputStream p))
+        err (slurp (.getErrorStream p))
+        code (.waitFor p)]
+    (when-not (zero? code)
+      (throw (ex-info (str "command failed (exit " code ")")
+                      {:exit code :stderr (subs err 0 (min 200 (count err)))})))
+    out))
+
+(defn ensure-browser-on-main-display!
+  "Move the browser's front window onto the MAIN display (origin 0,0). The macOS
+  host's screencapture grabs the MAIN display and cliclick clicks main-display
+  coordinates — so if the browser sits on a second display or a separate
+  fullscreen Space, the agent is BLIND to it (every screenshot shows whatever is
+  on the main display) and its clicks miss. Pinning the window to {0,25,…} drops
+  it onto the main display's visible Space, where the agent can see and click it.
+  This is the fix for the 'agent can't see the browser' trap."
+  [app]
+  (try
+    (sh "osascript"
+        "-e" (str "tell application \"" app "\" to activate")
+        "-e" (str "tell application \"" app "\" to set bounds of front window to {0, 25, 1440, 900}"))
+    (catch Exception _ nil)))
+
+(defn browser-focused-computer
+  "Wraps an IComputer so `app` is forced frontmost before every action. This
+  kills the focus contention that breaks a global-input agent launched from a
+  terminal: System Events keystrokes (osascript) go to the FRONTMOST app, so
+  without this they land in the terminal, not the browser. cliclick clicks then
+  reliably hit the visible browser. Read-only ops (move/cursor) skip activation."
+  [inner app]
+  (let [front! (fn [] (try (sh "osascript" "-e"
+                               (str "tell application \"" app "\" to activate"))
+                           (catch Exception _ nil)))]
+    (reify c/IComputer
+      (-screenshot [_] (front!) (c/-screenshot inner))
+      (-key! [_ combo] (front!) (c/-key! inner combo))
+      (-type! [_ text] (front!) (c/-type! inner text))
+      (-mouse-move! [_ x y] (c/-mouse-move! inner x y))
+      (-click! [_ b x y] (front!) (c/-click! inner b x y))
+      (-scroll! [_ x y d a] (front!) (c/-scroll! inner x y d a))
+      (-cursor-position [_] (c/-cursor-position inner)))))
+
+(def system-prompt
+  (str "You are a computer-use agent operating the user's macOS desktop to register "
+       "a free developer account on the European Patent Office Open Patent Services "
+       "site (developers.epo.org) and obtain API credentials, working in the frontmost "
+       "browser window.\n"
+       "HARD RULES (credentials):\n"
+       "- NEVER use the `type` action for the account password. Use `type_secret` with "
+       "the provided secret_ref; the host fills it from the vault and you never see it.\n"
+       "- The Consumer Key and Consumer Secret shown on the 'My Apps' page are NOT "
+       "secrets to hide from you — READ them and pass them to `save_credentials`.\n"
+       "HARD RULES (scope + honesty):\n"
+       "- Choose the FREE 'Non-paying' access tier.\n"
+       "- Do not invent personal data. Use only the name/email given in the task.\n"
+       "- Accept the EPO terms of use ONLY as required to complete registration.\n"
+       "- If a CAPTCHA, a 2FA prompt, or an 'verify your email' wall appears that you "
+       "cannot pass, call `done` success=false and state exactly what is blocking — do "
+       "NOT attempt to solve a CAPTCHA.\n"
+       "Work step by step: cmd+l focuses the address bar. Screenshot before and after "
+       "every action to verify the page state."))
+
+(defn save-credentials-tool [{:keys [item vault]}]
+  {:name "save_credentials"
+   :description
+   (str "Save the EPO OPS Consumer Key and Consumer Secret read from the My Apps "
+        "page. Call once, after the app is created and BOTH values are visible. "
+        "Stores them into the 1Password item. Returns confirmation.")
+   :schema {:type "object"
+            :properties {:consumer_key {:type "string"}
+                         :consumer_secret {:type "string"}}
+            :required ["consumer_key" "consumer_secret"]}
+   :fn (fn [{:keys [consumer_key consumer_secret]}]
+         (sh "op" "item" "edit" item
+             (str "consumer_key[text]=" consumer_key)
+             (str "consumer_secret[password]=" consumer_secret)
+             "--vault" vault)
+         (str "Saved Consumer Key + Secret to 1Password item " item))})
+
+(defn make-vault []
+  (case (or (System/getenv "VAULT") "op")
+    "op" (vault/op-vault {:account (System/getenv "OP_ACCOUNT")})
+    "bw" (vault/bw-vault {})
+    (throw (ex-info "VAULT must be op or bw" {}))))
+
+(defn register-task [name email pw-ref]
+  (str "Goal: in the frontmost browser, open " register-start-url " and REGISTER a new "
+       "free developer account (this is the EPO registration start page).\n"
+       "- Choose the FREE 'Non-paying' access tier if asked.\n"
+       "- Full name: " name "\n"
+       "- Email: " email "\n"
+       "- Password field(s): use `type_secret` with secret_ref " (pr-str pw-ref)
+       " (if asked to confirm the password, use the same secret_ref again).\n"
+       "- Accept the terms of use if required, then submit.\n"
+       "When the site says a confirmation email has been sent (or shows any CAPTCHA / "
+       "email-verification wall you cannot pass), call `done` success=false and say so "
+       "— the user will confirm via email and re-run with STAGE=createapp."))
+
+(defn createapp-task [email pw-ref app-name]
+  (str "Goal: the account " email " already exists and its email is confirmed. In the "
+       "frontmost browser, open " register-url ", LOG IN, then create an app and capture "
+       "its credentials.\n"
+       "- Click 'Log in' / 'Sign in'. Email: " email ". Password: use `type_secret` "
+       "secret_ref " (pr-str pw-ref) ".\n"
+       "- After login, open 'My Apps' (upper-right), click 'Add a new App'.\n"
+       "- App name: " app-name ". Submit to create it.\n"
+       "- The page now shows a 'Consumer Key' and 'Consumer Secret'. Read BOTH exactly "
+       "and call `save_credentials` with them, then call `done` success=true.\n"
+       "If a CAPTCHA or 2FA blocks login, call `done` success=false and say what blocked."))
+
+(defn -main [& [stage-arg]]
+  (let [stage (or stage-arg (System/getenv "STAGE") "register")
+        email (or (System/getenv "EPO_REG_EMAIL") "epo@etzhayyim.com")
+        vname (or (System/getenv "EPO_VAULT") "gftdcojp")
+        item (or (System/getenv "EPO_VAULT_ITEM") "epo.ops/developer-account")
+        app-name (or (System/getenv "EPO_APP_NAME") "hirameki-patent-mirror")
+        browser (or (System/getenv "EPO_BROWSER") "Google Chrome")
+        pw-ref {:item item :field "password" :vault vname}
+        task (case stage
+               "register" (register-task
+                           (or (System/getenv "EPO_REG_NAME")
+                               (throw (ex-info "EPO_REG_NAME is required for STAGE=register" {})))
+                           email pw-ref)
+               "createapp" (createapp-task email pw-ref app-name)
+               (throw (ex-info "STAGE must be register or createapp" {:stage stage})))
+        _ (ensure-browser-on-main-display! browser)
+        conn (db/create-conn agent/log-schema)
+        {:keys [result done steps]}
+        (agent/run (cond-> {:model (host/make-model)
+                            :computer (browser-focused-computer (macos/macos-computer) browser)
+                            :vault (make-vault)
+                            :system system-prompt
+                            :task task
+                            :history-conn conn
+                            :session-id (str "epo-ops-" stage)
+                            :max-steps 40}
+                     (= stage "createapp")
+                     (assoc :tools [(save-credentials-tool {:item item :vault vname})])))]
+    (println "stage:" stage "| done:" done "| result:" result "| steps:" steps)
+    (println "audit:"
+             (sort-by first
+                      (db/q '[:find ?step ?a
+                              :where [?e :caction/step ?step] [?e :caction/action ?a]]
+                            (db/db conn))))))

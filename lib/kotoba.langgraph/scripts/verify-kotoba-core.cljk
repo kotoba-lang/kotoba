@@ -1,0 +1,111 @@
+#!/usr/bin/env kbb
+;; scripts/verify-kotoba-core.cljk -- the guest half of the langgraph.core
+;; parity, end to end and JVM-free:
+;;
+;;   kbb --backend sci scripts/verify-kotoba-core.cljk
+;;
+;; 1. the `test-sN` literals in test/langgraph/kotoba/scenarios.kotoba are
+;;    the codes of test/langgraph/kotoba/expected.edn (the oracle test pins
+;;    the same file, so the two sides cannot drift apart silently);
+;; 2. `amu test --source-path src` runs the nine tests on the KIR
+;;    interpreter, wasm32 and the restricted ESM; all three must be green.
+;;    (Until kotoba-script #102 the ESM third trapped `invalid-i64`: amu's
+;;    linker renames a module's closure dispatcher and kotoba-script keyed
+;;    on the name. amu ADR 0350 pins the fix; a js row that goes red again
+;;    is that regression, and the FAIL line names the test and target.)
+;; 3. the fixture is compiled to this machine's native target
+;;    (aarch64-macos / x86_64-linux), each `sN` is extracted with
+;;    `amu extract-native` and EXECUTED through amu's kexe loader, and the
+;;    printed value must equal expected.edn. That execution is the gate for
+;;    "compiles to a native binary": `:ok true` from compile is not it.
+;;
+;; amu is the west sibling kotoba-lang/amu or $AMU. Exit 0 all green; 1 a
+;; mismatch or a required target red; 2 amu / cc missing or a compile refused.
+(ns verify-kotoba-core
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            [kotoba.lang.edn :as edn]
+            [clojure.string :as str]
+            [nbb.core :refer [*file*]]))
+
+(def here (path/resolve (path/dirname *file*) ".."))
+(defn- root [& parts] (apply path/join here parts))
+
+(def fixture (root "test" "langgraph" "kotoba" "scenarios.kotoba"))
+(def expected (edn/read-string (fs/readFileSync (root "test" "langgraph" "kotoba" "expected.edn") "utf8")))
+(def scenarios [:s1 :s2 :s3 :s4 :s5 :s6 :s7 :s8 :s9])
+(def fuel "2000000")
+
+(def failures (atom 0))
+(defn- check! [label ok? detail]
+  (if ok?
+    (println (str "ok   " label))
+    (do (swap! failures inc)
+        (println (str "FAIL " label " -- " (pr-str detail))))))
+
+(defn- amu []
+  (or (aget js/process.env "AMU")
+      (let [sibling (path/resolve here ".." "amu" "bin" "amu")]
+        (when (fs/existsSync sibling) sibling))
+      (do (println "REFUSED: amu not found; set AMU=<path to kotoba-lang/amu/bin/amu>")
+          (js/process.exit 2))))
+
+(defn- run [command args]
+  (let [r (cp/spawnSync command (clj->js args) #js {:encoding "utf8" :maxBuffer (* 64 1024 1024)})]
+    (when (.-error r) (println "REFUSED:" command (.-message (.-error r))) (js/process.exit 2))
+    {:status (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+;; 1. the literals
+(let [text (fs/readFileSync fixture "utf8")]
+  (doseq [s scenarios]
+    (let [m (re-find (re-pattern (str "\\(defn test-" (name s) " \\[\\] :i64 \\(if \\(= \\(" (name s) "\\) (\\d+)\\) 1 0\\)\\)")) text)]
+      (check! (str "literal " (name s) " = " (get expected s))
+              (and m (= (str (get expected s)) (second m)))
+              {:found (second m)}))))
+
+;; 2. interpreter / wasm32 (required), js (reported)
+(let [amu-path (amu)
+      {:keys [status out err]} (run amu-path ["test" fixture "--source-path" (root "src") "--fuel" fuel "--json"])
+      report (try (edn/read-string (str/trim out)) (catch :default _ nil))
+      by-target (fn [target] (get-in report [:results target]))
+      green? (fn [rows] (and (seq rows) (every? :ok rows)))]
+  (check! "amu test: report readable" (map? report) {:status status :err (subs err 0 (min 400 (count err)))})
+  (check! "amu test: 9 tests" (= 9 (count (:tests report))) (:tests report))
+  (check! "amu test: KIR interpreter green" (green? (by-target :jvm-kir)) (remove :ok (by-target :jvm-kir)))
+  (check! "amu test: wasm32 green" (green? (by-target :wasm)) (remove :ok (by-target :wasm)))
+  (check! "amu test: js (restricted ESM) green" (green? (by-target :js)) (remove :ok (by-target :js))))
+
+;; 3. native: compile, extract each export, execute
+(let [amu-path (amu)
+      platform (.-platform js/process)
+      arch (.-arch js/process)
+      isa (cond (contains? #{"arm64" "aarch64"} arch) "aarch64" (= "x64" arch) "x86_64"
+                :else (do (println "REFUSED: unsupported native arch" arch) (js/process.exit 2)))
+      target (str isa "-" (if (= "darwin" platform) "macos" "linux"))
+      tmp (fs/mkdtempSync (path/join (os/tmpdir) "langgraph-kotoba-core-"))
+      artifact (path/join tmp "scenarios.kexe")
+      loader (path/join tmp "kexe-loader")
+      loader-src (path/resolve (path/dirname amu-path) ".." "tools" "kexe_loader.c")
+      compiled (run amu-path ["compile" fixture "--jvm-free" "--source-path" (root "src")
+                              "--target" target "--fuel" fuel "--output" artifact])]
+  (check! (str "native compile " target) (zero? (:status compiled)) (subs (:err compiled) 0 (min 400 (count (:err compiled)))))
+  (when (zero? (:status compiled))
+    (let [cc (run "cc" ["-std=c11" "-O2" loader-src "-o" loader])]
+      (check! "kexe loader compiles" (zero? (:status cc)) (:err cc))
+      (when (zero? (:status cc))
+        (doseq [s scenarios]
+          (let [binary (path/join tmp (str (name s) ".bin"))
+                extracted (run amu-path ["extract-native" artifact "--symbol" (name s) "--output" binary])
+                offset (second (re-find #":offset ([0-9]+)" (:out extracted)))]
+            (if-not offset
+              (check! (str "native " (name s) " extracted") false (subs (:err extracted) 0 (min 300 (count (:err extracted)))))
+              (let [executed (run loader [binary offset "0" isa "-"])
+                    printed (str/trim (:out executed))]
+                (check! (str "native " (name s) " executes to " (get expected s))
+                        (= (str (get expected s)) printed)
+                        {:printed printed :status (:status executed) :err (:err executed)})))))))))
+
+(println (str "verify-kotoba-core: " (if (zero? @failures) "all green" (str @failures " failure(s)"))))
+(js/process.exit (if (zero? @failures) 0 1))

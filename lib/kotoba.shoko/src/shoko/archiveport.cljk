@@ -1,0 +1,247 @@
+(ns shoko.archiveport
+  "ArchiveTarget port — the ONLY place a file actually leaves the building.
+  An archive-LLM proposal is data (a `:draft` record) until a human approves
+  sharing it; `share!` is called exactly once, after that approval, by
+  `shoko.operation`'s commit step — the actuation (granting `principal`
+  access + handing the delivered content to an injected Distributor).
+  `propose-revision!` is the 'casual commit' analog (teian.deckport's/
+  koyomi.scheduleport's): recording that an archival draft candidate exists,
+  no external effect yet.
+
+  `mock-archiveport` is the default — a deterministic in-memory target so
+  the actor is runnable/testable with no network/creds. A real
+  implementation would still call an injected Distributor fn (e.g. an email/
+  notification API telling `principal` they now have access) for actual
+  delivery, same injection shape as kekkai/teian/koyomi's ports — a live
+  client is NOT shipped here (inject your own).
+
+  `r2-archiveport` (JVM-only, below) IS a real, opt-in ArchiveTarget backed
+  by a Cloudflare R2 bucket via R2's S3-compatible API — mock stays the
+  default everywhere (shoko.operation/build's :archiveport opt), real R2 is
+  only ever used when a caller explicitly constructs and injects one.
+  shoko is a plain JVM library, not a Cloudflare Worker, so it cannot use
+  the R2Bucket binding app-aozora's PDS Worker uses (ADR-2607071000,
+  `.put`/`.get` on an injected binding) — it must speak R2's S3-compatible
+  API over plain HTTP instead, which means signing every request with AWS
+  SigV4. That signing is `kotoba-lang/sigv4` (ADR-2607254100).
+
+  This file used to carry a function-for-function JVM port of
+  `kotobase.sigv4`, written because that one was ClojureScript-only
+  (`js/encodeURIComponent` et al) and so not `require`-able from a JVM host.
+  The shared library is portable `.cljc` with crypto injected through a
+  protocol — `javax.crypto` here, WebCrypto in a Worker — so the reason for
+  the port is gone, and with it the port's obligation to stay in step with an
+  original it could not see. What remains below is R2's own request shape,
+  which is genuinely this repo's: an endpoint host rather than a URL,
+  `Authorization` capitalised for `jvm-http-fn`, and byte[] payloads.
+
+  Still JVM-only (`#?(:clj ...)`): shoko has no cljs/kototama build target
+  today (deps.edn has no shadow-cljs; cli.clj/cacao.clj are already
+  .clj-only)."
+  ;; str/clojure.edn are used ONLY inside the #?(:clj ...) R2/SigV4
+  ;; section below (see docstring above) — under a :cljs reading that whole
+  ;; section vanishes, so clj-kondo's cljs-side pass would otherwise flag
+  ;; these as unused (and a fully-conditional #?(:clj [...]) require, with no
+  ;; :cljs branch, makes the :cljs ns's :require empty, which clj-kondo
+  ;; rejects outright) — ^:clj-kondo/ignore is the correct scoped escape
+  ;; hatch for a require that's genuinely host-specific by design.
+  (:require [kotoba.bytes :as kbytes] ^:clj-kondo/ignore [kotoba.lang.text :as str]
+            ^:clj-kondo/ignore [kotoba.lang.edn :as edn]
+            ^:clj-kondo/ignore [sigv4.crypto :as sigv4-crypto]
+            ^:clj-kondo/ignore [sigv4.request :as sigv4]))
+
+(defprotocol ArchiveTarget
+  (fetch-file [ap file-id] "the file's most recently shared content, or nil")
+  (propose-revision! [ap file content]
+    "record `content` (a drive.model file/folder EDN item) as a proposed
+    archival revision for `file` (the file's full ground-fact record) — not
+    yet shared. Returns a map (e.g. {:branch ...}) to be merged onto the
+    draft so a later :file/share knows the draft was proposed against a real
+    target.")
+  (share! [ap file-id principal content]
+    "grant `principal` access to `content` (the already human-approved,
+    checkpointed drive.model EDN — NEVER a fresh store re-read, see
+    shoko.operation/commit-effects!) and hand it to the target's injected
+    distributor for actual delivery — the actuation. Only ever called after
+    human approval."))
+
+;; ───────────────────────── mock (default, runnable offline) ─────────────────────────
+
+(defn mock-archiveport
+  "A deterministic in-memory ArchiveTarget: `shared` is an atom of
+  {file-id -> {:file-id :principal :content}} so tests/sim can assert on
+  what WOULD have been shared, without any network call. `distributor` is
+  the injected fn `share!` calls with that same map for actual delivery —
+  the default is a no-op (a real Distributor — email/Slack/etc — is caller-
+  injected; not shipped here)."
+  ([] (mock-archiveport (atom {}) (fn [_] nil)))
+  ([shared] (mock-archiveport shared (fn [_] nil)))
+  ([shared distributor]
+   (reify ArchiveTarget
+     (fetch-file [_ file-id] (get @shared file-id))
+     (propose-revision! [_ file _content] {:branch (str "shoko/" (:drive/id file))})
+     (share! [_ file-id principal content]
+       (let [rec {:file-id file-id :principal principal :content content}]
+         (distributor rec)
+         (swap! shared assoc file-id rec)
+         rec)))))
+
+
+;; ───────────────────────── R2 SigV4 (JVM-only, real opt-in) ─────────────────
+;;
+;; The signer is kotoba-lang/sigv4 (ADR-2607254100). This file used to carry a
+;; function-for-function JVM port of kotobase.sigv4, written because that one
+;; was ClojureScript-only (`js/encodeURIComponent` et al) and so not
+;; require-able from a JVM host. The shared library is portable `.cljc` with
+;; crypto injected through a protocol, which removes exactly that obstacle —
+;; and removes the port's obligation to stay in step with an original it could
+;; not see.
+;;
+;; What stays here is R2's own shape: an endpoint *host* rather than a URL,
+;; `Authorization` capitalised the way this repo's http-fn expects, byte[]
+;; payloads, and a java.time.Instant clock.
+
+#?(:clj
+(def ^:private signer-crypto (sigv4-crypto/crypto)))
+
+#?(:clj
+(defn- utf8-bytes ^bytes [^String s] (kbytes/utf8-bytes s)))
+
+#?(:clj
+(defn sign-request
+  "Build a SigV4-signed S3-compatible request map ({:url :method :headers
+  :body}, ready for `jvm-http-fn`) for R2's S3 API.
+
+  opts: :method (:get/:put/:delete), :bucket, :key, :query (map, default
+  {}), :headers (extra request headers to sign + send, default {}),
+  :payload (byte[], default empty — GETs have none), :access-key-id,
+  :secret-access-key, :region (default \"auto\" — R2's SigV4 signing region,
+  confirmed against a live bucket), :endpoint-host (e.g. \"<account-id>.r2.
+  cloudflarestorage.com\"), :now (java.time.Instant, default now — truncated
+  to whole seconds)."
+  [{:keys [method bucket key query headers payload access-key-id secret-access-key
+           region endpoint-host now]
+    :or {region "auto" query {} headers {} payload (byte-array 0)
+         now (java.time.Instant/now)}}]
+  (let [signed (sigv4/signed signer-crypto
+                             {:endpoint (str "https://" endpoint-host)
+                              :bucket bucket
+                              :key key
+                              :region region
+                              :access-key access-key-id
+                              :secret-key secret-access-key
+                              :method method
+                              :query query
+                              :headers headers
+                              :body payload
+                              :now (-> now
+                                       (.truncatedTo java.time.temporal.ChronoUnit/SECONDS)
+                                       .toString)})
+        h (:headers signed)]
+    {:url (:url signed)
+     :method method
+     ;; this repo's jvm-http-fn expects the capitalised name
+     :headers (-> h (dissoc "authorization") (assoc "Authorization" (get h "authorization")))
+     :body payload})))
+
+;; ── HTTP transport (same {:url :method :headers :body} -> {:status :body}
+;; convention as cloudflare.client/jvm-http-fn and cloud-itonami.mail/
+;; jvm-http-fn — byte[] bodied here since R2 payloads are arbitrary bytes,
+;; not JSON/text) ─────────────────────────────────────────────────────────
+
+;; JDK java.net.http refuses to let callers set certain headers directly
+;; (throws IllegalArgumentException: "restricted header name") — "host" is
+;; one (confirmed against the live R2 endpoint, not just docs), since the
+;; JDK derives it from the request URI itself instead. SigV4 still needs
+;; "host" in the SIGNED header set (sign-request puts it there), it just
+;; must not also be re-sent via .header() — the URI's authority already
+;; carries the same value we signed, so the wire header matches regardless.
+#?(:clj
+(def ^:private restricted-headers #{"host" "connection" "content-length" "date" "expect"
+                                    "from" "origin" "referer" "upgrade" "via" "warning"}))
+
+#?(:clj
+(defn jvm-http-fn
+  ([] (jvm-http-fn {}))
+  ([{:keys [timeout-seconds] :or {timeout-seconds 30}}]
+   (fn [{:keys [url method headers body]}]
+     (let [sendable-headers (into {} (remove (fn [[k _]] (restricted-headers (str/lower k)))) headers)
+           builder (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                       (.timeout (java.time.Duration/ofSeconds timeout-seconds))
+                       (as-> b (reduce-kv (fn [b k v] (.header ^java.net.http.HttpRequest$Builder b k v))
+                                          b sendable-headers)))
+           body-bytes (or body (byte-array 0))
+           request (-> (case method
+                        :put (.PUT ^java.net.http.HttpRequest$Builder builder
+                                   (java.net.http.HttpRequest$BodyPublishers/ofByteArray body-bytes))
+                        :get (.GET ^java.net.http.HttpRequest$Builder builder)
+                        :delete (.DELETE ^java.net.http.HttpRequest$Builder builder)
+                        (throw (ex-info "Unsupported HTTP method" {:method method})))
+                      .build)
+           resp (.send (java.net.http.HttpClient/newHttpClient) request
+                      (java.net.http.HttpResponse$BodyHandlers/ofByteArray))]
+       {:status (.statusCode resp) :body (.body resp)})))))
+
+;; ───────────────────────── r2-archiveport (real, opt-in) ─────────────────────────
+
+#?(:clj
+(defn r2-archiveport
+  "A REAL ArchiveTarget backed by a Cloudflare R2 bucket, via R2's S3-
+  compatible API (plain HTTP + SigV4 — no AWS SDK, no Worker runtime).
+  `fetch-file` = GET object; `share!` = PUT object (keyed by file-id) then
+  call the injected distributor; `propose-revision!` stays a pure branch-
+  name computation like mock-archiveport's — R2 has no branch concept and
+  the protocol docstring is explicit that propose-revision! has 'no
+  external effect yet' (only share!, after human approval, ever writes).
+
+  opts:
+    :bucket             R2 bucket name (e.g. \"cloud-itonami-shoko-archive\") — required.
+    :account-id         Cloudflare account id (endpoint host is
+                        \"<account-id>.r2.cloudflarestorage.com\") — falls
+                        back to env R2_ACCOUNT_ID, throws if neither given.
+    :access-key-id      R2 S3 Access Key ID — falls back to env
+                        R2_ACCESS_KEY_ID, throws if neither given.
+    :secret-access-key  R2 S3 Secret Access Key — falls back to env
+                        R2_SECRET_ACCESS_KEY, throws if neither given.
+    :region             SigV4 region — default \"auto\" (R2's own signing
+                        region; confirmed against a live bucket).
+    :key-prefix         object key prefix — default \"shoko/\".
+    :http-fn            HTTP transport — default (jvm-http-fn). Inject a
+                        stub in tests (see archiveport_test.clj) — the
+                        automated suite never needs real creds/network.
+    :distributor        fn share! calls with the delivered record, same
+                        shape as mock-archiveport's — default no-op.
+
+  Every env fallback is looked up lazily (only when the corresponding opt
+  key is absent), so tests that pass explicit :access-key-id/:secret-
+  access-key/:account-id never touch the environment at all."
+  [{:keys [bucket account-id access-key-id secret-access-key region key-prefix http-fn distributor]
+    :or {region "auto" key-prefix "shoko/" http-fn (jvm-http-fn) distributor (fn [_] nil)}}]
+  (let [env-or-throw (fn [v] (or (System/getenv v) (throw (ex-info (str v " is not set") {}))))
+        account-id (or account-id (env-or-throw "R2_ACCOUNT_ID"))
+        access-key-id (or access-key-id (env-or-throw "R2_ACCESS_KEY_ID"))
+        secret-access-key (or secret-access-key (env-or-throw "R2_SECRET_ACCESS_KEY"))
+        endpoint-host (str account-id ".r2.cloudflarestorage.com")
+        object-key (fn [file-id] (str key-prefix file-id ".edn"))
+        call! (fn [{:keys [method key payload req-headers]}]
+                (http-fn (sign-request {:method method :bucket bucket :key key
+                                        :headers (or req-headers {}) :payload (or payload (byte-array 0))
+                                        :access-key-id access-key-id :secret-access-key secret-access-key
+                                        :region region :endpoint-host endpoint-host})))]
+    (reify ArchiveTarget
+      (fetch-file [_ file-id]
+        (let [resp (call! {:method :get :key (object-key file-id)})]
+          (cond
+            (= 404 (:status resp)) nil
+            (< (:status resp) 300) (edn/read-string (kbytes/utf8-string ^bytes (:body resp)))
+            :else (throw (ex-info "R2 GET failed" {:status (:status resp) :file-id file-id})))))
+      (propose-revision! [_ file _content] {:branch (str "shoko/" (:drive/id file))})
+      (share! [_ file-id principal content]
+        (let [rec {:file-id file-id :principal principal :content content}
+              resp (call! {:method :put :key (object-key file-id)
+                          :payload (utf8-bytes (pr-str rec))
+                          :req-headers {"content-type" "application/edn"}})]
+          (when-not (< (:status resp) 300)
+            (throw (ex-info "R2 PUT failed" {:status (:status resp) :file-id file-id})))
+          (distributor rec)
+          rec))))))

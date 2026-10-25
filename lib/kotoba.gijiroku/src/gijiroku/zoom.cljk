@@ -1,0 +1,142 @@
+(ns gijiroku.zoom
+  "Zoom MeetingPlatform client (JVM). Server-to-Server OAuth
+  (https://developers.zoom.us/docs/internal-apps/s2s-oauth/) — an account-level
+  app with `cloud_recording:read` scope, no per-user consent screen. I/O
+  (:http-fn :json-write :json-read) is injected, same host-caps discipline as
+  `kekkai.kotoba` — this namespace is proven against the mock fixtures in
+  test/gijiroku/zoom_test.clj; a live call additionally needs an S2S app
+  registered in the Zoom Marketplace (account-id/client-id/client-secret),
+  which this workspace has not provisioned (same 'contract proven offline,
+  live pending creds' status as kekkai's kotobase.net wiring).
+
+  Endpoints (Zoom API v2):
+    POST https://zoom.us/oauth/token                          — S2S token
+    GET  /v2/meetings/{meetingId}                              — meeting-meta
+    GET  /v2/past_meetings/{meetingId}/participants            — list-participants
+    GET  /v2/meetings/{meetingId}/recordings                   — recording_files[]
+                                                                  (one file_type
+                                                                  \"TRANSCRIPT\" per
+                                                                  cloud recording)
+  Webhook: `recording.completed` payload, signature header `x-zm-signature`
+  = \"v0=\" + hex(HMAC-SHA256(secret-token, \"v0:{x-zm-request-timestamp}:{raw-body}\"))."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [gijiroku.platform :as p])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [javax.crypto Mac]
+           [javax.crypto.spec SecretKeySpec]))
+
+(defn jvm-http-fn
+  "host-caps :http-fn backed by the JDK HTTP client (no dependency). Mirrors
+  kekkai.kotoba/jvm-http-fn."
+  [{:keys [url method headers body]}]
+  (let [b (HttpRequest/newBuilder (URI/create url))]
+    (doseq [[k v] headers] (.header b k v))
+    (let [req  (-> b (.method (str/upper (name (or method :get)))
+                             (if body
+                               (HttpRequest$BodyPublishers/ofString body)
+                               (HttpRequest$BodyPublishers/noBody)))
+                   (.build))
+          resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp) :body (.body resp)})))
+
+(defn- basic-auth [client-id client-secret]
+  (str "Basic " (kbytes/base64-encode
+                                  (kbytes/utf8-bytes (str client-id ":" client-secret)))))
+
+(defn fetch-token
+  "S2S OAuth access token (grant_type=account_credentials)."
+  [{:keys [http-fn json-read account-id client-id client-secret]}]
+  (let [resp (http-fn {:method :post
+                       :url (str "https://zoom.us/oauth/token?grant_type=account_credentials&account_id=" account-id)
+                       :headers {"Authorization" (basic-auth client-id client-secret)}})]
+    (:access_token (json-read (:body resp)))))
+
+(defn- auth-header [token] {"Authorization" (str "Bearer " token)})
+
+(defn- api-get [{:keys [http-fn json-read]} token path]
+  (json-read (:body (http-fn {:method :get :url (str "https://api.zoom.us/v2" path)
+                              :headers (auth-header token)}))))
+
+;; ───────────────────────── normalization ─────────────────────────
+
+(defn- ->meeting [tenant raw]
+  {:id (str (:id raw)) :platform :zoom :external-id (str (:id raw))
+   :title (:topic raw) :host (:host_email raw) :tenant tenant
+   :participants [] :status (if (:end_time raw) :ended :in-progress)
+   :scheduled-start (:start_time raw)})
+
+(defn- ->recording [external-id raw]
+  (let [files (:recording_files raw)
+        primary (or (first (filter #(= "MP4" (:file_type %)) files)) (first files))]
+    {:id (str "r-" external-id) :meeting-id external-id :platform :zoom
+     :asset-ref (:download_url primary) :duration-s (:duration raw) :format (:file_type primary)}))
+
+(defn vtt->segments
+  "Parse a WebVTT-flavored transcript (Zoom and Teams both emit this shape)
+  into gijiroku.model segments. Cues are `<speaker-name>: <text>` on the cue
+  text line, preceded by a `HH:MM:SS.mmm --> HH:MM:SS.mmm` timing line.
+  Reused by `gijiroku.teams` (same VTT cue shape over Graph transcript
+  content) to avoid duplicating the parser."
+  [vtt-text]
+  (let [ts->s (fn [ts] (let [[h m s] (str/split ts #"[:.]")]
+                         (+ (* 3600 (parse-long h)) (* 60 (parse-long m)) (parse-long s))))]
+    (->> (str/split (or vtt-text "") #"\n\n")
+         (keep (fn [cue]
+                 (let [lines (str/split-lines cue)
+                       timing (first (filter #(str/includes? % "-->") lines))
+                       text-line (last lines)]
+                   (when (and timing text-line)
+                     (let [[t0 t1] (str/split timing #" --> ")
+                           [speaker text] (if (str/includes? text-line ":")
+                                            (str/split text-line #":" 2)
+                                            [nil text-line])]
+                       {:seg-id (str (hash cue)) :speaker (some-> speaker str/trim)
+                        :t0 (ts->s (str/trim t0)) :t1 (ts->s (str/trim (str/replace t1 #",\d+$" "")))
+                        :text (str/trim (or text text-line)) :sensitive #{}})))))
+         vec)))
+
+(defn- ->transcript [external-id {:keys [http-fn]} raw]
+  (let [files (:recording_files raw)
+        tfile (first (filter #(= "TRANSCRIPT" (:file_type %)) files))
+        body  (when tfile (:body (http-fn {:method :get :url (:download_url tfile)})))]
+    {:id (str "t-" external-id) :meeting-id external-id :source :platform-native :lang "ja"
+     :segments (vtt->segments body)}))
+
+;; ───────────────────────── webhook verification ─────────────────────────
+
+(defn- hmac-sha256-hex [secret ^String msg]
+  (let [mac (Mac/getInstance "HmacSHA256")]
+    (.init mac (SecretKeySpec. (kbytes/utf8-bytes ^String secret) "HmacSHA256"))
+    (apply str (map #(format "%02x" %) (.doFinal mac (kbytes/utf8-bytes msg))))))
+
+(defn signature-valid?
+  "Verify `x-zm-signature` against secret-token + timestamp + raw body."
+  [secret-token timestamp raw-body signature-header]
+  (= signature-header (str "v0=" (hmac-sha256-hex secret-token (str "v0:" timestamp ":" raw-body)))))
+
+;; ───────────────────────── client ─────────────────────────
+
+(defrecord ZoomPlatform [cfg tenant token-delay]
+  p/MeetingPlatform
+  (meeting-meta [_ external-id]
+    (->meeting tenant (api-get cfg @token-delay (str "/meetings/" external-id))))
+  (fetch-recording [_ external-id]
+    (->recording external-id (api-get cfg @token-delay (str "/meetings/" external-id "/recordings"))))
+  (fetch-transcript [_ external-id]
+    (->transcript external-id cfg (api-get cfg @token-delay (str "/meetings/" external-id "/recordings"))))
+  (list-participants [_ external-id]
+    (->> (api-get cfg @token-delay (str "/past_meetings/" external-id "/participants"))
+         :participants (mapv :id)))
+  (verify-webhook [_ headers raw-body]
+    (signature-valid? (:webhook-secret-token cfg) (get headers "x-zm-request-timestamp")
+                       raw-body (get headers "x-zm-signature"))))
+
+(defn client
+  "cfg: {:account-id :client-id :client-secret :webhook-secret-token
+         :http-fn (default jvm-http-fn) :json-write :json-read}
+  tenant: the consuming org, e.g. \"cloud-itonami\"."
+  [{:keys [http-fn] :as cfg} tenant]
+  (let [cfg (assoc cfg :http-fn (or http-fn jvm-http-fn))]
+    (->ZoomPlatform cfg tenant (delay (fetch-token cfg)))))

@@ -1,0 +1,98 @@
+(ns langgraph.thread-custody-test
+  "One checkpointer serves many threads — one per user, per ticket, per
+  conversation. These tests pin the boundary between them, and the
+  boundary between what a human was shown and what a human then wrote.
+
+  A failure here does not read as a wrong number. It reads as one
+  caller resuming into another caller's state, or as an approval whose
+  audit trail no longer contains what was approved."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [langchain.db :as db]))
+
+(defn- gated-graph
+  "draft (records who asked) → gate → send."
+  [cpr]
+  (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+      (g/add-node :draft (fn [s] {:log [(:who s)]}))
+      (g/add-node :send (fn [_] {:log [:send]}))
+      (g/set-entry-point :draft)
+      (g/add-edge :draft :send)
+      (g/set-finish-point :send)
+      (g/compile-graph {:checkpointer cpr :interrupt-before #{:send}})))
+
+;; ── per-thread scoping ───────────────────────────────────────────────
+
+(deftest checkpoints-are-scoped-to-the-thread-that-wrote-them
+  (testing "thread-id is the only thing separating two callers sharing a
+            checkpointer, and in the Datomic-backed one that separation
+            is a where-clause rather than a data structure — which means
+            it can be dropped without any type or arity complaining. The
+            two reads have to stay scoped independently: -get-latest
+            resolves a thread's OWN max step (an unscoped max would
+            address a step that thread never reached), and
+            -list-checkpoints returns that thread's rows alone.
+
+            The threads below are deliberately at different depths, so
+            an unscoped read lands somewhere visibly wrong instead of
+            coincidentally right."
+    (let [cpr (cp/datomic-checkpointer (db/create-conn cp/checkpoint-schema))
+          cg (gated-graph cpr)]
+      (g/run* cg {:who :alice} {:thread-id "alice"})   ; parks before :send
+      (g/run* cg {:who :bob} {:thread-id "bob"})       ; parks before :send
+      (g/run* cg nil {:thread-id "bob"})               ; bob goes one step further
+      (is (= :interrupted (:status (cp/get-latest cpr "alice")))
+          "bob finishing does not finish alice")
+      (is (= [:alice] (:log (:state (cp/get-latest cpr "alice"))))
+          "alice's latest is found at alice's own max step, not the store's")
+      (is (= :done (:status (cp/get-latest cpr "bob"))))
+      (is (= [:bob :send] (:log (:state (cp/get-latest cpr "bob")))))
+      (is (= #{[:alice]} (set (map #(:log (:state %)) (cp/list-checkpoints cpr "alice"))))
+          "every row listed under alice is alice's")
+      (is (< (count (cp/list-checkpoints cpr "alice"))
+             (count (cp/list-checkpoints cpr "bob")))
+          "…and alice's history did not inherit bob's extra step")))
+
+  (testing "the in-memory checkpointer keeps the same boundary"
+    (let [cpr (cp/mem-checkpointer)]
+      (cp/put! cpr "a" {:step 0 :state {:who :a} :frontier [] :status :done})
+      (cp/put! cpr "b" {:step 0 :state {:who :b} :frontier [] :status :interrupted})
+      (cp/put! cpr "b" {:step 1 :state {:who :b} :frontier [] :status :done})
+      (is (= {:who :a} (:state (cp/get-latest cpr "a"))))
+      (is (= 1 (count (cp/list-checkpoints cpr "a"))))
+      (is (= 2 (count (cp/list-checkpoints cpr "b"))))
+      (is (nil? (cp/get-latest cpr "never-seen"))
+          "an unknown thread is empty, not someone else's"))))
+
+;; ── the human edit ───────────────────────────────────────────────────
+
+(deftest a-human-edit-does-not-overwrite-the-checkpoint-it-edits
+  (testing "update-state! is the human-in-the-loop edit: an operator
+            reads an :interrupted thread, changes the state, and lets it
+            resume. The Datomic checkpointer addresses a row by
+            thread/step, so an edit written at the SAME step upserts —
+            and then the state the human was actually shown is gone,
+            replaced by the state they produced. The history says the
+            thread was always in the edited state, which is precisely
+            the question an audit asks it.
+
+            The edit therefore has to land on a new step. That is one
+            `inc`, and nothing else in the suite notices if it goes."
+    (let [cpr (cp/datomic-checkpointer (db/create-conn cp/checkpoint-schema))
+          cg (gated-graph cpr)
+          _ (g/run* cg {:who :alice} {:thread-id "t"})
+          before (cp/get-latest cpr "t")
+          history-before (count (cp/list-checkpoints cpr "t"))]
+      (is (= :interrupted (:status before)))
+      (is (= [:alice] (:log (:state before))))
+      (g/update-state! cg "t" {:log [:approved-by-human]})
+      (let [after (cp/get-latest cpr "t")]
+        (is (= (inc (:step before)) (:step after))
+            "the edit lands on a new step")
+        (is (= [:alice :approved-by-human] (:log (:state after)))
+            "…and goes through the channel reducer, not over it")
+        (is (= (:state before) (:state (cp/get-state-at cpr "t" (:step before))))
+            "what the human was shown is still readable at its own step")
+        (is (= (inc history-before) (count (cp/list-checkpoints cpr "t")))
+            "history grew by exactly the edit")))))

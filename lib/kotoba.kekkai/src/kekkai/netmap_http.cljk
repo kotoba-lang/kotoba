@@ -1,0 +1,186 @@
+(ns kekkai.netmap-http
+  "Loopback HTTPS-proxyable endpoint for authenticated node netmap bootstrap.
+
+  Requests are signed with the enrolled node DID key and read only that node's
+  already-published map. The listener itself binds to loopback; remote devices
+  must connect through a TLS-terminating reverse proxy."
+  (:require [clojure.string :as string]
+            [cljs.reader :as edn]
+            [ipns.core :as ipns]
+            [kekkai.heartbeat :as heartbeat]
+            [kekkai.netmap-reconciler :as reconciler]
+            [kekkai.store :as store]
+            ["node:http" :as http]
+            ["node:fs" :as fs]
+            ["node:crypto" :as crypto]))
+
+(def ^:private route-prefix "/v1/nodes/")
+(def ^:private route-suffix "/netmap")
+(def ^:private authority-skew-seconds heartbeat/max-clock-skew-seconds)
+
+(defn- valid-node-id? [node-id]
+  (and (string? node-id)
+       (<= 1 (count node-id) 128)
+       (every? #(boolean (re-matches #"[A-Za-z0-9._:-]" (str %))) node-id)))
+
+(defn- route-node-id [url]
+  (when (and (string? url)
+             (string/starts-with? url route-prefix)
+             (string/ends-with? url route-suffix))
+    (let [end (- (count url) (count route-suffix))
+          node-id (subs url (count route-prefix) end)]
+      (when (valid-node-id? node-id) node-id))))
+
+(defn- public-authority [authority-spki-b64]
+  (when-not (and (string? authority-spki-b64) (seq authority-spki-b64))
+    (throw (ex-info "netmap HTTP requires the pinned authority SPKI"
+                    {:type :kekkai/missing-netmap-authority})))
+  (let [der (.from js/Buffer authority-spki-b64 "base64")
+        public-key (.createPublicKey crypto
+                                     #js {:key der :format "der" :type "spki"})
+        raw (.subarray der (- (.-length der) 32))]
+    (when-not (= "ed25519" (.-asymmetricKeyType public-key))
+      (throw (ex-info "netmap HTTP authority must be Ed25519"
+                      {:type :kekkai/invalid-netmap-authority})))
+    {:public-key public-key
+     :authority-spki-b64 authority-spki-b64
+     :graph (ipns/pubkey->name (vec (array-seq raw)))}))
+
+(defn read-netmap
+  "Authorize and return the current signed netmap publication for one node."
+  [st roots authority node-id issued-at signature-hex]
+  (let [node (store/node st node-id)
+        now (heartbeat/now-seconds)
+        status (:status node)]
+    (if-not (and node
+                 (contains? #{"authorized" "revoked"} status)
+                 (integer? issued-at)
+                 (<= (- now authority-skew-seconds) issued-at
+                     (+ now authority-skew-seconds))
+                 (heartbeat/netmap-read-signature-valid?
+                  node-id node issued-at signature-hex))
+      {:status 403 :body {:error :netmap-read-rejected}}
+      (let [subject (reconciler/subject-for-node node)
+            publication (reconciler/pull-netmap roots subject authority)]
+        (if-not publication
+          {:status 503 :body {:error :netmap-not-published}}
+          {:status 200
+           :body {:desired/head
+                  (select-keys publication
+                               [:desired/cid :desired/name :desired/subject
+                                :desired/epoch])
+                  :desired/envelope (:desired/envelope publication)}})))))
+
+(defn- reply! [response status body]
+  (.writeHead response status
+              #js {"content-type" "application/edn; charset=utf-8"
+                   "cache-control" "no-store, private"
+                   "vary" "x-kekkai-issued-at, x-kekkai-signature"})
+  (.end response (pr-str body)))
+
+(defn- process-request! [state-file roots authority request response]
+  (let [method (.-method request)
+        node-id (route-node-id (.-url request))
+        issued-text (aget (.-headers request) "x-kekkai-issued-at")
+        signature (aget (.-headers request) "x-kekkai-signature")
+        issued-at (when (and (string? issued-text)
+                             (re-matches #"[0-9]{1,12}" issued-text))
+                    (js/Number issued-text))]
+    (cond
+      (not= "GET" method)
+      (do (.setHeader response "allow" "GET")
+          (reply! response 405 {:error :method-not-allowed}))
+
+      (nil? node-id)
+      (reply! response 404 {:error :not-found})
+
+      :else
+      (try
+        (let [st (reconciler/open-state-store state-file)
+              result (read-netmap st roots authority node-id issued-at signature)]
+          (reply! response (:status result) (:body result)))
+        (catch :default error
+          (reply! response 503 {:error :netmap-unavailable}))))))
+
+(defn- loopback-host? [host]
+  (contains? #{"127.0.0.1" "::1" "localhost"} host))
+
+(defn start!
+  "Start authenticated read-only netmap bootstrap on loopback.
+
+  `:state-file` is reloaded per request so new enrollment/revocation state is
+  honored without restarting this listener. Configure TLS at the public proxy."
+  [{:keys [state-file roots authority-spki-b64 host port]
+    :or {host "127.0.0.1" port 0}}]
+  (when-not (string? state-file)
+    (throw (ex-info "netmap HTTP requires :state-file"
+                    {:type :kekkai/missing-netmap-state-file})))
+  (reconciler/open-state-store state-file)
+  (when-not (and (vector? roots) (seq roots) (every? string? roots))
+    (throw (ex-info "netmap HTTP requires one or more publication roots"
+                    {:type :kekkai/missing-netmap-roots})))
+  (when-not (loopback-host? host)
+    (throw (ex-info "netmap HTTP may bind only to loopback"
+                    {:type :kekkai/non-loopback-netmap-bind :host host})))
+  (let [authority (public-authority authority-spki-b64)
+        server (.createServer http
+                              (fn [request response]
+                                (try
+                                  (process-request! state-file roots authority
+                                                   request response)
+                                  (catch :default _
+                                    (when-not (.-headersSent response)
+                                      (reply! response 500 {:error :internal-error}))))))]
+    (js/Promise.
+     (fn [resolve reject]
+       (.once server "error" reject)
+       (.listen server (int port) host
+                (fn []
+                  (let [address (.address server)]
+                    (.removeAllListeners server "error")
+                    (resolve {:server server
+                              :host (.-address address)
+                              :port (.-port address)
+                              :stop (fn []
+                                      (js/Promise.
+                                       (fn [done _]
+                                         (.close server (fn [] (done nil))))))}))))))))
+
+(defn- read-config! [config-file]
+  (when-not (and (string? config-file) (.existsSync fs config-file))
+    (throw (ex-info "netmap HTTP config is missing"
+                    {:type :kekkai/missing-netmap-http-config})))
+  (let [config (edn/read-string
+                (.readFileSync fs config-file "utf8"))]
+    (when-not (and (map? config) (string? (:state-file config))
+                   (vector? (:roots config)) (seq (:roots config))
+                   (string? (:authority-spki-b64 config)))
+      (throw (ex-info "netmap HTTP config is incomplete"
+                      {:type :kekkai/invalid-netmap-http-config})))
+    config))
+
+(defn- stop-on-signal! [stop]
+  (let [stop-process (fn []
+                       (-> (stop)
+                           (.then (fn [] (.exit js/process 0)))))]
+    (.on js/process "SIGINT" stop-process)
+    (.on js/process "SIGTERM" stop-process)))
+
+(defn -main [& args]
+  (let [[config-file] args]
+    (when-not config-file
+      (throw (ex-info "usage: kekkai.netmap-http CONFIG.edn"
+                      {:type :kekkai/invalid-cli-arguments})))
+    (let [config (read-config! config-file)]
+      (-> (start! config)
+          (.then (fn [handle]
+                   (println (pr-str {:event :netmap-http-started
+                                     :host (:host handle)
+                                     :port (:port handle)
+                                     :route "/v1/nodes/{node-id}/netmap"
+                                     :tls :required-at-proxy}))
+                   (stop-on-signal! (:stop handle))))
+          (.catch (fn [error]
+                    (js/console.error
+                     (str "netmap HTTP failed: " (ex-message error)))
+                    (set! (.-exitCode js/process) 1)))))))

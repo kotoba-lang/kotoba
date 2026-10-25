@@ -1,0 +1,96 @@
+(ns gijiroku.sim
+  "Demo: drive meeting records through one MeetingRecordActor.
+
+    ingest m-adhoc   register + consent + recording + transcript (observe → facts)
+    draft  m-weekly  consent on file, no sensitive segments → clean → auto-commit (phase 3)
+    draft  m-perf    NO consent recorded yet → HARD HOLD (no human override)
+    draft  m-perf    (careless advisor cites the health segment, no redaction)
+                     → HARD HOLD even after consent is recorded (no human override)
+    distribute m-weekly → valid participant recipients → always human sign-off (interrupt)
+    distribute m-weekly → a non-participant recipient → HARD HOLD (tenant-isolation)
+    phase 0          draft in observe-only phase → held (phase-disabled)
+
+  Run: kbb -M:dev:run"
+  (:require [langgraph.graph :as g]
+            [gijiroku.store :as store]
+            [gijiroku.scribellm :as scribellm]
+            [gijiroku.operation :as op]))
+
+(defn- line [& xs] (println (apply str xs)))
+
+(defn- drive [actor tid req phase approve? & [by]]
+  (let [res (g/run* actor {:request req :context {:phase phase}} {:thread-id tid})]
+    (if (= :interrupted (:status res))
+      (do (line "   ⏸  human sign-off requested (reason: "
+                (-> res :state :audit last :reason) ")")
+          (let [r2 (g/run* actor {:approval {:status (if approve? :approved :rejected)
+                                             :by (or by "jun")}}
+                           {:thread-id tid :resume? true})]
+            (line "   ▶  " (if approve? "承認" "却下") " → " (get-in r2 [:state :disposition]))
+            r2))
+      (do (line "   → " (get-in res [:state :disposition])
+                (when-let [pr (-> res :state :audit last :phase-reason)] (str " (" pr ")")))
+          res))))
+
+(def careless-advisor
+  "A scribe-LLM that quotes the sensitive segment verbatim without declaring a
+  redaction — demonstrates the PrivacyGovernor blocks it independently of
+  whether the LLM 'meant well'."
+  (reify scribellm/Advisor
+    (-advise [_ transcript]
+      {:summary (apply str (map :text (:segments transcript)))
+       :decisions [] :action-items []
+       :cites (mapv :seg-id (:segments transcript))
+       :redactions [] ; ← forgets to redact
+       :effect :minutes :confidence 0.95})))
+
+(defn -main [& _]
+  (let [st    (store/seed-db)
+        actor (op/build st)]
+
+    (line "── ingest m-adhoc (observe → ground facts) ──")
+    (drive actor "i1" {:op :meeting/register :meeting-id "m-adhoc"
+                       :value {:id "m-adhoc" :platform :mock :external-id "m-adhoc"
+                               :title "臨時MTG" :host "p-jun" :tenant "cloud-manimani"
+                               :participants [{:id "p-jun" :email "jun@gftd.group"}]
+                               :status :scheduled :scheduled-start store/demo-now}} 3 true)
+    (drive actor "i2" {:op :consent/record :meeting-id "m-adhoc"
+                       :value {:meeting-id "m-adhoc" :recording-announced? true
+                               :participant-consents {"p-jun" true} :legal-basis "consent"
+                               :jurisdiction "JP"}} 3 true)
+    (line "  registered meetings: " (mapv :id (store/all-meetings st)))
+
+    (line "\n── draft m-weekly (consent on file, no sensitive → auto-commit) ──")
+    (drive actor "d-ok" {:op :minutes/draft :meeting-id "m-weekly"} 3 true)
+    (line "  m-weekly minutes: " (:summary (store/minutes-of st "m-weekly")))
+
+    (line "\n── draft m-perf (no consent recorded yet) ──")
+    (drive actor "d-noconsent" {:op :minutes/draft :meeting-id "m-perf"} 3 true)
+
+    (line "\n── record consent for m-perf, then draft with a careless advisor ──")
+    (drive actor "i3" {:op :consent/record :meeting-id "m-perf"
+                       :value {:meeting-id "m-perf" :recording-announced? true
+                               :participant-consents {"p-jun" true "p-emp" true}
+                               :legal-basis "contract" :jurisdiction "JP"}} 3 true)
+    (let [careless-actor (op/build st {:advisor careless-advisor})]
+      (drive careless-actor "d-careless" {:op :minutes/draft :meeting-id "m-perf"} 3 true))
+
+    (line "\n── distribute m-weekly to valid participants (always human) ──")
+    (drive actor "x-ok" {:op :minutes/distribute :meeting-id "m-weekly"
+                        :recipients ["p-jun" "p-guest"]} 3 true "jun")
+
+    (line "\n── distribute m-weekly to a non-participant (tenant-isolation → HARD HOLD) ──")
+    (drive actor "x-bad" {:op :minutes/distribute :meeting-id "m-weekly"
+                         :recipients ["p-jun" "p-outsider"]} 3 true "jun")
+
+    (line "\n── phase 0 (observe-only): draft is held (phase-disabled) ──")
+    (drive actor "d-p0" {:op :minutes/draft :meeting-id "m-weekly"} 0 true)
+
+    (line "\n── 議事録監査台帳 (append-only) ──")
+    (doseq [f (store/ledger st)] (line "  " (store/ledger-line f)))
+
+    (line "\n── バックエンド差し替え: DatomicStore でも同一契約 ──")
+    (let [ds (store/datomic-seed-db) da (op/build ds)]
+      (drive da "d2" {:op :minutes/draft :meeting-id "m-weekly"} 3 true)
+      (line "  DatomicStore m-weekly minutes: " (:summary (store/minutes-of ds "m-weekly"))))
+    (line "\ndone.")))

@@ -1,0 +1,168 @@
+(ns mail-archive.ingest-test
+  "Feeds fake Gmail thread/message JSON through the ingest pipeline with a stub
+  :http-fn (com-gmail's own convention: fixed-response factory + a capturing atom
+  where request shape matters) and asserts on the transformed entity maps — plus
+  an end-to-end backfill (pagination) and incremental sync against a real
+  LangchainDbStore + a temp-dir BlobStore. No live account."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [json.data-json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [mail-archive.blob-store :as blob-store]
+            [mail-archive.ingest :as ingest]
+            [mail-archive.store :as store]))
+
+(defn- b64url [s]
+  (kbytes/base64url-encode (kbytes/utf8-bytes ^String s)))
+
+(defn- ms-of [iso] (str (.toEpochMilli (java.time.Instant/parse iso))))
+
+(defn- msg
+  "A Gmail message map (threads.get 'full' shape, keywordized as gmail.client
+  returns it)."
+  [{:keys [id thread-id subject from to cc internal-date labels body]}]
+  {:id id :threadId thread-id :internalDate internal-date :labelIds labels
+   :payload {:mimeType "text/plain"
+             :headers (cond-> [{:name "From" :value from}
+                               {:name "To" :value to}
+                               {:name "Subject" :value subject}
+                               {:name "Message-ID" :value (str "<" id "@mail>")}]
+                        cc (conj {:name "Cc" :value cc}))
+             :body {:data (b64url body)}}})
+
+;; ───────────────────────── pure projection ─────────────────────────
+
+(def a-message
+  (msg {:id "msg-1" :thread-id "t1" :subject "Hello"
+        :from "Alice <alice@corp.com>" :to "Jun <jun@example.com>, Bob <bob@corp.com>"
+        :cc "\"Carol\" <carol@corp.com>"
+        :internal-date (ms-of "2026-01-05T12:00:00Z")
+        :labels ["INBOX" "IMPORTANT"] :body "Hello body"}))
+
+(deftest message->email-entity-projects-the-right-shape
+  (let [e (ingest/message->email-entity a-message nil)]
+    (is (= "t1" (:email/thread-id e)))
+    (is (= "<msg-1@mail>" (:email/message-id e)))
+    (is (= "Hello" (:email/subject e)))
+    (is (= 20260105 (:email/date e)))
+    (is (= ["INBOX" "IMPORTANT"] (:email/labels e)))
+    (is (= {:person/id "alice@corp.com" :person/emails ["alice@corp.com"] :person/name "Alice"}
+           (:email/from e)))
+    (is (= [{:person/id "jun@example.com" :person/emails ["jun@example.com"] :person/name "Jun"}
+            {:person/id "bob@corp.com" :person/emails ["bob@corp.com"] :person/name "Bob"}]
+           (:email/to e)))
+    (is (= [{:person/id "carol@corp.com" :person/emails ["carol@corp.com"] :person/name "Carol"}]
+           (:email/cc e)))
+    ;; no blob passed -> no :email/cid / :email/blob
+    (is (nil? (:email/cid e)))
+    (is (nil? (:email/blob e)))))
+
+(deftest message->email-entity-attaches-blob-when-supplied
+  (let [blob {:cid "abc123" :entity {:blob/cid "abc123" :blob/size 5}}
+        e (ingest/message->email-entity a-message blob)]
+    (is (= "abc123" (:email/cid e)))
+    (is (= {:blob/cid "abc123" :blob/size 5} (:email/blob e)))))
+
+(deftest parse-address-splits-name-and-email
+  (is (= {:name "Alice" :email "alice@corp.com"} (ingest/parse-address "Alice <alice@corp.com>")))
+  (is (= {:name "Alice B" :email "alice@corp.com"} (ingest/parse-address "\"Alice B\" <alice@corp.com>")))
+  (is (= {:name nil :email "bare@corp.com"} (ingest/parse-address "bare@corp.com")))
+  (is (= {:name nil :email nil} (ingest/parse-address nil))))
+
+(deftest text-body-finds-nested-plain-part
+  (let [nested {:payload {:mimeType "multipart/alternative"
+                          :parts [{:mimeType "text/html" :body {:data (b64url "<p>hi</p>")}}
+                                  {:mimeType "text/plain" :body {:data (b64url "plain hi")}}]}}]
+    (is (= "plain hi" (ingest/text-body (:payload nested))))))
+
+(deftest reconstruct-source-includes-headers-and-decoded-body
+  (let [src (ingest/reconstruct-source a-message)]
+    (is (str/includes? src "From: Alice <alice@corp.com>"))
+    (is (str/includes? src "Subject: Hello"))
+    (is (str/includes? src "Hello body"))))
+
+;; ───────────────────────── end-to-end backfill (pagination) ─────────────────────────
+
+(defn- temp-blob-store []
+  (blob-store/local-dir-blob-store
+   (str (kio/temp-dir
+         "mail-archive-blobs"))))
+
+(def ^:private thread-t1
+  {:messages [(msg {:id "msg-1" :thread-id "t1" :subject "Hello"
+                    :from "Alice <alice@corp.com>" :to "Jun <jun@example.com>"
+                    :internal-date (ms-of "2026-01-05T00:00:00Z") :labels ["INBOX"]
+                    :body "Hello body"})]})
+
+(def ^:private thread-t2
+  {:messages [(msg {:id "msg-2" :thread-id "t2" :subject "Invoice"
+                    :from "Bob <bob@corp.com>" :to "Jun <jun@example.com>"
+                    :internal-date (ms-of "2026-03-15T00:00:00Z") :labels ["INBOX" "FINANCE"]
+                    :body "Invoice body"})]})
+
+(defn- paginating-http-fn
+  "list-threads returns page 1 (nextPageToken=p2) then page 2; get-thread returns
+  the matching thread. Dispatches on the request URL."
+  []
+  (fn [{:keys [url]}]
+    (cond
+      (str/includes? url "/threads/t1") {:status 200 :body (json/write-str thread-t1)}
+      (str/includes? url "/threads/t2") {:status 200 :body (json/write-str thread-t2)}
+      (str/includes? url "pageToken=p2") {:status 200 :body (json/write-str {:threads [{:id "t2"}]})}
+      (str/includes? url "/threads")     {:status 200 :body (json/write-str {:threads [{:id "t1"}]
+                                                                             :nextPageToken "p2"})}
+      :else {:status 404 :body "{}"})))
+
+(deftest backfill-paginates-and-ingests-all-threads
+  (let [s (store/langchain-store)
+        bs (temp-blob-store)
+        n (ingest/backfill! s bs {:http-fn (paginating-http-fn) :token "t" :q "in:anywhere"})]
+    (is (= 2 n))
+    (is (= #{"Hello" "Invoice"}
+           (set (map first (store/q s '[:find ?subj :where [?e :email/subject ?subj]])))))
+    ;; person ref join works after ingest
+    (is (= #{"Invoice"}
+           (set (map first (store/q s '[:find ?subj
+                                        :where [?p :person/id "bob@corp.com"]
+                                               [?e :email/from ?p]
+                                               [?e :email/subject ?subj]])))))
+    ;; each raw message content-addressed into a blob
+    (is (= 2 (count (store/q s '[:find ?cid :where [?b :blob/cid ?cid]]))))))
+
+;; ───────────────────────── incremental sync ─────────────────────────
+
+(defn- history-http-fn [{:keys [history-status]}]
+  (fn [{:keys [url]}]
+    (cond
+      (str/includes? url "/messages/msg-9")
+      {:status 200 :body (json/write-str
+                          (msg {:id "msg-9" :thread-id "t9" :subject "New mail"
+                                :from "Dave <dave@corp.com>" :to "Jun <jun@example.com>"
+                                :internal-date (ms-of "2026-07-01T00:00:00Z") :labels ["INBOX"]
+                                :body "new body"}))}
+      (str/includes? url "/history")
+      {:status (or history-status 200)
+       :body (json/write-str {:history [{:messagesAdded [{:message {:id "msg-9"}}]}]
+                              :historyId "200"})}
+      :else {:status 404 :body "{}"})))
+
+(deftest incremental-sync-ingests-added-messages-and-advances-cursor
+  (let [s (store/langchain-store)
+        bs (temp-blob-store)
+        cursor (atom "100")
+        result (ingest/incremental-sync! s bs
+                                         {:cursor-get #(deref cursor)
+                                          :cursor-set! #(reset! cursor %)}
+                                         {:http-fn (history-http-fn {}) :token "t"})]
+    (is (= {:ingested 1 :history-id "200"} result))
+    (is (= "200" @cursor))
+    (is (= #{"New mail"}
+           (set (map first (store/q s '[:find ?subj :where [?e :email/subject ?subj]])))))))
+
+(deftest incremental-sync-reports-cursor-expired-on-404
+  (let [s (store/langchain-store)
+        bs (temp-blob-store)
+        result (ingest/incremental-sync! s bs
+                                         {:cursor-get (constantly "1")
+                                          :cursor-set! (fn [_])}
+                                         {:http-fn (history-http-fn {:history-status 404}) :token "t"})]
+    (is (= {:cursor-expired true} result))))

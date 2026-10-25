@@ -1,0 +1,135 @@
+(ns ichiran.coordllm
+  "tally-LLM — the contained intelligence node. It reads an itonami activity's
+  ground facts (the registered artifact, any already-committed draft) and
+  returns a PROPOSAL: a tally workbook draft (verbatim kotoba-lang/sheets
+  EDN content), or (for `:tally/publish`) a pass-through recommendation over
+  the already-committed draft. It NEVER publishes a tally — every output is
+  censored by `ichiran.governor` before anything is recorded, and publishing
+  (`:tally/publish`) always routes to a human (charter: propose→draft only,
+  no actuation).
+
+  Advisor is injected (mock | real LLM via langchain.model), same as
+  kekkai.coordllm / koyomi.coordllm / teian.deckllm.
+
+  Proposal shape:
+    {:recommendation kw   ; :draft | :publish
+     :workbook-id str     ; the sheets.model workbook's own :sheets/id
+     :content edn         ; a sheets.model workbook item
+     :tenant str          ; the repo this tally is FOR (governor tenant check)
+     :summary str :rationale str :cites [kw ..] :redactions [kw ..]
+     :effect kw           ; :draft | :published
+     :confidence 0..1}"
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.model :as model]
+            [sheets.model :as sheets]
+            [ichiran.store :as store]))
+
+;; ───────────────────────── deterministic mock ─────────────────────────
+
+(defn- draft-artifact
+  "Compose a minimal, non-committal one-tab tally workbook from the
+  artifact's own title/status — the mock never invents facts, so a
+  registered artifact yields a confident draft and an unregistered one
+  yields a low-confidence noop."
+  [st {:keys [artifact]}]
+  (let [art (store/artifact st artifact)]
+    (if art
+      (let [wb-id (str artifact "-tally")]
+        {:recommendation :draft
+         :workbook-id wb-id
+         :content (-> (sheets/workbook wb-id)
+                      (sheets/add-tab
+                       (-> (sheets/tab "summary" {:sheets/title "Summary"})
+                           (sheets/put-cell 1 1 "Activity")
+                           (sheets/put-cell 1 2 (:title art))
+                           (sheets/put-cell 2 1 "Status")
+                           (sheets/put-cell 2 2 (name (:status art :open))))))
+         :tenant (:repo art)
+         :summary (str artifact " の集計表下書き")
+         :rationale (str (:title art) " に基づく一覧表案")
+         :cites [:artifact] :redactions []
+         :effect :draft :confidence 0.85})
+      {:recommendation :draft :workbook-id nil :content nil :tenant nil
+       :summary "未登録artifact" :rationale (str artifact)
+       :cites [] :redactions [] :effect :draft :confidence 0.0})))
+
+(defn- publish-artifact
+  "For :tally/publish there is nothing new to generate — the recommendation
+  is simply 'deliver the already-committed draft', carrying its
+  confidence/cites/redactions/tenant forward so the governor evaluates the
+  SAME facts twice (draft-time and publish-time)."
+  [st {:keys [artifact]}]
+  (let [d (store/draft-of st artifact)]
+    (if d
+      {:recommendation :publish :workbook-id (:workbook-id d) :content (:content d)
+       :tenant (:tenant d)
+       :summary (str artifact " の集計表をpublish") :rationale "承認済みdraftのpublish"
+       :cites (:cites d []) :redactions (:redactions d []) :effect :published
+       :confidence (:confidence d 0.0)}
+      {:recommendation :publish :workbook-id nil :content nil :tenant nil
+       :summary "draft未作成" :rationale (str artifact)
+       :cites [] :redactions [] :effect :published :confidence 0.0})))
+
+(defn infer [st {:keys [op] :as req}]
+  (case op
+    :tally/draft   (draft-artifact st req)
+    :tally/publish (publish-artifact st req)
+    {:recommendation :unknown :summary "未対応" :rationale (str op)
+     :cites [] :redactions [] :effect :noop :confidence 0.0}))
+
+;; ───────────────────────── Advisor protocol ─────────────────────────
+
+(defprotocol Advisor
+  (-advise [advisor store request]))
+
+(defn mock-advisor [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+(def ^:private system-prompt
+  (str "あなたは集計表(ワークブック)の下書き助言者です。"
+       "与えられた事実(登録済みactivity/artifact、既存draft)のみに基づき、"
+       "提案を1つ EDN マップで返します。EDN だけを出力。\n"
+       "キー: :recommendation(:draft|:publish) :workbook-id "
+       ":content(sheets.model workbook EDN) :tenant :summary :rationale :cites :redactions "
+       ":effect(:draft 固定 — :published は自称しない) :confidence(0..1)。\n"
+       "重要: あなたは配布/publishしない(propose→draftのみ)。機微情報"
+       "(financial/legal/personnel)を引用するときは必ず :redactions に列挙する。"))
+
+(defn- facts-for [st {:keys [artifact]}]
+  {:artifact (store/artifact st artifact) :draft (store/draft-of st artifact)})
+
+(defn- parse-proposal
+  "Defensive EDN parse of an LLM response — an unparseable / non-map response
+  degrades to a confidence-0 noop the governor will hold/escalate (mirrors
+  kekkai.coordllm/koyomi.coordllm/teian.deckllm's parse-proposal exactly)."
+  [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p (update :cites #(vec (or % [])))
+            (update :redactions #(vec (or % [])))
+            (update :confidence #(if (number? %) (double %) 0.0))
+            (update :effect #(or % :noop)))
+      {:recommendation :unknown :summary "LLM応答を解釈できません" :rationale (str content)
+       :cites [] :redactions [] :effect :noop :confidence 0.0})))
+
+(defn llm-advisor
+  "Advisor backed by a langchain.model/ChatModel (Anthropic / OpenAI-compatible
+  / mock-model). Output is parsed defensively → an unparseable response is a
+  confidence-0 noop the governor will hold/escalate."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ st req]
+       (let [resp (model/-generate chat-model
+                    [{:role :system :content system-prompt}
+                     {:role :user :content (str "操作:" (:op req) " artifact:" (:artifact req)
+                                                "\n事実:" (pr-str (facts-for st req)))}]
+                    gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace [request proposal]
+  {:t :coordllm-proposal :op (:op request) :subject (:artifact request)
+   :recommendation (:recommendation proposal) :summary (:summary proposal)
+   :rationale (:rationale proposal) :cites (:cites proposal) :confidence (:confidence proposal)})

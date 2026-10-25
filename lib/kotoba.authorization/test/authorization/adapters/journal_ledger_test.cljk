@@ -1,0 +1,140 @@
+(ns authorization.adapters.journal-ledger-test
+  (:require [authorization.adapters.decision-ledger :as ledger]
+            [authorization.adapters.journal-ledger :as jl]
+            [authorization.model :as m]
+            [kotoba.test :refer [deftest is testing]]
+            [journal.fs :as journal.fs]
+            [langchain.db :as db]))
+
+(defn- without-eids
+  "Pull results carry `:db/id`; the ledger's contract is about attributes,
+  not about which integers the store happened to allocate."
+  [m]
+  (cond-> (dissoc m :db/id)
+    (:authz.decision/request m) (update :authz.decision/request dissoc :db/id)))
+
+(defn- read-doc [id]
+  (m/request id "did:web:example.com:alice" "read" "doc:1" {:context {:tenant "t1"}}))
+
+(defn- allowed [request]
+  (m/decision request :allow {:by "rules"
+                              :policy-ref "kagi://policy/doc-access"
+                              :policy-version "2026-07-01"
+                              :effect-trace [{:rule-id "allow-reader" :decision :allow :matched? true}]
+                              :obligations [{:type :audit}]
+                              :issued-at "2026-07-01T00:00:00Z"}))
+
+(deftest persists-a-decision-with-the-request-it-answered
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+        req (read-doc "authz-r1")]
+    (is (= {:tx/id "tx-1" :tx/datoms 2 :tx/request-id "authz-r1" :tx/at nil}
+           (ledger/persist-decision! l req (allowed req) {:request-id "authz-r1"})))
+    (testing "the decision reads back with the request nested and its EDN blobs decoded"
+      (is (= {:authz.decision/request-id "authz-r1"
+              :authz.decision/decision :allow
+              :authz.decision/by "rules"
+              :authz.decision/policy-ref "kagi://policy/doc-access"
+              :authz.decision/policy-version "2026-07-01"
+              :authz.decision/effect-trace [{:rule-id "allow-reader" :decision :allow :matched? true}]
+              :authz.decision/obligations [{:type :audit}]
+              :authz.decision/issued-at "2026-07-01T00:00:00Z"
+              :authz.decision/request {:authz.request/id "authz-r1"
+                                       :authz.request/principal "did:web:example.com:alice"
+                                       :authz.request/action "read"
+                                       :authz.request/resource "doc:1"
+                                       :authz.request/context {:tenant "t1"}}}
+             (without-eids (jl/decision l "authz-r1")))))))
+
+(deftest a-request-and-its-decision-are-two-entities-joined-by-a-reference
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+        req (read-doc "authz-r2")]
+    (ledger/persist-decision! l req (allowed req) {})
+    (let [d (db/db (:conn l))]
+      (is (not= (db/q '[:find ?e . :where [?e :authz.request/id "authz-r2"]] d)
+                (db/q '[:find ?e . :where [?e :authz.decision/request-id "authz-r2"]] d))
+          "sharing one string :db/id used to merge them by accident")
+      (is (= "doc:1"
+             (db/q '[:find ?r . :where
+                     [?d :authz.decision/request-id "authz-r2"]
+                     [?d :authz.decision/request ?req]
+                     [?req :authz.request/resource ?r]]
+                   d))
+          "and the join is a real reference"))))
+
+(deftest rejects-a-replayed-request-id
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+        req (read-doc "authz-r3")
+        decision (m/decision req :deny {:by "rules" :reason :no-matching-rule})]
+    (ledger/persist-decision! l req decision {:request-id "authz-r3"})
+    (is (= :authz.decision/replay
+           (:error (ex-data (try (ledger/persist-decision! l req decision {:request-id "authz-r3"})
+                                 (catch #?(:clj clojure.lang.ExceptionInfo
+                                           :cljs cljs.core/ExceptionInfo) e
+                                   e))))))
+    (testing "and the rejection did not write anything"
+      (is (= 1 (count (jl/decisions l)))))))
+
+(deftest a-request-id-identifies-one-entity-across-transactions
+  (testing "a string :db/id is a tempid scoped to one transaction; the unique
+            attribute is what makes the second write about the same decision"
+    (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+          req (read-doc "authz-r4")]
+      (ledger/persist-decision! l req (m/decision req :deny {:by "rules" :reason :no-matching-rule}) {})
+      (ledger/persist-decision! l req (allowed req) {:allow-replay? true})
+      (is (= 1 (count (jl/decisions l))))
+      (is (= 1 (count (jl/requests l))))
+      (is (= :allow (:authz.decision/decision (jl/decision l "authz-r4")))))))
+
+(deftest a-new-ledger-over-the-same-journal-answers-the-same-queries
+  (let [io (journal.fs/memory-io)
+        req (read-doc "authz-r5")]
+    (ledger/persist-decision! (jl/journal-decision-ledger {:io io}) req (allowed req)
+                              {:request-id "authz-r5"})
+    (testing "a restarted process replays the journal rather than starting empty"
+      (let [l (jl/journal-decision-ledger {:io io})]
+        (is (= :allow (:authz.decision/decision (jl/decision l "authz-r5"))))
+        (is (= {:tenant "t1"}
+               (get-in (jl/decision l "authz-r5") [:authz.decision/request :authz.request/context]))
+            "including the EDN blobs, through encode, journal, replay and decode")))
+    (testing "including the replay invariant, which is a query and not in-memory bookkeeping"
+      (let [l (jl/journal-decision-ledger {:io io})]
+        (is (= :authz.decision/replay
+               (:error (ex-data (try (ledger/persist-decision! l req (allowed req)
+                                                               {:request-id "authz-r5"})
+                                     (catch #?(:clj clojure.lang.ExceptionInfo
+                                               :cljs cljs.core/ExceptionInfo) e
+                                       e))))))))))
+
+(deftest an-undecided-request-is-still-a-request
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})]
+    (ledger/persist-request! l (read-doc "authz-r6"))
+    (is (= ["authz-r6"] (mapv :authz.request/id (jl/requests l))))
+    (is (= [] (jl/decisions l)))
+    (is (nil? (jl/decision l "authz-r6")))))
+
+(deftest absent-attributes-are-not-asserted-as-nil
+  (let [l (jl/journal-decision-ledger {:io (journal.fs/memory-io)})
+        req (m/request "authz-r7" "did:web:example.com:bob" "write" "doc:2" {})]
+    (ledger/persist-decision! l req (m/decision req :deny {:by "rules" :reason :no-matching-rule}) {})
+    (testing "a real transactor rejects nil; the pull should not show it either"
+      (is (= {:authz.request/id "authz-r7"
+              :authz.request/principal "did:web:example.com:bob"
+              :authz.request/action "write"
+              :authz.request/resource "doc:2"}
+             (dissoc (first (jl/requests l)) :db/id)))
+      (is (= #{:authz.decision/request-id :authz.decision/decision :authz.decision/by
+               :authz.decision/reason :authz.decision/obligations :authz.decision/request}
+             (set (keys (without-eids (jl/decision l "authz-r7")))))))))
+
+(deftest the-history-is-readable-as-what-happened
+  (let [io (journal.fs/memory-io)
+        l (jl/journal-decision-ledger {:io io})]
+    (doseq [id ["authz-r8" "authz-r9"]]
+      (let [req (read-doc id)] (ledger/persist-decision! l req (allowed req) {})))
+    (let [events (jl/history io)]
+      (is (= [1 2] (mapv :tx events)))
+      (is (every? #(seq (:tx-data %)) events)))))
+
+(deftest needs-a-sink
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+               (jl/journal-decision-ledger {}))))

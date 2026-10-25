@@ -1,0 +1,189 @@
+(ns ichiran.tallyport
+  "TallyTarget port — where a tally workbook draft becomes a *real* delivered
+  report. A tally-LLM proposal is data (a `:draft` record, content = a
+  sheets.model workbook EDN item) until a human approves it; `publish!` is
+  called exactly once, after that approval, by `ichiran.operation`'s commit
+  step — the actuation (best-effort Transit export + handing the result to
+  an injected Distributor). `propose-revision!` is the 'casual commit' analog
+  (teian's deckport/koyomi's scheduleport): recording that a draft candidate
+  exists, no external effect yet.
+
+  `mock-tallyport` is the default — a deterministic in-memory target so the
+  actor is runnable/testable with no network/creds (ADR-2607062030
+  Consequences: real Distributor clients need per-provider API tokens, live
+  binding is out of scope here). `publish!` exports the workbook via
+  `kotoba-lang/sheets`'s `sheets.wire/workbook-envelope` (Kotoba Transit
+  JSON) — best-effort: malformed content or any failure to encode simply
+  degrades to no envelope bytes rather than failing the whole delivery (a
+  wire preview is a nicety, not the actuation itself). The Distributor is a
+  plain injected fn — ichiran does not ship a live email/Slack/BI-tool
+  client; the default just records what WOULD have been distributed.
+
+  `slack-tallyport` below is one such opt-in Distributor (Slack
+  `chat.postMessage`, alongside a separately-landing Resend-email one) —
+  still not a replacement for mock-tallyport, just another
+  `distribute-fn` a caller may inject into it. See README's 'Slack
+  Distributor (owner setup required)' section for what the human owner
+  still has to do (register a Slack app, obtain a bot token) before it is
+  usable; no live Slack call is made anywhere in this repo, including its
+  test suite."
+  (:require [kotoba.lang.text :as str]
+            [sheets.wire :as wire]))
+
+(defprotocol TallyTarget
+  (fetch-workbook [tt activity] "the artifact's currently delivered workbook content, or nil")
+  (propose-revision! [tt activity content] "record `content` as a draft delivery candidate — not yet published. Returns a map (e.g. {:branch ...}) to be merged onto the draft so publish! knows what to deliver.")
+  (publish! [tt activity target draft] "export + distribute an already human-approved draft (the store's :draft record) — the actuation"))
+
+(defn- try-export-transit
+  "Best-effort Transit envelope export via kotoba-lang/sheets's
+  `sheets.wire/workbook-envelope`. Wrapped defensively so a malformed/nil
+  workbook, or any encoding failure, degrades to nil instead of throwing —
+  publish! must not fail the actuation just because a wire preview couldn't
+  be produced."
+  [content]
+  (when content
+    (try (wire/workbook-envelope content)
+         (catch #?(:clj Exception :cljs :default) _ nil))))
+
+(defn mock-tallyport
+  "A deterministic in-memory TallyTarget: `delivered` is an atom of
+  {activity-id -> content} so tests/sim can assert on what WOULD have been
+  delivered, without any network call. `distribute-fn` is called exactly
+  once per publish! with {:activity :target :content :envelope?} — the
+  default is a no-op (a real Distributor — email/Slack/BI-tool/etc — is
+  caller-injected, see docs/DESIGN.md; not shipped here)."
+  ([] (mock-tallyport (atom {}) (fn [_] nil)))
+  ([delivered] (mock-tallyport delivered (fn [_] nil)))
+  ([delivered distribute-fn]
+   (reify TallyTarget
+     (fetch-workbook [_ activity] (get @delivered (:id activity)))
+     (propose-revision! [_ activity _content]
+       {:branch (str "ichiran/" (:id activity))})
+     (publish! [_ activity target draft]
+       (let [content  (:content draft)
+             envelope (try-export-transit content)]
+         (distribute-fn {:activity (:id activity) :target target
+                         :content content :envelope? (some? envelope)})
+         (swap! delivered assoc (:id activity) content)
+         draft)))))
+
+;; ───────────────────────── Slack (opt-in, real chat.postMessage) ─────────────────────────
+;;
+;; Mirrors tayori.channel.slack's already-real Slack Web API request shape
+;; (`Authorization: Bearer <bot-token>`, JSON POST body) — ichiran only
+;; ever needs the write side (`chat.postMessage`), not tayori's read side
+;; (`conversations.history`) for reply-drafting. Untested against a live
+;; workspace (no bot token exists yet — see README); the request-building
+;; itself is covered by test/ichiran/tallyport_test.cljk with an injected
+;; fake :http-fn, never a real network call.
+
+#?(:clj
+(defn- slack-jvm-http-fn
+  "Real java.net.http POST — {:url :method :headers :body} -> {:status
+  :body}, the same convention as cloudflare.client/jvm-http-fn and the
+  :http-fn tayori.channel.slack expects (JVM-only default; a cljs/SCI/WASM
+  host must inject its own :http-fn)."
+  [{:keys [url method headers body]}]
+  (let [builder (reduce-kv (fn [^java.net.http.HttpRequest$Builder b k v] (.header b k v))
+                           (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                           headers)
+        request (-> (case (or method :post)
+                      :post (.POST builder (java.net.http.HttpRequest$BodyPublishers/ofString (or body "")))
+                      :get  (.GET builder))
+                    .build)
+        resp    (.send (java.net.http.HttpClient/newHttpClient) request
+                       (java.net.http.HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp) :body (.body resp)})))
+
+(def ^:private json-hex-digits "0123456789abcdef")
+
+(defn- json-hex4
+  "4-digit hex for a JSON `\\uXXXX` escape (portable: bit ops + a lookup
+  table, no Long/Integer interop that would only work on :clj)."
+  [n]
+  (apply str (for [shift [12 8 4 0]] (nth json-hex-digits (bit-and (bit-shift-right n shift) 0xf)))))
+
+(defn- char-code-at [s i]
+  #?(:clj (int (.charAt ^String s (int i)))
+     :cljs (.charCodeAt s i)))
+
+(defn- escape-remaining-control-chars
+  "Escape any ASCII control character (U+0000-U+001F) still in `s` as
+  \\uXXXX. Called after the named replacements below have already turned
+  \\r/\\n/\\t into their own escape sequences, so only the control bytes
+  those don't cover -- \\b \\f and everything else in the C0 range -- are
+  left; RFC 8259 requires ALL of U+0000-U+001F to be escaped in a JSON
+  string, not just \\ \" \\r \\n \\t."
+  [s]
+  (apply str
+         (for [i (range (count s))]
+           (let [code (char-code-at s i)]
+             (if (< code 0x20)
+               (str "\\u" (json-hex4 code))
+               (subs s i (inc i)))))))
+
+(defn- json-string-escape [s]
+  (-> (str s)
+      (str/replace "\\" "\\\\")
+      (str/replace "\"" "\\\"")
+      (str/replace "\r\n" "\\n")
+      (str/replace "\n" "\\n")
+      (str/replace "\r" "\\n")
+      (str/replace "\t" "\\t")
+      escape-remaining-control-chars))
+
+(defn- default-json-write
+  "Minimal flat {k v} -> JSON object string encoder — sufficient for
+  chat.postMessage's {:channel :text} payload (both plain strings, no
+  nesting), so this file adds no JSON library dependency. A caller wanting
+  a richer payload (e.g. `blocks`) should inject a real :json-write (e.g.
+  `clojure.data.json/write-str`) instead."
+  [m]
+  (str "{" (str/join "," (map (fn [[k v]] (str "\"" (name k) "\":\"" (json-string-escape v) "\"")) m)) "}"))
+
+(defn slack-tallyport
+  "A Slack `chat.postMessage` Distributor for `mock-tallyport`'s
+  `distribute-fn` slot — an opt-in alternative to the default no-op,
+  alongside (not replacing) a Resend-email Distributor landing separately.
+  Usage: `(mock-tallyport (atom {}) (slack-tallyport {:token \"xoxb-...\" :channel \"C0123...\"}))`.
+
+  `:token` (Slack bot token) and `:channel` (target channel id) are
+  owner-supplied constructor params — see README's 'Slack Distributor
+  (owner setup required)' section; NEVER hardcoded or env-guessed here.
+
+  Posts exactly one `chat.postMessage` per `publish!` call: a short text
+  notification (the workbook's `:sheets/title` + a note a tally report was
+  published, and whether a Transit envelope export was attempted) —
+  never the workbook bytes themselves. Attaching the actual envelope would
+  need Slack's separate, more complex `files.upload` multipart endpoint,
+  which is out of scope here (a text notification is the honest scope of
+  this scaffold — see README for the follow-up).
+
+  The per-call `:target` (this actor's generic recipient field, e.g. an
+  email address for the Resend Distributor) is intentionally NOT used for
+  channel routing — Slack delivery is a fixed operational binding (the bot
+  must already be invited to a channel, or have `chat:write.public`), not a
+  per-message address the way email is; `:channel` is fixed at
+  construction instead.
+
+  `:http-fn` / `:json-write` are injected for testability (default: a real
+  java.net.http POST / the minimal encoder above) — no live Slack call
+  happens anywhere in this repo's automated test suite (there is no bot
+  token to call with yet)."
+  [{:keys [token channel http-fn json-write]}]
+  (let [http-fn    (or http-fn
+                       #?(:clj slack-jvm-http-fn
+                          :cljs (fn [_] (throw (ex-info "slack-tallyport: no :http-fn injected and no default HTTP transport on this host (JVM default is the built-in java.net.http POST; a cljs/SCI/WASM host must inject its own :http-fn)" {})))))
+        json-write (or json-write default-json-write)]
+    (fn [{:keys [activity content envelope?]}]
+      (let [title (or (:sheets/title content) (str "activity " activity))
+            text  (str "Tally report published: \"" title "\" (activity " activity ")"
+                       (if envelope?
+                         " — Transit envelope exported."
+                         " — no Transit envelope (malformed/nil workbook, or export failed)."))]
+        (http-fn {:url "https://slack.com/api/chat.postMessage"
+                  :method :post
+                  :headers {"Authorization" (str "Bearer " token)
+                            "Content-Type" "application/json; charset=utf-8"}
+                  :body (json-write {:channel channel :text text})})))))

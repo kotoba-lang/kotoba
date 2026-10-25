@@ -1,0 +1,198 @@
+(ns comfyui.gateway
+  "The JVM I/O adapter for an OpenAI-images-compatible ComfyUI gateway —
+  the http-kit/jsonista host-fn wiring comfyui.exec's pure engine needs to
+  actually reach a running gateway, plus the app-facing config needed by
+  every consumer (KSampler node-type name, default image dimensions,
+  env-var names, whether an API key is required, placeholder-stub sizing)
+  as injected config rather than hardcoded per-consumer copies. Originally
+  extracted from mangaka.comfy / animeka.comfy (near-duplicate copies of
+  each other) into a short-lived `kotoba-lang/genapp-clj`, then landed here
+  — its natural home next to the pure engine it drives. See
+  90-docs/adr/2607011816-ghosthacker-shiropico-standalone-repo.md and
+  90-docs/adr/2607011900-genapp-clj-mangaka-animeka-commons.md for the
+  history.
+
+  The engine (comfyui.exec) does no I/O: it topologically runs a pure node
+  graph with content-addressed caching. The single heavy node — the sampler
+  — is a `host-fn-node` that closes over an OpenAI-images-compatible ComfyUI
+  gateway call (POST /v1/images/generations, response_format b64_json). With
+  no configured base URL it returns a placeholder SVG, so the pipeline runs
+  end-to-end without a GPU."
+  (:require [kotoba.bytes :as kbytes] [comfyui.node :as node]
+            [comfyui.std :as std]
+            [comfyui.queue :as q]
+            [comfyui.exec :as exec]
+            [langchain.db :as db]
+            #?(:clj [org.httpkit.client :as http])
+            #?(:clj [jsonista.core :as j])
+            #?(:clj [kotoba.lang.text :as str])))
+
+;; ───────────────────────── gateway host call ─────────────────────────
+
+(defn- placeholder-b64
+  "A tiny SVG data payload (base64) standing in for a render. `placeholder`
+  = {:width :height :label}."
+  [{:keys [width height label]} prompt]
+  #?(:clj (-> (str "<svg xmlns='http://www.w3.org/2000/svg' width='" width "' height='" height "'>"
+                   "<rect width='100%' height='100%' fill='#1b1d24'/>"
+                   "<text x='16' y='40' fill='#8aa0c0' font-size='14'>" label "</text>"
+                   "<text x='16' y='70' fill='#5e6b82' font-size='11'>"
+                   (subs prompt 0 (min 40 (count prompt))) "</text></svg>")
+              (kbytes/utf8-bytes)
+              (->> (.encodeToString (java.util.Base64/getEncoder))))
+     :cljs "PHN2Zz48L3N2Zz4="))
+
+(def default-placeholder
+  {:width 512 :height 512 :label "comfyui.gateway render (stub)"})
+
+#?(:clj
+   (defn- stub-render [placeholder prompt seed extra]
+     (merge {:image-b64 (placeholder-b64 (or placeholder default-placeholder) prompt)
+             :mime "image/svg+xml" :source "stub" :seed seed}
+            extra)))
+
+#?(:clj
+   (defn render-via-gateway
+     "Renders `spec` via an OpenAI-images-compatible ComfyUI gateway. `cfg` =
+     {:base :api-key :http-post :require-api-key? :placeholder}, where
+     `require-api-key?` controls whether a missing key alone falls back to
+     the stub (true, mangaka's original behavior) or only a missing base
+     does (false/omitted, animeka's original behavior), and `placeholder` =
+     {:width :height :label} sizes/labels the offline stub. `http-post` is
+     (url, opts) → {:status :body :error} — injected so the success-parse
+     and error-fallback branches are testable without a live gateway. Any
+     failure (no config, transport error, non-2xx) degrades to a
+     placeholder; never throws."
+     [{:keys [base api-key http-post require-api-key? placeholder]}
+      {:keys [prompt seed width height model]}]
+     (if (if require-api-key? (and base api-key) base)
+       (try
+         (let [{:keys [status body error]}
+               (http-post (str base "/v1/images/generations")
+                          {:headers (cond-> {"content-type" "application/json"}
+                                      api-key (assoc "authorization" (str "Bearer " api-key)))
+                           :body (j/write-value-as-string
+                                  (cond-> {:prompt prompt :n 1
+                                           :size (str width "x" height)
+                                           :model model
+                                           :response_format "b64_json"}
+                                    seed (assoc :seed seed)))})]
+           (if (and (not error) status (<= 200 status 299))
+             (let [b64 (-> (j/read-value body j/keyword-keys-object-mapper)
+                           :data first :b64_json)]
+               {:image-b64 b64 :mime "image/png" :source "gateway" :seed seed})
+             (stub-render placeholder prompt seed {:error (or error status)})))
+         (catch Exception e (stub-render placeholder prompt seed {:error (ex-message e)})))
+       (stub-render placeholder prompt seed nil))))
+
+#?(:clj
+   (defn gateway-render-from-env
+     "Calls a ComfyUI gateway using env-resolved config + the real http-kit
+     transport. `env-cfg` = {:url-vars [...] :key-vars [...]
+     :require-api-key? :placeholder}; each *-vars list is tried in order,
+     first non-nil wins (lets a caller prefer a pod-specific var, falling
+     back to a shared COMFYUI_URL/COMFYUI_API_KEY, as animeka's original did)."
+     [{:keys [url-vars key-vars require-api-key? placeholder]} spec]
+     (render-via-gateway
+      {:base (some-> (some #(System/getenv %) url-vars) (str/replace #"/+$" ""))
+       :api-key (some #(System/getenv %) key-vars)
+       :require-api-key? require-api-key?
+       :placeholder placeholder
+       :http-post (fn [url opts] @(http/post url opts))}
+      spec))
+   :cljs
+   (defn gateway-render-from-env
+     [{:keys [placeholder]} {:keys [prompt seed]}]
+     {:image-b64 (placeholder-b64 (or placeholder default-placeholder) prompt)
+      :mime "image/svg+xml" :source "stub" :seed seed}))
+
+;; ───────────────────────── node pack ─────────────────────────
+
+(defn ksampler-node
+  "Builds a host-fn KSampler node. `cfg` = {:node-type :default-ckpt
+  :default-width :default-height :gateway-render (fn [spec] -> render-result)}."
+  [{:keys [node-type default-ckpt default-width default-height gateway-render]}]
+  (std/host-fn-node
+   {:type node-type :category "sampling"
+    :inputs {:positive {:type "STRING" :default ""}
+             :negative {:type "STRING" :default ""}
+             :model    {:type "STRING" :default default-ckpt}
+             :width    {:type "INT" :default default-width}
+             :height   {:type "INT" :default default-height}
+             :seed     {:type "INT" :default 0}}
+    :outputs [{:name "image" :type "IMAGE"}]}
+   (fn [{:keys [positive negative model width height seed]}]
+     [(gateway-render {:prompt positive :negative negative :model model
+                       :width width :height height :seed seed})])))
+
+(def save-node
+  {:type "SaveImage" :category "output" :output-node? true
+   :inputs {:images {:type "*"}}
+   :outputs [{:name "image" :type "IMAGE"}]
+   :fn (fn [{:keys [images]}] [images])})
+
+(defn registry
+  "The comfyui.node registry: comfyui-clj's standard nodes plus `ksampler`
+  (built via `ksampler-node`)."
+  [ksampler]
+  (node/registry (into std/all [ksampler save-node])))
+
+;; ───────────────────────── workflow ─────────────────────────
+
+(defn- a-str [v d] (if (string? v) v d))
+(defn- a-num [v d] (if (number? v) v d))
+
+(defn workflow
+  "API-format workflow (EDN) for one txt2img render. `cfg` = {:node-type
+  :default-ckpt :default-width :default-height} (the same cfg passed to
+  `ksampler-node` — `:node-type` must match). Mirrors the
+  CLIPTextEncode→KSampler→SaveImage shape ComfyUI uses, collapsed to the
+  gateway-backed sampler. Coerces each scalar to its declared type (nil OR
+  wrong-typed → default), so malformed client params (`:seed \"abc\"`, a
+  non-string `:model`, …) can't make workflow validation fail with a 500 —
+  they fall back to sane defaults."
+  [{:keys [node-type default-ckpt default-width default-height]}
+   {:keys [prompt negative model width height seed]}]
+  {"pos"  {:class_type "PrimitiveString" :inputs {:value (a-str prompt "")}}
+   "neg"  {:class_type "PrimitiveString" :inputs {:value (a-str negative "")}}
+   "ks"   {:class_type node-type
+           :inputs {:positive ["pos" 0] :negative ["neg" 0]
+                    :model (a-str model default-ckpt)
+                    :width (a-num width default-width) :height (a-num height default-height)
+                    :seed (a-num seed 0)}}
+   "save" {:class_type "SaveImage" :inputs {:images ["ks" 0]}}})
+
+(defn fresh-scratch
+  "A throwaway in-memory conn for one workflow run's exec cache + run
+  history. Generation graphs are one-shot, so each run gets its own conn
+  (GC'd afterward) — the server never accumulates per-run history/cache,
+  which would otherwise grow unbounded. (Trade-off: no cross-request render
+  cache; the gateway can cache, and an LRU could be added if needed.)"
+  []
+  (db/create-conn exec/exec-schema))
+
+(defn run
+  "Runs an arbitrary api-format workflow through `registry`. `scratch-conn`
+  (langchain.db) backs the content-addressed cache + run history. Returns
+  {:results :executed :cached :run-id}; throws on a node execution error.
+  `opts` is passed to the executor (e.g. {:targets […]})."
+  ([registry scratch-conn workflow] (run registry scratch-conn workflow {}))
+  ([registry scratch-conn workflow opts]
+   (let [pq  (q/make-queue)
+         _   (q/enqueue! pq workflow opts)
+         ctx {:registry registry
+              :cache (exec/datomic-cache scratch-conn)
+              :history-conn scratch-conn}
+         [entry] (q/run-all! pq ctx)]
+     (if (= :error (:status entry))
+       (throw (ex-info "comfy run failed" entry))
+       (select-keys entry [:results :executed :cached :run-id])))))
+
+(defn render
+  "Runs the txt2img workflow for `spec` through `registry`; returns the
+  sampler output map {:image-b64 :mime :source :seed} plus {:run-id
+  :cached}. `cfg` is the same map passed to `workflow`/`ksampler-node`."
+  [registry cfg scratch-conn spec]
+  (let [{:keys [results run-id cached]} (run registry scratch-conn (workflow cfg spec))]
+    (merge (first (get results "save"))
+           {:run-id run-id :cached (vec cached)})))

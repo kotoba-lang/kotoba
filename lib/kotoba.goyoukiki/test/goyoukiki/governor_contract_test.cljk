@@ -1,0 +1,269 @@
+(ns goyoukiki.governor-contract-test
+  "The propose-only ProcurementGovernor contract as executable tests —
+  goyoukiki's analog of teian's propose-only contract test / kekkai's
+  zero-trust contract test. Invariant: the actor never notifies a candidate
+  the ProcurementGovernor would reject, match-LLM never actuates directly,
+  and `:match/share` is always a human call regardless of phase — and,
+  domain-specific to goyoukiki, sharing is blocked outright during a
+  declared bid-silence window even when everything else about the match is
+  clean."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [goyoukiki.store :as store]
+            [goyoukiki.matchllm :as matchllm]
+            [goyoukiki.operation :as op]))
+
+(defn- fresh [] (let [s (store/seed-db)] [s (op/build s)]))
+(defn- ctx [phase] {:phase phase})
+
+(defn- run [actor tid req phase]
+  (g/run* actor {:request req :context (ctx phase)} {:thread-id tid}))
+
+;; a deterministic, always-compliant proposal for reify-based adversarial
+;; tests to selectively mutate — mirrors teian/kekkai's reify pattern.
+;; cand-fujitera (rank :A, #{:役務 :物品の製造}) is eligible for both demo
+;; opportunities (min-rank :B and :A respectively).
+(defn- clean-proposal [& [overrides]]
+  (merge {:recommendation :propose :candidate "cand-fujitera" :score 0.8
+         :rationale "x" :summary "x" :cites [] :redactions []
+         :effect :draft :confidence 0.9}
+        overrides))
+
+(deftest ingest-always-records
+  (testing "observe path records a ground fact regardless of phase"
+    (let [[s actor] (fresh)
+          res (run actor "i" {:op :candidate/register :candidate "cand-new"
+                              :value {:id "cand-new" :name "新規団体"
+                                      :categories #{:役務} :rank :A}} 0)]
+      (is (= :record (get-in res [:state :disposition])))
+      (is (= "新規団体" (:name (store/candidate s "cand-new")))))))
+
+(deftest clean-propose-auto-commits-at-phase3
+  (testing "phase 3: a clean, eligible propose is not high-stakes → auto"
+    (let [[s actor] (fresh)
+          res (run actor "p" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 3)]
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :proposed (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera")))))))
+
+(deftest missing-phase-context-does-not-grant-max-autonomy
+  ;; default-phase is the fallback both when :phase is entirely absent
+  ;; from context (goyoukiki.operation) and when an unrecognized phase
+  ;; number is passed (phase/gate). It used to be 3 -- where
+  ;; :match/propose can auto-commit -- so a caller that simply forgot to
+  ;; set :phase silently got MAXIMUM autonomy instead of the safe
+  ;; "start narrow" default.
+  (testing "omitting :phase from context still requires human approval on a clean propose"
+    (let [[s actor] (fresh)
+          res (g/run* actor {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"}
+                             :context {}}
+                      {:thread-id "mp"})]
+      (is (not= :commit (get-in res [:state :disposition]))
+          "a clean propose must not auto-commit when :phase is unset")
+      (is (nil? (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))
+          "SSoT untouched without explicit phase"))))
+
+(deftest propose-requires-human-at-phase1
+  (testing "phase 1: proposing is allowed but never auto-commits"
+    (let [[_ actor] (fresh)
+          r1 (run actor "p1" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 1)]
+      (is (= :interrupted (:status r1))))))
+
+;; ── no-actuation: a :match/propose proposal's :effect must be :draft, never :shared ──
+
+(deftest no-actuation-happy-path
+  (testing "a compliant :draft-effect proposal is not held on :no-actuation"
+    (let [[s _] (fresh)
+          ok-adv (reify matchllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor ok-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "na-ok"})]
+      (is (not= :hold (get-in res [:state :disposition])))
+      (is (= :committed (:t (last (store/ledger s))))
+          "a compliant proposal commits — no :goyoukiki-hold fact is ever appended"))))
+
+(deftest no-actuation-adversarial-hold
+  (testing "a proposal that claims to already :shared is held un-overridably"
+    (let [[s _] (fresh)
+          bad-adv (reify matchllm/Advisor (-advise [_ _ _] (clean-proposal {:effect :shared})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "na-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-actuation} (-> (store/ledger s) last :basis))))))
+
+;; ── nomination: a :match/propose proposal must actually name a candidate ──
+
+(deftest nomination-required-adversarial-hold
+  (testing "a proposal with no nominated candidate is held un-overridably (never trust confidence alone)"
+    (let [[s _] (fresh)
+          bad-adv (reify matchllm/Advisor (-advise [_ _ _] (clean-proposal {:candidate nil})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "nom-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-nomination} (-> (store/ledger s) last :basis))))))
+
+;; ── eligibility: the nominated candidate must actually satisfy the opportunity's floor ──
+
+(deftest eligibility-required-happy-path
+  (testing "a candidate meeting the category/rank floor commits cleanly"
+    (let [[s _] (fresh)
+          ok-adv (reify matchllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor ok-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "el-ok"})]
+      (is (= :commit (get-in res [:state :disposition]))))))
+
+(deftest eligibility-required-adversarial-hold
+  (testing "a candidate BELOW the opportunity's rank floor is held un-overridably
+            (cand-kaien is rank :C, opp-meti-cloud-2027 requires :min-rank :B)"
+    (let [[s _] (fresh)
+          bad-adv (reify matchllm/Advisor (-advise [_ _ _] (clean-proposal {:candidate "cand-kaien"})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "el-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:ineligible-candidate} (-> (store/ledger s) last :basis))))))
+
+;; ── redaction-required: sensitive cites must be covered by :redactions ──
+
+(deftest redaction-required-happy-path
+  (testing "a sensitive cite WITH a matching redaction commits cleanly"
+    (let [[s _] (fresh)
+          ok-adv (reify matchllm/Advisor
+                   (-advise [_ _ _] (clean-proposal {:cites [:agency-internal-budget]
+                                                      :redactions [:agency-internal-budget]})))
+          a2 (op/build s {:advisor ok-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "rr-ok"})]
+      (is (= :commit (get-in res [:state :disposition]))))))
+
+(deftest redaction-required-adversarial-hold
+  (testing "a sensitive cite with NO redaction is held un-overridably"
+    (let [[s _] (fresh)
+          bad-adv (reify matchllm/Advisor
+                    (-advise [_ _ _] (clean-proposal {:cites [:agency-internal-budget] :redactions []})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "rr-bad"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-redaction} (-> (store/ledger s) last :basis))))))
+
+(deftest redaction-required-covers-all-sensitive-categories
+  (testing "other-candidate capability/pricing cites are just as protected as agency-internal-budget"
+    (let [[s _] (fresh)
+          bad-adv (reify matchllm/Advisor
+                    (-advise [_ _ _] (clean-proposal {:cites [:other-candidate-capability :other-candidate-pricing]
+                                                       :redactions [:other-candidate-capability]})))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-meti-cloud-2027"} :context (ctx 3)}
+                      {:thread-id "rr-partial"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-redaction} (-> (store/ledger s) last :basis))))))
+
+;; ── subject must already be registered (fail-closed on a hallucinated id) ──
+
+(deftest unregistered-opportunity-is-held
+  (testing "a propose for an opportunity that was never registered is held"
+    (let [[s _] (fresh)
+          bad-adv (reify matchllm/Advisor (-advise [_ _ _] (clean-proposal)))
+          a2 (op/build s {:advisor bad-adv})
+          res (g/run* a2 {:request {:op :match/propose :opportunity "opp-hallucinated"} :context (ctx 3)}
+                      {:thread-id "no-opp"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-opportunity} (-> (store/ledger s) last :basis))))))
+
+(deftest phase0-disables-assessments
+  (let [[s actor] (fresh)
+        res (run actor "p0" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 0)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))))
+
+(deftest share-always-requires-human
+  (testing "notifying (:match/share) is high-stakes at every assess-enabled phase"
+    (doseq [phase [1 2 3]]
+      (let [[s actor] (fresh)
+            _  (run actor (str "propose-" phase) {:op :match/propose :opportunity "opp-meti-cloud-2027"} 3)
+            r1 (run actor (str "share-" phase) {:op :match/share :opportunity "opp-meti-cloud-2027"
+                                                :candidate "cand-fujitera"} phase)]
+        (is (= :interrupted (:status r1)) (str "phase " phase " must still interrupt"))
+        (let [r2 (g/run* actor {:approval {:status :approved :by "cpo-hana"}}
+                         {:thread-id (str "share-" phase) :resume? true})]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= :shared (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera")))))))))
+
+;; ── share-time recheck: eligibility/redaction are re-verified against the
+;; CURRENT ground facts at :match/share time, not trusted from propose-time
+;; approval alone (defense-in-depth against drift between the two) ──
+
+(deftest share-recheck-happy-path
+  (testing "a clean match with no drift shares normally (recheck doesn't break the happy path)"
+    (let [[s actor] (fresh)
+          _  (run actor "recheck-ok-propose" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 3)
+          r1 (run actor "recheck-ok-share" {:op :match/share :opportunity "opp-meti-cloud-2027"
+                                            :candidate "cand-fujitera"} 3)]
+      (is (= :interrupted (:status r1)) "still routes to a human — recheck doesn't skip sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "cpo-hana"}}
+                       {:thread-id "recheck-ok-share" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :shared (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))))))))
+
+(deftest share-recheck-catches-post-propose-redaction-drift
+  (testing "a match revised (out-of-band, bypassing governor) after propose-time approval to
+            add an unredacted sensitive cite is HELD at :match/share — the redaction fact
+            validated at propose-time is not blindly trusted at share-time"
+    (let [[s actor] (fresh)
+          _ (run actor "recheck-redact-propose" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 3)]
+      (is (= :proposed (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera")))
+          "sanity: match committed cleanly")
+      (store/record-datom! s {:kind :match :id "opp-meti-cloud-2027::cand-fujitera"
+                              :value {:opportunity-id "opp-meti-cloud-2027" :candidate-id "cand-fujitera"
+                                      :cites [:agency-internal-budget] :redactions []}})
+      (let [r1 (run actor "recheck-redact-share" {:op :match/share :opportunity "opp-meti-cloud-2027"
+                                                  :candidate "cand-fujitera"} 3)]
+        (is (= :hold (get-in r1 [:state :disposition]))
+            "hard violation short-circuits straight to hold, no human interrupt needed")
+        (is (some #{:missing-redaction} (-> (store/ledger s) last :basis)))
+        (is (not= :shared (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))))))))
+
+(deftest share-recheck-catches-post-propose-eligibility-drift
+  (testing "a candidate whose qualification lapses (rank downgraded out-of-band) between
+            propose-time approval and share-time is HELD at :match/share"
+    (let [[s actor] (fresh)
+          _ (run actor "recheck-el-propose" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 3)]
+      (is (= :proposed (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera")))
+          "sanity: match committed cleanly")
+      (store/record-datom! s {:kind :candidate :id "cand-fujitera" :value {:rank :D}})
+      (let [r1 (run actor "recheck-el-share" {:op :match/share :opportunity "opp-meti-cloud-2027"
+                                              :candidate "cand-fujitera"} 3)]
+        (is (= :hold (get-in r1 [:state :disposition])))
+        (is (some #{:ineligible-candidate} (-> (store/ledger s) last :basis)))
+        (is (not= :shared (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))))))))
+
+;; ── the flagship domain-specific invariant: silence-period blocks share, not propose ──
+
+(deftest silence-period-allows-propose-but-blocks-share
+  (testing "an opportunity flagged :silence-period? still allows the internal :match/propose
+            (no external effect), but :match/share is a hard, un-overridable violation —
+            goyoukiki must never become a channel for bid-rigging/collusion during a live
+            competitive window (官製談合防止法/入札談合等関与行為防止法)"
+    (let [[s actor] (fresh)]
+      (store/record-datom! s {:kind :opportunity :id "opp-mod-radar-2026" :value {:silence-period? true}})
+      (let [r0 (run actor "sp-propose" {:op :match/propose :opportunity "opp-mod-radar-2026"} 3)]
+        (is (= :commit (get-in r0 [:state :disposition])) "propose is unaffected by silence-period"))
+      (let [r1 (run actor "sp-share" {:op :match/share :opportunity "opp-mod-radar-2026"
+                                      :candidate "cand-fujitera"} 3)]
+        (is (= :hold (get-in r1 [:state :disposition])))
+        (is (some #{:silence-period} (-> (store/ledger s) last :basis)))
+        (is (not= :shared (:status (store/match-for s "opp-mod-radar-2026" "cand-fujitera"))))))))
+
+(deftest reject-signoff-holds
+  (testing "a human rejection of a share records a hold, not a notification"
+    (let [[s actor] (fresh)
+          _  (run actor "propose-r" {:op :match/propose :opportunity "opp-meti-cloud-2027"} 3)
+          _  (run actor "share-r" {:op :match/share :opportunity "opp-meti-cloud-2027"
+                                   :candidate "cand-fujitera"} 3)
+          r2 (g/run* actor {:approval {:status :rejected :by "cpo-hana"}}
+                     {:thread-id "share-r" :resume? true})]
+      (is (= :hold (get-in r2 [:state :disposition])))
+      (is (not= :shared (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera")))))))

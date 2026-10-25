@@ -1,0 +1,226 @@
+(ns kekkai.heartbeat-http
+  "Loopback-only HTTP ingress for signed Kekkai node heartbeats.
+
+  This is a narrow transport adapter around the actor/store contract: it
+  accepts no enrollment or policy writes, bounds EDN input, and lets the actor
+  verify enrolled DID, authorization, signature, time, and sequence before a
+  heartbeat reaches the store. Bind only to loopback; remote nodes must use a
+  TLS-terminating proxy."
+  (:require [clojure.string :as string]
+            [cljs.reader :as edn]
+            [langgraph.graph :as g]
+            [kekkai.operation :as operation]
+            [kekkai.store :as store]
+            ["node:http" :as http]
+            ["node:fs" :as fs]
+            ["node:crypto" :as crypto]))
+
+(def max-body-bytes 16384)
+(def ^:private route-prefix "/v1/nodes/")
+(def ^:private route-suffix "/heartbeat")
+
+(defn- valid-route-node-id? [node-id]
+  (and (string? node-id)
+       (<= 1 (count node-id) 128)
+       (let [n (count node-id)]
+         (loop [i 0]
+           (if (= i n)
+             true
+             (let [code (.charCodeAt node-id i)
+                   alpha-num? (or (<= 48 code 57)
+                                  (<= 65 code 90)
+                                  (<= 97 code 122))
+                   punctuation? (contains? #{45 46 58 95} code)]
+               (and (or alpha-num? punctuation?)
+                    (or (pos? i) alpha-num?)
+                    (recur (inc i)))))))))
+
+(defn- route-node-id [url]
+  (when (and (string? url)
+             (string/starts-with? url route-prefix)
+             (string/ends-with? url route-suffix))
+    (let [end (- (count url) (count route-suffix))
+          node-id (subs url (count route-prefix) end)]
+      (when (valid-route-node-id? node-id) node-id))))
+
+(defn- heartbeat-map? [value]
+  (and (map? value)
+       (= #{:heartbeat/sequence :heartbeat/issued-at :heartbeat/signature-hex :endpoints}
+          (set (keys value)))))
+
+(defn ingest!
+  "Send one decoded request through the actor and optional durable writer.
+
+  The atom snapshot is restored if actor validation or persistence fails, so
+  a client never receives a storage error after an in-memory-only commit."
+  [st actor persist! node-id value]
+  (if-not (heartbeat-map? value)
+    {:status 400 :body {:error :invalid-heartbeat-body}}
+    (let [before @(:a st)]
+      (try
+        (g/run* actor
+                {:request {:op :node/heartbeat :node node-id :value value}
+                 :context {:phase 3}}
+                {:thread-id (.randomUUID crypto)})
+        (when persist! (persist! st))
+        (let [accepted (last (store/heartbeats-of st node-id))]
+          {:status 202
+           :body {:accepted? true
+                  :node node-id
+                  :sequence (:heartbeat/sequence value)
+                  :last-seen (:last-seen accepted)}})
+        (catch :default error
+          (reset! (:a st) before)
+          (let [data (ex-data error)
+                problems (:problems data)
+                status (cond
+                         (= :kekkai/invalid-node-heartbeat (:type data))
+                         (if (some #{:replayed-sequence} problems) 409 403)
+                         :else 500)]
+            {:status status
+             :body {:error (if (= 500 status)
+                             :heartbeat-storage-failed
+                             :heartbeat-rejected)}}))))))
+
+(defn- reply! [response status body]
+  (.writeHead response status
+              #js {"content-type" "application/edn; charset=utf-8"
+                   "cache-control" "no-store"})
+  (.end response (pr-str body)))
+
+(defn- process-request! [st actor persist! request response]
+  (let [method (.-method request)
+        url (.-url request)
+        node-id (route-node-id url)
+        content-type (some-> (aget (.-headers request) "content-type")
+                             (string/split #";") first string/trim string/lower-case)]
+    (cond
+      (not= "POST" method)
+      (do (.setHeader response "allow" "POST")
+          (reply! response 405 {:error :method-not-allowed}))
+
+      (nil? node-id)
+      (reply! response 404 {:error :not-found})
+
+      (not= "application/edn" content-type)
+      (reply! response 415 {:error :unsupported-content-type})
+
+      :else
+      (let [chunks (js/Array.)
+            total (atom 0)
+            rejected? (atom false)]
+        (.on request "data"
+             (fn [chunk]
+               (when-not @rejected?
+                 (swap! total + (.-length chunk))
+                 (if (> @total max-body-bytes)
+                   (do (reset! rejected? true)
+                       (reply! response 413 {:error :body-too-large}))
+                   (.push chunks chunk)))))
+        (.on request "end"
+             (fn []
+               (when-not @rejected?
+                 (try
+                   (let [text (.toString (.concat js/Buffer chunks) "utf8")
+                         value (edn/read-string text)
+                         result (ingest! st actor persist! node-id value)]
+                     (reply! response (:status result) (:body result)))
+                   (catch :default _
+                     (reply! response 400 {:error :invalid-request}))))))))))
+
+(defn- loopback-host? [host]
+  (contains? #{"127.0.0.1" "::1" "localhost"} host))
+
+(defn start!
+  "Start the heartbeat ingress on loopback.
+
+  Required: `:store` (a `kekkai.store/MemStore`). Optional `:host` defaults to
+  127.0.0.1, `:port` defaults to 0, and `:persist!` is called after an accepted
+  actor write. Resolves to the actual bound port, store, and async `:stop` fn.
+  The listener refuses non-loopback binds; remote nodes must use TLS at a
+  reverse proxy rather than send signatures over public HTTP."
+  [{:keys [store host port persist!]
+    :or {host "127.0.0.1" port 0}}]
+  (when-not (instance? kekkai.store.MemStore store)
+    (throw (ex-info "heartbeat ingress requires a MemStore"
+                    {:type :kekkai/unsupported-heartbeat-store})))
+  (when-not (loopback-host? host)
+    (throw (ex-info "heartbeat ingress may bind only to loopback"
+                    {:type :kekkai/non-loopback-heartbeat-bind :host host})))
+  (let [actor (operation/build store)
+        server (.createServer http
+                              (fn [request response]
+                                (try
+                                  (process-request! store actor persist! request response)
+                                  (catch :default _
+                                    (when-not (.-headersSent response)
+                                      (reply! response 500 {:error :internal-error}))))))]
+    (js/Promise.
+     (fn [resolve reject]
+       (.once server "error" reject)
+       (.listen server (int port) host
+                (fn []
+                  (let [address (.address server)]
+                    (.removeAllListeners server "error")
+                    (resolve {:server server
+                              :store store
+                              :host (.-address address)
+                              :port (.-port address)
+                              :stop (fn []
+                                      (js/Promise.
+                                       (fn [done _]
+                                         (.close server (fn [] (done nil))))))}))))))))
+
+(defn open-state-store
+  "Read an operator-preseeded EDN snapshot. Missing or symlink files fail
+  closed; the heartbeat API cannot create or authorize nodes."
+  [state-file]
+  (when-not (.existsSync fs state-file)
+    (throw (ex-info "heartbeat state file must already exist"
+                    {:type :kekkai/missing-heartbeat-state-file})))
+  (let [stat (.lstatSync fs state-file)]
+    (when (or (.isSymbolicLink stat) (not (.isFile stat)))
+      (throw (ex-info "heartbeat state path must be a regular file"
+                      {:type :kekkai/invalid-heartbeat-state-file}))))
+  (let [data (edn/read-string (.readFileSync fs state-file "utf8"))]
+    (when-not (and (map? data) (map? (:nodes data)))
+      (throw (ex-info "heartbeat state must contain an enrolled :nodes map"
+                      {:type :kekkai/invalid-heartbeat-state-file})))
+    (store/->MemStore (atom (merge {:ledger [] :assessments {}} data)))))
+
+(defn persist-state!
+  "Atomically replace the state snapshot after an accepted heartbeat."
+  [state-file st]
+  (let [temp (str state-file ".tmp-" (.randomUUID crypto))
+        text (binding [*print-namespace-maps* false *print-length* nil *print-level* nil]
+               (str (pr-str @(:a st)) "\n"))]
+    (try
+      (.writeFileSync fs temp text #js {:encoding "utf8" :mode 384 :flag "wx"})
+      (.renameSync fs temp state-file)
+      (catch :default error
+        (try (.unlinkSync fs temp) (catch :default _ nil))
+        (throw error)))))
+
+(defn -main [& args]
+  (let [[state-file host port-text] args]
+    (when-not state-file
+      (throw (ex-info "usage: kekkai.heartbeat-http STATE_FILE [LOOPBACK_HOST] [PORT]"
+                      {:type :kekkai/invalid-cli-arguments})))
+    (let [st (open-state-store state-file)
+          host (or host "127.0.0.1")
+          port (if port-text (js/parseInt port-text 10) 17892)]
+      (when-not (and (number? port) (<= 0 port 65535))
+        (throw (ex-info "heartbeat server port must be in 0..65535"
+                        {:type :kekkai/invalid-heartbeat-server-port})))
+      (-> (start! {:store st :host host :port port
+                   :persist! #(persist-state! state-file %)})
+          (.then (fn [{:keys [host port stop]}]
+                   (println (pr-str {:event :heartbeat-server-started
+                                     :host host :port port
+                                     :route "/v1/nodes/{node-id}/heartbeat"
+                                     :tls :required-at-proxy}))
+                   (.on js/process "SIGINT" (fn [] (-> (stop) (.then (fn [] (.exit js/process 0))))))
+                   (.on js/process "SIGTERM" (fn [] (-> (stop) (.then (fn [] (.exit js/process 0))))))))
+          (.catch (fn [error]
+                    (js/console.error (str "heartbeat server failed: " (ex-message error)))
+                    (set! (.-exitCode js/process) 1)))))))

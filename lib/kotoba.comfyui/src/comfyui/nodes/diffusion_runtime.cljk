@@ -1,0 +1,576 @@
+(ns comfyui.nodes.diffusion-runtime
+  "Executable JVM diffusion nodes. Unlike `comfyui.nodes.diffusion`'s shape
+  contracts, every node in this pack performs real work: image I/O, checkpoint
+  execution, latent allocation, or sampling."
+  (:require [kotoba.image :as kotoba-image] [kotoba.lang.text :as str]
+            [comfyui.clip.encoder :as clip-encoder]
+            [comfyui.diffusion.architecture :as architecture]
+            [comfyui.diffusion.model :as diffusion-model]
+            [comfyui.diffusion.scheduler :as scheduler]
+            [comfyui.safetensors :as safe]
+            [num.array :as arr]
+            [num.core :as nm]
+            [num.tensor :as t])
+  (:import
+           [java.nio.file Files Paths]
+           [java.util Random]))
+
+(defonce ^:private output-counters (atom {}))
+
+(defn- existing-next-counter [directory prefix]
+  (let [start (str prefix "_")]
+    (inc (reduce
+          max -1
+          (keep (fn [^java.io.File file]
+                  (let [name (.getName file)]
+                    (when (and (.isFile file) (str/starts-with? name start)
+                               (str/ends-with? name ".png"))
+                      (let [number (subs name (count start) (- (count name) 4))]
+                        (when (re-matches #"[0-9]{5}" number)
+                          (Long/parseLong number))))))
+                (or (.listFiles (.toFile directory))
+                    (make-array java.io.File 0)))))))
+
+(defn- reserve-counters! [directory prefix count]
+  (let [key [(str directory) prefix]
+        existing (existing-next-counter directory prefix)]
+    (loop []
+      (let [old @output-counters
+            start (max existing (get old key 0))
+            next (assoc old key (+ start count))]
+        (if (compare-and-set! output-counters old next)
+          start
+          (recur))))))
+
+(defn- save-png-batch [images output-directory filename-prefix]
+  (let [[batch height width channels :as shape] (:shape images)]
+    (when-not (and (= 4 (count shape)) (= 3 channels))
+      (throw (ex-info "SaveImage requires NHWC RGB images" {:shape shape})))
+    (when-not output-directory
+      (throw (ex-info "SaveImage requires :output-directory in runtime pack" {})))
+    (let [directory (Paths/get (str output-directory) (make-array String 0))
+          prefix (str/replace (or filename-prefix "ComfyUI") #"[^A-Za-z0-9._-]" "_")
+          values (double-array (arr/->vec images))]
+      (Files/createDirectories directory (make-array java.nio.file.attribute.FileAttribute 0))
+      (let [start (reserve-counters! directory prefix batch)]
+        (mapv
+         (fn [batch-index]
+         (let [image (kotoba-image/create width height :rgb)
+               filename (format "%s_%05d.png" prefix (+ start batch-index))
+               path (.resolve directory filename)]
+           (dotimes [y height]
+             (dotimes [x width]
+               (let [base (+ (* batch-index height width channels)
+                             (* y width channels) (* x channels))
+                     byte (fn [channel]
+                            (int (Math/round (* 255.0
+                                               (max 0.0 (min 1.0
+                                                             (aget values (+ base channel))))))))
+                     rgb (bit-or (bit-shift-left (byte 0) 16)
+                                 (bit-shift-left (byte 1) 8)
+                                 (byte 2))]
+                 (kotoba-image/set-rgb! image x y rgb))))
+           (when-not (kotoba-image/write-png-file! image (.toFile path))
+             (throw (ex-info "no PNG ImageIO writer available" {})))
+           {:filename filename :subfolder "" :type "output" :path (str path)}))
+         (range batch))))))
+
+(defn- load-image [backend input-directory filename]
+  (when-not (and backend input-directory (string? filename) (not (str/blank? filename)))
+    (throw (ex-info "LoadImage requires backend, :input-directory, and filename"
+                    {:filename filename})))
+  (let [directory (.toRealPath
+                   (Paths/get (str input-directory) (make-array String 0))
+                   (make-array java.nio.file.LinkOption 0))
+        candidate (.normalize (.resolve directory filename))
+        path (when (Files/isRegularFile candidate
+                                        (make-array java.nio.file.LinkOption 0))
+               (.toRealPath candidate (make-array java.nio.file.LinkOption 0)))]
+    (when-not (and path (.startsWith path directory))
+      (throw (ex-info "LoadImage path must be a file inside :input-directory"
+                      {:filename filename :input-directory (str directory)})))
+    (let [image (kotoba-image/read-file (.toFile path))]
+      (when-not image
+        (throw (ex-info "ImageIO could not decode image" {:path (str path)})))
+      (let [width (kotoba-image/width image)
+            height (kotoba-image/height image)
+            pixels (vec
+                    (for [y (range height) x (range width) channel [16 8 0]]
+                      (/ (double (bit-and 0xff
+                                          (bit-shift-right (kotoba-image/get-rgb image x y)
+                                                           channel)))
+                         255.0)))
+            mask (vec
+                  (for [y (range height) x (range width)]
+                    (- 1.0 (/ (double (bit-and 0xff
+                                              (unsigned-bit-shift-right
+                                               (kotoba-image/get-rgb image x y) 24)))
+                              255.0))))]
+        [(arr/from-vec backend pixels [1 height width 3])
+         (arr/from-vec backend mask [1 height width])]))))
+
+(defn- component [checkpoint kind prefixes checkpoint-dtype-policy]
+  (let [names (filterv #(some (fn [prefix] (str/starts-with? % prefix)) prefixes)
+                       (safe/tensor-names checkpoint))]
+    {:comfyui/component kind
+     :comfyui/checkpoint checkpoint
+     :comfyui/tensor-names names
+     :comfyui/read-tensor (fn [backend tensor-name]
+                            (when-not (some #{tensor-name} names)
+                              (throw (ex-info "tensor does not belong to checkpoint component"
+                                              {:component kind :tensor tensor-name})))
+                            (safe/read-tensor checkpoint backend tensor-name
+                                              {:dtype-policy checkpoint-dtype-policy}))}))
+
+(defn release-components!
+  "Release all distinct compiled tensor caches and safetensors mappings owned
+  by loaded MODEL/CLIP/VAE components. Components and their functions are invalid
+  after this call. Safe to call with the three outputs of one loader together."
+  [components]
+  (let [components (vec (remove nil? components))
+        caches (->> components
+                    (mapcat vals)
+                    (filter fn?)
+                    (keep #(-> % meta :comfyui/tensor-cache))
+                    distinct
+                    vec)
+        checkpoints (->> components
+                         (keep :comfyui/checkpoint)
+                         distinct
+                         vec)]
+    (arr/release-all! (mapcat #(vals @%) caches))
+    (doseq [cache caches] (reset! cache {}))
+    (doseq [checkpoint checkpoints] (safe/close! checkpoint))
+    nil))
+
+(defn- config-value [config key]
+  (or (get config key) (get config (keyword key))))
+
+(defn- diffusers-alphas [config]
+  (let [steps (long (config-value config "num_train_timesteps"))
+        start (double (config-value config "beta_start"))
+        end (double (config-value config "beta_end"))
+        betas (case (config-value config "beta_schedule")
+                "scaled_linear" (scheduler/scaled-linear-betas steps start end)
+                "linear" (scheduler/linear-betas steps start end)
+                (throw (ex-info "unsupported Diffusers beta schedule"
+                                {:config config})))]
+    ;; Diffusers schedulers before `prediction_type` was serialized used
+    ;; epsilon prediction unconditionally; absence therefore means epsilon.
+    (when-not (= "epsilon" (or (config-value config "prediction_type") "epsilon"))
+      (throw (ex-info "only epsilon-prediction Diffusers pipelines are executable"
+                      {:prediction-type (config-value config "prediction_type")})))
+    (scheduler/alphas-cumprod betas)))
+
+(defn- diffusers-pipeline-loader [backend resolve-pipeline]
+  {:type "DiffusersPipelineLoader"
+   :category "loaders"
+   :inputs {:pipeline_name {:type "STRING"}}
+   :outputs [{:name "MODEL" :type "MODEL"}
+             {:name "CLIP" :type "CLIP"}
+             {:name "VAE" :type "VAE"}]
+   :fn
+   (fn [{:keys [pipeline_name]}]
+     (when-not (fn? resolve-pipeline)
+       (throw (ex-info "DiffusersPipelineLoader requires :resolve-diffusers-pipeline" {})))
+     (let [{:keys [unet text-encoder vae unet-config text-config vae-config
+                   scheduler-config]} (resolve-pipeline pipeline_name)
+           opened (atom [])
+           open! (fn [path]
+                   (let [checkpoint (safe/open-file path)]
+                     (swap! opened conj checkpoint)
+                     checkpoint))]
+       (try
+         (let [unet-checkpoint (open! unet)
+               text-checkpoint (open! text-encoder)
+               vae-checkpoint (open! vae)
+               model-component (component unet-checkpoint :model [""])
+               clip-component (component text-checkpoint :clip [""])
+               vae-component (component vae-checkpoint :vae [""])
+               model-spec (architecture/infer-diffusers-unet-spec
+                           unet-checkpoint unet-config)
+               clip-spec (architecture/infer-diffusers-clip-spec
+                          text-checkpoint text-config)
+               vae-spec (architecture/infer-diffusers-vae-spec
+                         vae-checkpoint vae-config)]
+           (when-not (and model-spec clip-spec vae-spec scheduler-config)
+             (throw (ex-info "incomplete Diffusers pipeline"
+                             {:model-spec? (boolean model-spec)
+                              :clip-spec? (boolean clip-spec)
+                              :vae-spec? (boolean vae-spec)
+                              :scheduler-config? (boolean scheduler-config)})))
+           [(assoc model-component
+                   :comfyui/architecture {:family :diffusers-stable-diffusion}
+                   :comfyui/model-spec model-spec
+                   :comfyui/alphas-cumprod (vec (diffusers-alphas scheduler-config))
+                   :comfyui/scheduler-config scheduler-config
+                   :comfyui/denoise
+                   (diffusion-model/compile-denoiser model-component backend model-spec))
+            (assoc clip-component :comfyui/clip-spec clip-spec
+                   :comfyui/encode
+                   (clip-encoder/compile-encoder clip-component backend clip-spec))
+            (cond-> (assoc vae-component :comfyui/model-spec vae-spec
+                           :comfyui/decode
+                           (diffusion-model/compile-decoder
+                            vae-component backend vae-spec))
+              (:encoder-layers vae-spec)
+              (assoc :comfyui/encode
+                     (diffusion-model/compile-encoder
+                      vae-component backend vae-spec)))])
+         (catch Throwable error
+           (doseq [checkpoint @opened] (safe/close! checkpoint))
+           (throw error)))))})
+
+(defn pack
+  "Build executable diffusion nodes.
+
+  Options:
+  - `:backend` num backend used for latent allocation
+  - `:resolve-checkpoint` maps ComfyUI's ckpt_name to a filesystem path
+  - `:model-spec` graph map, or `(fn [ckpt-name checkpoint] graph-map)`
+  - `:vae-spec` decoder graph map, or resolver function
+  - `:diffusers-vae-config` AutoencoderKL config map, or resolver function
+  - `:resolve-diffusers-pipeline` resolves a pipeline name to separate UNet,
+    text encoder, and VAE paths plus their configs and scheduler config
+  - `:input-directory` root for executable LoadImage files
+  - `:output-directory` destination for executable SaveImage PNG files
+  - `:clip-tokenizer` OpenAI CLIP BPE tokenizer function
+  - `:clip-spec` checkpoint transformer graph for CLIP encoding
+  - `:alphas-cumprod` schedule vector, or a resolver function
+  - `:checkpoint-dtype-policy` `:f32` (default) or `:native`; native retains
+    checkpoint F16/BF16 weights in physical two-byte storage
+
+  CheckpointLoaderSimple shares one SafeTensorFile across outputs; the
+  Diffusers loader owns one file per component. The host closes each distinct
+  `:comfyui/checkpoint` when the workflow/model unloads."
+  [{:keys [backend resolve-checkpoint model-spec diffusers-config
+           vae-spec diffusers-vae-config clip-spec alphas-cumprod
+           resolve-diffusers-pipeline input-directory output-directory clip-tokenizer
+           checkpoint-dtype-policy]
+    :or {resolve-checkpoint identity checkpoint-dtype-policy :f32}}]
+  [{:type "LoadImage"
+    :category "image"
+    :inputs {:image {:type "STRING"}}
+    :outputs [{:name "IMAGE" :type "IMAGE"} {:name "MASK" :type "MASK"}]
+    :fn (fn [{:keys [image]}] (load-image backend input-directory image))}
+   {:type "CheckpointLoaderSimple"
+    :category "loaders"
+    :inputs {:ckpt_name {:type "STRING"}}
+    :outputs [{:name "MODEL" :type "MODEL"}
+              {:name "CLIP" :type "CLIP"}
+              {:name "VAE" :type "VAE"}]
+    :fn (fn [{:keys [ckpt_name]}]
+          (let [checkpoint (safe/open-file (resolve-checkpoint ckpt_name))
+                resolved-diffusers-config
+                (if (fn? diffusers-config)
+                  (diffusers-config ckpt_name checkpoint) diffusers-config)
+                model-component (component checkpoint :model
+                                            (cond-> ["model.diffusion_model."
+                                                    "diffusion_model." "unet."]
+                                             resolved-diffusers-config (conj ""))
+                                           checkpoint-dtype-policy)
+                architecture-info (architecture/infer checkpoint)
+                configured-spec (if (fn? model-spec)
+                                  (model-spec ckpt_name checkpoint) model-spec)
+                spec (or configured-spec
+                         (architecture/infer-unet-spec checkpoint architecture-info)
+                         (when resolved-diffusers-config
+                           (architecture/infer-diffusers-unet-spec
+                            checkpoint resolved-diffusers-config)))
+                conditioning-layers (architecture/infer-sdxl-conditioning-layers
+                                     checkpoint architecture-info)
+                effective-spec
+                (if (and configured-spec conditioning-layers
+                         (not-any? #(= :timestep-vector (:op %)) (:layers spec)))
+                  (update spec :layers #(into (vec conditioning-layers) %))
+                  spec)
+                resolved-clip-spec (or clip-spec
+                                       (architecture/infer-clip-spec
+                                        checkpoint architecture-info))
+                configured-alphas (if (fn? alphas-cumprod)
+                                    (alphas-cumprod ckpt_name checkpoint)
+                                    alphas-cumprod)
+                alphas (or configured-alphas
+                           (architecture/default-alphas-cumprod architecture-info))
+                resolved-diffusers-vae-config
+                (if (fn? diffusers-vae-config)
+                  (diffusers-vae-config ckpt_name checkpoint)
+                  diffusers-vae-config)
+                configured-decoder-spec (if (fn? vae-spec)
+                                          (vae-spec ckpt_name checkpoint) vae-spec)
+                decoder-spec (or configured-decoder-spec
+                                 (when resolved-diffusers-vae-config
+                                   (architecture/infer-diffusers-vae-spec
+                                    checkpoint resolved-diffusers-vae-config)))
+                executable-model
+                (cond-> (assoc model-component :comfyui/architecture architecture-info)
+                  effective-spec (assoc :comfyui/model-spec effective-spec
+                              :comfyui/denoise
+                              (diffusion-model/compile-denoiser
+                               model-component backend effective-spec))
+                  alphas (assoc :comfyui/alphas-cumprod (vec alphas)))
+                vae-component (component checkpoint :vae
+                                         (cond-> ["first_stage_model." "vae."]
+                                           resolved-diffusers-vae-config (conj ""))
+                                         checkpoint-dtype-policy)
+                executable-vae
+                (cond-> vae-component
+                  decoder-spec
+                  (assoc :comfyui/model-spec decoder-spec
+                         :comfyui/decode
+                         (diffusion-model/compile-decoder
+                          vae-component backend decoder-spec))
+                  (:encoder-layers decoder-spec)
+                  (assoc :comfyui/encode
+                         (diffusion-model/compile-encoder
+                          vae-component backend decoder-spec)))
+                clip-component (component checkpoint :clip
+                                          ["cond_stage_model." "text_encoder."
+                                           "text_encoder_2." "conditioner.embedders."
+                                           "clip."]
+                                          checkpoint-dtype-policy)
+                executable-clip
+                (cond-> clip-component
+                  resolved-clip-spec
+                  (assoc :comfyui/clip-spec resolved-clip-spec
+                         :comfyui/encode
+                         ((if (= :dual (:mode resolved-clip-spec))
+                            clip-encoder/compile-dual-encoder
+                            clip-encoder/compile-encoder)
+                          clip-component backend resolved-clip-spec)))]
+            [executable-model
+             executable-clip
+             executable-vae]))}
+   (diffusers-pipeline-loader backend resolve-diffusers-pipeline)
+   {:type "CLIPTextEncode"
+    :category "conditioning"
+    :inputs {:clip {:type "CLIP"}
+             :text {:type "STRING" :multiline true}}
+    :outputs [{:name "CONDITIONING" :type "CONDITIONING"}]
+   :fn (fn [{:keys [clip text]}]
+          (when-not (and (= :clip (:comfyui/component clip))
+                         (fn? clip-tokenizer))
+            (throw (ex-info "CLIPTextEncode requires a CLIP component and tokenizer"
+                            {:clip-keys (keys clip)})))
+          (let [tokenized (assoc (clip-tokenizer text) :clip clip :text text)
+                encode (:comfyui/encode clip)]
+            [(if encode (encode tokenized) tokenized)]))}
+   {:type "CLIPTextEncodeSDXL"
+    :category "advanced/conditioning"
+    :inputs {:clip {:type "CLIP"}
+             :text {:type "STRING" :multiline true}
+             :width {:type "INT" :default 1024}
+             :height {:type "INT" :default 1024}
+             :crop_w {:type "INT" :default 0}
+             :crop_h {:type "INT" :default 0}
+             :target_width {:type "INT" :default 1024}
+             :target_height {:type "INT" :default 1024}}
+    :outputs [{:name "CONDITIONING" :type "CONDITIONING"}]
+    :fn (fn [{:keys [clip text width height crop_w crop_h
+                     target_width target_height]}]
+          (when-not (and (= :clip (:comfyui/component clip))
+                         (fn? clip-tokenizer) (:comfyui/encode clip))
+            (throw (ex-info "CLIPTextEncodeSDXL requires executable dual CLIP"
+                            {:clip-keys (keys clip)})))
+          (let [dimensions [width height crop_w crop_h target_width target_height]]
+            (when-not (every? #(and (integer? %) (not (neg? %))) dimensions)
+              (throw (ex-info "SDXL dimensions/crops must be non-negative integers"
+                              {:time-ids dimensions})))
+            (let [encoded ((:comfyui/encode clip)
+                           (assoc (clip-tokenizer text) :clip clip :text text))]
+              (when-not (and (:tensor encoded) (:pooled encoded))
+                (throw (ex-info "SDXL dual CLIP must return tensor and pooled output"
+                                {:result-keys (keys encoded)})))
+              [(assoc encoded
+                      :time-ids dimensions
+                      :original-size [width height]
+                      :crop [crop_w crop_h]
+                      :target-size [target_width target_height])])))}
+   {:type "EmptyLatentImage"
+    :category "latent"
+    :inputs {:width {:type "INT" :default 512}
+             :height {:type "INT" :default 512}
+             :batch_size {:type "INT" :default 1}}
+    :outputs [{:name "LATENT" :type "LATENT"}]
+    :fn (fn [{:keys [width height batch_size]}]
+          (when-not (and backend (zero? (mod width 8)) (zero? (mod height 8))
+                         (pos? width) (pos? height) (pos? batch_size))
+            (throw (ex-info "latent dimensions require backend and positive multiples of 8"
+                            {:width width :height height :batch-size batch_size})))
+          [(arr/zeros backend [batch_size 4 (quot height 8) (quot width 8)])])}
+   {:type "DDIMStep"
+    :category "sampling"
+    :inputs {:sample {:type "LATENT"}
+             :epsilon {:type "LATENT"}
+             :alpha {:type "FLOAT"}
+             :alpha_prev {:type "FLOAT"}
+             :eta {:type "FLOAT" :default 0.0}
+             :noise {:type "LATENT" :optional true}}
+    :outputs [{:name "previous_sample" :type "LATENT"}
+              {:name "predicted_original_sample" :type "LATENT"}]
+   :fn (fn [{:keys [sample epsilon alpha alpha_prev eta noise]}]
+          (let [{:keys [previous-sample predicted-original-sample]}
+                (scheduler/ddim-step sample epsilon alpha alpha_prev
+                                     {:eta eta :noise noise})]
+            [previous-sample predicted-original-sample]))}
+   {:type "VAEDecode"
+    :category "latent"
+    :inputs {:samples {:type "LATENT"}
+             :vae {:type "VAE"}}
+    :outputs [{:name "IMAGE" :type "IMAGE"}]
+    :fn (fn [{:keys [samples vae]}]
+          (let [latent (if (and (map? samples) (contains? samples :samples))
+                         (:samples samples) samples)
+                decode (:comfyui/decode vae)]
+            (when-not (and latent (fn? decode))
+              (throw (ex-info "VAE lacks executable checkpoint decoder"
+                              {:vae-keys (keys vae)})))
+            (let [decoded (decode latent)
+                  [_batch channels _height _width :as shape] (:shape decoded)]
+              (when-not (and (= 4 (count shape)) (= 3 channels))
+                (throw (ex-info "VAE decoder must return NCHW RGB"
+                                {:shape shape})))
+              [(t/nchw-to-rgb-image decoded)])))}
+   {:type "VAEDecodeTiled"
+    :category "latent"
+    :inputs {:samples {:type "LATENT"}
+             :vae {:type "VAE"}
+             :tile_size {:type "INT" :default 8}
+             :overlap {:type "INT" :default 2}}
+    :outputs [{:name "IMAGE" :type "IMAGE"}]
+    :fn (fn [{:keys [samples vae]}]
+          ;; The JVM backend has no WebGPU binding limit; it preserves the
+          ;; public ComfyUI node contract while using the exact full decoder.
+          (let [latent (if (and (map? samples) (contains? samples :samples))
+                         (:samples samples) samples)
+                decoded ((:comfyui/decode vae) latent)]
+            [(t/nchw-to-rgb-image decoded)]))}
+   {:type "VAEEncode"
+    :category "latent"
+    :inputs {:pixels {:type "IMAGE"}
+             :vae {:type "VAE"}}
+    :outputs [{:name "LATENT" :type "LATENT"}]
+    :fn (fn [{:keys [pixels vae]}]
+          (let [encode (:comfyui/encode vae)
+                [batch _height _width channels :as shape] (:shape pixels)]
+            (when-not (and (fn? encode) (= 4 (count shape)) (= 3 channels))
+              (throw (ex-info "VAEEncode requires executable VAE and NHWC RGB pixels"
+                              {:shape shape :vae-keys (keys vae)})))
+            (let [nchw (t/rgb-image-to-nchw pixels)
+                  latent (encode nchw)]
+              (when-not (and (= 4 (count (:shape latent)))
+                             (= batch (first (:shape latent))))
+                (throw (ex-info "VAE encoder must return batched NCHW latent"
+                                {:pixels shape :latent (:shape latent)})))
+              [latent])))}
+   {:type "SaveImage"
+    :category "image"
+    :inputs {:images {:type "IMAGE"}
+             :filename_prefix {:type "STRING" :default "ComfyUI"}}
+    :outputs [{:name "UI" :type "UI"}]
+    :fn (fn [{:keys [images filename_prefix]}]
+          [{:images (save-png-batch images output-directory filename_prefix)}])}
+   {:type "KSampler"
+    :category "sampling"
+    :inputs {:model {:type "MODEL"}
+             :positive {:type "CONDITIONING"}
+             :negative {:type "CONDITIONING"}
+             :latent_image {:type "LATENT"}
+             :seed {:type "INT" :default 0}
+             :steps {:type "INT" :default 20}
+             :cfg {:type "FLOAT" :default 7.0}
+             :sampler_name {:type "STRING" :default "ddim"}
+             :scheduler {:type "STRING" :default "normal"}
+             :denoise {:type "FLOAT" :default 1.0}}
+    :outputs [{:name "LATENT" :type "LATENT"}]
+    :fn (fn [{:keys [model positive negative latent_image seed steps cfg
+                     sampler_name scheduler denoise]}]
+          (when-not (and (contains? #{"ddim" "euler" "euler_ancestral"
+                                      "dpmpp_2m" "dpmpp_2s_ancestral"} sampler_name)
+                         (contains? #{"normal" "karras" "exponential"
+                                      "polyexponential"} scheduler)
+                         (not (and (= "ddim" sampler_name)
+                                   (not= "normal" scheduler)))
+                         (< 0.0 (double denoise) 1.0000000001))
+            (throw (ex-info "runtime KSampler supports denoise in (0,1], normal DDIM, and continuous sigma schedules for Euler/DPM++"
+                            {:sampler-name sampler_name :scheduler scheduler :denoise denoise})))
+          (let [denoise-fn (:comfyui/denoise model)
+                alphas (:comfyui/alphas-cumprod model)
+                scheduler-config (:comfyui/scheduler-config model)
+                sample (if (and (map? latent_image) (contains? latent_image :samples))
+                         (:samples latent_image)
+                         latent_image)
+                _ (when-not (and (fn? denoise-fn) (seq alphas) sample)
+                    (throw (ex-info "MODEL lacks executable denoiser or alpha schedule"
+                                    {:model-keys (keys model)})))
+                random (Random. (long seed))
+                noise-fn (fn [shape _]
+                           (arr/from-vec (:backend sample)
+                                         (repeatedly (arr/nelems shape) #(.nextGaussian random))
+                                         shape))
+                denoise (double denoise)
+                total-steps (if (= 1.0 denoise)
+                              steps
+                              (max steps (long (/ steps denoise))))
+                continuous-sigma? (not= "normal" scheduler)
+                explicit-sigmas
+                (when continuous-sigma?
+                  (vec
+                   (take-last
+                    (inc steps)
+                    (scheduler/sigma-schedule
+                     scheduler total-steps
+                     (scheduler/alpha->sigma (double (first alphas)))
+                     (scheduler/alpha->sigma (double (last alphas)))))))
+                timesteps
+                (if continuous-sigma?
+                  (mapv #(scheduler/sigma->timestep alphas %)
+                        (butlast explicit-sigmas))
+                  (vec
+                   (take-last
+                    steps
+                    (scheduler/select-timesteps
+                     (count alphas) total-steps
+                     (if scheduler-config
+                       {:spacing (or (config-value scheduler-config
+                                                     "timestep_spacing") "linspace")
+                        :steps-offset (long (or (config-value scheduler-config
+                                                               "steps_offset") 0))}
+                       {})))))
+                initial-timestep (first timesteps)
+                initial-noise (noise-fn (:shape sample) initial-timestep)
+                initial-sample
+                (case sampler_name
+                  "ddim" (if (= 1.0 denoise)
+                           (t/add sample initial-noise)
+                           (scheduler/add-noise
+                            sample initial-noise
+                            (double (nth alphas initial-timestep))))
+                  (let [sigma (if explicit-sigmas
+                                (first explicit-sigmas)
+                                (scheduler/alpha->sigma
+                                 (double (nth alphas initial-timestep))))]
+                    (t/add sample (nm/scal! sigma initial-noise))))
+                sampler-args
+                {:sample initial-sample
+                 :alphas alphas
+                 :timesteps timesteps
+                 :sigmas explicit-sigmas
+                 :denoise-fn denoise-fn
+                 :positive positive :negative negative :cfg cfg
+                 :final-alpha (if (and scheduler-config
+                                       (false? (config-value scheduler-config
+                                                             "set_alpha_to_one")))
+                                (first alphas) 1.0)
+                 :eta 0.0 :noise-fn noise-fn}
+                result (case sampler_name
+                         "ddim" (scheduler/ddim-sample sampler-args)
+                         "euler" (scheduler/euler-sample sampler-args)
+                         "euler_ancestral"
+                         (scheduler/euler-ancestral-sample
+                          (assoc sampler-args :eta 1.0))
+                         "dpmpp_2s_ancestral"
+                         (scheduler/dpmpp-2s-ancestral-sample
+                          (assoc sampler-args :eta 1.0))
+                         "dpmpp_2m" (scheduler/dpmpp-2m-sample sampler-args))]
+            [(:sample result)]))}])

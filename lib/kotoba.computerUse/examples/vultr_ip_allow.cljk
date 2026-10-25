@@ -1,0 +1,101 @@
+(ns vultr-ip-allow
+  "Add an IP to a Vultr API key's Access Control list via computer use,
+  with vault-backed login — the agent NEVER types a raw credential.
+
+     ANTHROPIC_API_KEY=… kbb -Sdeps '{:paths [\"src\" \"examples\"]
+                  :deps {io.github.com-junkawasaki/langgraph-clj
+                         {:git/tag \"v0.2.0\" :git/sha \"133740f\"}}}' \\
+       -M -e \"(require 'vultr-ip-allow) (vultr-ip-allow/-main \\\"203.0.113.7\\\")\"
+
+  Credentials come from a vault (1Password by default; set VAULT=bw for
+  Bitwarden). The agent fills the login form with the `type_secret`
+  action, which resolves the secret at the host/vault layer and types
+  it without it ever reaching the model, the message history, or the
+  Datomic action log. No secret is ever passed as raw text.
+
+  Vault item is configured by env:
+    VULTR_VAULT_ITEM   (default \"Vultr\")
+    VULTR_VAULT        1Password vault name (optional)
+  op must be signed in (`op signin`) / bw unlocked (`BW_SESSION=$(bw unlock --raw)`)."
+  (:require [computeruse.macos :as macos]
+            [computeruse.vault :as vault]
+            [computeruse.openai-model :as oai]
+            [computeruse.agent :as agent]
+            [langchain.model :as model]
+            [langchain.db :as db]
+            [jvm-host :as host]))
+
+(def system-prompt
+  (str "You are a computer-use agent operating the user's macOS desktop.\n"
+       "HARD RULES (credentials):\n"
+       "- NEVER use the `type` action for a username, password, OTP or any\n"
+       "  credential field. Use `type_secret` with the vault secret_ref instead;\n"
+       "  the host fills it from the vault and you never see the value.\n"
+       "- You do not know and must not guess any secret. If a field needs a\n"
+       "  credential you have no secret_ref for, call `done` success=false.\n"
+       "HARD RULES (scope):\n"
+       "- Only ADD the single allowlist entry you were asked to add, then save.\n"
+       "  Never delete or edit existing entries or other account settings.\n"
+       "Work in the frontmost browser window; cmd+l focuses the address bar.\n"
+       "Screenshot to verify every step before and after acting."))
+
+(defn task [ip subnet item vault-name]
+  (let [ref (cond-> {:item item :field "password"}
+              vault-name (assoc :vault vault-name))
+        user-ref (cond-> {:item item :field "username"}
+                   vault-name (assoc :vault vault-name))]
+    (str "Goal: in the frontmost browser, ensure my.vultr.com is signed in, then "
+         "open https://my.vultr.com/settings/#settingsapi and add the IPv4 subnet "
+         ip "/" subnet " to the personal API key's Access Control allowlist and save.\n"
+         "If a Vultr login page appears, fill the email field with `type_secret` "
+         "secret_ref " (pr-str user-ref) " and the password field with `type_secret` "
+         "secret_ref " (pr-str ref) ", then submit. If a 2FA/OTP prompt appears and "
+         "the item has a `totp` field, use `type_secret` secret_ref "
+         (pr-str (assoc (dissoc ref :field) :field "totp")) ".\n"
+         "After saving, screenshot to confirm the new allowlist entry is listed, "
+         "then call done success=true with the entry you added.")))
+
+(defn make-vault []
+  (case (or (System/getenv "VAULT") "op")
+    "op" (vault/op-vault {:account (System/getenv "OP_ACCOUNT")})
+    "bw" (vault/bw-vault {})
+    (throw (ex-info "VAULT must be op or bw" {}))))
+
+(defn make-model []
+  ;; MODEL=gemma (local Ollama, default) | anthropic
+  (if (= "anthropic" (System/getenv "MODEL"))
+    (model/anthropic-model {:api-key (System/getenv "ANTHROPIC_API_KEY")
+                            :http-fn host/http-fn
+                            :json-write host/json-write :json-read host/json-read})
+    (oai/openai-model {:base-url (or (System/getenv "OPENAI_BASE_URL")
+                                     "http://localhost:11434/v1")
+                       :model (or (System/getenv "OPENAI_MODEL") "gemma4:e4b-it-qat")
+                       :max-tokens 2048
+                       :http-fn host/http-fn
+                       :json-write host/json-write :json-read host/json-read})))
+
+(defn -main [& [ip subnet]]
+  (let [ip (or ip (System/getenv "VULTR_ALLOW_IP"))
+        _ (assert ip "usage: (vultr-ip-allow/-main \"203.0.113.7\") or VULTR_ALLOW_IP env")
+        subnet (or subnet "32")
+        item (or (System/getenv "VULTR_VAULT_ITEM") "Vultr")
+        vname (System/getenv "VULTR_VAULT")
+        conn (db/create-conn agent/log-schema)
+        {:keys [result steps]}
+        (agent/run {:model (make-model)
+                    :computer (macos/macos-computer)
+                    :vault (make-vault)
+                    :system system-prompt
+                    :task (task ip subnet item vname)
+                    :history-conn conn
+                    :session-id (str "vultr-ip-" ip)
+                    :max-steps 50})]
+    (println "result:" result "| steps:" steps)
+    ;; audit trail records the action + secret_ref, never the secret value
+    (println "audit:"
+             (sort-by first
+                      (db/q '[:find ?step ?a ?in
+                              :where [?e :caction/step ?step]
+                                     [?e :caction/action ?a]
+                                     [?e :caction/input ?in]]
+                            (db/db conn))))))

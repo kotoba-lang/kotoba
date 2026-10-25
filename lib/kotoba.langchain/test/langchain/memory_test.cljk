@@ -1,0 +1,96 @@
+(ns langchain.memory-test
+  "Contract of langchain.memory/datomic-chat-history.
+
+  Chat history is the one store in this library whose *shape* is not
+  self-evident from a round-trip: every operation is scoped to a thread,
+  and every scope is expressed as a join the query engine is free to
+  satisfy some other way if the join is written wrong. A store that
+  answers plausibly for a single thread can still be wrong the moment a
+  second conversation exists -- which is the only state a chat history is
+  ever in outside a test. So each test here keeps two threads alive and
+  asserts about both: the one under test, and the one that must not move."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langchain.db :as db]
+            [langchain.memory :as memory]
+            [langchain.message :as msg]))
+
+(defn- fresh []
+  (let [conn (db/create-conn memory/memory-schema)]
+    [conn (memory/datomic-chat-history conn)]))
+
+(deftest append-returns-the-index-it-assigned
+  ;; The index is assigned inside append! and is not otherwise observable
+  ;; at the call site; a caller that numbers its own turns has nothing to
+  ;; reconcile against if this return value drifts.
+  (let [[_ {:keys [append!]}] (fresh)]
+    (is (= 0 (append! "t1" (msg/user "one"))))
+    (is (= 1 (append! "t1" (msg/ai "two"))))
+    (is (= 2 (append! "t1" (msg/user "three"))))))
+
+(deftest indices-restart-per-thread
+  ;; next-idx takes (max ?i) over a join pinned to ?tid. Unpin it and the
+  ;; max is taken over every thread in the database, so a brand-new
+  ;; conversation starts numbering after some unrelated conversation's
+  ;; last turn. Nothing raises: the indices are still unique and still
+  ;; ascending within the thread, so the store keeps answering in order.
+  ;; What breaks is the claim that an index means "this turn of THIS
+  ;; conversation" -- which is what anything paging or resuming reads it as.
+  (let [[_ {:keys [append! messages]}] (fresh)]
+    (dotimes [_ 5] (append! "busy" (msg/user "chatter")))
+    (testing "a second thread starts at 0 however long the first one is"
+      (is (= 0 (append! "quiet" (msg/user "first words")))))
+    (testing "and the busy thread is unaffected"
+      (is (= 5 (count (messages "busy")))))))
+
+(deftest messages-come-back-in-turn-order
+  ;; q returns a set; :messages imposes order with sort-by. Sets of small
+  ;; vectors often iterate in insertion order, so a store that dropped the
+  ;; sort would look correct in any test that appends and immediately
+  ;; reads. Interleaving two threads makes the set's own order diverge
+  ;; from either thread's turn order.
+  (let [[_ {:keys [append! messages]}] (fresh)]
+    (doseq [i (range 12)]
+      (append! "a" (msg/user (str "a" i)))
+      (append! "b" (msg/user (str "b" i))))
+    (is (= (mapv #(str "a" %) (range 12)) (mapv msg/text (messages "a"))))
+    (is (= (mapv #(str "b" %) (range 12)) (mapv msg/text (messages "b"))))))
+
+(deftest messages-round-trip-the-whole-message-not-just-its-text
+  ;; Two attributes hold the message: :msg/content (a string, for
+  ;; querying) and :msg/data (the pr-str'd map). Reading the former is
+  ;; the cheaper-looking choice and returns something that prints the
+  ;; same in a REPL for the common case -- while silently dropping the
+  ;; tool calls, usage and role that make an assistant turn replayable.
+  (let [[_ {:keys [append! messages]}] (fresh)
+        call {:id "call_1" :name "search" :input {:q "kotoba"}}
+        sent (msg/ai "let me look that up"
+                     {:tool-calls [call] :usage {:input 12 :output 4}
+                      :stop-reason "tool_use"})]
+    (append! "t1" sent)
+    (append! "t1" (msg/tool-result "call_1" "no hits" {:error? true}))
+    (let [[assistant tool] (messages "t1")]
+      (testing "the assistant turn survives whole"
+        (is (= sent assistant))
+        (is (= [call] (msg/tool-calls assistant)))
+        (is (= {:input 12 :output 4} (:usage assistant))))
+      (testing "so does the tool result, error flag included"
+        (is (= :tool (:role tool)))
+        (is (= "call_1" (:tool-call-id tool)))
+        (is (true? (:error? tool)))))))
+
+(deftest clear-empties-one-thread-and-only-that-thread
+  ;; clear! retracts whatever the ?tid join selected. If that join stops
+  ;; constraining, clear! still returns a plausible count and still
+  ;; empties the thread that was asked for -- while taking every other
+  ;; conversation in the database with it. This is the one operation here
+  ;; that destroys data, so it is asserted from both sides.
+  (let [[_ {:keys [append! messages clear!]}] (fresh)]
+    (dotimes [i 3] (append! "doomed" (msg/user (str "d" i))))
+    (dotimes [i 2] (append! "bystander" (msg/user (str "b" i))))
+    (testing "the count is of what this thread actually held"
+      (is (= 3 (clear! "doomed"))))
+    (is (= [] (messages "doomed")))
+    (testing "the other conversation is still there, in order"
+      (is (= ["b0" "b1"] (mapv msg/text (messages "bystander")))))
+    (testing "and the cleared thread renumbers from 0"
+      (is (= 0 (append! "doomed" (msg/user "starting over")))))))

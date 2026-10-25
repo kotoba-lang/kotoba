@@ -1,0 +1,222 @@
+(ns kotoba.mesh.llm-infer-test
+  "`llm/infer` reachable from a Kotoba guest running ON THIS MESH NODE.
+
+  kotoba-core-contracts has declared the capability (id 225, host import
+  `llm_infer`, ABI (prompt-ptr prompt-len out-ptr out-cap) -> bytes-written
+  | -1) since ADR-2607062330's addendum, and `kotoba.wasm-exec` grew a real
+  provider for it at the pin this repository now carries. What was missing
+  was the last link: `kotoba.mesh.node/dispatch` bound only the kgraph-*
+  imports, so a guest declaring `llm_infer` could not be instantiated at all
+  -- Chicory links by (module, field) and `.build` throws on an unsatisfied
+  import. That is the gap kotoba-lang/murakumo's murakumo.app.edn names when
+  it keeps every Bot turn of the itonami cloud-agent OFF the mesh.
+
+  Every test here goes through the node the way an operator does: a real
+  `com.sun.net.httpserver` on a real socket, serving the real compiled
+  `examples/mesh_llm_answer.kotoba`. The two that assert on a REFUSAL REASON
+  call the seam directly, because a reason is not observable over HTTP -- a
+  denial surfaces as a 500 with an empty body, which is the same thing any
+  other server error looks like. Asserting `500` would be asserting that
+  something failed, not that the capability guard refused.
+
+  No test here makes a network call. `kotoba.wasm-exec/default-host-state`
+  ships `:llm-client` as nil on purpose, and every client below is a
+  recording stub -- which is also what lets the negative tests distinguish
+  `refused before the provider ran` from `ran and found nothing`."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.lang.capability-values :as capability-values]
+            [kotoba.mesh.node :as mesh-node]
+            [kotoba.runtime :as runtime]
+            [kotoba.wasm-exec :as wasm-exec])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]))
+
+(def ^:private source "lib/kotoba.mesh/examples/mesh_llm_answer.kotoba")
+(def ^:private policy-path "lib/kotoba.mesh/examples/mesh_llm_answer_policy.edn")
+
+;; mesh_llm_answer.kotoba's own prompt literal. Pinned here so the positive
+;; test can prove the host decoded it OUT OF GUEST MEMORY rather than
+;; fabricating or dropping it.
+(def ^:private guest-prompt
+  "Answer in one short sentence: what is a mesh node?")
+
+(defn- stub-client
+  "A recording `{:infer-fn}`: appends every prompt it is handed to SEEN and
+  answers REPLY (a String, or nil to model `no key configured / transport
+  failure`). Never touches the network.
+
+  SEEN is what makes the negatives discriminate. A refusal and a nil answer
+  both end as an unremarkable HTTP response; only the recorder says whether
+  the provider body ever ran."
+  [seen reply]
+  {:infer-fn (fn [prompt] (swap! seen conj prompt) reply)})
+
+(defn- compiled
+  "The guest, compiled under its own granting policy -- the same call
+  `kotoba.mesh.node/start!`'s operator makes."
+  []
+  (mesh-node/compile-route source policy-path))
+
+;; ── over real HTTP, through the node ─────────────────────────────────
+
+(def ^:private server (atom nil))
+(def ^:private test-port (atom nil))
+(def ^:private seen (atom []))
+
+(def ^:private reply
+  "Deliberately not a value the node could produce on its own: no kgraph
+  fact, no status, nothing in `route.kotoba`. If this string reaches the
+  socket it came through `llm_infer`."
+  "a mesh node is a host that runs compiled guests")
+
+(defn- with-server [f]
+  (let [answer (compiled)
+        ;; Two routes, ONE server, differing only in the client the node was
+        ;; configured with -- so the `-1 with no client` case is measured on
+        ;; the same binary, same policy and same socket as the positive one.
+        ;; A second server would leave open whether something else differed.
+        started (mesh-node/start! {"llm-answer" answer} 0
+                                  {:llm-client (stub-client seen reply)})
+        clientless (mesh-node/start! {"llm-answer" answer} 0 nil)]
+    (reset! server [started clientless])
+    (reset! test-port [(.getPort (.getAddress ^com.sun.net.httpserver.HttpServer started))
+                       (.getPort (.getAddress ^com.sun.net.httpserver.HttpServer clientless))])
+    (try (f)
+         (finally
+           (.stop ^com.sun.net.httpserver.HttpServer started 0)
+           (.stop ^com.sun.net.httpserver.HttpServer clientless 0)))))
+
+(use-fixtures :once with-server)
+
+(defn- post [port path]
+  (let [req (-> (HttpRequest/newBuilder (URI/create (str "http://localhost:" port path)))
+                (.POST (HttpRequest$BodyPublishers/noBody)) (.build))
+        resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))]
+    [(.statusCode resp) (.body resp)]))
+
+(deftest a-mesh-guest-completes-an-inference-over-real-http
+  (testing "the whole path an operator drives: POST /mesh/http/llm-answer ->
+            node dispatch -> Chicory instance -> guest calls llm_infer ->
+            guarded host reads the prompt out of guest linear memory, hands it
+            to the injected client, writes the reply back -> node reads it out
+            of guest memory and puts it on the socket"
+    (reset! seen [])
+    (let [[status body] (post (first @test-port) "/mesh/http/llm-answer")]
+      (is (= 200 status))
+      (is (= reply body)
+          "the injected client's reply, served as the HTTP response body --
+           this string exists nowhere in route.kotoba or node.clj")
+      (is (= [guest-prompt] @seen)
+          "the host really decoded the GUEST's own prompt literal out of its
+           linear memory: not empty, not fabricated, not the route name"))))
+
+(deftest with-no-client-injected-the-guest-sees-minus-one-and-nothing-is-attempted
+  (testing "`kotoba.wasm-exec/default-host-state` ships :llm-client nil on
+            purpose -- an LLM client is outbound network authority plus a
+            credential, so it is injected or it is absent. A node configured
+            without one still SERVES the import (the guest instantiates and
+            runs); the granted call returns -1, and route.kotoba's `answer?`
+            turns that into the same 204 an assert-only guest gets."
+    (is (nil? (:llm-client (wasm-exec/default-host-state)))
+        "this host must not ship an ambient client")
+    (reset! seen [])
+    (let [[status body] (post (second @test-port) "/mesh/http/llm-answer")]
+      (is (= 204 status))
+      (is (= "" body))
+      (is (= [] @seen)
+          "the OTHER server's client was not reached either -- no client means
+           no outbound call was attempted anywhere, not merely that this one
+           answered nothing")))
+  (testing "and a client that IS injected but answers nil (no key configured,
+            or the underlying call failed) is the same 204 -- with the
+            difference that the provider body really ran. Without this pair the
+            test above could pass on a node that had stopped calling the client
+            at all."
+    (let [nil-seen (atom [])
+          answer (compiled)
+          quiet (mesh-node/start! {"llm-answer" answer} 0
+                                  {:llm-client (stub-client nil-seen nil)})
+          port (.getPort (.getAddress ^com.sun.net.httpserver.HttpServer quiet))]
+      (try
+        (is (= [204 ""] (post port "/mesh/http/llm-answer")))
+        (is (= [guest-prompt] @nil-seen)
+            "the client WAS called: this 204 is a nil answer, not a missing
+             client and not a refusal")
+        (finally (.stop ^com.sun.net.httpserver.HttpServer quiet 0))))))
+
+;; ── refusals, by reason ──────────────────────────────────────────────
+
+(deftest an-ungranted-guest-is-refused-by-the-capability-guard-at-run-time
+  (testing "the SAME compiled bytes, dispatched under a policy that grants
+            nothing, are refused by `kotoba.wasm-exec/guard-host-call` BEFORE
+            the provider body runs. This is the test that says `dispatch` has
+            no unguarded path: a node that wired the import directly, or that
+            passed a granting policy of its own, would answer 200 here.
+
+            Asserted on the DENIAL REASON, so it cannot pass on some unrelated
+            throw -- and on the recorder, so it cannot pass on a call that was
+            made and then discarded."
+    (let [ungranted-seen (atom [])
+          ;; Compiled under the granting policy (so real bytes exist), then
+          ;; handed to dispatch with the run-time policy replaced. That is
+          ;; exactly the case the run-time guard exists for: bytes that were
+          ;; admitted once are not thereby authorized forever.
+          wasm (assoc (compiled)
+                      :kotoba.mesh-node/policy {:kotoba.policy/capabilities #{}})
+          thrown (try (mesh-node/dispatch
+                       wasm {:llm-client (stub-client ungranted-seen "should not be reached")})
+                      nil
+                      (catch kerror/ExceptionInfo e e))]
+      (is (some? thrown) "an ungranted llm_infer call must not succeed")
+      (is (= :empty-intersection (:kotoba.host/denied (ex-data thrown)))
+          "denied for the absent grant, not for some other reason")
+      (is (= 'llm-infer (:kotoba.host/call (ex-data thrown)))
+          "and denied for THIS op -- not for a kgraph one that happens to be
+           bound on the same instance")
+      (is (= [] @ungranted-seen)
+          "fail closed: the injected client was never called, so a refused
+           guest cannot even cause an outbound request"))))
+
+(deftest a-guest-whose-policy-omits-the-grant-is-refused-at-startup
+  (testing "the earlier of the two refusals: `compile-route` runs
+            `runtime/check` before emitting, so a route asking for
+            `llm-infer` under a policy that grants only :notify/show never
+            becomes a binary at all. Asserted on :capability-not-granted, the
+            problem the static checker names."
+    (let [err (try (mesh-node/compile-route source "lib/kotoba.mesh/examples/deny_policy.edn")
+                   nil
+                   (catch kerror/ExceptionInfo e e))]
+      (is (some? err))
+      (is (= source (:kotoba.mesh-node/source (ex-data err))))
+      (is (= "kotoba.mesh-node: safe-subset/capability check failed" (ex-message err))
+          "rejected by the static checker, not left to wasm-binary")
+      (is (some #(= :capability-not-granted (:kotoba.runtime/problem %))
+                (get-in (ex-data err) [:kotoba.runtime/result :kotoba.runtime/problems]))))))
+
+;; ── the half that is easy to lose silently ───────────────────────────
+
+(deftest the-capability-kind-resolves-so-a-granted-call-is-not-denied-unsupported
+  (testing "`kotoba.runtime/op->kind` must map 'llm-infer to a kind
+            `kotoba.lang.capability-values/effect-for-kind` actually knows.
+            Both halves live in different repositories and are pinned
+            separately. With only the first, `guard-call` denies every
+            GRANTED call at run time with :unsupported-kind while the static
+            capability gate -- which never consults effect-for-kind -- stays
+            green. This is the only assertion here that can see that."
+    (is (= :host/llm-infer (get runtime/op->kind 'llm-infer)))
+    (is (contains? capability-values/effect-for-kind :host/llm-infer)
+        "not registered in kotoba-lang's effect-for-kind -- advance the
+         io.github.kotoba-lang/kotoba pin (it carries kotoba-lang's)"))
+  (testing "and end to end, through dispatch: a GRANTED call is not denied at
+            all, and in particular not for :unsupported-kind"
+    (let [ok-seen (atom [])
+          outcome (try {:answer (mesh-node/dispatch
+                                 (compiled) {:llm-client (stub-client ok-seen "ok")})}
+                       (catch kerror/ExceptionInfo e
+                         {:denied (:kotoba.host/denied (ex-data e))}))]
+      (is (not= :unsupported-kind (:denied outcome))
+          "the granted call was denied :unsupported-kind -- op->kind knows the
+           op but effect-for-kind does not know the kind")
+      (is (= "ok" (:answer outcome)))
+      (is (= [guest-prompt] @ok-seen)))))

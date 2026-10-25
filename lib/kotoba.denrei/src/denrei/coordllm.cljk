@@ -1,0 +1,134 @@
+(ns denrei.coordllm
+  "post-LLM — the contained intelligence node. It reads an activity's and
+  space's ground facts (the itonami activity driving the request, the
+  already-registered `kaisha.model` space) and returns a PROPOSAL: a drafted
+  channel message, or (for :message/post) a pass-through recommendation over
+  the already-committed draft. It NEVER posts into the space itself — every
+  output is censored by `denrei.governor` before anything is recorded, and
+  posting always routes to a human (charter: propose→draft only, no
+  actuation).
+
+  Advisor is injected (mock | real LLM via langchain.model), same as
+  kekkai.coordllm/tayori.replyllm/koyomi.coordllm.
+
+  Proposal shape:
+    {:recommendation kw   ; :draft | :post
+     :content {...}       ; {:tenant :space :channel :message <kaisha message EDN>}
+     :summary str :rationale str :cites [kw ..] :redactions [kw ..]
+     :effect kw           ; :draft | :post
+     :confidence 0..1}"
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [kaisha.model :as k]
+            [langchain.model :as model]
+            [denrei.store :as store]))
+
+(def actor-member
+  "The member identity denrei posts as — the actor's own seat in the space
+  (never a human's). The governor's membership check runs against this."
+  "denrei")
+
+;; ───────────────────────── deterministic mock ─────────────────────────
+
+(defn- assess-draft
+  "Draft a channel message from the activity's own facts — the mock derives
+  the body from the activity's kind/due-at and stamps :kaisha/at from due-at
+  (no wall clock), so a clean activity+space yields a confident draft and a
+  missing one yields a low-confidence noop."
+  [st {:keys [message space channel activity]}]
+  (let [sp  (store/space st space)
+        act (store/activity st activity)]
+    (if (and sp act (k/channel-by-id sp channel))
+      {:recommendation :draft
+       :content    {:tenant  (:repo act)
+                    :space   space
+                    :channel channel
+                    :message (k/message message
+                                         {:kaisha/author actor-member
+                                          :kaisha/body (str (name (:kind act)) " の連絡: due-at=" (:due-at act))
+                                          :kaisha/at (:due-at act)})}
+       :summary    (str message " 投稿下書き (#" channel ")")
+       :rationale  (str activity " (" (name (:kind act)) ") の事実に基づく提案。due-at=" (:due-at act))
+       :cites      [:activity :space]
+       :redactions []
+       :effect     :draft
+       :confidence 0.9}
+      {:recommendation :draft :content nil
+       :summary    "未登録の活動/space/channel"
+       :rationale  (str "activity=" activity " space=" space " channel=" channel)
+       :cites [] :redactions [] :effect :draft :confidence 0.2})))
+
+(defn- assess-post
+  "For :message/post there is nothing new to generate — the recommendation is
+  simply 'post the already-committed draft', carrying its content/
+  confidence/cites/redactions forward so the governor evaluates the SAME
+  facts twice (draft-time and post-time)."
+  [st {:keys [message]}]
+  (let [d (store/draft-of st message)]
+    (if d
+      {:recommendation :post :content (:content d)
+       :summary (str message " のドラフトを投稿") :rationale "承認済みドラフトの投稿"
+       :cites (:cites d []) :redactions (:redactions d []) :effect :post
+       :confidence (:confidence d 0.0)}
+      {:recommendation :post :content nil :summary "ドラフト未作成" :rationale (str message)
+       :cites [] :redactions [] :effect :post :confidence 0.0})))
+
+(defn infer [st {:keys [op] :as req}]
+  (case op
+    :message/draft (assess-draft st req)
+    :message/post  (assess-post st req)
+    {:recommendation :unknown :content nil :summary "未対応" :rationale (str op)
+     :cites [] :redactions [] :effect :noop :confidence 0.0}))
+
+;; ───────────────────────── Advisor protocol ─────────────────────────
+
+(defprotocol Advisor
+  (-advise [advisor store request]))
+
+(defn mock-advisor [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+(def ^:private system-prompt
+  (str "あなたは社内 communication space (kaisha) のチャンネル投稿の下書き助言者です。"
+       "与えられた事実(活動/space)のみに基づき、提案を1つ EDN マップで返します。"
+       "EDN だけを出力。\n"
+       "キー: :recommendation(:draft|:post) :content({:tenant :space :channel "
+       ":message <kaisha.model message EDN>}) :summary :rationale :cites :redactions "
+       ":effect(:draft 固定 — :post は自称しない) :confidence(0..1)。\n"
+       "重要: あなたは投稿を送信しない(propose→draft のみ)。author は自分の member "
+       "identity から離れて捏造しない。request の space/channel 以外を対象にしない。"))
+
+(defn- facts-for [st {:keys [message space activity]}]
+  {:activity (store/activity st activity) :space (store/space st space)
+   :draft (store/draft-of st message)})
+
+(defn- parse-proposal [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p (update :cites #(vec (or % [])))
+            (update :redactions #(vec (or % [])))
+            (update :confidence #(if (number? %) (double %) 0.0))
+            (update :effect #(or % :noop)))
+      {:recommendation :unknown :content nil :summary "LLM応答を解釈できません" :rationale (str content)
+       :cites [] :redactions [] :effect :noop :confidence 0.0})))
+
+(defn llm-advisor
+  "Advisor backed by a langchain.model/ChatModel (Anthropic / OpenAI-compatible
+  / mock-model). Output is parsed defensively → an unparseable response is a
+  confidence-0 noop the governor will hold/escalate."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ st req]
+       (let [resp (model/-generate chat-model
+                    [{:role :system :content system-prompt}
+                     {:role :user :content (str "操作:" (:op req)
+                                                "\n事実:" (pr-str (facts-for st req)))}]
+                    gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace [request proposal]
+  {:t :coordllm-proposal :op (:op request) :subject (:message request)
+   :recommendation (:recommendation proposal) :summary (:summary proposal)
+   :rationale (:rationale proposal) :cites (:cites proposal) :confidence (:confidence proposal)})

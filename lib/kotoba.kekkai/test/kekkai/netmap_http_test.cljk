@@ -1,0 +1,253 @@
+(ns kekkai.netmap-http-test
+  (:require [kotoba.test :refer [async deftest is testing]]
+            [cljs.reader :as edn]
+            [ed25519.core :as ed25519]
+            [kekkai.heartbeat :as heartbeat]
+            [kekkai.heartbeat-http :as heartbeat-http]
+            [kekkai.netmap-http :as netmap-http]
+            [kekkai.node.endpoint :as endpoint]
+            [kekkai.node.heartbeat :as node-heartbeat]
+            [kekkai.node.netmap-watch :as node-netmap-watch]
+            [kekkai.node.signed-netmap :as signed-netmap]
+            [kekkai.netmap-reconciler :as reconciler]
+            [kekkai.store :as store]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def ^:private node-seed
+  (ed25519/unhex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
+(def ^:private peer-seed
+  (ed25519/unhex "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"))
+(def ^:private node-id "n-server")
+(def ^:private subject "default/n-server")
+(def ^:private peer-id "n-laptop")
+(def ^:private peer-subject "default/n-laptop")
+
+(defn- temp-root []
+  (.mkdtempSync fs (path/join (.tmpdir os) "kekkai-netmap-http-test-")))
+
+(defn- authority-in! [root]
+  (let [pair (.generateKeyPairSync crypto "ed25519")
+        private-der (.export (.-privateKey pair)
+                             #js {:format "der" :type "pkcs8"})
+        public-der (.export (.-publicKey pair)
+                            #js {:format "der" :type "spki"})
+        file (path/join root "authority.edn")]
+    (.writeFileSync fs file
+                    (pr-str {:private-b64 (.toString private-der "base64")
+                             :public-b64 (.toString public-der "base64")})
+                    #js {:encoding "utf8" :mode 384})
+    (reconciler/load-identity! file)))
+
+(defn- relay-fixture []
+  {:name "test-relay" :region "test" :host "127.0.0.1" :port 41642
+   :key (apply str (repeat 64 "a"))})
+
+(defn- prepared-fixture []
+  (let [root (temp-root)
+        roots [(path/join root "mirror-a") (path/join root "mirror-b")]
+        identity (authority-in! root)
+        st (store/seed-db)
+        did (ed25519/did-key-from-seed node-seed)
+        peer-did (ed25519/did-key-from-seed peer-seed)
+        peer-seed-file (path/join root "peer-heartbeat.seed")
+        state-file (path/join root "control-plane.edn")]
+    (store/record-datom! st {:kind :node :id node-id
+                             :value {:did did :status "authorized"}})
+    (store/record-datom! st {:kind :node :id peer-id
+                             :value {:did peer-did :status "authorized"}})
+    (store/record-datom! st {:kind :heartbeat :id node-id
+                             :value {:endpoints ["198.51.100.20:41641"]}})
+    (.writeFileSync fs peer-seed-file (str (ed25519/hexify peer-seed) "\n")
+                    #js {:encoding "utf8" :mode 384})
+    (.chmodSync fs peer-seed-file 384)
+    (reconciler/reconcile! {:store st :identity identity :roots roots
+                           :min-copies 2 :relays [(relay-fixture)]})
+    (.writeFileSync fs state-file (str (pr-str @(:a st)) "\n")
+                    #js {:encoding "utf8" :mode 384})
+    {:root root :roots roots :identity identity :store st :did did
+     :peer-did peer-did
+     :node-static-key (:static-pub (store/node st node-id))
+     :peer-static-key (:static-pub (store/node st peer-id))
+     :peer-seed-file peer-seed-file
+     :state-file state-file}))
+
+(defn- request-netmap [server issued-at signature]
+  (let [signature (or signature
+                      (heartbeat/sign-netmap-read node-id issued-at node-seed))
+        url (str "http://127.0.0.1:" (:port server)
+                 "/v1/nodes/" node-id "/netmap")]
+    (js/fetch url
+              #js {:method "GET"
+                   :headers #js {"x-kekkai-issued-at" (str issued-at)
+                                 "x-kekkai-signature" signature}})))
+
+(deftest netmap-http-requires-node-did-and-serves-only-verified-publication
+  (let [{:keys [root roots identity state-file did node-static-key]}
+        (prepared-fixture)
+        server* (atom nil)
+        seed-file (path/join root "node-heartbeat.seed")
+        output-file (path/join root "node-netmap.signed.edn")
+        node-config {:api-url "http://127.0.0.1"
+                     :node-id node-id
+                     :subject subject
+                     :node-static-key node-static-key
+                     :heartbeat {:did did :seed-file seed-file}
+                     :authority-spki-b64 (:authority-spki-b64 identity)
+                     :output-file output-file}
+        failure (netmap-http/start!
+                 {:state-file state-file :roots roots
+                  :authority-spki-b64 (:authority-spki-b64 identity)
+                  :host "127.0.0.1" :port 0})]
+    (.writeFileSync fs seed-file (str (ed25519/hexify node-seed) "\n")
+                    #js {:encoding "utf8" :mode 384})
+    (.chmodSync fs seed-file 384)
+    (testing "the loopback listener refuses a public bind"
+      (let [error (try
+                    (netmap-http/start!
+                     {:state-file state-file :roots roots
+                      :authority-spki-b64 (:authority-spki-b64 identity)
+                      :host "0.0.0.0" :port 0})
+                    nil
+                    (catch :default error error))]
+        (is (= :kekkai/non-loopback-netmap-bind (-> error ex-data :type)))))
+    (async done
+      (.then failure
+             (fn [server]
+               (reset! server* server)
+               (let [issued-at (heartbeat/now-seconds)
+                     finish! (fn []
+                               (.then ((:stop server))
+                                      (fn []
+                                        (.rmSync fs root #js {:recursive true :force true})
+                                        (done))))
+                     fail! (fn [error]
+                             (is false (str "netmap HTTP roundtrip failed: "
+                                            (ex-message error)))
+                             (finish!))]
+                 (.then (request-netmap server issued-at nil)
+                        (fn [response]
+                          (is (= 200 (.-status response)))
+                          (.then (.text response)
+                                 (fn [text]
+                                   (let [body (edn/read-string text)
+                                         verified (reconciler/verify-desired
+                                                   (:desired/envelope body) identity
+                                                   {:kind :kekkai/netmap
+                                                    :subject subject})
+                                         netmap (reconciler/verify-netmap-envelope
+                                                 (:desired/payload verified)
+                                                 (:authority-spki-b64 identity))]
+                                     (is (= (:desired/cid verified)
+                                            (get-in body [:desired/head :desired/cid])))
+                                     (is (= 1 (:desired/epoch verified)))
+                                     (is (= "n-server"
+                                            (get-in netmap [:netmap/self :node/id])))
+                                     (.then (node-netmap-watch/install-current!
+                                             (assoc node-config :api-url
+                                                    (str "http://127.0.0.1:" (:port server))))
+                                            (fn [result]
+                                              (is (= :installed (:status result)))
+                                              (is (= 1 (:netmap/version
+                                                        (signed-netmap/verify-envelope
+                                                         (.readFileSync fs output-file "utf8")
+                                                         (:authority-spki-b64 identity)))))
+                                              (.then (request-netmap
+                                                      server issued-at
+                                                      (apply str (repeat 128 "0")))
+                                                     (fn [bad-response]
+                                                       (is (= 403 (.-status bad-response)))
+                                                       (finish!))
+                                                     fail!))
+                                            fail!)))
+                                 fail!))
+                        fail!)))
+             (fn [error]
+               (is false (str "netmap HTTP listener failed: " (ex-message error)))
+               (.rmSync fs root #js {:recursive true :force true})
+               (done))))))
+
+(deftest heartbeat-candidates-reconcile-and-bootstrap-through-authenticated-http
+  (let [{:keys [root roots identity state-file did peer-did peer-seed-file
+                peer-static-key]}
+        (prepared-fixture)
+        heartbeat-server* (atom nil)
+        netmap-server* (atom nil)
+        output-file (path/join root "peer-netmap.signed.edn")
+        peer-config {:node-id peer-id
+                     :subject peer-subject
+                     :node-static-key peer-static-key
+                     :heartbeat {:did peer-did :seed-file peer-seed-file}
+                     :authority-spki-b64 (:authority-spki-b64 identity)
+                     :output-file output-file}
+        candidate (endpoint/endpoint :reflexive "203.0.113.41" 49152)
+        heartbeat-value (node-heartbeat/sign
+                         node-id 1 (heartbeat/now-seconds)
+                         (node-heartbeat/candidate-strings [candidate]) node-seed)
+        cleanup! (fn [done]
+                   (let [stops (cond-> []
+                                 @netmap-server* (conj ((:stop @netmap-server*)))
+                                 @heartbeat-server* (conj ((:stop @heartbeat-server*))))]
+                     (-> (js/Promise.all (clj->js stops))
+                         (.then (fn []
+                                  (.rmSync fs root #js {:recursive true :force true})
+                                  (done))))))
+        fail! (fn [done error]
+                (is false (str "heartbeat-to-netmap integration failed: "
+                               (ex-message error) "\n" (.-stack error)))
+                (cleanup! done))]
+    (async done
+      (.then (heartbeat-http/start!
+              {:store (heartbeat-http/open-state-store state-file)
+               :host "127.0.0.1" :port 0
+               :persist! #(heartbeat-http/persist-state! state-file %)})
+             (fn [heartbeat-server]
+               (reset! heartbeat-server* heartbeat-server)
+               (.then (netmap-http/start!
+                       {:state-file state-file :roots roots
+                        :authority-spki-b64 (:authority-spki-b64 identity)
+                        :host "127.0.0.1" :port 0})
+                      (fn [netmap-server]
+                        (reset! netmap-server* netmap-server)
+                        (.then
+                         (js/fetch
+                          (str "http://127.0.0.1:" (:port heartbeat-server)
+                               "/v1/nodes/" node-id "/heartbeat")
+                          #js {:method "POST"
+                               :headers #js {"content-type" "application/edn"}
+                               :body (pr-str heartbeat-value)})
+                         (fn [response]
+                           (is (= 202 (.-status response)))
+                           (let [latest-store (heartbeat-http/open-state-store state-file)
+                                 reconciled (reconciler/reconcile!
+                                             {:store latest-store
+                                              :identity identity
+                                              :roots roots :min-copies 2
+                                              :relays [(relay-fixture)]})]
+                             (is (pos? (:published reconciled)))
+                             (.then
+                              (node-netmap-watch/install-current!
+                               (assoc peer-config
+                                      :api-url (str "http://127.0.0.1:"
+                                                    (:port netmap-server))))
+                              (fn [installed]
+                                (let [netmap
+                                      (signed-netmap/verify-envelope
+                                       (.readFileSync fs output-file "utf8")
+                                       (:authority-spki-b64 identity))
+                                      peer (first
+                                            (filter #(= node-id (:node/id %))
+                                                    (:netmap/peers netmap)))]
+                                  (is (= :installed (:status installed)))
+                                  (is (= 2 (:netmap/version netmap)))
+                                  (is (= [{:kind :reflexive
+                                           :host "203.0.113.41"
+                                           :port 49152}]
+                                         (:node/endpoints peer)))
+                                  (cleanup! done)))
+                              (fn [error] (fail! done error)))))
+                         (fn [error] (fail! done error)))
+                      (fn [error] (fail! done error))))
+             (fn [error] (fail! done error)))))))

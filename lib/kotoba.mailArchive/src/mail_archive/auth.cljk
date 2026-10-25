@@ -1,0 +1,153 @@
+(ns mail-archive.auth
+  "OAuth2 access-token acquisition/refresh for the Gmail backfill, built on
+  `org-ietf-oauth2`'s pure request/response shaping (`oauth2.core`) plus an
+  injectable `:http-fn` — the same `{:url :method :headers :body} -> {:status :body}`
+  seam `gmail.client` uses, so the whole token flow is testable against a stub and
+  never only against Google. `oauth2.core` never makes a network call; this
+  namespace is the thin JVM layer that (a) executes the token request through the
+  injected transport and (b) reads/writes the long-lived secrets (OAuth client +
+  per-account refresh token) through a `CredentialStore`.
+
+  The default `KeychainCredentialStore` shells out to macOS `security`, mirroring
+  `orgs/personal/bin/google-auth.py` exactly:
+
+    service \"google-oauth-client\"  (account \"mail-archive\") -> {\"client_id\" \"client_secret\"} JSON
+    service \"google-oauth:<slug>\"  (account <email>)         -> refresh_token
+
+  Secrets are read on demand, never held on disk or in git. The token-executing
+  and Keychain functions are JVM-only (host capabilities); `authorize-url` and the
+  `CredentialStore` protocol are portable. Tests inject a fake in-memory
+  CredentialStore and a stub :http-fn."
+  (:require [oauth2.core :as oauth2]
+            #?(:clj [json.data-json :as json])
+            #?(:clj [kotoba.process :as shell])
+            #?(:clj [kotoba.lang.text :as str])
+            #?(:clj [gmail.client :as gclient])))
+
+(def google-token-endpoint "https://oauth2.googleapis.com/token")
+(def google-authorize-endpoint "https://accounts.google.com/o/oauth2/v2/auth")
+
+(def client-credential-service "google-oauth-client")
+(defn refresh-token-service [slug] (str "google-oauth:" slug))
+
+;; Read-only scope, matching orgs/personal/bin/google-auth.py.
+(def gmail-readonly-scope "https://www.googleapis.com/auth/gmail.readonly")
+
+;; ───────────────────────── credential store ─────────────────────────
+
+(defprotocol CredentialStore
+  (get-secret [this service] "The stored secret string for `service`, or nil.")
+  (put-secret! [this service account secret] "Store `secret` under `service`/`account`."))
+
+#?(:clj
+   (defn- security-find [service]
+     (let [{:keys [exit out]} (shell/sh "security" "find-generic-password" "-s" service "-w")]
+       (when (zero? exit) (str/trim out)))))
+
+#?(:clj
+   (defn- security-add! [service account secret]
+     (let [{:keys [exit err]} (shell/sh "security" "add-generic-password" "-U"
+                                        "-s" service "-a" account "-w" secret)]
+       (when-not (zero? exit)
+         (throw (ex-info "security add-generic-password failed"
+                         {:service service :err err}))))))
+
+#?(:clj
+   (defrecord KeychainCredentialStore []
+     CredentialStore
+     (get-secret [_ service] (security-find service))
+     (put-secret! [_ service account secret] (security-add! service account secret))))
+
+#?(:clj
+   (defn keychain-credential-store [] (->KeychainCredentialStore)))
+
+;; ───────────────────────── token requests (JVM) ─────────────────────────
+
+#?(:clj
+   (defn token-request!
+     "Execute one RFC 6749 token request. `params` is the caller's grant params
+     (`:grant-type` plus the fields that grant needs); it is shaped into a form
+     body by `oauth2.core/token-request-body` + `->form-body`, POSTed through
+     `:http-fn` (defaults to `gmail.client/jvm-http-fn`), and the JSON response
+     normalized by `oauth2.core/parse-token-response`. `parse-token-response`
+     throws the RFC 6749 §5.2 error map on an error response."
+     [params {:keys [http-fn token-endpoint]
+              :or {token-endpoint google-token-endpoint}}]
+     (let [http-fn (or http-fn (gclient/jvm-http-fn))
+           body (oauth2/->form-body (oauth2/token-request-body params))
+           resp (http-fn {:url token-endpoint
+                          :method :post
+                          :headers {"Content-Type" "application/x-www-form-urlencoded"}
+                          :body body})]
+       (when-not (< (:status resp) 300)
+         (throw (ex-info "oauth2 token endpoint transport error"
+                         {:status (:status resp) :body (:body resp)})))
+       (oauth2/parse-token-response (json/read-str (:body resp) :key-fn keyword)))))
+
+#?(:clj
+   (defn exchange-code!
+     "Exchange an authorization `:code` for tokens (RFC 6749 §4.1.3). Returns the
+     normalized token map (carries `:refresh-token` for later refreshes)."
+     [{:keys [code redirect-uri client-id client-secret code-verifier]} http-opts]
+     (token-request! {:grant-type "authorization_code"
+                      :code code :redirect-uri redirect-uri
+                      :client-id client-id :client-secret client-secret
+                      :code-verifier code-verifier}
+                     http-opts)))
+
+#?(:clj
+   (defn refresh!
+     "Refresh an access token (RFC 6749 §6). Returns the normalized token map."
+     [{:keys [refresh-token client-id client-secret scope]} http-opts]
+     (token-request! {:grant-type "refresh_token"
+                      :refresh-token refresh-token
+                      :client-id client-id
+                      :client-secret client-secret
+                      :scope scope}
+                     http-opts)))
+
+(defn authorize-url
+  "The Google consent URL for the read-only Gmail scope, ready to open in a
+  browser. `code-challenge`/`code-challenge-method` (from `oauth2.pkce`) enable
+  PKCE. `access_type=offline` + `prompt=consent` are Google's requirement to be
+  issued a refresh token."
+  [{:keys [client-id redirect-uri state code-challenge code-challenge-method scope login-hint]
+    :or {scope gmail-readonly-scope}}]
+  (str (oauth2/authorization-url
+        {:authorize-endpoint google-authorize-endpoint
+         :client-id client-id
+         :redirect-uri redirect-uri
+         :scope scope
+         :state state
+         :code-challenge code-challenge
+         :code-challenge-method code-challenge-method})
+       "&access_type=offline&prompt=consent"
+       (when login-hint (str "&login_hint=" login-hint))))
+
+;; ───────────────────────── keychain-backed access token (JVM) ─────────────────────────
+
+#?(:clj
+   (defn client-credentials
+     "Read the OAuth client `{:client-id :client-secret}` from the CredentialStore
+     (stored as JSON under `google-oauth-client`)."
+     [cred-store]
+     (if-let [raw (get-secret cred-store client-credential-service)]
+       (let [{:keys [client_id client_secret]} (json/read-str raw :key-fn keyword)]
+         {:client-id client_id :client-secret client_secret})
+       (throw (ex-info "no OAuth client in credential store — store one under google-oauth-client"
+                       {:service client-credential-service})))))
+
+#?(:clj
+   (defn access-token
+     "A fresh access token for account `slug`: read the client creds + that
+     account's refresh token from the CredentialStore, refresh, return the access
+     token string. `http-opts` may inject `:http-fn` (a stub in tests)."
+     ([cred-store slug] (access-token cred-store slug {}))
+     ([cred-store slug http-opts]
+      (let [{:keys [client-id client-secret]} (client-credentials cred-store)
+            refresh-token (or (get-secret cred-store (refresh-token-service slug))
+                              (throw (ex-info "no refresh token for account" {:slug slug})))]
+        (:access-token (refresh! {:refresh-token refresh-token
+                                  :client-id client-id
+                                  :client-secret client-secret}
+                                 http-opts))))))

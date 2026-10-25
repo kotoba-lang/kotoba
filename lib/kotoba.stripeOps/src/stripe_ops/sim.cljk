@@ -1,0 +1,79 @@
+(ns stripe-ops.sim
+  "Demo: drive a lookup and a Payment Link creation through one
+  StripeOpsActor.
+
+    lookup known price      phase 2 -> clean, auto-commits (read-only)
+    lookup unknown kind      HARD HOLD (un-overridable)
+    payment-link-create (known price)   ALWAYS high-stakes -> human sign-off
+                                          -> mock-stripeport actually creates it
+    payment-link-create (unknown price) HARD HOLD (un-overridable)
+    payment-link-create (missing idempotency-key) HARD HOLD
+    phase 0                  lookup held (phase-disabled)
+
+  Run: kbb -M:dev:run"
+  (:require [langgraph.graph :as g]
+            [stripe-ops.store :as store]
+            [stripe-ops.stripeport :as stripeport]
+            [stripe-ops.operation :as op]))
+
+(defn- line [& xs] (println (apply str xs)))
+
+(defn- drive [actor tid req phase approve?]
+  (let [res (g/run* actor {:request req :context {:phase phase}} {:thread-id tid})]
+    (if (= :interrupted (:status res))
+      (do (line "   ⏸  human sign-off — review (reason: "
+                (-> res :state :audit last :reason) ")")
+          (let [r2 (g/run* actor {:approval {:status (if approve? :approved :rejected)
+                                             :by "alice"}}
+                           {:thread-id tid :resume? true})]
+            (line "   ▶  " (if approve? "承認" "却下") " → " (get-in r2 [:state :disposition]))
+            r2))
+      (do (line "   → " (get-in res [:state :disposition])
+                (when-let [pr (-> res :state :audit last :phase-reason)] (str " (" pr ")")))
+          res))))
+
+(defn -main [& _]
+  (let [st          (store/seed-db)
+        created     (atom {})
+        id-seq      (atom 0)
+        sp          (stripeport/mock-stripeport created id-seq)
+        actor       (op/build st {:stripeport sp})]
+
+    (line "── lookup: known price (read-only → phase 2 auto-commit) ──")
+    (drive actor "l1" {:op :stripe/lookup :kind :price :query "price_demo_isic6399_managed_starter"} 2 true)
+
+    (line "\n── lookup: unrecognized kind → HARD HOLD ──")
+    (drive actor "l2" {:op :stripe/lookup :kind :refund :query "re_123"} 3 true)
+
+    (line "\n── payment-link-create: known price (ALWAYS high-stakes → human sign-off) ──")
+    (drive actor "p1" {:op :stripe/payment-link-create
+                       :price-id "price_demo_isic6399_managed_starter"
+                       :idempotency-key "lead-acme-corp-2026-07-24"} 3 true)
+    (line "  created payment links: " @created)
+
+    (line "\n── payment-link-create: SAME idempotency-key again (must not create a 2nd link) ──")
+    (drive actor "p1-retry" {:op :stripe/payment-link-create
+                            :price-id "price_demo_isic6399_managed_starter"
+                            :idempotency-key "lead-acme-corp-2026-07-24"} 3 true)
+    (line "  created payment links (unchanged count): " (count @created))
+
+    (line "\n── payment-link-create: unknown price-id → HARD HOLD ──")
+    (drive actor "p2" {:op :stripe/payment-link-create
+                       :price-id "price_invented_by_llm"
+                       :idempotency-key "lead-x-2026-07-24"} 3 true)
+
+    (line "\n── payment-link-create: missing idempotency-key → HARD HOLD ──")
+    (drive actor "p3" {:op :stripe/payment-link-create
+                       :price-id "price_demo_isic6399_managed_starter"} 3 true)
+
+    (line "\n── 段階導入: lookup を phase 0 (disabled) で ──")
+    (drive actor "l-p0" {:op :stripe/lookup :kind :price :query "price_demo_isic6399_managed_starter"} 0 true)
+
+    (line "\n── 監査台帳 (append-only) ──")
+    (doseq [f (store/ledger st)] (line "  " (store/ledger-line f)))
+
+    (line "\n── バックエンド差し替え: DatomicStore でも同一契約 ──")
+    (let [ds (store/datomic-seed-db) da (op/build ds {:stripeport sp})]
+      (drive da "d1" {:op :stripe/lookup :kind :price :query "price_demo_isic6399_managed_starter"} 2 true)
+      (line "  DatomicStore known-price: " (store/known-price ds "price_demo_isic6399_managed_starter")))
+    (line "\ndone.")))

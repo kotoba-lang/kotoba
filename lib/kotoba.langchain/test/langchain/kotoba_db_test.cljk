@@ -1,0 +1,424 @@
+(ns langchain.kotoba-db-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.kotoba-db :as kdb]))
+
+;; ─── mock host-caps ──────────────────────────────────────────────────────────
+
+(defn- nsid-from-url [url]
+  (last (str/split url #"/xrpc/")))
+
+(defn- mock-caps
+  "Returns host-caps that capture every request and return canned responses.
+
+  respond-fn: (fn [nsid parsed-body] => response-clj-map-with-keyword-keys)
+  captured:   atom that collects {:nsid :body} per call."
+  [captured respond-fn]
+  {:http-fn
+   (fn [{:keys [url body]}]
+     (let [nsid    (nsid-from-url url)
+           ;; json-write is pr-str in test so body is EDN
+           parsed  (edn/read-string body)
+           resp    (respond-fn nsid parsed)]
+       (swap! captured conj {:nsid nsid :body parsed})
+       ;; json-read is edn/read-string in test, so body must be pr-str'd
+       {:status 200 :body (pr-str resp)}))
+   :json-write pr-str
+   :json-read  edn/read-string})
+
+(def ^:private test-conn
+  (kdb/kotoba-conn "http://kotoba.test:8080" "k51testgraph" {:token "test-token"}))
+
+;; ─── transact! ───────────────────────────────────────────────────────────────
+
+(deftest transact!-sends-correct-xrpc
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body]
+                              {:status "ok" :graph "k51testgraph"
+                               :tx_cid "cid1" :commit_cid "cid2"
+                               :ipns_name "k51testgraph" :ipns_sequence 1
+                               :ipns_valid_until "2099-01-01"
+                               :index_roots {} :datom_count 2
+                               :journal_cids [] :tempids {} :datoms []}))
+        api      (kdb/kotoba-api caps)
+        tx-data  [{:db/id "-1" :checkpoint/key "t1/0"
+                   :checkpoint/step 0 :checkpoint/thread "t1"
+                   :checkpoint/state "{}" :checkpoint/frontier "[]"
+                   :checkpoint/status :running}]
+        result   ((:transact! api) test-conn tx-data)]
+    (testing "posts to correct NSID"
+      (is (= "ai.gftd.apps.kotobase.datomic.transact" (:nsid (first @captured)))))
+    (testing "sends graph and tx_edn"
+      (let [body (:body (first @captured))]
+        (is (= "k51testgraph" (:graph body)))
+        (is (string? (:tx_edn body)))))
+    (testing "returns tx-report stub"
+      (is (= tx-data (:tx-data result))))))
+
+;; ─── :db is identity ─────────────────────────────────────────────────────────
+
+(deftest db-returns-conn
+  (let [api (kdb/kotoba-api (mock-caps (atom []) (fn [_ _] {})))]
+    (is (= test-conn ((:db api) test-conn)))))
+
+;; ─── q scalar find ───────────────────────────────────────────────────────────
+
+(deftest q-scalar-find
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body]
+                              {:graph "k51testgraph" :basis_t nil
+                               ;; scalar result: one row, one cell → EDN string "5"
+                               :rows_edn [["5"]]}))
+        api  (kdb/kotoba-api caps)
+        step ((:q api) '[:find (max ?step) .
+                         :in $ ?tid
+                         :where [?e :checkpoint/thread ?tid]
+                                [?e :checkpoint/step ?step]]
+                       test-conn "thread-1")]
+    (testing "posts to datomic.q"
+      (is (= "ai.gftd.apps.kotobase.datomic.q" (:nsid (first @captured)))))
+    (testing "sends graph, query_edn, inputs_edn"
+      (let [body (:body (first @captured))]
+        (is (= "k51testgraph" (:graph body)))
+        (is (string? (:query_edn body)))
+        (is (= ["\"thread-1\""] (:inputs_edn body)))))
+    (testing "projects scalar result"
+      (is (= 5 step)))))
+
+(deftest q-accepts-native-json-rows
+  (let [caps (mock-caps (atom [])
+                        (fn [_nsid _body]
+                          {:graph "k51testgraph" :basis_t 7
+                           :rows [[5] [true] [":team-pro"]]}))
+        api (kdb/kotoba-api caps)]
+    (testing "current hosted rows keep native scalars and decode EDN strings"
+      (is (= #{[5] [true] [:team-pro]}
+             ((:q api) '[:find ?value :where [?e :value ?value]]
+              test-conn))))))
+
+;; ─── q collection find ───────────────────────────────────────────────────────
+
+(deftest q-collection-find
+  (let [caps (mock-caps (atom [])
+                        (fn [_nsid _body]
+                          {:graph "k51testgraph" :basis_t nil
+                           :rows_edn [["\"eid-1\""] ["\"eid-2\""]]}))
+        api  (kdb/kotoba-api caps)
+        eids ((:q api) '[:find [?e ...]
+                         :in $ ?tid
+                         :where [?e :checkpoint/thread ?tid]]
+                       test-conn "thread-1")]
+    (testing "projects collection result"
+      (is (= ["eid-1" "eid-2"] eids)))))
+
+;; ─── q relation find ─────────────────────────────────────────────────────────
+
+(deftest q-relation-find
+  (let [caps (mock-caps (atom [])
+                        (fn [_nsid _body]
+                          {:graph "k51testgraph" :basis_t nil
+                           ;; EDN cells: ":a" parses as keyword :a
+                           :rows_edn [["1" ":a"] ["2" ":b"]]}))
+        api  (kdb/kotoba-api caps)
+        res  ((:q api) '[:find ?e ?a :where [?e ?a _]] test-conn)]
+    (testing "projects relation as set of tuples"
+      (is (= #{[1 :a] [2 :b]} res)))))
+
+;; ─── q wire-shape normalization (2026-07-18) ────────────────────────────────
+;; The live kotobase.net edge's do-q treats a VECTOR-shaped query_edn as a
+;; single [s p o] triple-pattern query, not a multi-clause Datalog query --
+;; only a MAP-shaped query_edn ({:find [...] :where [...]}) routes to the
+;; real engine. Before this fix, :q always sent (pr-str query) verbatim --
+;; a vector-shaped find/where query (the form every existing in-process
+;; langchain.db/q caller already uses) silently matched nothing against
+;; the live edge (200 OK, empty rows, no error). Confirmed against
+;; kotobase.net directly, 2026-07-18: identical :find/:where query returns
+;; real rows as a map, empty as the original vector.
+
+(deftest q-sends-a-map-shaped-query-edn-even-when-called-with-a-vector-query
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body] {:graph "k51testgraph" :basis_t nil :rows_edn []}))
+        api      (kdb/kotoba-api caps)]
+    ((:q api) '[:find ?e ?a :where [?e ?a _]] test-conn)
+    (let [sent (edn/read-string (:query_edn (:body (first @captured))))]
+      (testing "wire query_edn is a map, not the original vector"
+        (is (map? sent)))
+      (testing "the map has the equivalent :find/:where"
+        (is (= '[?e ?a] (:find sent)))
+        (is (= '[[?e ?a _]] (:where sent)))))))
+
+(deftest q-passes-a-map-shaped-query-through-unchanged
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body] {:graph "k51testgraph" :basis_t nil :rows_edn []}))
+        api      (kdb/kotoba-api caps)]
+    ((:q api) '{:find [?e] :where [[?e :rep/name _]]} test-conn)
+    (let [sent (edn/read-string (:query_edn (:body (first @captured))))]
+      (is (= '{:find [?e] :where [[?e :rep/name _]]} sent)))))
+
+(deftest q-with-malformed-marker-sequence-throws-instead-of-silently-misparsing
+  (testing "same hazard as langchain.db/parse-query (independently duplicated
+            logic here, not shared code) -- an adjacent-marker query used to
+            silently parse to an incomplete :find spec instead of erroring
+            when interpreting the response's rows_edn shape"
+    (let [caps (mock-caps (atom [])
+                          (fn [_nsid _body]
+                            {:graph "k51testgraph" :basis_t nil :rows_edn [["1"]]}))
+          api  (kdb/kotoba-api caps)]
+      (is (thrown-with-msg? js/Error
+                            #"malformed query"
+                            ((:q api) '[:find :where [?e :checkpoint/thread ?tid]] test-conn))))))
+
+;; ─── pull ────────────────────────────────────────────────────────────────────
+
+;; wire-format helper for the tests below: kotobase-server's [*] pull
+;; result is {"str-key" #{"v"}} -- string keys (the printed form of a
+;; keyword, WITH quotes), set-wrapped values whose single element is
+;; that value's OWN pr-str for every type EXCEPT string (a string
+;; attribute's value comes back RAW/unquoted -- see decode-pull-value's
+;; docstring for why: confirmed against the live edge, 2026-07-18, a
+;; value with a space silently truncated when treated as pr-str like
+;; every other type is).
+(defn- wire-pull-result [m]
+  (pr-str (into {} (map (fn [[k v]] [(pr-str k) #{(if (string? v) v (pr-str v))}])) m)))
+
+(deftest pull-lookup-ref
+  (testing "response field is :result_edn, NOT :entity_edn; and only a
+           `[*]` pattern_edn is actually honored server-side (a
+           caller's own, possibly-narrower `pattern` is applied
+           CLIENT-side via select-keys, not sent over the wire) -- see
+           kotoba_db.cljc's :pull docstring for the full explanation."
+    (let [captured  (atom [])
+          wire-result (wire-pull-result {:checkpoint/key "t1/5"
+                                         :checkpoint/thread "t1"
+                                         :checkpoint/step 5
+                                         :checkpoint/status :running})
+          caps      (mock-caps captured
+                               (fn [_nsid _body]
+                                 {:graph "k51testgraph" :basis_t nil
+                                  :entity "t1/5"
+                                  :result_edn wire-result}))
+          api    (kdb/kotoba-api caps)
+          result ((:pull api) test-conn '[*] [:checkpoint/key "t1/5"])]
+      (testing "posts to datomic.pull"
+        (is (= "ai.gftd.apps.kotobase.datomic.pull" (:nsid (first @captured)))))
+      (testing "sends entity as the lookup ref's bare VALUE half, not an
+               EDN-encoded string of the whole ref -- see entity-wire-
+               value's docstring for why"
+        (is (= "t1/5" (:entity (:body (first @captured))))))
+      (testing "always requests [*] over the wire, even though the
+               caller's own pattern here already IS [*]"
+        (is (= "[*]" (:pattern_edn (:body (first @captured))))))
+      (testing "un-wraps the string-key/set-value wire format to a plain map"
+        (is (= 5 (:checkpoint/step result)))
+        (is (= "t1" (:checkpoint/thread result)))
+        (is (= :running (:checkpoint/status result)))))))
+
+(deftest pull-plain-eid-coerced-to-string
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body] {:graph "k51testgraph" :basis_t nil :result_edn "{}"}))
+        api      (kdb/kotoba-api caps)]
+    ((:pull api) test-conn '[*] "debug-rep-1")
+    (is (= "debug-rep-1" (:entity (:body (first @captured)))))))
+
+(deftest pull-lookup-ref-backfills-the-identity-attribute-when-absent-from-the-wire-result
+  (testing "this substrate has no separate storage for the identity attr
+           itself -- its value literally IS the entity id, so a wildcard
+           pull never returns it as its own key (confirmed against the
+           live edge, 2026-07-18: a rep transacted with :rep/id came back
+           from [*] with :rep/name present but no :rep/id key at all).
+           Without backfilling it from the lookup ref, every entity
+           looked up this way would be indistinguishable from
+           non-existent to a caller (like crm.store's pull->rep) that
+           gates on the id field's presence."
+    (let [wire-result (wire-pull-result {:rep/name "Acme" :rep/discount-tier :tier/rep})
+          caps     (mock-caps (atom [])
+                              (fn [_nsid _body]
+                                {:graph "k51testgraph" :basis_t nil :result_edn wire-result}))
+          api      (kdb/kotoba-api caps)
+          result   ((:pull api) test-conn '[*] [:rep/id "acct-1"])]
+      (is (= "acct-1" (:rep/id result)))
+      (is (= "Acme" (:rep/name result))))))
+
+(deftest pull-decodes-a-multi-word-string-value-without-truncating-it
+  (testing "a string attribute's value comes back RAW on this wire (not
+           pr-str'd/quoted like every other type) -- blindly edn/read-
+           string-ing a multi-word value silently truncates to its first
+           reader token (confirmed against the live edge, 2026-07-18: a
+           value with a space came back as just its first word, e.g. a
+           name of '6399 Managed Job Board (aggregate free-tenant pool)'
+           read back as just the symbol `6399`). decode-pull-value must
+           preserve the full string."
+    (let [wire-result (wire-pull-result {:account/name "6399 Managed Job Board (aggregate free-tenant pool)"
+                                         :account/active true})
+          caps (mock-caps (atom [])
+                          (fn [_nsid _body]
+                            {:graph "k51testgraph" :basis_t nil :result_edn wire-result}))
+          api  (kdb/kotoba-api caps)
+          result ((:pull api) test-conn '[*] "acct-6399")]
+      (is (= "6399 Managed Job Board (aggregate free-tenant pool)" (:account/name result)))
+      (is (= true (:account/active result))))))
+
+(deftest pull-with-a-narrower-pattern-still-requests-wildcard-and-filters-client-side
+  (testing "a pattern_edn naming specific attributes (e.g. [:rep/name])
+           silently returned {} against the live edge every time, while
+           [*] alone returned real attrs for the same entity (confirmed
+           2026-07-18) -- so this fn ALWAYS sends [*] and filters the
+           caller's narrower pattern in after the fact"
+    (let [captured (atom [])
+          wire-result (wire-pull-result {:rep/name "Acme" :rep/discount-tier :tier/rep})
+          caps     (mock-caps captured
+                              (fn [_nsid _body]
+                                {:graph "k51testgraph" :basis_t nil :result_edn wire-result}))
+          api      (kdb/kotoba-api caps)
+          result   ((:pull api) test-conn [:rep/name] "acct-1")]
+      (testing "still requests [*] over the wire despite the narrower pattern"
+        (is (= "[*]" (:pattern_edn (:body (first @captured))))))
+      (testing "only the requested attribute is present in the result"
+        (is (= {:rep/name "Acme"} result))))))
+
+;; ─── entid ───────────────────────────────────────────────────────────────────
+
+(deftest entid-lookup
+  (testing "response field is :entity_id, NOT :entity -- kotobase.server.
+           handler/do-entid returns {:ok true :graph ... :entity_id ...};
+           :entity is a different NSID's field name. A mock/expectation
+           using :entity here would silently pass while the live edge
+           returns nil for every real :entid call (confirmed by code
+           inspection, 2026-07-18)."
+    (let [caps   (mock-caps (atom [])
+                            (fn [_nsid _body]
+                              {:graph "k51testgraph"
+                               :basis_t nil
+                               :entity_id "bafyeid123"}))
+          api    (kdb/kotoba-api caps)
+          result ((:entid api) test-conn :checkpoint/key)]
+      (is (= "bafyeid123" result)))))
+
+;; ─── error propagation ───────────────────────────────────────────────────────
+
+(deftest error-on-non-200
+  (let [caps {:http-fn   (fn [_] {:status 401 :body "{\"error\":\"unauthorized\"}"})
+              :json-write pr-str
+              :json-read  edn/read-string}
+        api  (kdb/kotoba-api caps)]
+    (is (thrown-with-msg?
+         js/Error
+         #"kotoba XRPC error 401"
+         ((:transact! api) test-conn [])))))
+
+;; ─── authorization header ────────────────────────────────────────────────────
+
+(deftest bearer-token-forwarded
+  (let [captured (atom [])
+        caps     {:http-fn   (fn [req]
+                               (swap! captured conj req)
+                               {:status 200
+                                :body   (pr-str {:status "ok" :tx_cid "x"
+                                                 :commit_cid "y" :graph "g"
+                                                 :ipns_name "k" :ipns_sequence 0
+                                                 :ipns_valid_until "" :index_roots {}
+                                                 :datom_count 0 :journal_cids []
+                                                 :tempids {} :datoms []})})
+                 :json-write pr-str
+                 :json-read  edn/read-string}
+        api (kdb/kotoba-api caps)]
+    ((:transact! api) test-conn [])
+    (is (= "Bearer test-token"
+           (get-in (first @captured) [:headers "authorization"])))))
+
+;; ─── CACAO auth ──────────────────────────────────────────────────────────────
+
+(deftest cacao-auth-forwarded
+  (let [captured (atom [])
+        cacao-conn (kdb/kotoba-conn "http://kotoba.test:8080" "k51testgraph"
+                                    {:cacao "base64cacaoABC" :did "did:key:zABC"})
+        caps {:http-fn   (fn [req]
+                           (swap! captured conj req)
+                           {:status 200
+                            :body   (pr-str {:status "ok" :tx_cid "x"
+                                             :commit_cid "y" :graph "g"
+                                             :ipns_name "k" :ipns_sequence 0
+                                             :ipns_valid_until "" :index_roots {}
+                                             :datom_count 0 :journal_cids []
+                                             :tempids {} :datoms []})})
+              :json-write pr-str
+              :json-read  edn/read-string}
+        api (kdb/kotoba-api caps)]
+    ((:transact! api) cacao-conn [])
+    (testing "sends CACAO authorization header"
+      (is (= "CACAO base64cacaoABC"
+             (get-in (first @captured) [:headers "authorization"]))))
+    (testing "sends x-kotoba-did header"
+      (is (= "did:key:zABC"
+             (get-in (first @captured) [:headers "x-kotoba-did"]))))
+    (testing "sends cacao_b64 in request body"
+      (let [body (edn/read-string (:body (first @captured)))]
+        (is (= "base64cacaoABC" (:cacao_b64 body)))))))
+
+;; ─── tenant db-name addressing (kotoba-conn*) ────────────────────────────────
+
+(deftest db-name-conn-sends-db-name-not-graph
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body]
+                              {:status "ok" :graph "irrelevant"
+                               :tx_cid "cid1" :commit_cid "cid2"
+                               :ipns_name "k" :ipns_sequence 1
+                               :ipns_valid_until "2099-01-01"
+                               :index_roots {} :datom_count 0
+                               :journal_cids [] :tempids {} :datoms []}))
+        conn     (kdb/kotoba-conn* "http://kotoba.test:8080" "manga"
+                                   {:cacao "b64cacao" :did "did:key:zTsumugu"})
+        api      (kdb/kotoba-api caps)]
+    ((:transact! api) conn [])
+    (testing "sends db_name, not graph"
+      (let [body (:body (first @captured))]
+        (is (= "manga" (:db_name body)))
+        (is (not (contains? body :graph)))))))
+
+(deftest existing-graph-callers-unaffected
+  (testing "a plain kotoba-conn (no :db-name) keeps sending :graph, never :db_name"
+    (let [captured (atom [])
+          caps     (mock-caps captured
+                              (fn [_nsid _body]
+                                {:graph "k51testgraph" :basis_t nil :rows_edn []}))
+          api      (kdb/kotoba-api caps)]
+      ((:q api) '[:find ?e :where [?e]] test-conn)
+      (let [body (:body (first @captured))]
+        (is (= "k51testgraph" (:graph body)))
+        (is (not (contains? body :db_name)))))))
+
+(deftest kotoba-conn*-equivalent-to-kotoba-conn-with-db-name-opt
+  (is (= (kdb/kotoba-conn* "http://x" "manga" {:did "d"})
+         (kdb/kotoba-conn "http://x" nil {:did "d" :db-name "manga"}))))
+
+;; ─── kg-ingest! ──────────────────────────────────────────────────────────────
+
+(deftest kg-ingest!-sends-correct-request
+  (let [captured (atom [])
+        caps     (mock-caps captured
+                            (fn [_nsid _body]
+                              {:ok true :entity_cid "cid-x"
+                               :kind "langgraph/checkpoint" :quad_count 6}))
+        entity   {:id     "thread-A/0"
+                  :kind   "langgraph/checkpoint"
+                  :claims [{:pred "thread" :value "thread-A"}
+                           {:pred "step"   :value "0"}]}]
+    (kdb/kg-ingest! caps test-conn entity)
+    (testing "posts to correct NSID"
+      (is (= "ai.gftd.apps.kotobase.kg.ingest" (:nsid (first @captured)))))
+    (testing "sends id and kind"
+      (let [body (:body (first @captured))]
+        (is (= "thread-A/0" (:id body)))
+        (is (= "langgraph/checkpoint" (:kind body)))))
+    (testing "sends claims"
+      (is (= [{:pred "thread" :value "thread-A"}
+              {:pred "step"   :value "0"}]
+             (:claims (:body (first @captured))))))))

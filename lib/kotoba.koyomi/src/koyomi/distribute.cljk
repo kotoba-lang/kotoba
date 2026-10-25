@@ -1,0 +1,153 @@
+(ns koyomi.distribute
+  "REAL Resend-based Distributor for `koyomi.scheduleport`'s `:event/share` —
+  the koyomi analog of `cloud_itonami.mail`. `koyomi.scheduleport/mock-
+  scheduleport` stays the runnable, offline DEFAULT; `resend-scheduleport`
+  here is an opt-in real `ScheduleTarget`, swapped in only via `koyomi.
+  operation/build`'s `:scheduleport` opt — never the default, same discipline
+  as `koyomi.kotoba/kotoba-store` (a real backend that's still a constructor
+  call away, not a always-on side effect).
+
+  Only this namespace touches the network (`java.net.http`) or
+  `RESEND_API_KEY` — `koyomi.scheduleport` (ICS building), `mail.*`, and
+  `mailer.*` all stay pure, mirroring `cloud_itonami.mail`'s own charter
+  verbatim (\"Only this namespace touches the network ... mail.* and
+  mailer.* stay pure\"). `jvm-http-fn` below is a byte-for-byte port of
+  `cloud_itonami.mail/jvm-http-fn` (same `{:url :method :headers :body} ->
+  {:status :body}` convention as `koyomi.kotoba/jvm-http-fn` too) so
+  `send-invite!` can be tested with a stubbed `:http-fn` instead of a real
+  Resend call.
+
+  `kotoba-lang/mailer`'s `request` builds the Resend envelope (from/to/
+  subject/text/html + auth capability) — this ns does NOT reimplement that.
+  It only adds what `mailer.core/message-wire` doesn't build yet: an
+  `:attachments` entry carrying the ICS `koyomi.scheduleport/ics-string`
+  already produced, base64-encoded, `text/calendar` MIME type, filename
+  `invite.ics`. `koyomi.scheduleport/ics-string` does NOT emit a VCALENDAR
+  `METHOD:REQUEST` property (verified — grepping `METHOD` across
+  scheduleport.cljc is a zero hit), so this is deliberately a plain `.ics`
+  attachment, not a full RFC 5546 REQUEST — claiming `;method=REQUEST` in the
+  attachment's content-type while the ICS body itself lacks a matching
+  `METHOD` property would be an inaccurate, mismatched attachment.
+
+  Attendee-email assumption (see the koyomi live-integration report for the
+  explicit call-out): `koyomi.scheduleport/ics-string` already renders every
+  `:calendar/attendees` entry directly as an `ATTENDEE:mailto:<entry>` line —
+  i.e. this codebase's existing convention treats attendee strings as email
+  addresses already, with no separate id → email lookup table (`koyomi.
+  model/contact`'s `:attendee` field just mirrors the same identifier for
+  consent bookkeeping; it is not a second, email-shaped field). This ns keeps
+  that exact same assumption for the real Resend `to` list: each
+  `:calendar/attendees` entry is used AS the recipient email address
+  verbatim. `koyomi.store/demo-data`'s seed attendees (`\"att-alice\"` etc.)
+  are placeholder ids, NOT real addresses — `mail.message/assert-valid-
+  message` will throw `:invalid-recipient` if a real send is attempted
+  against them, by design (a real deployment must populate
+  `:calendar/attendees` with real email addresses for both the ICS ATTENDEE
+  lines and this real send path to be meaningful)."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [koyomi.scheduleport :as scheduleport]
+            [koyomi.store :as store]
+            [mail.message :as message]
+            [mailer.core :as mailer]))
+
+(defn- resend-api-key []
+  (or (System/getenv "RESEND_API_KEY")
+      (throw (ex-info "RESEND_API_KEY is not set" {}))))
+
+(defn jvm-http-fn
+  "Real java.net.http transport, same {:url :method :headers :body} ->
+  {:status :body} convention as cloud_itonami.mail/jvm-http-fn /
+  koyomi.kotoba/jvm-http-fn — lets send-invite! be tested with a stubbed
+  :http-fn instead of a real Resend call."
+  []
+  (fn [{:keys [url method headers body]}]
+    (let [builder (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                      (as-> b (reduce-kv (fn [b k v] (.header b k v)) b headers)))
+          request (case method
+                    :post (-> builder
+                             (.POST (java.net.http.HttpRequest$BodyPublishers/ofString (or body "")))
+                             .build)
+                    (throw (ex-info "Unsupported HTTP method" {:method method})))
+          resp (.send (java.net.http.HttpClient/newHttpClient) request
+                     (java.net.http.HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp) :body (.body resp)})))
+
+(defn ics-attachment
+  "A Resend `attachments[]` entry for an already-built ICS string: base64
+  `content`, `text/calendar` MIME `content_type`, filename `invite.ics` (see
+  the namespace docstring for why this is plain `.ics`, not
+  `;method=REQUEST`)."
+  [ics]
+  {:filename "invite.ics"
+   :content (kbytes/base64-encode (kbytes/utf8-bytes ^String ics))
+   :content_type "text/calendar; charset=utf-8"})
+
+(defn share-message
+  "Build the mail.message/message for a koyomi :event/share notification.
+  `from` is the verified Resend sender address — REQUIRED, no hardcoded
+  default (same discipline as cloud_itonami.mail/send-marketing-outreach!:
+  \"the caller supplies it explicitly rather than this ns guessing/
+  hardcoding one\"; this ecosystem's known-working value is
+  \"ops@mail.itonami.cloud\", the domain cloud-itonami already verified in
+  Resend — docs/adr/0004-mail-capability.md). `content`'s
+  :calendar/attendees are used directly as recipient addresses (see the ns
+  docstring's attendee-email assumption)."
+  [from {:calendar/keys [title start end attendees]}]
+  (message/message
+   {:from from
+    :to attendees
+    :subject (str "Invite: " title)
+    :text (str "You're invited: " title "\n" start " – " end
+               "\n\nSee the attached calendar invite (invite.ics).")}))
+
+(defn send-invite!
+  "POST a koyomi calendar-invite email (`m` + an already-built ICS string) to
+  Resend via `http-fn` (default jvm-http-fn, a real network call). Mirrors
+  cloud_itonami.mail/send-message-via-resend! exactly, except the request
+  body: kotoba-lang/mailer's `request` doesn't build an `:attachments` field
+  yet, so this fn adds one onto the `:http/json` envelope `mailer.core/
+  request` already built, rather than reimplementing Resend request-building
+  wholesale. Returns the parsed JSON response body. Throws on a non-2xx
+  status or a missing RESEND_API_KEY (via `token`)."
+  ([m ics] (send-invite! m ics {}))
+  ([m ics {:keys [http-fn token] :or {http-fn (jvm-http-fn)}}]
+   (let [request (mailer/request :resend {:mail.effect/type :mail/send :mail.effect/message m})
+         body (assoc (:http/json request) :attachments [(ics-attachment ics)])
+         resp (http-fn {:url (:http/url request)
+                        :method :post
+                        :headers {"Authorization" (str "Bearer " (or token (resend-api-key)))
+                                  "Content-Type" "application/json"}
+                        :body (json/write-str body)})
+         resp-body (json/read-str (:body resp) :key-fn keyword)]
+     (when-not (< (:status resp) 300)
+       (throw (ex-info "Resend send failed" {:status (:status resp) :body resp-body})))
+     resp-body)))
+
+(defn resend-scheduleport
+  "A REAL `koyomi.scheduleport/ScheduleTarget` backed by Resend — the opt-in
+  Distributor for `:event/share` (`koyomi.scheduleport/mock-scheduleport`
+  stays the default; swap this in via `koyomi.operation/build`'s
+  `:scheduleport` opt). `store` should be the SAME `koyomi.store/Store` the
+  actor is built against: `share!` records the Resend message id onto that
+  store's append-only ledger (the koyomi analog of `cloud_itonami.mail`'s
+  `:itonami.effect/tool (str \"resend:\" id)` pattern) directly inside
+  `share!`, since `koyomi.operation`'s `commit-effects!` discards `share!`'s
+  return value today. `from` is REQUIRED — see `share-message`'s docstring.
+  `fetch-event`/`propose-revision!` mirror `mock-scheduleport`'s in-memory
+  bookkeeping verbatim (control-plane only; no real backend for those yet)."
+  [store from & [{:keys [shared http-fn token]
+                  :or {shared (atom {}) http-fn (jvm-http-fn)}}]]
+  (reify scheduleport/ScheduleTarget
+    (fetch-event [_ event-id] (get @shared event-id))
+    (propose-revision! [_ event-id _content] {:proposal-id (str "koyomi/" event-id)})
+    (share! [_ event-id content]
+      (let [ics (scheduleport/ics-string content)
+            m (share-message from content)
+            resp (send-invite! m ics {:http-fn http-fn :token token})
+            id (:id resp)
+            rec {:event-id event-id :ics ics :attendees (:calendar/attendees content)
+                 :resend-id id}]
+        (store/append-ledger! store {:t :shared-externally :op :event/share :subject event-id
+                                     :disposition :sent :tool (str "resend:" id)})
+        (swap! shared assoc event-id rec)
+        rec))))

@@ -1,0 +1,73 @@
+(ns godaddydns.agent-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [godaddydns.dns :as dns]
+            [godaddydns.agent :as agent]
+            [langchain.model :as model]
+            [langchain.db :as db]))
+
+(defn- zone []
+  (dns/mock-dns {"example.com" [{:type "A" :name "@" :data "1.1.1.1"}]}))
+
+(defn- msg-ai [call]
+  {:role :assistant :content "" :tool-calls [call]})
+
+(defn- scripted-model
+  "list_records → upsert_record (blog → 1.2.3.4) → done."
+  []
+  (model/mock-model
+   [(msg-ai {:id "1" :name "list_records" :input {:domain "example.com"}})
+    (msg-ai {:id "2" :name "upsert_record"
+             :input {:domain "example.com" :type "A" :name "blog" :data "1.2.3.4"}})
+    (msg-ai {:id "3" :name "done"
+             :input {:text "Added A blog → 1.2.3.4 in example.com" :success true}})]))
+
+(deftest dry-run-plans-without-mutating
+  (let [d (zone)
+        conn (db/create-conn agent/log-schema)
+        {:keys [result done applied? plan steps]}
+        (agent/run {:task "Add an A record blog → 1.2.3.4 in example.com"
+                    :dns d
+                    :model (scripted-model)
+                    :dry-run true
+                    :history-conn conn
+                    :session-id "s1"})]
+    (is done)
+    (is (false? applied?))
+    (is (= "Added A blog → 1.2.3.4 in example.com" result))
+    (is (pos? steps))
+    (testing "the change is planned, not applied"
+      (is (= [{:op :upsert :domain "example.com" :type "A" :name "blog"
+               :data "1.2.3.4" :ttl 600}]
+             plan))
+      (is (empty? (dns/-list-records d "example.com" {:type "A" :name "blog"}))))
+    (testing "audit log records the tool calls, none applied"
+      (let [rows (db/q '[:find ?tool ?applied
+                         :where
+                         [?e :dnsaction/tool ?tool]
+                         [?e :dnsaction/applied? ?applied]]
+                       (db/db conn))]
+        (is (contains? (set (map first rows)) "upsert_record"))
+        (is (every? false? (map second rows)))))))
+
+(deftest live-applies-and-logs
+  (let [d (zone)
+        conn (db/create-conn agent/log-schema)
+        {:keys [applied?]}
+        (agent/run {:task "Add an A record blog → 1.2.3.4 in example.com"
+                    :dns d
+                    :model (scripted-model)
+                    :dry-run false
+                    :history-conn conn
+                    :session-id "s2"})]
+    (is (true? applied?))
+    (testing "the record now exists in the zone"
+      (is (= [{:type "A" :name "blog" :data "1.2.3.4" :ttl 600}]
+             (dns/-list-records d "example.com" {:type "A" :name "blog"}))))
+    (testing "the write is logged as applied"
+      (is (true? (ffirst
+                  (db/q '[:find ?applied
+                          :where
+                          [?e :dnsaction/tool "upsert_record"]
+                          [?e :dnsaction/applied? ?applied]]
+                        (db/db conn))))))))

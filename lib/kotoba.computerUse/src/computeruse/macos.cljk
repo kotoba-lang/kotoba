@@ -1,0 +1,188 @@
+(ns computeruse.macos
+  "Real IComputer host capability for macOS (JVM only).
+
+  Shells out to the OS toolchain:
+
+    screenshot        screencapture -x  → sips resize → Anthropic image block
+    key / type        osascript (System Events keystroke / key code)
+    mouse / click     cliclick  (https://github.com/BluM/cliclick, `brew install cliclick`)
+    cursor position   cliclick p
+
+  Coordinate model: the model sees screenshots resized to :model-width
+  (default 1280) pixels; incoming click coordinates are scaled back to
+  display points before dispatch, so the agent can click what it sees.
+
+  Permissions: the calling terminal needs macOS Screen Recording (for
+  screencapture) and Accessibility (for cliclick / System Events).
+
+  This namespace deliberately implements no credential handling — an
+  agent run on top of it must never type secrets (see
+  examples/vultr_ip_allow.cljk for the guardrail prompt)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [computeruse.computer :as c]
+            [kotoba.lang.text :as str]
+            [hil.core :as hil]))
+
+#?(:clj
+   (do
+
+(defn- sh [& args]
+  (let [p (.start (ProcessBuilder. ^java.util.List (vec args)))
+        out (slurp (.getInputStream p))
+        code (.waitFor p)]
+    (when-not (zero? code)
+      (throw (ex-info (str "command failed: " (str/join " " args))
+                      {:exit code :out out})))
+    out))
+
+(defn- display-points
+  "Main display size in points, via the Finder desktop bounds."
+  []
+  (let [out (sh "osascript" "-e"
+                "tell application \"Finder\" to get bounds of window of desktop")
+        [_ _ w h] (map #(Long/parseLong (str/trim %)) (str/split out #","))]
+    [w h]))
+
+(declare escape-as)
+
+(defn frontmost-application
+  "Name of the application currently receiving keyboard and mouse input."
+  []
+  (str/trim
+   (sh "osascript" "-e"
+       "tell application \"System Events\" to get name of first application process whose frontmost is true")))
+
+(defn activate-application!
+  "Bring an explicitly named app to the foreground before desktop control."
+  [app-name]
+  (sh "osascript" "-e" (str "tell application \"" (escape-as app-name) "\" to activate"))
+  app-name)
+
+(defn- require-frontmost! [expected-app]
+  (when (and expected-app (not= expected-app (frontmost-application)))
+    (throw (ex-info "desktop target is not frontmost"
+                    {:expected expected-app :actual (frontmost-application)}))))
+
+(defn- png-size [path]
+  (let [out (sh "sips" "-g" "pixelWidth" "-g" "pixelHeight" path)
+        nums (map #(Long/parseLong %) (re-seq #"\d+" (str/replace out #"(?s).*pixelWidth: (\d+).*pixelHeight: (\d+).*" "$1 $2")))]
+    (vec (take 2 nums))))
+
+(defn- b64-file [path]
+  (kbytes/base64-encode
+                   (kio/read-all-bytes path)))
+
+(def ^:private key-codes
+  ;; named (non-character) keys → macOS virtual key codes
+  {"return" 36 "enter" 36 "tab" 48 "space" 49 "delete" 51 "backspace" 51
+   "escape" 53 "esc" 53 "left" 123 "right" 124 "down" 125 "up" 126
+   "home" 115 "end" 119 "pageup" 116 "page_up" 116 "pagedown" 121 "page_down" 121
+   "f1" 122 "f2" 120 "f3" 99 "f4" 118 "f5" 96 "f6" 97})
+
+(def ^:private modifiers
+  {"cmd" "command down" "command" "command down" "super" "command down"
+   "ctrl" "control down" "control" "control down"
+   "alt" "option down" "option" "option down"
+   "shift" "shift down"})
+
+(defn- key-script
+  "xdotool-style combo (\"ctrl+l\", \"Return\", \"cmd+shift+t\") → AppleScript."
+  [combo]
+  (let [parts (str/split (str/lower combo) #"\+")
+        mods (keep modifiers (butlast parts))
+        mods (if (and (= 1 (count parts)) (modifiers (first parts))) [] mods)
+        k (last parts)
+        using (when (seq mods) (str " using {" (str/join ", " mods) "}"))]
+    (str "tell application \"System Events\" to "
+         (if-let [code (key-codes k)]
+           (str "key code " code using)
+           (str "keystroke \"" k "\"" using)))))
+
+(defn- escape-as [s]
+  (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")))
+
+(defn macos-computer
+  "IComputer over the live macOS desktop. opts:
+     :model-width  screenshot width sent to the model (default 1280)
+
+  Returns the IComputer directly (no wrapping state — the desktop is
+  the state)."
+  [& [{:keys [model-width expected-frontmost-app] :or {model-width 1280}}]]
+  (let [scale (atom nil)             ; [points-per-model-px-x points-per-model-px-y]
+        to-points (fn [x y]
+                    (let [[sx sy] (or @scale [1 1])]
+                      [(long (* x sx)) (long (* y sy))]))
+        target! #(require-frontmost! expected-frontmost-app)]
+    (reify c/IComputer
+      (-screenshot [_]
+        (target!)
+        (let [path (str "/tmp/cuse-" (System/nanoTime) ".png")]
+          (sh "screencapture" "-x" "-t" "png" path)
+          (sh "sips" "-Z" (str model-width) path)
+          (let [[mw mh] (png-size path)
+                [pw ph] (display-points)]
+            (reset! scale [(/ pw (double mw)) (/ ph (double mh))])
+            [{:type "image"
+              :source {:type "base64" :media_type "image/png"
+                       :data (b64-file path)}}])))
+      (-key! [_ combo]
+        (target!)
+        (sh "osascript" "-e" (key-script combo))
+        (str "Pressed " combo))
+      (-type! [_ text]
+        (target!)
+        (sh "osascript" "-e"
+            (str "tell application \"System Events\" to keystroke \""
+                 (escape-as text) "\""))
+        (str "Typed " (pr-str text)))
+      (-mouse-move! [_ x y]
+        (target!)
+        (let [[px py] (to-points x y)]
+          (sh "cliclick" (str "m:" px "," py))
+          (str "Moved to [" px " " py "]")))
+      (-click! [_ button x y]
+        (target!)
+        (let [[px py] (to-points x y)
+              cmd (case button
+                    :left "c" :right "rc" :double "dc" :middle "c")]
+          (sh "cliclick" (str cmd ":" px "," py))
+          (str (name button) " click at [" px " " py "]")))
+      (-scroll! [_ x y direction amount]
+        (target!)
+        ;; cliclick has no wheel verb — move then PageUp/PageDown, which is
+        ;; what browser/portal pages need in practice.
+        (let [[px py] (to-points x y)]
+          (sh "cliclick" (str "m:" px "," py))
+          (dotimes [_ (max 1 (long (/ (or amount 3) 3)))]
+            (sh "osascript" "-e"
+                (key-script (if (= direction :up) "pageup" "pagedown"))))
+          (str "Scrolled " (name direction))))
+      (-cursor-position [_]
+        (target!)
+        (let [out (sh "cliclick" "p")
+              [x y] (map #(Long/parseLong %) (re-seq #"\d+" out))]
+          [x y])))))
+
+(defn macos-approval-prompt
+  "Native alert implementation for hil/IHumanApproval. It displays only the
+  compact request contract and blocks until the account holder chooses.
+  `Approve` is intentionally not the default button."
+  []
+  (reify hil/IHumanApproval
+    (-request-approval! [_ request]
+      (let [message (str/replace (hil/alert-text request) #"\n+" " ")
+            input-label (:input-label request)
+            script (str "display dialog \"" (escape-as message)
+                        "\"" (when input-label " default answer \"\"")
+                        " with title \"" (escape-as (:title request))
+                        "\" buttons {\"Reject\", \"Approve\"} default button \"Reject\" cancel button \"Reject\"")]
+        (try
+          (let [out (sh "osascript" "-e" script)]
+            (if (str/includes? out "button returned:Approve")
+              (if input-label
+                {:decision :approved
+                 :input (some-> (re-find #"text returned:(.*)" out) second str/trim)}
+                :approved)
+              :rejected))
+          (catch Exception _ :dismissed))))))
+
+))

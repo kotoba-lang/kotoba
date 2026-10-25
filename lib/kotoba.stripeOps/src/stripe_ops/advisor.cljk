@@ -1,0 +1,107 @@
+(ns stripe-ops.advisor
+  "stripe-ops-LLM -- the contained intelligence node. For :stripe/lookup it is
+  a mechanical pass-through (there is nothing to 'infer' about a structured
+  read request); for :stripe/payment-link-create it proposes creating a link
+  for the price-id the request names, with confidence grounded in whether
+  that price-id is actually in the store's known-prices whitelist (mirrors
+  koyomi.coordllm/assess-draft's own store-grounded-confidence pattern). It
+  NEVER calls stripeport itself -- every proposal is censored by
+  stripe-ops.governor before any real effect, and payment-link-create ALWAYS
+  routes to a human regardless of confidence (governor's high-stakes flag).
+
+  Advisor is injected (mock | real LLM via langchain.model), same as every
+  other actor in this fleet.
+
+  Proposal shape:
+    {:op kw               ; :stripe/lookup | :stripe/payment-link-create
+     :summary str :rationale str :cites [kw ..] :redactions [kw ..]
+     :confidence 0..1
+     ;; :stripe/lookup only:
+     :kind kw :query any
+     ;; :stripe/payment-link-create only:
+     :price-id str :idempotency-key str :metadata {..}}"
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.model :as model]
+            [stripe-ops.store :as store]))
+
+;; ───────────────────────── deterministic mock ─────────────────────────
+
+(def known-lookup-kinds
+  #{:customer :customer-by-email :subscription :customer-subscriptions :product :price})
+
+(defn- infer-lookup [{:keys [kind query]}]
+  (if (contains? known-lookup-kinds kind)
+    {:op :stripe/lookup :kind kind :query query
+     :summary (str "Stripe " (name kind) " lookup: " (pr-str query))
+     :rationale "構造化された読み取り要求をそのまま中継 -- 生成の余地なし"
+     :cites [] :redactions [] :confidence 1.0}
+    {:op :stripe/lookup :kind kind :query query
+     :summary (str "未知の lookup 種別: " (pr-str kind))
+     :rationale "known-lookup-kinds に含まれない種別"
+     :cites [] :redactions [] :confidence 0.0}))
+
+(defn- infer-payment-link-create [st {:keys [price-id idempotency-key metadata]}]
+  (let [known? (some? (store/known-price st price-id))]
+    {:op :stripe/payment-link-create :price-id price-id
+     :idempotency-key idempotency-key :metadata (or metadata {})
+     :summary (str "Payment Link 作成提案: price=" price-id)
+     :rationale (if known?
+                  (str price-id " は既知カタログに登録済み")
+                  (str price-id " は既知カタログに存在しない -- governor が拒否する想定"))
+     :cites (if known? [:known-price] [])
+     :redactions []
+     :confidence (if known? 0.9 0.1)}))
+
+(defn infer [st {:keys [op] :as req}]
+  (case op
+    :stripe/lookup (infer-lookup req)
+    :stripe/payment-link-create (infer-payment-link-create st req)
+    {:op op :summary "未対応 op" :rationale (str op)
+     :cites [] :redactions [] :confidence 0.0}))
+
+;; ───────────────────────── Advisor protocol ─────────────────────────
+
+(defprotocol Advisor
+  (-advise [advisor store request]))
+
+(defn mock-advisor [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+(def ^:private system-prompt
+  (str "あなたは Stripe 操作の下書き助言者です。読み取り(lookup)要求はそのまま中継し、"
+       "Payment Link 作成要求は :price-id :idempotency-key :metadata を1つの EDN マップ"
+       "で返します。EDN だけを出力。\n"
+       "重要: あなたは実際に Stripe API を呼び出さない(propose のみ)。"
+       "返金・サブスクリプション変更・顧客/商品/価格の書き込みは絶対に提案しない --"
+       "そのような op はこの actor に存在しない。"))
+
+(defn- parse-proposal [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p (update :cites #(vec (or % [])))
+            (update :redactions #(vec (or % [])))
+            (update :confidence #(if (number? %) (double %) 0.0)))
+      {:op :unknown :summary "LLM応答を解釈できません" :rationale (str content)
+       :cites [] :redactions [] :confidence 0.0})))
+
+(defn llm-advisor
+  "Advisor backed by a langchain.model/ChatModel. Output is parsed
+  defensively -- an unparseable response is a confidence-0 proposal the
+  governor will hold/escalate, never silently trusted."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ st req]
+       (let [resp (model/-generate chat-model
+                    [{:role :system :content system-prompt}
+                     {:role :user :content (str "要求:" (pr-str req)
+                                                "\n既知価格カタログ:" (pr-str (store/all-known-prices st)))}]
+                    gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace [request proposal]
+  {:t :stripe-ops-proposal :op (:op request)
+   :summary (:summary proposal) :rationale (:rationale proposal)
+   :cites (:cites proposal) :confidence (:confidence proposal)})

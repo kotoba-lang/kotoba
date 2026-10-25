@@ -1,0 +1,157 @@
+(ns computeruse.backend
+  "Selectable execution-backend contract (ADR-0003).
+
+  A backend is one way to *observe* an environment and *act* on it,
+  chosen per bot/session from a fixed registry of ten ids
+  (resources/computeruse/backends.edn). The contract is deliberately
+  smaller than IComputer: one observation form, one action form, and a
+  measured availability probe — so backends that cannot support the
+  full Anthropic action vocabulary (a window-scoped capture, a headless
+  gate command) are still selectable through the same seam.
+
+    observe! → frame map    {:png-path .. :captured-at .. :backend ..}
+                            (or a non-visual observation map, or a
+                            refusal map)
+    act!     → result       deny-by-default: an action kind the backend
+                            does not support returns an explicit
+                            refusal value, never a silent no-op
+    probe!   → availability {:available? true|false|:unmeasured
+                             :why .. :measured-at ..}
+
+  Refusal values are maps {:refused true :reason <pinned literal>}.
+  The reason literals below are part of the contract — negative tests
+  pin them. A test that asserts only \"it failed\" cannot tell a refusal
+  apart from a crash, which is the failure mode this workspace calls
+  out (ADR-2608136000): assert the reason."
+  (:require [computeruse.hostfs :as fs]
+            [kotoba.lang.edn :as edn]
+            #?(:clj [kotoba.io :as io])))
+
+;; ───────────────────────── action vocabulary ─────────────────────────
+
+(def action-kinds
+  "The action vocabulary of the backend contract. Every action map has
+  a :kind from this set; the rest of the keys are kind-specific:
+
+    :pointer  {:kind :pointer :button :left|:right|:middle|:double
+               :coordinate [x y]}
+    :key      {:kind :key  :combo \"ctrl+s\"}
+    :type     {:kind :type :text \"...\"}
+    :script   {:kind :script :applescript \"...\"}  (app-scripting — no
+               synthetic global input; the safe act path on a desktop
+               shared with concurrent sessions)
+    :noop     {:kind :noop}"
+  #{:pointer :key :type :script :noop})
+
+;; ───────────────────────── refusal values ─────────────────────────
+
+(def refusal-reasons
+  "Pinned refusal literals. Assert these exact keywords in tests."
+  #{:backend/unsupported-action-kind   ; kind outside action-kinds, or a
+                                       ; kind this backend refuses
+    :backend/act-unsupported           ; backend has no act surface at all
+    :backend/foreground-not-allowed    ; act would steal focus/cursor and
+                                       ; :allow-foreground was not set
+    :backend/observe-failed            ; observation was attempted and failed
+    :backend/synthetic-input-in-script  ; the AppleScript would synthesise global
+                                        ; input (or shell out) — the same hazard
+                                        ; the refused action kinds exclude
+    :backend/not-implemented})         ; registry entry with no implementation
+
+(defn refusal
+  "An explicit refusal value. Never throw for a policy denial — return
+  this, so the caller can record it (the gate/receipt discipline)."
+  [reason & [extra]]
+  {:pre [(contains? refusal-reasons reason)]}
+  (merge {:refused true :reason reason} extra))
+
+(defn refused? [x]
+  (and (map? x) (true? (:refused x))))
+
+;; ───────────────────────── protocol ─────────────────────────
+
+(defprotocol IBackend
+  (-observe! [b opts] "→ frame/observation map, or a refusal map.")
+  (-act! [b action]   "→ result value, or a refusal map. Never a silent no-op.")
+  (-probe! [b]        "→ {:available? true|false|:unmeasured :why .. :measured-at ..}"))
+
+(defn observe!
+  ([b] (observe! b {}))
+  ([b opts] (-observe! b opts)))
+
+(defn act!
+  "Dispatches one action map onto the backend. Unknown action kinds are
+  refused here, before the backend sees them."
+  [b action]
+  (if (contains? action-kinds (:kind action))
+    (-act! b action)
+    (refusal :backend/unsupported-action-kind
+             {:kind (:kind action) :known-kinds action-kinds})))
+
+(defn probe! [b] (-probe! b))
+
+;; ───────────────────────── registry ─────────────────────────
+
+(def registry-ids
+  "The ten selectable backend ids — the selection surface. Fixed order;
+  resources/computeruse/backends.edn carries the description, isolation
+  properties and MEASURED qualification of each."
+  [:macos-local :window-scoped :agent-space :fleet-node :macos-vm
+   :linux-container :cf-browser :cf-sandbox :saas-sandbox :host-object])
+
+(def registry-resource "computeruse/backends.edn")
+
+(defn load-registry
+  "Reads the backend registry EDN.
+
+  0-arity: the classpath resource (JVM) — nil on nbb, which has no
+  classpath resources; the CLI passes an explicit path instead.
+  1-arity: from a filesystem path (works on both hosts)."
+  ([]
+   #?(:clj (some-> (io/resource registry-resource) slurp edn/read-string)
+      :cljs nil))
+  ([path]
+   (when (fs/path-exists? path)
+     (edn/read-string (fs/read-file path)))))
+
+(defn find-registry
+  "Locates resources/computeruse/backends.edn relative to a starting
+  directory (the CLI's own checkout), falling back to the classpath.
+  Returns the registry map, or nil."
+  [start-dir]
+  (or (some (fn [p] (when (fs/path-exists? p) (load-registry p)))
+            [(str start-dir "/resources/" registry-resource)
+             (str start-dir "/../resources/" registry-resource)])
+      (load-registry)))
+
+(defn registry-entry [registry id]
+  (get-in registry [:backends id]))
+
+(defn known-id? [registry id]
+  (boolean (or (registry-entry registry id)
+               (some #{id} registry-ids))))
+
+;; ───────────────────────── constructor seam ─────────────────────────
+
+(defmulti create-backend
+  "Constructs a backend instance from a bot's :bot/backend id and its
+  backend-specific :bot/target map. Implemented ids live in
+  computeruse.backends; unimplemented registry ids get a pending
+  backend whose observe!/act! refuse with :backend/not-implemented and
+  whose probe! answers :unmeasured — never false, which would claim a
+  measurement nobody took."
+  (fn [id _target _opts] id))
+
+(defrecord PendingBackend [id why]
+  IBackend
+  (-observe! [_ _] (refusal :backend/not-implemented {:backend id :why why}))
+  (-act! [_ _] (refusal :backend/not-implemented {:backend id :why why}))
+  (-probe! [_] {:available? :unmeasured :why why :backend id
+                :measured-at (fs/now-iso)}))
+
+(def pending-why
+  "registry entry without an implementation — see :qualification and :unblock in resources/computeruse/backends.edn")
+
+(defmethod create-backend :default [id _ _]
+  (when (some #{id} registry-ids)
+    (->PendingBackend id pending-why)))

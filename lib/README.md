@@ -220,6 +220,34 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.torihikiTerminal` | `kotoba.torihikiTerminal/src` | `torihiki-terminal.client`, `torihiki-terminal.config`, `torihiki-terminal.deploy`, `torihiki-terminal.keys` (Kotoba project library) |
+| `kotoba.diskspace` | `kotoba.diskspace/src` | `` (Kotoba project library) |
+| `kotoba.mesh` | `kotoba.mesh/src` | `kotoba.mesh.kotoba-oracle`, `kotoba.mesh.node` (Kotoba project library) |
+| `kotoba.stripeOps` | `kotoba.stripeOps/src` | `stripe-ops.advisor`, `stripe-ops.governor`, `stripe-ops.model`, `stripe-ops.operation` (Kotoba project library) |
+| `kotoba.soukai` | `kotoba.soukai/src` | `soukai.cacao`, `soukai.distribute`, `soukai.facts`, `soukai.governor` (Kotoba project library) |
+| `kotoba.shoko` | `kotoba.shoko/src` | `shoko.archiveport`, `shoko.cacao`, `shoko.cli`, `shoko.coordllm` (Kotoba project library) |
+| `kotoba.qaGovernor` | `kotoba.qaGovernor/src` | `qa-governor.collectors.clojure-project`, `qa-governor.collectors.clojure-project-shell`, `qa-governor.collectors.documentation`, `qa-governor.collectors.repo` (Kotoba project library) |
+| `kotoba.mailArchive` | `kotoba.mailArchive/src` | `mail-archive.auth`, `mail-archive.blob-store`, `mail-archive.datascript-store`, `mail-archive.ingest` (Kotoba project library) |
+| `kotoba.koyomi` | `kotoba.koyomi/src` | `koyomi.cacao`, `koyomi.cli`, `koyomi.coordllm`, `koyomi.distribute` (Kotoba project library) |
+| `kotoba.kotobaTaskdag` | `kotoba.kotobaTaskdag/src` | `task-graph.core`, `task-graph.langgraph` (Kotoba project library) |
+| `kotoba.kotobaCode` | `kotoba.kotobaCode/src` | `kotoba-code.agent`, `kotoba-code.composer-input`, `kotoba-code.durable`, `kotoba-code.gate` (Kotoba project library) |
+| `kotoba.koe` | `kotoba.koe/src` | `koe.arrival`, `koe.bridge`, `koe.carrier`, `koe.media` (Kotoba project library) |
+| `kotoba.kekkai` | `kotoba.kekkai/src` | `kekkai.acl`, `kekkai.cacao`, `kekkai.cli`, `kekkai.coordllm` (Kotoba project library) |
+| `kotoba.ichiran` | `kotoba.ichiran/src` | `ichiran.cacao`, `ichiran.cli`, `ichiran.coordllm`, `ichiran.governor` (Kotoba project library) |
+| `kotoba.goyoukiki` | `kotoba.goyoukiki/src` | `goyoukiki.cacao`, `goyoukiki.cli`, `goyoukiki.governor`, `goyoukiki.jp.geps` (Kotoba project library) |
+| `kotoba.tayori` | `kotoba.tayori/src` | `tayori.cacao`, `tayori.channel`, `tayori.channel.email`, `tayori.channel.slack` (Kotoba project library) |
+| `kotoba.godaddyDns` | `kotoba.godaddyDns/src` | `godaddydns.agent`, `godaddydns.dns`, `godaddydns.godaddy`, `godaddydns.tool` (Kotoba project library) |
+| `kotoba.gijiroku` | `kotoba.gijiroku/src` | `gijiroku.bot-join`, `gijiroku.cacao`, `gijiroku.consent`, `gijiroku.google-meet` (Kotoba project library) |
+| `kotoba.denrei` | `kotoba.denrei/src` | `denrei.cacao`, `denrei.channelport`, `denrei.cli`, `denrei.coordllm` (Kotoba project library) |
+| `kotoba.computerUse` | `kotoba.computerUse/src` | `computeruse.agent`, `computeruse.android`, `computeruse.backend`, `computeruse.backends` (Kotoba project library) |
+| `kotoba.comfyui` | `kotoba.comfyui/src` | `comfyui.clip.encoder`, `comfyui.clip.tokenizer`, `comfyui.diffusion.architecture`, `comfyui.diffusion.model` (Kotoba project library) |
+| `kotoba.browserAgent` | `kotoba.browserAgent/src` | `browseragent.browser.live`, `browseragent.browser.provider`, `browseragent.browser.session`, `browseragent.events` (Kotoba project library) |
+| `kotoba.browserUse` | `kotoba.browserUse/src` | `browseruse.actions`, `browseruse.agent`, `browseruse.browser`, `browseruse.browser-profile` (Kotoba project library) |
+| `kotoba.langgraph` | `kotoba.langgraph/src` | `langgraph.agent-loop`, `langgraph.checkpoint`, `langgraph.graph`, `langgraph.kg-checkpoint` (Kotoba project library) |
+| `kotoba.authorization` | `kotoba.authorization/src` | `authorization.adapters.cacao-policy`, `authorization.adapters.decision-ledger`, `authorization.adapters.journal-ledger`, `authorization.adapters.policy` (Kotoba project library) |
+| `kotoba.authenticator` | `kotoba.authenticator/src` | `auth.adapters.webcrypto`, `auth.base32`, `auth.cli`, `auth.clock` (Kotoba project library) |
+| `kotoba.authentication` | `kotoba.authentication/src` | `authentication.adapters.cacao`, `authentication.adapters.cacao-edge`, `authentication.adapters.cloudflare-kv`, `authentication.adapters.datomic` (Kotoba project library) |
+| `kotoba.langchain` | `kotoba.langchain/src` | `langchain.db`, `langchain.edn-persist`, `langchain.edn-persist-cli`, `langchain.json` (Kotoba project library) |
 | `kotoba.webgpu` | `kotoba.webgpu/src` | `kami.webgpu`, `kami.webgpu.geometry`, `kami.webgpu.ir`, `kami.webgpu.mesh` (Kotoba project library) |
 | `kotoba.webauthn` | `kotoba.webauthn/src` | `webauthn.adapters.ceremony`, `webauthn.adapters.edge`, `webauthn.adapters.hmac-ceremony`, `webauthn.adapters.production` (Kotoba project library) |
 | `kotoba.teleop` | `kotoba.teleop/src` | `kotoba.teleop`, `kotoba.teleop.dualsense`, `kotoba.teleop.governor`, `kotoba.teleop.ros` (Kotoba project library) |

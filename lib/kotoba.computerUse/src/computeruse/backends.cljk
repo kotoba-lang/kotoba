@@ -1,0 +1,520 @@
+(ns computeruse.backends
+  "Implemented execution backends (ADR-0003): :macos-local,
+  :window-scoped, :host-object, :fleet-node. The other six registry ids
+  resolve to computeruse.backend/PendingBackend until their unblock
+  condition (recorded in resources/computeruse/backends.edn) is met.
+
+  All shelling goes through an injected sh seam
+  (argv → {:exit :out :err}) so the same .cljc runs on the JVM
+  (ProcessBuilder) and on nbb/Node (child_process.spawnSync) — the
+  host-capability convention of this repo (openai_model's
+  :http-fn/:json-read, macos.cljc's toolchain)."
+  (:require [kotoba.io :as kio] [computeruse.backend :as b]
+            [computeruse.hostfs :as fs]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]))
+
+;; ───────────────────────── host seams ─────────────────────────
+
+(def default-timeout-ms 120000)
+
+(defn default-sh
+  "argv (vector of strings) → {:exit int :out str :err str}.
+
+  Never throws on non-zero exit; a spawn failure or a timeout is
+  :exit -1 with the cause in :err — the caller must be able to tell
+  \"the command ran and said no\" from \"the command never ran\", which
+  is the distinction a resident bot's three-valued outcome rests on.
+
+  opts: {:in stdin-string :cwd dir :timeout-ms ms}"
+  []
+  #?(:clj
+     (fn sh [argv & [{:keys [in cwd timeout-ms]}]]
+       (try
+         (let [pb (ProcessBuilder. ^java.util.List (vec (map str argv)))
+               _ (when cwd (.directory pb (kio/file ^String (str cwd))))
+               p (.start pb)]
+           (if in
+             (with-open [w (java.io.OutputStreamWriter. (.getOutputStream p))]
+               (.write w ^String in))
+             (.close (.getOutputStream p)))
+           (let [out-f (future (slurp (.getInputStream p)))
+                 err-f (future (slurp (.getErrorStream p)))
+                 finished? (.waitFor p (long (or timeout-ms default-timeout-ms))
+                                     java.util.concurrent.TimeUnit/MILLISECONDS)]
+             (if finished?
+               {:exit (.exitValue p) :out @out-f :err @err-f}
+               (do (.destroyForcibly p)
+                   {:exit -1 :out "" :err (str "timed out after "
+                                               (or timeout-ms default-timeout-ms) "ms")}))))
+         (catch java.io.IOException e
+           {:exit -1 :out "" :err (str e)})))
+     :cljs
+     (let [cp (js/require "node:child_process")]
+       (fn sh [argv & [{:keys [in cwd timeout-ms]}]]
+         (let [r (.spawnSync cp (str (first argv)) (clj->js (mapv str (rest argv)))
+                             (clj->js (cond-> {:encoding "utf8"
+                                               :maxBuffer (* 64 1024 1024)
+                                               :timeout (or timeout-ms default-timeout-ms)}
+                                        in (assoc :input in)
+                                        cwd (assoc :cwd (str cwd)))))]
+           {:exit (if (nil? (.-status r)) -1 (.-status r))
+            :out (or (.-stdout r) "")
+            :err (str (or (.-stderr r) "")
+                      (when (.-error r) (str (.-error r))))})))))
+
+(def now-iso fs/now-iso)
+
+(defn- tmp-png [tag]
+  (str (fs/tmp-dir) "/cua-" tag "-" (fs/epoch-ms) ".png"))
+
+;; ───────────────────────── image blankness ─────────────────────────
+;; A capture that succeeded and a capture that produced a black
+;; rectangle both exit 0. Measuring the pixels is the only way the two
+;; are distinguishable, and a bot that reports "observed" on a black
+;; frame is exactly the silent-pass failure this workspace forbids.
+
+(defn image-stats
+  "Downsamples a PNG to a 32px BMP with sips and measures its pixel
+  bytes → {:stddev .. :distinct .. :mean ..} or {:error ..}.
+  macOS-only (sips); backends that cannot measure say so rather than
+  claiming the frame is fine."
+  [sh png-path]
+  (let [bmp (str png-path ".stats.bmp")
+        r (sh ["sips" "-Z" "32" "-s" "format" "bmp" (str png-path) "--out" bmp]
+              {:timeout-ms 20000})]
+    (if-not (zero? (:exit r))
+      {:error (str "sips failed: " (str/trim (str (:err r))))}
+      (try
+        (let [bytes #?(:clj (kio/read-all-bytes
+                             ^String bmp)
+                       :cljs (.readFileSync (js/require "node:fs") bmp))
+              size #?(:clj (alength ^bytes bytes) :cljs (.-length bytes))
+              at (fn [i] (bit-and #?(:clj (aget ^bytes bytes i)
+                                     :cljs (aget bytes i))
+                                  0xff))
+              ;; BMP pixel-data offset is a little-endian u32 at byte 10
+              off (+ (at 10) (* 256 (at 11)) (* 65536 (at 12)) (* 16777216 (at 13)))
+              n (max 1 (- size off))
+              vs (mapv at (range off size))
+              mean (/ (reduce + 0 vs) (double n))
+              var* (/ (reduce + 0.0 (map #(let [d (- % mean)] (* d d)) vs)) (double n))]
+          {:bytes n
+           :mean (double mean)
+           :stddev #?(:clj (Math/sqrt var*) :cljs (js/Math.sqrt var*))
+           :distinct (count (set vs))})
+        (catch #?(:clj Exception :cljs :default) e
+          {:error (str "bmp read failed: " e)})))))
+
+(def blank-stddev-threshold
+  "Below this byte-stddev a 32px downsample is a flat rectangle. A
+  window showing real content measured 94.4 on this workstation
+  (2026-08-29); a solid fill measures 0."
+  4.0)
+
+(defn- blankness [sh png-path]
+  (let [st (image-stats sh png-path)]
+    (cond
+      (:error st) {:blank? :unmeasured :why (:error st)}
+      :else (assoc st :blank? (< (:stddev st) blank-stddev-threshold)))))
+
+;; ───────────────────────── window enumeration (Swift helper) ─────────────────────────
+;; Measured 2026-08-29 on this workstation: pyobjc Quartz is absent
+;; (ModuleNotFoundError) and JXA's ObjC.deepUnwrap of the CFArray
+;; returned by CGWindowListCopyWindowInfo yields `undefined`. A tiny
+;; Swift program is the measured-working route to CGWindowIDs — one
+;; 8.8s swiftc compile, then ~10ms per call from the cached binary.
+
+(def winlist-swift-source
+  "import CoreGraphics
+import Foundation
+let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+if let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+  for w in list {
+    let layer = w[\"kCGWindowLayer\"] as? Int ?? -1
+    guard layer == 0 else { continue }
+    let id = w[\"kCGWindowNumber\"] as? Int ?? 0
+    let app = w[\"kCGWindowOwnerName\"] as? String ?? \"\"
+    let name = w[\"kCGWindowName\"] as? String ?? \"\"
+    let b = w[\"kCGWindowBounds\"] as? [String: Any] ?? [:]
+    print(\"{:id \\(id) :app \\(String(reflecting: app)) :title \\(String(reflecting: name)) :x \\(b[\"X\"] ?? 0) :y \\(b[\"Y\"] ?? 0) :w \\(b[\"Width\"] ?? 0) :h \\(b[\"Height\"] ?? 0)}\")
+  }
+}
+")
+
+(defn- winlist-bin [] (str (fs/tmp-dir) "/cua-winlist-v1"))
+
+(defn- ensure-winlist!
+  "Compiles the window-list helper if it is not already built, then runs
+  it. → {:windows [..]} or {:error ..}."
+  [sh]
+  (let [bin (winlist-bin)
+        src (str (fs/tmp-dir) "/cua-winlist-v1.swift")
+        build (when-not (fs/path-exists? bin)
+                (fs/write-file! src winlist-swift-source)
+                (sh ["swiftc" "-O" src "-o" bin] {:timeout-ms 120000}))]
+    (if (and build (not (zero? (:exit build))))
+      {:error (str "swiftc failed: " (str/trim (str (:err build))))}
+      (let [r (sh [bin] {:timeout-ms 20000})]
+        (if (zero? (:exit r))
+          {:windows (vec (keep #(try (edn/read-string %)
+                                     (catch #?(:clj Exception :cljs :default) _ nil))
+                               (remove str/blank? (str/split-lines (:out r)))))}
+          {:error (str "window enumeration failed: "
+                       (str/trim (str (:err r) " " (:out r))))})))))
+
+(defn list-windows
+  "On-screen layer-0 windows with CGWindowIDs:
+  {:windows [{:id .. :app .. :title .. :x :y :w :h} …]} or {:error ..}."
+  [sh]
+  (ensure-winlist! sh))
+
+(defn match-window [windows {:keys [window-id app title-substr]}]
+  (if window-id
+    (first (filter #(= window-id (:id %)) windows))
+    (first (filter (fn [w]
+                     (and (or (nil? app) (= app (:app w)))
+                          (or (nil? title-substr)
+                              (str/includes? (str (:title w)) title-substr))))
+                   windows))))
+
+;; ───────────────────────── AppleScript synthetic-input guard ─────────────────────────
+;; MEASURED 2026-08-29, in a real session: refusing the :pointer/:key/
+;; :type action KINDS is not enough. The model reached the same hazard
+;; through the :script escape hatch —
+;;
+;;   tell application "Google Chrome" to activate
+;;   tell application "System Events" to key code 116   -- Page Down
+;;
+;; and the gate allowed it, four steps running, because the *kind* was
+;; :script. Synthetic global input lands in whatever window has OS
+;; focus, so on this workstation those key codes could have gone into a
+;; concurrent agent's terminal pane. Excluding a capability by naming
+;; the action kind is not excluding it; the content has to be checked
+;; too.
+
+(def synthetic-input-patterns
+  "AppleScript constructs that synthesise global input or escape to the
+  shell. Deny-by-default: this is a denylist over a language that could
+  hide these behind `run script`, so it is a floor, not a proof. The
+  structural guarantee is that the *kinds* are refused; this closes the
+  obvious hole in the one kind that remains."
+  [[#"(?i)\bkeystroke\b" "System Events keystroke"]
+   [#"(?i)\bkey\s+code\b" "System Events key code"]
+   [#"(?i)\bkey\s+(down|up)\b" "System Events key down/up"]
+   [#"(?i)\bclick\s+at\b" "System Events click at a screen coordinate"]
+   [#"(?i)\bdo\s+shell\s+script\b" "do shell script (an unbounded escape hatch)"]
+   [#"(?i)\brun\s+script\b" "run script (evaluates AppleScript this guard never saw)"]])
+
+(defn script-hazard
+  "→ nil when the script is app-scripting only, or a description of the
+  first synthetic-input construct found."
+  [applescript]
+  (let [s (str applescript)]
+    (some (fn [[re why]] (when (re-find re s) why)) synthetic-input-patterns)))
+
+(defn script-activates-app?
+  "AppleScript `activate` raises an application, which takes the
+  operator's focus. It does not synthesise input, so it is allowed —
+  but the act result reports it, so a receipt shows when a session
+  disturbed the desktop."
+  [applescript]
+  (boolean (re-find #"(?i)\bactivate\b" (str applescript))))
+
+;; ───────────────────────── :window-scoped ─────────────────────────
+
+(defrecord WindowScopedBackend [sh target]
+  b/IBackend
+  (-observe! [_ _opts]
+    (let [{:keys [windows error]} (list-windows sh)]
+      (if error
+        (b/refusal :backend/observe-failed {:backend :window-scoped :why error})
+        (if-let [w (match-window windows target)]
+          (let [path (tmp-png (str "win" (:id w)))
+                r (sh ["screencapture" "-x" "-o" "-l" (str (:id w)) "-t" "png" path]
+                      {:timeout-ms 60000})]
+            (if (and (zero? (:exit r)) (fs/path-exists? path))
+              (merge {:png-path path
+                      :captured-at (now-iso)
+                      :backend :window-scoped
+                      :window w
+                      :width (long (:w w))
+                      :height (long (:h w))}
+                     {:frame-stats (blankness sh path)})
+              (b/refusal :backend/observe-failed
+                         {:backend :window-scoped
+                          :why (str "screencapture -l " (:id w) " failed: "
+                                    (str/trim (str (:err r))))
+                          :window w})))
+          (b/refusal :backend/observe-failed
+                     {:backend :window-scoped
+                      :why "no on-screen window matches target"
+                      :target target
+                      :candidates (mapv #(select-keys % [:id :app]) windows)})))))
+  (-act! [_ {:keys [kind applescript]}]
+    (case kind
+      :noop {:ok true :noop true}
+      :script
+      (cond
+        (str/blank? (str applescript))
+        (b/refusal :backend/unsupported-action-kind
+                   {:backend :window-scoped :kind :script
+                    :why ":script needs :applescript source"})
+
+        (script-hazard applescript)
+        (b/refusal :backend/synthetic-input-in-script
+                   {:backend :window-scoped :kind :script
+                    :hazard (script-hazard applescript)
+                    :why (str "the script would " (script-hazard applescript)
+                              " — synthetic global input goes to whatever window "
+                              "has OS focus, which is the hazard refusing "
+                              ":pointer/:key/:type is meant to exclude. Drive the "
+                              "application through its own scripting dictionary "
+                              "instead (e.g. `execute javascript … in active tab`).")})
+
+        :else
+        (let [r (sh ["osascript" "-e" (str applescript)] {:timeout-ms 60000})]
+          (cond-> (if (zero? (:exit r))
+                    {:ok true :out (str/trim (str (:out r)))}
+                    {:ok false :out (:out r) :err (str/trim (str (:err r))) :exit (:exit r)})
+            (script-activates-app? applescript) (assoc :activated-app? true))))
+      ;; :pointer/:key/:type are synthetic GLOBAL input — they land in
+      ;; whichever window has OS focus, not in the target window. This
+      ;; workstation runs many concurrent Claude sessions in terminal
+      ;; panes competing for focus (a documented workspace hazard), so
+      ;; this backend refuses them permanently. Use :script (AppleScript
+      ;; / AX) instead, or select :macos-local with :allow-foreground.
+      (b/refusal :backend/unsupported-action-kind
+                 {:backend :window-scoped :kind kind
+                  :why "window-scoped acts only via app-scripting (:script); synthetic global input would race concurrent sessions for focus"})))
+  (-probe! [_]
+    (let [{:keys [windows error]} (list-windows sh)]
+      (cond
+        error {:available? false :why error
+               :measured-at (now-iso) :backend :window-scoped}
+        (empty? windows) {:available? false :why "no on-screen layer-0 windows"
+                          :measured-at (now-iso) :backend :window-scoped}
+        (nil? (match-window windows target))
+        {:available? false
+         :why (str "no on-screen window matches " (pr-str target))
+         :candidates (mapv #(select-keys % [:id :app]) windows)
+         :measured-at (now-iso) :backend :window-scoped}
+        :else {:available? true
+               :why (str (count windows) " on-screen windows; target matches window "
+                         (:id (match-window windows target)))
+               :window-count (count windows)
+               :measured-at (now-iso) :backend :window-scoped}))))
+
+;; ───────────────────────── :macos-local ─────────────────────────
+
+(defn key-osascript
+  "xdotool-style combo → AppleScript. A narrow subset of macos.cljc's
+  key-script (the full named-key table lives there)."
+  [combo]
+  (let [mods {"cmd" "command down" "command" "command down"
+              "ctrl" "control down" "control" "control down"
+              "alt" "option down" "option" "option down"
+              "shift" "shift down"}
+        named {"return" 36 "enter" 36 "tab" 48 "space" 49 "escape" 53 "esc" 53}
+        parts (str/split (str/lower (str combo)) #"\+")
+        ms (keep mods (butlast parts))
+        k (last parts)
+        using (when (seq ms) (str " using {" (str/join ", " ms) "}"))]
+    (str "tell application \"System Events\" to "
+         (if-let [code (named k)]
+           (str "key code " code using)
+           (str "keystroke \"" (str/replace (str k) "\"" "\\\"") "\"" using)))))
+
+(defrecord MacosLocalBackend [sh target]
+  ;; The current computeruse.macos behaviour as a selectable backend.
+  ;; Honest isolation: it DOES take focus and drive the operator's
+  ;; cursor — act! is deny-by-default unless :bot/target carries
+  ;; {:allow-foreground true}.
+  b/IBackend
+  (-observe! [_ _opts]
+    (let [path (tmp-png "screen")
+          r (sh ["screencapture" "-x" "-t" "png" path] {:timeout-ms 60000})]
+      (if (and (zero? (:exit r)) (fs/path-exists? path))
+        (merge {:png-path path :captured-at (now-iso) :backend :macos-local}
+               {:frame-stats (blankness sh path)})
+        (b/refusal :backend/observe-failed
+                   {:backend :macos-local :why (str/trim (str (:err r)))}))))
+  (-act! [_ {:keys [kind combo text applescript button coordinate]}]
+    (if-not (:allow-foreground target)
+      (b/refusal :backend/foreground-not-allowed
+                 {:backend :macos-local :kind kind
+                  :why "macos-local acts on the live desktop (steals focus and moves the operator's cursor); set :allow-foreground true in :bot/target to permit it"})
+      (case kind
+        :noop {:ok true :noop true}
+        :key (let [r (sh ["osascript" "-e" (key-osascript combo)] {:timeout-ms 30000})]
+               {:ok (zero? (:exit r)) :err (str/trim (str (:err r)))})
+        :type (let [r (sh ["osascript" "-e"
+                           (str "tell application \"System Events\" to keystroke \""
+                                (-> (str text)
+                                    (str/replace "\\" "\\\\")
+                                    (str/replace "\"" "\\\""))
+                                "\"")]
+                          {:timeout-ms 30000})]
+                {:ok (zero? (:exit r)) :err (str/trim (str (:err r)))})
+        :script (let [r (sh ["osascript" "-e" (str applescript)] {:timeout-ms 60000})]
+                  {:ok (zero? (:exit r)) :out (str/trim (str (:out r)))
+                   :err (str/trim (str (:err r)))})
+        :pointer (if-not (and (sequential? coordinate) (= 2 (count coordinate)))
+                   {:ok false :err ":pointer needs :coordinate [x y]"}
+                   (let [[x y] coordinate
+                         verb (case button :right "rc" :double "dc" "c")
+                         r (sh ["cliclick" (str verb ":" (long x) "," (long y))]
+                               {:timeout-ms 20000})]
+                     {:ok (zero? (:exit r)) :err (str/trim (str (:err r)))})))))
+  (-probe! [_]
+    (let [sc (sh ["which" "screencapture"] {:timeout-ms 10000})
+          cc (sh ["which" "cliclick"] {:timeout-ms 10000})]
+      {:available? (zero? (:exit sc))
+       :why (str "screencapture " (if (zero? (:exit sc)) "present" "absent")
+                 "; cliclick " (if (zero? (:exit cc)) "present" "absent — :pointer acts unavailable")
+                 (when-not (:allow-foreground target)
+                   "; act deny-by-default (:allow-foreground not set)"))
+       :allow-foreground (boolean (:allow-foreground target))
+       :measured-at (now-iso) :backend :macos-local})))
+
+;; ───────────────────────── :host-object ─────────────────────────
+
+(defn last-edn-form
+  "Reads the last non-blank line of s as EDN (gate tasks print their
+  verdict last); nil when unreadable."
+  [s]
+  (let [line (->> (str/split-lines (str s)) (remove str/blank?) last)]
+    (when line
+      (try (edn/read-string line)
+           (catch #?(:clj Exception :cljs :default) _ nil)))))
+
+(defrecord HostObjectBackend [sh target]
+  ;; Non-visual: the "observation" is the verdict of a caller-supplied
+  ;; probe command (e.g. a headless deterministic gate). The command's
+  ;; three-valued exit is part of the observation — 0 pass / 1 fail /
+  ;; 2 could-not-measure — and is NOT collapsed into a refusal: a gate
+  ;; that measured a failure measured something. Only a spawn failure
+  ;; or timeout refuses. There is no screen and no act surface, so
+  ;; act! is an explicit named refusal; that keeps the cheap non-visual
+  ;; gate selectable through the same contract as a desktop.
+  b/IBackend
+  (-observe! [_ _opts]
+    (let [{:keys [cmd cwd timeout-ms]} target]
+      (if-not (and (sequential? cmd) (seq cmd))
+        (b/refusal :backend/observe-failed
+                   {:backend :host-object :why ":bot/target needs :cmd [exe args…]"})
+        (let [r (sh (mapv str cmd) (cond-> {:timeout-ms (or timeout-ms 600000)}
+                                     cwd (assoc :cwd cwd)))]
+          (if (= -1 (:exit r))
+            (b/refusal :backend/observe-failed
+                       {:backend :host-object
+                        :why (str "command never ran: " (str/trim (str (:err r))))
+                        :cmd (vec cmd) :cwd cwd})
+            (merge {:captured-at (now-iso) :backend :host-object
+                    :cmd (vec cmd) :cwd cwd
+                    :exit (:exit r)
+                    :raw (let [o (str (:out r))]
+                           (subs o (max 0 (- (count o) 4000))))}
+                   (when-let [v (last-edn-form (:out r))] {:observation v})))))))
+  (-act! [_ {:keys [kind]}]
+    (b/refusal :backend/act-unsupported
+               {:backend :host-object :kind kind
+                :why "host-object is observation-only (a probe command's verdict); it has no act surface"}))
+  (-probe! [_]
+    (let [exe (first (:cmd target))
+          cwd (:cwd target)]
+      (cond
+        (nil? exe) {:available? false :why ":bot/target has no :cmd"
+                    :measured-at (now-iso) :backend :host-object}
+        (and cwd (not (fs/directory? cwd)))
+        {:available? false :why (str ":cwd does not exist: " cwd)
+         :measured-at (now-iso) :backend :host-object}
+        :else
+        (let [r (sh ["which" (str exe)] {:timeout-ms 10000})]
+          {:available? (zero? (:exit r))
+           :why (if (zero? (:exit r))
+                  (str exe " resolves to " (str/trim (str (:out r)))
+                       (when cwd (str "; cwd " cwd " exists")))
+                  (str exe " not on PATH"))
+           :measured-at (now-iso) :backend :host-object})))))
+
+;; ───────────────────────── :fleet-node ─────────────────────────
+
+(def ssh-base ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=8"])
+
+(defrecord FleetNodeBackend [sh target]
+  ;; ssh to a murakumo fleet node and capture there.
+  ;;
+  ;; Measured 2026-08-29 on judah, simeon AND zebulun: all three are ssh
+  ;; reachable and all three have /usr/sbin/screencapture, but the ssh
+  ;; session has no window-server connection, so screencapture exits 1
+  ;; with "could not create image from display" and osascript System
+  ;; Events errors -10810. The implementation stays — it is the right
+  ;; shape the moment a node has a GUI login session with Screen
+  ;; Recording TCC granted to sshd — and probe! measures the truth at
+  ;; call time rather than baking today's answer in.
+  b/IBackend
+  (-observe! [_ _opts]
+    (let [{:keys [host]} target
+          remote (str "/tmp/cua-fleet-" (fs/epoch-ms) ".png")
+          local (tmp-png (str "fleet-" host))
+          cap (sh (into ssh-base [(str host) "screencapture" "-x" "-t" "png" remote])
+                  {:timeout-ms 60000})]
+      (if-not (zero? (:exit cap))
+        (b/refusal :backend/observe-failed
+                   {:backend :fleet-node :host host
+                    :why (str "remote screencapture failed: "
+                              (str/trim (str (:out cap) " " (:err cap))))})
+        (let [cp (sh ["scp" "-o" "BatchMode=yes" "-o" "ConnectTimeout=8"
+                      (str host ":" remote) local]
+                     {:timeout-ms 120000})]
+          (if (and (zero? (:exit cp)) (fs/path-exists? local))
+            (merge {:png-path local :captured-at (now-iso)
+                    :backend :fleet-node :host host}
+                   {:frame-stats (blankness sh local)})
+            (b/refusal :backend/observe-failed
+                       {:backend :fleet-node :host host
+                        :why (str "scp failed: " (str/trim (str (:err cp))))}))))))
+  (-act! [_ {:keys [kind]}]
+    ;; Measured 2026-08-29 on all three reachable nodes: cliclick is
+    ;; absent and osascript System Events over ssh errors -10810 (no GUI
+    ;; session), so there is no working act path on any node today.
+    (b/refusal :backend/act-unsupported
+               {:backend :fleet-node :kind kind :host (:host target)
+                :why "no input tool on node (cliclick absent; osascript System Events over ssh errors -10810 without a GUI session) — measured 2026-08-29"}))
+  (-probe! [_]
+    (let [{:keys [host]} target
+          reach (sh (into ssh-base [(str host) "true"]) {:timeout-ms 30000})]
+      (if-not (zero? (:exit reach))
+        {:available? false :why (str "ssh unreachable: " (str/trim (str (:err reach))))
+         :measured-at (now-iso) :backend :fleet-node :host host}
+        (let [cap (sh (into ssh-base [(str host) "screencapture" "-x" "-t" "png"
+                                      "/tmp/cua-probe.png"])
+                      {:timeout-ms 60000})]
+          {:available? (zero? (:exit cap))
+           :why (if (zero? (:exit cap))
+                  "ssh + remote screencapture both succeed"
+                  (str "ssh ok but screencapture failed: "
+                       (str/trim (str (:out cap) " " (:err cap)))
+                       " — needs a GUI login session and Screen Recording TCC for the ssh context"))
+           :measured-at (now-iso) :backend :fleet-node :host host})))))
+
+;; ───────────────────────── constructors ─────────────────────────
+
+(defn sh-of [opts] (or (:sh opts) (default-sh)))
+
+(defmethod b/create-backend :macos-local [_ target opts]
+  (->MacosLocalBackend (sh-of opts) (or target {})))
+
+(defmethod b/create-backend :window-scoped [_ target opts]
+  (->WindowScopedBackend (sh-of opts) (or target {})))
+
+(defmethod b/create-backend :host-object [_ target opts]
+  (->HostObjectBackend (sh-of opts) (or target {})))
+
+(defmethod b/create-backend :fleet-node [_ target opts]
+  (->FleetNodeBackend (sh-of opts) (or target {})))
+
+(def implemented-ids
+  "The registry ids with a real implementation in this namespace."
+  #{:macos-local :window-scoped :host-object :fleet-node})

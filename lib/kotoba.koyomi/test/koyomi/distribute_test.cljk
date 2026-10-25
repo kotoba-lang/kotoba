@@ -1,0 +1,78 @@
+(ns koyomi.distribute-test
+  "koyomi.distribute's Resend request-building, proven with a stubbed
+  :http-fn -- zero real network/credentials, so `kbb -M:dev:test` stays
+  fully runnable offline. The one real send against Resend is a separate,
+  manual live-verification step, never part of this automated suite."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [json.data-json :as json]
+            [koyomi.distribute :as distribute]
+            [koyomi.scheduleport :as scheduleport]
+            [koyomi.store :as store]))
+
+(defn- test-content []
+  {:calendar/id "ev-livetest" :calendar/title "Board meeting"
+   :calendar/start "2026-07-10T09:00:00Z" :calendar/end "2026-07-10T10:00:00Z"
+   :calendar/attendees ["alice@example.com" "bob@example.com"]})
+
+(deftest send-invite-posts-the-right-request-with-a-stubbed-transport
+  (let [captured (atom nil)
+        http-fn (fn [req] (reset! captured req) {:status 200 :body "{\"id\":\"resend-invite-1\"}"})
+        content (test-content)
+        ics (scheduleport/ics-string content)
+        m (distribute/share-message "ops@mail.itonami.cloud" content)
+        resp (distribute/send-invite! m ics {:http-fn http-fn :token "test-token"})]
+    (testing "the parsed Resend response id comes back"
+      (is (= "resend-invite-1" (:id resp))))
+    (testing "posts to the Resend emails endpoint"
+      (is (= "https://api.resend.com/emails" (:url @captured)))
+      (is (= :post (:method @captured))))
+    (testing "auth header shape: Bearer <token>"
+      (is (= "Bearer test-token" (get (:headers @captured) "Authorization"))))
+    (let [body (json/read-str (:body @captured) :key-fn keyword)]
+      (testing "right recipients, straight from :calendar/attendees"
+        (is (= ["alice@example.com" "bob@example.com"] (:to body))))
+      (testing "subject is clearly a share notification"
+        (is (= "Invite: Board meeting" (:subject body))))
+      (testing "the ICS attachment carries the right filename/content-type"
+        (let [attachment (first (:attachments body))]
+          (is (= "invite.ics" (:filename attachment)))
+          (is (= "text/calendar; charset=utf-8" (:content_type attachment)))
+          (testing "content decodes back to the exact already-built ICS string"
+            (is (= ics (kbytes/utf8-string (kbytes/base64-decode-bytes ^String (:content attachment)))))))))))
+
+(deftest send-invite-throws-on-non-2xx
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"Resend send failed"
+       (let [content (test-content)
+             ics (scheduleport/ics-string content)
+             m (distribute/share-message "ops@mail.itonami.cloud" content)]
+         (distribute/send-invite!
+          m ics
+          {:http-fn (fn [_] {:status 422 :body "{\"message\":\"invalid\"}"}) :token "t"})))))
+
+(deftest resend-scheduleport-records-the-delivery-onto-the-ledger
+  (let [st (store/seed-db)
+        http-fn (fn [_] {:status 200 :body "{\"id\":\"resend-invite-2\"}"})
+        sp (distribute/resend-scheduleport st "ops@mail.itonami.cloud" {:http-fn http-fn :token "t"})
+        content (test-content)
+        result (scheduleport/share! sp "ev-livetest" content)]
+    (testing "share! returns the resend id alongside the built ICS (mock-scheduleport parity)"
+      (is (= "resend-invite-2" (:resend-id result)))
+      (is (string? (:ics result))))
+    (testing "the ledger records the delivery -- the koyomi analog of
+              cloud_itonami.mail's :itonami.effect/tool (str \"resend:\" id)"
+      (let [fact (last (store/ledger st))]
+        (is (= "resend:resend-invite-2" (:tool fact)))
+        (is (= :sent (:disposition fact)))
+        (is (= "ev-livetest" (:subject fact)))))))
+
+(deftest resend-scheduleport-fails-closed-on-non-email-attendees
+  (testing "demo/seed placeholder ids (e.g. \"att-alice\") are NOT real emails --
+            a real share against them fails closed (invalid recipient) instead
+            of silently posting to a bogus address"
+    (let [st (store/seed-db)
+          sp (distribute/resend-scheduleport st "ops@mail.itonami.cloud"
+                                             {:http-fn (fn [_] {:status 200 :body "{\"id\":\"x\"}"})})]
+      (is (thrown? kerror/ExceptionInfo
+                  (scheduleport/share! sp "ev-board" (store/event st "ev-board")))))))

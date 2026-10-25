@@ -1,0 +1,112 @@
+(ns denrei.pod-test
+  "The live ChannelTarget, proven against the in-process langchain.db backend
+  — the same `:db-api` map langchain.kotoba-db/kotoba-api implements against
+  a real kaisha pod (kotoba-server on a murakumo fleet node,
+  ADR-2607072400), so what passes here holds against the pod by the api
+  contract (the same argument denrei.store's MemStore ≡ DatomicStore
+  contract test makes for the SSoT)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kaisha.model :as k]
+            [langgraph.graph :as g]
+            [denrei.channelport :as channelport]
+            [denrei.operation :as op]
+            [denrei.pod :as pod]
+            [denrei.store :as store]))
+
+(defn- content [message-id body]
+  {:tenant "cloud-itonami" :space "gftd" :channel "general"
+   :message (k/message message-id {:kaisha/author "denrei"
+                                   :kaisha/body body
+                                   :kaisha/at "2026-07-13T09:00:00Z"})})
+
+(deftest post-and-fetch-round-trip
+  (let [{:keys [target] :as cp} (pod/in-process-channelport)
+        rec (channelport/post! target "msg-1" (content "msg-1" "standup @alice"))]
+    (is (= rec (channelport/fetch-message target "msg-1"))
+        "the pod graph read returns exactly the governed delivery record")
+    (is (= ["alice"] (:mentions rec))
+        "mentions derive from the governed body via kaisha.model/mentions")
+    (is (= [rec] (pod/channel-messages cp "gftd" "general")))))
+
+(deftest channel-index-isolates-and-orders
+  (let [{:keys [target] :as cp} (pod/in-process-channelport)]
+    (channelport/post! target "msg-b"
+      (assoc-in (content "msg-b" "second") [:message :kaisha/at] "2026-07-13T10:00:00Z"))
+    (channelport/post! target "msg-a" (content "msg-a" "first"))
+    (channelport/post! target "msg-ops"
+      (-> (content "msg-ops" "other channel") (assoc :channel "ops")))
+    (is (= ["msg-a" "msg-b"] (mapv :message-id (pod/channel-messages cp "gftd" "general")))
+        "oldest first by :at, other channels excluded")
+    (is (= ["msg-ops"] (mapv :message-id (pod/channel-messages cp "gftd" "ops"))))))
+
+(deftest propose-revision-records-a-proposal
+  (let [{:keys [target]} (pod/in-process-channelport)]
+    (is (= {:proposal-id "denrei-pod/msg-1"}
+           (channelport/propose-revision! target "msg-1" (content "msg-1" "draft body"))))
+    (is (nil? (channelport/fetch-message target "msg-1"))
+        "a proposal is not a post — nothing lands on the channel index")))
+
+(deftest deliverer-fires-only-after-a-successful-transact
+  (testing "a pod transact failure must not invoke the realtime nudge — no
+            consumer may hear about a post the graph never durably recorded"
+    (let [delivered (atom [])
+          failing-api (assoc (:api (:db (pod/in-process-channelport)))
+                             :transact! (fn [_ _] (throw (ex-info "pod down" {}))))
+          {:keys [target]} (pod/db-channelport failing-api :conn #(swap! delivered conj %))]
+      (is (thrown? Exception
+                   (channelport/post! target "msg-1" (content "msg-1" "hello"))))
+      (is (empty? @delivered)))))
+
+(deftest messages-since-is-a-loss-free-cursor-tail
+  (let [{:keys [target] :as cp} (pod/in-process-channelport)
+        r1 (channelport/post! target "msg-1" (content "msg-1" "first"))
+        _  (channelport/post! target "msg-2"
+             (assoc-in (content "msg-2" "second") [:message :kaisha/at] "2026-07-13T10:00:00Z"))]
+    (is (= ["msg-1" "msg-2"] (mapv :message-id (pod/messages-since cp "gftd" "general" nil)))
+        "nil cursor replays from the beginning (durable record, not an ephemeral tail)")
+    (is (= ["msg-2"] (mapv :message-id
+                           (pod/messages-since cp "gftd" "general" (pod/message-cursor r1)))))
+    (is (= [] (pod/messages-since cp "gftd" "general"
+                                  (pod/message-cursor
+                                   (last (pod/channel-messages cp "gftd" "general"))))))))
+
+(deftest follow!-delivers-new-posts-and-stops
+  (let [{:keys [target] :as cp} (pod/in-process-channelport)
+        seen (atom [])
+        stop (pod/follow! cp "gftd" "general" #(swap! seen conj (:message-id %))
+                          {:interval-ms 25})]
+    (try
+      (channelport/post! target "msg-1" (content "msg-1" "hello"))
+      (let [deadline (+ (System/currentTimeMillis) 3000)]
+        (while (and (empty? @seen) (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 10)))
+      (is (= ["msg-1"] @seen) "the follower saw the post exactly once")
+      (finally (stop)))))
+
+(deftest full-actor-run-lands-the-post-on-the-pod-graph
+  (testing "denrei's real ChannelActor, wired to the pod target: draft
+            auto-commits, post interrupts for a human, approval lands the
+            governed record as durable datoms on the channel index"
+    (let [s (store/seed-db)
+          delivered (atom [])
+          {:keys [target] :as cp} (pod/in-process-channelport #(swap! delivered conj %))
+          actor (op/build s {:channelport target})]
+      (g/run* actor {:request {:op :message/draft :activity "act-standup"
+                               :space "gftd" :channel "general" :message "msg-standup"}
+                     :context {:phase 3}}
+              {:thread-id "d"})
+      (is (= :proposed (:status (store/draft-of s "msg-standup"))))
+      (is (empty? (pod/channel-messages cp "gftd" "general"))
+          "a draft commit is data only — nothing on the pod yet")
+      (let [r1 (g/run* actor {:request {:op :message/post :activity "act-standup"
+                                        :space "gftd" :channel "general" :message "msg-standup"}
+                              :context {:phase 3}}
+                       {:thread-id "p"})]
+        (is (= :interrupted (:status r1)))
+        (g/run* actor {:approval {:status :approved :by "alice"}}
+                {:thread-id "p" :resume? true}))
+      (is (= :posted (:status (store/draft-of s "msg-standup"))))
+      (let [msgs (pod/channel-messages cp "gftd" "general")]
+        (is (= ["msg-standup"] (mapv :message-id msgs)))
+        (is (= "denrei" (:author (first msgs)))))
+      (is (= 1 (count @delivered)) "realtime nudge fired exactly once"))))

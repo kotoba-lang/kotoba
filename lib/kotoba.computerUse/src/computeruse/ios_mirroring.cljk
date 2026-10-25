@@ -1,0 +1,395 @@
+(ns computeruse.ios-mirroring
+  "IComputer over a *physical* iPhone, seen through macOS **iPhone Mirroring**.
+
+  The sibling of `computeruse.android`. Android has `adb`, which talks to the
+  device directly: `screencap` returns the framebuffer and `input tap` injects
+  a real touch. iOS has no such channel here — Appium / WebDriverAgent /
+  XCUITest are not present in this workspace, and `simctl` (simulator only)
+  has no `tap`. What macOS 15+ does give is a **window** that shows the live
+  phone screen and forwards pointer and keyboard events to it.
+
+  So this driver is entirely made of things that already worked:
+
+    screenshot   screencapture -R <window rect> → sips resize → image block
+    tap          cliclick c:  inside the window
+    swipe        cliclick dd/dm/du along an interpolated path
+    text / keys  osascript System Events, with iPhone Mirroring frontmost
+
+  ## Coordinate model
+
+  Same shape as `computeruse.android`: the model sees the window contents
+  scaled to `:model-width` pixels and answers in that space. Two corrections
+  separate this from the Android case, and both are silent when wrong:
+
+  1. **Origin.** The capture is a *crop*, so a model coordinate maps to
+     `content-origin + model * scale`, not to `model * scale`. Drop the origin
+     and every tap is off by the window's position on the desktop — plausible
+     taps, consistently wrong.
+  2. **Points, not pixels.** `screencapture -R` takes points and, on a Retina
+     display, writes a PNG at 2× those points. The scale factor is therefore
+     `content size in POINTS / model width in PIXELS`. Computing it from the
+     captured pixel dimensions is off by exactly the backing scale factor —
+     which reads as \"taps land in the top-left quadrant\".
+
+  `model->screen` is a pure function and is tested against both.
+
+  ## What this cannot do
+
+  - **Multitouch.** A mouse is one pointer. Pinch, rotate, and two-finger
+    gestures have no expression here. A game that requires them is out of
+    reach for this driver, not merely slow.
+  - **Frame-accurate timing.** iPhone Mirroring is a live video stream over
+    the local network. Observation lags the device by tens of milliseconds and
+    drops frames under load, so a policy that must react within one frame will
+    not do so reliably. Turn-based and slow real-time games are the honest
+    target.
+  - **Running while the phone is in use.** iPhone Mirroring requires the
+    iPhone to be locked and nearby; picking the phone up ends the session.
+
+  ## Prereqs
+
+  - macOS 15+ with iPhone Mirroring set up and connected, window open
+  - `cliclick` (`brew install cliclick`)
+  - Screen Recording permission (screencapture) and Accessibility permission
+    (cliclick / System Events) for the calling terminal
+
+  Everything above the `#?(:clj)` boundary is pure and runs on any host; only
+  the shell-outs are JVM-only."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [computeruse.computer :as c]
+            [kotoba.lang.text :as str]
+            #?(:clj [computeruse.macos :as macos])))
+
+;; ─── pure: geometry ──────────────────────────────────────────────────────────
+
+(def default-app-name "iPhone Mirroring")
+
+(defn parse-numbers
+  "Leading integers of `s`, in order. System Events answers `position` and
+   `size` as \"12, 34\" and AppleScript `bounds` as \"12, 34, 56, 78\"."
+  [s]
+  (mapv #(long (Math/round #?(:clj (Double/parseDouble %) :cljs (js/parseFloat %))))
+        (re-seq #"-?\d+(?:\.\d+)?" (or s ""))))
+
+(defn window-rect
+  "[x y w h] in points from a `position` answer and a `size` answer."
+  [position-out size-out]
+  (let [[x y] (parse-numbers position-out)
+        [w h] (parse-numbers size-out)]
+    (when (and x y w h) [x y w h])))
+
+(defn content-rect
+  "Window rect minus `inset` [left top right bottom], in points.
+
+   iPhone Mirroring draws the phone screen below a title bar, so the window
+   rect is not the phone. The inset is a constant of the app's chrome, not of
+   the device, which is why it is an option rather than something derived."
+  [[x y w h] [l t r b]]
+  [(+ x l) (+ y t) (- w l r) (- h t b)])
+
+(defn scale-factors
+  "Points per model pixel, as [sx sy].
+
+   `content` is in points; `[mw mh]` is the size of the image the model was
+   shown, in pixels."
+  [[_ _ cw ch] [mw mh]]
+  [(/ (double cw) (double (max 1 mw)))
+   (/ (double ch) (double (max 1 mh)))])
+
+(defn model->screen
+  "A coordinate in the model's image space → absolute desktop points.
+
+   The addition of the content origin is the whole point; see the namespace
+   docstring."
+  [[cx cy _ _] [sx sy] mx my]
+  [(long (Math/round (+ cx (* (double mx) sx))))
+   (long (Math/round (+ cy (* (double my) sy))))])
+
+(defn screen->model
+  "Inverse of `model->screen`, for reporting the cursor back to the model."
+  [[cx cy _ _] [sx sy] px py]
+  [(long (Math/round (/ (- (double px) cx) sx)))
+   (long (Math/round (/ (- (double py) cy) sy)))])
+
+(defn clamp-to-content
+  "Keep a point inside the content rect. A model that answers slightly outside
+   the image should tap the edge, not the desktop behind the window."
+  [[cx cy cw ch] [px py]]
+  [(min (+ cx cw -1) (max cx px))
+   (min (+ cy ch -1) (max cy py))])
+
+;; ─── pure: gestures ──────────────────────────────────────────────────────────
+
+(defn swipe-path
+  "`steps` intermediate points strictly between start and end, exclusive.
+
+   iOS gesture recognisers classify by the motion samples they receive: a
+   press at one point followed by a release at another, with nothing between,
+   is read as a tap or discarded. The intermediate points are what make the
+   gesture a swipe."
+  [[x1 y1] [x2 y2] steps]
+  (let [n (max 0 steps)]
+    (mapv (fn [i]
+            (let [t (/ (double (inc i)) (double (inc n)))]
+              [(long (Math/round (+ x1 (* t (- x2 x1)))))
+               (long (Math/round (+ y1 (* t (- y2 y1)))))]))
+          (range n))))
+
+(defn drag-args
+  "cliclick argument vector for one press → move → release gesture.
+
+   One invocation, not one per point: spawning a process per sample makes the
+   motion stutter enough to be classified as several gestures."
+  [[x1 y1 :as start] [x2 y2 :as end] {:keys [steps hold-ms step-ms]
+                                      :or   {steps 12 hold-ms 0 step-ms 16}}]
+  (into (into [(str "dd:" x1 "," y1)]
+              (when (pos? hold-ms) [(str "w:" hold-ms)]))
+        (concat
+         (mapcat (fn [[x y]] [(str "w:" step-ms) (str "dm:" x "," y)])
+                 (swipe-path start end steps))
+         [(str "w:" step-ms) (str "du:" x2 "," y2)])))
+
+(defn scroll-delta
+  "Finger travel for a scroll of `amount` notches in `direction`.
+
+   `direction` is the direction the FINGER travels, matching
+   `computeruse.android`. On iOS that means `:up` reveals content further down
+   the page — the same relationship the physical gesture has. Two device
+   drivers in one library disagreeing about this would be worse than either
+   convention being the surprising one."
+  [direction amount notch-points]
+  (let [d (* (max 1 (or amount 3)) notch-points)]
+    (case (keyword direction)
+      :up    [0 (- d)]
+      :down  [0 d]
+      :left  [(- d) 0]
+      :right [d 0]
+      [0 d])))
+
+;; ─── pure: keys ──────────────────────────────────────────────────────────────
+
+(def mirroring-shortcuts
+  "iPhone Mirroring's own window shortcuts. These are how the phone is
+   navigated: there is no home button to tap, and a game is reached by going
+   home first."
+  {"home"          "cmd+1"
+   "homescreen"    "cmd+1"
+   "home_screen"   "cmd+1"
+   "appswitcher"   "cmd+2"
+   "app_switcher"  "cmd+2"
+   "switcher"      "cmd+2"
+   "spotlight"     "cmd+3"
+   "search"        "cmd+3"})
+
+(defn resolve-combo
+  "Expand an iPhone-Mirroring shortcut name; pass anything else through."
+  [combo]
+  (get mirroring-shortcuts (str/lower (str/trim (or combo ""))) combo))
+
+(defn escape-applescript [s]
+  (-> (str s)
+      (str/replace "\\" "\\\\")
+      (str/replace "\"" "\\\"")))
+
+(def ^:private modifier-clauses
+  {"cmd" "command down" "command" "command down" "super" "command down"
+   "ctrl" "control down" "control" "control down"
+   "alt" "option down" "option" "option down"
+   "shift" "shift down"})
+
+(def ^:private named-key-codes
+  {"return" 36 "enter" 36 "tab" 48 "space" 49 "delete" 51 "backspace" 51
+   "escape" 53 "esc" 53 "left" 123 "right" 124 "down" 125 "up" 126})
+
+(defn key-script
+  "A combo (\"cmd+1\", \"home\", \"return\") → the AppleScript that sends it.
+
+   Bare modifier names are not treated as modifiers of nothing: \"cmd\" alone
+   is a keystroke request, not an empty `using` clause."
+  [combo]
+  (let [parts (str/split (str/lower (resolve-combo combo)) #"\+")
+        mods  (if (= 1 (count parts)) [] (keep modifier-clauses (butlast parts)))
+        k     (last parts)
+        using (when (seq mods) (str " using {" (str/join ", " mods) "}"))]
+    (str "tell application \"System Events\" to "
+         (if-let [code (named-key-codes k)]
+           (str "key code " code using)
+           (str "keystroke \"" (escape-applescript k) "\"" using)))))
+
+;; ─── JVM: the shell-outs ─────────────────────────────────────────────────────
+
+#?(:clj
+   (do
+
+(defn- sh [& args]
+  (let [p    (.start (ProcessBuilder. ^java.util.List (vec args)))
+        out  (slurp (.getInputStream p))
+        code (.waitFor p)]
+    (when-not (zero? code)
+      (throw (ex-info (str "command failed: " (str/join " " args))
+                      {:exit code :out out})))
+    out))
+
+(defn- osa [script] (sh "osascript" "-e" script))
+
+(defn mirroring-window-rect
+  "The iPhone Mirroring window's rect in points, via the accessibility API.
+
+   Throws with the reason rather than a coordinate default: a wrong rect here
+   silently relocates every tap, and taps on someone's desktop are worse than
+   a stopped run."
+  [app-name]
+  (let [ask (fn [what]
+              (osa (str "tell application \"System Events\" to tell process \""
+                        (escape-applescript app-name) "\" to get " what
+                        " of window 1")))]
+    (or (try (window-rect (ask "position") (ask "size"))
+             (catch Exception e
+               (throw (ex-info (str "cannot read the " app-name " window. "
+                                    "Is iPhone Mirroring open and connected, "
+                                    "and does this terminal have Accessibility "
+                                    "permission?")
+                               {:app app-name} e))))
+        (throw (ex-info (str app-name " reported no window geometry")
+                        {:app app-name})))))
+
+(defn- png-pixel-size [path]
+  (let [out (sh "sips" "-g" "pixelWidth" "-g" "pixelHeight" path)
+        w   (some-> (re-find #"pixelWidth:\s*(\d+)" out) second Long/parseLong)
+        h   (some-> (re-find #"pixelHeight:\s*(\d+)" out) second Long/parseLong)]
+    (when (and w h) [w h])))
+
+(defn- b64-file [path]
+  (kbytes/base64-encode
+                   (kio/read-all-bytes
+                    path)))
+
+(defn iphone-mirroring-computer
+  "IComputer over a physical iPhone via the macOS iPhone Mirroring window.
+
+   opts:
+     :app-name      window owner (default \"iPhone Mirroring\")
+     :model-width   width in pixels of the image shown to the model
+                    (default 480). Resized with `sips --resampleWidth`, NOT
+                    `-Z`: `-Z` caps the LARGEST dimension, so on a portrait
+                    phone it would pin the height and leave the width around
+                    220 — legible as a thumbnail, not as a game. That is the
+                    right idiom in `computeruse.macos` only because a desktop
+                    display is landscape, where the largest dimension is the
+                    width.
+     :content-inset [left top right bottom] points of app chrome to exclude
+                    (default [0 26 0 0] — the title bar)
+     :rect          [x y w h] to use instead of asking System Events, for
+                    hosts where the accessibility query is unavailable
+     :swipe-steps   motion samples per swipe (default 12)
+     :notch-points  finger travel per scroll notch (default 90)
+     :long-press-ms hold for a :right click (default 700)
+
+   Every action activates iPhone Mirroring first: keystrokes go to whatever is
+   frontmost, so a run that quietly lost focus would otherwise type into the
+   user's own windows."
+  [& [{:keys [app-name model-width content-inset rect
+              swipe-steps notch-points long-press-ms]
+       :or   {app-name      default-app-name
+              model-width   480
+              content-inset [0 26 0 0]
+              swipe-steps   12
+              notch-points  90
+              long-press-ms 700}}]]
+  (let [;; last observed geometry; refreshed on every screenshot, because the
+        ;; window can be moved or resized between actions
+        geom      (atom nil)
+        ;; Acting before the first screenshot has no defensible mapping: the
+        ;; scale is only known once an image has actually been measured. A
+        ;; default of [1.0 1.0] would put every tap somewhere plausible and
+        ;; wrong, which is the failure this namespace exists to prevent — so
+        ;; refuse, the same way mirroring-window-rect refuses.
+        observed! (fn []
+                    (or @geom
+                        (throw (ex-info
+                                (str "no screenshot has been taken yet, so the "
+                                     "coordinate mapping is unmeasured. Take a "
+                                     "screenshot before acting.")
+                                {:action :screenshot}))))
+        content   #(:content (observed!))
+        scale     #(:scale (observed!))
+        focus!    #(macos/activate-application! app-name)
+        at        (fn [mx my]
+                    (let [cr (content)]
+                      (clamp-to-content cr (model->screen cr (scale) mx my))))]
+
+    (reify c/IComputer
+
+      (-screenshot [_]
+        (focus!)
+        (let [cr   (content-rect (or rect (mirroring-window-rect app-name))
+                                 content-inset)
+              [x y w h] cr
+              path (str "/tmp/cuse-iphone-" (System/nanoTime) ".png")]
+          (when (or (<= w 0) (<= h 0))
+            (throw (ex-info "iPhone Mirroring content rect is empty — is the
+                             window collapsed, or the inset too large?"
+                            {:rect cr :inset content-inset})))
+          (sh "screencapture" "-x" "-t" "png"
+              "-R" (str x "," y "," w "," h) path)
+          (sh "sips" "--resampleWidth" (str model-width) path)
+          (let [[mw mh] (or (png-pixel-size path) [model-width model-width])]
+            ;; scale is points-per-model-pixel: computed from the rect in
+            ;; POINTS, never from the captured pixels (Retina writes 2× there)
+            (reset! geom {:content cr :scale (scale-factors cr [mw mh])})
+            [{:type "image"
+              :source {:type "base64" :media_type "image/png"
+                       :data (b64-file path)}}])))
+
+      (-key! [_ combo]
+        (focus!)
+        (osa (key-script combo))
+        (str "Pressed " combo
+             (when-not (= combo (resolve-combo combo))
+               (str " (" (resolve-combo combo) ")"))))
+
+      (-type! [_ text]
+        (focus!)
+        (osa (str "tell application \"System Events\" to keystroke \""
+                  (escape-applescript text) "\""))
+        (str "Typed " (pr-str text)))
+
+      (-mouse-move! [_ x y]
+        ;; A touchscreen has no hover. Moving the pointer without pressing is
+        ;; observable to nothing on the phone, so this only parks the cursor.
+        ;; Coordinates are resolved before focusing, here and below: an
+        ;; unmeasured mapping is a caller error, and it should surface without
+        ;; having first pulled a window to the front.
+        (let [[px py] (at x y)]
+          (focus!)
+          (sh "cliclick" (str "m:" px "," py))
+          (str "Moved to [" px " " py "] (no touch — iOS has no hover)")))
+
+      (-click! [_ button x y]
+        (let [[px py] (at x y)]
+          (focus!)
+          (case button
+            :double (sh "cliclick" (str "dc:" px "," py))
+            ;; iOS has no secondary click; its secondary gesture is the hold
+            :right  (apply sh "cliclick"
+                           (drag-args [px py] [px py]
+                                      {:steps 0 :hold-ms long-press-ms}))
+            (sh "cliclick" (str "c:" px "," py)))
+          (str (case button :double "double-tap" :right "long-press" "tap")
+               " [" px "," py "]")))
+
+      (-scroll! [_ x y direction amount]
+        (let [cr      (content)
+              [px py] (at x y)
+              [dx dy] (scroll-delta direction amount notch-points)
+              end     (clamp-to-content cr [(+ px dx) (+ py dy)])]
+          (focus!)
+          (apply sh "cliclick" (drag-args [px py] end {:steps swipe-steps}))
+          (str "swipe-" (name (keyword direction)) " ×" (or amount 3)
+               " " [px py] "→" end)))
+
+      (-cursor-position [_]
+        (let [out   (sh "cliclick" "p")
+              [x y] (parse-numbers out)]
+          (screen->model (content) (scale) (or x 0) (or y 0)))))))
+
+))

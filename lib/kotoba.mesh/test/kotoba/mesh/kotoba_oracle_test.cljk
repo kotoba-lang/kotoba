@@ -1,0 +1,182 @@
+(ns kotoba.mesh.kotoba-oracle-test
+  "What keeps the shipped artifact honest, now that it is what runs.
+
+  `node-test` drives the real HTTP contract end to end and passed BYTE FOR BYTE
+  before and after the contract moved into `route.kotoba` -- 8 tests, 23
+  assertions, unchanged. That is the point: a suite that pins behaviour cannot
+  see where the behaviour is decided. Two things have to hold that no existing
+  test here can check:
+
+    1. the shipped artifact IS the current source, compiled
+    2. the host actually reads it, rather than having quietly kept a copy
+
+  The second is the one that is easy to lose and impossible to see. A host that
+  kept its own `cond` would pass every behavioural test in this repository,
+  because that `cond` is what those tests were written against. So this asks the
+  only question that separates them -- register a core that answers differently
+  and see whether the SERVER follows, over real HTTP, on the same path an
+  operator uses."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.mesh.kotoba-oracle :as oracle]
+            [kotoba.mesh.kotoba-oracle-gen :as gen]
+            [kotoba.mesh.node :as mesh-node])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]))
+
+;; ── drift ────────────────────────────────────────────────────────────
+
+;; Compared with a raw `=`, deliberately, and the reason is measured.
+;;
+;; A sibling repository normalizes gensym counters before this comparison,
+;; because compiled KIR there carries per-JVM temporaries (`or-tmp__11099`,
+;; numbered by how much else that JVM had expanded first) which make a raw `=`
+;; fail always. That does NOT hold at this repository's compiler pin: measured
+;; 2026-08-12 at 806f5cef, `(and (> a 0) (> b 0))` lowers to
+;; `(let [__kotoba_and_2 ...])` -- a per-module counter, byte-identical in a
+;; cold JVM and in one warmed by five other compiles. A normalizer written for
+;; the other form would not even match this one (`__kotoba_and_2` has a single
+;; underscore before its digit; that pattern requires two), so it would be
+;; inert code carrying a claim that is false here.
+;;
+;; Raw `=` is also the stronger gate: no normalization can hide a difference it
+;; was not meant to hide. And this test is itself the cross-JVM determinism
+;; check -- it compares a compile in THIS JVM against a file written by an
+;; earlier one. If a compiler bump ever does make temporaries JVM-dependent,
+;; every run of this fails loudly rather than one machine disagreeing quietly,
+;; and the fix is to normalize the form that pin actually emits.
+(deftest the-shipped-artifact-is-the-current-source-compiled
+  (doseq [[id source] (sort-by key oracle/cores)]
+    (testing (str id " <- " source)
+      (let [shipped (edn/read-string (slurp (io/resource (oracle/resource-path id))))
+            fresh (:kir (compiler/compile-source (slurp (io/file "src" source))
+                                                 gen/target {}))]
+        (is (= fresh shipped)
+            (str "shipped KIR for " id " is stale -- run `kbb -M:test:gen`"))))))
+
+(deftest every-declared-core-actually-ships
+  (doseq [id (keys oracle/cores)]
+    (is (some? (io/resource (oracle/resource-path id))) (str "no artifact for " id))
+    (is (some? (oracle/kir id)))))
+
+(deftest a-missing-artifact-throws-rather-than-deciding-anything
+  ;; The seam's one refusal. If it fell back instead, the first thing anyone
+  ;; would notice is that a decision quietly stopped being the shipped one.
+  (is (thrown-with-msg? kerror/ExceptionInfo #"shipped decision core is missing"
+                        (oracle/kir :not-a-core)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"does not declare that export"
+                        (oracle/param-types :route 'no-such-export))))
+
+(deftest the-abi-is-read-out-of-the-artifact
+  ;; Pinned so that a rename or a retyping in `route.kotoba` shows up here
+  ;; rather than as arguments that no longer match their declared type.
+  (is (= [:string :string] (oracle/param-types :route 'request-kind)))
+  (is (= :keyword (:result (oracle/signature :route 'request-kind))))
+  (is (= [:string] (oracle/param-types :route 'mesh-route-name)))
+  (is (= :string (:result (oracle/signature :route 'mesh-route-name))))
+  (is (= [:i64] (oracle/param-types :route 'answer?)))
+  (is (= :bool (:result (oracle/signature :route 'answer?))))
+  (is (= [:keyword :bool :bool] (oracle/param-types :route 'outcome)))
+  (is (= [:keyword] (oracle/param-types :route 'status-for)))
+  (is (= :i64 (:result (oracle/signature :route 'status-for)))))
+
+;; ── delegation ───────────────────────────────────────────────────────
+
+(def ^:private wrong-route-source
+  "Same exports, same signatures, deliberately different answers.
+
+  Every export is changed in a way that is separately visible over HTTP:
+  `request-kind` swaps which METHOD reaches which endpoint, `mesh-route-name`
+  ignores the path and always names a bound route, `answer?` is inverted,
+  `outcome` sends `ran but said nothing` to :route-not-bound, and `status-for`
+  answers in codes the real contract never uses."
+  "(ns kotoba.mesh.route
+     (:export [request-kind mesh-route-name answer? outcome status-for]))
+   (defn request-kind [method :string path :string] :keyword
+     (if (string=? method \"POST\")
+       (if (string=? path \"/health\") :health :unknown)
+       (if (string=? method \"GET\")
+         (if (< (string-length path) 11)
+           :unknown
+           (if (string=? (string-substring path 0 11) \"/mesh/http/\")
+             :mesh-dispatch
+             :unknown))
+         :unknown)))
+   (defn mesh-route-name [path :string] :string
+     (if (< (string-length path) 0) path \"drama-profile\"))
+   (defn answer? [written :i64] :bool
+     (if (> written 0) false true))
+   (defn outcome [kind :keyword bound? :bool answered? :bool] :keyword
+     (if (= kind :health)
+       :health-ok
+       (if (= kind :mesh-dispatch)
+         (if bound? (if answered? :answer :route-not-bound) :no-answer)
+         :not-found)))
+   (defn status-for [outcome :keyword] :i64
+     (if (= outcome :health-ok) 418
+       (if (= outcome :answer) 201
+         (if (= outcome :no-answer) 205
+           (if (= outcome :route-not-bound) 409 451)))))")
+
+(def ^:private server (atom nil))
+(def ^:private test-port (atom nil))
+
+(defn- with-server [f]
+  (let [drama (mesh-node/compile-route "lib/kotoba.mesh/examples/mesh_drama_profile.kotoba"
+                                       "lib/kotoba.mesh/examples/mesh_drama_profile_policy.edn")
+        no-answer (mesh-node/compile-route "lib/kotoba.mesh/examples/mesh_no_answer.kotoba"
+                                           "lib/kotoba.mesh/examples/mesh_drama_profile_policy.edn")
+        started (mesh-node/start! {"drama-profile" drama "no-answer" no-answer} 0)]
+    (reset! server started)
+    (reset! test-port (.getPort (.getAddress ^com.sun.net.httpserver.HttpServer started)))
+    (try (f)
+         (finally
+           (oracle/deregister-kir! :route)
+           (.stop ^com.sun.net.httpserver.HttpServer started 0)))))
+
+(use-fixtures :once with-server)
+
+(defn- send! [method path]
+  (let [b (HttpRequest/newBuilder (URI/create (str "http://localhost:" @test-port path)))
+        req (.build (if (= "GET" method)
+                      (.GET b)
+                      (.POST b (HttpRequest$BodyPublishers/noBody))))
+        resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))]
+    [(.statusCode resp) (.body resp)]))
+
+(deftest the-server-reads-the-artifact-rather-than-keeping-a-copy
+  (let [wrong (:kir (compiler/compile-source wrong-route-source gen/target {}))]
+    (testing "the shipped contract"
+      (is (= [200 "{:status :ok :runtime :kotoba.wasm-exec}"] (send! "GET" "/health")))
+      (is (= [200 "[[\"minidrama.aozora.app\"]]"] (send! "POST" "/mesh/http/drama-profile")))
+      (is (= [204 ""] (send! "POST" "/mesh/http/no-answer")))
+      (is (= [404 "{:error :route-not-bound}"] (send! "POST" "/mesh/http/nope")))
+      (is (= [404 "{:error :not-found}"] (send! "GET" "/not-a-real-endpoint"))))
+
+    (oracle/register-kir! :route wrong)
+    (testing "and the same live server under a core that answers differently"
+      ;; A node that had kept its own `cond` would answer exactly as it did
+      ;; above, and nothing else in this repository would say so.
+      (is (= [418 "{:status :ok :runtime :kotoba.wasm-exec}"] (send! "POST" "/health"))
+          "request-kind, outcome and status-for all followed: POST now reaches health")
+      (is (= [451 "{:error :not-found}"] (send! "GET" "/health"))
+          "and followed in the other direction -- GET /health is no longer health")
+      (is (= [451 "{:error :not-found}"] (send! "POST" "/mesh/http/drama-profile"))
+          "the dispatch shape moved off POST with it")
+      (testing "a route name the shipped core would call unbound"
+        ;; GET now dispatches; `mesh-route-name` ignores "/zzz-not-bound" and
+        ;; names drama-profile, which IS bound, so the guest really runs and
+        ;; writes bytes; inverted `answer?` calls that nothing; `outcome` sends
+        ;; it to :route-not-bound; `status-for` renders 409. Four exports, one
+        ;; request.
+        (is (= [409 "{:error :route-not-bound}"] (send! "GET" "/mesh/http/zzz-not-bound"))
+            "mesh-route-name, answer?, outcome and status-for all followed")))
+
+    (oracle/deregister-kir! :route)
+    (testing "restored"
+      (is (= [200 "{:status :ok :runtime :kotoba.wasm-exec}"] (send! "GET" "/health")))
+      (is (= [200 "[[\"minidrama.aozora.app\"]]"] (send! "POST" "/mesh/http/drama-profile")))
+      (is (= [404 "{:error :not-found}"] (send! "POST" "/health"))))))

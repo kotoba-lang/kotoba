@@ -1,0 +1,139 @@
+(ns langgraph.checkpoint-test
+  "The conformance suite for the `Checkpointer` protocol itself.
+
+  `langgraph.checkpoint` declares a protocol and ships two
+  implementations of it; two more live in sibling namespaces
+  (`kg-checkpoint`, `kotoba-checkpoint`). Every other test in this repo
+  drives ONE of them, through a graph run, and asserts what that run
+  produced. That is the right shape for testing a graph. It is the wrong
+  shape for testing a protocol: it pins each implementation against its
+  own scenario, so a promise the protocol makes to ALL implementors ends
+  up pinned wherever someone happened to write a scenario, and unpinned
+  everywhere else.
+
+  Measured 2026-08-21 by mutating `checkpoint.cljc` against the suite as
+  it then stood (45 tests / 156 assertions, green): `get-state-at` could
+  be changed to answer with a step it was not asked for, `mem`'s
+  `-list-checkpoints` could lose its `sort-by :step`, and BOTH `-put!`
+  implementations could stop returning the checkpoint — four mutations,
+  no failures. The same three promises were already pinned elsewhere for
+  the other implementors (`:langgraph/history-ascending` covers the
+  Datomic sort; `kg-checkpoint-test/put-returns-ckpt` covers that
+  return), which is the asymmetry itself: the contract was never wrong,
+  it was just only ever checked on whichever implementation the last
+  scenario happened to use.
+
+  So each deftest here states one promise the protocol makes and runs it
+  against EVERY checkpointer this namespace ships, from one body. A new
+  implementation is added to `checkpointers` and inherits the contract
+  rather than being trusted with it."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.checkpoint :as cp]
+            [langchain.db :as db]))
+
+(defn- checkpointers
+  "Fresh instances of every checkpointer `langgraph.checkpoint` ships,
+  each behind the same protocol. Called per deftest so no test inherits
+  another's rows.
+
+  Deliberately NOT asserted anywhere below: `-get-latest` means
+  different things to these two when steps are written out of order —
+  `mem` peeks the last row WRITTEN, the Datomic one queries the highest
+  `:step`. In-order writes (what `graph/run*` does) can't tell them
+  apart. Picking a winner here would be inventing a contract the
+  protocol does not state, so this suite pins what the protocol DOES
+  state and leaves that difference visible for whoever needs to decide
+  it."
+  []
+  [["mem-checkpointer"     (cp/mem-checkpointer)]
+   ["datomic-checkpointer" (cp/datomic-checkpointer
+                            (db/create-conn cp/checkpoint-schema))]])
+
+(defn- ckpt [step] {:step step :state {:n step} :frontier [:node] :status :running})
+
+;; ── time travel ──────────────────────────────────────────────────────
+
+(deftest get-state-at-answers-only-for-the-step-it-was-asked-for
+  (testing "`get-state-at` is the time-travel read, and it is the one
+            operation here whose caller has already decided which moment
+            it wants: an audit asking what the thread looked like at the
+            step a human approved, a replay pinned to a step. It scans
+            the history with a predicate, and the predicate has to be
+            equality. Relaxed to `<=` or `>=` it still returns a real,
+            well-formed checkpoint — just a neighbouring one — so the
+            caller cannot tell it was answered with a different moment
+            than the one it named. That is worse than an error: the
+            audit gets a state, believes it is step N, and the record
+            says the thread was somewhere it never was.
+
+            A step can be missing from a history that is otherwise fine:
+            retention pruned the older rows, the history was restored
+            from a partial export, or the caller simply named a step
+            that does not exist. Every one of those must read as absent."
+    (doseq [[label cpr] (checkpointers)]
+      (testing label
+        (cp/put! cpr "t" (ckpt 0))
+        (cp/put! cpr "t" (ckpt 2))
+        (is (= 0 (:step (cp/get-state-at cpr "t" 0)))
+            "a step that is present answers as itself")
+        (is (= {:n 2} (:state (cp/get-state-at cpr "t" 2)))
+            "…and with its own state, not the newest one")
+        (is (nil? (cp/get-state-at cpr "t" 1))
+            "step 1 is a hole in this history — it must read as absent,
+             not as step 2 wearing step 1's name")
+        (is (nil? (cp/get-state-at cpr "t" 99))
+            "and a step past the end is absent, not the last one")
+        (is (nil? (cp/get-state-at cpr "never-seen" 0))
+            "an unknown thread has no moments to travel to")))))
+
+;; ── history order ────────────────────────────────────────────────────
+
+(deftest list-checkpoints-is-ascending-by-step-however-it-was-written
+  (testing "`-list-checkpoints` is documented on the protocol as \"All
+            checkpoints for the thread, ascending by :step\" — not \"in
+            the order they arrived\". Both shipped implementations sort,
+            but only the Datomic one's sort is pinned (mutation
+            `:langgraph/history-ascending`); `mem`'s survives being
+            deleted because nothing ever writes to it out of order.
+
+            The order is not cosmetic. `get-state-at` above reads
+            through this list and takes the FIRST match, and a caller
+            reading a history to reconstruct what happened reads it top
+            to bottom. Insertion order and step order are the same
+            sequence for a graph running forward, which is exactly why
+            this goes unnoticed until something writes out of order — a
+            backfill, a replayed export, a host restoring a thread it
+            had archived — and then the history is a plausible-looking
+            narrative of a run that never happened in that order."
+    (doseq [[label cpr] (checkpointers)]
+      (testing label
+        (cp/put! cpr "t" (ckpt 2))
+        (cp/put! cpr "t" (ckpt 0))
+        (cp/put! cpr "t" (ckpt 1))
+        (is (= [0 1 2] (mapv :step (cp/list-checkpoints cpr "t")))
+            "ascending by :step, not the order the rows were written")
+        (is (= [{:n 0} {:n 1} {:n 2}]
+               (mapv :state (cp/list-checkpoints cpr "t")))
+            "…and each row still carries its own state after the sort")))))
+
+;; ── what put! hands back ─────────────────────────────────────────────
+
+(deftest put!-returns-the-checkpoint-it-persisted
+  (testing "`-put!`'s return is the protocol's, not an implementation
+            detail: `kg-checkpoint-test/put-returns-ckpt` already pins it
+            for the kg-backed one, and both implementations here return
+            `ckpt` on purpose. Neither is checked, so either could start
+            returning the transaction result, or nil, and only a caller
+            that threads the value — `(-> ckpt (put! …) :step)`, a host
+            echoing the persisted checkpoint back to its own caller —
+            would find out, at runtime, in whatever process it was
+            written into.
+
+            Returning the checkpoint is also what makes `put!` safe to
+            use in a pipeline at all, so this is the promise that decides
+            whether the call is an expression or a statement."
+    (doseq [[label cpr] (checkpointers)]
+      (testing label
+        (let [c (ckpt 0)]
+          (is (= c (cp/put! cpr "t" c))
+              "put! answers with the checkpoint it was given"))))))

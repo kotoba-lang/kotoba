@@ -1,0 +1,143 @@
+(ns sumitclub-meisai
+  "Fetch カード利用明細 from SuMi TRUST CLUB (sumitclub.jp) via computer
+  use, with vault-backed login — the agent NEVER types a raw credential
+  and NEVER changes anything on the account (read-only scope).
+
+  Runs on a LOCAL model by default — Ollama serving gemma 4 QAT
+  (tools + vision capable), so statement data never leaves the machine:
+
+     kbb -M:dev:examples -e \"(require 'sumitclub-meisai) (sumitclub-meisai/-main)\"
+
+  Model backend is selected by LLM=ollama|gemini|anthropic (see
+  jvm-host): gemini uses Gemini's OpenAI-compatible endpoint with
+  GEMINI_API_KEY; OLLAMA_MODEL / GEMINI_MODEL override the defaults.
+
+  The agent drives an already-open browser to the 利用明細照会 page,
+  logs in through `type_secret` (the secret is resolved at the
+  host/vault layer and never reaches the model, the message history, or
+  the Datomic action log), reads the statement table, and persists the
+  rows through the `save_statement` tool as EDN — ready for downstream
+  ingestion (e.g. an etzhayyim actor normalizing into kotoba EAVT).
+
+  Env:
+    SUMITCLUB_VAULT_ITEM   vault item name      (default \"sumitclub\")
+    SUMITCLUB_VAULT        1Password vault name (optional)
+    SUMITCLUB_OUT          output EDN path      (default \"sumitclub-meisai.edn\")
+    SUMITCLUB_MONTH        statement month \"YYYY-MM\" (default: latest shown)
+    VAULT                  op | bw              (default op)
+  op must be signed in (`op signin`) / bw unlocked (`BW_SESSION=$(bw unlock --raw)`)."
+  (:require [computeruse.macos :as macos]
+            [computeruse.vault :as vault]
+            [computeruse.agent :as agent]
+            [jvm-host :as host]
+            [langchain.db :as db]
+            [kotoba.pprint :as pp]))
+
+(def meisai-url
+  "https://www.sumitclub.jp/JPCRD/col/action/WA2020101Action/RWA2020105")
+
+(def system-prompt
+  (str "You are a computer-use agent operating the user's macOS desktop to READ "
+       "a credit-card statement on a Japanese member site (sumitclub.jp).\n"
+       "HARD RULES (credentials):\n"
+       "- NEVER use the `type` action for an ID, password, OTP or any credential\n"
+       "  field. Use `type_secret` with the vault secret_ref instead; the host\n"
+       "  fills it from the vault and you never see the value.\n"
+       "- You do not know and must not guess any secret. If a login step needs a\n"
+       "  credential you have no secret_ref for (e.g. an unexpected 2FA), call\n"
+       "  `done` success=false and say what was asked.\n"
+       "HARD RULES (read-only scope):\n"
+       "- This is a READ-ONLY task. Only navigate, scroll, and read.\n"
+       "- NEVER click anything that changes account state: 支払い方法/支払方法,\n"
+       "  リボ, 分割, キャッシング, 変更, 登録, 解約, 申込, 設定 — if a dialog or\n"
+       "  campaign popup appears, close it without accepting anything.\n"
+       "- Logging in and paging through 明細 is allowed; everything else is not.\n"
+       "Work in the frontmost browser window; cmd+l focuses the address bar.\n"
+       "The site is Japanese: 利用明細 = statement, ご利用日 = transaction date,\n"
+       "ご利用先 = merchant, ご利用金額 = amount (yen).\n"
+       "Screenshot to verify every step before and after acting."))
+
+(defn save-statement-tool
+  "Tool the agent calls with the extracted rows; writes EDN to `out`."
+  [out]
+  {:name "save_statement"
+   :description
+   (str "Save extracted statement rows. Call once per statement month after "
+        "reading ALL pages of the table. Amounts are integer yen, dates "
+        "ISO yyyy-mm-dd. Returns the path written.")
+   :schema {:type "object"
+            :properties
+            {:statement_month {:type "string"
+                               :description "Statement month, \"YYYY-MM\"."}
+             :total_jpy {:type "integer"
+                         :description "Statement total in yen, if shown."}
+             :rows {:type "array"
+                    :items {:type "object"
+                            :properties
+                            {:date {:type "string"}
+                             :merchant {:type "string"}
+                             :amount_jpy {:type "integer"}
+                             :note {:type "string"}}
+                            :required ["date" "merchant" "amount_jpy"]}}}
+            :required ["statement_month" "rows"]}
+   :fn (fn [{:keys [statement_month total_jpy rows]}]
+         (let [doc {:source :sumitclub
+                    :source/url meisai-url
+                    :statement/month statement_month
+                    :statement/total-jpy total_jpy
+                    :statement/rows rows}]
+           (spit out (with-out-str (pp/pprint doc)))
+           (str "Saved " (count rows) " rows for " statement_month
+                " to " out)))})
+
+(defn task [item vault-name month]
+  (let [ref (fn [field]
+              (cond-> {:item item :field field}
+                vault-name (assoc :vault vault-name)))]
+    (str "Goal: in the frontmost browser, open " meisai-url " and read the "
+         "card 利用明細 (statement)" (when month (str " for " month)) ".\n"
+         "If a login page appears, fill the ID field with `type_secret` "
+         "secret_ref " (pr-str (ref "username")) " and the password field with "
+         "`type_secret` secret_ref " (pr-str (ref "password")) ", then submit. "
+         "If an OTP prompt appears and the item has a `totp` field, use "
+         "`type_secret` secret_ref " (pr-str (ref "totp")) ".\n"
+         (if month
+           (str "Select the statement month " month " if a month selector is shown.\n")
+           "Use the statement month shown by default.\n")
+         "Read EVERY row of the statement table — scroll and use 次へ/next "
+         "paging until you have all rows — then call `save_statement` with "
+         "statement_month, total_jpy (if shown) and all rows "
+         "(date as yyyy-mm-dd, merchant, amount_jpy as integer yen).\n"
+         "Finally call done success=true with the month, row count and total.")))
+
+(defn make-vault []
+  (case (or (System/getenv "VAULT") "op")
+    "op" (vault/op-vault {:account (System/getenv "OP_ACCOUNT")})
+    "bw" (vault/bw-vault {})
+    (throw (ex-info "VAULT must be op or bw" {}))))
+
+(defn -main [& [month]]
+  (let [month (or month (System/getenv "SUMITCLUB_MONTH"))
+        item (or (System/getenv "SUMITCLUB_VAULT_ITEM") "sumitclub")
+        vname (System/getenv "SUMITCLUB_VAULT")
+        out (or (System/getenv "SUMITCLUB_OUT") "sumitclub-meisai.edn")
+        conn (db/create-conn agent/log-schema)
+        {:keys [result steps]}
+        (agent/run {:model (host/make-model)
+                    :computer (macos/macos-computer)
+                    :vault (make-vault)
+                    :tools [(save-statement-tool out)]
+                    :system system-prompt
+                    :task (task item vname month)
+                    :history-conn conn
+                    :session-id (str "sumitclub-" (or month "latest"))
+                    :max-steps 60})]
+    (println "result:" result "| steps:" steps)
+    ;; audit trail records the action + secret_ref, never the secret value
+    (println "audit:"
+             (sort-by first
+                      (db/q '[:find ?step ?a ?in
+                              :where [?e :caction/step ?step]
+                                     [?e :caction/action ?a]
+                                     [?e :caction/input ?in]]
+                            (db/db conn))))))

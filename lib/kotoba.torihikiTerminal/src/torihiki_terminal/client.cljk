@@ -1,0 +1,836 @@
+(ns torihiki-terminal.client
+  "The live client: polls the node, re-renders the panels, and submits signed
+  transactions.
+
+  ## It renders with the same functions the server used
+
+  `order-book`, `trades-panel`, `chain-panel` and `ticker` are the SAME pure
+  hiccup functions `render-page` calls at build time. The client turns their
+  output into HTML with `kotoba-ui.core/->html` and swaps it in.
+
+  That replaces the previous version's hand-written JavaScript, which built
+  the same rows with string concatenation. Two renderers for one panel is two
+  things to keep in agreement, and the one written in JavaScript could not use
+  the design system's classes without repeating them by hand — which it did.
+
+  ## The order form used to be a picture of an order form
+
+  Buttons, price and size fields, three flag chips and a 'Connect wallet'
+  button, none of which did anything — next to a position panel whose size,
+  entry and unrealised PnL were the literal zeros this file passed in. The
+  page did not say any of that. A terminal that renders a position it never
+  asked the node about is not incomplete, it is wrong, and the panel hardest
+  to notice is the one that always shows a plausible number.
+
+  Both are real now: the form signs and submits, and the position comes from
+  `/account`.
+
+  ## What it does not do
+
+  It does not run the engine. The node does, and this asks it what happened.
+  Running the engine here as well would be a second execution of the same
+  transactions, which is a genuinely useful thing (it is how a light client
+  verifies) but is a different feature from a terminal, and claiming one while
+  doing the other is the kind of thing this project keeps refusing to do.
+
+  ## Failure is visible
+
+  When the node cannot be reached the page says so rather than freezing on the
+  last good frame. A terminal that silently shows stale prices is worse than
+  one that admits it is disconnected: the first invites a trade. The same
+  applies to a refused transaction — the chain gives a reason, so the form
+  shows the reason."
+  (:require [kotoba-ui.core :as ui]
+            [torihiki.book :as bk]
+            [torihiki.light :as light]
+            [torihiki-terminal.config :as cfg]
+            [torihiki-terminal.keys :as tkeys]
+            [torihiki-terminal.view :as view]))
+
+(def nodes
+  "The nodes this page reads, as base URLs: `?nodes=a,b,c` on the page URL,
+  else the `data-nodes` attribute the server rendered, else `config/node-urls`.
+
+  Several, on purpose, and any host: each is an ordinary torihiki node
+  (`torihiki-node`'s standalone implementation, plain HTTP), and the page
+  compares what they say rather than believing one. It used to be one URL on
+  one vendor's platform, with replicas addressed by a `?w=` parameter only
+  that platform's router understood."
+  (vec (remove empty?
+               (map #(.replace % #"/+$" "")
+                    (.split (or (some-> (js/URLSearchParams. (.. js/window -location -search)) (.get "nodes"))
+                                (some-> (.getElementById js/document "tk-root") (.getAttribute "data-nodes"))
+                                (.join (clj->js cfg/node-urls) ","))
+                            ",")))))
+
+;; Which node serves each witness, learned from their own `/head`.
+(defonce node-of (atom {}))
+
+(declare witness)
+
+(defn- base
+  "The node the page reads from: the one serving `witness`, or the first."
+  []
+  (let [u (get @node-of @witness)]
+    (if (and u (not= u ::ambiguous)) u (first nodes))))
+
+(def ^:private stall-ms
+  "How long the height may stand still before the status line stops saying
+  live. The validator set produced ~1.7 blocks/s when it ran; thirty seconds
+  without one is not a slow block."
+  30000)
+
+;; The last height seen and when it changed, for `view/stalled?`.
+(defonce ^:private progress (atom {:height nil :at nil}))
+
+(defn- note-progress! [height]
+  (let [now (js/Date.now)]
+    (swap! progress (fn [p] (if (= height (:height p)) p {:height height :at now})))
+    (view/stalled? @progress now stall-ms)))
+
+(defn- live-text
+  "The front of the status line: live, or stalled, and what the node is."
+  [head stalled?]
+  (str (if stalled?
+         (str "STALLED at block " (:height head) " for "
+              (js/Math.round (/ (- (js/Date.now) (:at @progress)) 1000)) "s")
+         (str "live · block " (:height head)))
+       " · " (view/path-label head)))
+
+(def ^:const market 1)
+
+(declare tick! refresh-markets!)
+
+(defonce session (atom {:key nil :account nil :chain-id nil :busy false}))
+
+(def pinned-set?
+  "Did the build pin a validator set (`data-set`)?"
+  (boolean (some-> (.getElementById js/document "tk-root") (.getAttribute "data-set") not-empty)))
+
+(def pinned-chain
+  "The chain id the build pinned with the validator set (`data-chain`), or
+  nil. When there is one, the page signs and verifies for that chain only,
+  whatever the nodes say theirs is. A set pinned WITHOUT a chain is a broken
+  page, and it fails closed: nothing is proved and nothing is signed."
+  (some-> (.getElementById js/document "tk-root") (.getAttribute "data-chain") not-empty))
+
+;; Declared here rather than beside `subscribe!` because `tick!` reaches for it:
+;; when the replica this page reads is outvoted, the socket has to be reopened
+;; against the replacement, and the socket is addressed to the replica.
+(defonce ^:private socket (atom {:ws nil :backoff 500 :ticking false :again false}))
+
+;; Which replica this page reads from. A page has to read the book from ONE of
+;; them, or a bid and an ask a block apart would look like a spread that is not
+;; there.
+;;
+;; ## It moved, and it used to be `w1` forever
+;;
+;; This was a constant, on the reasoning that the replicas agree and the status
+;; line proves it by fetching all four. They do agree — until one of them does
+;; not, and then the page is reading the one that does not.
+;;
+;; Measured on the deployed chain: w1 disagreed with w2, w3 and w4 in 16 of 16
+;; strict same-height comparisons, holding a resting order at a price the other
+;; three did not have. The status line said `4 replicas, agreeing` throughout,
+;; because it compares roots at equal HEIGHTS and each sample caught the
+;; replicas a block apart — the check was built for a chain that stalls, not for
+;; one that runs while one member computes a different answer.
+;;
+;; So the page picks a replica in the majority and says when it moves. This does
+;; not repair the chain; a divergent replica needs a state it can agree with,
+;; which is not something a client can hand it. What it repairs is showing
+;; somebody a book that no quorum stands behind.
+;;
+;; A comment rather than a docstring: `defonce` takes two arguments.
+(defonce witness (atom "w1"))
+
+;; Which market this page is showing. The chain can list one while the page is
+;; open (`/markets` POST does exactly that), so the picker is filled from what
+;; the node reports rather than from anything compiled in here — the header
+;; said `BTC-PERP` while the chain ran two markets, which is a plausible label
+;; nobody supplied.
+(defonce market* (atom 1))
+
+;; What `/markets` last reported: `[{:id :symbol}]`. The picker is drawn from
+;; this, so it is data rather than DOM.
+(defonce listed-markets (atom []))
+
+;; height -> {witness -> state-root}, bounded. See the comparison in `tick!`.
+(defonce ^:private seen-roots (atom {}))
+
+(defn- with-w
+  "Add the replica and the market to a path.
+
+  Both are page state and both are per-request: the replica because a page must
+  read one replica's book (a bid and an ask a block apart look like a spread
+  that is not there), the market because every read route now answers about
+  one. `/head` and `/markets` ignore `m=` and are unharmed by carrying it."
+  [path]
+  (str path (if (re-find #"\?" path) "&" "?") "m=" @market*))
+
+(defn- fetch-json [path]
+  (-> (js/fetch (str (base) (with-w path)))
+      (.then #(.json %))
+      (.then #(js->clj % :keywordize-keys true))))
+
+(defn- post-json [path body]
+  (-> (js/fetch (str (base) (with-w path))
+                #js {:method "POST"
+                     :headers #js {"content-type" "application/json"}
+                     :body (js/JSON.stringify (clj->js body))})
+      (.then #(.json %))
+      (.then #(js->clj % :keywordize-keys true))))
+
+(defn- el [id] (.getElementById js/document id))
+
+(defn- swap-html! [id hiccup]
+  (when-let [e (el id)] (set! (.-innerHTML e) (ui/->html hiccup))))
+
+(defn- set-text! [id s]
+  (when-let [e (el id)] (set! (.-textContent e) s)))
+
+(defn- set-status! [ok? text]
+  (when-let [e (el "tk-status")]
+    (set! (.-textContent e) text)
+    (set! (.-className e) (str "hig-caption2 " (if ok? "tk-dim" "tk-down")))))
+
+(defn- set-order-status! [ok? text]
+  (when-let [e (el "tk-order-status")]
+    (set! (.-textContent e) text)
+    (set! (.-className e) (str "hig-footnote " (if ok? "tk-dim" "tk-down")))))
+
+(def ^:private follow-ms
+  "How long a submitted transaction is followed before the page says it has
+  not seen it in a block. The node resubmits what it accepted for longer
+  (`torihiki-node.mempool`), so this is when to tell the trader, not when the
+  transaction is given up."
+  30000)
+
+(defn- follow-tx
+  "A promise of what became of the transaction signed `sig`, asking the node
+  (`/tx-status`) until the answer is final or `follow-ms` passes: the final
+  `{:status \"applied\"|\"rejected\" :reason :height}`, or — at the
+  deadline — `{::timeout last-answer}`.
+
+  Only a FINAL answer is a result. A rejection that consumed no nonce (a copy
+  that arrived before the transaction ahead of it, or somebody replaying the
+  signature inside another envelope) does not mean this one failed; it is
+  kept, and shown if nothing better arrives."
+  [sig]
+  (let [deadline (+ (js/Date.now) follow-ms)
+        last-answer (atom nil)
+        ;; The node the transaction was posted to: "pending" is ITS memory,
+        ;; and the page may switch nodes while it waits.
+        node (base)]
+    (letfn [(ask []
+              ;; Each request is bounded: a node that accepts the connection
+              ;; and never answers must not hold the form busy past the
+              ;; deadline.
+              (-> (js/fetch (str node (with-w (str "/tx-status?sig=" (js/encodeURIComponent sig))))
+                            #js {:signal (js/AbortSignal.timeout 5000)})
+                  (.then #(.json %))
+                  (.then #(js->clj % :keywordize-keys true))
+                  (.catch (fn [_] nil))
+                  (.then (fn [o]
+                           (when (map? o) (reset! last-answer o))
+                           (cond
+                             (and (true? (:final o)) (#{"applied" "rejected"} (:status o))) o
+                             ;; A node from before `/tx-status`: it cannot say,
+                             ;; and waiting would end in a claim it never made.
+                             (= "no-such-route" (:reason o)) ::unanswerable
+                             (> (js/Date.now) deadline) {::timeout @last-answer}
+                             :else (js/Promise. (fn [ok _] (js/setTimeout #(ok (ask)) 500))))))))]
+      (ask))))
+
+(defn- report-outcome!
+  "Say what the chain did with the transaction, in the chain's words.
+
+  \"included\", not \"placed\" or \"filled\": the engine takes a
+  post-only order that would cross, an IOC order that fills nothing, or a
+  reduce-only order with nothing to reduce, and does nothing with it. The
+  book and the position panel say what the order did; this line says only
+  that a block carried it."
+  [o]
+  (let [why (fn [r] (if (or (string? r) (keyword? r)) (name r) (str r)))]
+    (cond
+      (= ::unanswerable o) (set-order-status! true "queued — a block will carry it (this node does not report outcomes)")
+      (contains? o ::timeout)
+      (let [prev (::timeout o)
+            after (str "not in a block after " (quot follow-ms 1000) " s")]
+        (set-order-status! false
+                           (case (:status prev)
+                             "pending" (str after " — the node still holds it"
+                                            (when (:hint prev) (str "; last refusal: " (why (:hint prev))))
+                                            ". Check before resubmitting.")
+                             "rejected" (str after " — refused for now" (when (:reason prev) (str ": " (why (:reason prev)))))
+                             "unknown" (str after " — the node does not hold it; it may have been dropped")
+                             (str after " — no answer from the node"))))
+      (= "applied" (:status o)) (set-order-status! true (str "included in block " (:height o)))
+      :else (set-order-status! false (str "refused at block " (:height o) ": " (why (:reason o)))))))
+
+;; ── frames ──────────────────────────────────────────────────────────────────
+
+(defn- position-for
+  "`/account` returns positions keyed by market id, and JSON turns integer keys
+  into strings — so `js->clj :keywordize-keys` gives `:1`, not `1`. Looking up
+  the integer alone silently found nothing, which renders as a flat account:
+  the failure is invisible because 'no position' is a legitimate answer."
+  [acct m]
+  (let [ps (:positions acct)]
+    (or (get ps (keyword (str m))) (get ps (str m)) (get ps m))))
+
+(defn- frame
+  "Assemble the shape the view functions expect from what the node returns.
+  The node speaks its read models; the view speaks frames. Translating in one
+  place keeps both of them from knowing about the other's shape."
+  [head mkt-info book trades acct listed]
+  (let [pos (position-for acct market)]
+    {:market @market*
+     :markets listed
+     :height (:height head)
+     :last (:last mkt-info)
+     :mark (:mark mkt-info)
+     :oracle (:oracle mkt-info)
+     :bids (:bids book)
+     :asks (:asks book)
+     ;; `:h` — the block, carried as the block.
+     ;;
+     ;; This used to read `:ts (* 1000 (:h t))`, and the trades panel divided
+     ;; it back by a thousand to get the block again. A round trip through a
+     ;; unit that does not exist: the engine has no wall clock, so there is no
+     ;; timestamp to be had, and dressing a height up as milliseconds is the
+     ;; beginning of reading it as a time. The chart makes that concrete —
+     ;; block candles have to know they are block candles.
+     :trades (mapv (fn [t] {:level (:level t) :qty (:qty t)
+                            :side (:side t) :h (:h t)})
+                   (:trades trades))
+     ;; From /account, not from a literal. An account with nothing open
+     ;; genuinely has no position, which is a different statement from "we
+     ;; never asked".
+     :position {:size (:size pos 0)
+                :entry (:entry pos 0)
+                :upnl (:unrealized pos 0)}
+     :equity (:equity acct 0)
+     :funding (:funding-rate mkt-info)
+     :resting (:resting head)
+     :root (:state-root head)}))
+
+(defn- render! [f]
+  (swap-html! "tk-chart-panel" (view/chart-panel f))
+  (swap-html! "tk-book-panel" (view/order-book f))
+  (swap-html! "tk-trades-panel" (view/trades-panel f))
+  (swap-html! "tk-chain-panel" (view/chain-panel f nil))
+  (swap-html! "tk-positions-panel" (view/positions-panel f))
+  (swap-html! "tk-ticker" (view/ticker-body f)))
+
+(defn- render-session! [acct]
+  (set-text! "tk-account" (str (:account acct)))
+  (set-text! "tk-collateral" (str "$" (view/dollars (:collateral acct 0))))
+  (set-text! "tk-free" (str "$" (view/dollars (:free-collateral acct 0))))
+  (set-text! "tk-nonce" (str (:next-nonce acct 1))))
+
+;; ── claiming an id ──────────────────────────────────────────────────────────
+
+(defn- account-for
+  "The account this key owns. No lookup and no walk: the id is derived from
+  the key, so it is known before the node is asked anything.
+
+  A stored id wins when there is one. Sessions that predate the derivation
+  walked to an id and BOUND their key to it, and that binding is immutable —
+  showing them their derived id instead would show them an empty account and
+  leave the balance they had behind a key that can still sign for it."
+  [k]
+  (or (:account k) (tkeys/account-for (:public k))))
+
+;; ── submitting ──────────────────────────────────────────────────────────────
+
+(defn- submit!
+  "Sign `tx` with the session key and post it, reporting the outcome either
+  way.
+
+  The nonce is read from the node on every submission rather than tracked
+  here. A client-side counter drifts the moment a request is lost in flight or
+  anything else submits for the account, and the symptom is `bad-nonce` on the
+  transaction the trader is watching the price for."
+  [tx]
+  (let [{:keys [key account chain-id busy]} @session]
+    (cond
+      (not (tkeys/supported?))
+      (do (set-order-status! false "This browser has no Ed25519 in WebCrypto, so nothing here can be signed.")
+          (js/Promise.resolve nil))
+
+      (or (nil? key) (nil? account) (nil? chain-id))
+      (do (set-order-status! false "Still starting up — no session key yet.")
+          (js/Promise.resolve nil))
+
+      (and pinned-set? (nil? pinned-chain))
+      (do (set-order-status! false "This page pins a validator set but no chain id; it was built wrong. Nothing is signed.")
+          (js/Promise.resolve nil))
+
+      (and pinned-chain (not= pinned-chain chain-id))
+      (do (set-order-status! false (str "These nodes run chain " chain-id ", not " pinned-chain
+                                        " that this page was built for. Nothing is signed for it."))
+          (js/Promise.resolve nil))
+
+      busy
+      (do (set-order-status! false "One at a time: nonces are strictly sequential, so two in flight is one rejection.")
+          (js/Promise.resolve nil))
+
+      :else
+      (do
+        (swap! session assoc :busy true)
+        (set-order-status! true "signing…")
+        (-> (fetch-json (str "/account?id=" account))
+            (.then (fn [a] (tkeys/sign-tx key chain-id account (:next-nonce a 1) tx)))
+            (.then (fn [envelope]
+                     (-> (post-json "/tx" envelope)
+                         (.then #(assoc % ::sig (:sig envelope))))))
+            (.then (fn [r]
+                     (if (:ok r)
+                       ;; Queued, not landed. On a single sequencer /tx
+                       ;; returns the height the transaction landed at,
+                       ;; because the node that answers is the node that
+                       ;; ordered it. On a BFT chain the two are different
+                       ;; events: this replica has accepted the transaction
+                       ;; into its mempool and some later block will carry it.
+                       ;; Saying "accepted at block" here would name a height
+                       ;; that has not happened.
+                       ;;
+                       ;; So it is followed until a block says what happened,
+                       ;; and the form stays busy meanwhile: the next order
+                       ;; would read the same next nonce and be refused.
+                       (do (set-order-status! true "queued — waiting for a block")
+                           (tick!)
+                           (-> (follow-tx (::sig r))
+                               (.then (fn [o] (report-outcome! o) (tick!) r))))
+                       ;; the chain gave a reason; reporting "failed" instead
+                       ;; would throw away the only useful part of the answer
+                       (do (set-order-status! false (str "refused: " (or (:reason r) "unknown")))
+                           (tick!)
+                           r))))
+            (.catch (fn [e]
+                      (set-order-status! false "could not reach the node")
+                      (js/console.error "torihiki-terminal:" e)
+                      nil))
+            (.finally (fn [] (swap! session assoc :busy false))))))))
+
+;; ── the form ────────────────────────────────────────────────────────────────
+
+(defn- chip-el [act] (.querySelector js/document (str "[data-act='" (name act) "']")))
+
+(defn- flag-on? [act]
+  (= "1" (some-> (chip-el act) (.-dataset) (.-tkOn))))
+
+(defn- read-int [id]
+  (let [v (some-> (el id) (.-value) (.trim))]
+    (when (and v (seq v) (re-matches #"\d+" v))
+      (js/parseInt v 10))))
+
+;; torihiki.book's flag bits, taken from torihiki.book itself. They used to be
+;; copied here as 1/2/4 with post-only and IOC swapped — the engine's IOC is 1
+;; and post-only 2 — so the "Post only" chip sent an IOC order that took
+;; liquidity (found by crossing a post-only sell into a resting bid and
+;; watching it fill), and "IOC" sent a post-only one. A copy is a second
+;; place to be wrong; the engine's own constants are not.
+(def flag-post-only bk/flag-post-only)
+(def flag-ioc bk/flag-ioc)
+(def flag-reduce-only bk/flag-reduce-only)
+
+(defn- flags []
+  (bit-or (if (flag-on? :flag-post) flag-post-only 0)
+          (if (flag-on? :flag-ioc) flag-ioc 0)
+          (if (flag-on? :flag-ro) flag-reduce-only 0)))
+
+(defn- place! [side]
+  (let [level (read-int "tk-price")
+        qty (read-int "tk-size")]
+    (cond
+      (nil? level) (set-order-status! false "Limit price must be a whole number of ticks.")
+      (nil? qty) (set-order-status! false "Size must be a whole number of lots.")
+      (zero? qty) (set-order-status! false "Size must be greater than zero.")
+      :else (submit! {:tx :order :market @market* :side side
+                      :level level :qty qty :flags (flags)}))))
+
+(defn- faucet! []
+  ;; A deposit signed by this session's own key.
+  ;;
+  ;; On a devnet with no bridge, that is what a deposit IS, and the chain says
+  ;; so: `/head`'s `:collateral` reads "unbacked". It used to ask the node to
+  ;; sign as a bridge authority, which only the Cloudflare deployment had; an
+  ;; ordinary node holds no such key, and a chain in bridge mode refuses this
+  ;; deposit outright — collateral there comes only from the bridge contract.
+  (submit! {:tx :deposit :amount 10000000}))
+
+(defn- toggle-chip! [^js e]
+  (let [on? (= "1" (.. e -dataset -tkOn))]
+    (set! (.. e -dataset -tkOn) (if on? "0" "1"))
+    (.toggle (.-classList e) "tk-chip-on" (not on?))))
+
+(defn- wire-form!
+  "One delegated listener rather than one per control: the panels are replaced
+  wholesale on every tick, so anything bound to an element directly would stop
+  working after the first frame."
+  []
+  (.addEventListener
+   js/document "click"
+   (fn [^js ev]
+     (when-let [t (some-> (.-target ev) (.closest "[data-act]"))]
+       (case (.. t -dataset -act)
+         "buy" (do (.preventDefault ev) (place! 0))
+         "sell" (do (.preventDefault ev) (place! 1))
+         "faucet" (do (.preventDefault ev) (faucet!))
+         ("flag-post" "flag-ioc" "flag-ro") (do (.preventDefault ev) (toggle-chip! t))
+         nil)))))
+
+;; ── the loop ────────────────────────────────────────────────────────────────
+
+(defn tick! []
+  (refresh-markets!)
+  (let [account (:account @session)]
+    (-> (js/Promise.all
+         #js [(fetch-json "/head") (fetch-json "/market")
+              (fetch-json "/book?depth=11") (fetch-json "/trades?n=14")
+              (if account
+                (fetch-json (str "/account?id=" account))
+                (js/Promise.resolve {}))
+              ;; The chart's history, from the chain rather than from the
+              ;; tape. The tape is bounded by COUNT — 200 fills is a few dozen
+              ;; blocks on a busy book — so a chart folded from it cannot see
+              ;; further back than that however wide a window it asks for.
+              ;;
+              ;; Asked for at the FINEST granularity and rebucketed here, so
+              ;; the visible density stays the same as the window changes —
+              ;; the server has no idea how wide the panel is. `rebucket`'s
+              ;; boundaries are absolute, so this is the same answer the
+              ;; server would give for the coarser span.
+              ;;
+              ;; Tolerated missing rather than required: a replica running a
+              ;; version without the endpoint answers 404, and the chart falls
+              ;; back to folding the tape. A page that showed nothing because
+              ;; one node was mid-deploy would be a worse answer than a short
+              ;; chart.
+              (-> (fetch-json "/candles?span=1&n=1000")
+                  (.catch (fn [_] nil)))])
+        (.then (fn [[head market* book trades acct candles]]
+                 (swap! session assoc :chain-id (:chain-id head))
+                 (render! (assoc (frame head market* book trades acct @listed-markets)
+                                 :candles (when (seq (:candles candles))
+                                            (:candles candles))
+                                 ))
+                 (when account (render-session! acct))
+                 (when-let [e (el "tk-path")]
+                   (set! (.-textContent e) (view/path-label head)))
+                 (let [stalled? (note-progress! (:height head))]
+                   (set-status! (not stalled?) (live-text head stalled?))
+                   ;; Ask the other three what they hold. A single node saying
+                   ;; it is live is a single node's word for it; four roots on
+                   ;; the screen is the property that matters, or its absence.
+                   (-> (js/Promise.all
+                        (clj->js (map (fn [w]
+                                        (-> (js/fetch (str w "/head"))
+                                            (.then #(.json %))
+                                            (.then #(js->clj % :keywordize-keys true))
+                                            (.then (fn [h]
+                                                   ;; A node names its own witness, and a node can lie.
+                                                   ;; First claim wins; a witness claimed by two URLs
+                                                   ;; is nobody's, and the page reads the first node.
+                                                   (when-let [wn (:witness h)]
+                                                     (swap! node-of (fn [m] (let [c (get m wn)]
+                                                                              (cond (nil? c) (assoc m wn w)
+                                                                                    (or (= c w) (= c ::ambiguous)) m
+                                                                                    :else (assoc m wn ::ambiguous))))))
+                                                   h))
+                                            (.catch (fn [_] nil))))
+                                      nodes)))
+                       (.then (fn [hs]
+                                ;; Compared at the SAME height. Replicas are
+                                ;; legitimately a block or two apart at any
+                                ;; instant, and comparing their roots as-of-now
+                                ;; called that a disagreement — a status line
+                                ;; that cries wolf every few seconds teaches the
+                                ;; reader to ignore the one time it matters.
+                                (let [hs (remove nil? hs)
+                                      by-h (group-by :height hs)
+                                      split (some (fn [[_ g]]
+                                                    (> (count (set (map :state-root g))) 1))
+                                                  by-h)
+                                      ;; Who is in the majority, and is this page
+                                      ;; reading one of them?
+                                      ;;
+                                      ;; Accumulated across ticks, not judged
+                                      ;; within one. Four replicas at ~3 blocks a
+                                      ;; second are rarely all at the same height
+                                      ;; in one sample, and the first version of
+                                      ;; this judged the largest same-height
+                                      ;; group whatever its size — so a group of
+                                      ;; ONE became a majority of one (`2*1 > 1`)
+                                      ;; and the page either stayed put for no
+                                      ;; reason or moved for no reason. It said
+                                      ;; `agreeing` while w1 was demonstrably
+                                      ;; outvoted.
+                                      ;;
+                                      ;; Remembering what each witness said at
+                                      ;; each height lets the comparison wait
+                                      ;; until a quorum has reported the SAME
+                                      ;; height, which is the only comparison
+                                      ;; that means anything.
+                                      _ (swap! seen-roots
+                                               (fn [m]
+                                                 (let [m (reduce (fn [acc d]
+                                                                   (assoc-in acc [(:height d) (:witness d)]
+                                                                             (:state-root d)))
+                                                                 m hs)]
+                                                   ;; bounded: keep the newest 64
+                                                   (into {} (take-last 64 (sort-by key m))))))
+                                      judged (->> @seen-roots
+                                                  (filter (fn [[_ by-w]] (>= (count by-w) 3)))
+                                                  (sort-by key)
+                                                  last)
+                                      by-w (second judged)
+                                      tally (frequencies (vals by-w))
+                                      [top n] (when (seq tally) (last (sort-by val tally)))
+                                      majority (when (and top (> (* 2 n) (count by-w)))
+                                                 (set (map key (filter #(= top (val %)) by-w))))
+                                      minority? (and majority
+                                                     (contains? by-w @witness)
+                                                     (not (contains? majority @witness)))]
+                                  (when minority?
+                                    ;; Move, and reconnect the socket, which is
+                                    ;; addressed to the replica being read.
+                                    (reset! witness (first (sort majority)))
+                                    (some-> (:ws @socket) (.close)))
+                                  (set-status!
+                                   (and (not split) (not minority?) (not stalled?))
+                                   (str (live-text head stalled?) " · "
+                                        (count hs) " replicas, "
+                                        (cond
+                                          minority? (str "READ REPLICA WAS OUTVOTED — moved to "
+                                                         @witness)
+                                          split "DISAGREEING at one height"
+                                          :else "agreeing"))))))
+                       (.catch (fn [_] nil))))))
+        (.catch (fn [e]
+                  ;; say it, do not freeze on the last good frame
+                  (set-status! false "disconnected — the numbers below are stale")
+                  (js/console.error "torihiki-terminal:" e))))))
+
+;; ── woken by the chain, not by a timer ──────────────────────────────────────
+
+
+(defn- tick-once!
+  "Run `tick!`, and if wakeups arrive while it is running, run it once more
+  afterwards rather than once per wakeup.
+
+  Blocks land ~336 ms apart and a tick is five requests. Without this, a burst
+  after a reconnect would start five ticks at once, and the last one to return
+  would decide what the page shows — which is not necessarily the newest, so
+  the display could go backwards while every individual request succeeded."
+  []
+  (if (:ticking @socket)
+    (swap! socket assoc :again true)
+    (do (swap! socket assoc :ticking true :again false)
+        (js/Promise.resolve
+         (.finally (js/Promise.resolve (tick!))
+                   (fn []
+                     (let [again (:again @socket)]
+                       (swap! socket assoc :ticking false :again false)
+                       (when again (tick-once!)))))))))
+
+(defn- subscribe!
+  "Refresh once a second. A node announces nothing: it answers when asked, the
+  same to a page as to anybody, and `tick-once!` keeps overlapping refreshes
+  from showing an older answer after a newer one."
+  []
+  (js/setInterval tick-once! 1000))
+
+(defn- refresh-markets!
+  "Keep the market list, and keep the selection valid.
+
+  It used to write the picker's `<option>`s into the DOM. That never survived:
+  `render!` swaps the whole ticker body on every tick, so the options were
+  replaced by the server-rendered ones a moment after being written. The view
+  renders the picker from the frame now, and this only supplies the data.
+
+  Refreshed every tick rather than once at boot, because a market can be
+  listed while the page is open — `POST /markets` does exactly that."
+  []
+  (-> (fetch-json "/markets")
+      (.then (fn [{:keys [markets]}]
+               (reset! listed-markets (mapv #(select-keys % [:id :symbol]) markets))
+               ;; A market that stopped being listed must not leave the page
+               ;; reading an id the node answers about by falling back to its
+               ;; default — that answer looks like the market the user picked
+               ;; and is not.
+               (when-not (some #{@market*} (map :id markets))
+                 (reset! market* (or (:id (first markets)) 1)))))
+      (.catch (fn [_] nil))))
+
+(defn- wire-market!
+  "Listen on the document, not on the element.
+
+  The first version attached a `change` listener to `#tk-market` at boot, and
+  it stopped working after one tick: `render!` swaps the whole ticker body,
+  which replaces the select and takes the listener with it. The symptom was a
+  picker that showed both markets, accepted a click, and went back to the
+  first one — a control that looks wired and is not.
+
+  Delegation is what `wire-form!` already does with `data-act` for the same
+  reason, and it survives every re-render because the document does."
+  []
+  (.addEventListener
+   js/document "change"
+   (fn [ev]
+     (when (= "tk-market" (some-> (.-target ev) (.-id)))
+       (let [id (js/parseInt (.. ev -target -value))]
+         (when (and id (not= id @market*))
+           (reset! market* id)
+           ;; Redraw now rather than at the next wake: switching markets is a
+           ;; deliberate act and a page that keeps showing the old book for a
+           ;; block reads as the switch having failed.
+           (tick!)))))))
+
+(defn- b64->u8 [s] (js/Uint8Array.from (js/atob s) (fn [c] (.charCodeAt c 0))))
+
+(defn- ed25519-verify
+  "Does `sig` verify as `pubkey`'s over `payload`? WebCrypto, so a Promise."
+  [pubkey payload sig]
+  (-> (let [k (b64->u8 pubkey)]
+        (js/crypto.subtle.importKey (if (= 32 (.-length k)) "raw" "spki") k #js {:name "Ed25519"} false #js ["verify"]))
+      (.then (fn [k] (js/crypto.subtle.verify #js {:name "Ed25519"} k (b64->u8 sig)
+                                              (.encode (js/TextEncoder.) payload))))
+      (.catch (fn [_] false))))
+
+(defn- get-json [url]
+  (-> (js/fetch url) (.then #(when (.-ok %) (.json %)))
+      (.then #(some-> % (js->clj :keywordize-keys true))) (.catch (fn [_] nil))))
+
+(defn- trusted-set
+  "The validator set this page checks roots against: `data-set` (w=key,...)
+  with `data-epoch` when the server rendered them, else the set most nodes
+  report. The second is weaker — it trusts the majority of the URLs the page
+  was given — and the panel says which one it used."
+  [duties]
+  (let [root (.getElementById js/document "tk-root")
+        attr (some-> root (.getAttribute "data-set"))]
+    (if (seq attr)
+      {:held true
+       :chain pinned-chain
+       :epoch (js/parseInt (or (.getAttribute root "data-epoch") "0") 10)
+       :members (into {} (for [p (.split attr ",") :let [[w k] (.split p "=" 2)]] [w {:pubkey k :weight 1}]))}
+      (some (fn [[t n]] (when (> (* 2 n) (count nodes)) (assoc t :held false)))
+            (frequencies (keep #(when (:segment-keys %)
+                                  {:epoch (:epoch %)
+                                   :members (into {} (for [[w k] (:segment-keys %)] [(name w) {:pubkey k :weight 1}]))})
+                               duties))))))
+
+(defonce ^:private verifying (atom false))
+
+(defn- attested-at
+  "Ask every node for attestations at `h`, verify each signature here
+  (WebCrypto), and return what `torihiki.light/attested-root` makes of them.
+  A signature counts only for the exact (key, payload) it verified over — a
+  real signature copied onto another witness, height or root counts for
+  nothing."
+  [h members epoch chain]
+  (-> (js/Promise.all (clj->js (map #(get-json (str % "/attestation?h=" h)) nodes)))
+      (.then
+       (fn [as]
+         (let [as (vec (remove nil? (array-seq as)))
+               checks (vec (for [a as :let [m (get members (:witness a))]
+                                 :when (and m (string? (:sig a)) (string? (:root a)) (integer? (:height a)))]
+                             [(:pubkey m) (light/root-payload chain epoch (:height a) (:root a)) (:sig a)]))]
+           (-> (js/Promise.all (clj->js (map (fn [[k p sig]] (ed25519-verify k p sig)) checks)))
+               (.then (fn [oks]
+                        (let [good (set (keep (fn [[c ok]] (when ok c)) (map vector checks (array-seq oks))))]
+                          (light/attested-root as members chain epoch
+                                               (fn [k p sig] (contains? good [k p sig]))))))))))))
+
+(defn- verify-balance!
+  "Prove this session's collateral against a root more than 2/3 of the set
+  signed (`torihiki.light`), and say so on the panel. Signatures are checked
+  here; the balance is the account's own merkle-sum leaf under that root,
+  from whichever node serves a proof that checks.
+
+  Only a PINNED set (`data-set`) makes it a proof. With the set taken from the
+  nodes, whoever runs the nodes chooses the keys — a link with `?nodes=` can
+  point a page anywhere — so the panel shows the figure as unproved."
+  []
+  (let [acct (:account @session)
+        chain (:chain-id @session)]
+    (when (and acct chain (not @verifying))
+      (reset! verifying true)
+      (-> (js/Promise.all (clj->js (map #(get-json (str % "/duties")) nodes)))
+          (.then
+           (fn [duties]
+             (if-let [{:keys [members epoch held] :as t} (when-not (and pinned-set? (nil? pinned-chain))
+                                                             (trusted-set (array-seq duties)))]
+               (-> (js/Promise.all (clj->js (map #(get-json (str % "/attestation")) nodes)))
+                   (.then
+                    (fn [latest]
+                      ;; Newest first, a few: one node reporting a height nobody
+                      ;; else has must not stop the check.
+                      (let [hs (take 4 (sort > (distinct (filter integer? (keep :height (array-seq latest))))))]
+                        (letfn [(try-h [hs]
+                                  (if (empty? hs)
+                                    (js/Promise.resolve nil)
+                                    ;; A pinned set signs for its pinned chain; the
+                                    ;; nodes' word for the chain id would let them
+                                    ;; replay what the same keys signed elsewhere.
+                                    (-> (attested-at (first hs) members epoch (if held (:chain t) chain))
+                                        (.then (fn [r] (if r r (try-h (rest hs))))))))]
+                          (try-h hs)))))
+                   (.then
+                    (fn [found]
+                      (cond
+                        (:conflict found) (set-text! "tk-verified" "CONFLICTING ROOTS signed by the set — do not trust this chain")
+                        (nil? found) (set-text! "tk-verified" "not verified — no root signed by more than 2/3 of the set")
+                        :else
+                        (-> (js/Promise.all (clj->js (map #(get-json (str % "/proof?a=" acct "&h=" (:height found))) nodes)))
+                            (.then (fn [ps]
+                                     (if-let [ok (some #(light/verify-account % found acct) (remove nil? (array-seq ps)))]
+                                       (set-text! "tk-verified"
+                                                  (if held
+                                                    (str "$" (view/usd (quot (:collateral ok) 10))
+                                                         " proved at height " (:height ok) ", root signed by "
+                                                         (count (:signers ok)) "/" (count members))
+                                                    (str "$" (view/usd (quot (:collateral ok) 10))
+                                                         " — NOT a proof: the validator set was taken from these nodes, not pinned")))
+                                       (set-text! "tk-verified" "not verified — no proof checks against the signed root")))))))))
+               (set-text! "tk-verified" "not verified — no validator set to check against"))))
+          (.catch (fn [_] (set-text! "tk-verified" "not verified — nodes unreachable")))
+          (.finally (fn [] (reset! verifying false)))))))
+
+(defn ^:export start []
+  (wire-form!)
+  (wire-market!)
+  (if-not (tkeys/supported?)
+    (set-text! "tk-session-note"
+               "This browser has no Ed25519 in WebCrypto, so this page can read the chain but cannot sign anything for it.")
+    (-> (tkeys/load-or-create!)
+        (.then (fn [k]
+                 (let [id (account-for k)]
+                   (tkeys/remember-account! k id)
+                   (swap! session assoc :key k :account id)
+                   (tick!))))
+        (.catch (fn [e]
+                  (set-text! "tk-session-note"
+                             "Could not start a session — no key could be generated.")
+                  (js/console.error "torihiki-terminal:" e)))))
+  (tick!)
+  (subscribe!)
+  ;; The floor, not the clock.
+  ;;
+  ;; This used to be 1500 and it WAS the clock: nothing else asked the chain
+  ;; anything, so the average wait between a block committing and this page
+  ;; showing it was 750 ms — the largest single term in an end-to-end of about
+  ;; 2600 ms, against blocks that land ~336 ms apart. The page was four times
+  ;; slower than the chain it was watching.
+  ;;
+  ;; `subscribe!` is the clock now. This stays, ten times slower, for the case
+  ;; the socket cannot cover: it is closed, or reconnecting, or the replica is
+  ;; running a build without `/subscribe` and answers 426. A page that went
+  ;; silent whenever the socket did would be a worse answer than a slow one,
+  ;; and the status line cannot say "disconnected" if nothing is asking.
+  (js/setInterval tick! 15000)
+  (js/setInterval verify-balance! 10000)
+  (js/setTimeout verify-balance! 3000))
