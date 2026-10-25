@@ -1,0 +1,145 @@
+(ns nameserver.transfer-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [nameserver.transfer :as xfr]))
+
+(defn- soa [serial]
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "SOA"
+   :zone/rdata {:zone/mname "ns1.example.com." :zone/rname "hostmaster.example.com."
+                :zone/serial serial :zone/refresh 3600 :zone/retry 900
+                :zone/expire 604800 :zone/minimum 86400}})
+
+(defn- a-rr [nm addr & [ttl]]
+  {:zone/name nm :zone/ttl (or ttl 300) :zone/class "IN" :zone/type "A"
+   :zone/rdata {:zone/address addr}})
+
+(def zone-v1
+  {:zone/origin "example.com." :zone/ttl 3600
+   :zone/records [(soa 2024010101)
+                  (a-rr "example.com." "192.0.2.1")
+                  (a-rr "www.example.com." "192.0.2.2")]})
+
+(def zone-v2
+  {:zone/origin "example.com." :zone/ttl 3600
+   :zone/records [(soa 2024010102)
+                  (a-rr "example.com." "192.0.2.1")
+                  (a-rr "mail.example.com." "192.0.2.3")]})
+
+(defn- allow-all [_] true)
+
+;; ── RFC 1982 serial arithmetic ────────────────────────────────────────────
+
+(deftest serials-live-in-a-wrapping-sequence-space
+  (is (xfr/serial-newer? 2 1))
+  (is (not (xfr/serial-newer? 1 2)))
+  (is (not (xfr/serial-newer? 5 5)) "equal is not newer")
+  (testing "1 is newer than 4294967295 — a plain < comparison says the opposite"
+    (is (xfr/serial-newer? 1 4294967295))
+    (is (not (xfr/serial-newer? 4294967295 1)))
+    (is (< 1 4294967295) "which is exactly the naive comparison that breaks"))
+  (testing "exactly 2^31 apart is undefined (RFC 1982 §3.2), so neither direction wins"
+    (is (not (xfr/serial-newer? xfr/serial-half 0)))
+    (is (not (xfr/serial-newer? 0 xfr/serial-half))))
+  (testing "increment wraps rather than overflowing"
+    (is (= 0 (xfr/serial-increment 4294967295)))))
+
+;; ── AXFR ──────────────────────────────────────────────────────────────────
+
+(deftest axfr-is-framed-by-the-soa-at-both-ends
+  (let [r (xfr/axfr zone-v1 {:allow? allow-all :peer "192.0.2.53"})]
+    (is (= :ok (:status r)))
+    (is (= "SOA" (:zone/type (first (:records r)))))
+    (is (= "SOA" (:zone/type (last (:records r)))))
+    (is (= (first (:records r)) (last (:records r)))
+        "the closing SOA is the only end-of-transfer marker a secondary gets")
+    (is (= 4 (count (:records r)))
+        "SOA, the two non-SOA records, then the SOA again")
+    (is (= 2024010101 (:serial r)))))
+
+(deftest a-transfer-with-no-acl-is-refused-rather-than-defaulting-either-way
+  (is (= :refused (:status (xfr/axfr zone-v1 {:peer "192.0.2.53"})))
+      "permissive leaks the zone; restrictive silently breaks replication")
+  (is (= :refused (:status (xfr/axfr zone-v1 {:allow? (constantly false)
+                                              :peer "203.0.113.9"}))))
+  (testing "the predicate sees both the zone and the peer"
+    (let [seen (atom nil)]
+      (xfr/axfr zone-v1 {:allow? (fn [m] (reset! seen m) true) :peer "192.0.2.53"})
+      (is (= {:zone-origin "example.com." :peer "192.0.2.53"} @seen)))))
+
+(deftest a-zone-without-a-soa-cannot-be-transferred
+  (is (= :servfail (:status (xfr/axfr {:zone/origin "x." :zone/records []}
+                                      {:allow? allow-all})))))
+
+(deftest messages-are-chunked-without-reordering
+  (let [recs (:records (xfr/axfr zone-v1 {:allow? allow-all}))
+        msgs (xfr/split-messages recs 2)]
+    (is (= [2 2] (mapv count msgs)))
+    (is (= recs (vec (apply concat msgs))) "chunking never reorders")
+    (is (= "SOA" (:zone/type (first (first msgs)))))
+    (is (= "SOA" (:zone/type (last (last msgs)))))))
+
+;; ── diff ──────────────────────────────────────────────────────────────────
+
+(deftest the-diff-is-record-level-and-notices-a-ttl-only-change
+  (let [{:keys [deleted added]} (xfr/diff zone-v1 zone-v2)]
+    (is (= #{"www.example.com."} (into #{} (map :zone/name) (remove #(= "SOA" (:zone/type %)) deleted))))
+    (is (= #{"mail.example.com."} (into #{} (map :zone/name) (remove #(= "SOA" (:zone/type %)) added)))))
+  (testing "a TTL change is a real change to a secondary"
+    (let [v1 {:zone/records [(soa 1) (a-rr "a.example.com." "192.0.2.1" 300)]}
+          v2 {:zone/records [(soa 2) (a-rr "a.example.com." "192.0.2.1" 60)]}
+          {:keys [deleted added]} (xfr/diff v1 v2)]
+      (is (= 1 (count (remove #(= "SOA" (:zone/type %)) deleted))))
+      (is (= 1 (count (remove #(= "SOA" (:zone/type %)) added))))))
+  (testing "a case-only change in the owner name is not a change (RFC 4343)"
+    (let [v1 {:zone/records [(soa 1) (a-rr "A.Example.com." "192.0.2.1")]}
+          v2 {:zone/records [(soa 1) (a-rr "a.example.com." "192.0.2.1")]}
+          {:keys [deleted added]} (xfr/diff v1 v2)]
+      (is (empty? deleted))
+      (is (empty? added)))))
+
+;; ── IXFR ──────────────────────────────────────────────────────────────────
+
+(deftest an-up-to-date-client-gets-only-the-soa
+  (let [r (xfr/ixfr zone-v2 {:client-serial 2024010102 :allow? allow-all})]
+    (is (= :up-to-date (:kind r)))
+    (is (= 1 (count (:records r))))))
+
+(deftest a-known-serial-produces-an-incremental-answer
+  (let [r (xfr/ixfr zone-v2 {:client-serial 2024010101
+                             :history {2024010101 zone-v1}
+                             :allow? allow-all})]
+    (is (= :incremental (:kind r)))
+    (is (= 2024010102 (:serial r)))
+    (let [recs (:records r)]
+      (is (= "SOA" (:zone/type (first recs))))
+      (is (= "SOA" (:zone/type (last recs))))
+      (is (= 2024010102 (get-in (first recs) [:zone/rdata :zone/serial])))
+      (testing "the deleted side is introduced by the OLD soa"
+        (is (= 2024010101 (get-in (second recs) [:zone/rdata :zone/serial]))))
+      (is (some #(= "www.example.com." (:zone/name %)) recs))
+      (is (some #(= "mail.example.com." (:zone/name %)) recs)))))
+
+(deftest an-unknown-serial-falls-back-to-a-full-transfer
+  (let [r (xfr/ixfr zone-v2 {:client-serial 1999010101 :history {} :allow? allow-all})]
+    (is (= :ok (:status r)))
+    (is (= :axfr-fallback (:kind r)))
+    (is (= "SOA" (:zone/type (first (:records r)))))
+    (is (= "SOA" (:zone/type (last (:records r)))))
+    (is (> (count (:records r)) 1)
+        "an empty diff here would leave the secondary permanently stale")))
+
+(deftest a-client-claiming-a-newer-serial-gets-the-whole-zone
+  (let [r (xfr/ixfr zone-v1 {:client-serial 2024010102
+                             :history {2024010101 zone-v1}
+                             :allow? allow-all})]
+    (is (= :axfr-fallback (:kind r))
+        "a diff backwards would be a fabrication; let the client replace")))
+
+(deftest ixfr-is-behind-the-same-acl-as-axfr
+  (is (= :refused (:status (xfr/ixfr zone-v2 {:client-serial 1 :peer "203.0.113.9"}))))
+  (is (= :refused (:status (xfr/ixfr zone-v2 {:client-serial 1
+                                              :allow? (constantly false)})))))
+
+(deftest transfer-qtypes-are-recognized
+  (is (xfr/transfer-qtype? "AXFR"))
+  (is (xfr/transfer-qtype? "IXFR"))
+  (is (not (xfr/transfer-qtype? "A"))))

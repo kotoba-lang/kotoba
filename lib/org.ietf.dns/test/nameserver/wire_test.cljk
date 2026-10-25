@@ -1,0 +1,111 @@
+(ns nameserver.wire-test
+  (:require [kotoba.test :refer [deftest is]]
+            [nameserver.wire :as wire]))
+
+(def soa-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "SOA"
+   :zone/rdata {:zone/mname "ns1.example.com." :zone/rname "hostmaster.example.com."
+                :zone/serial 2024010101 :zone/refresh 3600 :zone/retry 900
+                :zone/expire 604800 :zone/minimum 86400}})
+
+(def ns1-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "NS"
+   :zone/rdata {:zone/target "ns1.example.com."}})
+
+(def a-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "A"
+   :zone/rdata {:zone/address "93.184.216.34"}})
+
+(def aaaa-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "AAAA"
+   :zone/rdata {:zone/address "2606:2800:220:1:248:1893:25c8:1946"}})
+
+(def mx-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "MX"
+   :zone/rdata {:zone/pref 10 :zone/exchange "mail.example.com."}})
+
+(def txt-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "TXT"
+   :zone/rdata {:zone/text "dnslink=/ipns/k51qzi5uqu5dgju4x3wsjbedmy1cscg3hz6ozzuu83lu7csnv77nfyeojw2jio"}})
+
+(def srv-record
+  {:zone/name "_sip._tcp.example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "SRV"
+   :zone/rdata {:zone/pri 10 :zone/weight 20 :zone/port 5060 :zone/target "sip.example.com."}})
+
+(def caa-record
+  {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "CAA"
+   :zone/rdata {:zone/flags 0 :zone/tag "issue" :zone/value "letsencrypt.org"}})
+
+(def cname-record
+  {:zone/name "www.example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "CNAME"
+   :zone/rdata {:zone/target "example.com."}})
+
+(defn- roundtrip [msg] (wire/decode-message (wire/encode-message msg)))
+
+(deftest query-roundtrip
+  (let [msg {:dns/id 0x1234 :dns/qr :query :dns/opcode 0
+             :dns/aa? false :dns/tc? false :dns/rd? true :dns/ra? false
+             :dns/rcode :noerror
+             :dns/questions [{:dns/qname "example.com." :dns/qtype "A" :dns/qclass "IN"}]
+             :dns/answers [] :dns/authority [] :dns/additional []}]
+    (is (= msg (roundtrip msg)))))
+
+(deftest response-roundtrip-all-record-types
+  (let [msg {:dns/id 0xBEEF :dns/qr :response :dns/opcode 0
+             :dns/aa? true :dns/tc? false :dns/rd? true :dns/ra? false
+             :dns/rcode :noerror
+             :dns/questions [{:dns/qname "example.com." :dns/qtype "ANY" :dns/qclass "IN"}]
+             :dns/answers [a-record aaaa-record mx-record txt-record srv-record caa-record cname-record]
+             :dns/authority [soa-record]
+             :dns/additional [ns1-record]}]
+    (is (= msg (roundtrip msg)))))
+
+(deftest name-compression-shrinks-repeated-suffixes
+  (let [msg {:dns/id 1 :dns/qr :response :dns/opcode 0
+             :dns/aa? true :dns/tc? false :dns/rd? true :dns/ra? false
+             :dns/rcode :noerror
+             :dns/questions [{:dns/qname "example.com." :dns/qtype "NS" :dns/qclass "IN"}]
+             :dns/answers [ns1-record
+                           {:zone/name "example.com." :zone/ttl 3600 :zone/class "IN" :zone/type "NS"
+                            :zone/rdata {:zone/target "ns2.example.com."}}]
+             :dns/authority [] :dns/additional []}
+        compressed (wire/encode-message msg)
+        naive-lower-bound (+ 12                    ; header
+                              1 7 1 7 1 3 2 2       ; question: "example"."com".root + qtype + qclass
+                              (* 2 (+ 1 7 1 7 1 3 2 2 4 2 1 3 1 7 1 3 1)))] ; two NS RRs uncompressed lower bound (rough)
+    (is (< (count compressed) naive-lower-bound))
+    (is (= msg (roundtrip msg)))))
+
+(deftest malicious-pointer-loop-throws-not-hangs
+  (let [bad (into [0 0 0 0 0 1 0 0 0 0 0 0]  ; header: qdcount=1
+                   [0xC0 12 0 1 0 1           ; question name = pointer to offset 12 (itself) -> infinite loop
+                    ])]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (wire/decode-message bad)))))
+
+(deftest truncated-message-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error) (wire/decode-message [0 0 0 0 0 1 0 0 0 0 0 0 7]))))
+
+(deftest ipv6-canonical-compression
+  (let [addr "2001:db8::1"
+        msg {:dns/id 1 :dns/qr :response :dns/opcode 0 :dns/aa? true :dns/tc? false
+             :dns/rd? true :dns/ra? false :dns/rcode :noerror
+             :dns/questions [] :dns/authority [] :dns/additional []
+             :dns/answers [{:zone/name "h.example.com." :zone/ttl 300 :zone/class "IN" :zone/type "AAAA"
+                            :zone/rdata {:zone/address addr}}]}
+        decoded (roundtrip msg)]
+    (is (= addr (get-in (first (:dns/answers decoded)) [:zone/rdata :zone/address])))))
+
+(deftest unknown-rr-type-decodes-as-opaque-typeN
+  ;; A synthetic OPT(41)-shaped RR: name=root, type=41, class=4096(payload size),
+  ;; ttl=0, rdlength=0 — proves decode never throws on RFC 6891 EDNS0 records
+  ;; even though this library doesn't interpret them (documented non-scope).
+  (let [bytes (into [0 0 0 0 0 0 0 0 0 0 0 1]  ; header: arcount=1
+                     [0                          ; root name
+                      0 41                       ; type OPT=41
+                      16 0                       ; class 4096
+                      0 0 0 0                    ; ttl
+                      0 0])                      ; rdlength 0
+        decoded (wire/decode-message bytes)
+        rr (first (:dns/additional decoded))]
+    (is (= "TYPE41" (:zone/type rr)))
+    (is (= "CLASS4096" (:zone/class rr)))))

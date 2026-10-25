@@ -1,0 +1,113 @@
+(ns nameserver.edns-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [nameserver.edns :as edns]
+            [nameserver.wire :as wire]))
+
+(defn- query-with-opt [& [{:keys [size do? version] :or {size 4096 do? false version 0}}]]
+  {:dns/id 1 :dns/qr :query :dns/opcode 0 :dns/rd? true :dns/rcode :noerror
+   :dns/questions [{:dns/qname "example.com." :dns/qtype "A" :dns/qclass "IN"}]
+   :dns/answers [] :dns/authority []
+   :dns/additional [(assoc (edns/opt-record {:payload-size size :do? do?})
+                           :zone/ttl (bit-or (bit-shift-left version 16)
+                                             (if do? 0x8000 0)))]})
+
+(def plain-query
+  {:dns/id 1 :dns/qr :query :dns/opcode 0 :dns/rd? true :dns/rcode :noerror
+   :dns/questions [{:dns/qname "example.com." :dns/qtype "A" :dns/qclass "IN"}]
+   :dns/answers [] :dns/authority [] :dns/additional []})
+
+(deftest an-opt-rr-survives-a-wire-round-trip
+  (testing "this is what the RFC 3597 generic encoding fix bought — before it, "
+    (testing "a message with an OPT could be decoded and not re-encoded"
+      (let [q (query-with-opt {:size 4096 :do? true})
+            round (-> q wire/encode-message wire/decode-message)]
+        (is (= 1 (count (:dns/additional round))))
+        (let [e (edns/parse round)]
+          (is (= 4096 (:edns/payload-size e)))
+          (is (true? (:edns/do? e)))
+          (is (= 0 (:edns/version e))))))))
+
+(deftest the-class-field-is-a-payload-size-not-a-class
+  (let [rr (edns/opt-record {:payload-size 1232})]
+    (is (= "CLASS1232" (:zone/class rr)))
+    (is (= "." (:zone/name rr)) "RFC 6891 §6.1.2 permits no other owner name")
+    (is (= 1232 (:edns/payload-size
+                 (edns/parse {:dns/additional [rr]}))))))
+
+(deftest an-advertised-size-below-the-floor-is-clamped-up
+  (is (= 512 (:edns/payload-size (edns/parse {:dns/additional [(edns/opt-record {:payload-size 128})]})))
+      "RFC 6891 §6.2.3 — honouring it would make answers smaller than plain DNS guarantees"))
+
+(deftest max-response-size-caps-the-client-against-the-server
+  (is (= 512 (edns/max-response-size plain-query))
+      "no OPT means the RFC 1035 §4.2.1 ceiling")
+  (is (= 1232 (edns/max-response-size (query-with-opt {:size 4096})))
+      "a client asking for 4096 must not be able to make the server fragment")
+  (is (= 4096 (edns/max-response-size (query-with-opt {:size 4096}) {:server-max 4096}))
+      "…unless the operator raised its own limit to meet it")
+  (is (= 4096 (edns/max-response-size (query-with-opt {:size 4096}) {:server-max 8192}))))
+
+(deftest the-do-bit-is-mirrored-not-chosen
+  (is (false? (edns/do? plain-query)))
+  (is (true? (edns/do? (query-with-opt {:do? true}))))
+  (testing "a response carries an OPT only if the query did"
+    (let [resp {:dns/answers [] :dns/additional []}]
+      (is (empty? (:dns/additional (edns/respond resp plain-query))))
+      (is (= 1 (count (:dns/additional (edns/respond resp (query-with-opt {:do? true}))))))
+      (is (true? (:edns/do? (edns/parse (edns/respond resp (query-with-opt {:do? true})))))))))
+
+(deftest more-than-one-opt-is-a-format-error-not-a-first-wins
+  (is (thrown? js/Error
+               (edns/opt-rr {:dns/additional [(edns/opt-record {}) (edns/opt-record {})]}))))
+
+(deftest the-extended-rcode-splits-across-two-places
+  (testing "BADVERS is 16, which does not fit in the header's four bits"
+    (is (= [0 1] (edns/split-rcode 16)))
+    (is (= 16 (apply edns/join-rcode (edns/split-rcode 16))))
+    (is (not= 16 (bit-and 16 0xF))
+        "writing it into the header alone reports a negotiation failure as success"))
+  (doseq [r [0 3 15 16 22 4095]]
+    (is (= r (apply edns/join-rcode (edns/split-rcode r))) (str "rcode " r))))
+
+(deftest an-unsupported-version-gets-badvers-with-an-opt-attached
+  (let [q (query-with-opt {:version 1})]
+    (is (false? (edns/supported-version? q)))
+    (let [r (edns/badvers q 1232)]
+      (is (= 1 (count (:dns/additional r))) "a FORMERR would never tell the client what to try")
+      (is (= 1 (:edns/extended-rcode (edns/parse r))))
+      (is (= 16 (edns/join-rcode 0 (:edns/extended-rcode (edns/parse r))))))))
+
+(deftest options-round-trip-including-ones-we-do-not-model
+  (let [rr (edns/opt-record {:options [{:edns.option/code 10   ; COOKIE
+                                        :edns.option/data [1 2 3 4 5 6 7 8]}
+                                       {:edns.option/code 8    ; ECS
+                                        :edns.option/data [0 1 24 0 192 0 2]}]})
+        parsed (edns/parse {:dns/additional [rr]})]
+    (is (= 2 (count (:edns/options parsed))))
+    (is (= [1 2 3 4 5 6 7 8] (:edns.option/data (first (:edns/options parsed)))))
+    (is (= 8 (:edns.option/code (second (:edns/options parsed)))))
+    (testing "and through the actual wire"
+      (let [round (-> {:dns/id 1 :dns/qr :query :dns/rcode :noerror
+                       :dns/questions [] :dns/answers [] :dns/authority []
+                       :dns/additional [rr]}
+                      wire/encode-message wire/decode-message)]
+        (is (= 2 (count (:edns/options (edns/parse round)))))))))
+
+(deftest truncation-is-measured-not-estimated
+  (let [answers (vec (for [i (range 60)]
+                       {:zone/name (str "host" i ".example.com.") :zone/ttl 300
+                        :zone/class "IN" :zone/type "A"
+                        :zone/rdata {:zone/address (str "192.0.2." (mod i 254))}}))
+        big {:dns/id 1 :dns/qr :response :dns/aa? true :dns/rcode :noerror
+             :dns/questions [{:dns/qname "example.com." :dns/qtype "A" :dns/qclass "IN"}]
+             :dns/answers answers :dns/authority [] :dns/additional []}]
+    (is (> (count (wire/encode-message big)) 512))
+    (let [t (edns/truncate-to big 512)]
+      (is (<= (count (wire/encode-message t)) 512))
+      (is (true? (:dns/tc? t)) "RFC 1035 §4.2.1 — a client not told the answer is partial will use it")
+      (is (< (count (:dns/answers t)) 60)))
+    (testing "a message that already fits is untouched and TC stays clear"
+      (let [small (assoc big :dns/answers (subvec answers 0 2))]
+        (is (= small (edns/truncate-to small 512)))))
+    (testing "EDNS0 is what lets the same answer through in one datagram"
+      (is (= 60 (count (:dns/answers (edns/truncate-to big 4096))))))))

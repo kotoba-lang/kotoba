@@ -135,6 +135,7 @@ The bundled standard libraries live in this repository:
 | `org.oasisOpen.saml` | `org.oasisOpen.saml/src` | `saml.core` (an external specification, publisher oasisOpen.org) |
 | `org.oasisOpen.xmile` | `org.oasisOpen.xmile/src` | `xmile.conformance`, `xmile.execute`, `xmile.expr`, `xmile.model` (an external specification, publisher oasisOpen.org) |
 | `org.iso.std6983` | `org.iso.std6983/src` | `kotoba.cam`, `kotoba.cam.gcode`, `kotoba.cam.stock`, `kotoba.cam.tool` (an external specification, publisher iso.org) |
+| `org.ietf.dns` | `org.ietf.dns/src` | `nameserver.amano`, `nameserver.custom-tld`, `nameserver.delegate`, `nameserver.domain-verification` (an external specification, publisher ietf.org) |
 | `com.microsoft.riff` | `com.microsoft.riff/src` | `riff.bytes`, `riff.core` (Kotoba project library) |
 | `com.pkware.zip` | `com.pkware.zip/src` | `zip.bytes`, `zip.core`, `zip.write` (Kotoba project library) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
