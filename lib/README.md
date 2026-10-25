@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.arxiv` | `kotoba.arxiv/src` | `arxiv-kotoba.dialogue`, `arxiv-kotoba.manifest`, `arxiv-kotoba.ops`, `arxiv-kotoba.policy` (Kotoba project library) |
 | `kotoba.comWise` | `kotoba.comWise/src` | `wise.balances`, `wise.client`, `wise.profiles`, `wise.quotes` (Kotoba project library) |
 | `kotoba.comNvidiaIsaacLab` | `kotoba.comNvidiaIsaacLab/src` | `shugyo`, `shugyo.cartpole`, `shugyo.dr`, `shugyo.ee-reach` (Kotoba project library) |
 | `kotoba.comGmail` | `kotoba.comGmail/src` | `gmail.async-client`, `gmail.async-history`, `gmail.async-threads`, `gmail.attachments` (Kotoba project library) |
