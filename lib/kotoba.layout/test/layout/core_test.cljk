@@ -1,0 +1,368 @@
+(ns layout.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [layout.core :as l]
+            [machine.core :as m]))
+
+(def mach
+  {:format m/format-id
+   :machine/id "fixture"
+   :machine/provenance :measured
+   :machine/source "test fixture"
+   :cpu {:arch :x86-64 :cores 8
+         :simd {:name :avx2 :width-bits 256}
+         :cache [{:level 1 :kind :data :bytes 32768 :line-bytes 64 :ways 8 :shared-by 1}
+                 {:level 2 :kind :unified :bytes 262144 :line-bytes 64 :ways 8 :shared-by 1}]}
+   :page {:base-bytes 4096 :huge [2097152]}})
+
+(def particle
+  [{:name :x :bytes 4 :align 4}
+   {:name :y :bytes 4 :align 4}
+   {:name :z :bytes 4 :align 4}
+   {:name :mass :bytes 8 :align 8}])
+
+(def ragged
+  "Ordered worst-first on purpose: 1-byte flag, then an 8-byte field that must
+  realign, then a 4-byte field."
+  [{:name :flag :bytes 1 :align 1}
+   {:name :mass :bytes 8 :align 8}
+   {:name :x :bytes 4 :align 4}])
+
+(deftest fixture-machine-is-valid
+  (is (m/valid? mach)))
+
+(deftest aos-packs-in-declaration-order
+  (let [p (l/aos mach particle)]
+    (is (= [0 4 8 16] (mapv :offset (:layout/fields p))))
+    (testing "mass realigns to 8, leaving 4 bytes of tail padding"
+      (is (= 24 (:layout/element-bytes p)))
+      (is (= 20 (:layout/payload-bytes p)))
+      (is (= 4 (:layout/padding-bytes p))))
+    (is (l/abi-canonical? p))
+    (is (= :abi-boundary (:layout/scope p)))))
+
+(deftest reordering-squeezes-padding-and-forfeits-the-abi
+  (let [natural (l/aos mach ragged)
+        packed (l/aos mach ragged {:reorder? true})]
+    (is (= 24 (:layout/element-bytes natural)))
+    (is (= 11 (:layout/padding-bytes natural)))
+    (testing "descending alignment: mass, x, flag"
+      (is (= [:mass :x :flag] (mapv :name (:layout/fields packed))))
+      (is (= [0 8 12] (mapv :offset (:layout/fields packed))))
+      (is (= 16 (:layout/element-bytes packed)))
+      (is (= 3 (:layout/padding-bytes packed))))
+    (testing "and that is exactly why it may not cross a component boundary"
+      (is (l/abi-canonical? natural))
+      (is (not (l/abi-canonical? packed)))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (l/abi-guard! packed :lift-record))))))
+
+(deftest reordering-is-stable
+  (testing "ties keep declaration order, so two runs agree"
+    (let [a (l/aos mach particle {:reorder? true})
+          b (l/aos mach particle {:reorder? true})]
+      (is (= (:layout/fields a) (:layout/fields b)))
+      (is (= [:mass :x :y :z] (mapv :name (:layout/fields a)))))))
+
+(deftest soa-is-internal-by-construction
+  (let [p (l/soa mach particle)]
+    (is (= 64 (:layout/align p)))
+    (is (every? #(= 64 (:array-align %)) (:layout/fields p)))
+    (testing "there is no struct for a canonical record lift to point at"
+      (is (not (l/abi-canonical? p)))
+      (is (= :internal-only (:layout/scope p))))
+    (testing "two threads writing the same field of adjacent elements are one
+              field apart, not one struct apart"
+      (is (= 4 (:layout/write-stride-bytes p))))))
+
+(deftest aosoa-block-makes-sub-arrays-whole-lines
+  (testing "64-byte line / 4-byte narrowest field"
+    (is (= 16 (l/default-block mach particle))))
+  (let [p (l/aosoa mach particle)]
+    (is (= 16 (:layout/block p)))
+    (is (= [0 64 128 192] (mapv :block-offset (:layout/fields p))))
+    (is (= [64 64 64 128] (mapv :block-bytes (:layout/fields p))))
+    (is (= 320 (:layout/block-bytes p)))
+    (testing "no padding: every sub-array landed on a line boundary"
+      (is (= 20.0 (:layout/element-bytes p)))
+      (is (= 0.0 (:layout/padding-bytes p))))))
+
+(deftest the-canonical-particle-result
+  (testing "reading only x: AoS drags y, z and mass through every line"
+    (let [n 1024
+          access {:access/fields #{:x} :access/stride 1}
+          a (l/cost mach (l/aos mach particle) n access)
+          s (l/cost mach (l/soa mach particle) n access)
+          h (l/cost mach (l/aosoa mach particle) n access)]
+      (is (= 384 (:cost/lines a)))
+      (is (= 64 (:cost/lines s)))
+      (is (= 64 (:cost/lines h)))
+      (is (= 4096 (:cost/bytes-useful a) (:cost/bytes-useful s)))
+      (testing "one sixth of every AoS line was wanted; all of every SoA line"
+        (is (< 0.16 (:cost/utilization a) 0.17))
+        (is (= 1.0 (:cost/utilization s)))))))
+
+(deftest a-stride-flips-which-regime-applies
+  (let [n 1024
+        access {:access/fields #{:x} :access/stride 4}
+        a (l/cost mach (l/aos mach particle) n access)
+        s (l/cost mach (l/soa mach particle) n access)]
+    (testing "stride 4 x 24 bytes exceeds a line: each touched struct is its own line"
+      (is (= 256 (:cost/lines a)))
+      (is (= 0.0625 (:cost/utilization a))))
+    (testing "stride 4 x 4 bytes does not: the skipped values came in anyway"
+      (is (= 64 (:cost/lines s)))
+      (is (= 0.25 (:cost/utilization s))))))
+
+(deftest lines-for-strided-run-boundaries
+  (testing "dense: the run costs its span"
+    (is (= 16 (l/lines-for-strided-run 1024 1 1 64)))
+    (is (= 64 (l/lines-for-strided-run 1024 4 1 64))))
+  (testing "sparse: each touched item costs a whole line"
+    (is (= 64 (l/lines-for-strided-run 1024 4 16 64)))
+    (is (= 1024 (l/lines-for-strided-run 1024 64 1 64))))
+  (testing "an item wider than a line costs several"
+    (is (= 2 (l/lines-for-strided-run 1 128 1 64))))
+  (is (= 0 (l/lines-for-strided-run 0 4 1 64))))
+
+(deftest the-model-admits-what-it-cannot-separate
+  (testing "no padding + every field touched: AoS and SoA fetch identical bytes"
+    (let [square [{:name :x :bytes 4 :align 4} {:name :y :bytes 4 :align 4}
+                  {:name :z :bytes 4 :align 4} {:name :w :bytes 4 :align 4}]
+          n 1024
+          access {:access/fields #{} :access/stride 1}
+          a (l/cost mach (l/aos mach square) n access)
+          s (l/cost mach (l/soa mach square) n access)]
+      (is (= (:cost/lines a) (:cost/lines s) 256))
+      (is (= 1.0 (:cost/utilization a) (:cost/utilization s)))
+      (testing "and the tie is broken by the thing the line count cannot price"
+        (is (= 1 (:cost/streams a)))
+        (is (= 4 (:cost/streams s)))))))
+
+(deftest recommend-returns-the-losers-too
+  (let [r (l/recommend mach particle 1024 {:access/fields #{:x} :access/stride 1})]
+    (is (= 4 (count (:recommend/ranked r))))
+    (testing "both AoS variants rank last for a single-field scan — reordering
+              cannot help a pass that only wanted one field"
+      (is (= #{:aos :aos-reordered}
+             (set (map :candidate (take-last 2 (:recommend/ranked r)))))))
+    (testing "the winner is one of the field-contiguous layouts"
+      (is (contains? #{:soa :aosoa} (:candidate (:recommend/chosen r))))
+      (is (= 64 (get-in r [:recommend/chosen :cost :cost/lines]))))
+    (testing "the model travels with the answer"
+      (is (= :kotoba.layout.cost/compulsory-lines-v1
+             (get-in r [:recommend/model :model/id])))))
+  (testing "ranking is deterministic across runs"
+    (let [k #(mapv :candidate (:recommend/ranked
+                               (l/recommend mach particle 4096
+                                            {:access/fields #{:x :y}})))]
+      (is (= (k) (k))))))
+
+(deftest false-sharing-needs-more-than-one-writer
+  (let [p (l/aos mach particle)]
+    (is (= :none (:risk (l/false-sharing-risk mach p {:concurrent-writers 1}))))
+    (let [r (l/false-sharing-risk mach p {:concurrent-writers 4})]
+      (is (= :present (:risk r)))
+      (testing "24-byte elements put two-and-a-bit writers on one 64-byte line"
+        (is (= 2 (:writes-per-line r)))
+        (is (= :pad-to-line (:fix r))))))
+  (testing "padding to a line removes it, at a stated footprint cost"
+    (let [padded (l/aos mach particle {:pad-to-line? true})]
+      (is (= 64 (:layout/element-bytes padded)))
+      (is (= 44 (:layout/padding-bytes padded)))
+      (is (= :none (:risk (l/false-sharing-risk mach padded {:concurrent-writers 8}))))
+      (testing "and forfeits the ABI, like every other transformation"
+        (is (not (l/abi-canonical? padded))))))
+  (testing "SoA is judged on field width, so it is at risk where AoS is not"
+    (let [r (l/false-sharing-risk mach (l/soa mach particle) {:concurrent-writers 4})]
+      (is (= :present (:risk r)))
+      (is (= 16 (:writes-per-line r))))))
+
+(deftest an-unprobed-machine-refuses-to-be-planned-against
+  (testing "no invented 64-byte default"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (l/soa m/unknown particle)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (l/cost m/unknown (l/aos mach particle) 10 {})))))
+
+(deftest bad-field-lists-are-rejected
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (l/aos mach [])))
+  (is (some #(= :duplicate-field-name (:error %))
+            (l/field-errors [{:name :x :bytes 4 :align 4} {:name :x :bytes 4 :align 4}])))
+  (is (some #(= :invalid-field-align (:error %))
+            (l/field-errors [{:name :x :bytes 4 :align 3}])))
+  (is (some #(= :invalid-field-bytes (:error %))
+            (l/field-errors [{:name :x :bytes 0 :align 4}]))))
+
+;; ── roofline (calibrated against an Apple M1 Max, 2026-08-03) ─────────────
+
+(def m1max
+  "The measured descriptor `machine-probe` reads off this machine, reduced to
+  what `layout` uses. 128-byte lines, not the 64 of `portable-64`."
+  {:format m/format-id
+   :machine/id "Apple M1 Max/performance"
+   :machine/provenance :measured
+   :machine/source "sysctl -a (Darwin)"
+   :cpu {:arch :aarch64 :cores 8
+         :simd {:name :neon :width-bits 128}
+         :cache [{:level 1 :kind :data :bytes 131072 :line-bytes 128 :shared-by 1}
+                 {:level 2 :kind :unified :bytes 12582912 :line-bytes 128 :shared-by 4}]}
+   :page {:base-bytes 16384 :huge []}})
+
+(def wide
+  "Sixteen f64 fields, one of which the pass reads."
+  (mapv (fn [i] {:name (keyword (str "f" i)) :bytes 8 :align 8}) (range 16)))
+
+(deftest the-roofline-explains-the-measurement-the-byte-model-could-not
+  (let [n 2000000
+        access {:access/fields #{:f0} :access/stride 1}
+        r (l/achievable-ratio m1max
+                              {:baseline (l/aos m1max wide)
+                               :candidate (l/soa m1max wide)
+                               :n n :access access
+                               ;; Both measured on the machine: the SoA arm's
+                               ;; floor was 6.066 ms / 2e6 elements, and one
+                               ;; thread observed 18.5 GB/s on the AoS arm.
+                               :loop-ns-per-element 3.03
+                               :bandwidth-bytes-per-ns 18.5})]
+    (testing "the byte ratio is 16x, exactly as `cost` always said"
+      (is (= 16.0 (:bytes-ratio r))))
+    (testing "but SoA is loop-bound and AoS is memory-bound, so the ratio caps"
+      (is (= :memory (get-in r [:baseline :bound-by])))
+      (is (= :loop (get-in r [:candidate :bound-by])))
+      (is (not (:both-memory-bound? r))))
+    (testing "and the cap lands on the measured 2.28x, within a few percent"
+      (is (< 2.2 (:achievable-ratio r) 2.4)))
+    (testing "the predicted per-arm times match the measured 13.8 ms / 6.07 ms"
+      (is (< 13.5e6 (get-in r [:baseline :time-ns]) 14.2e6))
+      (is (< 5.9e6 (get-in r [:candidate :time-ns]) 6.2e6)))))
+
+(deftest a-slower-loop-would-let-the-full-byte-ratio-through
+  (testing "the bytes ratio is reachable only when both arms are memory-bound;
+            with a cheap enough loop it is"
+    (let [r (l/achievable-ratio m1max
+                                {:baseline (l/aos m1max wide)
+                                 :candidate (l/soa m1max wide)
+                                 :n 2000000
+                                 :access {:access/fields #{:f0} :access/stride 1}
+                                 :loop-ns-per-element 0.05
+                                 :bandwidth-bytes-per-ns 18.5})]
+      (is (:both-memory-bound? r))
+      (is (< 15.9 (:achievable-ratio r) 16.1)))))
+
+;; ── wide elements: the bug the particle fixtures could not show ──────────
+
+(defn- wide-of [w] (mapv (fn [i] {:name (keyword (str "f" i)) :bytes 8 :align 8}) (range w)))
+
+(deftest reading-one-field-of-a-wide-element-pulls-one-line
+  (testing "a 4 KiB element on a 128-byte line: 32 lines per element would be
+            what reading the WHOLE struct costs, and this pass reads one f64"
+    (let [n 65536
+          access {:access/fields #{:f0} :access/stride 1}
+          a (l/cost m1max (l/aos m1max (wide-of 512)) n access)
+          s (l/cost m1max (l/soa m1max (wide-of 512)) n access)]
+      (is (= n (:cost/lines a)) "one line per element, not 32")
+      (is (= 16 (quot (:cost/lines a) (:cost/lines s)))))))
+
+(deftest narrow-elements-are-unchanged-by-the-fix
+  (testing "at or under a line, consecutive elements share lines and the span
+            formula is right — these are the numbers the fix must not move"
+    (let [n 65536
+          access {:access/fields #{:f0} :access/stride 1}]
+      (testing "32-byte element: four per line"
+        (is (= 16384 (:cost/lines (l/cost m1max (l/aos m1max (wide-of 4)) n access)))))
+      (testing "128-byte element: exactly one line each"
+        (is (= 65536 (:cost/lines (l/cost m1max (l/aos m1max (wide-of 16)) n access))))))))
+
+(deftest reading-every-field-of-a-wide-element-still-costs-the-whole-struct
+  (testing "the fix must degrade to the old answer when the pass really does
+            touch all of it"
+    (let [a (l/cost m1max (l/aos m1max (wide-of 512)) 1000
+                    {:access/fields #{} :access/stride 1})]
+      (is (= 32000 (:cost/lines a)) "ceil(4096/128) = 32 lines per element"))))
+
+;; ── the two arms do not share a bandwidth ────────────────────────────────
+
+(def ^:private m1max-curve
+  (assoc m1max :bandwidth
+         {:by-stride {128 6.2 256 6.1 512 7.9 1024 15.2 2048 23.8
+                      4096 15.3 8192 13.7 16384 10.6 32768 10.2}
+          :source "machine.bench/bandwidth-curve, 256 MiB working set"
+          :runtime :jvm}))
+
+(deftest each-arm-walks-a-different-stride
+  (let [access {:access/fields #{:f0} :access/stride 1}]
+    (testing "reading one f64 of a 128-byte AoS element skips 128 bytes a step"
+      (is (= 128 (l/touch-stride-bytes (l/aos m1max (wide-of 16)) access))))
+    (testing "the same field in a SoA walks 8"
+      (is (= 8 (l/touch-stride-bytes (l/soa m1max (wide-of 16)) access))))
+    (testing "and an access stride multiplies both"
+      (is (= 512 (l/touch-stride-bytes (l/aos m1max (wide-of 16))
+                                       (assoc access :access/stride 4)))))))
+
+(deftest the-curve-is-read-at-each-arm-s-own-stride
+  (let [r (l/achievable-ratio m1max-curve
+                              {:baseline (l/aos m1max-curve (wide-of 16))
+                               :candidate (l/soa m1max-curve (wide-of 16))
+                               :n 1000000
+                               :access {:access/fields #{:f0} :access/stride 1}
+                               :loop-ns-per-element 0.8})]
+    (testing "AoS at a 128-byte stride, SoA below the first measured point"
+      (is (= 128 (get-in r [:baseline :stride-bytes])))
+      (is (= 8 (get-in r [:candidate :stride-bytes]))))
+    (testing "so they get different figures off the same curve"
+      (is (= 6.2 (get-in r [:baseline :bandwidth-bytes-per-ns])))
+      (is (= 6.2 (get-in r [:candidate :bandwidth-bytes-per-ns]))))))
+
+(deftest a-wide-element-puts-the-arms-far-apart-on-the-curve
+  (testing "4 KiB elements: the AoS arm lands in the TLB-bound region while the
+            SoA arm is contiguous — 15.3 against 6.2, and sharing one figure
+            is exactly the mistake this wiring removes"
+    (let [r (l/achievable-ratio m1max-curve
+                                {:baseline (l/aos m1max-curve (wide-of 512))
+                                 :candidate (l/soa m1max-curve (wide-of 512))
+                                 :n 100000
+                                 :access {:access/fields #{:f0} :access/stride 1}
+                                 :loop-ns-per-element 0.8})]
+      (is (= 4096 (get-in r [:baseline :stride-bytes])))
+      (is (= 15.3 (get-in r [:baseline :bandwidth-bytes-per-ns])))
+      (is (= 6.2 (get-in r [:candidate :bandwidth-bytes-per-ns])))
+      (is (not= (get-in r [:baseline :bandwidth-bytes-per-ns])
+                (get-in r [:candidate :bandwidth-bytes-per-ns]))))))
+
+(deftest an-explicit-figure-still-wins-and-a-missing-curve-throws
+  (testing "a caller who measured this exact pass knows better than a curve"
+    (let [r (l/achievable-ratio m1max-curve
+                                {:baseline (l/aos m1max-curve (wide-of 16))
+                                 :candidate (l/soa m1max-curve (wide-of 16))
+                                 :n 1000 :access {:access/fields #{:f0}}
+                                 :loop-ns-per-element 0.8
+                                 :bandwidth-bytes-per-ns 30.0})]
+      (is (= 30.0 (get-in r [:baseline :bandwidth-bytes-per-ns])))))
+  (testing "and with neither, it says so rather than defaulting"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (l/achievable-ratio m1max
+                                     {:baseline (l/aos m1max (wide-of 16))
+                                      :candidate (l/soa m1max (wide-of 16))
+                                      :n 1000 :access {:access/fields #{:f0}}
+                                      :loop-ns-per-element 0.8})))))
+
+(deftest every-model-here-names-the-lever-it-bounds
+  (testing "a bound constrains one lever. Two libraries in this stack shipped a
+            floor a planner appeared to beat -- paging's replacement bound
+            against a prefetching cache, ioplan's merge floor against a plan
+            that bridges gaps -- and in both the bound was fine and the
+            comparison was not. Both now report the lever; these do too, so the
+            convention is checked rather than remembered"
+    (doseq [model [l/cost-model l/roofline-model]]
+      (is (= :layout-only (:model/bounds model))
+          (str (:model/id model) " does not say which lever it bounds")))))
+
+(deftest the-roofline-inherits-what-cost-cannot-see
+  (testing "bytes-fetched comes from cost, which counts compulsory lines only,
+            so the roofline ratio is blind to anything that works through reuse.
+            If cost stops disclaiming capacity misses, the roofline must stop
+            too, or the composed model quietly claims more than its input can
+            support"
+    (is (some #{:capacity-misses} (:model/does-not-model l/cost-model)))
+    (is (some #{:capacity-misses} (:model/does-not-model l/roofline-model))
+        "the composed model must inherit the disclosure of the model it consumes")))
