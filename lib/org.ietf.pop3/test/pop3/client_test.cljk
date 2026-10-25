@@ -1,0 +1,169 @@
+(ns pop3.client-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [pop3.client :as client]
+            [pop3.fake-transport :as fake]
+            [pop3.protocol :as p]))
+
+(defn- connected [script]
+  (let [{:keys [transport written]} (fake/make script)]
+    {:session (client/connect! "pop.example.com" {:transport transport})
+     :written written}))
+
+(deftest connect-reads-the-greeting-and-throws-on-a-bad-one
+  (let [{:keys [session]} (connected ["+OK POP3 ready"])]
+    (is (some? (:transport session))))
+  (let [{:keys [transport]} (fake/make ["-ERR maildrop locked"])]
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+         #"greeting"
+         (client/connect! "pop.example.com" {:transport transport})))))
+
+(deftest connect-keeps-the-apop-timestamp-out-of-the-greeting
+  (testing "the greeting is APOP's only advertisement; discarding it is how
+            a client concludes the mechanism is unavailable when it is not"
+    (let [{:keys [session]} (connected
+                             ["+OK ready <1896.697170952@dbc.mtview.ca.us>"])]
+      (is (= "<1896.697170952@dbc.mtview.ca.us>" (:apop-timestamp session))))))
+
+(deftest a-full-session-lists-retrieves-and-quits
+  (let [{:keys [session written]} (connected
+                                   ["+OK ready"
+                                    "+OK user accepted"
+                                    "+OK maildrop has 2 messages"
+                                    "+OK 2 520"
+                                    "+OK scan listing follows"
+                                    "1 120" "2 400" "."
+                                    "+OK unique-id listing follows"
+                                    "1 uid-one" "2 uid-two" "."
+                                    "+OK 120 octets"
+                                    "From: a@example.com" "Subject: hi" "" "body" "."
+                                    "+OK bye"])]
+    (client/login! session "me@example.com" "secret")
+    (is (= {:count 2 :size 520} (client/stat! session)))
+    (testing "LIST and UIDL joined, because neither alone is enough"
+      (is (= [{:number 1 :size 120 :uid "uid-one"}
+              {:number 2 :size 400 :uid "uid-two"}]
+             (client/list-messages! session))))
+    (is (= "From: a@example.com\r\nSubject: hi\r\n\r\nbody"
+           (client/retrieve! session 1)))
+    (is (nil? (client/quit! session)))
+    (is (= :closed (last @written)))))
+
+(deftest retrieve-does-not-delete
+  (testing "POP3's historical default removed the server's only copy as a
+            side effect of reading it, which destroys the mailbox for every
+            other client the account is opened in"
+    (let [{:keys [session written]} (connected
+                                     ["+OK ready" "+OK 4 octets" "body" "."])]
+      (client/retrieve! session 1)
+      (is (not-any? #(str/starts-with? (str %) "DELE") @written)))))
+
+(deftest a-retrieved-message-is-unstuffed
+  (let [{:keys [session]} (connected
+                           ["+OK ready" "+OK octets"
+                            "Subject: s" "" ".signature" "."])]
+    (is (= "Subject: s\r\n\r\n.signature" (client/retrieve! session 1)))))
+
+(deftest a-server-without-uidl-still-lists
+  (testing "UIDL is in RFC 1939's optional-commands section. Reporting an
+            absent :uid is better than failing the listing, and better than
+            silently substituting the session-local number for a stable id"
+    (let [{:keys [session]} (connected
+                             ["+OK ready"
+                              "+OK scan listing follows" "1 120" "."
+                              "-ERR unknown command"])]
+      (is (= [{:number 1 :size 120 :uid nil}] (client/list-messages! session))))))
+
+(deftest capa-absence-is-not-a-failure
+  (testing "a server that does not implement CAPA answers -ERR, which means
+            'this is a plain RFC 1939 server', not 'this session is broken'"
+    (let [{:keys [session]} (connected ["+OK ready" "-ERR unknown command"])
+          with-caps (client/capabilities! session)]
+      (is (= {} (:capabilities with-caps)))
+      (is (= #{} (:sasl-mechanisms with-caps))))))
+
+(deftest capa-is-read-when-it-is-there
+  (let [{:keys [session]} (connected
+                           ["+OK ready" "+OK capability list follows"
+                            "TOP" "UIDL" "SASL PLAIN XOAUTH2" "."])
+        with-caps (client/capabilities! session)]
+    (is (client/supports? with-caps "TOP"))
+    (is (client/supports? with-caps "uidl") "case-insensitive")
+    (is (= #{"PLAIN" "XOAUTH2"} (:sasl-mechanisms with-caps)))))
+
+(deftest top-reads-headers-without-downloading-the-attachments
+  (let [{:keys [session written]} (connected
+                                   ["+OK ready" "+OK top of message follows"
+                                    "Subject: s" "."])]
+    (is (= "Subject: s" (client/top! session 3 0)))
+    (is (= ["TOP 3 0\r\n"] @written))))
+
+(deftest auth-xoauth2-lets-an-oauth-grant-reach-pop3
+  (let [{:keys [session written]} (connected ["+OK ready" "+ " "+OK logged in"])]
+    (client/auth-xoauth2! session "me@example.com" "ya29.token")
+    (is (= "AUTH XOAUTH2\r\n" (first @written)))
+    (is (= (str (p/base64 (p/xoauth2-credentials "me@example.com" "ya29.token"))
+                "\r\n")
+           (second @written)))))
+
+(deftest a-refused-auth-throws-rather-than-continuing
+  (let [{:keys [session]} (connected ["+OK ready" "+ " "-ERR invalid credentials"])]
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+         #"AUTH XOAUTH2 failed"
+         (client/auth-xoauth2! session "me@example.com" "expired")))))
+
+#?(:clj
+(deftest apop-refuses-when-the-greeting-offered-no-timestamp
+  (testing "rather than sending a digest the server will not recognise"
+    (let [{:keys [session]} (connected ["+OK ready"])]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"APOP"
+           (client/apop! session "me" "secret")))))))
+
+#?(:clj
+(deftest apop-sends-the-digest-not-the-password
+  (let [{:keys [session written]} (connected
+                                   ["+OK ready <1896.697170952@dbc.mtview.ca.us>"
+                                    "+OK maildrop has 1 message"])]
+    (client/apop! session "mrose" "tanstaaf")
+    (is (= "APOP mrose c4c9334bac560ecc979e58001b3e22fb\r\n" (first @written)))
+    (is (not-any? #(str/includes? (str %) "tanstaaf") @written)
+        "the whole point of the mechanism"))))
+
+(deftest authenticate-prefers-the-strongest-mechanism-offered
+  (testing "XOAUTH2 when there is a token"
+    (let [{:keys [session written]} (connected ["+OK ready" "+ " "+OK ok"])
+          s (assoc session :sasl-mechanisms #{"PLAIN" "XOAUTH2"})]
+      (client/authenticate! s {:user "me" :access-token "tok"})
+      (is (= "AUTH XOAUTH2\r\n" (first @written)))))
+  (testing "SASL PLAIN over USER/PASS when there is only a password"
+    (let [{:keys [session written]} (connected ["+OK ready" "+ " "+OK ok"])
+          s (assoc session :sasl-mechanisms #{"PLAIN"})]
+      (client/authenticate! s {:user "me" :password "pw"})
+      (is (= "AUTH PLAIN\r\n" (first @written)))))
+  (testing "and USER/PASS when the server offers nothing better"
+    (let [{:keys [session written]} (connected
+                                     ["+OK ready" "+OK user" "+OK pass"])
+          s (assoc session :sasl-mechanisms #{})]
+      (client/authenticate! s {:user "me" :password "pw"})
+      (is (= ["USER me\r\n" "PASS pw\r\n"] @written)))))
+
+(deftest delete-marks-and-rset-takes-it-back
+  (testing "DELE marks; the maildrop is not changed until QUIT enters UPDATE
+            state, and RSET before then is POP3's only undo"
+    (let [{:keys [session written]} (connected
+                                     ["+OK ready" "+OK marked" "+OK unmarked"])]
+      (is (true? (client/delete! session 2)))
+      (client/undelete-all! session)
+      (is (= ["DELE 2\r\n" "RSET\r\n"] @written)))))
+
+(deftest quit-is-sent-because-it-is-what-releases-the-lock
+  (testing "dropping the socket instead leaves the maildrop locked until the
+            server times the session out, and every other client is refused
+            in the meantime"
+    (let [{:keys [session written]} (connected ["+OK ready" "+OK bye"])]
+      (client/quit! session)
+      (is (= ["QUIT\r\n" :closed] @written)))))

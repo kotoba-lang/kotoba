@@ -1,0 +1,475 @@
+;; `kotoba/pop3/session.kotoba` against `pop3.client`.
+;;
+;; The slice is opening a maildrop and listing it: greeting, CAPA, the
+;; strongest authentication the server advertised, STAT, LIST, UIDL, QUIT.
+;; The guest is an application — state in, one reply line in, next state and
+;; one inert effect out — so the oracle and the guest are driven by the SAME
+;; script and compared on what went on the wire, what the drop reported, what
+;; the listing joined to, and what a failure says.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+;;
+;; ## What is compared, and what deliberately is not
+;;
+;; The guest never receives a credential (see the module header): `init` is
+;; told *whether* a password exists, never what it is. So where the oracle
+;; writes `PASS secret\r\n` the guest emits `:credential/pass` and an empty
+;; line. Comparing those literally would assert the very thing this design
+;; removes, so `normalise` maps BOTH sides onto the same tags. It is
+;; deliberately the only place the two effect representations meet, and it
+;; recognises POP3 verbs by an explicit list rather than by a shape — a
+;; regex over "looks like a command" would silently reclassify a base64
+;; payload that happened to start with four capitals.
+;;
+;; ## The negative controls
+;;
+;; Four, because these are the rules a careless port loses while every
+;; in-order happy-path script still passes:
+;;
+;;   * `capa-err-is-not-a-failure` — RFC 2449;
+;;   * `absent-uidl-is-an-absent-uid-not-a-failed-listing` — RFC 1939 §7;
+;;   * `listing-must-join-list-and-uidl-on-the-number` — the join, checked by
+;;     scripting UIDL in a DIFFERENT order from LIST. A port that zips the
+;;     two listings positionally passes every in-order script and is wrong;
+;;   * `a-stuffed-line-loses-exactly-one-dot` — RFC 1939 §3.
+;;
+;; ## JVM
+;;
+;; This runs the guest in-process through the KIR interpreter, which is the
+;; shape `org-ietf-smtp` established and the only oracle-parity route that
+;; exists today. Per Q9 (`:oracle-parity {:jvm-required false …
+;; :jvm-observations :historical-non-gating}`) a JVM run is NOT the JVM-free
+;; evidence for this migration. That evidence is the pair recorded in the
+;; module header and reproducible without a JDK:
+;;
+;;   amu check   kotoba/pop3/session.kotoba --jvm-free            -> :ok true
+;;   amu compile kotoba/pop3/session.kotoba --jvm-free \
+;;     --target wasm32-browser                       -> 12554-byte .wasm
+;;
+;; (Measured 2026-08-30 on amu 88ae83e. An observation of one build, not a
+;; contract — re-measure rather than quoting it.)
+
+(ns pop3.session-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [pop3.client :as client]
+            [pop3.fake-transport :as fake]
+            [pop3.guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "pop3" "session.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'pop3.session (slurp guest-file)}
+                                         'pop3.session
+                                         :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+;; --- the one place the two effect representations meet ---------------------
+
+(def ^:private verbs
+  #{"USER" "PASS" "APOP" "AUTH" "CAPA" "STLS" "STAT" "LIST" "UIDL"
+    "RETR" "TOP" "DELE" "RSET" "NOOP" "QUIT"})
+
+(defn- verb-of [line]
+  (first (str/split (str/trim (str line)) #"\s+")))
+
+(defn- normalise
+  "Both sides' write logs, on one vocabulary.
+
+  Guest side: the mechanism-specific SASL tags collapse to `:credential/sasl`
+  because the oracle's write is opaque base64 and cannot say which mechanism
+  produced it — the mechanism itself is asserted separately, through the
+  `AUTH <mech>` line that precedes it and is compared verbatim."
+  [written]
+  (into []
+        (keep (fn [w]
+                (cond
+                  (= :closed w) nil
+                  (keyword? w) (if (#{:credential/sasl-plain
+                                      :credential/sasl-xoauth2} w)
+                                 :credential/sasl
+                                 w)
+                  (str/starts-with? w "PASS ") :credential/pass
+                  (str/starts-with? w "APOP ") :credential/apop
+                  (contains? verbs (verb-of w)) w
+                  ;; Not a verb: the base64 SASL initial response, which is
+                  ;; the only non-command the oracle writes.
+                  :else :credential/sasl)))
+        written))
+
+;; --- driving the guest -----------------------------------------------------
+
+(def ^:private credential-kinds
+  #{:credential/pass :credential/apop
+    :credential/sasl-plain :credential/sasl-xoauth2})
+
+(defn- ->guest-config
+  "The oracle's config, minus the secrets. This asymmetry is the point."
+  [{:keys [user password access-token uidl? want number]}]
+  (cond-> {:user user
+           :has-password? (some? password)
+           :has-access-token? (some? access-token)}
+    (some? uidl?) (assoc :uidl? uidl?)
+    (some? want) (assoc :want want)
+    (some? number) (assoc :number number)))
+
+(defn- guest-run
+  "Drive the guest with `script`, one reply line per `step`.
+
+  Returns what the host would have written (verbatim lines, and the tag for
+  every credential the guest named but does not hold), the projections, and
+  the final state so a test can call an export on it.
+
+  A script that runs out before the session finishes is EOF, which is what
+  `closed` is for."
+  [config script]
+  (loop [state (call 'init [(->doc (->guest-config config))])
+         lines script
+         written []
+         body []]
+    (let [kind (call 'outgoing-kind [state])
+          out (call 'outgoing [state])
+          written (cond
+                    (credential-kinds kind) (conj written kind)
+                    (seq out) (conj written out)
+                    :else written)
+          phase (call 'phase [state])
+          ;; What a host does with the body channel: open a buffer, append
+          ;; every non-empty line, seal it. The guest holds none of this.
+          body (if (call 'body-line? [state])
+                 (conj body (call 'body-line [state]))
+                 body)
+          done? (contains? #{:done :failed} phase)]
+      (if (or done? (empty? lines))
+        (let [final (if done? state (call 'closed [state]))]
+          {:state final
+           :phase (call 'phase [final])
+           ;; joined the way `pop3.client/retrieve!` joins it
+           :message (str/join "\r\n" body)
+           :body-lines (count body)
+           :body-state (call 'body-state [final])
+           :retrieved (call 'retrieved-bytes [final])
+           :written (normalise written)
+           :error (call 'error-text [final])
+           :apop-timestamp (call 'apop-timestamp [final])
+           :drop {:count (call 'drop-count [final])
+                  :size (call 'drop-size [final])}
+           :messages (mapv (fn [i]
+                             {:number (call 'message-number-at [final i])
+                              :size (call 'message-size-at [final i])
+                              :uid (call 'message-uid-at [final i])})
+                           (range (call 'message-count [final])))})
+        (recur (call 'step [state (first lines)]) (rest lines) written body)))))
+
+;; --- driving the oracle ----------------------------------------------------
+
+(defn- oracle-run
+  "`connect!` + `capabilities!` + `authenticate!` + `stat!` +
+  `list-messages!` + `quit!` against the same script."
+  [{:keys [uidl?] :as config} script]
+  (let [{:keys [transport written]} (fake/make script)]
+    (try
+      (let [session (-> (client/connect! "pop.example.com" {:transport transport})
+                        (client/capabilities!))
+            session (cond-> session (false? uidl?) (assoc :uidl? false))
+            session (client/authenticate! session
+                                          (select-keys config
+                                                       [:user :password
+                                                        :access-token]))
+            drop-status (client/stat! session)
+            messages (client/list-messages! session)]
+        (client/quit! session)
+        {:ok true
+         :written (normalise @written)
+         :drop drop-status
+         ;; The guest has no nil; an absent UID is "" on both sides.
+         :messages (mapv #(update % :uid (fn [u] (or u ""))) messages)})
+      (catch clojure.lang.ExceptionInfo e
+        {:ok false :written (normalise @written) :error (ex-message e)})
+      (catch AssertionError e
+        {:ok false :written (normalise @written) :error (.getMessage e)}))))
+
+;; --- shared fixtures -------------------------------------------------------
+
+(def ^:private with-password
+  {:user "me@example.com" :password "secret"})
+
+(def ^:private no-capa-prefix
+  ["+OK POP3 ready" "-ERR unknown command" "+OK user accepted" "+OK pass accepted"])
+
+;; --- the tests -------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-sasl-plain-listing-session-agrees-with-the-oracle
+  (let [script ["+OK POP3 ready"
+                "+OK capability list follows" "SASL PLAIN XOAUTH2" "UIDL" "TOP" "."
+                "+ "                            ; asks for the initial response
+                "+OK authenticated"
+                "+OK 2 520"
+                "+OK scan listing follows" "1 120" "2 400" "."
+                "+OK unique-id listing follows" "1 uid-one" "2 uid-two" "."
+                "+OK bye"]
+        guest (guest-run with-password script)
+        oracle (oracle-run with-password script)]
+    (testing "the session completed on both sides"
+      (is (= :done (:phase guest)) (:error guest))
+      (is (:ok oracle) (:error oracle)))
+    (testing "the same commands went on the wire, in the same order"
+      (is (= (:written oracle) (:written guest))))
+    (testing "SASL PLAIN was chosen over USER/PASS because CAPA advertised it"
+      (is (some #{"AUTH PLAIN\r\n"} (:written guest)))
+      (is (nil? (some #{:credential/pass} (:written guest)))))
+    (testing "STAT reported the same drop"
+      (is (= (:drop oracle) (:drop guest))))
+    (testing "LIST and UIDL joined to the same listing"
+      (is (= (:messages oracle) (:messages guest))))))
+
+(deftest xoauth2-wins-when-a-token-exists-and-the-server-offers-it
+  (let [config {:user "me@example.com" :password "secret"
+                :access-token "ya29.token"}
+        script ["+OK POP3 ready"
+                "+OK capability list follows" "SASL PLAIN XOAUTH2" "."
+                "+ "
+                "+OK authenticated"
+                "+OK 0 0"
+                "+OK scan listing follows" "."
+                "+OK unique-id listing follows" "."
+                "+OK bye"]
+        guest (guest-run config script)
+        oracle (oracle-run config script)]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (:ok oracle) (:error oracle))
+    (testing "the mechanism is asserted through the AUTH line, compared verbatim"
+      (is (some #{"AUTH XOAUTH2\r\n"} (:written guest)))
+      (is (= (:written oracle) (:written guest))))))
+
+(deftest capa-err-is-not-a-failure
+  (testing "RFC 2449: a server without CAPA is a plain RFC 1939 server, not
+            a session to unwind"
+    (let [script (into no-capa-prefix
+                       ["+OK 1 42"
+                        "+OK scan listing follows" "1 42" "."
+                        "+OK unique-id listing follows" "1 only-uid" "."
+                        "+OK bye"])
+          guest (guest-run with-password script)
+          oracle (oracle-run with-password script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (:ok oracle) (:error oracle))
+      (testing "and it fell back to USER/PASS, not to a failure"
+        (is (= (:written oracle) (:written guest)))
+        (is (some #{:credential/pass} (:written guest))))
+      (is (= [{:number 1 :size 42 :uid "only-uid"}] (:messages guest)))
+      (is (= (:messages oracle) (:messages guest))))))
+
+(deftest absent-uidl-is-an-absent-uid-not-a-failed-listing
+  (testing "RFC 1939 §7 puts UIDL in the optional commands"
+    (let [script (into no-capa-prefix
+                       ["+OK 2 300"
+                        "+OK scan listing follows" "1 100" "2 200" "."
+                        "-ERR UIDL not supported"
+                        "+OK bye"])
+          guest (guest-run with-password script)
+          oracle (oracle-run with-password script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (:ok oracle) (:error oracle))
+      (is (= [{:number 1 :size 100 :uid ""} {:number 2 :size 200 :uid ""}]
+             (:messages guest)))
+      (is (= (:messages oracle) (:messages guest))))))
+
+(deftest listing-must-join-list-and-uidl-on-the-number
+  (testing "a port that zips the two listings positionally passes every
+            in-order script and is still wrong -- UIDL is scripted here in
+            the reverse order"
+    (let [script (into no-capa-prefix
+                       ["+OK 2 300"
+                        "+OK scan listing follows" "1 100" "2 200" "."
+                        "+OK unique-id listing follows" "2 uid-two" "1 uid-one" "."
+                        "+OK bye"])
+          guest (guest-run with-password script)
+          oracle (oracle-run with-password script)]
+      (is (= [{:number 1 :size 100 :uid "uid-one"}
+              {:number 2 :size 200 :uid "uid-two"}]
+             (:messages guest))
+          "message 1 must keep uid-one even though UIDL listed 2 first")
+      (is (= (:messages oracle) (:messages guest))))))
+
+(deftest a-stuffed-line-loses-exactly-one-dot
+  (testing "RFC 1939 §3: a client that does not unstuff corrupts one message
+            in a thousand, and it looks like the sender's fault"
+    (let [script ["+OK POP3 ready"
+                  "+OK capability list follows" "..LEADING-DOT" "UIDL" "."
+                  "+OK user accepted" "+OK pass accepted"
+                  "+OK 0 0"
+                  "+OK scan listing follows" "."
+                  "+OK unique-id listing follows" "."
+                  "+OK bye"]
+          {:keys [state phase error]} (guest-run with-password script)]
+      (is (= :done phase) error)
+      (testing "the capability the guest recorded has one dot"
+        (is (true? (call 'supports? [state ".LEADING-DOT"])))
+        (is (false? (call 'supports? [state "..LEADING-DOT"])))))))
+
+(deftest capability-names-are-case-insensitive
+  (testing "RFC 2449 §5; comparing literally works against one server and
+            not the next"
+    (let [script ["+OK POP3 ready"
+                  "+OK capability list follows" "uidl" "sasl plain" "."
+                  "+ " "+OK authenticated"
+                  "+OK 0 0"
+                  "+OK scan listing follows" "."
+                  "+OK unique-id listing follows" "."
+                  "+OK bye"]
+          {:keys [state phase error written]} (guest-run with-password script)]
+      (is (= :done phase) error)
+      (is (true? (call 'supports? [state "UIDL"])))
+      (is (true? (call 'sasl-plain? [state])))
+      (testing "and a lower-case SASL advertisement still selects PLAIN"
+        (is (some #{"AUTH PLAIN\r\n"} written))))))
+
+(deftest the-greeting-carries-apops-only-advertisement
+  (testing "there is no capability for APOP, so a client that discards the
+            greeting concludes the mechanism is unavailable when it is not"
+    (let [script ["+OK ready <1896.697170952@dbc.mtview.ca.us>"
+                  "-ERR no CAPA here"
+                  "+OK apop accepted"
+                  "+OK 0 0"
+                  "+OK scan listing follows" "."
+                  "+OK unique-id listing follows" "."
+                  "+OK bye"]
+          guest (guest-run with-password script)]
+      (is (= "<1896.697170952@dbc.mtview.ca.us>" (:apop-timestamp guest)))
+      (testing "and having a timestamp is what selects APOP over USER/PASS"
+        (is (some #{:credential/apop} (:written guest)))
+        (is (nil? (some #{:credential/pass} (:written guest)))))
+      (is (= :done (:phase guest)) (:error guest)))))
+
+(deftest a-bad-greeting-fails-with-the-oracles-words
+  (let [script ["-ERR maildrop locked"]
+        guest (guest-run with-password script)
+        oracle (oracle-run with-password script)]
+    (is (= :failed (:phase guest)))
+    (is (= "POP3 greeting was not +OK" (:error guest)))
+    (is (false? (:ok oracle)))
+    (is (str/includes? (:error oracle) "greeting"))))
+
+(deftest eof-mid-response-is-the-hosts-fact-and-the-guests-meaning
+  (let [guest (guest-run with-password ["+OK POP3 ready"])]
+    (is (= :failed (:phase guest)))
+    (is (= "POP3 connection closed mid-response" (:error guest)))))
+
+(deftest no-credential-at-all-is-refused-before-any-is-named
+  (let [guest (guest-run {:user "me@example.com"}
+                         ["+OK POP3 ready" "-ERR no CAPA"])]
+    (is (= :failed (:phase guest)))
+    (is (= "POP3 の認証情報がありません。" (:error guest)))
+    (is (nil? (some credential-kinds (:written guest))))))
+
+;; --- RETR: the message passes through and is never a guest value ----------
+
+(def ^:private retrieve-config
+  (assoc with-password :want :retrieve :number 1))
+
+(deftest a-retrieved-message-matches-the-oracle-byte-for-byte
+  (let [body ["From: a@example.com" "Subject: hi" "" "body line one" "body line two"]
+        script (into no-capa-prefix
+                     (concat ["+OK 1 120" "+OK 120 octets"] body ["." "+OK bye"]))
+        guest (guest-run retrieve-config script)
+        {:keys [transport written]} (fake/make script)]
+    (testing "the guest completed and handed over every line"
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= :closed (:body-state guest)))
+      (is (= (count body) (:retrieved guest))))
+    (testing "and what the host assembled is what the oracle returns"
+      (let [session (-> (client/connect! "pop.example.com" {:transport transport})
+                        (client/capabilities!))
+            session (client/authenticate! session
+                                          (select-keys retrieve-config
+                                                       [:user :password]))
+            _ (client/stat! session)
+            oracle-message (client/retrieve! session 1)]
+        (client/quit! session)
+        (is (= oracle-message (:message guest)))
+        (is (= (normalise @written) (:written guest)))))))
+
+(deftest a-stuffed-body-line-loses-exactly-one-dot-in-a-message
+  (testing "RFC 1939 §3. The CAPA test above covers a capability name; this
+            is the case that actually corrupts mail -- a message line that
+            begins with a period, which is rarer than it sounds and
+            therefore worse."
+    (let [script (into no-capa-prefix
+                       (concat ["+OK 1 40" "+OK 40 octets"]
+                               ["..hidden leading dot" "...two of them" "plain"]
+                               ["." "+OK bye"]))
+          guest (guest-run retrieve-config script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= ".hidden leading dot\r\n..two of them\r\nplain" (:message guest))))))
+
+(deftest a-lone-dot-ends-the-message-and-is-not-part-of-it
+  (let [script (into no-capa-prefix
+                     (concat ["+OK 1 10" "+OK 10 octets"] ["only line"] ["." "+OK bye"]))
+        guest (guest-run retrieve-config script)]
+    (is (= "only line" (:message guest)))
+    (is (= 1 (:retrieved guest)))))
+
+(deftest session-carries-no-message-bytes
+  (testing "the design claim, tested rather than asserted in a comment: a
+            `:document` vector holds 32 items, so a guest that accumulated
+            the message traps `document-vector-too-large` on the 33rd line.
+            Verified by making it accumulate and watching exactly this test
+            fail with exactly that trap -- and nothing else fail. It
+            finishes because nothing in the guest keeps a line."
+    (let [line (apply str (repeat 200 "x"))
+          body (vec (repeat 2000 line))
+          bytes (* (count body) (count line))
+          script (into no-capa-prefix
+                       (concat ["+OK 1 400000" "+OK 400000 octets"] body ["." "+OK bye"]))
+          guest (guest-run retrieve-config script)]
+      (is (< 32 (count body)) "the control is only meaningful past :container-items")
+      (is (< 65536 bytes) "and past the aggregate byte bound too")
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= 2000 (:retrieved guest)))
+      (is (= (* 2000 200) (count (str/replace (:message guest) "\r\n" ""))))
+      (testing "and the guest's own answer about it is one integer"
+        (is (= 2000 (call 'retrieved-bytes [(:state guest)])))))))
+
+(deftest a-refused-retr-does-not-wait-for-a-terminator
+  (testing "RFC 1939 §3 sends the body only on success; reading for a
+            terminator after -ERR waits for a line that is never coming"
+    (let [script (into no-capa-prefix
+                       ["+OK 1 120" "-ERR no such message"])
+          guest (guest-run retrieve-config script)]
+      (is (= :failed (:phase guest)))
+      (is (= "POP3 RETR failed: no such message" (:error guest)))
+      (is (= :none (:body-state guest))))))
+
+(deftest retrieve-puts-the-number-on-the-wire
+  (testing "there is no integer-to-string builtin; the digits come out of a
+            literal, so a multi-digit number is the case that catches it"
+    (let [script (into no-capa-prefix
+                       (concat ["+OK 42 120" "+OK 120 octets"] ["x"] ["." "+OK bye"]))
+          guest (guest-run (assoc retrieve-config :number 137) script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (some #{"RETR 137\r\n"} (:written guest))))))
+
+(deftest an-empty-body-line-is-a-line
+  (testing "RFC 2822 separates headers from body with an empty line. The
+            first version of this channel signalled \"no line this step\" by
+            returning \"\", which merged the headers into the body of every
+            message; the parity test caught it on its first run. `body-line?`
+            is why that cannot recur -- the emptiness of the string does not
+            carry the answer."
+    (let [body ["Subject: hi" "" "" "two blank lines above"]
+          script (into no-capa-prefix
+                       (concat ["+OK 1 40" "+OK 40 octets"] body ["." "+OK bye"]))
+          guest (guest-run retrieve-config script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= 4 (:retrieved guest)) "all four lines, blanks included")
+      (is (= "Subject: hi\r\n\r\n\r\ntwo blank lines above" (:message guest))))))
