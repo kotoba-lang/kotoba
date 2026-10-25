@@ -108,6 +108,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.epp` | `org.ietf.epp/src` | `epp.command`, `epp.response`, `epp.server`, `epp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.imap` | `org.ietf.imap/src` | `imap.client`, `imap.protocol`, `imap.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.pop3` | `org.ietf.pop3/src` | `pop3.client`, `pop3.protocol`, `pop3.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.rdap` | `org.ietf.rdap/src` | `rdap.jcard`, `rdap.response`, `rdap.service`, `rdap.status` (an external specification, publisher ietf.org) |
 | `kotoba.nostr` | `kotoba.nostr/src` | `nostr.blossom`, `nostr.crypto`, `nostr.event`, `nostr.http` (Kotoba project library) |
 | `kotoba.mokurokuUi` | `kotoba.mokurokuUi/src` | `mokuroku-ui.core` (Kotoba project library) |
 | `kotoba.traversal` | `kotoba.traversal/src` | `traversal.core` (Kotoba project library) |

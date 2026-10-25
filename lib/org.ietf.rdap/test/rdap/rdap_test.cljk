@@ -1,0 +1,271 @@
+(ns rdap.rdap-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [json.core :as json]
+            [rdap.jcard :as jcard]
+            [rdap.response :as res]
+            [rdap.service :as service]
+            [rdap.status :as status]
+            [rdap.whois :as whois]
+            [srs.core :as srs]
+            [srs.time :as t]))
+
+(def t0 (t/civil->ms {:year 2024 :month 1 :day 15 :ms-of-day 0}))
+(defn d+ [n] (t/plus-days t0 n))
+(def opts {:base "https://rdap.example/rdap" :tos-url "https://example/tos"
+           :registrar-name "Example Registrar, Inc."})
+
+(def registry
+  (-> (srs/empty-registry "com")
+      (srs/execute {:command/kind :domain/create :command/name "example.com"
+                    :command/registrar "reg-a" :registrant "alice" :years 2
+                    :nameservers ["ns1.example.net" "ns2.example.net"]
+                    :auth-info "hunter2"}
+                   t0)
+      :registry))
+
+(defn- info [nm at] (srs/info registry nm at))
+
+;; ── RFC 8056 status mapping ───────────────────────────────────────────────
+
+(deftest ok-becomes-active-not-ok
+  (is (= ["active"] (status/project #{:ok})))
+  (is (not (contains? (set (status/project #{:ok})) "ok"))
+      "RDAP has no `ok`; a client checking for it would find no status at all"))
+
+(deftest rgp-statuses-survive-the-mapping
+  (testing "a redeemable name is distinguishable from one past rescue"
+    (is (= ["pending delete" "redemption period"]
+           (status/project #{:pendingDelete :redemptionPeriod})))
+    (is (= ["pending delete"] (status/project #{:pendingDelete})))))
+
+(deftest the-mapping-is-space-separated-lowercase
+  (is (= ["client transfer prohibited"] (status/project #{:clientTransferProhibited})))
+  (is (= ["server hold"] (status/project #{:serverHold}))))
+
+(deftest an-unknown-status-is-dropped-rather-than-invented
+  (is (= ["active"] (status/project #{:ok :someVendorExtension})))
+  (testing "the mechanical fallback exists but project does not use it"
+    (is (= "some vendor extension" (status/camel->rdap :someVendorExtension)))))
+
+(deftest the-projection-is-sorted-so-the-same-state-is-the-same-bytes
+  (is (= (status/project #{:clientHold :serverHold :inactive})
+         (status/project #{:serverHold :inactive :clientHold}))))
+
+(deftest statuses-round-trip-where-the-mapping-is-one-to-one
+  (doseq [s [:clientHold :serverDeleteProhibited :redemptionPeriod :pendingTransfer]]
+    (is (= s (status/parse (first (status/project #{s})))) (str s))))
+
+;; ── jCard ─────────────────────────────────────────────────────────────────
+
+(deftest jcard-has-the-shape-parsers-expect
+  (let [v (jcard/vcard {:name "Alice" :org "Acme" :email "a@example.com"
+                        :phone "+1.5551234"})]
+    (is (= "vcard" (first v)))
+    (is (vector? (second v)))
+    (testing "version is first and is 4.0 — a jCard without it is rejected whole"
+      (is (= ["version" {} "text" "4.0"] (first (second v)))))
+    (testing "every property is four elements"
+      (is (every? #(= 4 (count %)) (second v))))
+    (is (= "Alice" (jcard/value-of v "fn")))
+    (is (= "tel:+1.5551234" (jcard/value-of v "tel"))))
+  (testing "absent properties are omitted, not emitted empty"
+    (let [v (jcard/vcard {:name "Alice"})]
+      (is (nil? (jcard/value-of v "email"))))))
+
+(deftest adr-is-seven-elements-in-a-fixed-order
+  (let [a (jcard/adr {:street "1 Main St" :locality "Tokyo" :country "JP"})]
+    (is (= 7 (count a)))
+    (is (= "1 Main St" (nth a 2)))
+    (is (= "Tokyo" (nth a 3)))
+    (is (= "JP" (nth a 6)) "country is last; a short array relabels it")
+    (is (= ["" "" "1 Main St" "Tokyo" "" "" "JP"] a))))
+
+;; ── domain object ─────────────────────────────────────────────────────────
+
+(deftest a-domain-object-carries-dates-only-as-events
+  (let [d (res/domain (info "example.com" (d+ 1)) opts)
+        events (into {} (map (juxt #(get % "eventAction") #(get % "eventDate")))
+                     (get d "events"))]
+    (is (= "domain" (get d "objectClassName")))
+    (is (= "example.com" (get d "ldhName")))
+    (is (= (t/iso8601 t0) (get events "registration")))
+    (is (= (t/iso8601 (t/plus-years t0 2)) (get events "expiration")))
+    (is (nil? (get d "expires")) "RDAP has no `expires` member — dates are events")
+    (testing "eventAction values are the registered ones"
+      (is (contains? events "registration"))
+      (is (not (contains? events "registered"))))))
+
+(deftest nested-objects-do-not-repeat-the-conformance-array
+  (let [top (res/top-level (res/domain (info "example.com" (d+ 1)) opts) opts)]
+    (is (= res/conformance (get top "rdapConformance")))
+    (doseq [e (get top "entities")]
+      (is (nil? (get e "rdapConformance"))
+          "RFC 9083 §4.1: rdapConformance belongs only at the top level"))
+    (doseq [n (get top "nameservers")]
+      (is (nil? (get n "rdapConformance"))))))
+
+(deftest a-registrant-is-present-but-redacted
+  (let [d (res/domain (info "example.com" (d+ 1)) opts)
+        reg (first (filter #(= ["registrant"] (get % "roles")) (get d "entities")))]
+    (is (some? reg) "omitting the entity would say there is no registrant")
+    (is (= "alice" (get reg "handle")))
+    (is (nil? (get reg "vcardArray")) "contact detail is withheld, not blank")))
+
+(deftest an-out-of-zone-nameserver-carries-no-ipaddresses-member
+  (let [d (res/domain (info "example.com" (d+ 1)) opts)
+        ns1 (first (get d "nameservers"))]
+    (is (= "nameserver" (get ns1 "objectClassName")))
+    (is (= "ns1.example.net" (get ns1 "ldhName")))
+    (is (not (contains? ns1 "ipAddresses"))
+        "an empty ipAddresses asserts it has none, rather than that we do not know")))
+
+(deftest unicode-name-appears-only-for-an-idn
+  (let [ascii (res/domain (info "example.com" (d+ 1)) opts)]
+    (is (not (contains? ascii "unicodeName"))))
+  (let [idn (res/domain (info "example.com" (d+ 1))
+                        (assoc opts :unicode-name "日本.com"))]
+    (is (= "日本.com" (get idn "unicodeName")))))
+
+(deftest the-whole-response-serializes-to-json
+  (let [body (res/top-level (res/domain (info "example.com" (d+ 1)) opts) opts)
+        s (json/encode body)]
+    (is (str/includes? s "\"objectClassName\":\"domain\""))
+    (is (= body (json/decode s)) "round-trips through kotoba-lang/json")))
+
+;; ── service dispatch ──────────────────────────────────────────────────────
+
+(deftest a-lookup-answers-200-with-the-rdap-content-type
+  (let [r (service/handle registry :get "/domain/example.com" (d+ 1) opts)]
+    (is (= 200 (:status r)))
+    (is (= "application/rdap+json" (get-in r [:headers "Content-Type"]))
+        "not application/json — clients content-negotiate on it")
+    (is (= "*" (get-in r [:headers "Access-Control-Allow-Origin"])))
+    (is (= "example.com" (get-in r [:body "ldhName"])))))
+
+(deftest a-missing-name-is-404-and-the-body-agrees-with-the-status
+  (let [r (service/handle registry :get "/domain/nope.com" (d+ 1) opts)]
+    (is (= 404 (:status r)))
+    (is (= 404 (get-in r [:body "errorCode"]))
+        "two places to say the same thing means two places to disagree")))
+
+(deftest a-malformed-name-is-400-not-404
+  (doseq [bad ["-bad.com" "no-dot" "bad-.com" "a..b.com"]]
+    (is (= 400 (:status (service/handle registry :get (str "/domain/" bad) (d+ 1) opts)))
+        (str bad " should be a client error, not a free name"))))
+
+(deftest search-is-refused-explicitly-rather-than-silently-empty
+  (let [r (service/handle registry :get "/domains?name=exam*" (d+ 1) opts)]
+    (is (= 501 (:status r)))
+    (is (str/includes? (str (get-in r [:body "description"])) "Search"))))
+
+(deftest object-classes-this-registry-does-not-serve-say-so
+  (is (= 501 (:status (service/handle registry :get "/nameserver/ns1.example.net" (d+ 1) opts))))
+  (is (= 501 (:status (service/handle registry :get "/entity/alice" (d+ 1) opts))))
+  (is (= 400 (:status (service/handle registry :get "/frobnicate/x" (d+ 1) opts)))))
+
+(deftest help-is-served-and-carries-the-notices
+  (let [r (service/handle registry :get "/help" (d+ 1) opts)]
+    (is (= 200 (:status r)))
+    (is (seq (get-in r [:body "notices"])))
+    (is (some #(= "Terms of Service" (get % "title")) (get-in r [:body "notices"])))))
+
+(deftest writes-are-refused
+  (is (= 405 (:status (service/handle registry :post "/domain/example.com" (d+ 1) opts)))))
+
+(deftest a-purged-name-is-gone
+  (let [r2 (-> registry
+               (srs/execute {:command/kind :domain/delete :command/name "example.com"
+                             :command/registrar "reg-a"} (d+ 3))
+               :registry)]
+    (is (= 404 (:status (service/handle r2 :get "/domain/example.com" (d+ 4) opts))))))
+
+;; ── WHOIS ─────────────────────────────────────────────────────────────────
+
+(deftest whois-emits-the-labels-registrar-parsers-match-on
+  (let [txt (whois/domain (info "example.com" (d+ 1))
+                          (assoc opts :now (d+ 1) :whois-server "whois.example"))]
+    (is (str/includes? txt "Domain Name: EXAMPLE.COM"))
+    (is (str/includes? txt "Creation Date: 2024-01-15T00:00:00Z"))
+    (is (str/includes? txt "Registry Expiry Date: 2026-01-15T00:00:00Z"))
+    (is (str/includes? txt "Name Server: NS1.EXAMPLE.NET"))
+    (testing "lines are CRLF-separated, as port-43 clients expect"
+      (is (str/includes? txt "\r\n")))))
+
+(deftest whois-keeps-the-epp-spelling-where-rdap-does-not
+  (let [d (info "example.com" (d+ 1))
+        txt (whois/domain d opts)]
+    (is (str/includes? txt "Domain Status: addPeriod https://icann.org/epp#addPeriod")
+        "registrar parsers match the camelCase EPP name plus the ICANN URL")
+    (is (= ["add period"] (status/project (:domain/statuses d)))
+        "while RDAP gets the RFC 8056 form for the same state")))
+
+(deftest whois-and-rdap-read-the-same-projection
+  (let [d (info "example.com" (d+ 1))]
+    (is (= (mapv #(str/replace % #" https.*" "") (service/domain-status-lines d))
+           (mapv name (sort (:domain/statuses d))))
+        "both surfaces render from srs.core/info, so they cannot disagree")))
+
+(deftest whois-redacts-rather-than-blanking
+  (let [txt (whois/domain (info "example.com" (d+ 1)) opts)]
+    (is (str/includes? txt "Registrant Name: REDACTED FOR PRIVACY"))
+    (is (not (str/includes? txt "alice")))
+    (is (not (str/includes? txt "hunter2")) "the transfer secret must never appear")))
+
+(deftest whois-not-found-uses-the-wording-clients-match-on
+  (is (str/includes? (whois/not-found "free.com") "No match for \"FREE.COM\"")))
+
+(deftest whois-refuses-query-flags-rather-than-guessing
+  (let [lookup #(info % (d+ 1))]
+    (is (str/includes? (whois/respond "example.com" lookup opts) "Domain Name: EXAMPLE.COM"))
+    (is (str/includes? (whois/respond "  EXAMPLE.COM \r\n" lookup opts) "Domain Name: EXAMPLE.COM"))
+    (is (str/includes? (whois/respond "-T dn example.com" lookup opts) "not supported"))
+    (is (str/includes? (whois/respond "free.com" lookup opts) "No match"))))
+
+;; ── nameserver objects ────────────────────────────────────────────────────
+
+(def in-zone-host
+  {:host/name "ns1.example.com" :host/zone "example.com" :host/registrar "reg-a"
+   :host/addresses ["192.0.2.1" "2001:db8::1"] :host/statuses #{:linked}
+   :host/created-at t0 :host/updated-at t0})
+
+(def out-of-zone-host
+  {:host/name "ns1.example.net" :host/zone "example.com" :host/registrar "reg-a"
+   :host/addresses [] :host/statuses #{:ok}
+   :host/created-at t0 :host/updated-at t0})
+
+(deftest a-nameserver-object-splits-addresses-by-family
+  (let [n (res/nameserver-object in-zone-host opts)]
+    (is (= "nameserver" (get n "objectClassName")))
+    (is (= "ns1.example.com" (get n "ldhName")))
+    (is (= ["192.0.2.1"] (get-in n ["ipAddresses" "v4"])))
+    (is (= ["2001:db8::1"] (get-in n ["ipAddresses" "v6"])))))
+
+(deftest an-out-of-zone-nameserver-has-no-ipaddresses-member-at-all
+  (let [n (res/nameserver-object out-of-zone-host opts)]
+    (is (not (contains? n "ipAddresses"))
+        "an empty object would assert it has no addresses, rather than that the registry is not authoritative for it")))
+
+(deftest the-linked-status-reaches-rdap-through-the-same-projection
+  (is (= ["associated"] (status/project #{:linked})))
+  (is (= ["associated"] (get (res/nameserver-object in-zone-host opts) "status")))
+  (testing "and the list of linked domains is never published"
+    (is (not (contains? (res/nameserver-object in-zone-host opts) "linkedDomains")))
+    (is (nil? (get (res/nameserver-object in-zone-host opts) "domains")))))
+
+(deftest nameserver-lookup-is-served-when-hosts-are-available
+  (let [hosts {"ns1.example.com" in-zone-host}
+        o (assoc opts :host-lookup #(get hosts %))]
+    (let [r (service/handle registry :get "/nameserver/ns1.example.com" (d+ 1) o)]
+      (is (= 200 (:status r)))
+      (is (= "ns1.example.com" (get-in r [:body "ldhName"])))
+      (is (= res/conformance (get-in r [:body "rdapConformance"]))))
+    (testing "and a name it does not have is 404, not 501"
+      (is (= 404 (:status (service/handle registry :get "/nameserver/nope.example.com" (d+ 1) o)))))
+    (testing "while a malformed one is 400"
+      (is (= 400 (:status (service/handle registry :get "/nameserver/-bad" (d+ 1) o)))))))
+
+(deftest without-a-host-lookup-it-is-still-501-rather-than-a-lie
+  (let [r (service/handle registry :get "/nameserver/ns1.example.com" (d+ 1) opts)]
+    (is (= 501 (:status r))
+        "a deployment storing nameservers as strings has nothing to answer with; 404 would be a lie for a name that plainly exists in the zone")))
