@@ -1,0 +1,183 @@
+(ns kotobase.pg.sql-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.store :as st]
+            [kotobase.pg.sql :as sql]))
+
+(def ^:private everything (constantly true))
+
+(defn- fixture-store
+  "Mirrors kotobase-query's own bridge_test.cljc fixture shape -- a
+  realistic small dataset: `users` (several docs, one with no
+  `:dept-key` at all) and `departments` (unused directly by this v0.1
+  single-table SQL subset, but present to prove FROM correctly scopes
+  to only the named collection even when the store has more than one)."
+  []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :dept-key "d1" :age 41})
+    (st/-put s "users" "u2" {:name "Bob" :role "user" :dept-key "d2" :age 27})
+    (st/-put s "users" "u3" {:name "Carol" :role "admin" :dept-key "d1" :age 35})
+    (st/-put s "users" "u4" {:name "Dave" :role "user"}) ; no dept-key, no age
+    (st/-put s "departments" "d1" {:name "Engineering" :budget 900000})
+    (st/-put s "departments" "d2" {:name "Sales" :budget 400000})
+    s))
+
+;; ---------------------------------------------------------------- tokenize
+
+(deftest tokenize-basic-statement
+  (is (= [{:type :keyword :text "SELECT" :val "select"}
+          {:type :ident :text "name" :val "name"}
+          {:type :punct :text "," :val ","}
+          {:type :ident :text "role" :val "role"}
+          {:type :keyword :text "FROM" :val "from"}
+          {:type :ident :text "users" :val "users"}]
+         (sql/tokenize "SELECT name, role FROM users"))))
+
+(deftest tokenize-string-literal-with-escaped-quote
+  (is (= "O'Brien" (:val (first (sql/tokenize "'O''Brien'"))))))
+
+(deftest tokenize-rejects-unrecognized-character
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                         #"unexpected character"
+                         (sql/tokenize "SELECT name FROM users WHERE role $ 'admin'"))))
+
+;; -------------------------------------------------------------------- parse
+
+(deftest parse-select-with-where
+  (is (= {:select ["name" "role"] :from "users" :where {:col "role" :val "admin"}}
+         (sql/parse "SELECT name, role FROM users WHERE role = 'admin'"))))
+
+(deftest parse-select-without-where
+  (is (= {:select ["name"] :from "users" :where nil}
+         (sql/parse "SELECT name FROM users"))))
+
+(deftest parse-is-case-insensitive-on-keywords-only
+  (testing "SELECT/FROM/WHERE keywords are case-insensitive; identifiers keep their case"
+    (is (= {:select ["Name"] :from "Users" :where {:col "Role" :val "admin"}}
+           (sql/parse "select Name from Users where Role = 'admin'")))))
+
+(deftest parse-numeric-and-boolean-and-null-literals
+  (is (= 41 (:val (:where (sql/parse "SELECT name FROM users WHERE age = 41")))))
+  (is (= true (:val (:where (sql/parse "SELECT name FROM users WHERE active = TRUE")))))
+  (is (= false (:val (:where (sql/parse "SELECT name FROM users WHERE active = false")))))
+  (is (= nil (:val (:where (sql/parse "SELECT name FROM users WHERE dept_key = NULL"))))))
+
+(deftest parse-trailing-semicolon-is-ignored
+  (is (= {:select ["name"] :from "users" :where nil}
+         (sql/parse "SELECT name FROM users;"))))
+
+(deftest parse-rejects-empty-statement
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (sql/parse "")))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (sql/parse "   "))))
+
+(deftest parse-rejects-non-select-statements
+  (doseq [stmt ["INSERT INTO users (name) VALUES ('Eve')"
+                "UPDATE users SET role = 'admin' WHERE name = 'Bob'"
+                "DELETE FROM users WHERE name = 'Bob'"
+                "CREATE TABLE users (name text)"]]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                           #"must start with SELECT"
+                           (sql/parse stmt))
+        stmt)))
+
+;; --------------------------------------------------- out-of-scope rejections
+
+(defn- rejects? [sql feature]
+  (try
+    (sql/parse sql)
+    false
+    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+      (= feature (:feature (ex-data e))))))
+
+(deftest rejects-select-star
+  (is (rejects? "SELECT * FROM users" :select-star)))
+
+(deftest rejects-aggregate-functions
+  (is (rejects? "SELECT COUNT(*) FROM users" :aggregate-or-function))
+  (is (rejects? "SELECT SUM(age) FROM users" :aggregate-or-function))
+  (is (rejects? "SELECT name, MAX(age) FROM users" :aggregate-or-function)))
+
+(deftest rejects-joins
+  (testing "qualified `alias.col` identifiers aren't part of this v0.1 grammar at all (no `.` token) --
+    this specific query is exercised for its bare-JOIN-keyword rejection, not qualified-name support"
+    (is (rejects? "SELECT name FROM users JOIN departments" :join)))
+  (is (rejects? "SELECT name FROM users, departments" :join))
+  (is (rejects? "SELECT name FROM users LEFT JOIN departments" :join)))
+
+(deftest rejects-subqueries
+  (is (rejects? "SELECT name FROM (SELECT name FROM users)" :subquery)))
+
+(deftest rejects-order-by-group-by-limit
+  (is (rejects? "SELECT name FROM users ORDER BY name" :order-by))
+  (is (rejects? "SELECT name FROM users GROUP BY role" :group-by))
+  (is (rejects? "SELECT name FROM users LIMIT 10" :limit)))
+
+(deftest rejects-compound-where
+  (is (rejects? "SELECT name FROM users WHERE role = 'admin' AND age = 41" :compound-where))
+  (is (rejects? "SELECT name FROM users WHERE role = 'admin' OR role = 'user'" :compound-where)))
+
+(deftest rejects-non-equality-comparison-operators
+  (is (rejects? "SELECT name FROM users WHERE age > 30" :comparison-operator))
+  (is (rejects? "SELECT name FROM users WHERE age <> 30" :comparison-operator))
+  (is (rejects? "SELECT name FROM users WHERE age >= 30" :comparison-operator)))
+
+(deftest rejects-distinct
+  (is (rejects? "SELECT DISTINCT role FROM users" :distinct)))
+
+;; ----------------------------------------------------------------- ->datalog
+
+(deftest translate-produces-expected-datalog-shape
+  (is (= '{:find [?name ?role]
+           :where [[?e :kotobase/coll "users"]
+                   [?e :role "admin"]
+                   [?e :name ?name]
+                   [?e :role ?role]]}
+         (sql/->datalog (sql/parse "SELECT name, role FROM users WHERE role = 'admin'")))))
+
+(deftest translate-without-where-omits-filter-clause
+  (is (= '{:find [?name]
+           :where [[?e :kotobase/coll "users"]
+                   [?e :name ?name]]}
+         (sql/->datalog (sql/parse "SELECT name FROM users")))))
+
+;; ------------------------------------------------------------------ execute
+
+(deftest execute-select-with-equality-filter
+  (let [result (sql/execute (fixture-store) "SELECT name, role FROM users WHERE role = 'admin'" everything)]
+    (is (= ["name" "role"] (:columns result)))
+    (is (= #{["Alice" "admin"] ["Carol" "admin"]} (set (:rows result))))))
+
+(deftest execute-select-without-where-returns-every-row-with-that-column
+  (testing "Dave has no :dept-key, but does have :name -- SELECT name (no WHERE) still includes him"
+    (let [result (sql/execute (fixture-store) "SELECT name FROM users" everything)]
+      (is (= #{["Alice"] ["Bob"] ["Carol"] ["Dave"]} (set (:rows result)))))))
+
+(deftest execute-select-column-missing-on-some-rows-drops-them
+  (testing "Dave (no :dept-key) and Bob (no :age... wait he has age) -- age example: Dave has no :age at all"
+    (let [result (sql/execute (fixture-store) "SELECT name, age FROM users" everything)]
+      (is (= #{["Alice" 41] ["Bob" 27] ["Carol" 35]} (set (:rows result))))
+      (is (not (some #(= "Dave" (first %)) (:rows result)))
+          "Dave has no :age attribute at all, so he drops out of a query selecting age"))))
+
+(deftest execute-scopes-strictly-to-the-named-collection
+  (testing "querying `users` never returns departments rows even though both are in the same store"
+    (let [result (sql/execute (fixture-store) "SELECT name FROM users" everything)]
+      (is (every? #(#{"Alice" "Bob" "Carol" "Dave"} (first %)) (:rows result))))))
+
+(deftest execute-numeric-equality-filter
+  (let [result (sql/execute (fixture-store) "SELECT name FROM users WHERE age = 41" everything)]
+    (is (= #{["Alice"]} (set (:rows result))))))
+
+(deftest execute-no-matching-rows-returns-empty
+  (let [result (sql/execute (fixture-store) "SELECT name FROM users WHERE role = 'nonexistent'" everything)]
+    (is (= [] (:rows result)))))
+
+(deftest execute-respects-visible-predicate
+  (let [no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+        result (sql/execute (fixture-store) "SELECT name FROM users" no-bob?)]
+    (is (not (contains? (set (:rows result)) ["Bob"])))
+    (is (contains? (set (:rows result)) ["Alice"]))))
+
+(deftest execute-throws-on-out-of-scope-sql-rather-than-mis-executing
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+               (sql/execute (fixture-store) "SELECT COUNT(*) FROM users" everything))))

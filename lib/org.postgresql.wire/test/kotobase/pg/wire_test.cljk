@@ -1,0 +1,130 @@
+(ns kotobase.pg.wire-test
+  "Unit-level tests for kotobase.pg.wire's message encode/decode and
+  startup-code classification -- NO sockets, NO child process. The real
+  cross-process proof (a genuine second `nbb` OS process, a hand-rolled
+  client over a real TCP socket) is
+  `test/kotobase/pg/wire_demo.cljk` -- see that file and this repo's
+  README for exactly what IS and is NOT proven by each. `.cljs`-only,
+  same reason as kotobase.pg.wire itself (node:net/Buffer)."
+  (:require [cljs.test :refer [deftest is testing]]
+            [kotobase.pg.wire :as w]))
+
+;; ------------------------------------------------------- startup classifier
+
+(deftest classify-startup-code-recognizes-every-supported-and-unsupported-case
+  (is (= :startup-message (w/classify-startup-code w/protocol-version-3)))
+  (is (= :ssl-request (w/classify-startup-code w/ssl-request-code)))
+  (is (= :cancel-request (w/classify-startup-code w/cancel-request-code)))
+  (is (= :unsupported (w/classify-startup-code 12345)))
+  (testing "a hypothetical protocol 3.x minor version still classifies as :startup-message
+    (this repo only inspects the major version, per real Postgres backward-compat convention)"
+    (is (= :startup-message (w/classify-startup-code (bit-or (bit-shift-left 3 16) 42))))))
+
+;; ---------------------------------------------------------- StartupMessage
+
+(deftest startup-message-round-trips-through-hand-rolled-parsing
+  (testing "build-startup-message produces exactly what this repo's own server-side
+    startup parser (kotobase.pg.wire's private process-startup!) expects --
+    re-implementing the minimal parse here, without touching sockets, proves the
+    ON-WIRE SHAPE is right independent of the TCP plumbing"
+    (let [packet (w/build-startup-message {"user" "kotobase" "database" "kotobase"})
+          total-len (w/read-u32 packet 0)
+          code (w/read-u32 packet 4)
+          body (.subarray packet 8)]
+      (is (= (.-length packet) total-len) "the length field covers the WHOLE packet, itself included")
+      (is (= w/protocol-version-3 code))
+      (let [[k1 off1] (w/read-cstring body 0)
+            [v1 off2] (w/read-cstring body off1)
+            [k2 off3] (w/read-cstring body off2)
+            [v2 off4] (w/read-cstring body off3)]
+        (is (= ["user" "kotobase" "database" "kotobase"] [k1 v1 k2 v2]))
+        (is (zero? (aget body off4)) "params are terminated by a single NUL byte")))))
+
+(deftest ssl-request-has-the-fixed-8-byte-shape-with-no-body
+  (let [packet (w/build-ssl-request)]
+    (is (= 8 (.-length packet)))
+    (is (= 8 (w/read-u32 packet 0)))
+    (is (= w/ssl-request-code (w/read-u32 packet 4)))))
+
+;; ------------------------------------------------------------ backend msgs
+
+(deftest authentication-ok-round-trip
+  (let [{:keys [type body]} (w/parse-message-header (w/build-authentication-ok))]
+    (is (= "R" type))
+    (is (= 0 (w/read-i32 body 0)))))
+
+(deftest parameter-status-round-trip
+  (let [{:keys [type body]} (w/parse-message-header (w/build-parameter-status "server_version" "13.0"))]
+    (is (= "S" type))
+    (is (= ["server_version" "13.0"] (w/decode-parameter-status body)))))
+
+(deftest backend-key-data-round-trip
+  (let [{:keys [type body]} (w/parse-message-header (w/build-backend-key-data 4242 9999))]
+    (is (= "K" type))
+    (is (= {:process-id 4242 :secret-key 9999} (w/decode-backend-key-data body)))))
+
+(deftest ready-for-query-round-trip
+  (let [{:keys [type body]} (w/parse-message-header (w/build-ready-for-query \I))]
+    (is (= "Z" type))
+    (is (= "I" (w/decode-ready-for-query body)))))
+
+(deftest row-description-round-trip-preserves-column-order
+  (let [{:keys [type body]} (w/parse-message-header (w/build-row-description ["name" "role" "age"]))]
+    (is (= "T" type))
+    (is (= ["name" "role" "age"] (w/decode-row-description body)))))
+
+(deftest row-description-empty-column-list
+  (let [{:keys [body]} (w/parse-message-header (w/build-row-description []))]
+    (is (= [] (w/decode-row-description body)))))
+
+(deftest data-row-round-trip-with-mixed-value-types
+  (testing "strings, numbers, booleans (as Postgres t/f text), and NULL (-1 length, no bytes)"
+    (let [{:keys [type body]} (w/parse-message-header (w/build-data-row ["Alice" 41 true false nil]))]
+      (is (= "D" type))
+      (is (= ["Alice" "41" "t" "f" nil] (w/decode-data-row body))))))
+
+(deftest data-row-null-field-has-no-bytes-not-a-zero-length-string
+  (let [{:keys [body]} (w/parse-message-header (w/build-data-row [nil]))]
+    (is (= -1 (w/read-i32 body 2)) "the field length itself is -1, distinguishing NULL from an empty string")
+    (is (= [nil] (w/decode-data-row body)))))
+
+(deftest command-complete-round-trip
+  (let [{:keys [type body]} (w/parse-message-header (w/build-command-complete "SELECT 3"))]
+    (is (= "C" type))
+    (is (= "SELECT 3" (w/decode-command-complete body)))))
+
+(deftest empty-query-response-has-no-body
+  (let [{:keys [type body]} (w/parse-message-header (w/build-empty-query-response))]
+    (is (= "I" type))
+    (is (zero? (.-length body)))))
+
+(deftest error-response-round-trip-carries-severity-sqlstate-and-message
+  (let [{:keys [type body]} (w/parse-message-header (w/build-error-response "out of scope"))]
+    (is (= "E" type))
+    (is (= {"S" "ERROR" "C" "42601" "M" "out of scope"} (w/decode-error-response body)))))
+
+(deftest error-response-accepts-a-custom-sqlstate
+  (let [{:keys [body]} (w/parse-message-header (w/build-error-response "boom" "XX000"))]
+    (is (= "XX000" (get (w/decode-error-response body) "C")))))
+
+;; --------------------------------------------------------------- framing
+
+(deftest build-msg-length-field-includes-itself-but-not-the-type-byte
+  (let [m (w/build-query-message "SELECT 1")
+        declared-len (w/read-u32 m 1)]
+    (is (= (- (.-length m) 1) declared-len)
+        "total message size minus the 1 type byte == the declared length")))
+
+(deftest query-message-round-trips-the-sql-text
+  (let [{:keys [type body]} (w/parse-message-header (w/build-query-message "SELECT name FROM users"))]
+    (is (= "Q" type))
+    (is (= "SELECT name FROM users" (first (w/read-cstring body 0))))))
+
+(deftest terminate-message-has-no-body
+  (let [{:keys [type body]} (w/parse-message-header (w/build-terminate-message))]
+    (is (= "X" type))
+    (is (zero? (.-length body)))))
+
+(deftest ssl-deny-byte-is-a-single-unframed-byte
+  (is (= 1 (.-length w/ssl-deny-byte)))
+  (is (= (w/char-code \N) (aget w/ssl-deny-byte 0))))
