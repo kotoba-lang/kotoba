@@ -1,0 +1,98 @@
+(ns h264.transform
+  (:export [idct4-1d idct4-1d-dc idct4-1d-scaled dc-only-sample]))
+
+;; H.264 / ISO/IEC 14496-10 §8.5.12 inverse transform for residual 4x4
+;; blocks, as a JVM-free guest kernel.
+;;
+;; This is the `.kotoba` twin of `h264/transform.cljc`'s `inverse-4x4`,
+;; which remains the authoritative decoder implementation and is not
+;; changed by this file. It sits beside it exactly as `syntax.kotoba` sits
+;; beside `syntax.cljc`.
+;;
+;; WHY THE SHAPE IS 1-D AND NOT `inverse-4x4`. The guest value model has no
+;; bulk-data carrier that the word-typed native backends admit, and
+;; `lang/guest-grammar.edn` sets `:max-parameters 5`. Sixteen coefficients
+;; therefore cannot cross an exported boundary at all: not as a vector
+;; (native rejects typed values), not as sixteen parameters (arity 6 is
+;; `:kotoba.error/max-parameters`). What CAN cross is four coefficients and
+;; an output index. That is not a workaround — H.264's 2-D inverse
+;; transform is separable and IS defined as two passes of the 1-D butterfly
+;; below, so the 1-D operator is the spec's own primitive. The host performs
+;; the eight calls and the index permutation; it performs no arithmetic of
+;; its own, which is why `idct4-1d-dc` folds in the +32 DC bias and
+;; `idct4-1d-scaled` folds in the final >>6 rather than leaving either to
+;; the caller.
+;;
+;; The exact composition the host must perform, matching
+;; `h264.transform/inverse-4x4` bit for bit (its internal `transpose16` is
+;; absorbed into the gather, so pass 1 reads the coefficient ROWS):
+;;
+;;   pass 1, i in 0..3, p in 0..3:
+;;     tmp[i + 4p] = (if i = 0 then idct4-1d-dc else idct4-1d)
+;;                     coeffs[4i] coeffs[4i+1] coeffs[4i+2] coeffs[4i+3] p
+;;   pass 2, i in 0..3, p in 0..3:
+;;     out[i + 4p] = idct4-1d-scaled tmp[4i] tmp[4i+1] tmp[4i+2] tmp[4i+3] p
+;;   residual row r = [out[4r] out[4r+1] out[4r+2] out[4r+3]]
+;;
+;; The arithmetic below is the FFmpeg `ff_h264_idct_add` butterfly the
+;; `.cljc` is ported from, because bit-exactness against real ffmpeg output
+;; is what the golden-vector fixtures test.
+;;
+;; Measured through `bin/amu check` against amu 02c7e57 (2026-08-30): there
+;; is no admitted lowering for `bit-shift-right`, so H.264's arithmetic right
+;; shift is written as floor division, which is exactly what an arithmetic
+;; shift is.
+;; Do not "simplify" it to `quot`: `quot` truncates toward zero and would
+;; silently change every negative residual by one.
+
+(defn floor-div-2
+  "floor(v / 2), i.e. C's arithmetic `>> 1`, for either sign of v."
+  [v :i64] :i64
+  (let [q (quot v 2)
+        r (- v (* 2 q))]
+    (if (< r 0) (- q 1) q)))
+
+(defn floor-div-64
+  "floor(v / 64), i.e. C's arithmetic `>> 6`, for either sign of v."
+  [v :i64] :i64
+  (let [q (quot v 64)
+        r (- v (* 64 q))]
+    (if (< r 0) (- q 1) q)))
+
+(defn idct4-1d
+  "One pass of the H.264 §8.5.12.2 1-D inverse integer transform. `k`
+   selects which of the four outputs to return, so that the operator fits
+   the five-parameter scalar ABI. Out of range `k` returns the last output
+   rather than trapping, matching the closed `cond` style the rest of this
+   repo's guest code uses."
+  [x0 :i64 x1 :i64 x2 :i64 x3 :i64 k :i64] :i64
+  (let [z0 (+ x0 x2)
+        z1 (- x0 x2)
+        z2 (- (floor-div-2 x1) x3)
+        z3 (+ x1 (floor-div-2 x3))]
+    (cond
+      (= k 0) (+ z0 z3)
+      (= k 1) (+ z1 z2)
+      (= k 2) (- z1 z2)
+      :else   (- z0 z3))))
+
+(defn idct4-1d-dc
+  "`idct4-1d` with the §8.5.12.2 rounding bias +32 added to the DC input.
+   Used for the first pass over coefficient row 0 only."
+  [x0 :i64 x1 :i64 x2 :i64 x3 :i64 k :i64] :i64
+  (idct4-1d (+ x0 32) x1 x2 x3 k))
+
+(defn idct4-1d-scaled
+  "`idct4-1d` followed by the final arithmetic >>6. Used for the second
+   pass, which produces the residual samples themselves."
+  [x0 :i64 x1 :i64 x2 :i64 x3 :i64 k :i64] :i64
+  (floor-div-64 (idct4-1d x0 x1 x2 x3 k)))
+
+(defn dc-only-sample
+  "The uniform residual sample of a DC-only block, `(dc + 32) >> 6`. The
+   `.cljc` uses this as a fast path, so it must agree with the full two-pass
+   composition. The vector suite calls it on every DC-only block in the
+   corpus and compares it against the same `.cljc` expectation the two-pass
+   composition is compared against."
+  [dc :i64] :i64
+  (floor-div-64 (+ dc 32)))

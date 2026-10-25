@@ -1,0 +1,776 @@
+;; awk -- POSIX awk (IEEE Std 1003.1), a documented SUBSET: the print
+;; statement, over a regular-expression pattern (plain, on a field, or a
+;; range), with an optional explicit field separator and `exit`.
+;;
+;;   awk '{print}'                 the record, verbatim
+;;   awk '{print $0}'              the record, verbatim
+;;   awk '{print $N}'              field N, empty past the end
+;;   awk '{print NF}'              how many fields the record has
+;;   awk '/RE/'                    the records matching RE (an ERE)
+;;   awk '/RE/ {print ...}'        the action, on those records only
+;;   awk '$N ~ /RE/ {print ...}'   on records whose field N matches
+;;   awk '/A/,/B/ {print ...}'     from a record matching A through the next
+;;                                 matching B (the same record may be both)
+;;   awk '/A/,0'                   from A to the end of the input
+;;   awk '/RE/ {print $N; exit}'   the first such record, then stop
+;;   awk -FX '...'                 an explicit field separator
+;;
+;; Anything else is REFUSED with a diagnostic. Refusing is the point: a
+;; program this cannot represent must not be half-interpreted into a
+;; plausible-looking wrong answer.
+;;
+;; ## Regular expressions (2026-09-17, org-ieee-regex)
+;;
+;; Measured over 5,025 single-quoted agent awk programs: 842 hold a regular
+;; expression -- `/A/,/B/` 175 (conflict-marker hunks), `/RE/{print $N}` 71,
+;; `/RE/,0` 24, `$N ~ /RE/` 36, `/RE/{print $N; exit}` 10; the rest need
+;; variables (`/RE/{f=1} f&&/RE/`), NR, getline or printf, and are refused.
+;; A pattern is an ERE (regex.core, leftmost-longest, with its literal
+;; prefilter); one without a metacharacter keeps the literal host search.
+;; `//` matches every record. Measured on /usr/bin/awk: a range ends on the
+;; SAME record it starts on when the end matches there too (`/a/,/b/` over
+;; `a b` is one record -- unlike sed, which tests the end from the next
+;; line); `/A/,0` never ends; `/A/,3` ends at once (a non-zero constant is
+;; true); `exit` stops every operand, exit 0.
+;;
+;; ## What was measured against /usr/bin/awk (version 20200816), 2026-09-10
+;;
+;;   {print} / {print $0}   the record VERBATIM, leading and trailing blanks
+;;                          kept, and a missing final newline is ADDED
+;;   default splitting      on RUNS of space/tab, ignoring leading and
+;;                          trailing ones: "  spaced   out  " is $1=spaced,
+;;                          $2=out, NF=2; a blank-only record is NF=0
+;;   $9 past the end        an EMPTY line -- it still prints a line
+;;   -F:                    empty fields COUNT: `a::b` is NF=3 with $2="";
+;;                          `:lead` is NF=2 with $2=lead; `trail:` is NF=2
+;;                          with $2=""; an EMPTY record is still NF=0
+;;   -F. -Fxy               a single character is LITERAL, not a regular
+;;                          expression, and so is a multi-character one for
+;;                          the literal strings this compares
+;;   -Ft                    a TAB. That is awk's own special case for the
+;;                          letter t, and it is measured, not inferred
+;;   -F' '                  a single SPACE means default splitting
+;;   ''                     an empty program: exit 0, no output, and the
+;;                          operands are never opened -- a missing file is
+;;                          not reported
+;;   missing operand        `awk: can't open file X` on stderr, exit 2, and
+;;                          processing STOPS: later operands are not read
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
+(ns awk.core (:export [main]) (:require [regex.core :as rx]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+;; The capability call is a function's RESULT and nothing else: the
+;; linked-module route admits a named capability operation only in a typed
+;; result position (measured 2026-09-17 when regex.core was linked in).
+(defn- exists-answer [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn exists? [path :string] :bool
+  (string=? (exists-answer path) "1"))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; A one-byte tab, cut from a literal that contains one -- a control
+;; character cannot be written directly in Kotoba source.
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+;; --- numbers cross as decimal text ---------------------------------------
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+;; Non-empty and every byte a digit. This stops at the FIRST non-digit rather
+;; than walking on, which is what keeps `string-code-point-at` from ever being
+;; asked about a byte in the middle of a multi-byte character: index 0 is
+;; always a boundary, and the walk only advances past bytes it has already
+;; seen to be ASCII digits.
+(defn all-digits? [s :string i :i64 n :i64] :i64
+  (if (= n 0)
+    0
+    (if (>= i n)
+      1
+      (if (< (digit-value s i) 0) 0 (all-digits? s (+ i 1) n)))))
+
+;; --- blanks --------------------------------------------------------------
+;;
+;; Every offset handed to `string-substring` here is the index of an ASCII
+;; byte -- a space, a tab, a brace, a slash -- or 0, or the string's length.
+;; Nothing else is a code-point boundary, and a substring taken off one traps
+;; the process rather than answering wrongly. Measured 2026-09-10:
+;; `(string-substring "日本" 1 2)` is SIGILL, exit 120. So this file finds
+;; ASCII with `string-index-of` and never counts bytes by hand.
+
+;; The next space or tab at or after FROM, or -1. One host scan
+;; (`string-find-blank`, context ABI v7, 2026-09-16) that stops at the
+;; first of the host's six blanks; awk's default separator is space and
+;; tab ONLY -- measured 2026-09-16, `a\vb\fc\rd e` has two fields and
+;; `\va b` keeps its \v in $1 -- so a \v, \f or \r the scan stops on is
+;; read (it is ASCII, so a boundary) and stepped over. Until then this was
+;; a view and two whole-line searches per blank run, the tab search
+;; walking to the line's end on every line without one.
+(defn next-blank [s :string from :i64] :i64
+  (let [k (string-find-blank s from)]
+    (if (< k 0)
+      -1
+      (let [c (string-code-point-at s k)]
+        (if (= c 32) k (if (= c 9) k (next-blank s (+ k 1))))))))
+
+;; Leading spaces and tabs dropped: one code point read per leading blank,
+;; a boundary because offset 0 always is and a blank is one byte.
+(defn ltrim [s :string] :string
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      s
+      (let [c (string-code-point-at s 0)]
+        (if (= c 32)
+          (ltrim (string-substring s 1 n))
+          (if (= c 9) (ltrim (string-substring s 1 n)) s))))))
+
+;; Where the trailing run of blanks starts, or the length when there is none.
+;; RUN carries the start of the blank run currently open, or -1. Scanning
+;; FORWARD rather than back is what keeps this boundary-safe: reading the last
+;; byte directly would mean slicing at n-1, which is inside the character when
+;; the string ends in a multi-byte one.
+(defn rtrim-end [s :string from :i64 run :i64] :i64
+  (let [n (string-byte-length s)]
+    (if (>= from n)
+      (if (< run 0) n run)
+      (let [b (next-blank s from)]
+        (if (< b 0)
+          n
+          (rtrim-end s (+ b 1) (if (= b from) (if (< run 0) b run) b)))))))
+
+(defn rtrim [s :string] :string
+  (string-substring s 0 (rtrim-end s 0 -1)))
+
+(defn trim [s :string] :string
+  (ltrim (rtrim s)))
+
+;; The index of the LAST `}`, or -1. Used to ask whether an action's closing
+;; brace is the final byte, which cannot be asked by slicing the end.
+(defn last-brace [s :string from :i64 best :i64] :i64
+  (let [n (string-byte-length s)]
+    (if (>= from n)
+      best
+      (let [t (string-substring s from n)
+            i (string-index-of t "}")]
+        (if (< i 0) best (last-brace s (+ (+ from i) 1) (+ from i)))))))
+
+;; --- the argument vector -------------------------------------------------
+;; `awk [-FX] PROGRAM FILE...`. Only the ATTACHED form of -F is accepted; the
+;; detached `awk -F : prog file`, which the system awk takes, is refused here
+;; and the README says so.
+
+(defn dash-f? [] :bool
+  (= (string-index-of (arg "0") "-F") 0))
+
+(defn fs-raw [] :string
+  (let [a (arg "0")]
+    (string-substring a 2 (string-byte-length a))))
+
+(defn prog-text [] :string
+  (if (dash-f?) (arg "1") (arg "0")))
+
+(defn first-file [] :i64
+  (if (dash-f?) 2 1))
+
+(defn argc [] :i64
+  (let [t (arg "")]
+    (text->i64 t 0 (string-byte-length t) 0)))
+
+;; A single space means default splitting, measured -- `-F' '` over
+;; "  spaced   out  " answers NF=2, not NF=6.
+(defn ws-mode? [] :bool
+  (if (dash-f?) (string=? (fs-raw) " ") true))
+
+;; `-Ft` is a TAB. awk's own special case, measured over a tab-separated
+;; fixture: NF=3 where a literal letter t would have answered NF=1.
+(defn sep [] :string
+  (if (string=? (fs-raw) "t") (tab) (fs-raw)))
+
+;; --- the program ---------------------------------------------------------
+
+(defn body [] :string
+  (trim (prog-text)))
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+;; A pattern form starts with `/` (a regex) or `$` (a field match).
+(defn pattern-form? [] :bool
+  (let [b (body)]
+    (if (= (string-index-of b "/") 0) true (= (string-index-of b "$") 0))))
+
+;; --- length-prefixed fields, as org-ieee-sed keeps them ------------------
+(defn- lp [s :string] :string
+  (string-concat (decimal-of (string-byte-length s)) (string-concat ":" s)))
+
+(defn- field-len [s :string i :i64] :i64
+  (text->i64 s i (string-find-byte s 58 i) 0))
+
+(defn- field [s :string i :i64] :string
+  (let [c (string-find-byte s 58 i)]
+    (string-substring s (+ c 1) (+ (+ c 1) (field-len s i)))))
+
+(defn- after-field [s :string i :i64] :i64
+  (let [c (string-find-byte s 58 i)]
+    (+ (+ c 1) (field-len s i))))
+
+(defn- field-at [s :string j :i64 i :i64] :i64
+  (if (<= j 0) i (field-at s (- j 1) (after-field s i))))
+
+(defn- nth-field [s :string j :i64] :string (field s (field-at s j 0)))
+
+(defn- nth-i64 [s :string j :i64] :i64
+  (let [f (nth-field s j)] (text->i64 f 0 (string-byte-length f) 0)))
+
+(defn- error? [s :string] :bool
+  (if (= 0 (string-byte-length s)) false (= (string-code-point-at s 0) 33)))
+
+;; The index of the first unescaped `/` in B from I, or -1.
+(defn- slash-end [b :string i :i64] :i64
+  (let [n (string-byte-length b)]
+    (if (>= i n)
+      -1
+      (let [c (string-code-point-at b i)]
+        (if (= c 92)
+          (slash-end b (+ i 2))
+          (if (= c 47) i (slash-end b (+ i (cp-width c)))))))))
+
+(defn- ere-meta? [c :i64] :bool
+  (if (= c 46) true (if (= c 91) true (if (= c 93) true (if (= c 42) true (if (= c 94) true (if (= c 36) true (if (= c 92) true
+    (if (= c 43) true (if (= c 63) true (if (= c 40) true (if (= c 41) true (if (= c 123) true (if (= c 125) true (= c 124)))))))))))))))
+
+(defn- has-meta? [p :string i :i64] :bool
+  (if (>= i (string-byte-length p))
+    false
+    (let [c (string-code-point-at p i)]
+      (if (ere-meta? c) true (has-meta? p (+ i (cp-width c)))))))
+
+;; P with `\/` reduced to `/`; every other escape reaches the engine.
+(defn- unescape [p :string i :i64 acc :string] :string
+  (let [n (string-byte-length p)]
+    (if (>= i n)
+      acc
+      (let [c (string-code-point-at p i)]
+        (if (if (= c 92) (< (+ i 1) n) false)
+          (let [e (string-code-point-at p (+ i 1))]
+            (if (= e 47)
+              (unescape p (+ i 2) (string-concat acc "/"))
+              (unescape p (+ (+ i 1) (cp-width e)) (string-concat acc (string-substring p i (+ (+ i 1) (cp-width e)))))))
+          (unescape p (+ i (cp-width c)) (string-concat acc (string-substring p i (+ i (cp-width c))))))))))
+
+;; `R` + program + newline + prefilter runs, `L` + bytes for a pattern
+;; without a metacharacter, `` for the empty pattern (every record), or
+;; `!` + the engine's message.
+(defn- compiled [raw :string] :string
+  (let [pat (unescape raw 0 "")]
+    (if (= 0 (string-byte-length pat))
+      ""
+      (if (has-meta? pat 0)
+        (let [prog (rx/compile-pattern pat true)]
+          (if (rx/error? prog)
+            prog
+            (string-concat "R" (string-concat prog (string-concat (nl) (rx/prefilter pat true))))))
+        (string-concat "L" pat)))))
+
+;; The pattern of the program as length-prefixed fields `type p1 p2` and a
+;; fourth field, the text AFTER the pattern (the action, if any):
+;;   0            no pattern
+;;   1 RE         the record matches
+;;   2 N RE       field N matches
+;;   3 RE RE      a range, ended by a record matching the second
+;;   4 RE N       a range ended at once (N != 0) or never (N = 0)
+;; or `!` + message: `!unsupported` for a shape outside the subset, `!RE:`
+;; + the engine's words for a pattern it refuses.
+(defn- regex-at [b :string i :i64] :string
+  (let [e (slash-end b (+ i 1))]
+    (if (< e 0) "!unsupported" (compiled (string-substring b (+ i 1) e)))))
+
+(defn- after-regex [b :string i :i64] :i64
+  (+ (slash-end b (+ i 1)) 1))
+
+(defn- skip-blanks [b :string i :i64] :i64
+  (if (>= i (string-byte-length b))
+    i
+    (let [c (string-code-point-at b i)]
+      (if (= c 32) (skip-blanks b (+ i 1)) (if (= c 9) (skip-blanks b (+ i 1)) i)))))
+
+(defn- digits-end [b :string i :i64] :i64
+  (if (>= i (string-byte-length b))
+    i
+    (if (= 1 (all-digits? b i (+ i 1))) (digits-end b (+ i 1)) i)))
+
+;; The range end after the comma at I, appended to the fields so far.
+(defn- range-spec [b :string i :i64 p1 :string] :string
+  (let [j (skip-blanks b i)
+        n (string-byte-length b)]
+    (if (>= j n)
+      "!unsupported"
+      (if (= (string-code-point-at b j) 47)
+        (let [p2 (regex-at b j)]
+          (if (error? p2)
+            p2
+            (string-concat (lp "3") (string-concat (lp p1) (string-concat (lp p2) (lp (string-substring b (after-regex b j) n)))))))
+        (let [e (digits-end b j)]
+          (if (= e j)
+            "!unsupported"
+            (string-concat (lp "4") (string-concat (lp p1) (string-concat (lp (string-substring b j e)) (lp (string-substring b e n)))))))))))
+
+(defn- pattern-spec [] :string
+  (let [b (body)
+        n (string-byte-length b)]
+    (if (not (pattern-form?))
+      (string-concat (lp "0") (string-concat (lp "") (string-concat (lp "") (lp b))))
+      (if (= (string-code-point-at b 0) 47)
+        (let [p1 (regex-at b 0)]
+          (if (error? p1)
+            p1
+            (let [j (skip-blanks b (after-regex b 0))]
+              (if (if (< j n) (= (string-code-point-at b j) 44) false)
+                (range-spec b (+ j 1) p1)
+                (string-concat (lp "1") (string-concat (lp p1) (string-concat (lp "") (lp (string-substring b j n)))))))))
+        ;; `$N ~ /RE/`
+        (let [e (digits-end b 1)
+              t (skip-blanks b e)]
+          (if (= e 1)
+            "!unsupported"
+            (if (if (< t n) (= (string-code-point-at b t) 126) false)
+              (let [r (skip-blanks b (+ t 1))]
+                (if (if (< r n) (= (string-code-point-at b r) 47) false)
+                  (let [p (regex-at b r)]
+                    (if (error? p)
+                      p
+                      (string-concat (lp "2") (string-concat (lp (string-substring b 1 e)) (string-concat (lp p) (lp (string-substring b (after-regex b r) n)))))))
+                  "!unsupported"))
+              "!unsupported")))))))
+
+(defn after-pat [] :string (trim (nth-field (pattern-spec) 3)))
+
+;; What should be `{...}`: the whole program, or what follows the pattern.
+(defn braces-src [] :string
+  (if (pattern-form?) (after-pat) (body)))
+
+(defn braced? [] :bool
+  (let [s (braces-src)
+        n (string-byte-length s)]
+    (if (< n 2)
+      false
+      (if (= (string-index-of s "{") 0)
+        (= (last-brace s 0 -1) (- n 1))
+        false))))
+
+;; A pattern with NO action prints the record -- that is awk's default action,
+;; so it is spelled here as the action it means.
+(defn- braces-inner [] :string
+  (let [s (braces-src)
+        n (string-byte-length s)]
+    (if (string=? s "")
+      "print"
+      (trim (string-substring s 1 (- n 1))))))
+
+;; `print ...; exit` runs the print and then stops every operand. The
+;; action's text is what precedes the last `;`; `exit?` is what follows it.
+(defn- last-semicolon [s :string from :i64 best :i64] :i64
+  (let [i (string-index-of-from s ";" from)]
+    (if (< i 0) best (last-semicolon s (+ i 1) i))))
+
+(defn- exit? [] :bool
+  (let [s (braces-inner)
+        i (last-semicolon s 0 -1)]
+    (if (< i 0) false (string=? (trim (string-substring s (+ i 1) (string-byte-length s))) "exit"))))
+
+(defn action-text [] :string
+  (let [s (braces-inner)
+        i (last-semicolon s 0 -1)]
+    (if (exit?) (trim (string-substring s 0 i)) s)))
+
+;; `print`, or `print` followed by a blank. `print$1` and `printNF` are NOT
+;; accepted, though the system awk takes them; refusing is documented rather
+;; than guessed at.
+(defn print-form? [] :bool
+  (let [a (action-text)
+        n (string-byte-length a)]
+    (if (string=? a "print")
+      true
+      (if (< n 6)
+        false
+        (if (= (string-index-of a "print") 0)
+          (let [r (string-substring a 5 n)]
+            (if (= (string-index-of r " ") 0)
+              true
+              (= (string-index-of r (tab)) 0)))
+          false)))))
+
+(defn act-operand [] :string
+  (let [a (action-text)
+        n (string-byte-length a)]
+    (if (string=? a "print")
+      ""
+      (trim (string-substring a 5 n)))))
+
+;; 0 = the whole record, 1 = NF, 2 = a numbered field, -1 = refuse.
+(defn act-kind [] :i64
+  (if (print-form?)
+    (let [o (act-operand)
+          n (string-byte-length o)]
+      (if (string=? o "")
+        0
+        (if (string=? o "NF")
+          1
+          (if (= (string-index-of o "$") 0)
+            (if (= (all-digits? (string-substring o 1 n) 0 (- n 1)) 1)
+              (if (= (text->i64 (string-substring o 1 n) 0 (- n 1) 0) 0) 0 2)
+              -1)
+            -1))))
+    -1))
+
+(defn field-index [] :i64
+  (let [o (act-operand)
+        n (string-byte-length o)]
+    (text->i64 (string-substring o 1 n) 0 (- n 1) 0)))
+
+(defn program-ok? [] :bool
+  (if (error? (pattern-spec))
+    false
+    (if (pattern-form?)
+      (if (string=? (after-pat) "")
+        (>= (act-kind) 0)
+        (if (braced?) (>= (act-kind) 0) false))
+      (if (braced?) (>= (act-kind) 0) false))))
+
+;; --- fields --------------------------------------------------------------
+;;
+;; Two different questions, kept apart because awk answers them differently.
+;; Default splitting collapses RUNS of blanks and ignores them at both ends,
+;; so "  a   b  " has two fields. An explicit separator does not collapse
+;; anything, so `a::b` under -F: has THREE, the middle one empty.
+
+(defn ws-count [s :string acc :i64] :i64
+  (let [t (ltrim s)
+        n (string-byte-length t)]
+    (if (= n 0)
+      acc
+      (let [b (next-blank t 0)]
+        (if (< b 0)
+          (+ acc 1)
+          (ws-count (string-substring t (+ b 1) n) (+ acc 1)))))))
+
+(defn ws-field [s :string k :i64] :string
+  (let [t (ltrim s)
+        n (string-byte-length t)]
+    (if (= n 0)
+      ""
+      (let [b (next-blank t 0)]
+        (if (= k 1)
+          (if (< b 0) t (string-substring t 0 b))
+          (if (< b 0) "" (ws-field (string-substring t (+ b 1) n) (- k 1))))))))
+
+(defn sep-count [s :string d :string acc :i64] :i64
+  (let [i (string-index-of s d)]
+    (if (< i 0)
+      (+ acc 1)
+      (sep-count (string-substring s (+ i (string-byte-length d))
+                                   (string-byte-length s))
+                 d (+ acc 1)))))
+
+(defn sep-field [s :string d :string k :i64] :string
+  (let [i (string-index-of s d)
+        n (string-byte-length s)]
+    (if (< i 0)
+      (if (= k 1) s "")
+      (if (= k 1)
+        (string-substring s 0 i)
+        (sep-field (string-substring s (+ i (string-byte-length d)) n)
+                   d (- k 1))))))
+
+;; An EMPTY record is NF=0 whichever mode is in force -- measured under -F:
+;; as well as by default, where it would otherwise have counted as one empty
+;; field.
+;; --- the program, read ONCE ----------------------------------------------
+;;
+;; Until 2026-09-15 every record re-derived the action kind, the field
+;; index, the pattern and the separator from argv: `act-kind` alone is
+;; `print-form?` -> `action-text` -> `body` -> `trim (prog-text)` -> wire 38,
+;; and every wire answer is interned in the pool with a handle. Measured on
+;; a 33 MB file: 362 pair handles and 275 pool bytes per record, SIGILL at
+;; record 185,055 with the 64 Mi handle arena spent. The program is now
+;; read once in `run` into CFG -- `kind + 4 * ws + 8 * pattern-form + 16 *
+;; field-index` -- plus the pattern text and the separator, and carried.
+(defn cfg-kind [cfg :i64] :i64 (- cfg (* 4 (quot cfg 4))))
+(defn cfg-ws? [cfg :i64] :bool (= 1 (- (quot cfg 4) (* 2 (quot cfg 8)))))
+(defn cfg-pattern? [cfg :i64] :bool (= 1 (- (quot cfg 8) (* 2 (quot cfg 16)))))
+;; Bits 4..39 the field index; bit 40 `exit` after the action; bit 41 the
+;; range is active (what crosses records: the region releases everything
+;; else).
+(defn cfg-field [cfg :i64] :i64 (- (quot cfg 16) (* 68719476736 (quot cfg 1099511627776))))
+(defn- cfg-exit? [cfg :i64] :bool (= 1 (- (quot cfg 1099511627776) (* 2 (quot cfg 2199023255552)))))
+(defn- cfg-active? [cfg :i64] :bool (= 1 (- (quot cfg 2199023255552) (* 2 (quot cfg 4398046511104)))))
+(defn- cfg-with-active [cfg :i64 active? :bool] :i64
+  (+ (- cfg (* 2199023255552 (if (cfg-active? cfg) 1 0))) (if active? 2199023255552 0)))
+
+(defn nf-of [rec :string cfg :i64 sepd :string] :i64
+  (if (= (string-byte-length rec) 0)
+    0
+    (if (cfg-ws? cfg) (ws-count rec 0) (sep-count rec sepd 0))))
+
+(defn field-of [rec :string k :i64 cfg :i64 sepd :string] :string
+  (if (= k 0)
+    rec
+    (if (cfg-ws? cfg) (ws-field rec k) (sep-field rec sepd k))))
+
+;; --- records -------------------------------------------------------------
+
+(defn- program-of [v :string] :string
+  (string-substring v 1 (string-find-byte v 10 0)))
+
+(defn- runs-of [v :string] :string
+  (string-substring v (+ 1 (string-find-byte v 10 0)) (string-byte-length v)))
+
+;; Does the compiled pattern V match TEXT? `` every record; `L` a host
+;; search; `R` the prefilter and then the simulation.
+(defn- hit? [v :string text :string] :bool
+  (if (= 0 (string-byte-length v))
+    true
+    (if (= (string-code-point-at v 0) 82)
+      (let [runs (runs-of v)]
+        (if (if (= 0 (string-byte-length runs)) true (rx/holds-run? text runs 0))
+          (rx/matches? (program-of v) text 0 (string-byte-length text))
+          false))
+      (>= (string-index-of text (string-substring v 1 (string-byte-length v))) 0))))
+
+;; Whether the record is selected, and whether a range stays active after
+;; it: active * 2 + selected.
+(defn- select [rec :string cfg :i64 spec :string sepd :string] :i64
+  (let [t (nth-i64 spec 0)
+        p1 (nth-field spec 1)
+        p2 (nth-field spec 2)]
+    (if (= t 0)
+      1
+      (if (= t 1)
+        (if (hit? p1 rec) 1 0)
+        (if (= t 2)
+          (if (hit? p2 (field-of rec (nth-i64 spec 1) cfg sepd)) 1 0)
+          ;; A range: started by p1 (or already active), ended by p2 on the
+          ;; same or a later record; `/A/,N` ends at once unless N is 0.
+          (if (if (cfg-active? cfg) true (hit? p1 rec))
+            (let [ends? (if (= t 3) (hit? p2 rec) (not (= 0 (nth-i64 spec 2))))]
+              (if ends? 1 3))
+            0))))))
+
+;; print always terminates its line, which is why an input whose last line has
+;; no newline gains one. Answers active * 2 + exited.
+(defn show [rec :string cfg :i64 spec :string sepd :string] :i64
+  (let [r (select rec cfg spec sepd)
+        selected? (= 1 (- r (* 2 (quot r 2))))
+        active (quot r 2)]
+    (if selected?
+      (do
+        (if (= (cfg-kind cfg) 1)
+          (emit (decimal-of (nf-of rec cfg sepd)))
+          (emit (field-of rec (if (= (cfg-kind cfg) 2) (cfg-field cfg) 0) cfg sepd)))
+        (emit (nl))
+        (+ (* 2 active) (if (cfg-exit? cfg) 1 0)))
+      (* 2 active))))
+
+;; Records by a scalar cursor over the text: the search view and every
+;; handle a record's `show` cuts (its view, its fields, its writes) are
+;; released as the region (arena-scope, ABI v6) answers, so a file leaves
+;; nothing in the arena per record. TEXT and POS are packed for the arity:
+;; the walk carries `text cfg pat sepd` and the cursor.
+;; Answers 1 when the program exited, else the CFG to carry to the next
+;; operand (its range bit updated) -- both fit one i64 since a cfg is even
+;; or has its kind bits set... no: a cfg can be 1 (kind NF). So the answer
+;; is cfg * 2 + exited.
+(defn walk-from [text :string pos :i64 cfg :i64 spec :string sepd :string] :i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      (* 2 cfg)
+      ;; One host search from POS (`string-find-byte`), no view; the record
+      ;; view, its fields and its writes live in the region.
+      (let [i (string-find-byte text 10 pos)
+            end (if (< i 0) n i)
+            r (arena-scope (show (string-substring text pos end) cfg spec sepd))
+            exited? (= 1 (- r (* 2 (quot r 2))))
+            cfg2 (cfg-with-active cfg (= 1 (quot r 2)))]
+        (if exited?
+          (+ (* 2 cfg2) 1)
+          (if (< i 0)
+            (* 2 cfg2)
+            (walk-from text (+ i 1) cfg2 spec sepd)))))))
+
+(defn walk [text :string cfg :i64 spec :string sepd :string] :i64
+  (walk-from text 0 cfg spec sepd))
+
+(defn rec-count-from [text :string pos :i64 n :i64 acc :i64] :i64
+  (if (>= pos n)
+    acc
+    (let [i (string-find-byte text 10 pos)]
+      (if (< i 0)
+        (+ acc 1)
+        (rec-count-from text (+ i 1) n (+ acc 1))))))
+
+(defn rec-count [text :string acc :i64] :i64
+  (rec-count-from text 0 (string-byte-length text) acc))
+
+;; --- operands ------------------------------------------------------------
+;;
+;; The diagnostic for a file that will not open carries two more lines than it
+;; looks like it should, and they are measured rather than guessed:
+;;
+;;   awk: can't open file nope.txt
+;;    input record number 3, file nope.txt
+;;    source line number 1
+;;
+;; The middle line appears only when SOME record has already been read (awk's
+;; own condition is NR > 0), and the number it carries is FNR -- the record
+;; count of the file just before, not the running total. Measured
+;; 2026-09-10:
+;;
+;;   plain colon nope   -> 3   plain has 2 records and colon 3; NR is 5
+;;   plain empty nope   -> 0   an empty file opens and resets FNR
+;;   empty nope         -> the line is absent: nothing had been read
+;;
+;; The name in the first line is awk's argv[0]; the system awk prints whatever
+;; path invoked it. There is no capability that answers "what am I called", so
+;; this says `awk`, and the suite gives the system awk the same argv[0] rather
+;; than comparing two different questions.
+
+(defn any-recs? [j :i64 limit :i64] :bool
+  (if (>= j limit)
+    false
+    (if (> (rec-count (slurp-file (arg (decimal-of j))) 0) 0)
+      true
+      (any-recs? (+ j 1) limit))))
+
+(defn complain [i :i64 path :string] :i64
+  (do
+    (emit-error "awk: can't open file ")
+    (emit-error path)
+    (emit-error (nl))
+    (if (any-recs? (first-file) i)
+      (do
+        (emit-error " input record number ")
+        (emit-error (decimal-of
+                     (rec-count (slurp-file (arg (decimal-of (- i 1)))) 0)))
+        (emit-error ", file ")
+        (emit-error path)
+        (emit-error (nl)))
+      "")
+    (emit-error " source line number 1")
+    (emit-error (nl))
+    2))
+
+;; A file that will not open STOPS the run -- measured: `awk '{print}'
+;; nope.txt plain` writes nothing from plain and exits 2. cut and sed both
+;; carry on and report at the end; awk does not, so this returns rather than
+;; recursing.
+(defn each [i :i64 total :string cfg :i64 spec :string sepd :string] :i64
+  (if (string=? (decimal-of i) total)
+    0
+    (let [path (arg (decimal-of i))]
+      (if (exists? path)
+        (let [r (walk (slurp-file path) cfg spec sepd)]
+          (if (= 1 (- r (* 2 (quot r 2))))
+            0
+            (each (+ i 1) total (quot r 2) spec sepd)))
+        (complain i path)))))
+
+;; CFG, PAT and SEPD as `show` wants them, derived from argv exactly once.
+(defn config [] :i64
+  (+ (act-kind)
+     (+ (if (ws-mode?) 4 0)
+        (+ (if (pattern-form?) 8 0)
+           (+ (* 16 (if (= (act-kind) 2) (field-index) 0))
+              (if (exit?) 1099511627776 0))))))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn run [] :i64
+  ;; An empty program exits 0 without opening anything -- measured, `awk ''
+  ;; nope.txt` reports no error at all. So this decides emptiness before it
+  ;; looks at the operands.
+  (if (string=? (body) "")
+    0
+    (if (program-ok?)
+      (if (>= (first-file) (argc))
+        ;; No file operand: standard input, whole (wire 41, 2026-09-16 --
+        ;; 81% of awk's invocations in agent tool use are a later pipeline
+        ;; segment, 3,883 of 4,800 measured). Input past the string pool is
+        ;; refused, never walked short.
+        (do (walk (stdin "") (config) (pattern-spec) (if (ws-mode?) "" (sep)))
+            0)
+        (each (first-file) (arg "") (config) (pattern-spec) (if (ws-mode?) "" (sep))))
+      (if (if (error? (pattern-spec)) (not (string=? (pattern-spec) "!unsupported")) false)
+        ;; A pattern the engine refuses: /usr/bin/awk's shape (its own words
+        ;; differ -- `nonterminated character class a[` where this says
+        ;; `brackets [ ] not balanced`), exit 2.
+        (do (emit-error "awk: ")
+            (emit-error (string-substring (pattern-spec) 1 (string-byte-length (pattern-spec))))
+            (emit-error (nl))
+            (emit-error " source line number 1")
+            (emit-error (nl))
+            (emit-error " context is")
+            (emit-error (nl))
+            (emit-error (string-concat (tab) " >>> "))
+            (emit-error (prog-text))
+            (emit-error " <<< ")
+            (emit-error (nl))
+            2)
+        (do (emit-error "awk: unsupported program: ")
+            (emit-error (prog-text))
+            (emit-error (nl))
+            2)))))
+
+(defn main [] :i64
+  (if (= (argc) 0)
+    (do (emit-error "awk: usage: awk [-Fsep] 'program' file ...")
+        (emit-error (nl))
+        2)
+    (if (dash-f?)
+      (if (string=? (fs-raw) "")
+        ;; The system awk reads the NEXT argument as the separator here. That
+        ;; is the detached form, which this does not accept, so it refuses
+        ;; instead of silently reading the program as a separator.
+        (do (emit-error "awk: -F needs its separator attached, as -Fx")
+            (emit-error (nl))
+            2)
+        (if (< (argc) 2)
+          (do (emit-error "awk: no program text")
+              (emit-error (nl))
+              2)
+          (run)))
+      (run))))

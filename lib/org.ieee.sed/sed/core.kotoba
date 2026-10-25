@@ -1,0 +1,813 @@
+;; sed -- POSIX sed (IEEE Std 1003.1): `s`, `p`, `d` with line, `$`, `/re/`
+;; and `+N` addresses, joined by `;`; `-n`, `-E`, `-e`; standard input or
+;; file operands. Written in .kotoba, compiled to a standalone native
+;; executable, linked with org-ieee-regex for the regular expressions.
+;;
+;;   sed 's/RE/REPLACEMENT/[g][p]' [FILE...]
+;;   sed -n '/RE/,/RE/p'           [FILE...]
+;;   sed -n '12,40p'               [FILE...]
+;;   sed '/RE/d'                   [FILE...]
+;;   sed -E 's/(a|b)+/X/g'         [FILE...]
+;;   sed -i '' 's/RE/REPLACEMENT/' FILE...      in place (2026-09-17)
+;;
+;; ## Which scripts, measured 2026-09-17
+;;
+;; Of 1,268,018 agent Bash calls, 15,968 are `sed` with a single-quoted
+;; script. By shape: `-n 'N,Mp'` 8,762 (+205 joined by `;`); `s` with a
+;; metacharacter 3,217 plain, 139 `g`, 102 `-E`, 207 + 69 + 61 + 43 joined
+;; by `;`; `-i` 1,042 (not here: it writes the file); `-n '/re/,/re/p'`
+;; 817 and `/re/p` 59 (some `,+N`); `\1` in the replacement 193 + 105 + 89
+;; (since 2026-09-17: rx/captures re-walks the match for its groups);
+;; `s` literal 345 + 57; `/re/d` 109; `-n 's/../\1/p'` 105. `-i ''` since
+;; 2026-09-17 (the wire-35 APPEND form, amu #1023); operands may be
+;; relative since the same landing (the loader resolves them).
+;;
+;; ## Semantics, each measured on /usr/bin/sed
+;;
+;;   s/X/-/       the FIRST match on each line; `g` every match, scanning on
+;;                AFTER each replacement (so `s/a/aa/g` terminates)
+;;   s/x*/-/g     `-a-b-c-` over `abc`: an empty match at every position;
+;;   s/b*/-/g     `-a-c-`: an empty match right after a match is skipped
+;;   s/^a/X/g     `Xaa` over `aaa`: `^` is the line start, not the scan start
+;;   &  \&  \n    the match, a literal `&`, a newline, in the replacement
+;;   \1..\9       group N: macOS libc regex's greedy-first groups
+;;                ((a|ab)(c|bcd) over abcd is [a][bcd]); a group that did
+;;                not take part is empty; past the pattern's groups refused
+;;   s/a\/b/X/    `\` before the delimiter is the delimiter itself
+;;   \x1b         a byte by hex (the ANSI-escape stripper agents write)
+;;   s//-/        an EMPTY pattern is refused: "first RE may not be empty"
+;;   s/X/-/p      prints the line when it substituted (twice without -n)
+;;   /A/,/B/p     from a line matching A through the next matching B, the
+;;                end tested from the NEXT line (`/A/,/A/` spans two lines);
+;;                ranges restart after they end
+;;   /A/,3p       through line 3; an end at or before the start is ONE line
+;;   /A/,+2p      the start and two more lines
+;;   2,/B/p       from line 2 through the next B
+;;   0,2p         nothing (lines begin at 1); `$` is the last line
+;;   1,2p;2,3p    a line prints once PER command selecting it
+;;   /A/d         deletes: no later command sees the line, no autoprint
+;;   without -n   every line once, plus once per `p`
+;;   no newline   a last line without one keeps none, on EVERY print of it
+;;                (`printf a | sed p` is `aa`)
+;;   several files ONE stream: line numbers continue, and a file lacking a
+;;                final newline gets one only when another LINE follows
+;;   s/a\|b/X/    BRE: `\|` is a literal `|` (no GNU alternation); -E for `|`
+;;
+;; ## Not here, by name
+;;
+;;   y, a, i, c, q, {}, w, N, hold space, `I` flag, `//` (the last RE)
+;;   two `+N` addresses in one script (one counter is kept)
+;;   more than 40 commands in one script (one bit per command is kept)
+;;
+;; ## How
+;;
+;; The script is parsed ONCE into length-prefixed fields (`LEN:bytes`, eight
+;; per command: addr1 type, value, addr2 type, value, command, pattern,
+;; replacement template, flags). A pattern with a metacharacter is a
+;; regex.core program (`R` + program), one without keeps the literal walk
+;; (`L` + bytes, one host search per occurrence). Each line runs its cycle
+;; inside an arena-scope, so a file's walk never accumulates; what crosses
+;; lines is one i64: bit k = "command k's range is active", bits 40+ the
+;; `+N` countdown. `d` carries the untouched bits of the commands after it.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39), :io/read (41).
+(ns sed.core (:export [main]) (:require [regex.core :as rx]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+;; The capability call is a function's RESULT and nothing else: the
+;; linked-module route admits a named capability operation only in a typed
+;; result position (measured 2026-09-17 when regex.core was linked in).
+(defn- exists-answer [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn exists? [path :string] :bool
+  (string=? (exists-answer path) "1"))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn nl [] :string "\n")
+
+;; --- numbers -------------------------------------------------------------
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn- digit? [c :i64] :bool (if (>= c 48) (<= c 57) false))
+
+(defn- text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (text->i64 s (+ i 1) n (+ (* acc 10) (- (string-code-point-at s i) 48)))))
+
+(defn- i64-of [s :string] :i64 (text->i64 s 0 (string-byte-length s) 0))
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- pow2 [k :i64] :i64 (if (<= k 0) 1 (* 2 (pow2 (- k 1)))))
+
+(defn- bit-set? [st :i64 k :i64] :bool
+  (= 1 (- (quot st (pow2 k)) (* 2 (quot st (pow2 (+ k 1)))))))
+
+;; --- options -------------------------------------------------------------
+;; Leading arguments of `-` and letters from `n`, `E`, `e` are options
+;; (`-n`, `-E`, `-nE`, `-En`, `-e`); the script is the first other argument.
+;; `-i EXT` / `-iEXT` edits the operands in place (2026-09-17; 1,042 of
+;; 15,968 measured scripts, all but one `-i ''`): EXT names the backup
+;; suffix, "" for none -- as /usr/bin/sed reads it, so `sed -i 's/a/b/' f`
+;; takes the script as the suffix and refuses `f` as the script.
+(defn- total [] :i64 (i64-of (arg "")))
+
+(defn- in-place-arg? [a :string] :bool
+  (if (< (string-byte-length a) 2) false (string=? (string-substring a 0 2) "-i")))
+
+(defn- option-letters? [a :string i :i64] :bool
+  (if (>= i (string-byte-length a))
+    true
+    (let [c (string-code-point-at a i)]
+      (if (= c 110) (option-letters? a (+ i 1))
+        (if (= c 69) (option-letters? a (+ i 1))
+          (if (= c 101) (option-letters? a (+ i 1)) false))))))
+
+(defn- option? [a :string] :bool
+  (if (< (string-byte-length a) 2)
+    false
+    (if (= (string-code-point-at a 0) 45) (option-letters? a 1) false)))
+
+(defn- script-index-from [i :i64] :i64
+  (if (>= i (total))
+    i
+    (let [a (arg (decimal-of i))]
+      (if (string=? a "-i")
+        (script-index-from (+ i 2))
+        (if (in-place-arg? a)
+          (script-index-from (+ i 1))
+          (if (option? a) (script-index-from (+ i 1)) i))))))
+
+(defn- in-place-from [i :i64] :i64
+  (if (>= i (script-index)) -1 (if (in-place-arg? (arg (decimal-of i))) i (in-place-from (+ i 1)))))
+
+(defn- in-place? [] :bool (>= (in-place-from 0) 0))
+
+;; The backup suffix: the rest of `-iEXT`, or the argument after `-i`.
+(defn- backup-suffix [] :string
+  (let [i (in-place-from 0)
+        a (arg (decimal-of i))]
+    (if (string=? a "-i") (arg (decimal-of (+ i 1))) (string-substring a 2 (string-byte-length a)))))
+
+(defn- script-index [] :i64 (script-index-from 0))
+
+(defn- option-has? [i :i64 letter :string] :bool
+  (if (>= i (script-index))
+    false
+    (let [a (arg (decimal-of i))]
+      (if (if (option? a) (>= (string-index-of a letter) 0) false) true (option-has? (+ i 1) letter)))))
+
+(defn- quiet? [] :bool (option-has? 0 "n"))
+(defn- ere? [] :bool (option-has? 0 "E"))
+
+;; --- length-prefixed fields ----------------------------------------------
+;; `LEN:bytes`. No separator byte, so any bytes fit, programs included.
+(defn- lp [s :string] :string
+  (string-concat (decimal-of (string-byte-length s)) (string-concat ":" s)))
+
+(defn- field-len [s :string i :i64] :i64
+  (text->i64 s i (string-find-byte s 58 i) 0))
+
+(defn- field [s :string i :i64] :string
+  (let [c (string-find-byte s 58 i)]
+    (string-substring s (+ c 1) (+ (+ c 1) (field-len s i)))))
+
+(defn- after-field [s :string i :i64] :i64
+  (let [c (string-find-byte s 58 i)]
+    (+ (+ c 1) (field-len s i))))
+
+(defn- field-at [s :string j :i64 i :i64] :i64
+  (if (<= j 0) i (field-at s (- j 1) (after-field s i))))
+
+(defn- nth-field [s :string j :i64] :string (field s (field-at s j 0)))
+
+(defn- nth-i64 [s :string j :i64] :i64 (i64-of (nth-field s j)))
+
+(defn- error? [s :string] :bool
+  (if (= 0 (string-byte-length s)) false (= (string-code-point-at s 0) 33)))
+
+;; --- the script ----------------------------------------------------------
+(defn- skip-blanks [sc :string i :i64] :i64
+  (if (>= i (string-byte-length sc))
+    i
+    (if (= (string-code-point-at sc i) 32) (skip-blanks sc (+ i 1)) i)))
+
+(defn- skip-separators [sc :string i :i64] :i64
+  (if (>= i (string-byte-length sc))
+    i
+    (let [c (string-code-point-at sc i)]
+      (if (= c 32) (skip-separators sc (+ i 1))
+        (if (= c 59) (skip-separators sc (+ i 1)) i)))))
+
+;; The index of the first unescaped D in R from I, or -1.
+(defn- delim-index [r :string d :i64 i :i64] :i64
+  (let [n (string-byte-length r)]
+    (if (>= i n)
+      -1
+      (let [c (string-code-point-at r i)]
+        (if (= c 92)
+          (delim-index r d (+ i 2))
+          (if (= c d)
+            i
+            (delim-index r d (+ i (cp-width c)))))))))
+
+(defn- digits-end [sc :string i :i64] :i64
+  (if (>= i (string-byte-length sc))
+    i
+    (if (digit? (string-code-point-at sc i)) (digits-end sc (+ i 1)) i)))
+
+;; The end of the address at I: digits, `$`, `/.../`, `+digits`; I itself
+;; when there is none; -1 for an unterminated `/`.
+(defn- address-end [sc :string i :i64] :i64
+  (if (>= i (string-byte-length sc))
+    i
+    (let [c (string-code-point-at sc i)]
+      (if (digit? c)
+        (digits-end sc i)
+        (if (= c 36)
+          (+ i 1)
+          (if (= c 47)
+            (let [e (delim-index sc 47 (+ i 1))] (if (< e 0) -1 (+ e 1)))
+            (if (= c 43)
+              (if (< (+ i 1) (string-byte-length sc))
+                (if (digit? (string-code-point-at sc (+ i 1))) (digits-end sc (+ i 1)) i)
+                i)
+              i)))))))
+
+;; 0 none, 1 a line number, 2 `$`, 3 a regular expression, 5 `+N`.
+(defn- address-type [sc :string i :i64 e :i64] :i64
+  (if (= e i)
+    0
+    (let [c (string-code-point-at sc i)]
+      (if (digit? c) 1 (if (= c 36) 2 (if (= c 47) 3 5))))))
+
+;; --- patterns ------------------------------------------------------------
+(defn- meta? [c :i64 ere? :bool] :bool
+  (if (= c 46) true (if (= c 91) true (if (= c 93) true (if (= c 42) true (if (= c 94) true (if (= c 36) true (if (= c 92) true
+    (if ere? (if (= c 43) true (if (= c 63) true (if (= c 40) true (if (= c 41) true (if (= c 123) true (if (= c 125) true (= c 124))))))) false)))))))))
+
+(defn- has-meta? [p :string i :i64 ere? :bool] :bool
+  (if (>= i (string-byte-length p))
+    false
+    (let [c (string-code-point-at p i)]
+      (if (meta? c ere?) true (has-meta? p (+ i (cp-width c)) ere?)))))
+
+;; Bytes 1..127, so `\xHH` can name one.
+(defn- byte-table [] :string "\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u0009\u000a\u000b\u000c\u000d\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\u007f")
+
+(defn- hex-value [c :i64] :i64
+  (if (digit? c) (- c 48)
+    (if (if (>= c 97) (<= c 102) false) (- c 87)
+      (if (if (>= c 65) (<= c 70) false) (- c 55) -1))))
+
+;; The byte B as pattern text: escaped when it is a metacharacter.
+(defn- byte-text [b :i64 ere? :bool] :string
+  (let [t (string-substring (byte-table) (- b 1) b)]
+    (if (meta? b ere?) (string-concat "\\" t) t)))
+
+;; P with `\D` (D the delimiter) reduced to D and `\xHH` to its byte; every
+;; other escape reaches the engine as written.
+(defn- unescape-pattern [p :string i :i64 d :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length p)]
+    (if (>= i n)
+      acc
+      (let [c (string-code-point-at p i)]
+        (if (if (= c 92) (< (+ i 1) n) false)
+          (let [e (string-code-point-at p (+ i 1))]
+            (if (= e d)
+              (unescape-pattern p (+ i 2) d (string-concat acc (string-substring p (+ i 1) (+ i 2))) ere?)
+              (if (if (= e 120) (< (+ i 3) n) false)
+                (let [h (hex-value (string-code-point-at p (+ i 2)))
+                      l (hex-value (string-code-point-at p (+ i 3)))
+                      b (+ (* 16 h) l)]
+                  (if (if (>= h 0) (if (>= l 0) (if (> b 0) (< b 128) false) false) false)
+                    (unescape-pattern p (+ i 4) d (string-concat acc (byte-text b ere?)) ere?)
+                    (unescape-pattern p (+ i 2) d (string-concat acc (string-substring p i (+ i 2))) ere?)))
+                (unescape-pattern p (+ (+ i 1) (cp-width e)) d (string-concat acc (string-substring p i (+ (+ i 1) (cp-width e)))) ere?))))
+          (unescape-pattern p (+ i (cp-width c)) d (string-concat acc (string-substring p i (+ i (cp-width c)))) ere?))))))
+
+;; `R` + program + newline + prefilter runs for a pattern with a
+;; metacharacter, `L` + bytes for one without, `!` + message when the
+;; engine refuses it. The runs (rx/prefilter: a literal each matching line
+;; must hold, or none) let a host search skip most lines before the
+;; simulation; measured 2026-09-17 on 769,400 lines, `/^\.\.\./,/^:/p`
+;; 3.69 s unfiltered.
+(defn- compiled-pattern [raw :string d :i64 ere? :bool] :string
+  (if (= 0 (string-byte-length raw))
+    "!first RE may not be empty"
+    (let [pat (unescape-pattern raw 0 d "" ere?)]
+      (if (= 0 (string-byte-length pat))
+        "!first RE may not be empty"
+        (if (has-meta? pat 0 ere?)
+          (let [prog (rx/compile-pattern pat ere?)]
+            (if (rx/error? prog)
+              (string-concat "!RE error: " (string-substring prog 1 (string-byte-length prog)))
+              (string-concat "R" (string-concat prog (string-concat (nl) (rx/prefilter pat ere?))))))
+          (string-concat "L" pat))))))
+
+;; The address in [I, E) as its value: the digits, "" for `$`, the compiled
+;; pattern for `/re/`, the digits after `+`.
+(defn- address-value [sc :string i :i64 e :i64 ere? :bool] :string
+  (let [c (string-code-point-at sc i)]
+    (if (= c 36)
+      ""
+      (if (= c 47)
+        (compiled-pattern (string-substring sc (+ i 1) (- e 1)) 47 ere?)
+        (if (= c 43)
+          (string-substring sc (+ i 1) e)
+          (string-substring sc i e))))))
+
+;; The replacement as length-prefixed PIECES with a REF field between each
+;; consecutive pair -- `0` for `&` (the match), `1`..`9` for `\N` (the
+;; group; 2026-09-17, rx/captures): `a&b\1` is `1:a1:01:b1:10:`. `\&` is
+;; `&`, `\n` a newline, `\t` a tab, any other `\X` is X.
+(defn- template [rep :string i :i64 piece :string acc :string] :string
+  (let [n (string-byte-length rep)]
+    (if (>= i n)
+      (string-concat acc (lp piece))
+      (let [c (string-code-point-at rep i)]
+        (if (= c 38)
+          (template rep (+ i 1) "" (string-concat acc (string-concat (lp piece) (lp "0"))))
+          (if (if (= c 92) (< (+ i 1) n) false)
+            (let [e (string-code-point-at rep (+ i 1))]
+              (if (if (>= e 49) (<= e 57) false)
+                (template rep (+ i 2) "" (string-concat acc (string-concat (lp piece) (lp (string-substring rep (+ i 1) (+ i 2))))))
+                (if (= e 110)
+                  (template rep (+ i 2) (string-concat piece (nl)) acc)
+                (if (= e 116)
+                  (template rep (+ i 2) (string-concat piece "\t") acc)
+                  (template rep (+ (+ i 1) (cp-width e)) (string-concat piece (string-substring rep (+ i 1) (+ (+ i 1) (cp-width e)))) acc)))))
+            (template rep (+ i (cp-width c)) (string-concat piece (string-substring rep i (+ i (cp-width c)))) acc)))))))
+
+;; The highest group a template refers to (0 when only `&` or nothing).
+(defn- max-ref [tpl :string i :i64 acc :i64] :i64
+  (let [j (after-field tpl i)]
+    (if (>= j (string-byte-length tpl))
+      acc
+      (let [r (i64-of (field tpl j))]
+        (max-ref tpl (after-field tpl j) (if (> r acc) r acc))))))
+
+;; Group K of GROUPS (ten `start:end;` tokens, offsets into PS) as text;
+;; a group that did not take part is "".
+(defn- group-text [groups :string k :i64 ps :string] :string
+  (let [i (group-token-at groups k)
+        colon (string-find-byte groups 58 i)
+        semi (string-find-byte groups 59 i)
+        st (string-substring groups i colon)]
+    (if (string=? st "-1")
+      ""
+      (string-substring ps (i64-of st) (i64-of (string-substring groups (+ colon 1) semi))))))
+
+;; The index where token K starts.
+(defn- group-token-at [groups :string k :i64] :i64
+  (if (<= k 0) 0 (+ 1 (string-find-byte groups 59 (group-token-at groups (- k 1))))))
+
+;; The template TPL over PS with GROUPS: pieces with the referenced group
+;; between each pair.
+(defn- expand [tpl :string i :i64 ps :string groups :string acc :string] :string
+  (let [j (after-field tpl i)
+        out (string-concat acc (field tpl i))]
+    (if (>= j (string-byte-length tpl))
+      out
+      (expand tpl (after-field tpl j) ps groups
+              (string-concat out (group-text groups (i64-of (field tpl j)) ps))))))
+
+;; GROUPS for a match [S, E) with no capture groups (the literal path).
+(defn- whole-groups [s :i64 e :i64] :string
+  (string-concat (decimal-of s) (string-concat ":" (string-concat (decimal-of e) ";-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;"))))
+
+;; Substitute flags from I: bit 1 `g`, bit 2 `p`; -1 for any other letter
+;; or a repeated one (`gg` is refused, as /usr/bin/sed refuses it).
+(defn- flag-bits [sc :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length sc))
+    acc
+    (let [c (string-code-point-at sc i)]
+      (if (= c 103) (if (bit-set? acc 0) -1 (flag-bits sc (+ i 1) (+ acc 1)))
+        (if (= c 112) (if (bit-set? acc 1) -1 (flag-bits sc (+ i 1) (+ acc 2)))
+          (if (= c 59) acc (if (= c 32) acc -1)))))))
+
+(defn- flags-end [sc :string i :i64] :i64
+  (if (>= i (string-byte-length sc))
+    i
+    (let [c (string-code-point-at sc i)]
+      (if (= c 59) i (if (= c 32) i (flags-end sc (+ i 1)))))))
+
+;; The records end with one more field, the SINK: `SINK` for standard
+;; output, `SINK<path>` for the file `-i` appends each line to. A record's
+;; first field is an address type (a digit), so the sink is told apart by
+;; its first byte.
+(defn- at-sink? [cmds :string] :bool
+  (if (>= 0 (string-byte-length cmds)) true (= (string-code-point-at (nth-field cmds 0) 0) 83)))
+
+(defn- sink-of [cmds :string] :string
+  (if (at-sink? cmds)
+    (let [f (nth-field cmds 0)] (string-substring f 4 (string-byte-length f)))
+    (sink-of (string-substring cmds (field-at cmds 8 0) (string-byte-length cmds)))))
+
+;; Does the script have a second `+N` address from I? One countdown is kept.
+(defn- plus-count [cmds :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length cmds))
+    acc
+    (plus-count cmds (field-at cmds 8 i) (+ acc (if (string=? (field cmds (field-at cmds 2 i)) "5") 1 0)))))
+
+(defn- command-count [cmds :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length cmds))
+    acc
+    (command-count cmds (field-at cmds 8 i) (+ acc 1))))
+
+;; The command at P0 (after its addresses), appended to ACC, then the rest.
+(defn- parse-command [sc :string p0 :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length sc)]
+    (if (>= p0 n)
+      "!unsupported script"
+      (let [c (string-code-point-at sc p0)]
+        (if (if (= c 112) true (= c 100))
+          (let [q (skip-blanks sc (+ p0 1))]
+            (if (if (< q n) (not (= (string-code-point-at sc q) 59)) false)
+              "!unsupported script"
+              (parse sc q (string-concat acc (string-concat (lp (string-substring sc p0 (+ p0 1))) (string-concat (lp "") (string-concat (lp "") (lp "0"))))) ere?)))
+          (if (= c 115)
+            (if (>= (+ p0 1) n)
+              "!unsupported script"
+              (let [d (string-code-point-at sc (+ p0 1))
+                    wd (cp-width d)
+                    ps (+ (+ p0 1) wd)
+                    e1 (delim-index sc d ps)
+                    e2 (if (< e1 0) -1 (delim-index sc d (+ e1 wd)))]
+                (if (< e2 0)
+                  "!unsupported script"
+                  (let [pat (compiled-pattern (string-substring sc ps e1) d ere?)
+                        tpl (template (string-substring sc (+ e1 wd) e2) 0 "" "")
+                        bits (flag-bits sc (+ e2 wd) 0)
+                        groups (if (error? pat) 0 (if (= (string-code-point-at pat 0) 82) (rx/group-count (unescape-pattern (string-substring sc ps e1) 0 d "" ere?) ere?) 0))]
+                    (if (error? pat)
+                      pat
+                      (if (error? tpl)
+                        tpl
+                      ;; `\N` past the pattern's groups: /usr/bin/sed's words.
+                      (if (> (max-ref tpl 0 0) groups)
+                        (string-concat "!\\" (string-concat (decimal-of (max-ref tpl 0 0)) " not defined in the RE"))
+                        (if (< bits 0)
+                          "!unsupported script"
+                          (parse sc (flags-end sc (+ e2 wd))
+                                 (string-concat acc (string-concat (lp "s") (string-concat (lp pat) (string-concat (lp tpl) (lp (decimal-of bits))))))
+                                 ere?)))))))))
+            "!unsupported script"))))))
+
+;; The script from I as commands, appended to ACC; `!` + message when it
+;; is not one this implements.
+(defn parse [sc :string i :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length sc)
+        a0 (skip-separators sc i)]
+    (if (>= a0 n)
+      acc
+      (let [a1 (address-end sc a0)
+            t1 (if (< a1 0) 5 (address-type sc a0 a1))]
+        (if (= t1 5)
+          "!unsupported script"
+          (let [b0 (skip-blanks sc a1)
+                comma? (if (< b0 n) (= (string-code-point-at sc b0) 44) false)
+                c0 (if comma? (skip-blanks sc (+ b0 1)) b0)
+                c1 (if comma? (address-end sc c0) c0)
+                t2 (if comma? (if (< c1 0) 0 (address-type sc c0 c1)) 0)]
+            (if (if comma? (if (= t2 0) true (= t1 0)) false)
+              "!unsupported script"
+              (let [v1 (if (= t1 0) "" (address-value sc a0 a1 ere?))
+                    v2 (if (= t2 0) "" (address-value sc c0 c1 ere?))]
+                (if (error? v1)
+                  v1
+                  (if (error? v2)
+                    v2
+                    (parse-command sc (skip-blanks sc c1)
+                                   (string-concat acc (string-concat (lp (decimal-of t1)) (string-concat (lp v1) (string-concat (lp (decimal-of t2)) (lp v2)))))
+                                   ere?)))))))))))
+
+;; --- matching ------------------------------------------------------------
+(defn- program-of [v :string] :string
+  (string-substring v 1 (string-find-byte v 10 0)))
+
+(defn- runs-of [v :string] :string
+  (string-substring v (+ 1 (string-find-byte v 10 0)) (string-byte-length v)))
+
+;; Is the line a candidate: no prefilter, or one of its runs on the line?
+(defn- candidate? [v :string ps :string] :bool
+  (let [runs (runs-of v)]
+    (if (= 0 (string-byte-length runs)) true (rx/holds-run? ps runs 0))))
+
+(defn- pattern-hit? [v :string ps :string] :bool
+  (if (= (string-code-point-at v 0) 82)
+    (if (candidate? v ps) (rx/matches? (program-of v) ps 0 (string-byte-length ps)) false)
+    (>= (string-index-of ps (string-substring v 1 (string-byte-length v))) 0)))
+
+(defn- addr-hit? [t :i64 v :string ps :string l :i64 last :i64] :bool
+  (if (= t 1) (= l (i64-of v))
+    (if (= t 2) (= l last)
+      (if (= t 3) (pattern-hit? v ps) false))))
+
+;; --- substitution --------------------------------------------------------
+;; Each answers "1" + the new line when something was substituted, else
+;; "0" + the line as it was.
+
+;; FG: bit 0 `g`, bit 1 "first call".
+(defn- subst-lit [lit :string tpl :string rest :string fg :i64 acc :string] :string
+  (let [i (string-index-of rest lit)]
+    (if (< i 0)
+      (if (bit-set? fg 1) (string-concat "0" rest) (string-concat acc rest))
+      (let [out (string-concat (string-concat (if (bit-set? fg 1) "1" acc) (string-substring rest 0 i))
+                               (expand tpl 0 rest (whole-groups i (+ i (string-byte-length lit))) ""))
+            after (string-substring rest (+ i (string-byte-length lit)) (string-byte-length rest))]
+        (if (bit-set? fg 0)
+          (subst-lit lit tpl after 1 out)
+          (string-concat out after))))))
+
+;; FA: from * 4 + adjacent * 2 + g, ADJACENT meaning the previous match ended
+;; at FROM and was not empty, so an empty match there is skipped (measured:
+;; `s/b*/-/g` over `abc` is `-a-c-`, not `-a--c-`).
+(defn- subst-rx [prog :string tpl :string ps :string fa :i64 acc :string] :string
+  (let [n (string-byte-length ps)
+        from (quot fa 4)
+        adjacent? (bit-set? fa 1)
+        g? (bit-set? fa 0)
+        first? (= 0 (quot fa 2))
+        r (if (> from n) -1 (rx/find prog ps 0 from n))
+        s (quot r 4294967296)
+        e (- r (* 4294967296 (quot r 4294967296)))]
+    (if (< r 0)
+      (if first? (string-concat "0" ps) (string-concat acc (string-substring ps from n)))
+      (if (if adjacent? (if (= s e) (= s from) false) false)
+        (if (>= s n)
+          acc
+          (let [w (cp-width (string-code-point-at ps s))]
+            (subst-rx prog tpl ps (+ (* 4 (+ s w)) (if g? 1 0)) (string-concat acc (string-substring ps from (+ s w))))))
+        (let [groups (if (> (max-ref tpl 0 0) 0)
+                       (let [g (rx/captures prog ps 0 n r)] (if (string=? g "!") (whole-groups s e) g))
+                       (whole-groups s e))
+              out (string-concat (string-concat (if first? "1" acc) (string-substring ps from s))
+                                 (expand tpl 0 ps groups ""))]
+          (if (not g?)
+            (string-concat out (string-substring ps e n))
+            (if (> e s)
+              (subst-rx prog tpl ps (+ (* 4 e) 3) out)
+              (if (>= s n)
+                out
+                (let [w (cp-width (string-code-point-at ps s))]
+                  (subst-rx prog tpl ps (+ (* 4 (+ s w)) 1) (string-concat out (string-substring ps s (+ s w)))))))))))))
+
+(defn- substitute [pat :string tpl :string ps :string g? :bool] :string
+  (if (= (string-code-point-at pat 0) 82)
+    (if (candidate? pat ps)
+      (subst-rx (program-of pat) tpl ps (if g? 1 0) "")
+      (string-concat "0" ps))
+    (subst-lit (string-substring pat 1 (string-byte-length pat)) tpl ps (+ 2 (if g? 1 0)) "")))
+
+;; --- the cycle -----------------------------------------------------------
+;; PACKED: (((l * 2^26 + last) * 64 + k) * 2 + terminated) * 2 + quiet.
+(defn- pk-l [p :i64] :i64 (quot p 34359738368))
+(defn- pk-last [p :i64] :i64 (- (quot p 512) (* 67108864 (quot p 34359738368))))
+(defn- pk-k [p :i64] :i64 (- (quot p 8) (* 64 (quot p 512))))
+(defn- pk-term? [p :i64] :bool (bit-set? p 2))
+(defn- pk-quiet? [p :i64] :bool (bit-set? p 0))
+
+(defn- fs-request [s :string] :string
+  (typed-cap-call :fs/app-data :string :string s))
+
+;; The line to the sink: standard output, or appended to the `-i` temporary
+;; (one APPEND per line, the line and its newline together).
+(defn- emit-line [ps :string packed :i64 sink :string] :i64
+  (if (= 0 (string-byte-length sink))
+    (do (emit ps)
+        (if (pk-term? packed) (emit (nl)) "")
+        0)
+    (do (fs-request (string-concat (string-concat sink "APPEND_SEP")
+                                   (if (pk-term? packed) (string-concat ps (nl)) ps)))
+        0)))
+
+;; Whether command K (the record at the head of CMDS) selects this line, and
+;; its range state after it: OUT * 2 + selected, OUT holding bit k when the
+;; range stays active and the `+N` countdown above bit 40.
+(defn- select [cmds :string ps :string st :i64 out :i64 packed :i64] :i64
+  (let [t1 (nth-i64 cmds 0)
+        v1 (nth-field cmds 1)
+        t2 (nth-i64 cmds 2)
+        v2 (nth-field cmds 3)
+        l (pk-l packed)
+        last (pk-last packed)
+        k (pk-k packed)
+        bit (pow2 k)]
+    (if (= t1 0)
+      (+ (* 2 out) 1)
+      (if (= t2 0)
+        (+ (* 2 out) (if (addr-hit? t1 v1 ps l last) 1 0))
+        (if (bit-set? st k)
+          ;; Active: this line is selected; does the range end on it?
+          (if (= t2 1)
+            (if (>= l (i64-of v2)) (+ (* 2 out) 1) (+ (* 2 (+ out bit)) 1))
+            (if (= t2 2)
+              (+ (* 2 (+ out bit)) 1)
+              (if (= t2 3)
+                (if (pattern-hit? v2 ps) (+ (* 2 out) 1) (+ (* 2 (+ out bit)) 1))
+                (let [left (- (quot st 1099511627776) 1)]
+                  (if (<= left 0) (+ (* 2 out) 1) (+ (* 2 (+ (+ out bit) (* left 1099511627776))) 1))))))
+          (if (not (addr-hit? t1 v1 ps l last))
+            (* 2 out)
+            ;; Starts here. A line-number end at or before this line, or
+            ;; `+0`, makes it one line; a pattern end is tested from the next.
+            (if (= t2 1)
+              (if (<= (i64-of v2) l) (+ (* 2 out) 1) (+ (* 2 (+ out bit)) 1))
+              (if (= t2 2)
+                (if (= l last) (+ (* 2 out) 1) (+ (* 2 (+ out bit)) 1))
+                (if (= t2 3)
+                  (+ (* 2 (+ out bit)) 1)
+                  (let [n (i64-of v2)
+                        c (if (> n 4194303) 4194303 n)]
+                    (if (<= c 0) (+ (* 2 out) 1) (+ (* 2 (+ (+ out bit) (* c 1099511627776))) 1))))))))))))
+
+;; The range bits of the commands from the head of CMDS, unchanged: what
+;; `d` leaves for the commands it stops the cycle before.
+(defn- carry [cmds :string st :i64 out :i64 packed :i64] :i64
+  (if (at-sink? cmds)
+    out
+    (let [k (pk-k packed)
+          bit (if (bit-set? st k) (pow2 k) 0)
+          cnt (if (= 5 (nth-i64 cmds 2)) (* 1099511627776 (quot st 1099511627776)) 0)]
+      (carry (string-substring cmds (field-at cmds 8 0) (string-byte-length cmds)) st (+ out (+ bit cnt)) (+ packed 8)))))
+
+;; One line through the commands at the head of CMDS; answers the range
+;; state for the next line. Autoprint at the end unless -n.
+(defn- run-cmds [cmds :string ps :string st :i64 out :i64 packed :i64] :i64
+  (if (at-sink? cmds)
+    (do (if (pk-quiet? packed) 0 (emit-line ps packed (sink-of cmds))) out)
+    (let [r (select cmds ps st out packed)
+          out2 (quot r 2)
+          selected? (bit-set? r 0)
+          cmd (nth-field cmds 4)
+          rest (string-substring cmds (field-at cmds 8 0) (string-byte-length cmds))]
+      (if (not selected?)
+        (run-cmds rest ps st out2 (+ packed 8))
+        (if (string=? cmd "p")
+          (do (emit-line ps packed (sink-of cmds)) (run-cmds rest ps st out2 (+ packed 8)))
+          (if (string=? cmd "d")
+            (carry rest st out2 (+ packed 8))
+            (let [bits (nth-i64 cmds 7)
+                  r2 (substitute (nth-field cmds 5) (nth-field cmds 6) ps (bit-set? bits 0))
+                  ps2 (string-substring r2 1 (string-byte-length r2))]
+              (do (if (if (bit-set? bits 1) (= (string-code-point-at r2 0) 49) false) (emit-line ps2 packed (sink-of cmds)) 0)
+                  (run-cmds rest ps2 st out2 (+ packed 8))))))))))
+
+;; --- lines ---------------------------------------------------------------
+(defn- count-lines [text :string pos :i64 acc :i64] :i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      acc
+      (let [nl-at (string-find-byte text 10 pos)]
+        (count-lines text (if (< nl-at 0) n (+ nl-at 1)) (+ acc 1))))))
+
+;; Every line of TEXT from POS through the commands, each cycle in its own
+;; region; PACKED is (l * 2^26 + last) * 2 + quiet.
+(defn- lines [text :string cmds :string st :i64 pos :i64 packed :i64] :i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      0
+      (let [nl-at (string-find-byte text 10 pos)
+            end (if (< nl-at 0) n nl-at)
+            term (if (< nl-at 0) 0 1)
+            quiet (- packed (* 2 (quot packed 2)))
+            pk (+ (+ (* 512 (quot packed 2)) (* 4 term)) quiet)
+            st2 (arena-scope (run-cmds cmds (string-substring text pos end) st 0 pk))]
+        (lines text cmds st2 (+ end 1) (+ packed 134217728))))))
+
+;; --- operands ------------------------------------------------------------
+(defn complain [path :string] :i64
+  (do
+    (emit-error "sed: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; Every operand from I as one stream. A file lacking a final newline gets
+;; one only when a later operand brings a line (measured: `nonl empty` stays
+;; open, `nonl plain` is closed). A missing operand is reported and skipped.
+(defn- gather [i :i64 total :i64 acc :string] :string
+  (if (>= i total)
+    acc
+    (let [path (arg (decimal-of i))]
+      (if (exists? path)
+        (let [t (slurp-file path)
+              n (string-byte-length acc)
+              open? (if (= n 0) false (not (string=? (string-substring acc (- n 1) n) (nl))))
+              bridge (if (if open? (> (string-byte-length t) 0) false) (nl) "")]
+          (gather (+ i 1) total (string-concat (string-concat acc bridge) t)))
+        (do (complain path) (gather (+ i 1) total acc))))))
+
+(defn- all-exist? [i :i64 total :i64] :bool
+  (if (>= i total)
+    true
+    (if (exists? (arg (decimal-of i))) (all-exist? (+ i 1) total) false)))
+
+(defn- refuse [sc :string message :string] :i64
+  (do (emit-error "sed: ")
+      (if (if (string=? (string-substring message 0 (if (< (string-byte-length message) 9) 0 9)) "RE error:") true (= (string-code-point-at message 0) 92))
+        (do (emit-error "1: \"") (emit-error sc) (emit-error (nl)) (emit-error "\": ") 0)
+        0)
+      (emit-error message)
+      (emit-error (nl))
+      1))
+
+(defn- run [sc :string cmds :string si :i64] :i64
+  (let [total (total)
+        text (if (>= (+ si 1) total) (stdin "") (gather (+ si 1) total ""))
+        last (count-lines text 0 0)]
+    (do (lines text (string-concat cmds (lp "SINK")) 0 0 (+ (* 2 (+ 67108864 last)) (if (quiet?) 1 0)))
+        (if (all-exist? (+ si 1) total) 0 1))))
+
+;; --- in place ------------------------------------------------------------
+;; Each operand is its own stream (line numbers and `$` restart, as
+;; /usr/bin/sed does under -i). The output goes to `<path>.sed-tmp` one
+;; line at a time, the mode is copied, the original is renamed to the backup
+;; (if a suffix was given), and the temporary is renamed over the operand. A missing
+;; operand, or a directory, is reported with /usr/bin/sed's words and STOPS
+;; the run (exit 1): the operands before it are edited, the ones after it
+;; are not -- measured, and unlike the read-only path, which skips and
+;; goes on. Nothing reaches standard output.
+(defn- stat-of [path :string] :string (fs-request (string-concat path "STAT_SEP")))
+
+(defn- field-n [s :string n :i64 i :i64] :string
+  (let [sp (string-find-byte s 32 i)]
+    (if (<= n 0)
+      (string-substring s i (if (< sp 0) (string-byte-length s) sp))
+      (field-n s (- n 1) (+ sp 1)))))
+
+(defn- octal-of [mode :i64] :string
+  (if (< mode 8) (digit-text mode) (string-concat (octal-of (quot mode 8)) (digit-text (- mode (* 8 (quot mode 8)))))))
+
+(defn- edit-in-place [path :string cmds :string suffix :string] :i64
+  (let [st (stat-of path)
+        text (slurp-file path)
+        tmp (string-concat path ".sed-tmp")
+        mode (- (i64-of (field-n st 0 0)) (* 4096 (quot (i64-of (field-n st 0 0)) 4096)))
+        last (count-lines text 0 0)]
+    (do (fs-request (string-concat tmp "WRITE_SEP"))
+        (lines text (string-concat cmds (lp (string-concat "SINK" tmp))) 0 0 (+ (* 2 (+ 67108864 last)) (if (quiet?) 1 0)))
+        ;; The backup is the original RENAMED (its mode travels with it, as
+        ;; /usr/bin/sed's `-i.bak` leaves a 640 backup of a 640 file).
+        (if (> (string-byte-length suffix) 0)
+          (fs-request (string-concat path (string-concat "RENAME_SEP" (string-concat path suffix))))
+          "")
+        (fs-request (string-concat tmp (string-concat "CHMOD_SEP" (octal-of mode))))
+        (fs-request (string-concat tmp (string-concat "RENAME_SEP" path)))
+        0)))
+
+(defn- each-in-place [i :i64 total :i64 cmds :string suffix :string] :i64
+  (if (>= i total)
+    0
+    (let [path (arg (decimal-of i))]
+      (if (not (exists? path))
+        (complain path)
+        (if (string=? (field-n (stat-of path) 3 0) "1")
+          (do (emit-error "sed: ") (emit-error path) (emit-error ": in-place editing only works for regular files") (emit-error (nl))
+              1)
+          (+ (edit-in-place path cmds suffix) (each-in-place (+ i 1) total cmds suffix)))))))
+
+(defn- run-in-place [cmds :string si :i64] :i64
+  (if (>= (+ si 1) (total))
+    (refuse "" "-I or -i may not be used with stdin")
+    (if (> (each-in-place (+ si 1) (total) cmds (backup-suffix)) 0) 1 0)))
+
+(defn main [] :i64
+  (let [si (script-index)]
+    (if (>= si (total))
+      (refuse "" "unsupported script")
+      (let [sc (arg (decimal-of si))
+            cmds (parse sc 0 "" (ere?))]
+        (if (error? cmds)
+          (refuse sc (string-substring cmds 1 (string-byte-length cmds)))
+          (if (> (plus-count cmds 0 0) 1)
+            (refuse sc "unsupported script: two +N addresses")
+            (if (> (command-count cmds 0 0) 40)
+              (refuse sc "unsupported script: more than 40 commands")
+              (if (in-place?) (run-in-place cmds si) (run sc cmds si)))))))))

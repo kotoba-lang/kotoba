@@ -1,0 +1,645 @@
+;; grep -- fixed-string line search, in the shape of POSIX grep
+;; (IEEE Std 1003.1) restricted to `-F`.
+;;
+;;   grep [-i|-v|-c|-n|-l] PATTERN FILE...
+;;
+;; Exit 0 when at least one line was selected, 1 when none was, 2 when an
+;; operand could not be read. That status IS the answer for a caller in a
+;; pipeline, which is why it is asserted alongside the bytes.
+;;
+;; ## Fixed string, not a regular expression
+;;
+;; POSIX grep reads its pattern as a basic regular expression; this reads it
+;; literally, which is `grep -F`. Measured 2026-09-10 on a file holding
+;; `a.c` and `abc`: `grep 'a.c'` answers both lines and `grep -F 'a.c'`
+;; answers one. The test compares against `-F` and says so, rather than
+;; comparing against a different operation and calling the difference a bug.
+;;
+;; ## Search the file, not the lines (2026-09-15)
+;;
+;; `string-index-of` is a host slot since context ABI v5 -- one memmem per
+;; call, nothing allocated. Until then it was a per-byte source rewrite, and
+;; this command, which asked it twice per line, measured 75 ns/byte and
+;; trapped after 2 MB of a 3.3 MB file with the pair arena spent one handle
+;; per byte. The shape now is ripgrep's: find the NEXT OCCURRENCE of the
+;; needle in the whole remaining text with one call, then find the line
+;; around it -- newlines between the last position and the hit (one call
+;; each, which is also how `-n` counts), and the newline after it. Text
+;; between matches is never walked by this program at all. `-v` is the one
+;; mode that must look at every line, and does, with one call per line.
+;;
+;; `-i` is the SAME walk over a folded copy of the text (2026-09-16,
+;; context ABI v7): `string-fold-ascii` lowers A-Z in one host pass, one
+;; byte to one byte, so an offset into the folded text is the same offset
+;; into the original -- the matches are found in the fold and the lines are
+;; reported from the original. Until then `-i` folded every LINE by 26
+;; `string-replace-all` passes and was the slow mode by a factor of 26.
+;; ASCII only, in the README.
+;;
+;; ## The newline grep ADDS
+;;
+;; A matched last line without a trailing newline is printed WITH one.
+;; Measured: a 20-byte file whose only line has no newline produces 21 bytes.
+;; This is the opposite of head, which adds nothing -- two commands, two
+;; contracts, and the only way to know which is which is to run them.
+;;
+;; ## ONE flag, found by SHAPE
+;;
+;; Argument 0 is the flag when it STARTS WITH `-`, and the pattern otherwise.
+;; It is deliberately not the argument COUNT: `-c alpha words` and
+;; `alpha words one` are both three arguments and mean entirely different
+;; things, and both are in the suite for that reason. Sibling commands in
+;; this family have carried exactly that bug.
+;;
+;; Combining flags (`-in`, `-vc`) is out of scope and exits 2 rather than
+;; guessing; so does any other dashed argument 0.
+;;
+;; ## Five parameters, so two of them are packed
+;;
+;; A function here carries at most five parameters. The scan needs the
+;; searchable text, the original text, the needle, and four scalars -- the
+;; byte position, the line number, the number of lines selected, and the
+;; mode. POS and MODE share one i64 (`mode + 8 * pos`); LINE and HITS share
+;; another (`line * 1e9 + hits`), as this command always packed them. The
+;; output prefix is rebuilt from argument F when a line is reported, so it
+;; needs no parameter of its own.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
+(ns grep.core (:export [main]) (:require [regex.core :as rx]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; The capability call is a function's RESULT and nothing else: the
+;; linked-module route (a `:require` in the namespace) admits a named
+;; capability operation only in a typed result position -- as an argument
+;; or a `let` binding it is "named capability operation requires a typed
+;; result context", measured 2026-09-17 when regex.core was linked in.
+(defn- exists-answer [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn readable? [path :string] :bool
+  (string=? (exists-answer path) "1"))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+;; Numbers cross the wire as decimal TEXT, so `-c` and `-n` render their own
+;; digits. There is no number-to-string on this surface; there is a digit
+;; walk, and this is it.
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn line-unit [] :i64 1000000000)
+
+;; MODE is a bit set since 2026-09-17: 1 `-i`, 2 `-v`, 4 `-c`, 8 `-n`,
+;; 16 `-l`, 32 `-o`, 64 `-h`, 128 `-q`, 256 `-E`, 512 `-F`, in any combination and spelling
+;; (`-in`, `-i -n`, `-vc`). Measured over 1,268,018 agent Bash calls: `-n`
+;; 17,633, `-c` 7,822, `-v` 6,234, `-o` 3,183, `-i` 2,929 -- and the
+;; combinations were an unknown flag here while each letter alone was
+;; accepted. -1 for a letter this does not have (-r, -E, -w, -x, ...).
+(defn- letter-bits [a :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length a))
+    acc
+    (let [c (string-code-point-at a i)]
+      (if (= c 105) (letter-bits a (+ i 1) (bit-or acc 1))
+        (if (= c 118) (letter-bits a (+ i 1) (bit-or acc 2))
+          (if (= c 99) (letter-bits a (+ i 1) (bit-or acc 4))
+            (if (= c 110) (letter-bits a (+ i 1) (bit-or acc 8))
+              (if (= c 108) (letter-bits a (+ i 1) (bit-or acc 16))
+                (if (= c 111) (letter-bits a (+ i 1) (bit-or acc 32))
+                  (if (= c 104) (letter-bits a (+ i 1) (bit-or acc 64))
+                    (if (= c 113) (letter-bits a (+ i 1) (bit-or acc 128))
+                      (if (= c 69) (letter-bits a (+ i 1) (bit-or acc 256))
+                        (if (= c 70) (letter-bits a (+ i 1) (bit-or acc 512))
+                          -1)))))))))))))
+
+;; Is argument I a flag: a dash and letters (a lone `-` or `--` is not)?
+(defn- flag-arg? [i :i64] :bool
+  (let [a (arg (decimal-of i))]
+    (if (< (string-byte-length a) 2)
+      false
+      (if (= (string-code-point-at a 0) 45)
+        (not (= (string-code-point-at a 1) 45))
+        false))))
+
+;; The set of every leading flag argument, or -1.
+(defn- flags-from [i :i64 acc :i64] :i64
+  (if (string=? (decimal-of i) (arg ""))
+    acc
+    (if (flag-arg? i)
+      (let [bits (letter-bits (arg (decimal-of i)) 1 0)]
+        (if (< bits 0) -1 (flags-from (+ i 1) (bit-or acc bits))))
+      acc)))
+
+(defn mode-of [] :i64 (flags-from 0 0))
+
+;; The index of the pattern: after the flags, and after a `--` if one ends
+;; them (`grep -- -x file`).
+(defn- pattern-index-from [i :i64] :i64
+  (if (string=? (decimal-of i) (arg ""))
+    i
+    (if (flag-arg? i)
+      (pattern-index-from (+ i 1))
+      (if (string=? (arg (decimal-of i)) "--") (+ i 1) i))))
+
+(defn- has? [mode :i64 bit :i64] :bool (= bit (bit-and mode bit)))
+
+;; --- ASCII case folding, and only ASCII ----------------------------------
+;; `string-fold-ascii` (ABI v7) lowers A-Z and keeps every other code
+;; point, over the needle and over the WHOLE text once per file. This is
+;; NARROWER than the system utility and the README says so. Measured
+;; 2026-09-10 in en_US.UTF-8 on a file holding `Éclair` and `éclair`:
+;; `/usr/bin/grep -F -i É` answers BOTH lines, because it folds U+00C9 to
+;; U+00E9. This answers one. The divergence is asserted in the suite as a
+;; divergence.
+(defn fold [s :string] :string
+  (string-fold-ascii s))
+
+;; --- the packed scalars --------------------------------------------------
+;; PACKED is `mode + 1024 * prefixed + 2048 * pos + 2^49 * f`: MODE ten
+;; bits, PREFIXED 1 when reported lines carry `FILE:` (two or more operands
+;; and no -h), POS the byte cursor (38 bits), F the index of the file operand
+;; in argv. F is carried rather than the prefix string because the prefix is
+;; only needed for reported lines, and a parameter is the scarcer thing.
+(defn pack [mode :i64 prefixed :i64 pos :i64 f :i64] :i64
+  (+ mode (+ (* 1024 prefixed) (+ (* 2048 pos) (* 562949953421312 f)))))
+
+(defn mode-part [packed :i64] :i64
+  (- packed (* 1024 (quot packed 1024))))
+
+(defn prefixed? [packed :i64] :bool
+  (= 1 (- (quot packed 1024) (* 2 (quot packed 2048)))))
+
+(defn pos-part [packed :i64] :i64
+  (let [q (quot packed 2048)]
+    (- q (* 274877906944 (quot q 274877906944)))))
+
+(defn file-part [packed :i64] :i64
+  (quot packed 562949953421312))
+
+;; The prefix a reported line carries: `FILE:` when there are two or more
+;; file operands (argument F is the operand), nothing when there is one.
+;; One argv read per REPORTED line in the multi-operand case, and no call at
+;; all in the single-operand one: measured on a 33 MB file with 598,400
+;; matching lines, re-deriving the operand count from argv for every line
+;; (two capability calls each) was most of the run.
+(defn emit-prefix [packed :i64] :i64
+  (if (prefixed? packed)
+    (do (emit (arg (decimal-of (file-part packed)))) (emit ":") 0)
+    0))
+
+;; What a selected line (or, under -o, a match) puts on stdout.
+;;   -c, -l, -q  nothing here; -c and -l write one line per file in `scan`
+;;   -n          PREFIX then the 1-based line number then `:` then the line.
+;;               Measured: `grep -F -n alpha words one` writes `words:1:alpha`.
+;;   else        PREFIX then the line.
+(defn report [line :string packed :i64 number :i64] :i64
+  (let [mode (mode-part packed)]
+    (if (if (has? mode 4) true (if (has? mode 16) true (has? mode 128)))
+      0
+      (if (has? mode 8)
+        (do (emit-prefix packed)
+            (emit (decimal-of number))
+            (emit ":")
+            (emit line)
+            (emit (nl))
+            0)
+        (do (emit-prefix packed) (emit line) (emit (nl)) 0)))))
+
+;; -o prints the MATCH, not the line, and every match on a line: measured,
+;; `grep -F -o a` over `aa` prints two lines. Only when something is
+;; printed at all -- under -c / -l / -q the line walk is what counts.
+(defn- only-matches? [mode :i64] :bool
+  (if (has? mode 32) (not (if (has? mode 4) true (if (has? mode 16) true (has? mode 128)))) false))
+
+;; --- the scan ------------------------------------------------------------
+;; The byte offset of the newline at or after I in TEXT of length N, or N
+;; when there is none: the END of the line that starts at or contains I.
+;; Every search here is `string-index-of-from` (context ABI v8): one host
+;; call from an offset, no view cut. The needle is a literal -- a handle
+;; each time it is evaluated -- so each search is a region.
+(defn line-end [text :string i :i64 n :i64] :i64
+  (let [k (string-find-byte text 10 i)]
+    (if (< k 0) n (if (> k n) n k))))
+
+;; Walk the newlines in [CUR, HIT): answers `start * 2^23 + line`, where
+;; START is the offset of the line containing HIT and LINE its number, given
+;; that CUR starts a line numbered LINE. One host call per newline crossed,
+;; which is what `-n` costs and what nothing else pays.
+(defn line-of [text :string cur :i64 hit :i64 line :i64] :i64
+  (let [k (string-find-byte text 10 cur)]
+    (if (if (< k 0) true (>= k hit))
+      (+ (* cur 8388608) line)
+      (line-of text (+ k 1) hit (+ line 1)))))
+
+;; The last newline in [FROM, HIT), or -1: found by searching FORWARD inside
+;; the window for the first newline and then for the next after it, until
+;; none -- one call per newline in the window plus one.
+(defn last-newline [text :string from :i64 hit :i64 seen :i64] :i64
+  (let [k (string-find-byte text 10 from)]
+    (if (if (< k 0) true (>= k hit))
+      seen
+      (last-newline text (+ k 1) hit k))))
+
+;; The offset where the line containing HIT starts, without a line count:
+;; the last newline before HIT, looked for in a window of W bytes ending at
+;; HIT that doubles backwards until it holds one or reaches FLOOR (the end
+;; of the previously reported line, which is known to start a line). Two or
+;; three calls per match however far the previous match was -- where
+;; `line-of` costs one per line crossed, which `-n` needs and nothing else
+;; does. Measured on a 33 MB file with 26,400 matches thirty lines apart:
+;; 0.35 s counting, 0.16 s with this.
+(defn line-start [text :string floor :i64 hit :i64 w :i64] :i64
+  (let [from (if (< (- hit w) floor) floor (- hit w))
+        k (last-newline text from hit -1)]
+    (if (< k 0)
+      (if (= from floor) floor (line-start text floor hit (* w 2)))
+      (+ k 1))))
+
+;; Every mode but `-v`: jump to the next occurrence with ONE search over
+;; the remaining text, report the line around it, continue after that
+;; line. Under `-i` TEXT is the folded copy and ORIG the original, at the
+;; same offsets. STATE is `line * 1e9 + hits` for the line that starts at
+;; the cursor; the line number is only maintained under `-n`.
+(defn scan-hits [text :string orig :string needle :string packed :i64 state :i64] :i64
+  (let [n (string-byte-length text)
+        pos (pos-part packed)]
+    (if (>= pos n)
+      state
+      ;; Every allocating step of a match is its own REGION (arena-scope,
+      ;; ABI v6): the search view, the line walk's views, the reported
+      ;; line's view and the write counts are released as each answers its
+      ;; number, so the recursion carries only scalars and the arena stays
+      ;; where it was after the file was read -- measured 2026-09-16, a
+      ;; 33 MB file with 598,400 matching lines under the loader's DEFAULT
+      ;; 4,096 handles, where the unscoped scan spent four per match.
+      (let [k (string-index-of-from text needle pos)]
+        (if (< k 0)
+          state
+          (let [mode (mode-part packed)
+                where (arena-scope
+                       (if (has? mode 8)
+                         (line-of text pos k (quot state (line-unit)))
+                         (* (line-start text pos k 128) 8388608)))
+                start (quot where 8388608)
+                number (- where (* 8388608 (quot where 8388608)))
+                end (line-end text k n)
+                only? (only-matches? mode)
+                ;; Under -o the cursor resumes right after the MATCH, so the
+                ;; next occurrence on the same line is found too; the line
+                ;; number carried forward is then this line's, not the
+                ;; next's. Otherwise the whole line is done.
+                resume (if only? (+ k (string-byte-length needle)) (+ end 1))
+                next-line (if only? number (+ number 1))]
+            (do
+              (arena-scope (report (if only?
+                                     (string-substring orig k (+ k (string-byte-length needle)))
+                                     (string-substring orig start end))
+                                   packed number))
+              (scan-hits text orig needle
+                         (pack mode (if (prefixed? packed) 1 0) resume (file-part packed))
+                         (+ (* next-line (line-unit))
+                            (+ (- state (* (line-unit) (quot state (line-unit)))) 1))))))))))
+
+;; `-v`: every line, one search each; a line WITHOUT the needle is selected.
+(defn scan-lines [text :string orig :string needle :string packed :i64 state :i64] :i64
+  (let [n (string-byte-length text)
+        pos (pos-part packed)
+        mode (mode-part packed)]
+    (if (>= pos n)
+      state
+      ;; Per line, the same regions as `scan-hits`.
+      ;; The needle holds no newline, so a match starting before END lies
+      ;; inside the line.
+      (let [end (line-end text pos n)
+            number (quot state (line-unit))
+            hits (- state (* (line-unit) number))
+            k (string-index-of-from text needle pos)
+            found (if (< k 0) false (< k end))
+            selected (not found)]
+        (do
+          (if selected
+            (arena-scope (report (string-substring orig pos end) packed number))
+            0)
+          (scan-lines text orig needle
+                      (pack mode (if (prefixed? packed) 1 0) (+ end 1) (file-part packed))
+                      (+ (* (+ number 1) (line-unit)) (if selected (+ hits 1) hits))))))))
+
+;; `grep: PATH: No such file or directory`, exit 2 -- grep and sort exit 2
+;; here where cat, wc, head and uniq exit 1. Measured on each.
+(defn complain [path :string] :i64
+  (do
+    (emit-error "grep: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    2))
+
+;; The exit status is a three-way worst-of: an unreadable operand (2) beats
+;; a match (0), which beats no match (1). Measured: `grep -F alpha a.txt
+;; missing.txt` prints a.txt's match, complains about missing.txt, exits 2.
+(defn worse [a :i64 b :i64] :i64
+  (if (= a 2) 2 (if (= b 2) 2 (if (= a 0) 0 b))))
+
+;; Scanning one file, argument F. Returns 0 when something was selected and
+;; 1 when nothing was -- for `-v` that means a line was PRINTED.
+;;
+;; `-c` writes one line PER FILE whether or not anything matched. Measured:
+;; `grep -F -c alpha words one` writes `words:2` and `one:0`, and
+;; `grep -F -c zzz words` writes `0` and still exits 1. `-l` writes the file
+;; name ONCE however many lines matched, the operand rather than a prefix.
+;; --- regular expressions (2026-09-17, org-ieee-regex) ---------------------
+;;
+;; A pattern with a metacharacter -- `. [ ] * ^ $ \` and, under -E, `+ ? ( )
+;; { } |` -- is compiled by regex.core (POSIX ERE or BRE; -E picks) and
+;; matched one LINE at a time with `rx/find`, the leftmost-longest match.
+;; Measured 2026-09-17: `grep -E` is 9,582 of 1,268,018 agent Bash calls
+;; and its patterns are alternations of words, anchors, `+` and `.`. A
+;; pattern without a metacharacter, and every `-F` pattern, keeps the
+;; literal path above: one host search per occurrence, no simulation.
+;; The regex walk is one `find` per line (a Pike simulation, linear in the
+;; line times the program), each inside its own region.
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- meta? [c :i64 ere? :bool] :bool
+  (if (= c 46) true (if (= c 91) true (if (= c 93) true (if (= c 42) true (if (= c 94) true (if (= c 36) true (if (= c 92) true
+    (if ere? (if (= c 43) true (if (= c 63) true (if (= c 40) true (if (= c 41) true (if (= c 123) true (if (= c 125) true (= c 124))))))) false)))))))))
+
+(defn- has-meta? [p :string i :i64 ere? :bool] :bool
+  (if (>= i (string-byte-length p))
+    false
+    (let [c (string-code-point-at p i)]
+      (if (meta? c ere?) true (has-meta? p (+ i (cp-width c)) ere?)))))
+
+;; --- the literal prefilter ---------------------------------------------------
+;;
+;; The measured -E patterns are alternations of words: `W|W`, `^(W|W)`,
+;; `^W |W`. A line can match such a pattern only if it holds the literal
+;; PREFIX of one alternative, and a host search (`string-index-of-from`)
+;; finds that a hundred times faster than the simulation decides it. So
+;; the pattern's top-level alternatives are split, each one's leading
+;; literal run taken (an escaped metacharacter counts as its character; a
+;; run whose last character is quantified loses it), and the simulation
+;; runs only on lines holding one of the runs. A pattern with an
+;; alternative that has no literal prefix (`.*foo`, `[ab]c`) gets no
+;; prefilter and every line is simulated. Measured 2026-09-17 on 5.4 MB:
+;; `SIGILL|static_assert` 10.4 s unfiltered.
+;;
+;; The runs are packed into one newline-separated string (a pattern holds
+;; no newline), and the program string carries them after its own newline.
+
+;; The pattern with a leading `^` and one wrapping pair of parentheses
+;; removed: `^(a|b)` -> `a|b`.
+(defn- unwrap [p :string ere? :bool] :string
+  (let [n (string-byte-length p)
+        p1 (if (if (> n 0) (= (string-code-point-at p 0) 94) false) (string-substring p 1 n) p)
+        n1 (string-byte-length p1)]
+    (if ere?
+      (if (if (> n1 1) (if (= (string-code-point-at p1 0) 40) (= (string-code-point-at p1 (- n1 1)) 41) false) false)
+        (if (< (paren-close p1 1 1) (- n1 1)) p1 (string-substring p1 1 (- n1 1)))
+        p1)
+      p1)))
+
+;; The index of the `)` closing depth DEPTH from I (ERE), or -1.
+(defn- paren-close [p :string i :i64 depth :i64] :i64
+  (if (>= i (string-byte-length p))
+    -1
+    (let [c (string-code-point-at p i)]
+      (if (= c 92)
+        (paren-close p (+ i 2) depth)
+        (if (= c 40)
+          (paren-close p (+ i 1) (+ depth 1))
+          (if (= c 41)
+            (if (= depth 1) i (paren-close p (+ i 1) (- depth 1)))
+            (paren-close p (+ i (cp-width c)) depth)))))))
+
+;; The leading literal run of ALT (a code-point walk): stops at a
+;; metacharacter; drops its last character when a quantifier follows.
+(defn- literal-run [alt :string i :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length alt)]
+    (if (>= i n)
+      acc
+      (let [c (string-code-point-at alt i)]
+        (if (= c 92)
+          (if (< (+ i 1) n)
+            (let [d (string-code-point-at alt (+ i 1))]
+              ;; \w \d \s \b are classes, not literals; a metacharacter
+              ;; after the backslash is itself.
+              (if (if (= d 119) true (if (= d 100) true (if (= d 115) true (if (= d 98) true (if (= d 87) true (if (= d 68) true (if (= d 83) true (= d 66))))))))
+                acc
+                (if (if (not ere?) (if (= d 40) true (if (= d 41) true (if (= d 123) true (if (= d 124) true (if (= d 43) true (= d 63)))))) false)
+                  acc
+                  (literal-run alt (+ (+ i 1) (cp-width d)) (string-concat acc (string-substring alt (+ i 1) (+ (+ i 1) (cp-width d)))) ere?))))
+            acc)
+          (if (meta? c ere?)
+            ;; A quantifier after the run's last character makes that
+            ;; character optional: drop it.
+            (if (if (= c 42) true (if ere? (if (= c 63) true (= c 123)) false))
+              (drop-last acc)
+              acc)
+            (literal-run alt (+ i (cp-width c)) (string-concat acc (string-substring alt i (+ i (cp-width c)))) ere?)))))))
+
+(defn- drop-last [s :string] :string
+  (let [n (string-byte-length s)]
+    (if (<= n 1) "" (string-substring s 0 (last-boundary s 0 n)))))
+
+;; The start of the last code point of S[0, N).
+(defn- last-boundary [s :string i :i64 n :i64] :i64
+  (let [w (cp-width (string-code-point-at s i))]
+    (if (>= (+ i w) n) i (last-boundary s (+ i w) n))))
+
+;; The top-level alternatives' runs, newline-separated; "" when any
+;; alternative has no run (no prefilter). I walks P at depth 0.
+(defn- runs-of [p :string i :i64 start :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length p)]
+    (if (>= i n)
+      (let [r (literal-run (string-substring p start n) 0 "" ere?)]
+        (if (= 0 (string-byte-length r)) "" (string-concat acc (string-concat r "\n"))))
+      (let [c (string-code-point-at p i)]
+        (if (= c 92)
+          (if (if (not ere?) (= (string-code-point-at p (+ i 1)) 124) false)
+            ;; BRE `\|`
+            (let [r (literal-run (string-substring p start i) 0 "" ere?)]
+              (if (= 0 (string-byte-length r)) "" (runs-of p (+ i 2) (+ i 2) (string-concat acc (string-concat r "\n")) ere?)))
+            (runs-of p (+ i 2) start acc ere?))
+          (if (if ere? (= c 40) false)
+            ;; A group inside an alternative: its run ends here, and the
+            ;; alternative continues past the matching paren.
+            (let [close (paren-close p (+ i 1) 1)]
+              (if (< close 0) "" (runs-of p (+ close 1) start acc ere?)))
+            (if (if ere? (= c 124) false)
+              (let [r (literal-run (string-substring p start i) 0 "" ere?)]
+                (if (= 0 (string-byte-length r)) "" (runs-of p (+ i 1) (+ i 1) (string-concat acc (string-concat r "\n")) ere?)))
+              (runs-of p (+ i (cp-width c)) start acc ere?))))))))
+
+(defn- prefilter-of [needle :string ere? :bool] :string
+  (runs-of (unwrap needle ere?) 0 0 "" ere?))
+
+;; Does the line [POS, END) of TEXT hold one of RUNS (newline-separated)?
+;; LINE is the line's own view: a search bounded by it. The first cut
+;; searched the whole remaining file from the line's start and tested the
+;; hit against the line's end -- correct, and quadratic (measured).
+(defn- holds-run? [line :string runs :string i :i64] :bool
+  (let [n (string-byte-length runs)]
+    (if (>= i n)
+      false
+      (let [nl-at (string-find-byte runs 10 i)
+            run (string-substring runs i nl-at)]
+        (if (>= (string-index-of line run) 0)
+          true
+          (holds-run? line runs (+ nl-at 1)))))))
+
+;; Every non-empty match on the line [POS, END) under -o, from FROM.
+(defn- report-matches [prog :string orig :string pe :i64 packed :i64 number :i64] :i64
+  (let [pos (quot pe 4294967296)
+        end (- pe (* 4294967296 (quot pe 4294967296)))
+        from (pos-part packed)]
+    (if (> from end)
+      0
+      (let [r (arena-scope (rx/find prog orig pos from end))]
+        (if (< r 0)
+          0
+          (let [s (quot r 4294967296)
+                e (- r (* 4294967296 (quot r 4294967296)))]
+            (if (> e s)
+              (do (arena-scope (report (string-substring orig s e) packed number))
+                  (report-matches prog orig pe (pack (mode-part packed) (if (prefixed? packed) 1 0) e (file-part packed)) number))
+              (if (>= s end)
+                0
+                (report-matches prog orig pe (pack (mode-part packed) (if (prefixed? packed) 1 0) (+ s (cp-width (string-code-point-at orig s))) (file-part packed)) number)))))))))
+
+;; One line [POS, END): 1 when selected (and reported), else 0. Everything
+;; this mints -- the program and prefilter views, the candidate check, the
+;; simulation, the report -- lives in the region the caller wraps it in,
+;; so the walk over a file never accumulates: the first cut re-cut the two
+;; views per line outside any region and 80,000 lines met the pair budget.
+(defn- regex-line [text :string orig :string pr :string packed :i64 number :i64] :i64
+  (let [pos (pos-part packed)
+        mode (mode-part packed)
+        end (line-end text pos (string-byte-length text))
+        split (string-find-byte pr 10 0)
+        prog (string-substring pr 0 split)
+        runs (string-substring pr (+ split 1) (string-byte-length pr))
+        candidate (if (= 0 (string-byte-length runs)) true (holds-run? (string-substring text pos end) runs 0))
+        found (if candidate (rx/matches? prog text pos end) false)
+        selected (if (has? mode 2) (not found) found)]
+    (if selected
+      (do (if (if (only-matches? mode) (not (has? mode 2)) false)
+            (report-matches prog orig (+ (* pos 4294967296) end) packed number)
+            (report (string-substring orig pos end) packed number))
+          1)
+      0)))
+
+;; Every line: selected when it matches (or, under -v, when it does not).
+(defn- scan-regex [text :string orig :string pr :string packed :i64 state :i64] :i64
+  (let [n (string-byte-length text)
+        pos (pos-part packed)
+        mode (mode-part packed)]
+    (if (>= pos n)
+      state
+      (let [end (line-end text pos n)
+            number (quot state (line-unit))
+            hits (- state (* (line-unit) number))
+            selected (arena-scope (regex-line text orig pr packed number))]
+        (scan-regex text orig pr
+                    (pack mode (if (prefixed? packed) 1 0) (+ end 1) (file-part packed))
+                    (+ (* (+ number 1) (line-unit)) (+ hits selected)))))))
+
+(defn scan-text [text :string label :string needle :string mode :i64 packed :i64] :i64
+  (let [;; `-i` searches the folded text and reports from the original.
+        haystack (if (has? mode 1) (fold text) text)
+        regex? (if (has? mode 512) false (has-meta? needle 0 (has? mode 256)))
+        state (if regex?
+                (scan-regex haystack text
+                            (string-concat (rx/compile-pattern needle (has? mode 256))
+                                           (string-concat (nl) (prefilter-of needle (has? mode 256))))
+                            packed (line-unit))
+                (if (has? mode 2)
+                  (scan-lines haystack text needle packed (line-unit))
+                  (scan-hits haystack text needle packed (line-unit))))
+        hits (- state (* (quot state (line-unit)) (line-unit)))]
+    (do
+      (if (if (has? mode 4) (not (has? mode 128)) false)
+        (do (emit-prefix packed) (emit (decimal-of hits)) (emit (nl)) 0)
+        0)
+      (if (if (has? mode 16) (not (if (has? mode 4) true (has? mode 128))) false)
+        (if (> hits 0) (do (emit label) (emit (nl)) 0) 0)
+        0)
+      (if (> hits 0) 0 1))))
+
+(defn scan [f :i64 needle :string mode :i64 prefixed :i64] :i64
+  (let [path (arg (decimal-of f))]
+    (scan-text (slurp-file path) path needle mode (pack mode prefixed 0 f))))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+;; MODE and PREFIXED share a parameter here too: `mode + 1024 * prefixed`.
+(defn each [i :i64 total :string needle :string mp :i64 worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (if (readable? (arg (decimal-of i)))
+      (each (+ i 1) total needle mp
+            (worse worst (scan i needle (mode-part mp) (quot mp 1024))))
+      (each (+ i 1) total needle mp (worse worst (complain (arg (decimal-of i))))))))
+
+;; How many arguments there are, as an i64. Wire 38 answers the count as
+;; decimal TEXT, so this counts up until the rendering matches.
+(defn argc-from [k :i64 total :string] :i64
+  (if (string=? (decimal-of k) total)
+    k
+    (argc-from (+ k 1) total)))
+
+(defn main [] :i64
+  (let [mode (mode-of)]
+    (if (< mode 0)
+      2
+      (let [n (argc-from 0 (arg ""))
+            first-file (+ (pattern-index-from 0) 1)]
+        ;; Fewer arguments than a pattern needs is a usage error, exit 2.
+        (if (< n first-file)
+          2
+          (let [needle (arg (decimal-of (- first-file 1)))
+                folded-needle (if (has? mode 1) (fold needle) needle)]
+            ;; An empty pattern would trap: string-index-of refuses an empty
+            ;; needle, in the host as in the language. grep -F '' matches
+            ;; every line; this refuses with exit 2 and the README says so.
+            (if (= (string-byte-length needle) 0)
+              2
+             (if (if (has? mode 512) false (if (has-meta? needle 0 (has? mode 256)) (rx/error? (rx/compile-pattern folded-needle (has? mode 256))) false))
+              (do (emit-error "grep: ")
+                  (emit-error (string-substring (rx/compile-pattern folded-needle (has? mode 256)) 1
+                                                (string-byte-length (rx/compile-pattern folded-needle (has? mode 256)))))
+                  (emit-error (nl))
+                  2)
+              ;; No file operand: standard input, whole (wire 41, 2026-09-16
+              ;; -- 67% of grep's invocations in agent tool use are a later
+              ;; pipeline segment, 27,408 of 41,041 measured, and `grep |
+              ;; head` is the most frequent pipeline shape of all). No
+              ;; prefix, and `-l` names it `(standard input)` as grep does.
+              ;; Input past the string pool is refused, never searched short.
+              (if (= n first-file)
+                (scan-text (stdin "") "(standard input)" folded-needle mode (pack mode 0 0 0))
+                ;; FILE: prefixes with two or more operands, unless -h.
+                (each first-file (arg "") folded-needle
+                      (+ mode (if (if (> (- n first-file) 1) (not (has? mode 64)) false) 1024 0)) 1))))))))))

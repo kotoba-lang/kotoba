@@ -1,0 +1,882 @@
+;; regex -- POSIX regular expressions (IEEE Std 1003.1, ERE and BRE) as a
+;; Kotoba library module, for grep, sed and awk.
+;;
+;;   (compile-pattern pattern ere?) -> a PROGRAM string, or "!" + message
+;;   (find prog text lo from hi)    -> start * 2^32 + end of the leftmost-
+;;                                     longest match in [from, hi) of the
+;;                                     line [lo, hi), or -1
+;;   (matches? prog text lo hi)     -> is there a match in the line?
+;;   (prefilter pattern ere?)       -> newline-separated literal runs one of
+;;                                     which every matching line holds, or
+;;                                     "" when the pattern yields none
+;;   (holds-run? line runs i)       -> does the line hold one of the runs?
+;;   (captures prog text lo hi se)  -> the groups of the match se (start *
+;;                                     2^32 + end, as find answers) as ten
+;;                                     `start:end;` tokens, group 0 the
+;;                                     match, -1:-1 a group that did not
+;;                                     take part; "!" when the span cannot
+;;                                     be re-walked
+;;   (group-count pattern ere?)     -> how many groups the pattern opens
+;;
+;; ## Measured, 2026-09-17
+;;
+;; Over 1,268,018 agent Bash calls: `grep -E` 9,582 patterns, and their
+;; shape is alternation of words (`W|W`, `^W |W`, `^(W|W)`), then `+` 1,294,
+;; `.` 1,225, `*` 497, `?` 150, `{n,m}` 98, `[:space:]` 43. That is the
+;; subset here: `|` `( )` `.` `*` `+` `?` `{n}` `{n,}` `{n,m}` `[...]` with
+;; ranges, negation and the POSIX classes, `^` `$`, `\` escapes (a literal
+;; metacharacter; `\w \W \d \D \s \S` as classes; `\b \B` as boundaries),
+;; and the BRE spellings `\( \) \{ \} \| \+ \?` for plain grep and sed
+;; (`\+` and `\?` as /usr/bin/grep reads them -- one-or-more, optional --
+;; where /usr/bin/sed reads a literal `+` and `?`; BRE `^` `$` `*` are
+;; literal where they cannot anchor or repeat, see `bre-start?`); `\t` is
+;; a tab in both grammars, as /usr/bin/grep reads it.
+;; No back-references (`\1` in a pattern): they are not regular, and none
+;; were measured.
+;;
+;; ## How it runs: Thompson's NFA, over strings
+;;
+;; The pattern compiles to a PROGRAM: a string of fixed-width records, one
+;; instruction each, with RELATIVE jump targets computed from the lengths of
+;; the sub-programs -- so a program is built by concatenation alone, no
+;; patching, and a string is a value the compiler admits anywhere. Matching
+;; is Pike's simulation: the set of live threads is a STRING of `pc;`
+;; tokens, deduplicated with one `string-index-of`, rebuilt per input
+;; character. Linear in the input times the program size, never
+;; exponential -- `(a*)*b` cannot hang -- and every per-character
+;; allocation is reclaimed by the caller's region. Why strings and not
+;; vectors: a thread set is read and written in the same step, and
+;; `vector-assoc!` wants a handle that is only written on its path.
+;;
+;; Leftmost-longest (the POSIX rule, which `-o` and `s///` depend on) is
+;; found the plain way: anchored runs from each start position, left to
+;; right, the first start that matches winning and the last accepting
+;; position of that run being its end.
+;;
+;; Code points, not bytes: `.` and a bracket expression consume one UTF-8
+;; sequence, as /usr/bin/grep does in a UTF-8 locale. Case folding is the
+;; caller's (grep folds text and pattern to ASCII lower before compiling).
+;;
+;; ## The record
+;;
+;;   op (1 char) + a (4 base-93 digits) + b (4 base-93 digits) = 9 bytes
+;;
+;; A field is four printable ASCII characters (33..126 without `;`), most
+;; significant first: 93^4 = 74 million, enough for a code point (1114111)
+;; and an offset carried plus 5000000. Four host calls decode a field where
+;; seven decimal digits took seven -- and a field is decoded for every live
+;; thread at every character, which is where the time goes (measured
+;; 2026-09-17: 6.4 s on a 5.4 MB file with seven digits). `;` is kept out
+;; of the alphabet so it can end a thread token unambiguously.
+;;
+;;   c a      consume the code point a
+;;   a        consume any code point but newline
+;;   k n neg  consume one code point in (neg = 1: not in) the n ranges
+;;            that follow, each `r lo hi`
+;;   s a b    split: continue at pc + a and at pc + b
+;;   j a      jump to pc + a
+;;   ^  $     assert the line start / end
+;;   b neg    assert a word boundary (neg = 1: not one)
+;;   o k      open capture group k (2026-09-17; inert in the simulation)
+;;   l k      close capture group k
+;;   m        match
+;;
+;; Offsets are stored plus 5000000, so a negative one is a smaller number.
+(ns regex.core (:export [compile-pattern find matches? error? prefilter holds-run? captures group-count]))
+
+;; --- numbers and records ------------------------------------------------------
+
+(defn- digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn- decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10)) (digit-text (- n (* 10 (quot n 10)))))))
+
+;; The digit alphabet: printable ASCII 33..126 without `;` (59), 93 digits.
+;; A digit's value is its index here; a byte's value is byte - 33, minus one
+;; past `;`.
+(defn- digits93 [] :string
+  "!\"#$%&'()*+,-./0123456789:<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~")
+
+(defn- d93 [v :i64] :string (string-substring (digits93) v (+ v 1)))
+
+(defn- v93 [byte :i64] :i64 (if (> byte 59) (- byte 34) (- byte 33)))
+
+;; Four base-93 digits, most significant first; N is 0..74805200.
+(defn- four [n :i64] :string
+  (let [q1 (quot n 93)
+        q2 (quot q1 93)
+        q3 (quot q2 93)]
+    (string-concat (d93 (- q3 (* 93 (quot q3 93))))
+                   (string-concat (d93 (- q2 (* 93 q3)))
+                                  (string-concat (d93 (- q1 (* 93 q2))) (d93 (- n (* 93 q1))))))))
+
+;; The field of four base-93 digits at byte I of S.
+(defn- field-at [s :string i :i64] :i64
+  (+ (* (v93 (string-code-point-at s i)) 804357)
+     (+ (* (v93 (string-code-point-at s (+ i 1))) 8649)
+        (+ (* (v93 (string-code-point-at s (+ i 2))) 93)
+           (v93 (string-code-point-at s (+ i 3)))))))
+
+;; Two base-93 digits (a pc, up to 8648) and the pc at byte I.
+(defn- two [n :i64] :string
+  (string-concat (d93 (quot n 93)) (d93 (- n (* 93 (quot n 93))))))
+
+(defn- pc-at [s :string i :i64] :i64
+  (+ (* (v93 (string-code-point-at s i)) 93) (v93 (string-code-point-at s (+ i 1)))))
+
+;; Seven decimal digits, for the parser's positions only.
+(defn- seven [n :i64] :string
+  (let [d (decimal-of n)
+        k (string-byte-length d)]
+    (string-concat (string-substring "0000000" 0 (- 7 k)) d)))
+
+(defn- digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn- text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) acc (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn- rec [op :string a :i64 b :i64] :string
+  (string-concat op (string-concat (four a) (four b))))
+
+(defn- off [d :i64] :i64 (+ d 5000000))
+
+(defn- recs [prog :string] :i64 (quot (string-byte-length prog) 9))
+
+(defn- op-at [prog :string pc :i64] :i64
+  (string-code-point-at prog (* pc 9)))
+
+(defn- a-at [prog :string pc :i64] :i64
+  (field-at prog (+ (* pc 9) 1)))
+
+(defn- b-at [prog :string pc :i64] :i64
+  (field-at prog (+ (* pc 9) 5)))
+
+;; A jump target stored in field A (or B) of PC.
+(defn- target-a [prog :string pc :i64] :i64 (+ pc (- (a-at prog pc) 5000000)))
+(defn- target-b [prog :string pc :i64] :i64 (+ pc (- (b-at prog pc) 5000000)))
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+;; --- the parser --------------------------------------------------------------
+;;
+;; Every parse function answers `NNNNNNN` + program: the position it
+;; stopped at, then the records. An error answers `!` + message, which every
+;; caller passes up unchanged.
+
+(defn- failed? [r :string] :bool
+  (if (= 0 (string-byte-length r)) false (= (string-code-point-at r 0) 33)))
+
+(defn- pos-of [r :string] :i64 (text->i64 r 0 7 0))
+
+(defn- prog-of [r :string] :string (string-substring r 7 (string-byte-length r)))
+
+(defn- answer [pos :i64 prog :string] :string (string-concat (seven pos) prog))
+
+(defn- oops [message :string] :string (string-concat "!" message))
+
+(defn- at [p :string i :i64] :i64
+  (if (>= i (string-byte-length p)) -1 (string-code-point-at p i)))
+
+;; A class record set: `k n neg` then n `r lo hi`.
+(defn- class-of [ranges :string n :i64 neg :i64] :string
+  (string-concat (rec "k" n neg) ranges))
+
+(defn- range-rec [lo :i64 hi :i64] :string (rec "r" lo hi))
+
+;; The POSIX class NAME as ranges, "" when unknown. Counts ride in the
+;; caller through `ranges-count`.
+(defn- named-class [name :string] :string
+  (if (string=? name "alpha") (string-concat (range-rec 65 90) (range-rec 97 122))
+    (if (string=? name "digit") (range-rec 48 57)
+      (if (string=? name "alnum") (string-concat (range-rec 48 57) (string-concat (range-rec 65 90) (range-rec 97 122)))
+        (if (string=? name "upper") (range-rec 65 90)
+          (if (string=? name "lower") (range-rec 97 122)
+            (if (string=? name "space") (string-concat (range-rec 9 13) (range-rec 32 32))
+              (if (string=? name "blank") (string-concat (range-rec 9 9) (range-rec 32 32))
+                (if (string=? name "punct") (string-concat (range-rec 33 47) (string-concat (range-rec 58 64) (string-concat (range-rec 91 96) (range-rec 123 126))))
+                  (if (string=? name "print") (range-rec 32 126)
+                    (if (string=? name "xdigit") (string-concat (range-rec 48 57) (string-concat (range-rec 65 70) (range-rec 97 102)))
+                      (if (string=? name "cntrl") (string-concat (range-rec 0 31) (range-rec 127 127))
+                        (if (string=? name "graph") (range-rec 33 126)
+                          "")))))))))))))
+
+(defn- ranges-count [ranges :string] :i64 (recs ranges))
+
+;; `\w` `\d` `\s` and their negations as classes; -1 when C is not one.
+(defn- escape-class [c :i64] :string
+  (if (= c 119) (class-of (string-concat (range-rec 48 57) (string-concat (range-rec 65 90) (string-concat (range-rec 97 122) (range-rec 95 95)))) 4 0)
+    (if (= c 87) (class-of (string-concat (range-rec 48 57) (string-concat (range-rec 65 90) (string-concat (range-rec 97 122) (range-rec 95 95)))) 4 1)
+      (if (= c 100) (class-of (range-rec 48 57) 1 0)
+        (if (= c 68) (class-of (range-rec 48 57) 1 1)
+          (if (= c 115) (class-of (string-concat (range-rec 9 13) (range-rec 32 32)) 2 0)
+            (if (= c 83) (class-of (string-concat (range-rec 9 13) (range-rec 32 32)) 2 1)
+              "")))))))
+
+;; Inside `[...]` from I (after the opening bracket and any `^`): the
+;; ranges, until the closing bracket. A `]` first is a literal. `[:name:]`
+;; expands. Answers `NNNNNN` + ranges (the position is just past `]`).
+(defn- class-items [p :string i :i64 acc :string first? :bool] :string
+  (let [c (at p i)]
+    (if (< c 0)
+      (oops "brackets [ ] not balanced")
+      (if (if (= c 93) (not first?) false)
+        (answer (+ i 1) acc)
+        (if (if (= c 91) (= (at p (+ i 1)) 58) false)
+          ;; [:name:]
+          (let [close (string-index-of-from p ":]" (+ i 2))]
+            (if (< close 0)
+              (oops "brackets [ ] not balanced")
+              (let [ranges (named-class (string-substring p (+ i 2) close))]
+                (if (= 0 (string-byte-length ranges))
+                  (oops "unknown character class")
+                  (class-items p (+ close 2) (string-concat acc ranges) false)))))
+          (let [w (cp-width c)
+                dash? (if (= (at p (+ i w)) 45) (not (= (at p (+ (+ i w) 1)) 93)) false)]
+            (if (if dash? (>= (at p (+ (+ i w) 1)) 0) false)
+              (let [hi (at p (+ (+ i w) 1))]
+                (if (< hi c)
+                  (oops "invalid range end")
+                  (class-items p (+ (+ (+ i w) 1) (cp-width hi)) (string-concat acc (range-rec c hi)) false)))
+              (class-items p (+ i w) (string-concat acc (range-rec c c)) false))))))))
+
+(defn- parse-class [p :string i :i64] :string
+  (let [neg? (= (at p i) 94)
+        r (class-items p (if neg? (+ i 1) i) "" true)]
+    (if (failed? r)
+      r
+      (let [ranges (prog-of r)]
+        (answer (pos-of r) (class-of ranges (ranges-count ranges) (if neg? 1 0)))))))
+
+;; e* / e+ / e? / e{n,m}, given the program E of the atom.
+(defn- star [e :string] :string
+  (let [l (recs e)]
+    (string-concat (rec "s" (off 1) (off (+ l 2))) (string-concat e (rec "j" (off (- 0 (+ l 1))) 0)))))
+
+(defn- plus [e :string] :string
+  (let [l (recs e)]
+    (string-concat e (rec "s" (off (- 0 l)) (off 1)))))
+
+(defn- opt [e :string] :string
+  (let [l (recs e)]
+    (string-concat (rec "s" (off 1) (off (+ l 1))) e)))
+
+(defn- times [e :string n :i64] :string
+  (if (<= n 0) "" (string-concat e (times e (- n 1)))))
+
+(defn- opts [e :string n :i64] :string
+  (if (<= n 0) "" (string-concat (opt e) (opts e (- n 1)))))
+
+;; `{n}` `{n,}` `{n,m}` at I (after the brace). Answers NNNNNN + program.
+(defn- parse-interval [p :string i :i64 e :string] :string
+  (let [n (string-byte-length p)
+        e1 (let [j (string-index-of-from p "}" i)] (if (< j 0) -1 j))]
+    (if (< e1 0)
+      (oops "braces { } not balanced")
+      (let [comma (string-index-of-from p "," i)
+            has-comma (if (< comma 0) false (< comma e1))
+            lo-end (if has-comma comma e1)
+            lo (text->i64 p i lo-end 0)
+            hi (if has-comma (if (= (+ comma 1) e1) -1 (text->i64 p (+ comma 1) e1 0)) lo)]
+        (if (= i lo-end)
+          (oops "invalid repetition count")
+          (if (> lo 255)
+            (oops "repetition count too large")
+            (if (< hi 0)
+              (answer (+ e1 1) (string-concat (times e lo) (star e)))
+              (if (< hi lo)
+                (oops "invalid repetition count")
+                (answer (+ e1 1) (string-concat (times e lo) (opts e (- hi lo))))))))))))
+
+;; BRE context, measured 2026-09-17 on /usr/bin/grep (macOS libc regex):
+;; `^` is an anchor at the start of the pattern, after `\(` and after `\|`,
+;; and a literal elsewhere (`a^b` matches `a^b`); `$` is an anchor at the
+;; end and before `\)`, a literal elsewhere -- even before `\|` (`b$\|x`
+;; over `ab$` answers `b$`); `*` is a literal where an anchor `^` would be
+;; and right after one (`^*b` over `**b` answers `*b`). ERE has none of
+;; this: `^` `$` anchor everywhere and a leading `*` is refused.
+(defn- bre-start? [p :string i :i64] :bool
+  (if (= i 0)
+    true
+    (if (>= i 2)
+      (if (= (at p (- i 2)) 92)
+        (if (= (at p (- i 1)) 40) true (= (at p (- i 1)) 124))
+        false)
+      false)))
+
+(defn- bre-end? [p :string i :i64] :bool
+  (if (>= (+ i 1) (string-byte-length p))
+    true
+    (if (= (at p (+ i 1)) 92) (= (at p (+ i 2)) 41) false)))
+
+(defn- bre-star-literal? [p :string i :i64] :bool
+  (if (bre-start? p i)
+    true
+    (if (= (at p (- i 1)) 94) (bre-start? p (- i 1)) false)))
+
+;; Quantifiers after an atom whose program is E, from I. ERE? decides
+;; whether `+ ? {` are quantifiers (ERE) or need a backslash (BRE).
+(defn- parse-quants [p :string i :i64 e :string ere? :bool] :string
+  (let [c (at p i)]
+    (if (if (= c 42) (if ere? true (not (bre-star-literal? p i))) false)
+      (parse-quants p (+ i 1) (star e) ere?)
+      (if (if ere? (= c 43) (if (= c 92) (= (at p (+ i 1)) 43) false))
+        (parse-quants p (+ i (if ere? 1 2)) (plus e) ere?)
+        (if (if ere? (= c 63) (if (= c 92) (= (at p (+ i 1)) 63) false))
+          (parse-quants p (+ i (if ere? 1 2)) (opt e) ere?)
+          (if (if ere? (= c 123) (if (= c 92) (= (at p (+ i 1)) 123) false))
+            (let [r (parse-interval p (+ i (if ere? 1 2)) e)]
+              (if (failed? r)
+                r
+                ;; BRE closes with `\}`: parse-interval stopped after `}`,
+                ;; and the backslash before it is what a BRE writes.
+                (parse-quants p (pos-of r) (prog-of r) ere?)))
+            (answer i e)))))))
+
+;; How many groups open in P before position UNTIL (ERE `(`, BRE `\(`),
+;; walking from I: a group's number is its opening order, and since the
+;; parser knows where each group starts, the number needs no threading.
+;; Brackets are skipped so `[(]` does not count.
+(defn- opens-before [p :string i :i64 until :i64 acc :i64 ere? :bool] :i64
+  (if (>= i until)
+    acc
+    (let [c (at p i)]
+      (if (= c 92)
+        (opens-before p (+ i 2) until (+ acc (if (if (not ere?) (= (at p (+ i 1)) 40) false) 1 0)) ere?)
+        (if (= c 91)
+          (opens-before p (bracket-end p (+ i 1)) until acc ere?)
+          (opens-before p (+ i (cp-width c)) until (+ acc (if (if ere? (= c 40) false) 1 0)) ere?))))))
+
+;; The index just past the `]` closing the bracket expression whose body
+;; starts at I (a `]` first is a literal); the end of P when unclosed.
+(defn- bracket-end [p :string i :i64] :i64
+  (let [n (string-byte-length p)
+        j (if (= (at p i) 94) (+ i 1) i)
+        k (if (= (at p j) 93) (+ j 1) j)
+        e (string-index-of-from p "]" k)]
+    (if (< e 0) n (+ e 1))))
+
+(defn group-count [pattern :string ere? :bool] :i64
+  (opens-before pattern 0 (string-byte-length pattern) 0 ere?))
+
+;; One atom at I. Answers NNNNNN + program, or `!`.
+(defn- parse-atom [p :string i :i64 ere? :bool] :string
+  (let [c (at p i)]
+    (if (< c 0)
+      (oops "unexpected end of pattern")
+      (if (= c 46)
+        (answer (+ i 1) (rec "a" 0 0))
+        (if (if (= c 94) (if ere? true (bre-start? p i)) false)
+          (answer (+ i 1) (rec "^" 0 0))
+          (if (if (= c 36) (if ere? true (bre-end? p i)) false)
+            (answer (+ i 1) (rec "$" 0 0))
+            (if (= c 91)
+              (parse-class p (+ i 1))
+              (if (if ere? (= c 40) (if (= c 92) (= (at p (+ i 1)) 40) false))
+                (let [r (parse-alt p (+ i (if ere? 1 2)) ere?)
+                      k (+ 1 (opens-before p 0 i 0 ere?))]
+                  (if (failed? r)
+                    r
+                    (let [j (pos-of r)
+                          close? (if ere? (= (at p j) 41) (if (= (at p j) 92) (= (at p (+ j 1)) 41) false))]
+                      (if close?
+                        (answer (+ j (if ere? 1 2))
+                                (string-concat (rec "o" k 0) (string-concat (prog-of r) (rec "l" k 0))))
+                        (oops "parentheses ( ) not balanced")))))
+                (if (= c 92)
+                  ;; An escape: a class letter, a boundary, or the literal
+                  ;; character after the backslash.
+                  (let [d (at p (+ i 1))]
+                    (if (< d 0)
+                      (oops "trailing backslash")
+                      (let [cls (escape-class d)]
+                        (if (> (string-byte-length cls) 0)
+                          (answer (+ i 2) cls)
+                          (if (= d 116)
+                            (answer (+ i 2) (rec "c" 9 0))
+                          (if (= d 98)
+                            (answer (+ i 2) (rec "b" 0 0))
+                            (if (= d 66)
+                              (answer (+ i 2) (rec "b" 1 0))
+                              (answer (+ i 2) (rec "c" d 0)))))))))
+                  (if (if ere? (if (= c 42) true (if (= c 43) true (if (= c 63) true (= c 123)))) (if (= c 42) (not (bre-star-literal? p i)) false))
+                    (oops "repetition-operator operand invalid")
+                    (answer (+ i (cp-width c)) (rec "c" c 0))))))))))))
+
+;; A branch: pieces until `|`, `)` (ERE) / `\|`, `\)` (BRE) or the end.
+(defn- parse-branch [p :string i :i64 acc :string ere? :bool] :string
+  (let [c (at p i)]
+    (if (< c 0)
+      (answer i acc)
+      (if (if ere? (if (= c 124) true (= c 41)) false)
+        (answer i acc)
+        (if (if (not ere?) (if (= c 92) (if (= (at p (+ i 1)) 124) true (= (at p (+ i 1)) 41)) false) false)
+          (answer i acc)
+          (let [r (parse-atom p i ere?)]
+            (if (failed? r)
+              r
+              (let [q (parse-quants p (pos-of r) (prog-of r) ere?)]
+                (if (failed? q)
+                  q
+                  (parse-branch p (pos-of q) (string-concat acc (prog-of q)) ere?))))))))))
+
+;; Alternation: branches joined by `|` (ERE) or `\|` (BRE).
+(defn- parse-alt [p :string i :i64 ere? :bool] :string
+  (let [r (parse-branch p i "" ere?)]
+    (if (failed? r)
+      r
+      (let [j (pos-of r)
+            bar? (if ere? (= (at p j) 124) (if (= (at p j) 92) (= (at p (+ j 1)) 124) false))]
+        (if bar?
+          ;; An empty alternative (`a||b`, `|b`, `a|`) is refused, as
+          ;; /usr/bin/grep refuses it (exit 2).
+          (if (= 0 (recs (prog-of r)))
+            (oops "empty (sub)expression")
+          (let [rest (parse-alt p (+ j (if ere? 1 2)) ere?)]
+            (if (failed? rest)
+              rest
+              (if (= 0 (recs (prog-of rest)))
+                (oops "empty (sub)expression")
+              (let [a (prog-of r)
+                    b (prog-of rest)
+                    la (recs a)
+                    lb (recs b)]
+                (answer (pos-of rest)
+                        (string-concat (rec "s" (off 1) (off (+ la 2)))
+                                       (string-concat a (string-concat (rec "j" (off (+ lb 1)) 0) b)))))))))
+          r)))))
+
+;; The program for PATTERN, or `!` + message.
+(defn compile-pattern [pattern :string ere? :bool] :string
+  (let [r (parse-alt pattern 0 ere?)]
+    (if (failed? r)
+      r
+      (if (< (pos-of r) (string-byte-length pattern))
+        (oops "parentheses ( ) not balanced")
+        (string-concat (prog-of r) (rec "m" 0 0))))))
+
+(defn error? [prog :string] :bool (failed? prog))
+
+;; --- the literal prefilter ---------------------------------------------------
+;;
+;; The measured -E patterns are alternations of words: `W|W`, `^(W|W)`,
+;; `^W |W`. A line can match such a pattern only if it holds the literal
+;; PREFIX of one alternative, and a host search (`string-index-of`) finds
+;; that a hundred times faster than the simulation decides it. So the
+;; pattern's top-level alternatives are split, each one's leading literal
+;; run taken (an escaped metacharacter counts as its character; a run whose
+;; last character is quantified loses it), and the caller simulates only
+;; lines holding one of the runs. A pattern with an alternative that has no
+;; literal prefix (`.*foo`, `[ab]c`) gets no prefilter and every line is
+;; simulated. Measured 2026-09-17 on 5.4 MB: `SIGILL|static_assert` 10.4 s
+;; unfiltered, 0.15 s filtered. Moved here from org-ieee-grep so sed and
+;; awk share it (2026-09-17).
+;;
+;; The runs are packed into one newline-separated string (a pattern holds
+;; no newline).
+
+;; The pattern with a leading `^` and one wrapping pair of parentheses
+;; removed: `^(a|b)` -> `a|b`.
+(defn- unwrap [p :string ere? :bool] :string
+  (let [n (string-byte-length p)
+        p1 (if (if (> n 0) (= (string-code-point-at p 0) 94) false) (string-substring p 1 n) p)
+        n1 (string-byte-length p1)]
+    (if ere?
+      (if (if (> n1 1) (if (= (string-code-point-at p1 0) 40) (= (string-code-point-at p1 (- n1 1)) 41) false) false)
+        (if (< (paren-close p1 1 1) (- n1 1)) p1 (string-substring p1 1 (- n1 1)))
+        p1)
+      p1)))
+
+;; The index of the `)` closing depth DEPTH from I (ERE), or -1.
+(defn- paren-close [p :string i :i64 depth :i64] :i64
+  (if (>= i (string-byte-length p))
+    -1
+    (let [c (string-code-point-at p i)]
+      (if (= c 92)
+        (paren-close p (+ i 2) depth)
+        (if (= c 40)
+          (paren-close p (+ i 1) (+ depth 1))
+          (if (= c 41)
+            (if (= depth 1) i (paren-close p (+ i 1) (- depth 1)))
+            (paren-close p (+ i (cp-width c)) depth)))))))
+
+(defn- meta-char? [c :i64 ere? :bool] :bool
+  (if (= c 46) true (if (= c 91) true (if (= c 93) true (if (= c 42) true (if (= c 94) true (if (= c 36) true (if (= c 92) true
+    (if ere? (if (= c 43) true (if (= c 63) true (if (= c 40) true (if (= c 41) true (if (= c 123) true (if (= c 125) true (= c 124))))))) false)))))))))
+
+;; The leading literal run of ALT (a code-point walk): stops at a
+;; metacharacter; drops its last character when a quantifier follows.
+(defn- literal-run [alt :string i :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length alt)]
+    (if (>= i n)
+      acc
+      (let [c (string-code-point-at alt i)]
+        (if (= c 92)
+          (if (< (+ i 1) n)
+            (let [d (string-code-point-at alt (+ i 1))]
+              ;; \w \d \s \b are classes, not literals; \t is a tab; a
+              ;; metacharacter after the backslash is itself.
+              (if (if (= d 119) true (if (= d 100) true (if (= d 115) true (if (= d 98) true (if (= d 87) true (if (= d 68) true (if (= d 83) true (= d 66))))))))
+                acc
+                ;; BRE `\?` and `\{` make the run's last character
+                ;; optional (found by the driver's soundness check on
+                ;; `a\?b` over `b`, 2026-09-17); `\( \) \| \+` end it.
+                (if (if (not ere?) (if (= d 63) true (= d 123)) false)
+                  (drop-last acc)
+                (if (if (not ere?) (if (= d 40) true (if (= d 41) true (if (= d 124) true (= d 43)))) false)
+                  acc
+                  (if (= d 116)
+                    (literal-run alt (+ i 2) (string-concat acc "\t") ere?)
+                    (literal-run alt (+ (+ i 1) (cp-width d)) (string-concat acc (string-substring alt (+ i 1) (+ (+ i 1) (cp-width d)))) ere?))))))
+            acc)
+          (if (meta-char? c ere?)
+            ;; A quantifier after the run's last character makes that
+            ;; character optional: drop it.
+            (if (if (= c 42) true (if ere? (if (= c 63) true (= c 123)) false))
+              (drop-last acc)
+              acc)
+            (literal-run alt (+ i (cp-width c)) (string-concat acc (string-substring alt i (+ i (cp-width c)))) ere?)))))))
+
+(defn- drop-last [s :string] :string
+  (let [n (string-byte-length s)]
+    (if (<= n 1) "" (string-substring s 0 (last-boundary s 0 n)))))
+
+;; The start of the last code point of S[0, N).
+(defn- last-boundary [s :string i :i64 n :i64] :i64
+  (let [w (cp-width (string-code-point-at s i))]
+    (if (>= (+ i w) n) i (last-boundary s (+ i w) n))))
+
+;; The top-level alternatives' runs, newline-separated; "" when any
+;; alternative has no run (no prefilter). I walks P at depth 0.
+(defn- runs-of [p :string i :i64 start :i64 acc :string ere? :bool] :string
+  (let [n (string-byte-length p)]
+    (if (>= i n)
+      (let [r (literal-run (string-substring p start n) 0 "" ere?)]
+        (if (= 0 (string-byte-length r)) "" (string-concat acc (string-concat r "\n"))))
+      (let [c (string-code-point-at p i)]
+        (if (= c 92)
+          (if (if (not ere?) (= (at p (+ i 1)) 124) false)
+            ;; BRE `\|`
+            (let [r (literal-run (string-substring p start i) 0 "" ere?)]
+              (if (= 0 (string-byte-length r)) "" (runs-of p (+ i 2) (+ i 2) (string-concat acc (string-concat r "\n")) ere?)))
+            (runs-of p (+ i 2) start acc ere?))
+          (if (if ere? (= c 40) false)
+            ;; A group inside an alternative: its run ends here, and the
+            ;; alternative continues past the matching paren.
+            (let [close (paren-close p (+ i 1) 1)]
+              (if (< close 0) "" (runs-of p (+ close 1) start acc ere?)))
+            (if (if ere? (= c 124) false)
+              (let [r (literal-run (string-substring p start i) 0 "" ere?)]
+                (if (= 0 (string-byte-length r)) "" (runs-of p (+ i 1) (+ i 1) (string-concat acc (string-concat r "\n")) ere?)))
+              (runs-of p (+ i (cp-width c)) start acc ere?))))))))
+
+(defn prefilter [pattern :string ere? :bool] :string
+  (runs-of (unwrap pattern ere?) 0 0 "" ere?))
+
+;; Does LINE hold one of RUNS (newline-separated), from I? A search bounded
+;; to the line: the caller passes the line's own view, not the file.
+(defn holds-run? [line :string runs :string i :i64] :bool
+  (let [n (string-byte-length runs)]
+    (if (>= i n)
+      false
+      (let [nl-at (string-find-byte runs 10 i)
+            run (string-substring runs i nl-at)]
+        (if (>= (string-index-of line run) 0)
+          true
+          (holds-run? line runs (+ nl-at 1)))))))
+
+;; --- the simulation ------------------------------------------------------------
+;;
+;; The text handed to the simulation is ONE LINE (a view the caller cuts, no
+;; copy), so `^` is position 0 and `$` the line's length. A thread list is
+;; a string of `pc;` tokens; `;` + list is searched for `;pc;` to dedupe.
+;; "M;" in a list records that a thread matched at the position the list
+;; was built for. PH packs the position and the code point before it:
+;; pos * 2^22 + (prev + 1), prev = -1 at the start of the line.
+
+(defn- token [pc :i64] :string (string-concat (two pc) ";"))
+
+(defn- has-thread? [list :string pc :i64] :bool
+  (>= (string-index-of (string-concat ";" list) (string-concat ";" (token pc))) 0))
+
+(defn- word-char? [c :i64] :bool
+  (if (< c 0) false
+    (if (= c 95) true
+      (if (if (>= c 48) (<= c 57) false) true
+        (if (if (>= c 65) (<= c 90) false) true
+          (if (>= c 97) (<= c 122) false))))))
+
+(defn- ph-pos [ph :i64] :i64 (quot ph 4194304))
+(defn- ph-prev [ph :i64] :i64 (- (- ph (* 4194304 (quot ph 4194304))) 1))
+(defn- pack-ph [pos :i64 prev :i64] :i64 (+ (* pos 4194304) (+ prev 1)))
+
+;; Add PC to LIST at PH, following the epsilon instructions. Every pc
+;; visited is recorded, the epsilon ones too: `(a*)*` is a cycle of splits
+;; and jumps, and a walk that recorded only consuming threads followed it
+;; forever (the first cut overflowed the stack on `(a*)*b`, exit 123). A
+;; recorded epsilon pc is inert in `step`, which advances consumers only.
+(defn- add-thread [prog :string list :string pc :i64 line :string ph :i64] :string
+  (if (has-thread? list pc)
+    list
+    (let [op (op-at prog pc)
+          pos (ph-pos ph)
+          prev (ph-prev ph)
+          n (string-byte-length line)
+          seen (string-concat list (token pc))]
+      (if (= op 115)
+        (add-thread prog (add-thread prog seen (target-a prog pc) line ph) (target-b prog pc) line ph)
+        (if (= op 106)
+          (add-thread prog seen (target-a prog pc) line ph)
+          (if (= op 94)
+            (if (= pos 0) (add-thread prog seen (+ pc 1) line ph) seen)
+            (if (= op 36)
+              (if (= pos n) (add-thread prog seen (+ pc 1) line ph) seen)
+              (if (= op 98)
+                (let [before (word-char? prev)
+                      after (word-char? (if (< pos n) (string-code-point-at line pos) -1))
+                      boundary? (not (= before after))]
+                  (if (= boundary? (= 0 (a-at prog pc)))
+                    (add-thread prog seen (+ pc 1) line ph)
+                    seen))
+                (if (= op 109)
+                  (string-concat seen "M;")
+                  (if (if (= op 111) true (= op 108))
+                    (add-thread prog seen (+ pc 1) line ph)
+                    seen))))))))))
+
+;; Does the class at PC (n ranges after it) hold C?
+(defn- in-ranges? [prog :string pc :i64 n :i64 c :i64] :bool
+  (if (<= n 0)
+    false
+    (if (if (>= c (a-at prog pc)) (<= c (b-at prog pc)) false)
+      true
+      (in-ranges? prog (+ pc 1) (- n 1) c))))
+
+;; The next list from the tokens in REST at the code point C -- which is
+;; PH's prev, since PH is the position the next list is built for. Every
+;; consuming thread that accepts C advances.
+;; Tokens are three bytes each -- two base-93 digits and `;` -- so the
+;; walk is by stride, no substring and no decimal parse per thread. The
+;; match marker "M;" is two bytes and is told apart by the `;` in second
+;; place, which no digit can be.
+(defn- step [prog :string list :string line :string next :string ph :i64] :string
+  (step-from prog list line next (* ph 1048576)))
+
+;; PHI packs PH above the list index I (20 bits: a thread list is at most a
+;; megabyte), which keeps this at five parameters; PH itself holds the
+;; position above the previous code point, so a line is at most 2^21 bytes.
+(defn- step-from [prog :string list :string line :string next :string phi :i64] :string
+  (let [n (string-byte-length list)
+        i (- phi (* 1048576 (quot phi 1048576)))
+        ph (quot phi 1048576)
+        c (ph-prev ph)]
+    (if (>= i n)
+      next
+      (if (= (string-code-point-at list (+ i 1)) 59)
+        ;; "M;" -- two bytes.
+        (step-from prog list line next (+ phi 2))
+        (let [pc (pc-at list i)
+              op (op-at prog pc)
+              ok? (if (= op 99)
+                    (= c (a-at prog pc))
+                    (if (= op 97)
+                      (not (= c 10))
+                      (if (= op 107)
+                        (not (= (in-ranges? prog (+ pc 1) (a-at prog pc) c) (= 1 (b-at prog pc))))
+                        false)))
+              advance (if (= op 107) (+ (+ pc 1) (a-at prog pc)) (+ pc 1))]
+          (step-from prog list line (if ok? (add-thread prog next advance line ph) next) (+ phi 3)))))))
+
+(defn- matched? [list :string] :bool
+  (>= (string-index-of (string-concat ";" list) ";M;") 0))
+
+;; Run from PH with LIST live; answers the last accepting position, BEST so
+;; far being carried as best + 1 in PB (0 = none) beside the position:
+;; PB = pos * 2^22 + (prev + 1), BEST separate... one value each: PH holds
+;; pos and prev, BEST rides as its own parameter.
+(defn- run [prog :string line :string list :string ph :i64 best :i64] :i64
+  (let [pos (ph-pos ph)
+        n (string-byte-length line)
+        best2 (if (matched? list) pos best)]
+    (if (= 0 (string-byte-length list))
+      best2
+      (if (>= pos n)
+        best2
+        (let [c (string-code-point-at line pos)
+              nph (pack-ph (+ pos (cp-width c)) c)]
+          (run prog line (step prog list line "" nph) nph best2))))))
+
+;; The leftmost-longest match at or after S in LINE, PREV the code point
+;; before S: start * 2^32 + end, or -1.
+(defn- find-from [prog :string line :string s :i64 prev :i64] :i64
+  (let [n (string-byte-length line)
+        ;; One region per start: a run allocates a thread list per
+        ;; character, and a line with no match runs from every start --
+        ;; unscoped, a 60-character line of misses minted 18,000 handles
+        ;; against a 4,096 budget (exit 120, measured 2026-09-17).
+        end (arena-scope (run prog line (add-thread prog "" 0 line (pack-ph s prev)) (pack-ph s prev) -1))]
+    (if (>= end 0)
+      (+ (* s 4294967296) end)
+      (if (>= s n)
+        -1
+        (let [c (string-code-point-at line s)]
+          (find-from prog line (+ s (cp-width c)) c))))))
+
+;; The code point before position AT in LINE, walking from 0 (-1 at 0).
+(defn- prev-before [line :string i :i64 at :i64 prev :i64] :i64
+  (if (>= i at)
+    prev
+    (let [c (string-code-point-at line i)]
+      (prev-before line (+ i (cp-width c)) at c))))
+
+;; The leftmost-longest match in [FROM, HI) of TEXT whose line is [LO, HI):
+;; absolute start * 2^32 + absolute end, or -1. Every allocation in here is
+;; the caller's to reclaim: wrap the call in an arena-scope.
+(defn find [prog :string text :string lo :i64 from :i64 hi :i64] :i64
+  (let [line (string-substring text lo hi)
+        r (find-from prog line (- from lo) (prev-before line 0 (- from lo) -1))]
+    (if (< r 0)
+      -1
+      (+ (* (+ lo (quot r 4294967296)) 4294967296)
+         (+ lo (- r (* 4294967296 (quot r 4294967296))))))))
+
+;; Is there a match anywhere in the line? ONE pass: a fresh thread at pc 0
+;; joins at every position (the `.*` prefix Thompson's construction would
+;; add), so this is linear in the line -- where `find` runs from every
+;; start and is quadratic on a line with no match. Measured 2026-09-17 on
+;; 5.4 MB: `grep -Ec 'SIGILL|static_assert'` 6.4 s through `find`, and the
+;; answer is the same. The first accepting position ends the walk.
+(defn- run-any [prog :string line :string list :string ph :i64] :bool
+  (let [pos (ph-pos ph)
+        n (string-byte-length line)
+        live (add-thread prog list 0 line ph)]
+    (if (matched? live)
+      true
+      (if (>= pos n)
+        false
+        (let [c (string-code-point-at line pos)
+              nph (pack-ph (+ pos (cp-width c)) c)]
+          (run-any prog line (step prog live line "" nph) nph))))))
+
+(defn matches? [prog :string text :string lo :i64 hi :i64] :bool
+  (arena-scope (run-any prog (string-substring text lo hi) "" (pack-ph 0 -1))))
+
+;; --- captures: the groups of a match already found ---------------------------
+;;
+;; The simulation keeps no per-thread state, so once `find` has the span
+;; [s, e) the groups are found by walking the program again over exactly
+;; that span, depth first, the greedy branch first (every split in this
+;; compiler puts the greedy continuation in `a`): the first walk that
+;; reaches `m` at e is the answer. That is what macOS libc regex answers
+;; (measured 2026-09-17 on /usr/bin/sed -E: `(a|ab)(c|bcd)` over abcd is
+;; [a][bcd], `(a*)(a*)` over aaa is [aaa][], `(ab)*` over abab is [ab] --
+;; the last iteration, `(a)(b)?` over ab is [a][b]), not the POSIX
+;; subexpression rule. Per position the epsilon instructions visited are
+;; remembered so `(a*)*` cannot loop; a walk is exponential in the worst
+;; case and the span is a known match, so the greedy walk succeeds first
+;; on every measured pattern.
+;;
+;; The state string: seven digits of END, then ten groups of seven-digit
+;; start and end (9999999 = unset), then `|` and the `pc;` tokens visited
+;; at the current position.
+(defn- cap-field [st :string k :i64] :i64
+  (text->i64 st (+ 7 (* 14 k)) (+ 14 (* 14 k)) 0))
+
+(defn- cap-end-field [st :string k :i64] :i64
+  (text->i64 st (+ 14 (* 14 k)) (+ 21 (* 14 k)) 0))
+
+(defn- caps-part [st :string] :string (string-substring st 0 147))
+
+(defn- visited-part [st :string] :string (string-substring st 148 (string-byte-length st)))
+
+(defn- with-field [st :string at :i64 v :i64] :string
+  (string-concat (string-substring st 0 at)
+                 (string-concat (seven v) (string-substring st (+ at 7) (string-byte-length st)))))
+
+(defn- visited? [st :string pc :i64] :bool
+  (>= (string-index-of (string-concat ";" (visited-part st)) (string-concat ";" (token pc))) 0))
+
+(defn- visit [st :string pc :i64] :string (string-concat st (token pc)))
+
+;; The walk from PC at PH with state ST: the 147-character caps on
+;; success, "!" on failure.
+(defn- bt [prog :string line :string pc :i64 ph :i64 st :string] :string
+  (let [op (op-at prog pc)
+        pos (ph-pos ph)
+        prev (ph-prev ph)
+        n (string-byte-length line)
+        end (text->i64 st 0 7 0)]
+    (if (= op 109)
+      (if (= pos end) (caps-part st) "!")
+      (if (if (= op 99) true (if (= op 97) true (= op 107)))
+        (if (>= pos end)
+          "!"
+          (let [c (string-code-point-at line pos)
+                ok? (if (= op 99)
+                      (= c (a-at prog pc))
+                      (if (= op 97)
+                        (not (= c 10))
+                        (not (= (in-ranges? prog (+ pc 1) (a-at prog pc) c) (= 1 (b-at prog pc))))))
+                advance (if (= op 107) (+ (+ pc 1) (a-at prog pc)) (+ pc 1))]
+            (if ok?
+              (bt prog line advance (pack-ph (+ pos (cp-width c)) c) (string-concat (caps-part st) "|"))
+              "!")))
+        (if (visited? st pc)
+          "!"
+          (let [seen (visit st pc)]
+            (if (= op 115)
+              (let [r (bt prog line (target-a prog pc) ph seen)]
+                (if (string=? r "!") (bt prog line (target-b prog pc) ph seen) r))
+              (if (= op 106)
+                (bt prog line (target-a prog pc) ph seen)
+                (if (= op 94)
+                  (if (= pos 0) (bt prog line (+ pc 1) ph seen) "!")
+                  (if (= op 36)
+                    (if (= pos n) (bt prog line (+ pc 1) ph seen) "!")
+                    (if (= op 98)
+                      (let [before (word-char? prev)
+                            after (word-char? (if (< pos n) (string-code-point-at line pos) -1))]
+                        (if (= (not (= before after)) (= 0 (a-at prog pc)))
+                          (bt prog line (+ pc 1) ph seen)
+                          "!"))
+                      (if (= op 111)
+                        (bt prog line (+ pc 1) ph (with-field seen (+ 7 (* 14 (a-at prog pc))) pos))
+                        (if (= op 108)
+                          (bt prog line (+ pc 1) ph (with-field seen (+ 14 (* 14 (a-at prog pc))) pos))
+                          "!")))))))))))))
+
+(defn- unset-groups [k :i64 acc :string] :string
+  (if (<= k 0) acc (unset-groups (- k 1) (string-concat acc "99999999999999"))))
+
+;; The tokens `start:end;` for groups 0..9 from the caps, LO added; a group
+;; whose start or end is unset, or whose end precedes its start, is -1:-1.
+(defn- render-groups [caps :string k :i64 lo :i64 acc :string] :string
+  (if (> k 9)
+    acc
+    (let [s (cap-field caps k)
+          e (cap-end-field caps k)
+          ok? (if (< s 9999999) (if (< e 9999999) (>= e s) false) false)
+          tok (if ok?
+                (string-concat (decimal-of (+ lo s)) (string-concat ":" (string-concat (decimal-of (+ lo e)) ";")))
+                "-1:-1;")]
+      (render-groups caps (+ k 1) lo (string-concat acc tok)))))
+
+;; Every allocation in here is the caller's to reclaim (a string cannot
+;; leave a region): wrap the call in an arena-scope where the answer is
+;; consumed.
+(defn captures [prog :string text :string lo :i64 hi :i64 se :i64] :string
+  (let [line (string-substring text lo hi)
+        s (- (quot se 4294967296) lo)
+        e (- (- se (* 4294967296 (quot se 4294967296))) lo)
+        st (string-concat (seven e)
+                          (string-concat (seven s) (string-concat (seven e) (string-concat (unset-groups 9 "") "|"))))
+        caps (bt prog line 0 (pack-ph s (prev-before line 0 s -1)) st)]
+    (if (string=? caps "!") "!" (render-groups caps 0 lo ""))))

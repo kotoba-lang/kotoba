@@ -183,6 +183,36 @@ The bundled standard libraries live in this repository:
 | `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
 | `org.khronos.gltf` | `org.khronos.gltf/src` | `gltf`, `kotoba.gltf.retarget` (an external specification, publisher khronos.org) |
 | `org.accellera.uvm` | `org.accellera.uvm/src` | `uvm.component`, `uvm.factory`, `uvm.phase`, `uvm.rtl-driver` (an external specification, publisher accellera.org) |
+| `org.ieee.awk` | `org.ieee.awk/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.basename` | `org.ieee.basename/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.cat` | `org.ieee.cat/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.chmod` | `org.ieee.chmod/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.cp` | `org.ieee.cp/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.cut` | `org.ieee.cut/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.date` | `org.ieee.date/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.diff` | `org.ieee.diff/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.dirname` | `org.ieee.dirname/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.echo` | `org.ieee.echo/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.grep` | `org.ieee.grep/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.head` | `org.ieee.head/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.ls` | `org.ieee.ls/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.mkdir` | `org.ieee.mkdir/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.mv` | `org.ieee.mv/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.regex` | `org.ieee.regex/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.rm` | `org.ieee.rm/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.sed` | `org.ieee.sed/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.shasum` | `org.ieee.shasum/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.sort` | `org.ieee.sort/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.stat` | `org.ieee.stat/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.tail` | `org.ieee.tail/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.tr` | `org.ieee.tr/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.uniq` | `org.ieee.uniq/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.wc` | `org.ieee.wc/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.which` | `org.ieee.which/src` | `` (an external specification, publisher ieee.org) |
+| `org.aomedia.av1` | `org.aomedia.av1/src` | `av1.bitreader`, `av1.bitwriter`, `av1.bool-decoder`, `av1.bool-encoder` (an external specification, publisher aomedia.org) |
+| `org.iso.h264` | `org.iso.h264/src` | `h264.bitstream`, `h264.cabac`, `h264.cavlc`, `h264.decode` (an external specification, publisher iso.org) |
+| `org.iso.isobmff` | `org.iso.isobmff/src` | `isobmff.blob`, `isobmff.box`, `isobmff.bytes`, `isobmff.demux` (an external specification, publisher iso.org) |
+| `org.vrmC.vrm` | `org.vrmC.vrm/src` | `vrm`, `vrm.compat`, `vrm.compose`, `vrm.constraint` (an external specification, publisher vrmC.org) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |

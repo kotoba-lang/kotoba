@@ -1,0 +1,215 @@
+;; rm -- POSIX rm (IEEE Std 1003.1).
+;;
+;;   rm FILE...       remove each file
+;;   rm -f FILE...    say nothing about what is not there, and exit 0
+;;   rm -r DIR...     remove a tree
+;;
+;; ## Measured against /bin/rm 2026-09-10
+;;
+;;   rm f1        (absent)  ->  rm: f1: No such file or directory   exit 1
+;;   rm -f f1     (absent)  ->  nothing                             exit 0
+;;   rm d1        (a dir)   ->  rm: d1: is a directory              exit 1
+;;   rm g1 nope g2          ->  g1 and g2 go, one line about nope,  exit 1
+;;
+;; Note the lower-case `is a directory`, which is rm's own wording and not
+;; the capitalised form its siblings use.
+;;
+;; ## The tree walk is a stack, and the directories come back deepest-first
+;;
+;; Mutual recursion is unavailable -- a callee must be declared before its
+;; caller -- so "remove this directory, then recurse into each subdirectory"
+;; cannot be two functions calling each other. Instead one self-recursive
+;; sweep unlinks files and pushes subdirectories onto the FRONT of a
+;; "\n"-joined stack, PREPENDING each directory it visits to a second list.
+;; Prepending reverses discovery order, so that list ends up children before
+;; parents -- which is the order rmdir needs, since it only removes an empty
+;; directory.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :fs/browse (34),
+;; :io/write-error (39).
+(ns rm.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn cap [s :string] :string
+  (typed-cap-call :fs/app-data :string :string s))
+
+(defn listing [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn exists? [path :string] :bool
+  (string=? (cap (string-concat path "EXISTS_SEP")) "1"))
+
+(defn unlink [path :string] :bool
+  (string=? (cap (string-concat path "UNLINK_SEP")) "1"))
+
+(defn remove-dir [path :string] :bool
+  (string=? (cap (string-concat path "RMDIR_SEP")) "1"))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn first-line [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn rest-lines [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+(defn entry-name [line :string] :string
+  (let [i (string-index-of line (tab))]
+    (if (< i 0) line (string-substring line 0 i))))
+
+(defn entry-dir? [line :string] :bool
+  (let [i (string-index-of line (tab))]
+    (if (< i 0) false (string=? (string-substring line (+ i 1) (+ i 2)) "1"))))
+
+(defn join-path [dir :string name :string] :string
+  (string-concat (string-concat dir "/") name))
+
+;; --- is this operand a directory -----------------------------------------
+;; Read out of the PARENT's listing, since there is no stat form. The same
+;; technique org-ieee-cp and org-ieee-ls use.
+(defn last-slash [p :string from :i64 best :i64] :i64
+  (let [rest (string-substring p from (string-byte-length p))
+        i (string-index-of rest "/")]
+    (if (< i 0) best (last-slash p (+ from (+ i 1)) (+ from i)))))
+
+(defn parent-of [p :string] :string
+  (let [i (last-slash p 0 -1)]
+    (if (< i 0) "." (if (= i 0) "/" (string-substring p 0 i)))))
+
+(defn base-of [p :string] :string
+  (let [i (last-slash p 0 -1)]
+    (if (< i 0) p (string-substring p (+ i 1) (string-byte-length p)))))
+
+(defn line-flag [line :string name :string] :i64
+  (let [t (string-index-of line (tab))]
+    (if (< t 0)
+      -1
+      (if (string=? (string-substring line 0 t) name)
+        (if (string=? (string-substring line (+ t 1) (+ t 2)) "1") 1 0)
+        -1))))
+
+(defn flag-in [rest :string name :string] :i64
+  (let [n (string-byte-length rest)]
+    (if (= n 0)
+      -1
+      (let [i (string-index-of rest "\n")]
+        (if (< i 0)
+          (line-flag rest name)
+          (let [f (line-flag (string-substring rest 0 i) name)]
+            (if (>= f 0) f (flag-in (string-substring rest (+ i 1) n) name))))))))
+
+(defn dir? [p :string] :bool
+  (= (flag-in (listing (parent-of p)) (base-of p)) 1))
+
+;; --- the recursive sweep -------------------------------------------------
+;; Unlinks every file in ONE directory's listing and answers its
+;; subdirectories, "\n"-joined.
+(defn sweep-one [dir :string rest :string acc :string] :string
+  (if (= (string-byte-length rest) 0)
+    acc
+    (let [line (first-line rest)
+          more (rest-lines rest)
+          child (join-path dir (entry-name line))]
+      (if (entry-dir? line)
+        (sweep-one dir more (string-concat (string-concat acc child) (nl)))
+        (do (unlink child) (sweep-one dir more acc))))))
+
+;; `done` is built by PREPENDING, so it comes back children-before-parents --
+;; the order rmdir needs. `fuel` bounds the walk.
+(defn sweep [stack :string done :string fuel :i64] :string
+  (if (= (string-byte-length stack) 0)
+    done
+    (if (< fuel 1)
+      done
+      (let [dir (first-line stack)
+            rest (rest-lines stack)
+            subs (sweep-one dir (listing dir) "")]
+        (sweep (string-concat subs rest)
+               (string-concat (string-concat dir (nl)) done)
+               (- fuel 1))))))
+
+(defn rmdir-each [rest :string] :bool
+  (if (= (string-byte-length rest) 0)
+    true
+    (if (remove-dir (first-line rest))
+      (rmdir-each (rest-lines rest))
+      false)))
+
+(defn remove-tree [dir :string] :bool
+  (rmdir-each (sweep (string-concat dir (nl)) "" 4096)))
+
+;; --- flags ---------------------------------------------------------------
+;; Argument 0's SHAPE, never the argument COUNT.
+(defn forced? [] :bool
+  (string=? (arg "0") "-f"))
+
+(defn recursive? [] :bool
+  (string=? (arg "0") "-r"))
+
+(defn flagged? [] :bool
+  (if (forced?) true (recursive?)))
+
+(defn first-operand [] :i64
+  (if (flagged?) 1 0))
+
+(defn say [path :string reason :string] :i64
+  (do (emit-error "rm: ")
+      (emit-error path)
+      (emit-error reason)
+      (emit-error (nl))
+      1))
+
+(defn one [path :string] :i64
+  (if (exists? path)
+    (if (dir? path)
+      (if (recursive?)
+        (if (remove-tree path) 0 (say path ": Directory not empty"))
+        ;; rm's own lower-case wording, measured rather than matched to a
+        ;; sibling's capitalisation.
+        (say path ": is a directory"))
+      (if (unlink path) 0 (say path ": No such file or directory")))
+    ;; -f is silent about what is not there, and does not fail.
+    (if (forced?) 0 (say path ": No such file or directory"))))
+
+(defn each [i :i64 total :string worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [r (one (arg (decimal-of i)))]
+      (each (+ i 1) total (if (= r 1) 1 worst)))))
+
+(defn main [] :i64
+  (let [total (arg "")
+        start (first-operand)]
+    (if (string=? (decimal-of start) total)
+      ;; No operand. Measured: rm(1) prints TWO usage lines and exits 64 --
+      ;; not 1 -- while `rm -f` with no operand is silent and exits 0.
+      (if (forced?)
+        0
+        (do
+          (emit-error "usage: rm [-f | -i] [-dIPRrvWx] file ...")
+          (emit-error (nl))
+          (emit-error "       unlink [--] file")
+          (emit-error (nl))
+          64))
+      (each start total 0))))

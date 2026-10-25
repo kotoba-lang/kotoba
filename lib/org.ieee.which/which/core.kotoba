@@ -1,0 +1,152 @@
+;; which -- BSD which(1) as a Kotoba command.
+;;
+;;   which NAME...        the first executable NAME on PATH, one per line
+;;   which -s NAME...     say nothing, answer with the exit status
+;;   which -a NAME...     every executable NAME on PATH, in PATH order
+;;
+;; Exit 0 when every name was found, 1 otherwise. A NAME with a slash is
+;; tried as given, not searched.
+;;
+;; ## Measured, 2026-09-16
+;;
+;; 1,495 invocations in 1,268,018 agent Bash calls (superproject
+;; ADR-2609161710), all but a handful `which NAME`. Looking where the
+;; caller's shell looks needs the caller's PATH: `:env/read` (wire 33)
+;; answers it, and the packaged scope names `$PATH` (amu #1021) so wire 35
+;; may probe beneath those directories -- `EXISTS_SEP` for "is there a
+;; readable file", `STAT_SEP` for its mode bits. A directory on PATH that
+;; does not exist, or that the loader could not resolve, simply has nothing
+;; in it.
+;;
+;; "Executable" here is any of the three execute bits, as /usr/bin/which
+;; decides with access(X_OK) for the calling user -- the same answer for a
+;; file the caller owns, and the case the suite pins is a file with no
+;; execute bit at all, which which(1) skips.
+;;
+;; Capabilities: :cli/args (38), :env/read (33), :fs/app-data (35),
+;; :io/write (37), :io/write-error (39).
+(ns which.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn env [name :string] :string
+  (typed-cap-call :env/read :string :string name))
+
+(defn fsq [s :string] :string
+  (typed-cap-call :fs/app-data :string :string s))
+
+(defn nl [] :string "\n")
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10)) (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn argc-from [k :i64 total :string] :i64
+  (if (string=? (decimal-of k) total) k (argc-from (+ k 1) total)))
+
+(defn argc [] :i64 (argc-from 0 (arg "")))
+
+(defn- digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn- text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) acc (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+;; The first field of STAT's "<mode> <size> <blocks> <isdir>", as a number.
+(defn- mode-of [st :string] :i64
+  (let [sp (string-find-byte st 32 0)]
+    (text->i64 st 0 (if (< sp 0) (string-byte-length st) sp) 0)))
+
+;; Is PATH a readable regular file with an execute bit? EXISTS answers "1"
+;; only for a readable file inside the scope (a directory answers "0");
+;; STAT's mode carries the bits.
+(defn- executable? [path :string] :bool
+  (if (string=? (fsq (string-concat path "EXISTS_SEP")) "1")
+    (let [st (fsq (string-concat path "STAT_SEP"))]
+      (if (= 0 (string-byte-length st))
+        false
+        (if (string=? (string-substring st (- (string-byte-length st) 1) (string-byte-length st)) "1")
+          false
+          (not= 0 (bit-and (mode-of st) 73)))))
+    false))
+
+;; Walk PATH's directories from FROM for NAME. Prints each hit (all of them
+;; under -a, the first otherwise); answers 1 when at least one was found.
+;; MODE: bit 0 = -s (silent), bit 1 = -a (all).
+(defn- search [dirs :string from :i64 name :string mode :i64 found :i64] :i64
+  (let [n (string-byte-length dirs)]
+    (if (> from n)
+      found
+      (let [colon (string-find-byte dirs 58 from)
+            end (if (< colon 0) n colon)
+            dir (string-substring dirs from end)
+            ;; An empty PATH entry is the working directory in a shell;
+            ;; a packaged command has no scope for it, so it holds nothing.
+            candidate (if (= 0 (string-byte-length dir)) "" (string-concat dir (string-concat "/" name)))
+            hit (if (= 0 (string-byte-length candidate)) false (executable? candidate))]
+        (if hit
+          (do (if (= 0 (bit-and mode 1)) (do (emit candidate) (emit (nl)) 0) 0)
+              (if (= 2 (bit-and mode 2))
+                (search dirs (+ end 1) name mode 1)
+                1))
+          (search dirs (+ end 1) name mode found))))))
+
+(defn- has-slash? [s :string] :bool (>= (string-find-byte s 47 0) 0))
+
+;; One NAME; answers 1 when found.
+(defn- one [name :string mode :i64] :i64
+  (if (has-slash? name)
+    (if (executable? name)
+      (do (if (= 0 (bit-and mode 1)) (do (emit name) (emit (nl)) 0) 0) 1)
+      0)
+    (search (env "PATH") 0 name mode 0)))
+
+;; Every NAME from I; answers the exit status (1 when any was not found).
+(defn- each [i :i64 n :i64 mode :i64 worst :i64] :i64
+  (if (>= i n)
+    worst
+    (each (+ i 1) n mode (if (= 1 (one (arg (decimal-of i)) mode)) worst 1))))
+
+(defn- usage [] :i64
+  (do (emit-error "usage: which [-as] program ...") (emit-error (nl)) 1))
+
+;; Leading flags: -a, -s, -as, -sa.
+(defn- flags-of [i :i64 acc :i64] :i64
+  (if (>= i (argc))
+    acc
+    (let [a (arg (decimal-of i))]
+      (if (string=? a "-a") (flags-of (+ i 1) (bit-or acc 2))
+        (if (string=? a "-s") (flags-of (+ i 1) (bit-or acc 1))
+          (if (string=? a "-as") (flags-of (+ i 1) 3)
+            (if (string=? a "-sa") (flags-of (+ i 1) 3)
+              acc)))))))
+
+(defn- first-name [i :i64] :i64
+  (if (>= i (argc))
+    i
+    (let [a (arg (decimal-of i))]
+      (if (if (string=? a "-a") true (if (string=? a "-s") true (if (string=? a "-as") true (string=? a "-sa"))))
+        (first-name (+ i 1))
+        i))))
+
+(defn main [] :i64
+  (let [n (argc)
+        start (first-name 0)]
+    (if (>= start n)
+      (usage)
+      (each start n (flags-of 0 0) 0))))

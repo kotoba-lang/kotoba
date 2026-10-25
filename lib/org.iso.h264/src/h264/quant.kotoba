@@ -1,0 +1,104 @@
+(ns h264.quant
+  (:export [group-idx level-scale ac-qmul dc-qmul dequant-ac chroma-qp]))
+
+;; H.264 / ISO/IEC 14496-10 §8.5.9 residual 4x4 dequantization, plus the
+;; §8.5.8 / Table 8-15 chroma QP derivation, as a JVM-free guest kernel.
+;;
+;; This is the `.kotoba` twin of `h264/quant.cljc`, which remains the
+;; authoritative decoder implementation and is not changed by this file.
+;; Every function here is a pure scalar function of at most five `:i64`
+;; parameters. That shape is FORCED, not chosen: `lang/guest-grammar.edn`
+;; sets `:max-parameters 5`, and the word-typed native backends admit only
+;; word-sized values, so nothing wider than a scalar can cross an exported
+;; boundary. In exchange the module is admissible on `aarch64`/`x86_64` and
+;; emits a Wasm module with ZERO host imports.
+;;
+;; Two spellings below look like circumlocutions and are not. Measured
+;; through `bin/amu check` against amu 02c7e57 (2026-08-30), there is NO
+;; admitted lowering
+;; for `bit-shift-left`, `bit-shift-right`, `unsigned-bit-shift-right`,
+;; `mod`, `rem`, `min`, `max` or `/`, all of which `lang/guest-grammar.edn`
+;; lists in `:admitted-builtins`. `quot`, `bit-and`, `bit-or`, `bit-xor`,
+;; `inc`, `dec`, `cond` and `case` from the same set ARE admitted. So the
+;; dequant left shift is written as multiplication by a power of two, and
+;; H.264's arithmetic right shift is written as floor division. Both are
+;; exactly equivalent, not approximations. Do not "simplify" them back to
+;; shifts without re-measuring the frontend.
+
+(defn norm-adjust
+  "normAdjust4x4(m, group) for m = qp mod 6 and the position group from
+   `group-idx`. Same values as `h264.quant/normadjust-v`, spelled as a
+   closed scalar function because no map literal survives to the word ABI."
+  [m :i64 group :i64] :i64
+  (cond
+    (= m 0) (cond (= group 0) 10 (= group 1) 13 :else 16)
+    (= m 1) (cond (= group 0) 11 (= group 1) 14 :else 18)
+    (= m 2) (cond (= group 0) 13 (= group 1) 16 :else 20)
+    (= m 3) (cond (= group 0) 14 (= group 1) 18 :else 23)
+    (= m 4) (cond (= group 0) 16 (= group 1) 20 :else 25)
+    :else   (cond (= group 0) 18 (= group 1) 23 :else 29)))
+
+(defn group-idx
+  "Position group 0/1/2 for raster (row,col), both 0..3. Both are
+   non-negative here, so truncating `quot` and flooring `mod` agree."
+  [row :i64 col :i64] :i64
+  (+ (- row (* 2 (quot row 2)))
+     (- col (* 2 (quot col 2)))))
+
+(defn level-scale
+  "LevelScale4x4(qp mod 6, row, col) with the flat baseline-profile
+   weightScale4x4 value 16."
+  [qp :i64 row :i64 col :i64] :i64
+  (* 16 (norm-adjust (- qp (* 6 (quot qp 6))) (group-idx row col))))
+
+(defn power-of-two
+  "2^exponent for the bounded exponents this module needs (2..10)."
+  [exponent :i64] :i64
+  (if (= exponent 0) 1 (* 2 (power-of-two (- exponent 1)))))
+
+(defn ac-qmul
+  "Dequant multiplier for a regular (non-DC) coefficient at raster
+   (row,col): LevelScale4x4 << (qp/6 + 2)."
+  [qp :i64 row :i64 col :i64] :i64
+  (* (level-scale qp row col) (power-of-two (+ (quot qp 6) 2))))
+
+(defn dc-qmul
+  "Dequant multiplier for the Hadamard-domain DC block: the position-(0,0)
+   LevelScale, applied uniformly."
+  [qp :i64] :i64
+  (ac-qmul qp 0 0))
+
+(defn floor-div-64
+  "floor(v / 64) for any sign of v, i.e. C's arithmetic `>> 6`. `quot`
+   truncates toward zero, so a negative remainder needs one more step down."
+  [v :i64] :i64
+  (let [q (quot v 64)
+        r (- v (* 64 q))]
+    (if (< r 0) (- q 1) q)))
+
+(defn dequant-ac
+  "One dequantized regular coefficient: `(level * ac-qmul + 32) >> 6`, the
+   exact expression `h264.decode` applies per coefficient. The zero guard
+   mirrors the decoder's own and is value-neutral, since (0+32)>>6 = 0."
+  [level :i64 qp :i64 row :i64 col :i64] :i64
+  (if (= level 0) 0
+    (floor-div-64 (+ (* level (ac-qmul qp row col)) 32))))
+
+(defn chroma-qp-tail
+  "Table 8-15's compressed tail for qPI >= 30 (BitDepthC = 8)."
+  [q :i64] :i64
+  (cond
+    (= q 30) 29 (= q 31) 30 (= q 32) 31 (= q 33) 32
+    (= q 34) 32 (= q 35) 33 (= q 36) 34 (= q 37) 34
+    (= q 38) 35 (= q 39) 35 (= q 40) 36 (= q 41) 36
+    (= q 42) 37 (= q 43) 37 (= q 44) 37 (= q 45) 38
+    (= q 46) 38 (= q 47) 38 (= q 48) 39 (= q 49) 39
+    (= q 50) 39 :else 39))
+
+(defn chroma-qp
+  "QPc from QPy and the PPS chroma_qp_index_offset, for BitDepthC = 8:
+   Clip3(0,51, qpy + offset) then Table 8-15, identity below 30."
+  [qpy :i64 qp-offset :i64] :i64
+  (let [raw (+ qpy qp-offset)
+        q (if (< raw 0) 0 (if (> raw 51) 51 raw))]
+    (if (< q 30) q (chroma-qp-tail q))))

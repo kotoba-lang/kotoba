@@ -1,0 +1,260 @@
+;; test/cut_test.cljk — build the command and compare it with the system
+;; cut, byte for byte, on stdout, stderr AND exit status.
+;;
+;; Two behaviours carry most of the weight here and neither is an edge case:
+;;
+;;   a line with NO delimiter is printed WHOLE, not as an empty field
+;;   the default delimiter is a TAB, not a space
+;;
+;; Both measured against /usr/bin/cut rather than recalled.
+
+(ns cut-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-cut "/usr/bin/cut")
+
+;; A directory of fixtures, and the cases over them. Each case is an argv,
+;; and each is here because it separates a right implementation from a wrong
+;; one that passes the others:
+;;
+;;   one file           -- the basic contract
+;;   two files          -- concatenated in ORDER, with nothing added between
+;;   the same file twice-- an operand is not deduplicated
+;;   an EMPTY file      -- reads as the empty string, which must not end the
+;;                         loop the way "past the last operand" does
+;;   empty then content -- the same trap from the other side
+;;   no trailing newline-- cat adds nothing of its own
+;;   binary-ish bytes   -- high bytes survive the round trip
+;;   no operands        -- POSIX reads stdin; there is no stdin capability,
+;;                         so this asserts what it ACTUALLY does (nothing),
+;;                         not what POSIX says
+(def fixtures
+  {"colon"  "a:b:c\nd:e:f\n"
+   ;; Multi-byte lines for -c: characters, not bytes.
+   "utf8c"  "\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8\nab\u00e9d\n"
+   "tabs"   "one\ttwo\tthree\n"
+   ;; No delimiter at all: cut prints the line WHOLE.
+   "nosep"  "nofield\n"
+   "empty"  ""
+   ;; Two fields, so -f9 asks for one that is not there.
+   "short"  "a:b\n"
+   ;; A leading and a trailing delimiter: the empty field on each side is a
+   ;; field.
+   "edges"  ":lead\ntrail:\n"
+   "utf8"   "\u65e5:\u672c:\u8a9e\n"
+   ;; No trailing newline, WITH a delimiter: cut extracts a field and adds a
+   ;; newline, 13 bytes in and 7 out.
+   "nonl"   "nonl-x:nonl-y"
+   ;; No trailing newline and NO delimiter: cut echoes the line whole and
+   ;; adds NOTHING, 1 byte in and 1 out. This is the fixture the
+   ;; single-operand suite never had -- every undelimited case ended in a
+   ;; newline -- and without it the two-operand run-on looks like proof that
+   ;; cut concatenates its inputs, which it does not.
+   "bare"   "g"
+   ;; Five fields, so ranges have room on both sides.
+   "wide"   "a:b:c:d:e\n"})
+
+(def cases
+  [["-d:" "-f1" "colon"] ["-d:" "-f2" "colon"] ["-d:" "-f3" "colon"]
+   ;; Past the last field. This is the case that separates "the remainder is
+   ;; the last field" from "the line ran out": before it was fixed, -f4 over
+   ;; a three-field line answered `c` while -f1, -f2 and -f3 all agreed.
+   ["-d:" "-f4" "colon"] ["-d:" "-f9" "short"]
+   ["-d:" "-f2" "nosep"] ["-d:" "-f2" "empty"] ["-d:" "-f2" "short"]
+   ["-d:" "-f1" "edges"] ["-d:" "-f2" "edges"] ["-d:" "-f2" "utf8"]
+   ;; No -d: the delimiter is a TAB. `colon` has none, so the whole line.
+   ["-f1" "tabs"] ["-f2" "tabs"] ["-f2" "colon"]
+   ["-d:" "-f2" "missing"]
+   ;; --- field LISTS and RANGES ---------------------------------------
+   ;; The output is ascending and de-duplicated regardless of how the list
+   ;; is written, so `3,1` and `1,1` are the two cases that separate "test
+   ;; each field in order" from "walk the list as given".
+   ["-d:" "-f1,3" "wide"] ["-d:" "-f3,1" "wide"] ["-d:" "-f1,1" "wide"]
+   ["-d:" "-f2-4" "wide"] ["-d:" "-f2-" "wide"] ["-d:" "-f-3" "wide"]
+   ;; Every field, and a range that starts past the end.
+   ["-d:" "-f1-" "wide"] ["-d:" "-f9-" "wide"]
+   ;; A field past the end inside a list is SKIPPED, not an error, and does
+   ;; not produce a stray delimiter.
+   ["-d:" "-f2,9" "wide"] ["-d:" "-f4,5" "short"]
+   ;; A DESCENDING range selects nothing -- and still prints a line.
+   ["-d:" "-f3-1" "wide"]
+   ;; A list over a line with no delimiter still prints the whole line.
+   ["-d:" "-f1,3" "nosep"]
+   ;; A list over the empty and the multi-byte fixtures.
+   ["-d:" "-f1,3" "utf8"] ["-d:" "-f1,3" "empty"]
+   ;; Malformed lists: two different diagnostics and exit 1, compared as
+   ;; bytes like every other case. `0` and the empty list are "may not
+   ;; include zero"; a non-number and a second dash are "illegal list
+   ;; value". Before this the command had ONE message, spelled `[-cf]`
+   ;; where cut spells it `[-bcf]`, and no case exercised it at all.
+   ["-d:" "-f0" "wide"] ["-d:" "-fx" "wide"] ["-d:" "-f1-x" "wide"]
+   ["-d:" "-f1-2-3" "wide"] ["-d:" "-f1," "wide"] ["-d:" "-f,1" "wide"]
+   ["-d:" "-f-" "wide"]
+   ;; --- two or more operands ------------------------------------------
+   ;; cut CONCATENATES and cuts the result; there are no headers.
+   ["-d:" "-f1" "colon" "short"] ["-d:" "-f2" "colon" "short"]
+   ["-d:" "-f1,3" "colon" "wide"]
+   ;; The same file twice is not de-duplicated.
+   ["-d:" "-f1" "colon" "colon"]
+   ;; An empty operand contributes nothing.
+   ["-d:" "-f1" "colon" "empty"] ["-d:" "-f1" "empty" "colon"]
+   ;; THE contrast with sort. `nonl` has no trailing newline, and cut runs
+   ;; it into the next operand's first line where sort keeps it whole.
+   ["-d:" "-f1" "nonl" "colon"] ["-d:" "-f1" "colon" "nonl"]
+   ;; A missing operand: the readable ones are still cut and printed, and
+   ;; the exit status is 1 -- cut continues where sort refuses outright.
+   ["-d:" "-f1" "colon" "missing"] ["-d:" "-f1" "missing" "colon"]
+   ["-d:" "-f1" "colon" "missing" "short"]
+   ;; No -d, so the delimiter is a TAB, across two operands.
+   ["-f1" "tabs" "colon"]
+   ;; The pair that distinguishes "cut concatenates its operands" from "cut
+   ;; leaves an undelimited last line unterminated". Alone, `bare` must come
+   ;; back as ONE byte with no newline; followed by another operand, that
+   ;; operand's first field lands on the same line -- which looks like
+   ;; concatenation and is not.
+   ["-d:" "-f1" "bare"] ["-d:" "-f1" "bare" "colon"]
+   ["-d:" "-f2" "bare" "colon"]
+   ;; --- -s suppresses lines with no delimiter ---------------------------
+   ;; Exactly the lines cut otherwise echoes WHOLE. An empty line has no
+   ;; delimiter either, so -s drops it too.
+   ["-d:" "-s" "-f1" "colon"] ["-d:" "-s" "-f1" "nosep"]
+   ["-d:" "-s" "-f1" "edges"] ["-d:" "-s" "-f1" "empty"]
+   ;; A delimited line missing the field still prints an empty line under -s;
+   ;; -s is about the DELIMITER, not about the field.
+   ["-d:" "-s" "-f9" "colon"] ["-d:" "-s" "-f4" "short"]
+   ;; The flags may come in ANY order -- all three of these are one request.
+   ["-s" "-d:" "-f1" "colon"] ["-d:" "-f1" "-s" "colon"]
+   ;; -s with the TAB default, and across several operands.
+   ["-s" "-f1" "tabs"] ["-s" "-f1" "colon"]
+   ["-d:" "-s" "-f1" "colon" "nosep"]
+   ;; -s over the unterminated undelimited fixture: dropped entirely.
+   ["-d:" "-s" "-f1" "bare"] ["-d:" "-s" "-f1" "bare" "colon"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 97% of cut's invocations in agent tool use are a later pipeline
+   ;; segment (7,766 of 7,976 measured); `head | cut` alone is 1,481.
+   {:argv ["-d:" "-f2"] :stdin "colon"}
+   {:argv ["-f1"] :stdin "tabs"}
+   {:argv ["-d:" "-f1,3"] :stdin "colon"}
+   {:argv ["-d:" "-f9"] :stdin "short"}
+   {:argv ["-f1"] :stdin "nosep"}
+   {:argv ["-f1"] :stdin "empty"}
+   {:argv ["-d:" "-s" "-f1"] :stdin "bare"}
+   ;; Past one pipe buffer: 1 MB of lines, field 2 of each.
+   {:argv ["-d6" "-f2"] :stdin :big}
+   ;; --- -c: character positions (2026-09-17) ------------------------------
+   ;; `cut -c1-200` and its siblings are 5,598 measured calls, the most
+   ;; frequent cut flag. Positions are code points: the utf8 fixture is the
+   ;; case that separates characters from bytes.
+   ["-c1-3" "colon"] ["-c1-200" "colon"] ["-c3-" "colon"] ["-c-3" "colon"] ["-c2,4,6" "colon"]
+   ["-c1-2,5-" "colon"] ["-c5-20" "colon"] ["-c1-3,2-4" "colon"] ["-c20" "colon"] ["-c1" "empty"]
+   ["-c1-3" "utf8c"] ["-c2" "utf8c"] ["-c2-" "utf8c"] ["-c1-3" "nonl"] ["-c3-1" "colon"]
+   ["-c0" "colon"] ["-cx" "colon"] ["-c1-3" "colon" "tabs"] ["-c1-3" "missing" "colon"]
+   {:argv ["-c1-4"] :stdin "colon"} {:argv ["-c2-"] :stdin "utf8c"} {:argv ["-c1-30"] :stdin :big}])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-cut) (refuse (str "no " system-cut " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-wc-"))
+        src (.resolve path (.cwd js/process) "cut" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "cut.kexe")
+        blob (.join path tmp "cut.bin")
+        exe (.join path tmp "cut")
+        exe-big (.join path tmp "cut-big")]
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
+    ;; The fixtures live in the tree the binary is packaged for. The native
+    ;; loader refuses a relative request outright, so operands are absolute.
+    (let [data (.join path tmp "data")]
+      (.mkdirSync fs data)
+      (doseq [[name content] fixtures]
+        (.writeFileSync fs (.join path data name)
+                        content
+                        "utf8")))
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      ;; TWO binaries from the same code: one with the loader's default
+      ;; string-arena budget and one with a raised budget. The pair is what
+      ;; makes the ceiling below a measurement instead of a claim -- a single
+      ;; binary could only show that some size works and some does not, not
+      ;; that the bound is the arena and that it moves.
+      ;; Fuel and arena are constants of the binary, so they are packaged
+      ;; here rather than supplied at run time. Counting words walks one code
+      ;; point at a time, so the guest recursion is as long as the file and
+      ;; the default 512 fuel counts almost nothing.
+      (doseq [[out extra] [[exe ["--fuel" "50000000" "--pairs" "4096" "--string-pool" "8000000"]]]]
+        (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                                  "--allow" "35,37,38,39,41"
+                                  "--fs-scope" (.realpathSync fs (.join path tmp "data"))
+                                  "--output" out]
+                                 extra) {})]
+          (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
+    ;; Now the only thing that matters: run it.
+    (let [results
+          (for [case cases]
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture (or :big) fed as standard input to
+                  ;; BOTH binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (let [f (:stdin case)]
+                            (if (= f :big)
+                              (.repeat "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n" 16384)
+                              (get fixtures f))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (mapv #(if (str/starts-with? % "-")
+                                %
+                                (.join path (.realpathSync fs (.join path tmp "data")) %))
+                             names)
+                  k (run exe argv opts)
+                  s (run system-cut argv opts)
+                  ;; stderr is compared too, now that there is a capability
+                  ;; that can write it. Without this the `-n 0` case would
+                  ;; pass on an empty stdout and the right exit status while
+                  ;; saying nothing -- which is what it did before wire 39.
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s)))]
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+                   :ok same? :kotoba (.toString (:out k) "utf8")
+               :kotoba-err (.toString (:err k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ")
+                      (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-cut " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r))))))) 
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

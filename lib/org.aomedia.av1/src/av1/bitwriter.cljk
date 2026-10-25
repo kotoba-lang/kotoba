@@ -1,0 +1,198 @@
+(ns av1.bitwriter
+  "MSB-first bit writer -- the exact structural inverse of av1.bitreader's
+   descriptor primitives (AV1 Bitstream & Decoding Process Specification
+   section 4 \"Descriptors\" / 8.1 \"Parsing process for f(n)\"). This
+   repo's decode side (av1.bitreader) is transcribed straight from the
+   spec's read-side pseudocode; the spec itself never defines an encode
+   side (it is a decoder-only document, like every other bitstream spec
+   this org has encoded for -- see kotoba-lang/org-iso-h264's own
+   decode->encode derivation) -- so every fn here is derived by literally
+   inverting av1.bitreader's own fn, one descriptor at a time, and
+   cross-checked by round-tripping through av1.bitreader itself (see
+   test/av1/bitwriter_test.cljk): `(br/f (br/make-reader (to-bytes (f
+   (make-writer) n v))) n)` must reproduce `v` for every descriptor.
+
+   ENCODE scope (first AV1 encode support, ADR-2607122000 Migration step 9
+   continuation -- 'AV1 encode side' task, 2026-07): only the descriptors
+   this repo's narrow single-keyframe/single-BLOCK_32X32-leaf encode scope
+   actually needs are exercised end-to-end (f/uvlc/le/leb128/su/ns/
+   byte-alignment/to-bytes) -- all seven are implemented in full generality
+   (mirroring av1.bitreader's own generality) since each is a small,
+   self-contained inversion, not because every branch is exercised by a
+   real encoded stream.
+
+   State is a plain map `{:bits [...]}` -- a vector of 0/1 ints, MSB-first
+   in write order -- so callers can thread it explicitly (no mutable
+   atoms), exactly like av1.bitreader's reader map. This repo's encode
+   scope only ever produces on the order of a few hundred bits (a single
+   32x32 keyframe), so the O(1)-amortized-append persistent-vector
+   representation is simplicity-over-micro-optimization, matching this
+   repo's usual stance (see av1.transform's docstring for the same
+   tradeoff rationale)."
+  ;; `two-pow` lives in the reader. Copying it here would make two
+  ;; definitions of one fact, and the whole point of this namespace is that it
+  ;; is the reader's inverse -- so it should be reading the reader's constant,
+  ;; not restating it.
+  (:require [av1.bitreader :as br])
+  #?(:clj (:refer-clojure)))
+
+(defn make-writer
+  "Empty writer, positioned at bit 0."
+  []
+  {:bits []})
+
+(defn bit-pos [writer] (count (:bits writer)))
+(defn byte-aligned? [writer] (zero? (mod (bit-pos writer) 8)))
+
+(defn write-bit
+  "Append a single 0/1 bit. `bit` may be any truthy/falsy-via-zero int (only
+   its low bit is used, matching f(n)'s own MSB-first bit-by-bit accumulation)."
+  [writer bit]
+  (update writer :bits conj (bit-and bit 1)))
+
+(defn f
+  "Inverse of av1.bitreader/f: write the low `n` bits of `value`, MSB first.
+   n=0 writes nothing (matches f(0)==0 reading nothing)."
+  [writer n value]
+  (loop [w writer, i 0]
+    (if (>= i n)
+      w
+      (let [shift (- n 1 i)
+            bit (bit-and (bit-shift-right value shift) 1)]
+        (recur (write-bit w bit) (inc i))))))
+
+(defn uvlc
+  "Inverse of av1.bitreader/uvlc: `leading-zeros` zero-bits, a 1-bit
+   terminator, then `leading-zeros` bits of `(value - (2^leading-zeros - 1))`
+   -- exactly inverting the reader's `value = extra + (2^leading_zeros - 1)`.
+   Only values < 2^32 - 1 are supported (the reader's own >=32-leading-zeros
+   clamp path is a lossy saturating encode on the read side with no unique
+   inverse, and this repo's encode scope never needs it)."
+  [writer value]
+  ;; `br/two-pow`, not `(bit-shift-left 1 n)`: see its docstring. On
+  ;; ClojureScript the guard below used to read `(>= value 0)`, because
+  ;; `(dec (bit-shift-left 1 32))` is 0 there -- so every encode threw.
+  (when (>= value (dec (br/two-pow 32)))
+    (throw (ex-info "av1.bitwriter/uvlc: value too large for this repo's non-saturating uvlc encode"
+                     {:value value})))
+  (let [leading-zeros (loop [lz 0]
+                         (if (< value (dec (br/two-pow (inc lz))))
+                           lz
+                           (recur (inc lz))))
+        extra (- value (dec (br/two-pow leading-zeros)))]
+    (-> writer
+        (f leading-zeros 0)
+        (f 1 1)
+        (f leading-zeros extra))))
+
+(defn le
+  "Inverse of av1.bitreader/le: `n` little-endian bytes of `value`. Only
+   valid when byte-aligned (matches the reader's own precondition)."
+  [writer n value]
+  (loop [w writer, i 0]
+    (if (>= i n)
+      w
+      (recur (f w 8 (bit-and 0xff (bit-shift-right value (* i 8)))) (inc i)))))
+
+(defn leb128
+  "Inverse of av1.bitreader/leb128: variable-length little-endian base-128,
+   7 payload bits + 1 continuation bit per byte, MSB of each byte set on
+   every byte except the last. Matches the reader's own up-to-8-byte cap
+   (values needing a 9th byte are out of scope, same as the reader, which
+   never reads past i=8)."
+  [writer value]
+  (loop [w writer, v value, i 0]
+    (when (>= i 8)
+      (throw (ex-info "av1.bitwriter/leb128: value needs more than 8 leb128 bytes"
+                       {:value value})))
+    (let [byte7 (bit-and v 0x7f)
+          rest (bit-shift-right v 7)]
+      (if (zero? rest)
+        (f w 8 byte7)
+        (recur (f w 8 (bit-or byte7 0x80)) rest (inc i))))))
+
+(defn su
+  "Inverse of av1.bitreader/su: n-bit unsigned field whose top bit is the
+   sign, exactly inverting `value = x - 2*sign_mask when bit set, else x`.
+   `value` must be in `[-(2^(n-1)), 2^(n-1) - 1]` (the reader's own
+   representable range for su(n))."
+  [writer n value]
+  (let [sign-mask (bit-shift-left 1 (dec n))
+        x (if (neg? value) (+ value (bit-shift-left 1 n)) value)]
+    (when (or (>= value sign-mask) (< value (- sign-mask)))
+      (throw (ex-info "av1.bitwriter/su: value out of range for su(n)" {:n n :value value})))
+    (f writer n x)))
+
+(defn floor-log2
+  "Same as av1.bitreader/floor-log2 (duplicated here rather than requiring
+   av1.bitreader, to keep this namespace's only dependency being 'plain
+   values in, plain values out' -- no reader/writer cross-talk)."
+  [x]
+  (loop [s 0, x' x]
+    (if (<= x' 1) s (recur (inc s) (quot x' 2)))))
+
+(defn ns
+  "Inverse of av1.bitreader/ns: non-symmetric unsigned encoding of `value`
+   in range 0..(n-1). Exactly inverts the reader's two-branch derivation:
+   w = FloorLog2(n)+1, m = 2^w - n; if value < m, write (w-1) bits of value
+   directly; else write (w-1) bits of the derived `v` plus 1 extra bit,
+   where v/extraBit are chosen so the reader's `(v<<1 + extraBit) - m`
+   reconstructs `value` exactly."
+  [writer n value]
+  (if (<= n 1)
+    writer
+    (let [w (inc (floor-log2 n))
+          m (- (bit-shift-left 1 w) n)]
+      (if (< value m)
+        (f writer (dec w) value)
+        (let [combined (+ value m)
+              v (bit-shift-right combined 1)
+              extra-bit (bit-and combined 1)]
+          (-> writer (f (dec w) v) (f 1 extra-bit)))))))
+
+(defn byte-alignment
+  "Inverse of av1.bitreader/byte-alignment: pad with 0 zero_bit until
+   byte-aligned (writes nothing if already aligned)."
+  [writer]
+  (loop [w writer]
+    (if (byte-aligned? w) w (recur (write-bit w 0)))))
+
+(defn trailing-bits
+  "spec 5.3.4 \"Trailing bits syntax\" -- `trailing_bits(nbBits)`:
+   `trailing_one_bit f(1) = 1` then `trailing_zero_bit f(1) = 0` repeated
+   until byte-aligned. NOT the same as `byte-alignment` above (which pads
+   with plain 0 bits, matching spec's own `byte_alignment()` used e.g.
+   inside `frame_obu()` between `frame_header_obu()` and
+   `tile_group_obu()`) -- `trailing_bits()` is specifically what
+   `open_bitstream_unit()`'s own wrapper calls whenever an OBU's actual
+   syntax consumed FEWER bits than its declared `obu_size*8`, for every
+   OBU type EXCEPT `OBU_TILE_GROUP`/`OBU_FRAME`/`OBU_TILE_LIST` (whose own
+   internal syntax already accounts for every declared byte) --
+   `OBU_SEQUENCE_HEADER`/standalone `OBU_FRAME_HEADER`/`OBU_METADATA`/
+   `OBU_TEMPORAL_DELIMITER` all need this if their payload doesn't already
+   end byte-aligned. Writing plain zero padding here instead (as
+   `byte-alignment` does) produces a bitstream a real spec-conformant
+   decoder rejects -- confirmed empirically: ffmpeg/dav1d's own OBU
+   parser explicitly checks `trailing_one_bit` is exactly 1
+   (\"trailing_one_bit out of range: 0, but must be in [1,1]\"), so this
+   distinction is a REAL interop requirement, not a cosmetic one."
+  [writer]
+  (if (byte-aligned? writer)
+    writer
+    (loop [w (write-bit writer 1)]
+      (if (byte-aligned? w) w (recur (write-bit w 0))))))
+
+(defn to-bytes
+  "Pack the accumulated bits into a vector of byte values (0-255),
+   zero-padding the final partial byte if any (matches how a real encoder
+   flushes -- av1.bitreader never reads padding bits meaningfully since
+   every OBU's payload length is itself leb128-framed, so trailing zero
+   padding here is never misinterpreted downstream)."
+  [writer]
+  (let [bits (:bits writer)
+        n (count bits)
+        padded (into bits (repeat (mod (- 8 (mod n 8)) 8) 0))]
+    (mapv (fn [byte-idx]
+            (reduce (fn [acc i] (bit-or (bit-shift-left acc 1) (nth padded (+ (* byte-idx 8) i))))
+                    0 (range 8)))
+          (range (quot (count padded) 8)))))

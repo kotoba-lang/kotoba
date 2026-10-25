@@ -1,0 +1,847 @@
+(ns av1.decode-block-test
+  "Validates av1.decode-block's decode_block() (mode_info/read_block_tx_size/
+   residual/coeffs/dequantize/inverse-transform-2d/DC intra prediction)
+   against TWO REAL aomenc-encoded 32x32 monochrome keyframes, comparing
+   this repo's reconstructed luma plane bit-exactly against dav1d's
+   independent decode of the same bitstream -- see av1.decode-block's
+   namespace docstring for the exact scope this validates (single
+   superblock / single BLOCK_32X32 leaf / TX_32X32 / DCT_DCT / DC_PRED /
+   luma-only) and test/av1/fixtures.cljk's docstrings for exactly how each
+   fixture was generated and why it lands in that scope by construction
+   (encoder flags disable every non-DC intra mode, every non-NONE/SPLIT
+   partition type, CDEF/loop-filter/restoration, and TX_MODE_SELECT) rather
+   than merely by observed probability.
+
+   `keyframe-32x32-gradient` (eob=7, few nonzero coefficients) and
+   `keyframe-32x32-busy` (eob=67, many more) exercise this namespace's
+   coefficient-context derivation (get-coeff-base-ctx/get-coeff-br-ctx) and
+   per-context CDF adaptation (av1.bool-decoder/read-symbol) at two very
+   different coefficient densities within the same TX_32X32 block.
+
+   `keyframe-64x64-vpred`/`keyframe-64x64-hpred` (Phase 1 mode-coverage
+   extension, ADR-2607122000 Migration step 9 continuation) extend the
+   above to real MULTI-leaf frames (2x2 grid of BLOCK_32X32 leaves) and
+   V_PRED/H_PRED, exercising av1.decode-block's cross-block context
+   tracking (YModes/Intra_Mode_Context via `read-y-mode`, AboveDcContext/
+   LeftDcContext via `get-dc-sign-ctx`, footprint-wide grid writes via
+   `record-footprint!`) for the first time -- see test/av1/fixtures.cljk's
+   docstrings for the content design and av1.decode-block's namespace
+   docstring for the exact scope boundary.
+
+   `keyframe-64x64-split16` (Migration step 9 continuation, real-partition
+   scope-boundary regression) validates that when a real bitstream's
+   decode_partition() recursion goes deeper than BLOCK_32X32 (forced via
+   `--min-partition-size=16 --max-partition-size=16` to reach BLOCK_16X16),
+   av1.decode-block's tx-size scope guard rejects it with ex-info against
+   REAL encoded bits, rather than only in a synthetic/direct-table-lookup
+   unit test -- see test/av1/fixtures.cljk's docstring.
+
+   `keyframe-64x64-paeth` (Migration step 9 continuation, PAETH_PRED
+   mode-coverage extension) extends the DC/V/H_PRED luma mode set to also
+   include PAETH_PRED (spec 7.11.2.2 \"Basic intra prediction process\") --
+   see av1.decode-block/av1.intra-pred namespace docstrings' PAETH
+   sections and test/av1/fixtures.cljk's docstring for the additively-
+   separable diagonal-ramp content design that makes a real aomenc encode
+   genuinely choose PAETH_PRED (not merely DC_PRED) for two of the four
+   BLOCK_32X32 leaves.
+
+   `keyframe-64x64-smooth` (Migration step 9 continuation, SMOOTH_PRED
+   mode-coverage extension) extends the DC/V/H/PAETH_PRED luma mode set to
+   also include SMOOTH_PRED (spec 7.11.2.6 \"Smooth intra prediction
+   process\", SMOOTH_PRED case only -- SMOOTH_V_PRED/SMOOTH_H_PRED remain
+   out of scope) -- see av1.decode-block/av1.intra-pred namespace
+   docstrings' SMOOTH sections and test/av1/fixtures.cljk's docstring for
+   the exact-SMOOTH_PRED-formula content design (using the real
+   Sm_Weights_Tx_32x32 table) that makes a real aomenc encode genuinely
+   choose SMOOTH_PRED (not merely DC_PRED, and not SMOOTH_V_PRED/
+   SMOOTH_H_PRED) for the one BLOCK_32X32 leaf with both a real
+   avail-above and a real avail-left neighbor."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [av1.bitreader :as br]
+            [av1.obu :as obu]
+            [av1.sequence-header :as sh]
+            [av1.frame-header :as fh]
+            [av1.tile-group :as tg]
+            [av1.decode-block :as db]
+            [av1.fixtures :as fixtures]))
+
+(defn- find-obu [bytes type-kw]
+  (loop [r (br/make-reader bytes)]
+    (let [o (obu/parse-obu r)]
+      (cond
+        (= type-kw (get-in o [:header :obu-type-kw])) o
+        (>= (:payload-end o) (* 8 (count bytes))) nil
+        :else (recur (obu/seek r (:payload-end o)))))))
+
+(defn- decode-luma-plane
+  "Parses `bytes` end-to-end (sequence header -> frame header ->
+   tile_group_obu -> decode_partition -> decode_block, via
+   av1.decode-block/make-decode-block-fn wired in as av1.tile-group's
+   injectable :decode-block-fn) and returns
+   {:frame-header ... :leaf ... :luma-plane [<flat row-major pixel vector>]}."
+  [bytes]
+  (let [seq-obu (find-obu bytes :obu-sequence-header)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obu (find-obu bytes :obu-frame)
+        frame-hdr0 (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+        decode-block-fn (db/make-decode-block-fn frame-hdr0 seq-hdr)
+        result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+        tile (first (:tiles (:tile-group result)))
+        find-leaf (fn find-leaf [node]
+                    (if (:leaf node)
+                      node
+                      (when (:children node) (some find-leaf (:children node)))))
+        leaf (some find-leaf (:superblock-partitions tile))]
+    {:frame-header (:frame-header result)
+     :leaf leaf
+     :luma-plane (:luma-plane (:final-tile-state tile))}))
+
+(defn- golden-vec [golden-bytes]
+  (mapv #(bit-and 0xff %) golden-bytes))
+
+(deftest gradient-32x32-bit-exact-test
+  (let [bytes (fixtures/keyframe-32x32-gradient-bytes)
+        golden (golden-vec (fixtures/keyframe-32x32-gradient-golden-yuv))
+        {:keys [frame-header leaf luma-plane]} (decode-luma-plane bytes)]
+    (testing "frame geometry: 32x32, single superblock"
+      (is (= 32 (:frame-width frame-header)))
+      (is (= 32 (:frame-height frame-header))))
+    (testing "the encoder's disabled-everything-but-DC/NONE/TX_32X32 flags
+              (see test/av1/fixtures.cljk docstring) actually produced
+              exactly the single-leaf/BLOCK_32X32/PARTITION_NONE shape this
+              namespace supports -- not a different shape that happened to
+              also decode without throwing"
+      (is (= tg/BLOCK_32X32 (:b-size leaf)))
+      (is (= tg/PARTITION_NONE (:partition leaf)))
+      (is (= 3 (get-in leaf [:decode-block :tx-size])) "TX_32X32")
+      (is (false? (get-in leaf [:decode-block :skip])))
+      (is (= 7 (get-in leaf [:decode-block :eob]))
+          "documents the actual observed coefficient density for this fixture"))
+    (testing "reconstructed luma plane is bit-exact against dav1d's
+              independent decode of the same real encoded bitstream (no
+              tolerance -- see namespace docstring)"
+      (is (= 1024 (count luma-plane)))
+      (is (= golden luma-plane)))))
+
+(deftest busy-32x32-bit-exact-test
+  (let [bytes (fixtures/keyframe-32x32-busy-bytes)
+        golden (golden-vec (fixtures/keyframe-32x32-busy-golden-yuv))
+        {:keys [frame-header leaf luma-plane]} (decode-luma-plane bytes)]
+    (testing "frame geometry: 32x32, single superblock"
+      (is (= 32 (:frame-width frame-header)))
+      (is (= 32 (:frame-height frame-header))))
+    (testing "same validated shape as the gradient fixture, but with far
+              more nonzero coefficients (eob=67 vs. 7) -- exercises much
+              more of get-coeff-base-ctx/get-coeff-br-ctx and per-context
+              CDF adaptation within the same single transform block"
+      (is (= tg/BLOCK_32X32 (:b-size leaf)))
+      (is (= tg/PARTITION_NONE (:partition leaf)))
+      (is (= 3 (get-in leaf [:decode-block :tx-size])))
+      (is (false? (get-in leaf [:decode-block :skip])))
+      (is (= 67 (get-in leaf [:decode-block :eob]))))
+    (testing "reconstructed luma plane is bit-exact against dav1d's
+              independent decode (no tolerance)"
+      (is (= 1024 (count luma-plane)))
+      (is (= golden luma-plane)))))
+
+(defn- decode-all-planes
+  "Like `decode-luma-plane` but also returns the U/V plane buffers (for the
+   color chroma-decode fixtures below, which are 4:2:0 -- num_planes=3)."
+  [bytes]
+  (let [seq-obu (find-obu bytes :obu-sequence-header)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obu (find-obu bytes :obu-frame)
+        frame-hdr0 (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+        decode-block-fn (db/make-decode-block-fn frame-hdr0 seq-hdr)
+        result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+        tile (first (:tiles (:tile-group result)))
+        find-leaf (fn find-leaf [node]
+                    (if (:leaf node)
+                      node
+                      (when (:children node) (some find-leaf (:children node)))))
+        leaf (some find-leaf (:superblock-partitions tile))]
+    {:frame-header (:frame-header result)
+     :leaf leaf
+     :luma-plane (:luma-plane (:final-tile-state tile))
+     :u-plane (:u-plane (:final-tile-state tile))
+     :v-plane (:v-plane (:final-tile-state tile))}))
+
+(deftest color-32x32-bit-exact-test
+  (let [bytes (fixtures/keyframe-32x32-color-bytes)
+        golden (golden-vec (fixtures/keyframe-32x32-color-golden-yuv))
+        golden-y (subvec golden 0 1024)
+        golden-u (subvec golden 1024 1280)
+        golden-v (subvec golden 1280 1536)
+        {:keys [frame-header leaf luma-plane u-plane v-plane]} (decode-all-planes bytes)]
+    (testing "frame geometry: 32x32, single superblock, 4:2:0 (num_planes=3)"
+      (is (= 32 (:frame-width frame-header)))
+      (is (= 32 (:frame-height frame-header)))
+      (is (= 3 (:num-planes frame-header))))
+    (testing "the encoder's disabled-everything-but-DC/UV_DC/NONE/TX_32X32
+              flags (see test/av1/fixtures.cljk docstring, notably
+              --enable-cfl-intra=0) actually produced exactly the single-
+              leaf/BLOCK_32X32/PARTITION_NONE/DC_PRED/UV_DC_PRED shape this
+              namespace supports"
+      (is (= tg/BLOCK_32X32 (:b-size leaf)))
+      (is (= tg/PARTITION_NONE (:partition leaf)))
+      (is (= 3 (get-in leaf [:decode-block :tx-size])) "TX_32X32 (luma)")
+      (is (false? (get-in leaf [:decode-block :skip])))
+      (is (= db/DC_PRED (get-in leaf [:decode-block :y-mode])))
+      (is (= db/UV_DC_PRED (get-in leaf [:decode-block :uv-mode])))
+      (is (= 16 (get-in leaf [:decode-block :eob])) "luma eob")
+      (is (= 7 (get-in leaf [:decode-block :u-eob])) "U (Cb) eob")
+      (is (= 10 (get-in leaf [:decode-block :v-eob])) "V (Cr) eob"))
+    (testing "reconstructed luma AND chroma (Cb/Cr) planes are bit-exact
+              against dav1d's independent decode of the same real encoded
+              bitstream (no tolerance) -- the primary chroma-decode
+              regression test"
+      (is (= 1024 (count luma-plane)))
+      (is (= 256 (count u-plane)))
+      (is (= 256 (count v-plane)))
+      (is (= golden-y luma-plane) "luma plane bit-exact")
+      (is (= golden-u u-plane) "Cb plane bit-exact")
+      (is (= golden-v v-plane) "Cr plane bit-exact"))))
+
+(deftest color-busy-32x32-bit-exact-test
+  (let [bytes (fixtures/keyframe-32x32-color-busy-bytes)
+        golden (golden-vec (fixtures/keyframe-32x32-color-busy-golden-yuv))
+        golden-y (subvec golden 0 1024)
+        golden-u (subvec golden 1024 1280)
+        golden-v (subvec golden 1280 1536)
+        {:keys [frame-header leaf luma-plane u-plane v-plane]} (decode-all-planes bytes)]
+    (testing "frame geometry: 32x32, single superblock, 4:2:0"
+      (is (= 32 (:frame-width frame-header)))
+      (is (= 32 (:frame-height frame-header)))
+      (is (= 3 (:num-planes frame-header))))
+    (testing "same validated shape as keyframe-32x32-color, but with far more
+              nonzero coefficients on every plane (eob=190/66/105 vs.
+              16/7/10) -- exercises much more of get-coeff-base-ctx/
+              get-coeff-br-ctx (including the coeff_br/golomb continuation
+              paths) and per-context CDF adaptation for the chroma planes,
+              with the U and V planes' SHARED coefficient-cdf adaptation
+              state (see av1.decode-block namespace docstring) actually
+              exercised across many symbol reads instead of just a
+              few"
+      (is (= tg/BLOCK_32X32 (:b-size leaf)))
+      (is (= tg/PARTITION_NONE (:partition leaf)))
+      (is (= db/DC_PRED (get-in leaf [:decode-block :y-mode])))
+      (is (= db/UV_DC_PRED (get-in leaf [:decode-block :uv-mode])))
+      (is (= 190 (get-in leaf [:decode-block :eob])))
+      (is (= 66 (get-in leaf [:decode-block :u-eob])))
+      (is (= 105 (get-in leaf [:decode-block :v-eob]))))
+    (testing "reconstructed luma AND chroma planes are bit-exact against
+              dav1d's independent decode (no tolerance)"
+      (is (= golden-y luma-plane))
+      (is (= golden-u u-plane))
+      (is (= golden-v v-plane)))))
+
+;; NOTE: the old single-whole-frame-leaf-only guard (:unsupported-multi-leaf-chroma,
+;; thrown whenever avail-u?/avail-l? was true for ANY color-frame leaf) is
+;; gone -- multi-leaf color decode for the simple 1:1 BLOCK_32X32-leaf/
+;; BLOCK_16X16-chroma-block correspondence is now genuinely exercised end to
+;; end against a REAL multi-leaf aomenc-encoded bitstream, bit-exactly
+;; against dav1d, rather than only asserted via a synthetic direct call --
+;; see `multi-leaf-color-64x64-bit-exact-test` below.
+
+(deftest shared-chroma-block-throws-test
+  (testing "the AV1 spec's 'shared chroma block' case (a luma leaf mi-size
+            other than BLOCK_32X32, where multiple small luma leaves would
+            share one chroma block) is explicitly out of scope for color
+            frames and throws :unsupported-shared-chroma-block -- simulated
+            directly (uses keyframe-32x32-color's frame-header/seq-header
+            shape) since this repo's own luma leaf-size support is
+            structurally restricted to BLOCK_32X32 elsewhere (tx-size-for),
+            so a real bitstream reaching this exact guard doesn't otherwise
+            exist yet"
+    (let [bytes (fixtures/keyframe-32x32-color-bytes)
+          seq-obu (find-obu bytes :obu-sequence-header)
+          seq-hdr (sh/parse (:reader-at-payload seq-obu))
+          frame-obu (find-obu bytes :obu-frame)
+          frame-hdr (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+          decode-block-fn (db/make-decode-block-fn frame-hdr seq-hdr)
+          result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+          tile (first (:tiles (:tile-group result)))
+          tile-state (:final-tile-state tile)]
+      (try
+        (decode-block-fn (assoc tile-state :bd nil) 0 0 tg/BLOCK_16X16 false false)
+        (is false "expected ex-info to be thrown, but decode-block-fn completed without throwing")
+        (catch kerror/ExceptionInfo e
+          (is (= :unsupported-shared-chroma-block (:reason (ex-data e))))
+          (is (= tg/BLOCK_16X16 (:mi-size (ex-data e)))))))))
+
+(defn- find-leaves
+  "Collects every `:leaf` node from a tile's superblock-partitions tree, in
+   raster/z-order (matches decode_partition()'s real traversal order)."
+  [tile]
+  (let [leaves (atom [])
+        find-leaf (fn find-leaf [node]
+                    (if (:leaf node)
+                      (swap! leaves conj node)
+                      (when (:children node) (doseq [c (:children node)] (find-leaf c)))))]
+    (doseq [sb (:superblock-partitions tile)] (find-leaf sb))
+    @leaves))
+
+(defn- decode-luma-plane+leaves
+  "Like `decode-luma-plane` but also returns every leaf (for the multi-leaf
+   V_PRED/H_PRED fixtures below, which have 4 leaves per frame, not 1)."
+  [bytes]
+  (let [seq-obu (find-obu bytes :obu-sequence-header)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obu (find-obu bytes :obu-frame)
+        frame-hdr0 (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+        decode-block-fn (db/make-decode-block-fn frame-hdr0 seq-hdr)
+        result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+        tile (first (:tiles (:tile-group result)))]
+    {:frame-header (:frame-header result)
+     :leaves (find-leaves tile)
+     :luma-plane (:luma-plane (:final-tile-state tile))}))
+
+(deftest v-pred-64x64-bit-exact-test
+  (let [bytes (fixtures/keyframe-64x64-vpred-bytes)
+        golden (golden-vec (fixtures/keyframe-64x64-vpred-golden-yuv))
+        {:keys [frame-header leaves luma-plane]} (decode-luma-plane+leaves bytes)]
+    (testing "frame geometry: 64x64, one 64x64 superblock forced to split
+              into a 2x2 grid of BLOCK_32X32 leaves (--min-partition-size=32
+              --max-partition-size=32, see test/av1/fixtures.cljk docstring)"
+      (is (= 64 (:frame-width frame-header)))
+      (is (= 64 (:frame-height frame-header)))
+      (is (= 4 (count leaves)) "top-left/top-right/bottom-left/bottom-right"))
+    (testing "every leaf is BLOCK_32X32/PARTITION_NONE/TX_32X32 (this
+              namespace's per-block scope is unchanged by having multiple
+              leaves per frame)"
+      (doseq [leaf leaves]
+        (is (= tg/BLOCK_32X32 (:b-size leaf)))
+        (is (= tg/PARTITION_NONE (:partition leaf)))
+        (is (= 3 (get-in leaf [:decode-block :tx-size])) "TX_32X32")))
+    (testing "the real encoder actually chose DC_PRED for the first three
+              leaves and V_PRED (not merely a value this repo assumed) for
+              the last -- see test/av1/fixtures.cljk docstring for why this
+              content/flag combination reliably produces this exact
+              mode assignment via real RD comparison, not by construction"
+      (let [[tl tr bl br] leaves]
+        (is (= db/DC_PRED (get-in tl [:decode-block :y-mode])))
+        (is (= db/DC_PRED (get-in tr [:decode-block :y-mode])))
+        (is (= db/DC_PRED (get-in bl [:decode-block :y-mode])))
+        (is (= db/V_PRED (get-in br [:decode-block :y-mode]))
+            "bottom-right: real avail-above neighbor (top-right) with a
+             matching column-invariant profile makes V_PRED cheaper than
+             DC_PRED's blended average -- confirmed via real aomenc RDO")))
+    (testing "reconstructed luma plane is bit-exact against dav1d's
+              independent decode of the same real encoded bitstream (no
+              tolerance) -- this is the primary regression test for the
+              angle_delta_y bug this extension uncovered and fixed (see
+              av1.decode-block/read-angle-delta-y's docstring): without a
+              real angle_delta_y symbol read for every V_PRED/H_PRED
+              block, the bottom-right leaf's residual desyncs from the
+              real bitstream by exactly that symbol's width, producing a
+              plausible-looking but wrong reconstruction that only a
+              bit-exact comparison (not visual inspection) catches"
+      (is (= 4096 (count luma-plane)))
+      (is (= golden luma-plane)))))
+
+(deftest h-pred-64x64-bit-exact-test
+  (let [bytes (fixtures/keyframe-64x64-hpred-bytes)
+        golden (golden-vec (fixtures/keyframe-64x64-hpred-golden-yuv))
+        {:keys [frame-header leaves luma-plane]} (decode-luma-plane+leaves bytes)]
+    (testing "frame geometry: 64x64, 2x2 grid of BLOCK_32X32 leaves"
+      (is (= 64 (:frame-width frame-header)))
+      (is (= 64 (:frame-height frame-header)))
+      (is (= 4 (count leaves))))
+    (testing "every leaf is BLOCK_32X32/PARTITION_NONE/TX_32X32"
+      (doseq [leaf leaves]
+        (is (= tg/BLOCK_32X32 (:b-size leaf)))
+        (is (= tg/PARTITION_NONE (:partition leaf)))
+        (is (= 3 (get-in leaf [:decode-block :tx-size])))))
+    (testing "the real encoder chose DC_PRED for the first three leaves and
+              H_PRED for the last"
+      (let [[tl tr bl br] leaves]
+        (is (= db/DC_PRED (get-in tl [:decode-block :y-mode])))
+        (is (= db/DC_PRED (get-in tr [:decode-block :y-mode])))
+        (is (= db/DC_PRED (get-in bl [:decode-block :y-mode])))
+        (is (= db/H_PRED (get-in br [:decode-block :y-mode]))
+            "bottom-right: real avail-left neighbor (bottom-left) with a
+             matching row-invariant profile makes H_PRED cheaper than
+             DC_PRED's blended average")))
+    (testing "reconstructed luma plane is bit-exact against dav1d's
+              independent decode (no tolerance)"
+      (is (= 4096 (count luma-plane)))
+      (is (= golden luma-plane)))))
+
+(deftest paeth-pred-64x64-bit-exact-test
+  (let [bytes (fixtures/keyframe-64x64-paeth-bytes)
+        golden (golden-vec (fixtures/keyframe-64x64-paeth-golden-yuv))
+        {:keys [frame-header leaves luma-plane]} (decode-luma-plane+leaves bytes)]
+    (testing "frame geometry: 64x64, one 64x64 superblock forced to split
+              into a 2x2 grid of BLOCK_32X32 leaves (--min-partition-size=32
+              --max-partition-size=32, see test/av1/fixtures.cljk docstring)"
+      (is (= 64 (:frame-width frame-header)))
+      (is (= 64 (:frame-height frame-header)))
+      (is (= 4 (count leaves)) "top-left/top-right/bottom-left/bottom-right"))
+    (testing "every leaf is BLOCK_32X32/PARTITION_NONE/TX_32X32 (this
+              namespace's per-block scope is unchanged by the PAETH_PRED
+              mode-coverage extension)"
+      (doseq [leaf leaves]
+        (is (= tg/BLOCK_32X32 (:b-size leaf)))
+        (is (= tg/PARTITION_NONE (:partition leaf)))
+        (is (= 3 (get-in leaf [:decode-block :tx-size])) "TX_32X32")))
+    (testing "the real encoder actually chose PAETH_PRED (not merely a
+              value this repo assumed) for two of the four leaves -- see
+              test/av1/fixtures.cljk docstring for the additively-separable
+              diagonal-ramp content design and why it favors Paeth's
+              corner-based predictor over DC_PRED's blended average"
+      (let [[tl tr bl br] leaves]
+        (is (= db/DC_PRED (get-in tl [:decode-block :y-mode]))
+            "top-left: no neighbors at all, forces DC_PRED trivially")
+        (is (= db/PAETH_PRED (get-in tr [:decode-block :y-mode]))
+            "top-right: real avail-left neighbor only (top-left) -- Paeth's
+             AboveRow[-1]-anchored formula fits this ramp better than DC's
+             average")
+        (is (= db/PAETH_PRED (get-in bl [:decode-block :y-mode]))
+            "bottom-left: real avail-above neighbor only (top-left) --
+             symmetric case to top-right")
+        (is (= db/DC_PRED (get-in br [:decode-block :y-mode]))
+            "bottom-right: real avail-above AND avail-left neighbors --
+             empirically the real encoder's RD search still preferred
+             DC_PRED here (not assumed a priori when this fixture's content
+             was designed -- see test/av1/fixtures.cljk docstring)")))
+    (testing "reconstructed luma plane is bit-exact against dav1d's
+              independent decode of the same real encoded bitstream (no
+              tolerance)"
+      (is (= 4096 (count luma-plane)))
+      (is (= golden luma-plane)))))
+
+(deftest smooth-pred-64x64-bit-exact-test
+  (let [bytes (fixtures/keyframe-64x64-smooth-bytes)
+        golden (golden-vec (fixtures/keyframe-64x64-smooth-golden-yuv))
+        {:keys [frame-header leaves luma-plane]} (decode-luma-plane+leaves bytes)]
+    (testing "frame geometry: 64x64, one 64x64 superblock forced to split
+              into a 2x2 grid of BLOCK_32X32 leaves (--min-partition-size=32
+              --max-partition-size=32, see test/av1/fixtures.cljk docstring)"
+      (is (= 64 (:frame-width frame-header)))
+      (is (= 64 (:frame-height frame-header)))
+      (is (= 4 (count leaves)) "top-left/top-right/bottom-left/bottom-right"))
+    (testing "every leaf is BLOCK_32X32/PARTITION_NONE/TX_32X32 (this
+              namespace's per-block scope is unchanged by the SMOOTH_PRED
+              mode-coverage extension)"
+      (doseq [leaf leaves]
+        (is (= tg/BLOCK_32X32 (:b-size leaf)))
+        (is (= tg/PARTITION_NONE (:partition leaf)))
+        (is (= 3 (get-in leaf [:decode-block :tx-size])) "TX_32X32")))
+    (testing "the real encoder actually chose SMOOTH_PRED (not merely DC_PRED
+              or SMOOTH_V_PRED/SMOOTH_H_PRED, and not merely a value this
+              repo assumed) for the one leaf with both a real avail-above
+              AND a real avail-left neighbor -- see test/av1/fixtures.cljk
+              docstring for the exact-SMOOTH_PRED-formula content design and
+              why it favors SMOOTH_PRED over the DC/1D-smooth alternatives"
+      (let [[tl tr bl br] leaves]
+        (is (= db/DC_PRED (get-in tl [:decode-block :y-mode]))
+            "top-left: no neighbors at all, forces DC_PRED trivially")
+        (is (= db/DC_PRED (get-in tr [:decode-block :y-mode]))
+            "top-right: real avail-left neighbor only (top-left, flat) --
+             not enough asymmetric 2D content to beat DC_PRED here")
+        (is (= db/DC_PRED (get-in bl [:decode-block :y-mode]))
+            "bottom-left: real avail-above neighbor only (top-left, flat) --
+             symmetric case to top-right")
+        (is (= db/SMOOTH_PRED (get-in br [:decode-block :y-mode]))
+            "bottom-right: real avail-above AND avail-left neighbors, with
+             content authored to be the exact SMOOTH_PRED reconstruction of
+             those neighbors -- the real encoder's RD search genuinely
+             chose SMOOTH_PRED (mode 9) here, confirmed by this repo's own
+             CDF-symbol read against the real bitstream, not assumed")
+        (is (= 1 (get-in br [:decode-block :eob]))
+            "documents the actual observed near-zero residual for this
+             leaf (only 1 nonzero coefficient) -- consistent with the
+             content being authored as the exact SMOOTH_PRED formula
+             output, not a coincidentally-small residual")))
+    (testing "reconstructed luma plane is bit-exact against dav1d's
+              independent decode of the same real encoded bitstream (no
+              tolerance) -- the primary regression test for
+              av1.intra-pred/smooth-predict's Sm_Weights_Tx_32x32-driven
+              two-edge blend, not just the CDF-symbol-read/dispatch
+              machinery in isolation"
+      (is (= 4096 (count luma-plane)))
+      (is (= golden luma-plane)))))
+
+(defn- decode-all-planes+leaves
+  "Like `decode-luma-plane+leaves` but also returns the U/V plane buffers
+   (for `keyframe-64x64-color-multileaf-bytes`, the multi-leaf-chroma
+   regression fixture, which is both multi-leaf AND 4:2:0 color)."
+  [bytes]
+  (let [seq-obu (find-obu bytes :obu-sequence-header)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obu (find-obu bytes :obu-frame)
+        frame-hdr0 (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+        decode-block-fn (db/make-decode-block-fn frame-hdr0 seq-hdr)
+        result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+        tile (first (:tiles (:tile-group result)))]
+    {:frame-header (:frame-header result)
+     :leaves (find-leaves tile)
+     :luma-plane (:luma-plane (:final-tile-state tile))
+     :u-plane (:u-plane (:final-tile-state tile))
+     :v-plane (:v-plane (:final-tile-state tile))}))
+
+(deftest multi-leaf-color-64x64-bit-exact-test
+  (let [bytes (fixtures/keyframe-64x64-color-multileaf-bytes)
+        golden (golden-vec (fixtures/keyframe-64x64-color-multileaf-golden-yuv))
+        golden-y (subvec golden 0 4096)
+        golden-u (subvec golden 4096 5120)
+        golden-v (subvec golden 5120 6144)
+        {:keys [frame-header leaves luma-plane u-plane v-plane]}
+        (decode-all-planes+leaves bytes)]
+    (testing "frame geometry: 64x64, one 64x64 superblock forced (via
+              --min-partition-size=32 --max-partition-size=32, see
+              test/av1/fixtures.cljk docstring) into a real 2x2 grid of
+              BLOCK_32X32 leaves, 4:2:0 color (num_planes=3)"
+      (is (= 64 (:frame-width frame-header)))
+      (is (= 64 (:frame-height frame-header)))
+      (is (= 3 (:num-planes frame-header)))
+      (is (= 4 (count leaves)) "top-left/top-right/bottom-left/bottom-right"))
+    (testing "every leaf is genuinely BLOCK_32X32/PARTITION_NONE/TX_32X32(luma)/
+              TX_16X16(chroma)/DC_PRED/UV_DC_PRED (the encoder's disabled-
+              everything-but-DC/UV_DC/NONE/TX_32X32 flags, see
+              test/av1/fixtures.cljk docstring, leave no other mode
+              structurally possible) -- and each leaf's Cb/Cr block has
+              real, nonzero coefficients (not an all-zero/skip block)"
+      (doseq [leaf leaves]
+        (is (= tg/BLOCK_32X32 (:b-size leaf)))
+        (is (= tg/PARTITION_NONE (:partition leaf)))
+        (is (= 3 (get-in leaf [:decode-block :tx-size])) "TX_32X32 (luma)")
+        (is (= db/DC_PRED (get-in leaf [:decode-block :y-mode])))
+        (is (= db/UV_DC_PRED (get-in leaf [:decode-block :uv-mode])))
+        (is (pos? (get-in leaf [:decode-block :u-eob])) "Cb: real nonzero coefficients")
+        (is (pos? (get-in leaf [:decode-block :v-eob])) "Cr: real nonzero coefficients"))
+      (let [u-eobs (mapv #(get-in % [:decode-block :u-eob]) leaves)
+            v-eobs (mapv #(get-in % [:decode-block :v-eob]) leaves)
+            luma-eobs (mapv #(get-in % [:decode-block :eob]) leaves)]
+        (is (apply distinct? luma-eobs)
+            "the 4 leaves' luma eobs are pairwise distinct (per-quadrant
+             frequency-varying content, see test/av1/fixtures.cljk docstring
+             -- an earlier same-frequency content design coincidentally
+             produced identical eob across all 4 leaves despite genuinely
+             different pixel content, so this fixture was redesigned to
+             avoid that ambiguity)")
+        (is (apply distinct? u-eobs) "the 4 leaves' Cb eobs are pairwise distinct")
+        (is (apply distinct? v-eobs) "the 4 leaves' Cr eobs are pairwise distinct")))
+    (testing "each leaf actually decoded an INDEPENDENT chroma block, not
+              one block's reconstruction reused/broadcast across all 4
+              leaves -- pulls each leaf's own 16x16 chroma quadrant out of
+              the shared 32x32 u-plane/v-plane buffer (via that leaf's own
+              :r/:c, subsampled) and confirms the 4 quadrants are pairwise
+              DIFFERENT reconstructed pixel content (the fixture's Cb/Cr
+              content is a continuous, non-repeating function of position,
+              see test/av1/fixtures.cljk docstring, so 4 independently
+              decoded quadrants must differ)"
+      (let [quadrant (fn [plane leaf]
+                        (let [pcol (bit-shift-right (:c leaf) 1)
+                              prow (bit-shift-right (:r leaf) 1)
+                              cx (* 4 pcol) cy (* 4 prow)]
+                          (vec (for [i (range 16) j (range 16)]
+                                 (nth plane (+ (* (+ cy i) 32) cx j))))))
+            u-quads (mapv #(quadrant u-plane %) leaves)
+            v-quads (mapv #(quadrant v-plane %) leaves)]
+        (is (apply distinct? u-quads) "4 independently reconstructed Cb quadrants, pairwise distinct")
+        (is (apply distinct? v-quads) "4 independently reconstructed Cr quadrants, pairwise distinct")))
+    (testing "reconstructed luma AND chroma (Cb/Cr) planes are bit-exact
+              against dav1d's independent decode of the same real encoded
+              bitstream (no tolerance) -- the primary multi-leaf-chroma
+              regression test: this exercises real cross-leaf
+              AboveLevelContext/AboveDcContext/LeftLevelContext/
+              LeftDcContext threading for the chroma planes for the first
+              time (previously only reachable by a leaf that couldn't
+              exist under the pre-extension single-whole-frame-leaf-only
+              scope)"
+      (is (= 4096 (count luma-plane)))
+      (is (= 1024 (count u-plane)))
+      (is (= 1024 (count v-plane)))
+      (is (= golden-y luma-plane) "luma plane bit-exact")
+      (is (= golden-u u-plane) "Cb plane bit-exact")
+      (is (= golden-v v-plane) "Cr plane bit-exact"))))
+
+(deftest split16-throws-on-block16x16-test
+  (testing "av1.tile-group/decode-partition's real recursion genuinely
+            reaches a BLOCK_16X16 leaf against a REAL encoded stream
+            (keyframe-64x64-split16.obu, forced --min-partition-size=16
+            --max-partition-size=16 -- see test/av1/fixtures.cljk docstring),
+            and av1.decode-block's tx-size scope guard rejects it with
+            ex-info instead of mis-decoding or crashing uncontrolled"
+    (let [bytes (fixtures/keyframe-64x64-split16-bytes)
+          seq-obu (find-obu bytes :obu-sequence-header)
+          seq-hdr (sh/parse (:reader-at-payload seq-obu))
+          frame-obu (find-obu bytes :obu-frame)
+          frame-hdr (fh/parse (:reader-at-payload frame-obu) seq-hdr)]
+      (testing "frame geometry: 64x64, TX_MODE_LARGEST"
+        (is (= 64 (:frame-width frame-hdr)))
+        (is (= 64 (:frame-height frame-hdr)))
+        (is (= :tx-mode-largest (:tx-mode frame-hdr))))
+      (testing "WITHOUT decode-block-fn wired in, the first leaf
+                decode_partition() reaches (bit-exact-valid up to this
+                point, per av1.tile-group's namespace docstring -- every
+                leaf after the first is not, since decode_block() was never
+                called to consume its bits) is genuinely BLOCK_16X16/
+                PARTITION_NONE at (0,0) -- confirms the real bitstream's
+                forced recursion depth (64x64 -> 32x32 -> 16x16, two real
+                partition-symbol reads) rather than assuming it"
+        (let [result (tg/parse-frame-obu frame-obu seq-hdr)
+              tile (first (:tiles (:tile-group result)))
+              first-leaf (some (fn find-leaf [node]
+                                  (if (:leaf node)
+                                    node
+                                    (when (:children node) (some find-leaf (:children node)))))
+                                (:superblock-partitions tile))]
+          (is (= 0 (:r first-leaf)))
+          (is (= 0 (:c first-leaf)))
+          (is (= tg/BLOCK_16X16 (:b-size first-leaf)))
+          (is (= tg/PARTITION_NONE (:partition first-leaf)))))
+      (testing "WITH decode-block-fn wired in (av1.decode-block/make-decode-block-fn),
+                decoding this same real bitstream throws ex-info at that
+                first leaf -- reason :unsupported-tx-size, mi-size
+                BLOCK_16X16, tx-size TX_16X16 -- rather than silently
+                mis-decoding a leaf shape this namespace doesn't support"
+        (let [decode-block-fn (db/make-decode-block-fn frame-hdr seq-hdr)]
+          (try
+            (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+            (is false "expected ex-info to be thrown, but decode completed without throwing")
+            (catch kerror/ExceptionInfo e
+              (is (re-find #"only TX_32X32/TX_4X4 are supported transform sizes" (.getMessage e)))
+              (is (= :unsupported-tx-size (:reason (ex-data e))))
+              (is (= tg/BLOCK_16X16 (:mi-size (ex-data e))))
+              (is (= 2 (:tx-size (ex-data e))) "TX_16X16"))))))))
+
+(deftest adst-diag-8x8-bit-exact-test
+  (testing "ADST extension (ADR-2607122000 Migration step 9 continuation,
+            see av1.decode-block/av1.transform namespace docstrings' ADST
+            sections): a real aomenc encode of an 8x8 diagonal-edge
+            monochrome frame, forced into a 2x2 grid of BLOCK_4X4/TX_4X4
+            leaves (see test/av1/fixtures.cljk docstring). Confirms the
+            real encoder actually chose ADST_ADST (not merely DCT_DCT) for
+            2 of the 4 leaves, and that this repo's reconstruction --
+            including a real av1.transform/inverse-adst4! invocation, not
+            just the transform_type() cdf read -- is bit-exact against
+            dav1d's independent decode."
+    (let [bytes (fixtures/keyframe-8x8-adst-diag-bytes)
+          golden (golden-vec (fixtures/keyframe-8x8-adst-diag-golden-yuv))
+          {:keys [frame-header leaves luma-plane]} (decode-luma-plane+leaves bytes)]
+      (testing "frame geometry: 8x8, one 64x64 superblock forced (via
+                --min-partition-size=4 --max-partition-size=4) all the way
+                down to a 2x2 grid of BLOCK_4X4 leaves"
+        (is (= 8 (:frame-width frame-header)))
+        (is (= 8 (:frame-height frame-header)))
+        (is (= 4 (count leaves)) "top-left/top-right/bottom-left/bottom-right"))
+      (testing "every leaf is BLOCK_4X4/PARTITION_NONE/TX_4X4 -- the ADST
+                extension's new leaf shape, not the pre-existing
+                BLOCK_32X32/TX_32X32 one"
+        (doseq [leaf leaves]
+          (is (= tg/BLOCK_4X4 (:b-size leaf)))
+          (is (= tg/PARTITION_NONE (:partition leaf)))
+          (is (= 0 (get-in leaf [:decode-block :tx-size])) "TX_4X4")))
+      (testing "the real encoder chose DC_PRED for every leaf (no neighbor
+                context ever favored V_PRED/H_PRED for this content at this
+                size), but ADST_ADST (not DCT_DCT) for the top-right and
+                bottom-left leaves -- confirmed by actually decoding and
+                inspecting the real chosen TxType, not assumed from the
+                content design alone"
+        (let [[tl tr bl br] leaves]
+          (is (= db/DC_PRED (get-in tl [:decode-block :y-mode])))
+          (is (= :DCT_DCT (get-in tl [:decode-block :tx-type])))
+          (is (= db/DC_PRED (get-in tr [:decode-block :y-mode])))
+          (is (= :ADST_ADST (get-in tr [:decode-block :tx-type]))
+              "real ADST selection, not DCT -- the primary assertion this
+               extension exists to make")
+          (is (= db/DC_PRED (get-in bl [:decode-block :y-mode])))
+          (is (= :ADST_ADST (get-in bl [:decode-block :tx-type])))
+          (is (= db/DC_PRED (get-in br [:decode-block :y-mode])))
+          (is (= :DCT_DCT (get-in br [:decode-block :tx-type])))))
+      (testing "reconstructed luma plane is bit-exact against dav1d's
+                independent decode of the same real encoded bitstream (no
+                tolerance) -- this is the primary regression test for
+                av1.transform/inverse-adst4!, exercised via 2 real
+                ADST_ADST leaves, not just unit-level butterfly math"
+        (is (= 64 (count luma-plane)))
+        (is (= golden luma-plane))))))
+
+(deftest adst-quad-8x8-bit-exact-test
+  (testing "same ADST-extension scope as adst-diag-8x8-bit-exact-test
+            above, but with a per-quadrant mixed edge pattern (see
+            test/av1/fixtures.cljk docstring) -- broadens real-decode
+            validation to a SECOND ADST-family TxType, DCT_ADST (row=ADST,
+            col=DCT -- the opposite axis from ADST_ADST's both-axes case),
+            confirming av1.transform/inverse-transform-2d's row/col
+            transform-kind dispatch (row-transform-kind/col-transform-kind)
+            picks the correct axis, not just that SOME ADST path runs"
+    (let [bytes (fixtures/keyframe-8x8-adst-quad-bytes)
+          golden (golden-vec (fixtures/keyframe-8x8-adst-quad-golden-yuv))
+          {:keys [frame-header leaves luma-plane]} (decode-luma-plane+leaves bytes)]
+      (testing "frame geometry: 8x8, 2x2 grid of BLOCK_4X4/TX_4X4 leaves"
+        (is (= 8 (:frame-width frame-header)))
+        (is (= 8 (:frame-height frame-header)))
+        (is (= 4 (count leaves))))
+      (testing "every leaf is BLOCK_4X4/PARTITION_NONE/TX_4X4"
+        (doseq [leaf leaves]
+          (is (= tg/BLOCK_4X4 (:b-size leaf)))
+          (is (= tg/PARTITION_NONE (:partition leaf)))
+          (is (= 0 (get-in leaf [:decode-block :tx-size])))))
+      (testing "the real encoder chose DC_PRED for every leaf, and
+                DCT_ADST (not DCT_DCT or ADST_ADST) for the bottom-right
+                (diagonal-edge) leaf -- a genuinely different ADST-family
+                TxType than the diag fixture's ADST_ADST, confirming this
+                repo's transform_type() cdf read/mapping distinguishes
+                between ADST-family types correctly, not just ADST-vs-DCT"
+        (let [[tl tr bl br] leaves]
+          (is (= db/DC_PRED (get-in tl [:decode-block :y-mode])))
+          (is (= db/DC_PRED (get-in tr [:decode-block :y-mode])))
+          (is (= db/DC_PRED (get-in bl [:decode-block :y-mode])))
+          (is (= db/DC_PRED (get-in br [:decode-block :y-mode])))
+          (is (= :DCT_ADST (get-in br [:decode-block :tx-type]))
+              "real DCT_ADST selection -- confirms the row=ADST/col=DCT
+               axis dispatch, not just ADST_ADST's both-axes case")))
+      (testing "reconstructed luma plane is bit-exact against dav1d's
+                independent decode (no tolerance)"
+        (is (= 64 (count luma-plane)))
+        (is (= golden luma-plane))))))
+
+;; ---------------------------------------------------------------------
+;; Inter zero-motion-baseline extension (ADR-2607122000 Migration step 9
+;; continuation, "first inter-frame support") -- see av1.decode-block's
+;; namespace docstring's inter section and test/av1/fixtures.cljk's
+;; `inter-32x32-zeromv-bytes`/`inter-32x32-zeromv-residual-bytes`
+;; docstrings for the exact scope/real-encoder findings this validates.
+
+(defn- find-all-obus
+  "Like `find-obu` but returns every OBU in `bytes`, in order -- needed here
+   since a 2-frame sequence has two `:obu-frame`s (find-obu only ever
+   returns the first match)."
+  [bytes]
+  (loop [r (br/make-reader bytes) acc []]
+    (let [o (obu/parse-obu r)]
+      (if (>= (:payload-end o) (* 8 (count bytes)))
+        (conj acc o)
+        (recur (obu/seek r (:payload-end o)) (conj acc o))))))
+
+(defn- decode-inter-sequence
+  "Decodes a real 2-OBU_FRAME sequence (keyframe then inter frame) end to
+   end: parses the sequence header once, decodes frame 1 via the existing
+   intra `make-decode-block-fn` path, then decodes frame 2 as an inter
+   frame by passing frame 1's reconstructed luma plane through as
+   `make-decode-block-fn`'s `ref-frame` argument (see its docstring).
+   Returns {:frame-header-1 :frame-header-2 :leaf-2 :luma-1 :luma-2}."
+  [bytes]
+  (let [obus (find-all-obus bytes)
+        seq-obu (some #(when (= :obu-sequence-header (get-in % [:header :obu-type-kw])) %) obus)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obus (filterv #(= :obu-frame (get-in % [:header :obu-type-kw])) obus)
+        _ (assert (= 2 (count frame-obus)) "expected exactly 2 OBU_FRAMEs")
+        frame-hdr-1 (fh/parse (:reader-at-payload (nth frame-obus 0)) seq-hdr)
+        decode-block-fn-1 (db/make-decode-block-fn frame-hdr-1 seq-hdr)
+        result-1 (tg/parse-frame-obu (nth frame-obus 0) seq-hdr {:decode-block-fn decode-block-fn-1})
+        tile-1 (first (:tiles (:tile-group result-1)))
+        luma-1 (:luma-plane (:final-tile-state tile-1))
+        frame-hdr-2 (fh/parse (:reader-at-payload (nth frame-obus 1)) seq-hdr)
+        ref-frame {:luma-plane luma-1
+                   :frame-width (:frame-width frame-hdr-1)
+                   :frame-height (:frame-height frame-hdr-1)}
+        decode-block-fn-2 (db/make-decode-block-fn frame-hdr-2 seq-hdr ref-frame)
+        result-2 (tg/parse-frame-obu (nth frame-obus 1) seq-hdr {:decode-block-fn decode-block-fn-2})
+        tile-2 (first (:tiles (:tile-group result-2)))
+        luma-2 (:luma-plane (:final-tile-state tile-2))
+        leaf-2 (first (find-leaves tile-2))]
+    {:frame-header-1 (:frame-header result-1)
+     :frame-header-2 (:frame-header result-2)
+     :leaf-2 leaf-2
+     :luma-1 luma-1
+     :luma-2 luma-2}))
+
+(deftest inter-zeromv-bit-exact-test
+  (let [bytes (fixtures/inter-32x32-zeromv-bytes)
+        golden (golden-vec (fixtures/inter-32x32-zeromv-golden-yuv))
+        golden-1 (subvec golden 0 1024)
+        golden-2 (subvec golden 1024 2048)
+        {:keys [frame-header-1 frame-header-2 leaf-2 luma-1 luma-2]} (decode-inter-sequence bytes)]
+    (testing "frame 2 is a real INTER_FRAME within this repo's narrow
+              error_resilient_mode==1/enable_order_hint==0 inter scope"
+      (is (true? (:frame-is-intra frame-header-1)))
+      (is (false? (:frame-is-intra frame-header-2)))
+      (is (= fh/INTER_FRAME (:frame-type frame-header-2)))
+      (is (= 1 (:error-resilient-mode frame-header-2)))
+      (is (= fh/PRIMARY_REF_NONE (:primary-ref-frame frame-header-2)))
+      (is (= [0 0 0 0 0 0 0] (:ref-frame-idx frame-header-2)))
+      (is (= 0 (:is-motion-mode-switchable frame-header-2)))
+      (is (not= :switchable (:interpolation-filter frame-header-2)))
+      (is (every? #(= :identity %) (:gm-type frame-header-2))))
+    (testing "the real encoder's chosen inter mode -- confirmed by actually
+              decoding, not assumed -- is NEARESTMV with a genuinely
+              decoded (0,0) motion vector against LAST_FRAME, and skip=true
+              (zero residual, matching the byte-identical frame content) --
+              see av1.decode-block/read-inter-y-mode's docstring for why
+              NEARESTMV (not the originally-guessed GLOBALMV/NEWMV) is
+              legitimately in scope for this exact degenerate
+              find_mv_stack case"
+      (is (true? (get-in leaf-2 [:decode-block :is-inter])))
+      (is (= db/LAST_FRAME (get-in leaf-2 [:decode-block :ref-frame])))
+      (is (= db/NEARESTMV (get-in leaf-2 [:decode-block :y-mode])))
+      (is (= [0 0] (get-in leaf-2 [:decode-block :mv])))
+      (is (true? (get-in leaf-2 [:decode-block :skip]))))
+    (testing "both frames' reconstructed luma planes are bit-exact against
+              dav1d's independent decode of the same real bitstream (no
+              tolerance)"
+      (is (= 1024 (count luma-1)))
+      (is (= 1024 (count luma-2)))
+      (is (= golden-1 luma-1))
+      (is (= golden-2 luma-2))
+      (is (= luma-1 luma-2)
+          "the two frames' content is byte-identical by construction, and
+           motion compensation + zero residual should reproduce that
+           exactly"))))
+
+(deftest inter-zeromv-residual-bit-exact-test
+  (let [bytes (fixtures/inter-32x32-zeromv-residual-bytes)
+        golden (golden-vec (fixtures/inter-32x32-zeromv-residual-golden-yuv))
+        golden-1 (subvec golden 0 1024)
+        golden-2 (subvec golden 1024 2048)
+        {:keys [leaf-2 luma-1 luma-2]} (decode-inter-sequence bytes)]
+    (testing "same real-decoded NEARESTMV/LAST_FRAME/MV=(0,0) inter mode as
+              the zeromv fixture, but this time with a real, nonzero
+              residual (skip=false) -- exercises decode-transform-block's
+              inter-ref (predict_inter + coeffs()/dequantize/inverse-DCT/
+              reconstruct) path for the first time"
+      (is (true? (get-in leaf-2 [:decode-block :is-inter])))
+      (is (= db/LAST_FRAME (get-in leaf-2 [:decode-block :ref-frame])))
+      (is (= db/NEARESTMV (get-in leaf-2 [:decode-block :y-mode])))
+      (is (= [0 0] (get-in leaf-2 [:decode-block :mv])))
+      (is (false? (get-in leaf-2 [:decode-block :skip])))
+      (is (= 1024 (get-in leaf-2 [:decode-block :eob]))
+          "the checkerboard perturbation is maximally high-frequency -- every
+           coefficient position is nonzero")
+      (is (= :DCT_DCT (get-in leaf-2 [:decode-block :tx-type]))
+          "a REAL inter_tx_type cdf read (TX_SET_INTER_3, {IDTX,DCT_DCT})
+           decoded DCT_DCT, not IDTX"))
+    (testing "both frames' reconstructed luma planes are bit-exact against
+              dav1d's independent decode (no tolerance)"
+      (is (= golden-1 luma-1))
+      (is (= golden-2 luma-2)))))
+
+(deftest guard-frame-scope-throws-test
+  (testing "make-decode-block-fn rejects out-of-scope frame headers instead
+            of silently mis-parsing them (see av1.decode-block/guard-frame-scope!)"
+    (let [bytes (fixtures/keyframe-32x32-gradient-bytes)
+          seq-obu (find-obu bytes :obu-sequence-header)
+          seq-hdr (sh/parse (:reader-at-payload seq-obu))
+          frame-obu (find-obu bytes :obu-frame)
+          frame-hdr (fh/parse (:reader-at-payload frame-obu) seq-hdr)]
+      (testing "coded_lossless=1 is rejected (lossless uses the WHT, not DCT_DCT)"
+        (is (thrown-with-msg? kerror/ExceptionInfo #"CodedLossless"
+                               (db/make-decode-block-fn (assoc frame-hdr :coded-lossless 1) seq-hdr))))
+      (testing "non-monochrome with an unsupported chroma format (num_planes>1
+                but not 4:2:0) is rejected -- monochrome (mono_chrome=1) and
+                4:2:0 color (mono_chrome=0, num_planes=3, subsampling_x=1,
+                subsampling_y=1) are both supported, see av1.decode-block
+                namespace docstring's chroma section"
+        (is (thrown-with-msg? kerror/ExceptionInfo #"mono_chrome"
+                               (db/make-decode-block-fn frame-hdr (assoc seq-hdr :mono-chrome 0 :num-planes 3
+                                                                          :subsampling-x 0 :subsampling-y 0)))
+            "4:4:4 (subsampling 0,0) is rejected -- only 4:2:0 chroma is supported")
+        (is (thrown-with-msg? kerror/ExceptionInfo #"mono_chrome"
+                               (db/make-decode-block-fn (assoc frame-hdr :num-planes 2) (assoc seq-hdr :mono-chrome 0 :subsampling-x 1 :subsampling-y 1)))
+            "num_planes=2 (not 1 or 3) is rejected"))
+      (testing "tx_mode other than TX_MODE_LARGEST is rejected (no tx_depth CDF support)"
+        (is (thrown-with-msg? kerror/ExceptionInfo #"tx_mode"
+                               (db/make-decode-block-fn (assoc frame-hdr :tx-mode :tx-mode-select) seq-hdr)))))))

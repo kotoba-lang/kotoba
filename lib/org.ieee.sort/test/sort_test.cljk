@@ -1,0 +1,356 @@
+;; test/sort_test.cljk — build the command and compare it with the system
+;; sort, byte for byte, in the POSIX locale.
+;;
+;; LC_ALL=C, and that is not a convenience. Measured 2026-09-10 on the lines
+;; `b a B A`, the default locale answers `a A b B` and LC_ALL=C answers
+;; `A B a b`; on `日 é z` the default answers `日 é z` and LC_ALL=C answers
+;; `z é 日`. This implementation walks code points, and UTF-8 keeps code
+;; point order and byte order the same, so it produces the second -- and
+;; comparing it against the first would be comparing two orderings.
+
+(ns sort-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      ;; The large fixture answers 3.6 MB; Node's default 1 MiB
+                      ;; maxBuffer would kill the child and call it a difference.
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-sort "/usr/bin/sort")
+
+;; A directory of fixtures, and the cases over them. Each case is an argv,
+;; and each is here because it separates a right implementation from a wrong
+;; one that passes the others:
+;;
+;;   one file           -- the basic contract
+;;   two files          -- merged and sorted together, with no headers
+;;   the same file twice-- an operand is not deduplicated
+;;   an EMPTY file      -- reads as the empty string, which must not end the
+;;                         loop the way "past the last operand" does
+;;   empty then content -- the same trap from the other side
+;;   no trailing newline-- sort ADDS the newline, and the line stays whole
+;;   no operands        -- POSIX reads stdin; there is no stdin capability,
+;;                         so this asserts what it ACTUALLY does (nothing),
+;;                         not what POSIX says
+(def fixtures
+  {;; A LARGE file: 80,000 lines, 3.6 MB, shuffled by a fixed stride so
+   ;; every level of the merge does work, with duplicates for -u and a
+   ;; numeric key for -n. The previous core.kotoba -- a selection sort
+   ;; rebuilding its remainder per line -- trapped at 4,600 lines (measured
+   ;; 2026-09-15); this is the case that pins the merge sort.
+   "big"    (str/join "" (map (fn [i]
+                               (let [k (mod (* i 7919) 80000)]
+                                 (str (- (quot k 3) 10000) " line " (quot k 3) " of the corpus, " (mod k 4) "\n")))
+                             (range 80000)))
+   "fruit"  "banana\napple\ncherry\n"
+   ;; Case is where the two locales disagree most visibly.
+   "case"   "b\na\nB\nA\n"
+   ;; Lexical, not numeric: 10 100 9.
+   "nums"   "10\n9\n100\n"
+   ;; Duplicates are KEPT, both of them.
+   "dup"    "dup\ndup\na\n"
+   ;; No trailing newline: sort ADDS one, 13 bytes in and 14 out.
+   "nonl"   "nonl-b\nnonl-a"
+   ;; Multi-byte, where a byte walk and a code-point walk must agree.
+   "utf8"   "日\né\nz\n"
+   "one"    "x\n"
+   "empty"  ""
+   ;; A common prefix: `a` sorts before `ab`, which is the case a comparison
+   ;; that stops at the shorter string's end gets wrong.
+   "prefix" "ab\na\nabc\n"
+   ;; A blank line in the middle, and a blank LAST line. The second is the
+   ;; one that caught a defensive trim of the final newline: the trim made
+   ;; `a\n\n` answer `a` where sort answers an empty line and then `a`, and
+   ;; every other fixture here passed with and without it.
+   "blank"      "b\n\na\n"
+   ;; With `-r` the empty line goes LAST, which is what caught the
+   ;; accumulator that could not tell "no lines yet" from "one empty line".
+   "trailblank" "a\n\n"
+   "twoblank"   "a\n\n\nb\n"
+
+   ;; --- -u ---------------------------------------------------------------
+   "udup"   "b\na\nb\na\nc\n"
+   "usame"  "x\nx\nx\n"
+   ;; Duplicate EMPTY lines: -u keeps one, and it sorts first.
+   "ublank" "a\n\n\nb\n"
+   ;; A duplicate that straddles the missing final newline.
+   "unonl"  "z\na\nz"
+
+   ;; --- -n, one measured shape per fixture -------------------------------
+   ;; Ordinary numbers, where the numeric and the lexical order disagree.
+   "nbasic" "10\n9\n100\n2\n"
+   "nsame"  "1\n1.0\n01\nb\n2\na\n"
+   ;; Lines that are not numbers at all: key 0, then the whole-line
+   ;; tiebreak. `apple` and `banana` come out in byte order and not in input
+   ;; order, which is also the proof that -n is not stable.
+   "nmixed" "banana\n10\napple\n9\n2\n"
+   ;; Negatives, with two non-numbers sitting between them and the
+   ;; positives.
+   "nneg"   "banana\n-5\n10\napple\n0\n"
+   "nonly"  "-5\n-10\n-1\n3\n0\n"
+   ;; A leading '+' is NOT a number here: measured `+1 +5 3 10`, not
+   ;; `+1 3 +5 10`.
+   "nplus"  "+5\n3\n+1\n10\n"
+   "nplus2" "+5\n-1\n2\n"
+   ;; Leading blanks are skipped -- space and TAB.
+   "nblank" "  5\n3\n 4\n\t2\n"
+   ;; \v and \f are NOT blanks. Measured: `\v7 \f6 5` answers `\v7 \f6 5`,
+   ;; which is byte order over three key-0 lines. Had they been skipped the
+   ;; keys would be 7, 6 and 5 and the answer would be `5 \f6 \v7`.
+   "nws"    "\u000b7\n\u000c6\n5\n"
+   ;; An empty line: key 0, and first because "" is bytewise least.
+   "nempty" "5\n\n3\n0\n"
+   "nspace" " \n\n0\n"
+   ;; The key is a leading PREFIX, not the whole line.
+   "npfx"   "10abc\n9xyz\n2zzz\n"
+   "npfx2"  "3abc9\n30\n"
+   ;; No exponent: 1e3 is 1.
+   "nexp"   "1e3\n50\n2\n"
+   ;; Equal keys, distinct lines: ordered by the WHOLE line, not by input
+   ;; position.
+   "ntie"   "1\n01\n 1\n1x\n"
+   ;; And the tiebreak is the whole line rather than the part after the
+   ;; number: `01b` before `1a`.
+   "ntie2"  "1a\n01b\n"
+   "nzeros" "007\n7\n10\n"
+   ;; Fractions.
+   "nfrac"  "1.5\n1.25\n1.10\n2\n"
+   "nfrac2" "1.50\n1.5\n1.500\n"
+   "nfrac3" "2\n2.000\n1.999\n"
+   ;; A NEGATIVE fraction that is a byte-prefix of another. This is the only
+   ;; shape where "a missing fraction digit reads as 0" can be told apart
+   ;; from "stop at the shorter fraction": on the positive side the extra
+   ;; digits only make the number bigger AND the line bytewise larger, so
+   ;; both rules agree. Negated, they disagree -- measured, `-1.50001` comes
+   ;; first, where a whole-line tiebreak would have put `-1.5` first.
+   "nfracn" "-1.5\n-1.50001\n"
+   "nfracn2" "-1.5\n-1.6\n-1.55\n"
+   "ndot"   ".5\n-.5\n0\n1\n"
+   "ndot2"  "5.\n5\n4\n"
+   "ndot3"  "1.2.3\n1.3\n1.1\n"
+   ;; A lone '-' and a lone '.' are 0.
+   "nlone"  "-\n.\n0\n-1\n1\n"
+   "nlone2" "-.\n-\n.\n0\n"
+   ;; A space after the '-' ends it: key 0.
+   "nsgnsp" "- 5\n-5\n0\n"
+   ;; -0 EQUALS 0. The pair `-0 0` cannot show it -- both orderings agree on
+   ;; it -- so the fixture is `-0` against `  0`, where a sign that made -0
+   ;; strictly negative puts `-0` first and sort puts `  0` first.
+   "nzero"  "-0\n  0\n"
+   ;; Past i64 (19 digits) and past any binary float: 21 and then 31 digits
+   ;; that differ only in the last one.
+   "nbig"   "123456789012345678901\n123456789012345678900\n5\n"
+   "nbig2"  "1111111111111111111111111111112\n1111111111111111111111111111111\n"})
+
+;; An argv entry that begins with '-' is a FLAG and is passed through; every
+;; other entry is a path into the fixture directory.
+;;
+;; Joining a flag onto the fixture path would have produced `/tmp/.../-r`,
+;; which does not exist -- and then BOTH implementations would have failed
+;; with the same missing-file message and the same exit 2, so every flag case
+;; would have PASSED while testing nothing at all. That is the same shape as
+;; the `(first names)` bug below, one argument to the left.
+(defn- flag? [s] (str/starts-with? s "-"))
+
+(def cases
+  [["fruit"] ["case"] ["nums"] ["dup"] ["nonl"] ["utf8"] ["one"] ["empty"]
+   ["prefix"] ["blank"] ["trailblank"] ["twoblank"]
+   ;; The large file under every flag.
+   ["big"] ["-r" "big"] ["-u" "big"] ["-n" "big"]
+   ;; A MISSING operand: matched on stderr and exit status since wire 35
+   ;; gained an EXISTS form. Every utility words this differently --
+   ;; measured on each, not copied from a sibling.
+   ["missing"]
+   ;; --- two or more operands ------------------------------------------
+   ;; sort MERGES: no headers, and the operand order does not change the
+   ;; output because everything is sorted together.
+   ["fruit" "nums"] ["nums" "fruit"]
+   ;; The same file twice: every line appears twice.
+   ["dup" "dup"]
+   ;; An empty operand contributes nothing.
+   ["fruit" "empty"] ["empty" "fruit"]
+   ;; THE case that separates reading operands as LINES from concatenating
+   ;; their bytes. `nonl` ends without a newline, so a byte concatenation
+   ;; runs its last line into the next file's first one -- measured,
+   ;; `sort nonl fruit` keeps `nonl-a` whole where `cat nonl fruit | sort`
+   ;; produces `nonl-aapple`.
+   ["nonl" "fruit"] ["fruit" "nonl"] ["nonl" "one"]
+   ;; Multi-byte across operands.
+   ["utf8" "fruit"]
+   ;; An unreadable operand writes NOTHING -- not the readable ones and not
+   ;; a partial answer -- and exits 2. An implementation that printed what
+   ;; it could, the way cat and wc do, fails these three and nothing else.
+   ["fruit" "missing"] ["missing" "fruit"] ["fruit" "missing" "nums"]
+   ;; Three readable operands.
+   ["fruit" "nums" "dup"]
+
+   ;; --- -r ---------------------------------------------------------------
+   ;; The exact reverse of the ascending answer, duplicates kept.
+   ["-r" "fruit"] ["-r" "case"] ["-r" "nums"] ["-r" "dup"] ["-r" "prefix"]
+   ["-r" "utf8"] ["-r" "one"] ["-r" "empty"] ["-r" "nonl"] ["-r" "blank"]
+   ;; The empty line goes LAST here, which is where a joined accumulator
+   ;; loses it.
+   ["-r" "trailblank"] ["-r" "twoblank"]
+   ["-r" "fruit" "nums"] ["-r" "nonl" "fruit"]
+   ["-r" "missing"] ["-r" "fruit" "missing"]
+
+   ;; --- -u ---------------------------------------------------------------
+   ["-u" "udup"] ["-u" "usame"] ["-u" "ublank"] ["-u" "unonl"] ["-u" "dup"]
+   ["-u" "fruit"] ["-u" "empty"] ["-u" "utf8"] ["-u" "trailblank"]
+   ;; Across operands: the same file twice collapses to one copy.
+   ["-u" "dup" "dup"] ["-u" "fruit" "fruit"] ["-u" "nonl" "fruit"]
+   ["-u" "missing"] ["-u" "missing" "fruit"]
+
+   ;; --- -n ---------------------------------------------------------------
+   ["-n" "nbasic"] ["-n" "nums"] ["-n" "nmixed"] ["-n" "nneg"] ["-n" "nonly"]
+   ["-n" "nplus"] ["-n" "nplus2"] ["-n" "nblank"] ["-n" "nws"]
+   ["-n" "nempty"] ["-n" "nspace"]
+   ["-n" "npfx"] ["-n" "npfx2"] ["-n" "nexp"]
+   ["-n" "ntie"] ["-n" "ntie2"] ["-n" "nzeros"]
+   ["-n" "nfrac"] ["-n" "nfrac2"] ["-n" "nfrac3"]
+   ["-n" "nfracn"] ["-n" "nfracn2"]
+   ["-n" "ndot"] ["-n" "ndot2"] ["-n" "ndot3"]
+   ["-n" "nlone"] ["-n" "nlone2"] ["-n" "nsgnsp"] ["-n" "nzero"]
+   ["-n" "nbig"] ["-n" "nbig2"]
+   ;; -n over things that are not numbers at all, and over empties.
+   ["-n" "fruit"] ["-n" "utf8"] ["-n" "empty"] ["-n" "blank"]
+   ["-n" "trailblank"] ["-n" "dup"]
+   ;; -n across operands, including the unterminated one.
+   ["-n" "nbasic" "nums"] ["-n" "nonl" "nbasic"] ["-n" "nmixed" "fruit"]
+   ["-n" "missing"] ["-n" "nbasic" "missing"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 97% of sort's invocations in agent tool use are a later pipeline
+   ;; segment (6,046 of 6,208 measured); `sort | uniq` alone is 1,889.
+   {:argv [] :stdin "fruit"}
+   {:argv ["-r"] :stdin "fruit"}
+   {:argv ["-u"] :stdin "dup"}
+   {:argv ["-n"] :stdin "nbasic"}
+   {:argv [] :stdin "nonl"}
+   {:argv [] :stdin "empty"}
+   ;; The 3.6 MB fixture through the pipe: past one pipe buffer, and the
+   ;; merge sort over stdin the way it runs over a file.
+   {:argv [] :stdin "big"}
+   {:argv ["-n"] :stdin "big"}
+   ;; --- combined flags (2026-09-17) ---------------------------------------
+   ;; `sort -rn` is 1,031 of the measured agent calls; it was an unknown
+   ;; flag here while -r and -n alone were fine. Every spelling of the set.
+   ["-rn" "nbasic"] ["-nr" "nbasic"] ["-r" "-n" "nbasic"] ["-rn" "nmixed"] ["-rn" "nonl"]
+   ["-ru" "dup"] ["-ur" "dup"] ["-nu" "nbasic"] ["-rnu" "nbasic"] ["-nru" "dup"]
+   ["-rn" "nbasic" "nums"] ["-rn" "missing"] ["-r" "-u" "-n" "nbasic"]
+   {:argv ["-rn"] :stdin "nbasic"} {:argv ["-rn"] :stdin "big"} {:argv ["-ru"] :stdin "dup"}
+   ;; -nu: numerically equal lines are ONE line (1, 1.0, 01; and any two
+   ;; non-numbers).
+   {:argv ["-nu"] :stdin "nsame"} {:argv ["-rnu"] :stdin "nsame"} {:argv ["-nu"] :stdin "fruit"}])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-sort) (refuse (str "no " system-sort " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-wc-"))
+        src (.resolve path (.cwd js/process) "sort" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "sort.kexe")
+        blob (.join path tmp "sort.bin")
+        exe (.join path tmp "sort")]
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
+    ;; The fixtures live in the tree the binary is packaged for. The native
+    ;; loader refuses a relative request outright, so operands are absolute.
+    (let [data (.join path tmp "data")]
+      (.mkdirSync fs data)
+      (doseq [[name content] fixtures]
+        (.writeFileSync fs (.join path data name)
+                        content
+                        "utf8")))
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      ;; Fuel and arena are constants of the binary, so they are packaged
+      ;; here rather than supplied at run time. Sorting walks one code point
+      ;; at a time and the numeric key walks the digits again, so the guest
+      ;; recursion is long and the default 512 fuel counts almost nothing.
+      ;; Budgets for the large fixture (index sort, 2026-09-16): the text
+      ;; plus the answer in the pool, two vector words per line (the
+      ;; offsets, sorted between two vectors), the loader's DEFAULT 4,096
+      ;; handles -- every step is a region -- and several CPU seconds on a
+      ;; loaded machine.
+      (doseq [[out extra] [[exe ["--fuel" "4000000000" "--string-pool" "268435456" "--pairs" "4096"
+                                 "--vector-items" "4194304"
+                                 "--cpu-seconds" "120" "--wall-seconds" "600"]]]]
+        (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                                  "--allow" "35,37,38,39,41"
+                                  "--fs-scope" (.realpathSync fs (.join path tmp "data"))
+                                  "--output" out]
+                                 extra) {})]
+          (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
+    ;; Now the only thing that matters: run it.
+    (let [data (.realpathSync fs (.join path tmp "data"))
+          results
+          (for [case cases]
+            ;; EVERY operand is a path, and every FLAG is not. This took only
+            ;; `(first names)` until 2026-09-10, which silently dropped the
+            ;; rest -- the twelve multi-operand cases added that day all
+            ;; passed against it, because both implementations were handed
+            ;; one file and agreed about it. The giveaway was in the output
+            ;; rather than the status: `["fruit" "nums"]` printed fruit's
+            ;; three lines with none of nums', and `["fruit" "missing"]`
+            ;; printed instead of failing.
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture fed as standard input to BOTH
+                  ;; binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (or (get fixtures (:stdin case))
+                              (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (mapv #(if (flag? %) % (.join path data %)) names)
+                  k (run exe argv opts)
+                  ;; LC_ALL=C: byte order. See the header.
+                  s (run system-sort argv
+                         (assoc opts
+                                :env (let [e (js/Object.assign #js {} (.-env js/process))]
+                                       (aset e "LC_ALL" "C")
+                                       e)))
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             ;; stderr too: a missing operand differs there
+                             ;; and nowhere else, so a suite that compared
+                             ;; only stdout and status would call it green.
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s)))]
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ")
+                      (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-sort " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

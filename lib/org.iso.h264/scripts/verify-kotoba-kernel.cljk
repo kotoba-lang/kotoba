@@ -1,0 +1,320 @@
+#!/usr/bin/env kbb
+(ns verify-kotoba-kernel
+  "Execute this repo's `.kotoba` residual kernels WITHOUT a JVM and compare
+  them against `resources/h264/kotoba-vectors/kernel-vectors.edn`, whose
+  every expectation was produced by the authoritative `.cljc` decoder, and
+  whose inverse-transform inputs are coefficient blocks that real libx264
+  fixtures actually produced while being decoded.
+
+  Three independent executions are compared against the same vectors:
+
+    reference  kotoba.kir/execute, the language's own interpreter
+    wasm       the emitted wasm32 module, instantiated by node
+    native     the emitted aarch64/x86_64 machine code, extracted by symbol
+               and run through amu's W^X kexe loader (opt-in: --native)
+
+  `java`, `javac`, `clojure` and `clj` are shadowed on PATH by stubs that
+  exit 127 and append to a marker file, so a JVM cannot be reached even by
+  accident; the run fails if that marker is ever written.
+
+  The native path is reported per MODULE (`transform` and `quant`
+  separately), because a module whose symbols cannot be extracted must not
+  erase the result of one that ran. As of amu 02c7e57 `quant.kexe` cannot be
+  extracted at all -- see test/h264/kotoba-compiler-repro -- so a `--native`
+  run legitimately ends in exit 3 today, with NATIVE-transform reported as
+  passed beside it.
+
+  usage: kbb --backend sci --classpath scripts scripts/verify-kotoba-kernel.cljk
+             --amu <amu-checkout> [--native] [--vectors <edn>]
+                                  [--skip-reference]
+
+  exit 0  every path that ran matched every case it ran
+  exit 1  a mismatch: a kernel and the .cljc decoder disagree
+  exit 3  UNVERIFIED -- a path could not be run at all, or an evidence
+          floor was not met. Deliberately neither 0 nor 1, because 'could
+          not measure' must not return the same value as 'measured clean'."
+  (:require [kotoba.lang.text :as str]
+            [kotoba-kernel-common :as common]
+            ["node:child_process" :as child]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def argv (vec (drop 2 js/process.argv)))
+(defn opt [flag] (second (drop-while #(not= flag %) argv)))
+(defn flag? [f] (boolean (some #{f} argv)))
+
+(defn unverified! [message]
+  (println (str "UNVERIFIED\t" message))
+  (js/process.exit 3))
+
+(def amu-root (or (opt "--amu") (aget js/process.env "AMU_ROOT")))
+(def vectors-path (or (opt "--vectors") "resources/h264/kotoba-vectors/kernel-vectors.edn"))
+(def want-native? (flag? "--native"))
+;; The reference interpreter walks every case in KIR and is by far the slowest
+;; path. `--skip-reference` exists for the negative-control driver, which runs
+;; the whole comparison four times over deliberately broken copies and only
+;; needs ONE execution to demonstrate that the comparison discriminates. It is
+;; not a way to make a red run green: the skipped path is reported as skipped,
+;; never as passed.
+(def skip-reference? (flag? "--skip-reference"))
+
+(when-not (and amu-root (fs/existsSync (.join path amu-root "bin" "amu")))
+  (unverified! (str "no amu checkout at --amu " (pr-str amu-root))))
+(when-not (fs/existsSync vectors-path)
+  (unverified! (str "no vectors at " vectors-path)))
+
+(def tmp (.mkdtempSync fs (.join path (.tmpdir os) "h264-kotoba-kernel-")))
+(def shadow (.join path tmp "shadow"))
+(def marker (.join path tmp "jvm-invoked.log"))
+(def amu-bin (.join path amu-root "bin" "amu"))
+
+(fs/mkdirSync shadow)
+(doseq [binary ["java" "javac" "clojure" "clj"]]
+  (let [target (.join path shadow binary)]
+    (fs/writeFileSync target (str "#!/bin/sh\necho '" binary " $*' >> '" marker
+                                  "'\necho '" binary ": forbidden' >&2\nexit 127\n"))
+    (fs/chmodSync target (js/parseInt "755" 8))))
+
+(def env
+  (js/Object.assign #js {} js/process.env
+                    #js {"PATH" (str shadow (.-delimiter path) (.-PATH js/process.env))
+                         "JAVA_HOME" (.join path tmp "no-java-home")}))
+
+(defn run [command args]
+  (let [r (.spawnSync child command (clj->js args)
+                      #js {:encoding "utf8" :maxBuffer 16777216 :env env})]
+    {:status (if (nil? (.-status r)) 70 (.-status r))
+     :stdout (or (.-stdout r) "") :stderr (or (.-stderr r) "")}))
+
+(defn amu! [args]
+  (let [r (run js/process.execPath (into [amu-bin] args))]
+    (when-not (zero? (:status r))
+      (unverified! (str "amu " (str/join " " args) " exited " (:status r) ": "
+                        (str/trim (str (:stdout r) (:stderr r))))))
+    r))
+
+(def sources {:quant "src/h264/quant.kotoba" :transform "src/h264/transform.kotoba"})
+
+(def isa
+  (let [arch (.arch os)]
+    (cond (contains? #{"arm64" "aarch64"} arch) "aarch64"
+          (= "x64" arch) "x86_64"
+          :else nil)))
+
+(def compiled
+  (into {}
+        (for [[k src] sources]
+          (let [abs (.resolve path src)
+                wasm (.join path tmp (str (name k) ".wasm"))]
+            (amu! ["compile" abs "--target" "wasm32" "--output" wasm])
+            [k {:wasm wasm
+                :kexe (when (and want-native? isa)
+                        (let [out (.join path tmp (str (name k) ".kexe"))]
+                          (amu! ["compile" abs "--target" isa "--output" out])
+                          out))}]))))
+
+;; ------------------------------------------------------------------ wasm
+
+(defn wasm-instance [file]
+  (let [m (js/WebAssembly.Module. (fs/readFileSync file))
+        imports (js/WebAssembly.Module.imports m)]
+    ;; A kernel that needed host imports would no longer be self-contained,
+    ;; and the "runs with nothing underneath it" claim would be false.
+    (when (pos? (.-length imports))
+      (unverified! (str file " declares " (.-length imports) " host imports")))
+    (.-exports (js/WebAssembly.Instance. m #js {}))))
+
+(def wasm-modules
+  (into {} (for [[k v] compiled] [k (js/WebAssembly.Module. (fs/readFileSync (:wasm v)))])))
+
+;; Instantiating checks the import surface; a kernel that needed host imports
+;; would not be self-contained and the "runs with nothing underneath it"
+;; claim would be false.
+(doseq [[_ v] compiled] (wasm-instance (:wasm v)))
+
+;; A Kotoba Wasm artifact carries a fuel budget that is spent over the
+;; INSTANCE's lifetime, not per call: measured 2026-08-30, this module traps
+;; `unreachable` on the 103rd `idct4-1d-scaled` call of one instance. That is
+;; the artifact behaving as specified, so the driver refuels by making a new
+;; instance and retrying exactly once. A second trap is a real failure and is
+;; allowed to propagate -- the retry must not become a way to swallow one.
+(def wasm-live (atom (into {} (for [[k m] wasm-modules]
+                                [k (.-exports (js/WebAssembly.Instance. m #js {}))]))))
+(def wasm-refuels (atom 0))
+
+(defn wasm-call [module fname args]
+  (let [bigs (map #(js/BigInt %) args)
+        invoke (fn [] (let [f (aget (get @wasm-live module) fname)]
+                        (when-not f
+                          (unverified! (str "wasm module " (name module)
+                                            " has no export " fname)))
+                        (js/Number (apply f bigs))))]
+    (try (invoke)
+         (catch :default _
+           (swap! wasm-refuels inc)
+           (swap! wasm-live assoc module
+                  (.-exports (js/WebAssembly.Instance. (get wasm-modules module) #js {})))
+           (invoke)))))
+
+;; ---------------------------------------------------------------- native
+
+(def loader
+  (when (and want-native? isa)
+    (let [out (.join path tmp "kexe-loader")
+          r (run "cc" ["-std=c11" "-O2" "-Wall" "-Wextra" "-Werror"
+                       (.join path amu-root "tools" "kexe_loader.c") "-o" out])]
+      (when-not (zero? (:status r)) (unverified! (str "cc failed: " (:stderr r))))
+      out)))
+
+(def native-symbols (atom {}))
+
+;; Extraction is a PRE-FLIGHT, per module, and a module that cannot be
+;; extracted makes only its own group unverified. Aborting the whole native
+;; path on the first bad symbol -- which is what this did first -- threw away
+;; the result for the module that had extracted fine, and reported nothing
+;; about it at all.
+(defn extract-module!
+  "Extracts every `fnames` symbol of `module`, returning {:ok entries} or
+  {:error diagnostic}. The offset and arity come from the artifact's own
+  symbol table, not from a guess: passing 0 would silently run a different
+  function."
+  [module fnames]
+  (reduce
+   (fn [acc fname]
+     (if (:error acc)
+       acc
+       (let [bin (.join path tmp (str (name module) "-" fname ".bin"))
+             r (run js/process.execPath
+                    [amu-bin "extract-native" (:kexe (get compiled module))
+                     "--symbol" fname "--output" bin])
+             offset (second (re-find #":offset ([0-9]+)" (:stdout r)))
+             arity (second (re-find #":arity ([0-9]+)" (:stdout r)))]
+         (if (or (not (zero? (:status r))) (not offset) (not arity))
+           {:error (str "extract-native --symbol " fname " exited " (:status r)
+                        ": " (str/trim (str (:stdout r) (:stderr r))))}
+           (update acc :ok assoc fname
+                   {:bin bin :offset offset :arity (js/parseInt arity 10)})))))
+   {:ok {}} fnames))
+
+(defn native-call [module fname args]
+  (let [{:keys [bin offset arity]} (get-in @native-symbols [module fname])]
+    (when-not bin
+      (unverified! (str "no extracted symbol for " (name module) "/" fname)))
+    (when-not (= arity (count args))
+      (unverified! (str fname ": artifact declares arity " arity
+                        ", call passes " (count args))))
+    (let [r (run loader (into [bin offset (str (count args)) isa "-"] (map str args)))]
+      (when-not (zero? (:status r))
+        (unverified! (str "native " fname " exited " (:status r) ": " (:stderr r))))
+      (js/parseInt (str/trim (:stdout r)) 10))))
+
+;; ------------------------------------------------------------- reference
+
+(defn reference-result []
+  (let [nbb (.join path amu-root "node_modules" ".bin" "nbb")
+        printer (.join path amu-root "scripts" "print-classpath.cljk")]
+    (if-not (and (fs/existsSync nbb) (fs/existsSync printer))
+      {:state :unverified :why "amu's nbb or print-classpath.cljs is missing"}
+      (let [cp (run nbb ["--classpath" (.join path amu-root "src") printer amu-root])]
+        (if-not (zero? (:status cp))
+          {:state :unverified :why (str "classpath resolution exited " (:status cp))}
+          (let [entries (->> (str/split-lines (:stdout cp)) (map str/trim) (remove str/blank?))
+                classpath (str/join (.-delimiter path)
+                                    (concat entries [(.join path amu-root "src")
+                                                     (.resolve path "scripts")]))
+                r (run nbb ["--classpath" classpath
+                            (.resolve path "scripts/kotoba-kernel-reference.cljk")
+                            "--vectors" (.resolve path vectors-path)])]
+            {:state (case (:status r) 0 :passed 1 :failed :unverified)
+             :output (str (:stdout r) (:stderr r))}))))))
+
+;; ----------------------------------------------------------------- drive
+
+(def data (common/load-vectors vectors-path))
+(def idct-cases (:idct data))
+(def quant-total (reduce + (map (fn [[k _]] (count (get-in data [:quant k]))) common/quant-plan)))
+(defn dc-only-count [cases]
+  (count (filter #(every? zero? (rest (:coeffs %))) cases)))
+;; The floor is the exact number of values a complete run compares, so a run
+;; that silently skipped part of the corpus reports UNVERIFIED rather than a
+;; clean pass with a smaller number nobody reads.
+(def full-floor (+ (* 16 (count idct-cases)) (dc-only-count idct-cases) quant-total))
+
+(when (zero? (count idct-cases))
+  (unverified! "the vector file carries no inverse-transform cases"))
+
+(defn report [label {:keys [checked failures]} floor]
+  (println (str label "\tCHECKED\t" checked "\tFAILURES\t" (count failures)))
+  ;; The FULL set of failing groups, not just the three sample failures below
+  ;; it. Printing only samples made a red run unreadable to anything checking
+  ;; WHICH check went red -- the negative-control driver read the samples,
+  ;; saw three :level-scale failures, and reported its :ac-qmul control as
+  ;; unproven even though ac-qmul had failed too, further down the list.
+  (when (seq failures)
+    (println (str label "\tFAILING-GROUPS\t"
+                  (str/join " " (sort (map name (distinct (map :kind failures))))))))
+  (doseq [f (take 3 failures)] (println (str "  " (pr-str f))))
+  (cond
+    (< checked floor) (do (println (str "UNVERIFIED\t" label " checked " checked
+                                        ", floor is " floor)) :unverified)
+    (seq failures) :failed
+    :else :passed))
+
+(def native-cases (when want-native? (common/native-subset idct-cases 8)))
+(def native-quant-limit 8)
+
+(defn native-group
+  "Runs one native group after extracting exactly the symbols it needs, and
+  keeps 'could not extract' visibly distinct from 'ran and matched'."
+  [label module fnames run-check floor]
+  (let [{:keys [ok error]} (extract-module! module fnames)]
+    (if error
+      (do (println (str "UNVERIFIED\t" label "\t" error)) :unverified)
+      (do (swap! native-symbols assoc module ok)
+          (report label (run-check) floor)))))
+
+(def outcomes
+  (cond-> {:wasm (report "WASM" (common/check wasm-call data idct-cases nil) full-floor)}
+    want-native?
+    (merge
+     (if-not isa
+       (do (println (str "UNVERIFIED\tNATIVE\tunsupported architecture " (.arch os)))
+           {:native-transform :unverified :native-quant :unverified})
+       {:native-transform
+        (native-group (str "NATIVE-" isa "-transform") :transform
+                      ["idct4-1d" "idct4-1d-dc" "idct4-1d-scaled" "dc-only-sample"]
+                      #(common/check native-call
+                                     (assoc data :quant {})
+                                     native-cases 0)
+                      (+ (* 16 (count native-cases)) (dc-only-count native-cases)))
+        :native-quant
+        (native-group (str "NATIVE-" isa "-quant") :quant
+                      (mapv second common/quant-plan)
+                      #(common/check native-call data [] native-quant-limit)
+                      (* native-quant-limit (count common/quant-plan)))}))))
+
+(def outcomes
+  (if skip-reference?
+    (do (println "SKIPPED\tREFERENCE\t--skip-reference was passed") outcomes)
+    (let [reference (reference-result)]
+      (when-let [out (:output reference)] (print out))
+      (when (= :unverified (:state reference))
+        (println (str "UNVERIFIED\tREFERENCE\t" (:why reference))))
+      (assoc outcomes :reference (:state reference)))))
+
+(when (fs/existsSync marker)
+  (println (str "UNVERIFIED\ta JVM tool was invoked: "
+                (str/trim (fs/readFileSync marker "utf8"))))
+  (js/process.exit 3))
+
+(fs/rmSync tmp #js {:recursive true :force true})
+
+(println (str "SUMMARY\t" (pr-str outcomes)
+              "\tidct-blocks " (count idct-cases)
+              "\tquant-cases " quant-total
+              "\twasm-refuels " @wasm-refuels))
+(js/process.exit
+ (cond (some #{:failed} (vals outcomes)) 1
+       (some #{:unverified} (vals outcomes)) 3
+       :else 0))

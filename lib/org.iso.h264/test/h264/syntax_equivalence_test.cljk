@@ -1,0 +1,301 @@
+(ns h264.syntax-equivalence-test
+  "The whole point of h264.syntax + resources/h264/syntax/sps.edn is that a
+   generic reader over a DATA transcription of ISO/IEC 14496-10 §7.3.2.1.1
+   produces the same answer as this repo's hand-written `h264.sps/parse`.
+   A new parser that merely runs proves nothing; these tests are equivalence
+   against the incumbent, which stays the shipping parser.
+
+   Three kinds of evidence, in increasing strength:
+
+   1. the real libx264 fixture (`sample.h264`) — the same NAL sps_test.clj
+      validates against ffprobe;
+   2. every SPS `h264.sps/encode` can produce;
+   3. synthetic streams built bit-by-bit here that reach paths the
+      incumbent's own tests never do — high-profile scaling lists (both the
+      run-to-completion and the nextScale-hits-zero early-exit branch),
+      chroma_format_idc 3 with separate_colour_plane_flag and twelve scaling
+      lists, pic_order_cnt_type 1 with its
+      num_ref_frames_in_pic_order_cnt_cycle loop, interlaced
+      (frame_mbs_only_flag 0) with mb_adaptive_frame_field_flag, and frame
+      cropping. For those the test also asserts the table-driven reader
+      stopped at EXACTLY the bit the writer stopped at — a position check the
+      incumbent cannot supply, since it owns a private reader."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            #?(:clj [clojure.java.io :as io])
+            [h264.bitstream :as bs]
+            [h264.expgolomb :as eg]
+            [h264.rbsp :as rbsp]
+            [h264.sps :as sps]
+            [h264.sps-table :as spst]
+            [h264.syntax :as syntax]))
+
+(def table (spst/load-table))
+
+(defn- rd [p] (mapv #(bit-and (int %) 0xff)
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "lib/org.iso.h264/resources/" p))))))
+
+(defn- agrees?
+  "Assert the table-driven parse equals the incumbent parse, whole map."
+  [rbsp label]
+  (let [incumbent (sps/parse rbsp)
+        driven    (spst/parse table rbsp)]
+    (is (= incumbent driven)
+        (str label ": table-driven parse must equal h264.sps/parse"))
+    driven))
+
+;; ---------------------------------------------------------------------------
+;; 1. the real encoder fixture
+
+(deftest equivalence-on-real-libx264-fixture
+  (let [units (bs/nal-units (rd "h264/fixtures/sample.h264"))
+        sps-u (first (filter #(= :sps (:kind %)) units))]
+    (is (some? sps-u) "fixture must contain an SPS NAL")
+    (let [r (rbsp/unescape (:bytes sps-u))
+          m (agrees? r "sample.h264 SPS")]
+      (testing "and it is still the 64x48 baseline stream sps_test.clj pins"
+        (is (= 66 (:profile-idc m)))
+        (is (= 64 (:width m)))
+        (is (= 48 (:height m)))))))
+
+(deftest equivalence-across-every-fixture-in-the-repo
+  (testing "every .h264 fixture's SPS NALs, not just sample.h264"
+    (let [files (sort
+                 #?(:clj (->> (file-seq (io/file (io/resource "h264/fixtures")))
+                              (filter #(.isFile ^java.io.File %))
+                              (filter #(.endsWith (.getName ^java.io.File %) ".h264")))
+                    :cljs (->> (.readdirSync (js/require "fs") "lib/org.iso.h264/resources/h264/fixtures"
+                                              #js {:withFileTypes false})
+                               (js->clj)
+                               (filter #(str/ends-with? % ".h264"))
+                               (map #(str "lib/org.iso.h264/resources/h264/fixtures/" %)))))
+          n (atom 0)]
+      (is (pos? (count files)) "fixture directory must not be empty")
+      (doseq [f files]
+        (let [b (mapv #(bit-and (int %) 0xff)
+                      #?(:clj (.readAllBytes (io/input-stream f))
+                         :cljs (js->clj (.readFileSync (js/require "fs") (str f)))))]
+          (doseq [u (filter #(= :sps (:kind %)) (bs/nal-units b))]
+            (swap! n inc)
+            (agrees? (rbsp/unescape (:bytes u)) #?(:clj (.getName f) :cljs (last (str/split f #"/")))))))
+      ;; evidence floor: a scan that found nothing must not look like a pass
+      (is (pos? @n) "SCANNED 0 SPS NALs — this test would otherwise be vacuous")
+      (println "  [equivalence] SPS NALs compared across repo fixtures:" @n))))
+
+;; ---------------------------------------------------------------------------
+;; 2. everything the incumbent encoder can produce
+
+(deftest equivalence-across-the-encoders-whole-range
+  (let [n (atom 0)]
+    (doseq [profile [66 77 88]
+            level   [10 30 31 40 51]
+            [w h]   [[16 16] [64 48] [176 144] [320 240] [1280 720] [1920 1088]]]
+      (swap! n inc)
+      (agrees? (sps/encode {:profile-idc profile :level-idc level :width w :height h})
+               (str "encode " profile "/" level " " w "x" h)))
+    (is (= 90 @n))))
+
+;; ---------------------------------------------------------------------------
+;; 3. synthetic streams reaching paths the incumbent's tests never do
+
+(defn- pos-bits [r] (+ (* 8 @(:bytepos r)) @(:bitpos r)))
+(defn- written-bits [w] (+ (* 8 (count @(:out w))) @(:nbits w)))
+
+(defn- write-scaling-list!
+  "§7.3.2.1.1.1 scaling_list( ) encoder. `mode` :full writes `size` zero
+   deltas (nextScale never reaches 0, so the reader must consume all `size`
+   se(v) values); :early writes one delta of -8, driving nextScale to 0 at
+   j=0 so the reader must consume NOTHING further for this list. The two
+   modes are the two branches of the state machine that h264.syntax cannot
+   express and hands to h264.sps-table/scaling-list-escape."
+  [w size mode]
+  (case mode
+    :full  (dotimes [_ size] (eg/write-se! w 0))
+    :early (eg/write-se! w -8)))
+
+(defn- build-sps
+  "Write an SPS RBSP bit-by-bit from a §7.3.2.1.1 description. Returns
+   {:rbsp bytes :syntax-bits n} where n is the bit position immediately
+   after frame_cropping — i.e. exactly where the syntax table says the
+   structure this repo parses ends."
+  [{:keys [profile-idc level-idc sps-id
+           chroma-format-idc separate-colour-plane bit-depth-luma-minus8
+           bit-depth-chroma-minus8 scaling-matrix? scaling-modes
+           log2-max-frame-num-minus4 poc-type log2-max-poc-lsb-minus4
+           poc-cycle-offsets max-num-ref-frames width-mbs-minus1
+           height-map-units-minus1 frame-mbs-only? mb-adaptive?
+           crop]
+    :or {sps-id 0 chroma-format-idc 1 separate-colour-plane 0
+         bit-depth-luma-minus8 0 bit-depth-chroma-minus8 0
+         scaling-matrix? false scaling-modes []
+         log2-max-frame-num-minus4 0 poc-type 0 log2-max-poc-lsb-minus4 0
+         poc-cycle-offsets [] max-num-ref-frames 1
+         frame-mbs-only? true mb-adaptive? false crop nil}}]
+  (let [w (eg/writer)
+        high? (contains? #{100 110 122 244 44 83 86 118 128 138 139 134 135} profile-idc)]
+    (eg/write-bits! w 8 (bit-or (bit-shift-left 3 5) 7))     ; NAL header, type 7
+    (eg/write-bits! w 8 profile-idc)
+    (eg/write-bits! w 8 0)                                   ; constraint flags + reserved
+    (eg/write-bits! w 8 level-idc)
+    (eg/write-ue! w sps-id)
+    (when high?
+      (eg/write-ue! w chroma-format-idc)
+      (when (= 3 chroma-format-idc) (eg/write-bits! w 1 separate-colour-plane))
+      (eg/write-ue! w bit-depth-luma-minus8)
+      (eg/write-ue! w bit-depth-chroma-minus8)
+      (eg/write-bits! w 1 0)                                 ; qpprime_y_zero_transform_bypass_flag
+      (eg/write-flag! w scaling-matrix?)
+      (when scaling-matrix?
+        (let [n (if (not= 3 chroma-format-idc) 8 12)]
+          (dotimes [i n]
+            (let [mode (nth scaling-modes i nil)]
+              (if mode
+                (do (eg/write-bits! w 1 1)
+                    (write-scaling-list! w (if (< i 6) 16 64) mode))
+                (eg/write-bits! w 1 0)))))))
+    (eg/write-ue! w log2-max-frame-num-minus4)
+    (eg/write-ue! w poc-type)
+    (cond
+      (= 0 poc-type) (eg/write-ue! w log2-max-poc-lsb-minus4)
+      (= 1 poc-type) (do (eg/write-bits! w 1 1)              ; delta_pic_order_always_zero_flag
+                         (eg/write-se! w -3)                 ; offset_for_non_ref_pic
+                         (eg/write-se! w 5)                  ; offset_for_top_to_bottom_field
+                         (eg/write-ue! w (count poc-cycle-offsets))
+                         (doseq [o poc-cycle-offsets] (eg/write-se! w o)))
+      :else nil)
+    (eg/write-ue! w max-num-ref-frames)
+    (eg/write-bits! w 1 0)                                   ; gaps_in_frame_num_value_allowed_flag
+    (eg/write-ue! w width-mbs-minus1)
+    (eg/write-ue! w height-map-units-minus1)
+    (eg/write-flag! w frame-mbs-only?)
+    (when-not frame-mbs-only? (eg/write-flag! w mb-adaptive?))
+    (eg/write-bits! w 1 1)                                   ; direct_8x8_inference_flag
+    (if crop
+      (do (eg/write-bits! w 1 1)
+          (doseq [v crop] (eg/write-ue! w v)))
+      (eg/write-bits! w 1 0))
+    (let [mark (written-bits w)]
+      (eg/write-bits! w 1 0)                                 ; vui_parameters_present_flag (unread)
+      (eg/rbsp-trailing-bits! w)
+      {:rbsp (eg/bytes! w) :syntax-bits mark})))
+
+(defn- agrees-and-lands? [desc label]
+  (let [{:keys [rbsp syntax-bits]} (build-sps desc)
+        m (agrees? rbsp label)
+        r (eg/reader rbsp)]
+    (syntax/read-structure r table spst/escapes)
+    (is (= syntax-bits (pos-bits r))
+        (str label ": table-driven reader must stop at the exact bit the writer stopped at"))
+    m))
+
+(deftest equivalence-high-profile-with-scaling-lists
+  (testing "profile 100, all eight 4:2:0 scaling lists present, full-length"
+    (let [m (agrees-and-lands?
+             {:profile-idc 100 :level-idc 40 :chroma-format-idc 1
+              :scaling-matrix? true :scaling-modes (vec (repeat 8 :full))
+              :width-mbs-minus1 79 :height-map-units-minus1 44 :crop nil}
+             "high-profile 8x:full scaling lists")]
+      (is (= 100 (:profile-idc m)))
+      (is (= 1280 (:width m)))
+      (is (= 720 (:height m)))))
+  (testing "the nextScale-reaches-zero early-exit branch of scaling_list()"
+    (agrees-and-lands?
+     {:profile-idc 110 :level-idc 41 :chroma-format-idc 1
+      :scaling-matrix? true
+      :scaling-modes [:early :full :early nil nil :full nil :early]
+      :width-mbs-minus1 39 :height-map-units-minus1 29}
+     "high-profile mixed early/full/absent scaling lists"))
+  (testing "chroma_format_idc 3: separate_colour_plane_flag + twelve lists"
+    (let [m (agrees-and-lands?
+             {:profile-idc 244 :level-idc 51 :chroma-format-idc 3
+              :separate-colour-plane 1 :bit-depth-luma-minus8 2
+              :bit-depth-chroma-minus8 2
+              :scaling-matrix? true
+              :scaling-modes [:full :early :full :early :full :early
+                              :full :early nil :full :early nil]
+              :width-mbs-minus1 119 :height-map-units-minus1 67
+              :crop [0 0 0 4]}
+             "4:4:4 twelve scaling lists")]
+      (is (= 3 (:chroma-format-idc m))))))
+
+(deftest equivalence-pic-order-cnt-type-1-loop
+  (testing "num_ref_frames_in_pic_order_cnt_cycle loop, several lengths"
+    (doseq [offsets [[] [0] [-1 2] [3 -4 5 -6 7 -8 9 -10 11 -12 13]]]
+      (agrees-and-lands?
+       {:profile-idc 77 :level-idc 30 :poc-type 1 :poc-cycle-offsets offsets
+        :width-mbs-minus1 21 :height-map-units-minus1 17}
+       (str "poc_type 1, cycle length " (count offsets)))))
+  (testing "pic_order_cnt_type 2 reads no POC bits at all"
+    (let [m (agrees-and-lands?
+             {:profile-idc 66 :level-idc 30 :poc-type 2
+              :width-mbs-minus1 3 :height-map-units-minus1 2}
+             "poc_type 2")]
+      (is (= 2 (:pic-order-cnt-type m)))
+      (is (nil? (:log2-max-pic-order-cnt-lsb-minus4 m))))))
+
+(deftest equivalence-interlaced-and-cropping
+  (testing "frame_mbs_only_flag 0 pulls in mb_adaptive_frame_field_flag"
+    (doseq [ada? [true false]]
+      (let [m (agrees-and-lands?
+               {:profile-idc 77 :level-idc 40 :frame-mbs-only? false
+                :mb-adaptive? ada?
+                :width-mbs-minus1 79 :height-map-units-minus1 22}
+               (str "interlaced, mb_adaptive=" ada?))]
+        (is (false? (:frame-mbs-only? m))))))
+  (testing "frame cropping in every direction, on both chroma paths"
+    (doseq [crop [[0 0 0 0] [1 0 0 0] [0 2 0 0] [0 0 1 0] [0 0 0 3] [2 2 1 1]]
+            prof [66 100]]
+      (agrees-and-lands?
+       {:profile-idc prof :level-idc 30 :chroma-format-idc 1
+        :width-mbs-minus1 11 :height-map-units-minus1 8 :crop crop}
+       (str "crop " crop " profile " prof)))))
+
+;; ---------------------------------------------------------------------------
+;; the format's stated limits are ENFORCED, not merely documented
+
+(deftest ae-descriptor-is-refused-not-faked
+  (testing "ae(v) has no (name, descriptor, condition) reading — the table says so and the reader throws"
+    (let [t {:syntax/rows [[:u 8 :header]
+                           [:unsupported :ae :mb_type]]}]
+      (is (thrown-with-msg?
+           js/Error #"cannot express"
+           (syntax/read-bytes [0x67 0x42 0x00] t))))))
+
+(deftest out-of-order-reference-throws-rather-than-seeing-nil
+  (testing "a condition on an element not yet read must fail loudly"
+    (let [t {:syntax/rows [[:when [:= [:var :never_read] 1] [[:u 1 :x]]]]}]
+      (is (thrown-with-msg?
+           js/Error #"unread syntax element"
+           (syntax/read-bytes [0xff] t))))))
+
+(deftest presence-conditions-must-be-boolean
+  (testing "H.264 flags are 0/1 ints; relying on truthiness is a table bug and is rejected"
+    (let [t {:syntax/rows [[:u 1 :flag]
+                           [:when [:var :flag] [[:u 1 :y]]]]}]
+      (is (thrown-with-msg?
+           js/Error #"did not evaluate to a boolean"
+           (syntax/read-bytes [0x00] t))))))
+
+(deftest missing-escape-handler-throws
+  (testing "a table naming an escape the caller did not supply must not silently read zero bits"
+    (let [t {:syntax/rows [[:escape :nobody/home]]}]
+      (is (thrown-with-msg?
+           js/Error #"no handler for escape"
+           (syntax/read-bytes [0x00] t))))))
+
+(deftest cross-structure-widths-resolve-from-seeded-context
+  (testing "§7.3.3 slice_header reads frame_num as u(log2_max_frame_num_minus4 + 4),
+            a width that lives in the referenced SPS — the reader takes it as context"
+    (let [t {:syntax/rows [[:u [:+ [:var :log2_max_frame_num_minus4] 4] :frame_num]]}]
+      (doseq [[l2 byte expected]
+              [[0 2r10110000 2r1011]           ; 4 bits
+               [4 2r10110011 2r10110011]]]     ; 8 bits
+        (let [r (eg/reader [byte 0x00])
+              [m _] (syntax/read-structure r t {} {:log2_max_frame_num_minus4 l2})]
+          (is (= expected (:frame_num m)))
+          (is (= (+ l2 4) (pos-bits r)))))))
+  (testing "without the context the same table refuses rather than reading a wrong width"
+    (let [t {:syntax/rows [[:u [:+ [:var :log2_max_frame_num_minus4] 4] :frame_num]]}]
+      (is (thrown-with-msg? js/Error #"unread syntax element"
+                            (syntax/read-bytes [0xff 0xff] t))))))

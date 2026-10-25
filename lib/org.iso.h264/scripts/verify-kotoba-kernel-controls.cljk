@@ -1,0 +1,123 @@
+#!/usr/bin/env kbb
+(ns verify-kotoba-kernel-controls
+  "Negative controls for `verify-kotoba-kernel.cljs`.
+
+  A comparison that cannot fail is decoration. This script breaks the guest
+  kernels one edit at a time, in a throwaway copy of the tree, and requires
+  the verifier to REJECT each broken copy — and to reject it for the stated
+  reason, by naming which vector group must show the failure. An edit that the
+  verifier still passes is reported as a hole in the corpus, not as a success.
+
+  Each control is a single textual substitution, so the thing that is broken
+  and the thing that is reported can be compared directly. Three of the four
+  are the specific ways this kernel is easiest to get subtly wrong: a
+  truncating division where H.264 wants an arithmetic shift, a wrong rounding
+  bias, and a dropped `>>1` inside the butterfly.
+
+  usage: kbb --backend sci --classpath scripts scripts/verify-kotoba-kernel-controls.cljk
+             --amu <amu-checkout>
+
+  exit 0  every control was detected, in the expected vector group
+  exit 1  a control went undetected, or was detected in the wrong group
+  exit 3  UNVERIFIED -- the controls could not be run"
+  (:require [kotoba.lang.text :as str]
+            ["node:child_process" :as child]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def argv (vec (drop 2 js/process.argv)))
+(defn opt [flag] (second (drop-while #(not= flag %) argv)))
+(def amu-root (or (opt "--amu") (aget js/process.env "AMU_ROOT")))
+(def repo (.resolve path "."))
+
+(defn unverified! [m] (println (str "UNVERIFIED\t" m)) (js/process.exit 3))
+(when-not (and amu-root (fs/existsSync (.join path amu-root "bin" "amu")))
+  (unverified! (str "no amu checkout at --amu " (pr-str amu-root))))
+
+(def controls
+  [{:id :truncating-division-instead-of-arithmetic-shift
+    :file "src/h264/transform.kotoba"
+    :from "(let [q (quot v 64)\n        r (- v (* 64 q))]\n    (if (< r 0) (- q 1) q))"
+    :to "(quot v 64)"
+    :expect :idct
+    :why "H.264's >>6 floors; `quot` truncates toward zero. Only blocks whose
+          residual goes negative can tell the two apart, which is why the
+          corpus is required to contain them."}
+   {:id :wrong-dc-rounding-bias
+    :file "src/h264/transform.kotoba"
+    :from "(idct4-1d (+ x0 32) x1 x2 x3 k)"
+    :to "(idct4-1d (+ x0 31) x1 x2 x3 k)"
+    :expect :idct
+    :why "the §8.5.12.2 rounding constant, off by one"}
+   {:id :dropped-butterfly-halving
+    :file "src/h264/transform.kotoba"
+    :from "z2 (- (floor-div-2 x1) x3)"
+    :to "z2 (- x1 x3)"
+    :expect :idct
+    :why "the >>1 inside the 1-D butterfly"}
+   {:id :wrong-normadjust-entry
+    :file "src/h264/quant.kotoba"
+    :from "(= m 3) (cond (= group 0) 14 (= group 1) 18 :else 23)"
+    :to "(= m 3) (cond (= group 0) 14 (= group 1) 17 :else 23)"
+    :expect :ac-qmul
+    :why "one digit of the normAdjust4x4 table"}])
+
+(defn- copy-tree! [dest]
+  (fs/mkdirSync dest #js {:recursive true})
+  (doseq [entry ["src" "resources" "scripts"]]
+    (fs/cpSync (.join path repo entry) (.join path dest entry) #js {:recursive true})))
+
+(def results
+  (doall
+   (for [{:keys [id file from to expect why]} controls]
+     (let [dir (.mkdtempSync fs (.join path (.tmpdir os) (str "h264-control-")))]
+       (try
+         (copy-tree! dir)
+         (let [target (.join path dir file)
+               source (fs/readFileSync target "utf8")]
+           (if-not (str/includes? source from)
+             {:id id :state :unverified
+              :why (str "control text not found in " file
+                        "; the control was not applied, so nothing was tested")}
+             (do
+               (fs/writeFileSync target (str/replace source from to))
+               (let [r (.spawnSync child "nbb"
+                                   #js ["--classpath" (.join path dir "scripts")
+                                        (.join path dir "scripts" "verify-kotoba-kernel.cljk")
+                                        "--amu" amu-root "--skip-reference"]
+                                   #js {:cwd dir :encoding "utf8" :maxBuffer 16777216})
+                     out (str (.-stdout r) (.-stderr r))
+                     status (if (nil? (.-status r)) 70 (.-status r))]
+                 (cond
+                   (zero? status)
+                   {:id id :state :undetected :why why :output out}
+                   (not= 1 status)
+                   {:id id :state :unverified
+                    :why (str "the broken copy exited " status
+                              ", which is not the mismatch code; the control may have"
+                              " been rejected for some other reason") :output out}
+                   ;; A control is only met if the failure is reported in the
+                   ;; group the edit is in. A run that goes red for a different
+                   ;; reason has not demonstrated anything about this edit.
+                   ;; The verifier prints a FAILING-GROUPS line carrying every
+                   ;; failing group, which is what this reads -- the three
+                   ;; sample failures under it are not the whole answer.
+                   (not (some #(and (str/includes? % "FAILING-GROUPS")
+                                    (str/includes? % (name expect)))
+                              (str/split-lines out)))
+                   {:id id :state :wrong-reason
+                    :why (str "expected a failure in " expect) :output out}
+                   :else {:id id :state :detected})))))
+         (finally (fs/rmSync dir #js {:recursive true :force true})))))))
+
+(doseq [{:keys [id state why]} results]
+  (println (str "CONTROL\t" id "\t" (str/upper (name state))
+                (when why (str "\t" why)))))
+(println (str "CONTROLS\tRUN\t" (count results)
+              "\tDETECTED\t" (count (filter #(= :detected (:state %)) results))))
+(js/process.exit
+ (cond (zero? (count results)) 3
+       (some #{:unverified} (map :state results)) 3
+       (every? #{:detected} (map :state results)) 0
+       :else 1))

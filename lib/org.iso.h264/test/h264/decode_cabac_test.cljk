@@ -1,0 +1,179 @@
+(ns h264.decode-cabac-test
+  "Golden-vector tests for CABAC (main/high-profile entropy coding) decode
+   (`h264.cabac`, wired into `h264.decode` — ADR-2607122000 CABAC increment).
+
+   **Scope validated here: I-slice / Intra_16x16** (see `h264.cabac`'s
+   namespace docstring for the full scope statement — CABAC + P-slice/
+   inter, CABAC + I_NxN/I_PCM, and CABAC encode are all out of scope).
+   Three fixtures are REAL libx264 (Main profile, CABAC — verified
+   via `entropy_coding_mode_flag=1` in the actual PPS bits, not just the
+   SPS `profile_idc`) Annex B elementary streams, generated exactly like
+   this repo's own CAVLC counterparts (`flat16-dc-only.h264`/
+   `gradient16-ac.h264` in `decode_test.clj`) but with `-profile:v main`
+   (ffmpeg) / `--profile main` (x264) instead of baseline:
+
+   `flat16-dc-only-cabac.h264`:
+     ffmpeg -f lavfi -i color=c=0x808080:s=16x16 -frames:v 1 -update 1 test16.png
+     ffmpeg -i test16.png -c:v libx264 -profile:v main \\
+       -x264opts keyint=1:qp=26 -frames:v 1 -pix_fmt yuv420p flat16-dc-only-cabac.h264
+   A single flat 16x16 macroblock, DC prediction, `CodedBlockPatternLuma=0`
+   (no AC residual — only the luma DC/Hadamard coefficient, itself zero for
+   flat content, is coded). Exercises: the CABAC arithmetic decoding engine
+   init/byte-alignment (`h264.cabac/byte-align!`/`init-engine!`), context
+   model init from SliceQPY, `mb_type` (I-slice) binarization/context
+   (unavailable-neighbor case), `intra_chroma_pred_mode`, `mb_qp_delta`, and
+   the `coded_block_flag`=0 (empty-block) fast path for the DC block AND all
+   16 AC blocks (since `CodedBlockPatternLuma=0` means the AC blocks aren't
+   read at all, matching the CAVLC path's own `cbp-luma` gating) plus both
+   chroma DC blocks.
+
+   `gradient16-ac-cabac.h264`:
+     ffmpeg -f lavfi -i \"color=size=16x16:c=black\" \\
+       -vf \"geq=lum='100+3*X':cb=128:cr=128\" -frames:v 1 -update 1 softgrad16b.png
+     ffmpeg -i softgrad16b.png -pix_fmt yuv420p soft16b.y4m
+     x264 --input-res 16x16 --fps 25 -o gradient16-ac-cabac.h264 --qp 33 \\
+       --keyint 1 --partitions none --no-deblock --profile main soft16b.y4m
+   A single 16x16 macroblock with a real horizontal luma gradient, forced to
+   Intra_16x16 (`--partitions none`) at a QP where libx264 codes real AC
+   residual (`CodedBlockPatternLuma!=0`, real ffmpeg log:
+   `coded y,uvDC,uvAC intra: 100.0% 0.0% 0.0%`). Exercises: real
+   `coded_block_flag`=1 decode, `significant_coeff_flag`/
+   `last_significant_coeff_flag` map decode, and `coeff_abs_level_minus1`
+   (+bypass sign bit) for a genuinely nonzero AC coefficient — i.e. the full
+   CABAC residual decode path (`h264.cabac/residual-block!`), not just the
+   empty-block fast path the flat fixture exercises.
+
+   `--no-deblock` (`disable_deblocking_filter_idc=1`, spec-mandated,
+   properly signaled in the slice header) is REQUIRED for this fixture: an
+   earlier attempt without it decoded successfully but was off by ±1 at
+   every internal 4x4 transform-block boundary — a real libx264 in-loop
+   deblocking-filter effect this repo's decoder (CABAC OR CAVLC alike) does
+   not implement, same limitation the existing CAVLC
+   `horizontal-multimb64.h264` fixture documents (see `decode_test.clj`).
+   This was root-caused during this increment's own development by manually
+   verifying the pre-deblock reconstruction (from this decoder's own decoded
+   coefficients, fed back through the already-tested `h264.transform`
+   pipeline) matched ffmpeg's OWN output only once `--no-deblock` was added
+   — i.e. confirmed to be a deblocking difference, not a CABAC decode bug.
+
+   **Multi-macroblock CABAC pictures, and 4x4 residual blocks with MORE
+   THAN ONE significant coefficient, are now ALSO confirmed bit-exact**
+   (`multimb64-cabac-golden-vector` below) — this was a real, now
+   root-caused and fixed bug (see `h264.cabac/decode-exp-golomb-bypass!`'s
+   own docstring for the full root-cause trail): the EG0 bypass-suffix
+   accumulator was silently discarding the suffix value whenever a
+   coefficient's magnitude was large enough to saturate
+   `decode-ueg-level!`'s truncated-unary bank (cMax=13, i.e.
+   `coeff_abs_level_minus1 >= 14`) — invisible on the two single-MB
+   fixtures above (neither has a coefficient anywhere near that large) but
+   reliably wrong on real complex multi-macroblock content. Root-caused via
+   an independent from-scratch Python re-implementation of the arithmetic
+   engine + context-init tables (cross-checked programmatically against
+   Cisco OpenH264's own `common_tables.cpp`/`parse_mb_syn_cabac.cpp` —
+   zero diffs across all 460 context-init entries and every block-category
+   constant), which reproduced the IDENTICAL wrong bin sequence and
+   coefficient values on the new multi-macroblock fixture — confirming the
+   entropy decode's CONTROL FLOW (which bins, in what order, against which
+   contexts) was already correct, narrowing the bug to the one arithmetic
+   combination step that was actually wrong."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [h264.decode :as decode]))
+
+(defn- rd [p] (mapv #(bit-and (int %) 0xff)
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "lib/org.iso.h264/resources/" p))))))
+
+(deftest flat16-dc-only-cabac-golden-vector
+  (let [bytes (rd "h264/fixtures/flat16-dc-only-cabac.h264")
+        result (decode/decode-idr-frame bytes)
+        ref (rd "h264/fixtures/flat16-dc-only-cabac.ref.yuv")
+        luma-ref (vec (take 256 ref))
+        cb-ref (vec (subvec (vec ref) 256 320))
+        cr-ref (vec (subvec (vec ref) 320 384))]
+    (testing "dimensions from SPS"
+      (is (= 16 (:width result)))
+      (is (= 16 (:height result))))
+    (testing "reconstructed luma plane is bit-exact vs. real ffmpeg decode (real Main-profile CABAC stream)"
+      (is (= luma-ref (:luma result))))
+    (testing "reconstructed Cb/Cr planes are bit-exact vs. real ffmpeg decode"
+      (is (= cb-ref (:cb result)))
+      (is (= cr-ref (:cr result))))
+    (testing "the flat source produces a uniform reconstructed value (DC correction applied, same as the CAVLC counterpart)"
+      (is (= 1 (count (distinct (:luma result))))))))
+
+(deftest gradient16-ac-cabac-golden-vector
+  (let [bytes (rd "h264/fixtures/gradient16-ac-cabac.h264")
+        result (decode/decode-idr-frame bytes)
+        ref (rd "h264/fixtures/gradient16-ac-cabac.ref.yuv")
+        luma-ref (vec (take 256 ref))
+        cb-ref (vec (subvec (vec ref) 256 320))
+        cr-ref (vec (subvec (vec ref) 320 384))]
+    (testing "dimensions from SPS"
+      (is (= 16 (:width result)))
+      (is (= 16 (:height result))))
+    (testing "reconstructed luma plane is bit-exact vs. real ffmpeg decode (real CABAC significant_coeff_flag/coeff_abs_level_minus1 decode)"
+      (is (= luma-ref (:luma result))))
+    (testing "reconstructed Cb/Cr planes are bit-exact vs. real ffmpeg decode"
+      (is (= cb-ref (:cb result)))
+      (is (= cr-ref (:cr result))))
+    (testing "the gradient is non-uniform (sanity: AC residual actually changed pixels, this isn't accidentally the DC-only path)"
+      (is (> (count (distinct (:luma result))) 1)))))
+
+(deftest multimb64-cabac-golden-vector
+  (let [bytes (rd "h264/fixtures/multimb64-cabac.h264")]
+    (testing "multimb64-cabac.h264 — 64x64 (4x4=16 macroblocks), REAL libx264
+     (Main profile, CABAC) Annex B stream, generated:
+       ffmpeg -f lavfi -i \"nullsrc=size=64x64,geq=lum='128+40*sin(2*PI*Y/16)+25*sin(2*PI*X/6)':cb=128:cr=128\" \\
+         -frames:v 1 -update 1 multimb64-cabac.png
+       ffmpeg -i multimb64-cabac.png -pix_fmt yuv420p multimb64-cabac.y4m
+       x264 --input-res 64x64 --fps 25 -o multimb64-cabac.h264 --qp 20 \\
+         --keyint 1 --preset ultrafast --no-deblock --profile main \\
+         --partitions none --cabac multimb64-cabac.y4m
+     Two-frequency luma texture (a slow sine along Y combined with a much
+     faster sine along X) deliberately chosen so libx264 (i16 v,h,dc,p:
+     19%/75%/6%/0% — no Plane, this decoder's own out-of-scope Intra_16x16
+     mode) picks real DC/Horizontal/Vertical prediction with GENUINE,
+     substantial residual energy per macroblock — unlike
+     `gradient16-ac-cabac.h264` (single MB, exactly ONE significant AC
+     coefficient), several 4x4 blocks here have 3+ significant coefficients
+     (`coded_block_flag`=1 blocks whose `coeff_abs_level_minus1` decode
+     visits the `c1`/`c2` adaptive-context state machine repeatedly per
+     block AND, critically, reaches large enough per-coefficient magnitude
+     to exercise the EG0 bypass-suffix continuation in
+     `h264.cabac/decode-ueg-level!`/`decode-exp-golomb-bypass!` — exactly
+     the previously-NOT-root-caused multi-macroblock limitation this
+     namespace's own docstring and README documented).
+
+     THIS WAS THE BUG (see `h264.cabac/decode-exp-golomb-bypass!`'s own
+     docstring for the full root-cause trail): the EG0 bypass suffix
+     accumulator was reusing the prefix unary run's OWN accumulator (via
+     `bit-or`) instead of a separate one added at the end — a
+     `count`-length unary prefix always sums to exactly `2^count - 1` (ALL
+     `count` low bits already 1), so OR-ing `count` MORE suffix bits into
+     those SAME bit positions is a silent no-op REGARDLESS of the actual
+     suffix value, truncating every large `coeff_abs_level_minus1` to the
+     truncated-unary prefix's own value. Invisible on both single-MB
+     fixtures above (neither has a coefficient large enough to reach the
+     EG0 path at all); reliably wrong here (root-caused via an independent
+     from-scratch Python re-implementation of the arithmetic engine +
+     context-init tables, cross-checked bit-for-bit against Cisco
+     OpenH264's own `common_tables.cpp`/`parse_mb_syn_cabac.cpp`, which
+     reproduced the identical wrong bin sequence — confirming the entropy
+     decode CONTROL FLOW was already correct and narrowing the bug to this
+     one arithmetic step)."
+      (let [result (decode/decode-idr-frame bytes)
+            ref (rd "h264/fixtures/multimb64-cabac.ref.yuv")
+            luma-ref (vec (take 4096 ref))
+            cb-ref (vec (subvec (vec ref) 4096 5120))
+            cr-ref (vec (subvec (vec ref) 5120 6144))]
+        (testing "dimensions from SPS"
+          (is (= 64 (:width result)))
+          (is (= 64 (:height result))))
+        (testing "reconstructed luma plane is bit-exact vs. real ffmpeg decode (real multi-macroblock CABAC, including 4x4 blocks with 3+ significant coefficients and large-magnitude EG0-bypass-suffix levels)"
+          (is (= luma-ref (:luma result))))
+        (testing "reconstructed Cb/Cr planes are bit-exact vs. real ffmpeg decode"
+          (is (= cb-ref (:cb result)))
+          (is (= cr-ref (:cr result))))
+        (testing "a real encoder actually selected DC/Horizontal/Vertical prediction across multiple macroblocks (sanity: this isn't accidentally a single degenerate mode)"
+          (is (= [2 1 1 1 0 1 1 1 0 1 1 1 0 1 1 1] (:mb-pred-modes result))))))))

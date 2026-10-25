@@ -1,0 +1,391 @@
+;; diff -- POSIX diff (IEEE Std 1003.1) as a Kotoba command: the normal
+;; output format and -q.
+;;
+;;   diff FILE1 FILE2       hunks as `XaY`, `XdY`, `XcY` with `<` / `>` lines
+;;   diff -q FILE1 FILE2    `Files A and B differ`, or nothing
+;;
+;; Exit 0 when the files are the same, 1 when they differ, 2 on trouble.
+;;
+;; ## Measured, 2026-09-16
+;;
+;; 888 invocations in 1,268,018 agent Bash calls (superproject
+;; ADR-2609161710): plain `diff A B` about 450, `-q` 127, `-U`/`-u` 68, and
+;; 316 with process substitution (`diff <(a) <(b)`, whose operands are
+;; /dev/fd paths and so outside a packaged scope -- see the README). Unified
+;; output prints each file's mtime in the header, which needs the time zone
+;; database this has no capability for, so `-u` is refused, not half-done.
+;;
+;; ## The algorithm
+;;
+;; Myers' O(ND) shortest edit script over LINES. Both files are read whole
+;; and joined into ONE text (a newline inserted between them when FILE1 does
+;; not end in one), so every line is an offset into a single string and the
+;; host's `string-compare-lines` (context ABI v8) compares two lines by
+;; their offsets without minting a view. Line starts live in one vector S:
+;; S[0] = n, S[1] = m, S[2] = flags (bit 0: FILE1's last line had no
+;; newline, bit 1: FILE2's, bit 2: -q), then the n + 1 starts of FILE1 and
+;; the m + 1 starts of FILE2.
+;;
+;; The furthest-reaching row V of each step d is written into a fresh row
+;; while the previous row is read: `vector-assoc!` wants a linear handle and
+;; a vector that is read and then written on one path is refused, so two
+;; rows P and C alternate (C becomes the next step's P) and every row is
+;; also copied into the trace T, write-only, at offset 1 + d^2 (row d holds
+;; 2d + 1 entries, so the rows pack exactly). The back-trace reads T only
+;; and marks each deleted FILE1 line and inserted FILE2 line in M; the
+;; output walk reads M and S and prints hunks the way /usr/bin/diff does:
+;; between two common lines every marked FILE1 line is `<` and every marked
+;; FILE2 line is `>`.
+;;
+;; A line "equals" another when the bytes match AND both end the same way:
+;; `a` and `a\n` differ, and the one without the newline gets
+;; `\ No newline at end of file` after it. Measured against /usr/bin/diff.
+;;
+;; ## Budget
+;;
+;; T holds (D + 1)^2 words for D differences. It is allocated at
+;; min((n + m + 1)^2, 2^22) words; when a step would not fit, this
+;; refuses with `diff: too many differences for this build` and exit 2 --
+;; a named divergence, rather than a trap or a wrong answer.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
+(ns diff.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn nl [] :string "\n")
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10)) (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn argc-from [k :i64 total :string] :i64
+  (if (string=? (decimal-of k) total) k (argc-from (+ k 1) total)))
+
+(defn argc [] :i64 (argc-from 0 (arg "")))
+
+;; --- lines -----------------------------------------------------------------
+
+;; Newlines in S from FROM.
+(defn- count-newlines [s :string from :i64 acc :i64] :i64
+  (let [i (string-find-byte s 10 from)]
+    (if (< i 0) acc (count-newlines s (+ i 1) (+ acc 1)))))
+
+;; Does S end in a newline? (An empty S does not.)
+(defn- ends-nl? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      false
+      (let [last-nl (string-find-byte s 10 (- n 1))]
+        ;; n-1 is a boundary when the last byte is ASCII; when it is not,
+        ;; find-byte from a non-boundary would trap, so ask from the last
+        ;; newline instead: the text ends in one iff a newline sits at n-1.
+        (= last-nl (- n 1))))))
+
+;; The number of lines in S: newlines, plus one for an unterminated tail.
+(defn- line-count [s :string] :i64
+  (let [nls (count-newlines s 0 0)]
+    (if (= (string-byte-length s) 0)
+      0
+      (if (ends-nl? s) nls (+ nls 1)))))
+
+;; Write the starts of the lines of TEXT[FROM, END) into V at K.., then END
+;; itself as the sentinel. Returns V.
+(defn- fill-starts [text :string v :vector-i64 k :i64 from :i64 end :i64] :vector-i64
+  (if (>= from end)
+    (vector-assoc! v k end)
+    (let [i (string-find-byte text 10 from)
+          next (if (< i 0) end (if (>= i end) end (+ i 1)))]
+      (fill-starts text (vector-assoc! v k from) (+ k 1) next end))))
+
+;; --- equality --------------------------------------------------------------
+
+(defn- a-start [s :vector-i64 x :i64] :i64 (vector-at s (+ 3 x)))
+(defn- b-start [s :vector-i64 y :i64] :i64 (vector-at s (+ (+ 4 (vector-at s 0)) y)))
+
+;; Is FILE1 line X the same as FILE2 line Y? Bytes, and the same ending.
+(defn- same-line? [text :string s :vector-i64 x :i64 y :i64] :bool
+  (if (= 0 (string-compare-lines text (a-start s x) text (b-start s y)))
+    (let [flags (vector-at s 2)
+          a-open (if (= 1 (bit-and flags 1)) (= x (- (vector-at s 0) 1)) false)
+          b-open (if (= 2 (bit-and flags 2)) (= y (- (vector-at s 1) 1)) false)]
+      (= a-open b-open))
+    false))
+
+;; Follow the diagonal from (X, Y) while the lines match; answers the new X.
+(defn- snake [text :string s :vector-i64 x :i64 y :i64] :i64
+  (if (>= x (vector-at s 0))
+    x
+    (if (>= y (vector-at s 1))
+      x
+      (if (same-line? text s x y)
+        (snake text s (+ x 1) (+ y 1))
+        x))))
+
+;; --- forward pass ------------------------------------------------------------
+;;
+;; Rows are indexed by k + OFF with OFF = n + m + 4: k runs over
+;; [-(n + m), n + m] and the first three slots are metadata (the first cut
+;; used n + m + 1 and a one-line file's row landed on its own capacity slot
+;; -- SIGILL, measured 2026-09-16). Slot 0 of a row holds
+;; the step d it belongs to plus 1 (so the NEXT step reads its own d there),
+;; slot 1 whether (n, m) was reached, slot 2 the trace's capacity. A row is
+;; only ever READ as P and only ever WRITTEN as C: a handle that is read and
+;; written on one path is refused by the linearity analysis, which is also
+;; why `done` rides in the k parameter (k + OFF, doubled, plus the flag)
+;; rather than in a slot read back.
+
+(defn- off [s :vector-i64] :i64 (+ (+ (vector-at s 0) (vector-at s 1)) 4))
+
+;; One k of row d, k from -d to d by 2. KK packs (k + OFF) * 2 + done.
+(defn- row [text :string s :vector-i64 p :vector-i64 c :vector-i64 kk :i64] :vector-i64
+  (let [d (vector-at p 0)
+        o (off s)
+        k (- (quot kk 2) o)
+        done (- kk (* 2 (quot kk 2)))]
+    (if (> k d)
+      (vector-assoc! (vector-assoc! (vector-assoc! c 0 (+ d 1)) 1 done) 2 (vector-at p 2))
+      (let [down? (if (= k (- 0 d))
+                    true
+                    (if (= k d)
+                      false
+                      (< (vector-at p (+ (- k 1) o)) (vector-at p (+ (+ k 1) o)))))
+            x0 (if down? (vector-at p (+ (+ k 1) o)) (+ (vector-at p (+ (- k 1) o)) 1))
+            x (snake text s x0 (- x0 k))
+            y (- x k)
+            done? (if (>= x (vector-at s 0)) (>= y (vector-at s 1)) false)]
+        (row text s p (vector-assoc! c (+ k o) x)
+             (+ (* 2 (+ (+ k 2) o)) (if done? 1 done)))))))
+
+;; Copy row d of C (entries k = -d..d) into T at 1 + d^2 + (k + d).
+(defn- copy-row [c :vector-i64 t :vector-i64 o :i64 d :i64 k :i64] :vector-i64
+  (if (> k d)
+    t
+    (copy-row c (vector-assoc! t (+ (+ 1 (* d d)) (+ k d)) (vector-at c (+ k o))) o d (+ k 2))))
+
+;; Steps until (n, m) is reached. Answers T with T[0] = D, or a T whose
+;; T[0] is -1 when the trace would not fit (its capacity rides in slot 2 of
+;; the rows, since reading T's own count would be a read before a write).
+(defn- forward [text :string s :vector-i64 p :vector-i64 c :vector-i64 t :vector-i64] :vector-i64
+  (let [d (vector-at p 0)]
+    (if (> (+ (+ 2 (* d d)) (* 2 d)) (vector-at p 2))
+      (vector-assoc! t 0 -1)
+      (let [c2 (row text s p c (* 2 (- (off s) d)))]
+        (if (= 1 (vector-at c2 1))
+          (vector-assoc! (copy-row c2 t (off s) d (- 0 d)) 0 d)
+          ;; C becomes the next P, and the old P -- read here, never
+          ;; written -- becomes the next C, which `row` overwrites in full.
+          (forward text s c2 p (copy-row c2 t (off s) d (- 0 d))))))))
+
+;; --- back-trace ----------------------------------------------------------------
+;;
+;; From (n, m) at step D back to (0, 0), marking each deleted FILE1 line at
+;; M[x] and each inserted FILE2 line at M[n + y]. XY packs x and y.
+
+(defn- t-at [t :vector-i64 d :i64 k :i64] :i64
+  (vector-at t (+ (+ 1 (* d d)) (+ k d))))
+
+(defn- back [t :vector-i64 s :vector-i64 m :vector-i64 xy :i64 d :i64] :vector-i64
+  (let [x (quot xy 4294967296)
+        y (- xy (* 4294967296 (quot xy 4294967296)))]
+    (if (= d 0)
+      m
+      (let [k (- x y)
+            pd (- d 1)
+            down? (if (= k (- 0 d))
+                    true
+                    (if (= k d)
+                      false
+                      (< (t-at t pd (- k 1)) (t-at t pd (+ k 1)))))
+            pk (if down? (+ k 1) (- k 1))
+            px (t-at t pd pk)
+            py (- px pk)]
+        ;; The diagonal from the edit to (x, y) is common lines; the edit
+        ;; itself is one line: an insertion of FILE2 line py (down) or a
+        ;; deletion of FILE1 line px (right). Then continue from (px, py)
+        ;; at step d - 1.
+        (back t s
+              (if down?
+                (vector-assoc! m (+ (vector-at s 0) py) 1)
+                (vector-assoc! m px 1))
+              (+ (* px 4294967296) py) pd)))))
+
+;; --- output --------------------------------------------------------------------
+
+(defn- range-text [lo :i64 hi :i64] :string
+  (if (= lo hi) (decimal-of lo) (string-concat (decimal-of lo) (string-concat "," (decimal-of hi)))))
+
+;; Line X of FILE1 (SIDE 0) or Y of FILE2 (SIDE 1), without its newline.
+(defn- line-text [text :string s :vector-i64 side :i64 i :i64] :string
+  (let [start (if (= side 0) (a-start s i) (b-start s i))
+        next (if (= side 0) (a-start s (+ i 1)) (b-start s (+ i 1)))
+        nl-at (string-find-byte text 10 start)
+        end (if (< nl-at 0) next (if (>= nl-at next) next nl-at))]
+    (string-substring text start end)))
+
+(defn- open-line? [s :vector-i64 side :i64 i :i64] :bool
+  (let [flags (vector-at s 2)]
+    (if (= side 0)
+      (if (= 1 (bit-and flags 1)) (= i (- (vector-at s 0) 1)) false)
+      (if (= 2 (bit-and flags 2)) (= i (- (vector-at s 1) 1)) false))))
+
+(defn- emit-lines [text :string s :vector-i64 side :i64 i :i64 end :i64] :i64
+  (if (>= i end)
+    0
+    (do (emit (if (= side 0) "< " "> "))
+        (emit (line-text text s side i))
+        (emit (nl))
+        (if (open-line? s side i)
+          (do (emit "\\ No newline at end of file") (emit (nl)) 0)
+          0)
+        (emit-lines text s side (+ i 1) end))))
+
+(defn- deleted? [m :vector-i64 x :i64] :bool (= 1 (vector-at m x)))
+(defn- inserted? [m :vector-i64 s :vector-i64 y :i64] :bool (= 1 (vector-at m (+ (vector-at s 0) y))))
+
+(defn- run-end-a [m :vector-i64 s :vector-i64 x :i64] :i64
+  (if (>= x (vector-at s 0)) x (if (deleted? m x) (run-end-a m s (+ x 1)) x)))
+(defn- run-end-b [m :vector-i64 s :vector-i64 y :i64] :i64
+  (if (>= y (vector-at s 1)) y (if (inserted? m s y) (run-end-b m s (+ y 1)) y)))
+
+;; The hunk beginning at (X, Y): FILE1 lines [x, x2) deleted, FILE2 lines
+;; [y, y2) inserted. Line numbers are 1-based; `a` names the FILE1 line
+;; AFTER which, `d` the FILE2 line after which. Answers x2 and y2 packed.
+(defn- hunk [text :string s :vector-i64 m :vector-i64 x :i64 y :i64] :i64
+  (let [x2 (run-end-a m s x)
+        y2 (run-end-b m s y)]
+    (do
+      (if (= y2 y)
+        (do (emit (range-text (+ x 1) x2)) (emit "d") (emit (decimal-of y)) (emit (nl))
+            (emit-lines text s 0 x x2))
+        (if (= x2 x)
+          (do (emit (decimal-of x)) (emit "a") (emit (range-text (+ y 1) y2)) (emit (nl))
+              (emit-lines text s 1 y y2))
+          (do (emit (range-text (+ x 1) x2)) (emit "c") (emit (range-text (+ y 1) y2)) (emit (nl))
+              (emit-lines text s 0 x x2)
+              (emit "---") (emit (nl))
+              (emit-lines text s 1 y y2))))
+      (+ (* x2 4294967296) y2))))
+
+;; Walk both files, printing each hunk. Answers 1 when any was printed.
+(defn- walk [text :string s :vector-i64 m :vector-i64 x :i64 y :i64] :i64
+  (let [n (vector-at s 0)
+        mm (vector-at s 1)]
+    (if (>= x n)
+      (if (>= y mm)
+        0
+        (let [p (hunk text s m x y)] (do (walk text s m (quot p 4294967296) (- p (* 4294967296 (quot p 4294967296)))) 1)))
+      (if (>= y mm)
+        (let [p (hunk text s m x y)] (do (walk text s m (quot p 4294967296) (- p (* 4294967296 (quot p 4294967296)))) 1))
+        (if (if (deleted? m x) true (inserted? m s y))
+          (let [p (hunk text s m x y)] (do (walk text s m (quot p 4294967296) (- p (* 4294967296 (quot p 4294967296)))) 1))
+          (walk text s m (+ x 1) (+ y 1)))))))
+
+;; --- the run -------------------------------------------------------------------
+
+;; The trace is capped at 2^22 words (D up to 2,047): the first cut asked
+;; for the whole item budget and an identical pair of 3,000-line files
+;; trapped on the allocation.
+(defn- fits [n :i64] :i64
+  (if (> n 4194304) 4194304 n))
+
+;; Fill S: sizes, flags, starts of both files inside TEXT (FILE2 begins at
+;; SPLIT).
+(defn- build-s [text :string n :i64 m :i64 flags :i64 split :i64] :vector-i64
+  (let [v (vector-assoc! (vector-assoc! (vector-assoc! (vector-alloc (+ (+ n m) 5)) 0 n) 1 m) 2 flags)
+        v2 (fill-starts text v 3 0 split)]
+    (fill-starts text v2 (+ 4 n) split (string-byte-length text))))
+
+;; Compare TEXT's two halves; answers the exit status.
+(defn- run-diff [text :string s :vector-i64 quiet? :bool a :string b :string] :i64
+  (let [n (vector-at s 0)
+        m (vector-at s 1)
+        o (off s)
+        cap (fits (+ 1 (* (+ (+ n m) 1) (+ (+ n m) 1))))
+        t (forward text s (vector-assoc! (vector-alloc (+ (* 2 o) 1)) 2 cap) (vector-alloc (+ (* 2 o) 1))
+                   (vector-alloc cap))
+        d (vector-at t 0)]
+    (if (< d 0)
+      (do (emit-error "diff: too many differences for this build") (emit-error (nl)) 2)
+      (if (= d 0)
+        0
+        (if quiet?
+          (do (emit "Files ") (emit a) (emit " and ") (emit b) (emit " differ") (emit (nl)) 1)
+          (let [marks (back t s (vector-alloc (+ (+ n m) 1)) (+ (* n 4294967296) m) d)]
+            (walk text s marks 0 0)))))))
+
+(defn- complain [path :string] :i64
+  (do (emit-error "diff: ") (emit-error path) (emit-error ": No such file or directory") (emit-error (nl)) 2))
+
+;; Verbatim from /usr/bin/diff, measured 2026-09-16 -- the block names
+;; every flag BSD diff has, not the two this build accepts, because the
+;; suite compares it byte for byte.
+(defn- usage [] :i64
+  (do
+      (emit-error "usage: diff [-aBbdilpTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]") (emit-error (nl))
+      (emit-error "            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]") (emit-error (nl))
+      (emit-error "            [-I pattern] [-F pattern] [-L label] file1 file2") (emit-error (nl))
+      (emit-error "       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]") (emit-error (nl))
+      (emit-error "            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]") (emit-error (nl))
+      (emit-error "            [-F pattern] -C number file1 file2") (emit-error (nl))
+      (emit-error "       diff [-aBbdiltw] [-I pattern] [--ignore-case] [--no-ignore-case]") (emit-error (nl))
+      (emit-error "            [--normal] [--strip-trailing-cr] [--tabsize] -D string file1 file2") (emit-error (nl))
+      (emit-error "       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]") (emit-error (nl))
+      (emit-error "            [--no-ignore-case] [--normal] [--tabsize] [--strip-trailing-cr]") (emit-error (nl))
+      (emit-error "            [-F pattern] -U number file1 file2") (emit-error (nl))
+      (emit-error "       diff [-aBbdilNPprsTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]") (emit-error (nl))
+      (emit-error "            [--no-ignore-case] [--normal] [--tabsize] [-I pattern] [-L label]") (emit-error (nl))
+      (emit-error "            [-F pattern] [-S name] [-X file] [-x pattern] dir1 dir2") (emit-error (nl))
+      (emit-error "       diff [-aBbditwW] [--expand-tabs] [--ignore-all-space]") (emit-error (nl))
+      (emit-error "            [--ignore-blank-lines] [--ignore-case] [--minimal]") (emit-error (nl))
+      (emit-error "            [--no-ignore-file-name-case] [--strip-trailing-cr]") (emit-error (nl))
+      (emit-error "            [--suppress-common-lines] [--tabsize] [--text] [--width]") (emit-error (nl))
+      (emit-error "            -y | --side-by-side file1 file2") (emit-error (nl))
+      (emit-error "       diff [--help] [--version]") (emit-error (nl))
+      2))
+
+(defn- diff-files [a :string b :string quiet? :bool] :i64
+  (if (readable? a)
+    (if (readable? b)
+      (let [ta (slurp-file a)
+            tb (slurp-file b)
+            a-open (if (= 0 (string-byte-length ta)) false (if (ends-nl? ta) false true))
+            b-open (if (= 0 (string-byte-length tb)) false (if (ends-nl? tb) false true))
+            joined (if a-open (string-concat ta (string-concat (nl) tb)) (string-concat ta tb))
+            split (+ (string-byte-length ta) (if a-open 1 0))
+            flags (+ (if a-open 1 0) (+ (if b-open 2 0) (if quiet? 4 0)))]
+        (run-diff joined (build-s joined (line-count ta) (line-count tb) flags split) quiet? a b))
+      (complain b))
+    (complain a)))
+
+(defn main [] :i64
+  (let [n (argc)]
+    (if (= n 2)
+      (diff-files (arg "0") (arg "1") false)
+      (if (= n 3)
+        (if (string=? (arg "0") "-q")
+          (diff-files (arg "1") (arg "2") true)
+          (if (string=? (arg "0") "-u")
+            (do (emit-error "diff: -u needs the files' mtimes in the local time zone, which this build cannot read") (emit-error (nl)) 2)
+            (usage)))
+        (usage)))))

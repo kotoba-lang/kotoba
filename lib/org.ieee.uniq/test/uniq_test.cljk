@@ -1,0 +1,262 @@
+;; test/uniq_test.cljk — build the command and compare it with the system
+;; uniq, byte for byte.
+;;
+;; No locale here: uniq compares lines for EQUALITY, not order, so it has no
+;; collation to disagree about. That is also why it needed no ordering
+;; primitive -- `string=` is the whole comparison.
+
+(ns uniq-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      ;; The large fixture answers 3 MB; Node's default 1 MiB
+                      ;; maxBuffer would kill the child and call it a difference.
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-uniq "/usr/bin/uniq")
+
+;; A directory of fixtures, and the cases over them. Each case is an argv,
+;; and each is here because it separates a right implementation from a wrong
+;; one that passes the others:
+;;
+;;   one file           -- the basic contract
+;;   two files          -- concatenated in ORDER, with nothing added between
+;;   the same file twice-- an operand is not deduplicated
+;;   an EMPTY file      -- reads as the empty string, which must not end the
+;;                         loop the way "past the last operand" does
+;;   empty then content -- the same trap from the other side
+;;   no trailing newline-- cat adds nothing of its own
+;;   binary-ish bytes   -- high bytes survive the round trip
+;;   no operands        -- POSIX reads stdin; there is no stdin capability,
+;;                         so this asserts what it ACTUALLY does (nothing),
+;;                         not what POSIX says
+(def fixtures
+  {;; ADJACENT only: `a a b a` answers `a b a`, not `a b`. This is the case
+   ;; that separates uniq from "distinct".
+   "adj"      "a\na\nb\na\n"
+   "none"     "a\nb\nc\n"
+   "all"      "x\nx\nx\n"
+   "empty"    ""
+   "one"      "one\n"
+   ;; No trailing newline: uniq ADDS one. Three bytes in, two out.
+   "nonl"     "a\na"
+   ;; An unterminated last line that is its OWN run. `a\na` above merges into
+   ;; the first line's run and inherits that line's newline, so it cannot
+   ;; tell "the newline uniq adds" from "the newline the first line had".
+   ;; Measured 2026-09-15: /usr/bin/uniq answers `a\nb` -- three bytes, no
+   ;; newline added -- and with -c the same shape.
+   "nonl2"    "a\nb"
+   ;; Blank lines are lines, and two of them are a run of two.
+   "blanks"   "a\n\n\nb\n"
+   ;; Runs of 2, 1, 3 and 1 -- so -d and -u each take a proper subset.
+   "mixed"    "a\na\nb\nc\nc\nc\nd\n"
+   ;; Case differing WITHIN a run, for -i.
+   "case"     "A\na\nB\n"
+   ;; The -c field boundary. `"%4d "` and a fixed five-wide field agree on
+   ;; every count below 1000 and differ at it -- measured, 9 prints as
+   ;; `   9 `, 1000 as `1000 ` and 10000 as `10000 `, so the four is a
+   ;; MINIMUM. This fixture is why the width is tested rather than assumed.
+   "thousand" :thousand-lines
+   ;; A LARGE file: 80,000 lines, 3.4 MB, in runs of one to four so every
+   ;; flag has work. The previous core.kotoba built the whole answer by
+   ;; copying its accumulator per run and trapped at 800 KB (measured
+   ;; 2026-09-15); this is the case that pins the string builder.
+   "big"      :big-lines})
+
+(def cases
+  [["adj"] ["none"] ["all"] ["empty"] ["one"] ["nonl"] ["nonl2"] ["blanks"] ["thousand"]
+   ["-c" "adj"] ["-c" "none"] ["-c" "all"] ["-c" "empty"] ["-c" "one"]
+   ["-c" "nonl"] ["-c" "nonl2"] ["-c" "blanks"] ["-c" "thousand"]
+   ;; The large file under every flag, and written to the OUTPUT operand.
+   ["big"] ["-c" "big"] ["-d" "big"] ["-u" "big"] ["-i" "big"] ["big" "OUT"] ["-c" "big" "OUT"]
+   ;; A MISSING operand: matched on stderr and exit status since wire 35
+   ;; gained an EXISTS form. Every utility words this differently --
+   ;; measured on each, not copied from a sibling.
+   ["missing"]
+   ;; --- the second operand is a DESTINATION ----------------------------
+   ;; `uniq INPUT OUTPUT` writes the answer to OUTPUT and puts NOTHING on
+   ;; stdout. The file is compared, not just the streams -- otherwise an
+   ;; implementation that wrote nothing at all would pass, since both sides
+   ;; produce empty stdout and exit 0.
+   ;; `adj`, not a name that is not a fixture: written as "dups" first, and
+   ;; those cases PASSED -- both implementations reported the same missing
+   ;; file, wrote nothing, and agreed. A destination case whose input does
+   ;; not exist tests nothing about destinations.
+   ["adj" "OUT"] ["-c" "adj" "OUT"] ["blanks" "OUT"]
+   ;; --- -d, -u and -i ---------------------------------------------------
+   ;; -d keeps only runs LONGER than one, -u only runs of exactly one, and
+   ;; both print ONE copy rather than n. `mixed` has runs of 2, 1, 3 and 1,
+   ;; so the two flags partition it and neither is the whole file.
+   ["-d" "mixed"] ["-u" "mixed"] ["-c" "mixed"]
+   ["-d" "adj"] ["-u" "adj"] ["-d" "none"] ["-u" "none"]
+   ["-d" "all"] ["-u" "all"]
+   ;; Empty input under each.
+   ["-d" "empty"] ["-u" "empty"]
+   ;; -i compares folded but prints the FIRST occurrence verbatim: over
+   ;; `A a B` uniq answers `A` and `B`, not `a`.
+   ["-i" "case"] ["-c" "case"] ["-d" "case"]
+   ;; -i to a destination file.
+   ["-i" "case" "OUT"]
+   ;; An empty input still creates the destination, empty.
+   ["empty" "OUT"]
+   ;; No trailing newline on the input.
+   ["nonl" "OUT"] ["nonl2" "OUT"]
+   ;; A missing INPUT leaves the destination untouched: not created, not
+   ;; created-and-empty. An implementation that opened the output before
+   ;; checking the input fails here and nowhere else.
+   ["missing" "OUT"]
+   ;; Three operands is a usage error, exit 1, with uniq's own usage line.
+   ["adj" "OUT" "extra"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 99% of uniq's invocations in agent tool use are a later pipeline
+   ;; segment (1,933 of 1,951 measured); `sort | uniq` alone is 1,889.
+   {:argv [] :stdin "adj"}
+   {:argv ["-c"] :stdin "adj"}
+   {:argv ["-d"] :stdin "adj"}
+   {:argv ["-u"] :stdin "adj"}
+   {:argv ["-i"] :stdin "case"}
+   {:argv [] :stdin "none"}
+   {:argv [] :stdin "all"}
+   {:argv [] :stdin "empty"}
+   {:argv [] :stdin "nonl"}])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-uniq) (refuse (str "no " system-uniq " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-wc-"))
+        src (.resolve path (.cwd js/process) "uniq" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "uniq.kexe")
+        blob (.join path tmp "uniq.bin")
+        exe (.join path tmp "uniq")
+        exe-big (.join path tmp "uniq-big")]
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
+    ;; The fixtures live in the tree the binary is packaged for. The native
+    ;; loader refuses a relative request outright, so operands are absolute.
+    (let [data (.join path tmp "data")]
+      (.mkdirSync fs data)
+      (doseq [[name content] fixtures]
+        (.writeFileSync fs (.join path data name)
+                        (case content
+                          :thousand-lines (.repeat "q\n" 1000)
+                          ;; Groups of three equal lines; every fifth group
+                          ;; spells its second line in capitals, so -i has
+                          ;; something to fold and the others have a run
+                          ;; boundary there.
+                          :big-lines (str/join "" (map (fn [i]
+                                                         (let [g (quot i 3)
+                                                               line (str "line " g " of the corpus, group " (mod g 4))]
+                                                           (str (if (and (= 0 (mod g 5)) (= 1 (mod i 3)))
+                                                                  (str/upper-case line)
+                                                                  line)
+                                                                "\n")))
+                                                       (range 80000)))
+                          content)
+                        "utf8")))
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      ;; TWO binaries from the same code: one with the loader's default
+      ;; string-arena budget and one with a raised budget. The pair is what
+      ;; makes the ceiling below a measurement instead of a claim -- a single
+      ;; binary could only show that some size works and some does not, not
+      ;; that the bound is the arena and that it moves.
+      ;; Fuel and arena are constants of the binary, so they are packaged
+      ;; here rather than supplied at run time. Counting words walks one code
+      ;; point at a time, so the guest recursion is as long as the file and
+      ;; the default 512 fuel counts almost nothing.
+      ;; Budgets for the large fixture: about ten handles per line, the text
+      ;; plus the answer in the pool, and more than a second of CPU on a
+      ;; loaded machine.
+      (doseq [[out extra] [[exe ["--fuel" "500000000" "--string-pool" "67108864" "--pairs" "4194304"
+                                 "--cpu-seconds" "60" "--wall-seconds" "600"]]]]
+        (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                                  "--allow" "35,37,38,39,41"
+                                  "--fs-scope" (.realpathSync fs (.join path tmp "data"))
+                                  "--output" out]
+                                 extra) {})]
+          (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
+    ;; Now the only thing that matters: run it.
+    (let [results
+          ;; `OUT` names uniq's second operand, the DESTINATION. Each
+          ;; implementation is given its own path for it, so the two runs
+          ;; cannot see each other's file and no reset is needed between
+          ;; them; the destination's name never appears in stdout or stderr,
+          ;; so giving them different ones does not weaken the comparison.
+          ;;
+          ;; The FILE is then compared, and that is the whole point of these
+          ;; cases: uniq writing to a destination puts nothing on stdout, so
+          ;; a suite comparing only the streams would pass an implementation
+          ;; that wrote nothing at all.
+          (for [[idx case] (map-indexed vector cases)]
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture fed as standard input to BOTH
+                  ;; binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (or (get fixtures (:stdin case))
+                              (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  dir (.realpathSync fs (.join path tmp "data"))
+                  resolve (fn [tag n]
+                            (mapv #(cond (str/starts-with? % "-") %
+                                         (= % "OUT") (.join path dir (str "out-" tag "-" idx))
+                                         :else (.join path dir %))
+                                  n))
+                  ka (resolve "k" names)
+                  sa (resolve "s" names)
+                  k (run exe ka opts)
+                  s (run system-uniq sa opts)
+                  read-out (fn [a] (let [f (last a)]
+                                     ;; `f` is nil for a stdin case with no argv.
+                                     (if (and f (str/includes? f "/out-")
+                                              (.existsSync fs f))
+                                       (.toString (.readFileSync fs f) "base64")
+                                       :absent)))
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             ;; stderr too: a missing operand differs there
+                             ;; and nowhere else, so a suite that compared
+                             ;; only stdout and status would call it green.
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s))
+                             (= (read-out ka) (read-out sa)))]
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :wrote [(read-out ka) (read-out sa)]
+               :exit [(:status k) (:status s)]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ")
+                      (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-uniq " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r))))))) 
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

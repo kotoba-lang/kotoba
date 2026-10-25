@@ -1,0 +1,312 @@
+;; ls -- POSIX ls (IEEE Std 1003.1) as a Kotoba command, in its default
+;; non-terminal form: one entry per line, sorted, entries beginning with a
+;; period omitted.
+;;
+;;   ls DIR       the visible entries
+;;   ls -a DIR    every entry, including `.` and `..`
+;;
+;; Capabilities: :cli/args (38) for the operand, :fs/browse (34) for the
+;; listing, :io/write (37) to answer. The browse scope is baked into the
+;; packaged binary, so `./ls` lists exactly the tree it was packaged for.
+;;
+;; ## The sort is the host's, and it is bytes
+;;
+;; Wire 34 answers one entry per line as "NAME<TAB>D" -- D is "1" for a
+;; directory -- already sorted, dotfiles included, `.` and `..` excluded.
+;; Measured 2026-09-10, the order is BYTES, and that is the order
+;; `LC_ALL=C /bin/ls` prints. macOS's /bin/ls in a normal locale prints a
+;; different order entirely (locale collation puts a Japanese name first and
+;; `Zebra` last), so this implementation matches the POSIX locale and not the
+;; default one -- the test compares against `LC_ALL=C /bin/ls` and says why.
+(ns ls.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn listing [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; The NAME half of one "NAME<TAB>D" line. A line with no separator is
+;; returned whole, which is what the identity stub answers.
+(defn entry-name [line :string] :string
+  (let [i (string-index-of line "\t")]
+    (if (< i 0) line (string-substring line 0 i))))
+
+;; Does NAME begin with a period?
+;;
+;; NOT `(string=? (string-substring name 0 1) ".")`. A substring offset must
+;; be a code-point boundary, and 1 is not one when the first character is
+;; multi-byte -- measured 2026-09-10, that form listed the ASCII entries and
+;; then trapped SIGILL on `é`, so the wrong answer was a truncated listing
+;; and a signal rather than a visibly wrong name.
+;;
+;; `string-index-of` answers the first BYTE OFFSET of the needle, so an
+;; answer of 0 is exactly "begins with", and it never constructs an offset it
+;; has not walked to. A name with no period at all answers -1.
+;; --- byte order, for -a --------------------------------------------------
+;;
+;; This file used to record `-a` as blocked: wire 34 excludes `.` and `..`,
+;; adding them is not a prepend -- `LC_ALL=C ls -a` puts `-dash` BEFORE `.`
+;; -- and the language has no string ordering comparison to merge with.
+;;
+;; The last clause was wrong, and org-ieee-sort is where that turned up. UTF-8
+;; preserves code point order lexicographically, so walking both strings with
+;; `string-code-point-at` and comparing code points IS byte order. No
+;; primitive, no language change: ordinary guest code, ported from there.
+
+(defn cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn less-from [a :string b :string i :i64 j :i64] :bool
+  (if (>= i (string-byte-length a))
+    (if (>= j (string-byte-length b)) false true)
+    (if (>= j (string-byte-length b))
+      false
+      (let [ca (string-code-point-at a i)
+            cb (string-code-point-at b j)]
+        (if (< ca cb)
+          true
+          (if (> ca cb)
+            false
+            (less-from a b (+ i (cp-width ca)) (+ j (cp-width cb)))))))))
+
+(defn less? [a :string b :string] :bool
+  (less-from a b 0 0))
+
+;; This asked whether the argument COUNT was 2 until 2026-09-10, which was
+;; right only while ls took a single operand: `ls d1 d2` is also two arguments
+;; and would have been read as carrying a `-a`. The question is about argument
+;; 0's shape, so that is what it asks -- the same correction cut's `dashed?`
+;; and uniq's `counted?` needed.
+(defn all? [] :bool
+  (string=? (arg "0") "-a"))
+
+(defn first-operand [] :i64
+  (if (all?) 1 0))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn exists? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn dir-arg [] :string
+  (if (all?) (arg "1") (arg "0")))
+
+;; The two entries wire 34 never answers, by index. Kept as a function rather
+;; than a collection because the merge below needs them one at a time.
+(defn dot-entry [i :i64] :string
+  (if (= i 0) "." ".."))
+
+(defn hidden? [name :string] :bool
+  (if (= (string-byte-length name) 0)
+    false
+    (= (string-index-of name ".") 0)))
+
+;; Walk the listing line by line. The host's order is kept as given: sorting
+;; here would mean re-deriving an order this guest has no primitive for --
+;; there is no string ordering comparison in the language, only `string=?`.
+(defn walk [rest :string] :i64
+  (let [i (string-index-of rest "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length rest) 0)
+        0
+        (let [name (entry-name rest)]
+          (if (hidden? name) 0 (do (emit name) (emit (nl)) 0))))
+      (let [name (entry-name (string-substring rest 0 i))]
+        (do
+          (if (hidden? name) 0 (do (emit name) (emit (nl)) 0))
+          (walk (string-substring rest (+ i 1) (string-byte-length rest))))))))
+
+;; Emit `.` and `..` while they sort before NAME, answering the index reached.
+;; Two elements, so this is a merge with a fixed side rather than a general
+;; one -- and it is a MERGE and not a prepend, which is the whole point:
+;; `-dash` sorts before `.`, measured.
+(defn flush-dots [i :i64 before :string] :i64
+  (if (>= i 2)
+    i
+    (if (less? (dot-entry i) before)
+      (do (emit (dot-entry i)) (emit (nl)) (flush-dots (+ i 1) before))
+      i)))
+
+;; Everything still pending, unconditionally. Used at the end of the listing,
+;; where there is no next name to compare against -- a sentinel string
+;; "greater than every name" would have to be one this reader can spell, and
+;; there is no need for one when the answer is "all of them".
+(defn flush-rest [i :i64] :i64
+  (if (>= i 2)
+    i
+    (do (emit (dot-entry i)) (emit (nl)) (flush-rest (+ i 1)))))
+
+;; The -a walk: the host's listing merged with the two entries it omits.
+(defn walk-all [rest :string dots :i64] :i64
+  (let [i (string-index-of rest "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length rest) 0)
+        (flush-rest dots)
+        (let [name (entry-name rest)
+              d (flush-dots dots name)]
+          (do (emit name) (emit (nl)) (flush-rest d))))
+      (let [name (entry-name (string-substring rest 0 i))
+            d (flush-dots dots name)]
+        (do
+          (emit name)
+          (emit (nl))
+          (walk-all (string-substring rest (+ i 1) (string-byte-length rest)) d))))))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- what KIND of thing is this operand ----------------------------------
+;;
+;; There is no stat form, so a path's kind is read out of its PARENT's
+;; listing, which answers NAME<TAB>D per entry. Same technique org-ieee-cp
+;; uses and org-ieee-find walks with.
+(defn last-slash [p :string from :i64 best :i64] :i64
+  (let [rest (string-substring p from (string-byte-length p))
+        i (string-index-of rest "/")]
+    (if (< i 0)
+      best
+      (last-slash p (+ from (+ i 1)) (+ from i)))))
+
+(defn parent-of [p :string] :string
+  (let [i (last-slash p 0 -1)]
+    (if (< i 0) "." (if (= i 0) "/" (string-substring p 0 i)))))
+
+(defn base-of [p :string] :string
+  (let [i (last-slash p 0 -1)]
+    (if (< i 0) p (string-substring p (+ i 1) (string-byte-length p)))))
+
+(defn line-flag [line :string name :string] :i64
+  (let [t (string-index-of line "\t")]
+    (if (< t 0)
+      -1
+      (if (string=? (string-substring line 0 t) name)
+        (if (string=? (string-substring line (+ t 1) (+ t 2)) "1") 1 0)
+        -1))))
+
+(defn flag-in [rest :string name :string] :i64
+  (let [n (string-byte-length rest)]
+    (if (= n 0)
+      -1
+      (let [i (string-index-of rest "\n")]
+        (if (< i 0)
+          (line-flag rest name)
+          (let [f (line-flag (string-substring rest 0 i) name)]
+            (if (>= f 0) f (flag-in (string-substring rest (+ i 1) n) name))))))))
+
+;; 0 missing, 1 not a directory, 2 a directory.
+(defn kind-of [p :string] :i64
+  (if (exists? p)
+    (if (= (flag-in (listing (parent-of p)) (base-of p)) 1) 2 1)
+    0))
+
+;; --- operands are SORTED, and non-directories come first -----------------
+;;
+;; Measured against /bin/ls 2026-09-10:
+;;
+;;   ls d2 d1        -> d1: ... then d2: ...   the operands are sorted
+;;   ls f.txt d1     -> f.txt, blank, d1: ...  a FILE is listed first, with
+;;                                             no header, whatever the order
+;;
+;; There is no array and no sort primitive, so the order is produced by
+;; repeatedly selecting the smallest operand strictly AFTER the one just
+;; emitted. Ties are broken by argument index, which is what makes a repeated
+;; operand appear twice rather than once -- and the index is all that has to
+;; be carried, since the value is `(arg (decimal-of i))` away.
+(defn after? [a :i64 p :i64] :bool
+  (if (< p 0)
+    true
+    (let [va (arg (decimal-of a))
+          vp (arg (decimal-of p))]
+      (if (less? va vp)
+        false
+        (if (less? vp va) true (> a p))))))
+
+;; The index of the smallest operand of kind K that comes after P, or -1.
+(defn next-of [i :i64 total :string k :i64 p :i64 best :i64] :i64
+  (if (string=? (decimal-of i) total)
+    best
+    (let [path (arg (decimal-of i))]
+      (if (if (= (kind-of path) k) (after? i p) false)
+        (next-of (+ i 1) total k p
+                 (if (< best 0) i (if (after? best i) i best)))
+        (next-of (+ i 1) total k p best)))))
+
+;; --- emitting ------------------------------------------------------------
+(defn body-of [path :string] :i64
+  (if (all?) (walk-all (listing path) 0) (walk (listing path))))
+
+;; Non-directory operands: the name alone, no header. `written` is how many
+;; lines have been produced so far, which decides the blank line.
+(defn each-file [total :string p :i64 written :i64] :i64
+  (let [n (next-of (first-operand) total 1 p -1)]
+    (if (< n 0)
+      written
+      (do (emit (arg (decimal-of n))) (emit (nl))
+          (each-file total n (+ written 1))))))
+
+;; Directory operands: `PATH:` then the listing, with a blank line before
+;; every section except the first thing written.
+(defn each-dir [total :string p :i64 written :i64 header? :i64] :i64
+  (let [n (next-of (first-operand) total 2 p -1)]
+    (if (< n 0)
+      written
+      (do
+        (if (> written 0) (emit (nl)) "")
+        (if (= header? 1)
+          (do (emit (arg (decimal-of n))) (emit ":") (emit (nl)))
+          "")
+        (body-of (arg (decimal-of n)))
+        (each-dir total n (+ written 1) header?)))))
+
+;; Missing operands are reported in ARGUMENT order, before anything is
+;; listed -- measured: `ls d1 nope` writes the diagnostic first and the
+;; listing after, because stdout and stderr are separate streams and ls
+;; checks as it walks its arguments.
+(defn complain-each [i :i64 total :string worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (= (kind-of path) 0)
+        (do (emit-error "ls: ")
+            (emit-error path)
+            (emit-error ": No such file or directory")
+            (emit-error (nl))
+            (complain-each (+ i 1) total 1))
+        (complain-each (+ i 1) total worst)))))
+
+;; How many operands there are, as a count of the ones of each kind, is not
+;; needed -- what decides whether headers appear is whether MORE THAN ONE
+;; operand exists at all, missing ones included, which is exactly "the second
+;; operand index is not the end".
+(defn several? [total :string] :i64
+  (if (string=? (decimal-of (+ (first-operand) 1)) total) 0 1))
+
+(defn main [] :i64
+  (let [total (arg "")
+        start (first-operand)]
+    (if (string=? (decimal-of start) total)
+      ;; No operand at all. POSIX lists the working directory; there is no
+      ;; cwd capability, so this refuses rather than listing something else.
+      1
+      (let [failed (complain-each start total 0)
+            files (each-file total -1 0)]
+        (do
+          (each-dir total -1 files (several? total))
+          failed)))))

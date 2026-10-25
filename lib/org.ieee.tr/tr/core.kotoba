@@ -1,0 +1,388 @@
+;; tr -- POSIX tr (IEEE Std 1003.1) as a Kotoba command, the forms agents use.
+;;
+;;   ... | tr SET1 SET2      translate: the k-th byte of SET1 becomes the k-th
+;;                           of SET2 (SET2 shorter: its last byte repeats)
+;;   ... | tr -d SET1        delete every byte in SET1
+;;   ... | tr -s SET1        squeeze runs of a SET1 byte to one
+;;   ... | tr -s SET1 SET2   translate, then squeeze runs of a SET2 byte
+;;   ... | tr -ds SET1 SET2  delete SET1, then squeeze runs of a SET2 byte
+;;
+;; ## Why these forms, measured
+;;
+;; Over 1,268,018 Bash calls in 558 agent transcripts (2026-09-16,
+;; superproject ADR-2609161710) `tr` was invoked 7,020 times, 99% of them as a
+;; later pipeline segment -- there is no file operand form at all. The
+;; argument shapes, most frequent first: `-d ' '` (2,261), `'\n' ' '`
+;; (1,659), `-d '\n'` (228), `':' '\n'` (178), `',' '\n'` (140), `'/' '_'`,
+;; `' ' '\n'`, `-d '"'`, `-d '\r'`, `-s ' '`, `-d '[:space:]'`, `'\t' '\n'`,
+;; `-s ' \n' ' \n'`. Everything above is one of the five forms, with escapes
+;; (`\n` `\t` `\r` `\\` and octal `\NNN`), ranges (`a-z`) and the POSIX
+;; classes. `-c` (complement) and `-C` are refused, not half-done.
+;;
+;; ## Sets are ASCII; input is bytes
+;;
+;; A set holding a code point past 127 is refused with a message, exit 1. The
+;; INPUT may hold anything: a multi-byte sequence is copied through untouched
+;; as one unit, which is also what /usr/bin/tr does with an ASCII set, so the
+;; two answer the same bytes. Sets are looked up in a 256-word table -- the
+;; low half the translation (-1 = delete), the high half the squeeze flags --
+;; built once from argv before any input is read.
+;;
+;; ## The walk
+;;
+;; Standard input is read 64 KiB at a time (wire 41's decimal form, which
+;; answers whole code points), each chunk inside its own `arena-scope` so the
+;; pool holds one chunk at a time and `yes | tr` streams. Within a chunk the
+;; walk keeps a RUN of unchanged bytes and appends the run in one
+;; `string-append-range` when something changes, so `tr -d ' '` over text
+;; with few spaces is a handful of appends per chunk rather than one per
+;; byte. The squeeze state (the last byte written) crosses chunk boundaries
+;; in the walk's return value.
+;;
+;; ## A byte as a one-byte string
+;;
+;; The guest has no byte->string operation; the alphabet below holds bytes 1
+;; through 127 in order, so byte B is `(string-substring alphabet (- b 1) b)`.
+;; NUL cannot be in a literal, which is why `\0` and `\000` are refused.
+;; Four of the bytes are spelled as escapes -- `\n`, `\r`, `\"`, `\\` -- the
+;; rest are raw. CR HAS to be an escape: a raw CR in source is read as a
+;; line ending, and the first cut's `tr -d '\r'` deleted newlines instead
+;; (measured 2026-09-16, the one red case of fifty).
+;;
+;; Capabilities: :cli/args (38), :io/read (41), :io/write (37),
+;; :io/write-error (39).
+(ns tr.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn nl [] :string "\n")
+
+(defn alphabet [] :string
+  "	\n\r !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~")
+
+;; Byte B (1..127) as a one-byte string.
+(defn byte-text [b :i64] :string
+  (string-substring (alphabet) (- b 1) b))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; How many arguments, as an i64: wire 38 answers the count as decimal text.
+(defn argc-from [k :i64 total :string] :i64
+  (if (string=? (decimal-of k) total) k (argc-from (+ k 1) total)))
+
+(defn argc [] :i64 (argc-from 0 (arg "")))
+
+;; --- set expansion --------------------------------------------------------
+;;
+;; A set expands into a STRING of the bytes it names, in order, so that the
+;; k-th byte of SET1 pairs with the k-th of SET2 by index and the table can be
+;; built from two strings with nothing but reads. (The first cut kept the
+;; lists in the table's own vector; `vector-assoc!` wants a linear handle and
+;; reading a length from a vector before writing to it is two uses on one
+;; path, which the compiler refuses.) The answer's FIRST byte is a verdict:
+;; "1" then the bytes, or "0" alone when something was refused -- a NUL or
+;; too-large octal, a code point past 127, an unknown class, a reversed range.
+
+(defn- range-text [lo :i64 hi :i64] :string
+  (if (> lo hi) "" (string-concat (byte-text lo) (range-text (+ lo 1) hi))))
+
+;; The POSIX classes, by name; "0" when the name is not one.
+(defn- class-text [name :string] :string
+  (if (string=? name "space")
+    (string-concat "1" (string-concat (range-text 9 13) " "))
+    (if (string=? name "blank")
+      (string-concat "1" (string-concat (byte-text 9) " "))
+      (if (string=? name "upper")
+        (string-concat "1" (range-text 65 90))
+        (if (string=? name "lower")
+          (string-concat "1" (range-text 97 122))
+          (if (string=? name "digit")
+            (string-concat "1" (range-text 48 57))
+            (if (string=? name "alpha")
+              (string-concat "1" (string-concat (range-text 65 90) (range-text 97 122)))
+              (if (string=? name "alnum")
+                (string-concat "1" (string-concat (range-text 48 57) (string-concat (range-text 65 90) (range-text 97 122))))
+                (if (string=? name "punct")
+                  (string-concat "1" (string-concat (range-text 33 47) (string-concat (range-text 58 64) (string-concat (range-text 91 96) (range-text 123 126)))))
+                  (if (string=? name "print")
+                    (string-concat "1" (range-text 32 126))
+                    (if (string=? name "cntrl")
+                      (string-concat "1" (string-concat (range-text 1 31) (byte-text 127)))
+                      "0")))))))))))
+
+(defn- octal-digit [c :i64] :i64
+  (if (< c 48) -1 (if (> c 55) -1 (- c 48))))
+
+;; Up to three octal digits from S at I; answers value * 8 + digits consumed
+;; (the count in the low 3 bits), or -1 when there is none.
+(defn- octal-at [s :string i :i64 n :i64 acc :i64 k :i64] :i64
+  (if (>= k 3)
+    (+ (* acc 8) k)
+    (if (>= i n)
+      (if (= k 0) -1 (+ (* acc 8) k))
+      (let [d (octal-digit (string-code-point-at s i))]
+        (if (< d 0)
+          (if (= k 0) -1 (+ (* acc 8) k))
+          (octal-at s (+ i 1) n (+ (* acc 8) d) (+ k 1)))))))
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+;; The byte a `\` escape at S[I] (I is the byte AFTER the backslash) stands
+;; for, times 4, plus the bytes consumed after the backslash (0..3); -1 for
+;; an octal value this cannot hold (0, or past 127). A trailing lone
+;; backslash is itself.
+(defn- escape-at [s :string i :i64 n :i64] :i64
+  (if (>= i n)
+    (* 92 4)
+    (let [c (string-code-point-at s i)]
+      (if (= c 110) (+ (* 10 4) 1)
+        (if (= c 116) (+ (* 9 4) 1)
+          (if (= c 114) (+ (* 13 4) 1)
+            (if (= c 92) (+ (* 92 4) 1)
+              (if (= c 97) (+ (* 7 4) 1)
+                (if (= c 98) (+ (* 8 4) 1)
+                  (if (= c 102) (+ (* 12 4) 1)
+                    (if (= c 118) (+ (* 11 4) 1)
+                      (let [o (octal-at s i n 0 0)]
+                        (if (< o 0)
+                          (if (< c 128) (+ (* c 4) 1) -1)
+                          (let [value (quot o 8)
+                                used (- o (* 8 (quot o 8)))]
+                            (if (= value 0) -1 (if (> value 127) -1 (+ (* value 4) used)))))))))))))))))
+
+;; Expand S from byte I. ACC is the bytes so far; PREV the last byte pushed
+;; (for `a-z`), or -1. Answers the verdict-prefixed string.
+(defn- expand [s :string i :i64 acc :string prev :i64] :string
+  (let [n (string-byte-length s)]
+    (if (>= i n)
+      (string-concat "1" acc)
+      (let [c (string-code-point-at s i)]
+        (if (>= c 128)
+          "0"
+          (if (= c 92)
+            (let [e (escape-at s (+ i 1) n)]
+              (if (< e 0)
+                "0"
+                (expand s (+ (+ i 1) (- e (* 4 (quot e 4)))) (string-concat acc (byte-text (quot e 4))) (quot e 4))))
+            (if (if (= c 91) (if (< (+ i 1) n) (= (string-code-point-at s (+ i 1)) 58) false) false)
+              ;; `[:name:]`
+              (let [close (string-index-of-from s ":]" (+ i 2))]
+                (if (< close 0)
+                  "0"
+                  (let [cls (class-text (string-substring s (+ i 2) close))]
+                    (if (string=? cls "0")
+                      "0"
+                      (expand s (+ close 2)
+                              (string-concat acc (string-substring cls 1 (string-byte-length cls)))
+                              -1)))))
+              (if (if (= c 45) (if (>= prev 0) (< (+ i 1) n) false) false)
+                ;; `a-z`: PREV was pushed already, so the range starts after it.
+                (let [hi (string-code-point-at s (+ i 1))]
+                  (if (>= hi 128)
+                    "0"
+                    (if (< hi prev)
+                      "0"
+                      (expand s (+ i 2) (string-concat acc (range-text (+ prev 1) hi)) -1))))
+                (expand s (+ i 1) (string-concat acc (byte-text c)) c)))))))))
+
+;; The set's bytes, verdict stripped; "" for a refused set is told apart by
+;; `refused?` on the verdict.
+(defn- set-of [verdict :string] :string
+  (string-substring verdict 1 (string-byte-length verdict)))
+
+(defn- refused? [verdict :string] :bool
+  (= (string-code-point-at verdict 0) 48))
+
+;; --- the table -------------------------------------------------------------
+;;
+;; V[b] for b in 0..127 is the byte b becomes, -1 to delete. V[128 + b] is 1
+;; when runs of b (after translation) squeeze to one. Built with writes only,
+;; reading from the set strings, so every `vector-assoc!` sees a handle used
+;; once on its path; the walk then only reads it.
+
+(defn- identity-from [v :vector-i64 b :i64] :vector-i64
+  (if (>= b 128) v (identity-from (vector-assoc! v b b) (+ b 1))))
+
+(defn- delete-from [v :vector-i64 set1 :string k :i64] :vector-i64
+  (if (>= k (string-byte-length set1))
+    v
+    (delete-from (vector-assoc! v (string-code-point-at set1 k) -1) set1 (+ k 1))))
+
+;; k-th of SET1 -> k-th of SET2, the last of SET2 repeating past its end.
+(defn- translate-from [v :vector-i64 set1 :string set2 :string k :i64] :vector-i64
+  (if (>= k (string-byte-length set1))
+    v
+    (let [n2 (string-byte-length set2)
+          j (if (< k n2) k (- n2 1))]
+      (translate-from (vector-assoc! v (string-code-point-at set1 k) (string-code-point-at set2 j))
+                      set1 set2 (+ k 1)))))
+
+(defn- squeeze-from [v :vector-i64 set :string k :i64] :vector-i64
+  (if (>= k (string-byte-length set))
+    v
+    (squeeze-from (vector-assoc! v (+ 128 (string-code-point-at set k)) 1) set (+ k 1))))
+
+;; --- the walk --------------------------------------------------------------
+;;
+;; STATE packs the run start (high) and the last byte written (low 9 bits:
+;; 0..255, or 256 for "nothing yet" / "not ASCII"). ACC is the chunk's output
+;; so far. The walk answers ACC with a two-byte TRAILER -- the last byte
+;; written and "a" (or "x" and "n" when there is none) -- because it answers
+;; one value and `batch` needs both the bytes and the squeeze state; `batch`
+;; strips the trailer with a substring, which is a view and copies nothing.
+
+(defn- run-of [state :i64] :i64 (quot state 512))
+(defn- last-of [state :i64] :i64 (- state (* 512 (quot state 512))))
+(defn- pack [run :i64 last :i64] :i64 (+ (* run 512) last))
+
+;; Flush the unchanged run [run, i) into ACC.
+(defn- flush [acc :string s :string run :i64 i :i64] :string
+  (if (< run i) (string-append-range acc s run i) acc))
+
+(defn- trailer [last :i64] :string
+  (if (< last 256) (string-concat (byte-text last) "a") "xn"))
+
+(defn- walk [v :vector-i64 s :string i :i64 state :i64 acc :string] :string
+  (let [n (string-byte-length s)]
+    (if (>= i n)
+      (string-concat (flush acc s (run-of state) n) (trailer (last-of state)))
+      (let [c (string-code-point-at s i)]
+        (if (>= c 128)
+          ;; A multi-byte sequence: never in a set, never squeezed; it just
+          ;; extends the run. 256 = "the last byte written is not ASCII".
+          (walk v s (+ i (cp-width c)) (pack (run-of state) 256) acc)
+          (let [t (vector-at v c)]
+            (if (< t 0)
+              ;; Delete: close the run before it, open one after it.
+              (walk v s (+ i 1) (pack (+ i 1) (last-of state)) (flush acc s (run-of state) i))
+              (if (if (= 1 (vector-at v (+ 128 t))) (= t (last-of state)) false)
+                ;; Squeeze: the same byte was written last; drop this one.
+                (walk v s (+ i 1) (pack (+ i 1) t) (flush acc s (run-of state) i))
+                (if (= t c)
+                  (walk v s (+ i 1) (pack (run-of state) c) acc)
+                  (walk v s (+ i 1) (pack (+ i 1) t)
+                        (string-concat (flush acc s (run-of state) i) (byte-text t))))))))))))
+
+;; One chunk: answers the last byte written (0..256), or -1 at EOF. The
+;; region around it reclaims the chunk and everything the walk minted.
+(defn- batch [v :vector-i64 last :i64] :i64
+  (let [chunk (stdin "65536")]
+    (if (= 0 (string-byte-length chunk))
+      -1
+      (let [out (walk v chunk 0 (pack 0 last) "")
+            m (string-byte-length out)]
+        (do (emit (string-substring out 0 (- m 2)))
+            (if (= (string-code-point-at out (- m 1)) 97)
+              (string-code-point-at out (- m 2))
+              256))))))
+
+(defn- batches [v :vector-i64 last :i64] :i64
+  (let [r (arena-scope (batch v last))]
+    (if (< r 0) 0 (batches v r))))
+
+;; --- argv ------------------------------------------------------------------
+
+(defn- flag-arg? [i :i64] :bool
+  (if (>= i (argc))
+    false
+    (let [a (arg (decimal-of i))]
+      (if (< (string-byte-length a) 2)
+        false
+        (if (= (string-code-point-at a 0) 45)
+          ;; A lone "-" or a set that begins with "-" is an operand; a flag
+          ;; is letters after the dash.
+          true
+          false)))))
+
+;; Bit 1 = -d, bit 2 = -s, bit 4 = something this does not do (-c / -C / an
+;; unknown letter). Walks the letters of one flag argument.
+(defn- flag-bits [a :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length a))
+    acc
+    (let [c (string-code-point-at a i)]
+      (flag-bits a (+ i 1)
+                 (if (= c 100) (bit-or acc 1)
+                   (if (= c 115) (bit-or acc 2) (bit-or acc 4)))))))
+
+(defn- flags-from [i :i64 acc :i64] :i64
+  (if (flag-arg? i)
+    (flags-from (+ i 1) (bit-or acc (flag-bits (arg (decimal-of i)) 1 0)))
+    acc))
+
+(defn- first-set [i :i64] :i64
+  (if (flag-arg? i) (first-set (+ i 1)) i))
+
+(defn- usage [] :i64
+  (do (emit-error "usage: tr [-Ccsu] string1 string2")
+      (emit-error (nl))
+      (emit-error "       tr [-Ccu] -d string1")
+      (emit-error (nl))
+      (emit-error "       tr [-Ccu] -s string1")
+      (emit-error (nl))
+      (emit-error "       tr [-Ccu] -ds string1 string2")
+      (emit-error (nl))
+      1))
+
+(defn- refuse [message :string] :i64
+  (do (emit-error "tr: ") (emit-error message) (emit-error (nl)) 1))
+
+;; The table for the mode, or a refusal. SETS is how many operands there are.
+(defn- table-for [flags :i64 s1 :string s2 :string sets :i64] :i64
+  (let [e1 (expand s1 0 "" -1)
+        e2 (if (= sets 2) (expand s2 0 "" -1) "1")]
+    (if (if (refused? e1) true (refused? e2))
+      (refuse "a set may hold ASCII only, escapes \\n \\t \\r \\\\ \\NNN (1..177), ranges and the POSIX classes")
+      ;; The table is allocated in each branch rather than bound once: the
+      ;; linearity analysis counts a binding's textual uses, and one vector
+      ;; named on five branches is five uses (sort's guest does the same).
+      (let [set1 (set-of e1)
+            set2 (set-of e2)]
+        (if (= flags 0)
+          (batches (translate-from (identity-from (vector-alloc 256) 0) set1 set2 0) 256)
+          (if (= flags 1)
+            (batches (delete-from (identity-from (vector-alloc 256) 0) set1 0) 256)
+            (if (= flags 2)
+              (batches (squeeze-from (identity-from (vector-alloc 256) 0) set1 0) 256)
+              (if (= flags 3)
+                (batches (squeeze-from (delete-from (identity-from (vector-alloc 256) 0) set1 0) set2 0) 256)
+                ;; -s with two sets: translate, then squeeze SET2.
+                (batches (squeeze-from (translate-from (identity-from (vector-alloc 256) 0) set1 set2 0) set2 0) 256)))))))))
+
+(defn main [] :i64
+  (let [flags (flags-from 0 0)
+        start (first-set 0)
+        sets (- (argc) start)]
+    (if (= 4 (bit-and flags 4))
+      (refuse "only -d and -s are supported (no -c, -C, -u)")
+      ;; Which forms take which operand counts, as /usr/bin/tr counts them:
+      ;;   none   two sets
+      ;;   -d     one set
+      ;;   -s     one set (squeeze) or two (translate then squeeze)
+      ;;   -ds    two sets
+      (if (= flags 0)
+        (if (= sets 2) (table-for 0 (arg (decimal-of start)) (arg (decimal-of (+ start 1))) 2) (usage))
+        (if (= flags 1)
+          (if (= sets 1) (table-for 1 (arg (decimal-of start)) "" 1) (usage))
+          (if (= flags 2)
+            (if (= sets 1)
+              (table-for 2 (arg (decimal-of start)) "" 1)
+              (if (= sets 2) (table-for 6 (arg (decimal-of start)) (arg (decimal-of (+ start 1))) 2) (usage)))
+            (if (= sets 2) (table-for 3 (arg (decimal-of start)) (arg (decimal-of (+ start 1))) 2) (usage))))))))

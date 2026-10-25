@@ -1,0 +1,424 @@
+(ns h264.transform
+  "H.264 baseline-profile integer 4x4 inverse transform (ITU-T H.264 /
+   ISO/IEC 14496-10 §8.5.10 \"Transformation process for residual 4x4
+   blocks\") + the Intra16x16 luma DC Hadamard transform (§8.5.10, luma DC
+   transform coefficients). Implements `codec-primitives.transform/BlockTransform`
+   for the regular 4x4 residual block.
+
+   Encode side (ADR-2607122000 Migration step 8): `forward-4x4` (textbook
+   forward transform, used for DC extraction — see its own docstring for
+   why it is NOT used for AC quantization) and `forward-luma-dc-hadamard`
+   (the exact linear inverse of `luma-dc-hadamard`, empirically derived —
+   see that fn's docstring). The actual AC-coefficient quantizer used by
+   `h264.encode` is NOT in this namespace — it solves the exact
+   least-squares inverse of `ac-qmul`+`inverse-4x4` directly.
+
+   The exact butterfly arithmetic (including the `+32`/`>>6` rounding
+   constants) is ported from FFmpeg's reference decoder
+   (`libavcodec/h264idct_template.c` `ff_h264_idct_add` /
+   `ff_h264_luma_dc_dequant_idct`, https://github.com/FFmpeg/FFmpeg) rather
+   than re-derived from the spec prose, specifically so this implementation
+   is bit-exact against real x264-encoded streams decoded by a real ffmpeg
+   (the golden-vector fixtures in `test/h264/decode_test.cljk` are decoded
+   by ffmpeg itself, so matching its exact integer arithmetic — not just
+   the abstract DCT math — is what makes bit-exactness possible).
+
+   IMPORTANT internal convention: `inverse-4x4`'s coefficient input is
+   accepted in normal row-major order (index = row*4 + col, matching how
+   `h264.cavlc`'s zigzag-unscanned coefficients are naturally laid out) —
+   but FFmpeg's `ff_h264_idct_add` C code indexes its `block[]` array in a
+   column-major sense internally. This was NOT obvious from reading the C
+   source alone; it was discovered empirically (see ADR/README) by decoding
+   a real x264 gradient-image golden vector and observing the reconstructed
+   picture was transposed until the coefficient matrix was transposed
+   before running the butterfly. `inverse-4x4` transposes internally so
+   callers can pass/receive plain row-major 4x4 grids throughout.
+
+   New implementation as part of the kotoba-lang reverse-domain
+   media/graphics standards-substrate split (com-junkawasaki/root)."
+  (:require [codec-primitives.transform :as cp-transform]))
+
+(defn- transpose16
+  "Transpose a 16-element row-major (idx = row*4+col) coefficient vector."
+  [v]
+  (mapv (fn [idx] (let [row (quot idx 4) col (mod idx 4)]
+                    (nth v (+ (* col 4) row))))
+        (range 16)))
+
+(defn inverse-4x4
+  "Inverse 4x4 transform of a already-dequantized 16-element row-major
+   (idx = row*4+col) coefficient vector, per H.264 §8.5.10 (two-stage
+   integer butterfly + `+32` rounding bias on the DC term + final `>>6`).
+   Returns a 4x4 residual grid (vector of 4 row vectors) — NOT yet added to
+   a predictor and NOT yet clipped (that's the caller's job, see
+   `h264.decode`)."
+  [coeffs]
+  ;; Two butterfly stages over a 16-element scratch buffer, written as tight
+  ;; index loops over a transient rather than `reduce` + four `assoc`s per
+  ;; step. The previous form allocated a fresh 16-element vector per assoc —
+  ;; 32 intermediate vectors per call — and this is the single hottest
+  ;; function in the encoder: measured 2026-07-30, 173k calls and 802 ms of a
+  ;; 4,070 ms 720x1280 frame (17.7%). The arithmetic is unchanged, which
+  ;; matters because the DECODER depends on this being bit-exact against
+  ;; FFmpeg's reference (see this ns's own tests).
+  (let [dc-only? (loop [i 1] (cond (= i 16) true
+                                   (zero? (long (nth coeffs i))) (recur (inc i))
+                                   :else false))]
+    (if dc-only?
+      ;; A DC-only block's inverse transform is the uniform grid
+      ;; ((dc + 32) >> 6) — verified against the general path across the
+      ;; coefficient range. Chroma AC solving calls this per block with a
+      ;; DC-only vector, so the butterfly was pure waste there.
+      (let [v (bit-shift-right (+ (long (nth coeffs 0)) 32) 6)
+            row (vec (repeat 4 v))]
+        (vec (repeat 4 row)))
+      (let [block (-> (transpose16 coeffs) (update 0 + 32))
+            tmp (loop [i 0 acc (transient (vec (repeat 16 0)))]
+                  (if (= i 4)
+                    (persistent! acc)
+                    (let [b0 (long (nth block i))
+                          b1 (long (nth block (+ i 4)))
+                          b2 (long (nth block (+ i 8)))
+                          b3 (long (nth block (+ i 12)))
+                          z0 (+ b0 b2)
+                          z1 (- b0 b2)
+                          z2 (- (bit-shift-right b1 1) b3)
+                          z3 (+ b1 (bit-shift-right b3 1))]
+                      (recur (inc i)
+                             (-> acc
+                                 (assoc! i (+ z0 z3))
+                                 (assoc! (+ i 4) (+ z1 z2))
+                                 (assoc! (+ i 8) (- z1 z2))
+                                 (assoc! (+ i 12) (- z0 z3)))))))
+            out (loop [i 0 acc (transient (vec (repeat 16 0)))]
+                  (if (= i 4)
+                    (persistent! acc)
+                    (let [base (* 4 i)
+                          t0 (long (nth tmp base))
+                          t1 (long (nth tmp (+ base 1)))
+                          t2 (long (nth tmp (+ base 2)))
+                          t3 (long (nth tmp (+ base 3)))
+                          z0 (+ t0 t2)
+                          z1 (- t0 t2)
+                          z2 (- (bit-shift-right t1 1) t3)
+                          z3 (+ t1 (bit-shift-right t3 1))]
+                      (recur (inc i)
+                             (-> acc
+                                 (assoc! i (bit-shift-right (+ z0 z3) 6))
+                                 (assoc! (+ i 4) (bit-shift-right (+ z1 z2) 6))
+                                 (assoc! (+ i 8) (bit-shift-right (- z1 z2) 6))
+                                 (assoc! (+ i 12) (bit-shift-right (- z0 z3) 6)))))))]
+        (loop [r 0 rows (transient [])]
+          (if (= r 4)
+            (persistent! rows)
+            (recur (inc r)
+                   (conj! rows (let [base (* r 4)]
+                                 [(nth out base) (nth out (+ base 1))
+                                  (nth out (+ base 2)) (nth out (+ base 3))])))))))))
+
+(def luma-dc-x-offset
+  "Column-group base offsets into the flattened 16-blocks*16-samples buffer
+   used by `luma-dc-hadamard`, ported from
+   `ff_h264_luma_dc_dequant_idct`'s `x_offset` table."
+  [0 32 128 160])
+
+(defn luma-dc-hadamard
+  "Inverse Hadamard transform + dequant of the Intra16x16 luma DC block
+   (H.264 §8.5.10). `dc-raster` is the 16 RAW (NOT yet dequantized — the
+   DC block's CAVLC decode in `h264.cavlc` does not apply `qmul`, matching
+   ffmpeg's split) coefficients, row-major (idx=row*4+col) after zigzag
+   unscan. `qmul` is `h264.quant/dc-qmul`.
+
+   Returns a 16-element vector indexed by the SAME luma 4x4 block index
+   (0..15) used throughout this namespace/`h264.decode`
+   (`h264.decode/blk->col-row`) — i.e. `(nth result blk-idx)` is the
+   transform-domain DC coefficient to place at position 0 of that block's
+   own 4x4 coefficient array before calling `inverse-4x4` on it. Ported
+   1:1 from `ff_h264_luma_dc_dequant_idct` (including its exact `x_offset`
+   index arithmetic) since that arithmetic IS the block-index mapping —
+   re-deriving it independently risks a subtly different (but
+   self-consistent-looking) mapping that silently mismatches ffmpeg's.
+
+   IMPORTANT internal convention, analogous to `inverse-4x4`'s own
+   documented transpose: `dc-raster` is accepted in normal row-major order
+   (matching how `h264.decode`'s zigzag-unscanned DC coefficients are
+   naturally laid out), but FFmpeg's `ff_h264_luma_dc_dequant_idct` reads
+   its `input[]` in a column-major sense relative to that (same underlying
+   reason as `inverse-4x4`'s transpose — this is a SEPARATE transform from
+   the regular 4x4 residual one, so it needed its OWN transpose, which
+   wasn't applied when this function was first ported). This went
+   undetected through the chroma-decode/multi-MB-V/H-prediction
+   development session because every fixture up to that point had luma DC
+   content that's symmetric under transpose (flat, or a single-MB gradient
+   with only one real spatial axis of variation) — no fixture had
+   multi-macroblock luma content varying by ROW (not column) with real
+   per-block DC energy to distinguish the two. It was caught by a real
+   x264-encoded multi-macroblock stream (libx264 selected Intra_16x16
+   Horizontal prediction) whose luma content varies by row: without this
+   transpose, the DC-Hadamard output varies along the WRONG screen axis
+   (by column instead of by row) regardless of which
+   `h264.decode/blk->col-row` block-index mapping is used — this bug and
+   the `blk->col-row` column-major-vs-raster bug are independent and both
+   had to be fixed together (fixing only one still fails: e.g. transposing
+   only this input, while `blk->col-row` still used its old wrong mapping,
+   produced a THIRD wrong permutation, not a partial improvement).
+   `luma-dc-hadamard` transposes internally so callers can keep passing
+   plain row-major 4x4 grids, exactly like `inverse-4x4` does."
+  [dc-raster qmul]
+  (let [dc-raster (transpose16 dc-raster)
+        in (fn [i] (nth dc-raster i))
+        tmp (vec (repeat 16 0))
+        tmp (reduce
+             (fn [acc i]
+               (let [z0 (+ (in (+ (* 4 i) 0)) (in (+ (* 4 i) 1)))
+                     z1 (- (in (+ (* 4 i) 0)) (in (+ (* 4 i) 1)))
+                     z2 (- (in (+ (* 4 i) 2)) (in (+ (* 4 i) 3)))
+                     z3 (+ (in (+ (* 4 i) 2)) (in (+ (* 4 i) 3)))]
+                 (-> acc
+                     (assoc (+ (* 4 i) 0) (+ z0 z3))
+                     (assoc (+ (* 4 i) 1) (- z0 z3))
+                     (assoc (+ (* 4 i) 2) (- z1 z2))
+                     (assoc (+ (* 4 i) 3) (+ z1 z2)))))
+             tmp (range 4))
+        t (fn [i] (nth tmp i))
+        stride 16
+        out (vec (repeat 256 0))
+        out (reduce
+             (fn [acc i]
+               (let [offset (nth luma-dc-x-offset i)
+                     z0 (+ (t (+ (* 4 0) i)) (t (+ (* 4 2) i)))
+                     z1 (- (t (+ (* 4 0) i)) (t (+ (* 4 2) i)))
+                     z2 (- (t (+ (* 4 1) i)) (t (+ (* 4 3) i)))
+                     z3 (+ (t (+ (* 4 1) i)) (t (+ (* 4 3) i)))
+                     sc (fn [v] (bit-shift-right (+ (* v qmul) 128) 8))]
+                 (-> acc
+                     (assoc (+ (* stride 0) offset) (sc (+ z0 z3)))
+                     (assoc (+ (* stride 1) offset) (sc (+ z1 z2)))
+                     (assoc (+ (* stride 4) offset) (sc (- z1 z2)))
+                     (assoc (+ (* stride 5) offset) (sc (- z0 z3))))))
+             out (range 4))]
+    (mapv #(nth out (* % 16)) (range 16))))
+
+(defn chroma-dc-hadamard
+  "Inverse 2x2 Hadamard transform + dequant of one ChromaArrayType 1
+   (4:2:0) chroma DC block (H.264 §8.5.8/§8.5.11). `dc-raster` is the 4 RAW
+   (NOT yet dequantized) coefficients, row-major (idx = row*2+col, i.e.
+   `[a b c d]` = top-left/top-right/bottom-left/bottom-right). No zigzag
+   unscan is needed here (unlike the luma DC/AC blocks) — `ff_h264_chroma_dc_scan`
+   (ffmpeg `libavcodec/h264data.c`) is the identity permutation for
+   ChromaArrayType 1, so `h264.cavlc/residual-block!`'s scan-order output
+   IS already raster order for this 2x2 block; see `h264.decode`. `qmul` is
+   `h264.quant/dc-qmul` applied to the
+   component's own QPc (`h264.quant/chroma-qp`) — same table construction
+   as luma, just a different QP input.
+
+   Returns a 4-element vector `[dc00 dc01 dc10 dc11]` (row-major, idx =
+   row*2+col) — the dequantized transform-domain DC coefficient to place
+   at position 0 of that quadrant's own 4x4 coefficient array before
+   calling `inverse-4x4` on it (mirrors `luma-dc-hadamard`'s per-block
+   output convention, but for chroma's 4 quadrants instead of 16 blocks).
+   Ported 1:1 from ffmpeg's `ff_h264_chroma_dc_dequant_idct_c`
+   (`libavcodec/h264idct_template.c`) — note this dequant has NO `+`
+   rounding bias before its final `>>7` (unlike the luma DC transform's
+   `+128`/`>>8`), which was verified against ffmpeg source rather than
+   assumed from the (superficially similar) luma case."
+  [dc-raster qmul]
+  (let [a (nth dc-raster 0) b (nth dc-raster 1)
+        c (nth dc-raster 2) d (nth dc-raster 3)
+        e (- a b)
+        a' (+ a b)
+        b' (- c d)
+        c' (+ c d)
+        sc (fn [v] (bit-shift-right (* v qmul) 7))]
+    [(sc (+ a' c')) (sc (+ e b'))
+     (sc (- a' c')) (sc (- e b'))]))
+
+;; --- encode side (Wave 3 addition, kotoba-lang/root ADR-2607122000 Migration
+;;     step 8: 量子化→変換→CAVLC→簡易モード決定 encode-side pipeline) ---
+
+(defn- row-fwd
+  "1-D 4-point forward butterfly, the textbook H.264 core forward transform
+   row/column operator (matrix [[1 1 1 1][2 1 -1 -2][1 -1 -1 1][1 -2 2 -1]]
+   applied via a fast butterfly, the standard documented dual shape of the
+   spec's inverse butterfly). Used by `forward-4x4` below."
+  [x0 x1 x2 x3]
+  (let [e0 (+ x0 x3) e1 (+ x1 x2) e2 (- x1 x2) e3 (- x0 x3)]
+    [(+ e0 e1) (+ (* 2 e3) e2) (- e0 e1) (- e3 (* 2 e2))]))
+
+(defn forward-4x4
+  "Standard H.264 core forward 4x4 integer transform (the textbook
+   encoder-side dual shape of `inverse-4x4`'s butterfly — separable
+   row-then-column application of `row-fwd`). Takes a 4x4 PIXEL-DOMAIN
+   residual grid (vector of 4 row vectors), returns the UNQUANTIZED
+   transform-domain 4x4 grid (same shape).
+
+   IMPORTANT, stated honestly rather than glossed over: this is provided
+   for API symmetry with `inverse-4x4` and for the one property this repo's
+   encoder actually relies on it for — `(get-in (forward-4x4 block) [0 0])`
+   is the block's DC (sum-of-samples) term, used by `h264.encode`'s
+   Intra16x16 luma-DC path — NOT as the numerically-exact dual of
+   `inverse-4x4` for the AC (non-DC) positions. Empirically (see ADR/session
+   notes for the probe scripts), composing this `forward-4x4` with this
+   repo's own tested `ac-qmul`/`inverse-4x4` pipeline leaves measurably MORE
+   cross-coefficient leakage (~20%) than the pipeline's OWN inherent
+   non-orthogonality (~2%, i.e. `M = Ci · diag(ac-qmul)` is not perfectly
+   diagonal even before any forward-transform choice — a real, expected
+   property of H.264's integer transform, not a bug). Rather than trust an
+   textbook-remembered pairing that measurably underperforms, `h264.encode`
+   quantizes AC coefficients by solving the EXACT linear least-squares
+   inverse of the real (already bit-exact-vs-ffmpeg-tested) `ac-qmul` +
+   `inverse-4x4` pipeline directly from pixel-domain residuals, bypassing
+   this fn for that purpose entirely. See `h264.encode`'s namespace
+   docstring for the full derivation."
+  [block]
+  (let [rows (mapv (fn [row] (vec (apply row-fwd row))) block)
+        cols (vec (for [c (range 4)] (mapv #(nth % c) rows)))
+        cols-t (mapv (fn [col] (vec (apply row-fwd col))) cols)]
+    (vec (for [r (range 4)] (vec (for [c (range 4)] (nth (nth cols-t c) r)))))))
+
+(def dc-hadamard-fwd-matrix
+  "16x16 integer matrix `H` such that the EXISTING, tested `luma-dc-hadamard`
+   (called with `qmul=256`, which makes its internal `sc` scaling the
+   identity, exposing the raw linear map) computes
+   `dc-per-block[b] = sum_p (H[b][p] * dc-raster[p])` for every unit-impulse
+   `dc-raster`. This was empirically PROBED (not hand-derived or
+   remembered) by unit-impulse-testing `luma-dc-hadamard` directly — see
+   ADR-2607122000 session notes for the probe script. Self-consistency was
+   verified programmatically: `H * H^T = 16 * I` exactly (an integer
+   identity — checked in `transform_test.clj`), proving `H` is invertible
+   with `H^-1 = H^T / 16`. `forward-luma-dc-hadamard` below uses this exact
+   inverse relationship — not a separately-derived formula — to guarantee
+   its output is the precise linear inverse of the already bit-exact-vs-
+   real-ffmpeg-verified decode path.
+
+   Re-probed (values below regenerated, not hand-edited) after
+   `luma-dc-hadamard` gained its internal `transpose16` fix
+   (multi-macroblock Horizontal-prediction desync fix, see that fn's own
+   docstring) — the probe is mechanical and platform/version-agnostic (it
+   just calls the real, current `luma-dc-hadamard`), so this matrix always
+   tracks whatever that function's CURRENT behavior actually is."
+  [[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]
+   [1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 -1]
+   [1 1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1]
+   [1 1 -1 -1 1 1 -1 -1 -1 -1 1 1 -1 -1 1 1]
+   [1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1]
+   [1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 1 -1]
+   [1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 -1 1 1 -1]
+   [1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 -1 1 -1 1]
+   [1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1]
+   [1 1 -1 -1 -1 -1 1 1 -1 -1 1 1 1 1 -1 -1]
+   [1 1 1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1]
+   [1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1 1 1]
+   [1 -1 -1 1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 1]
+   [1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 1 -1]
+   [1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1 1 -1]
+   [1 -1 1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1]])
+
+(defn- floor-div
+  "Portable floor division (integer `a`, positive integer `b`) — avoids
+   platform-specific `Math/floor` (this is a `.cljc` file, kept portable per
+   the rest of this repo's arithmetic style, which uses only `quot`/`rem`/
+   bit-shift operations, no JVM-only interop)."
+  [a b]
+  (let [q (quot a b) r (rem a b)]
+    (if (neg? r) (dec q) q)))
+
+(defn- round-half-up-frac
+  "Round the fraction `n/d` (integers, `d` positive) to the nearest integer,
+   ties rounding away from negative infinity (`floor(n/d + 1/2)`) —
+   portable, no `Math/` interop."
+  [n d]
+  (floor-div (+ (* 2 n) d) (* 2 d)))
+
+(defn forward-luma-dc-hadamard
+  "Encode-side exact dual of `luma-dc-hadamard`. `target-dc-per-block` is 16
+   values indexed by blk-idx b (SAME indexing `luma-dc-hadamard` returns —
+   i.e. index b is the desired transform-domain DC coefficient of the 4x4
+   luma block at spatial position `h264.decode/blk->col-row[b]`, typically
+   just the sum of that block's pixel-domain residual samples — see
+   `h264.encode`). `qmul` is this macroblock's `h264.quant/dc-qmul`.
+
+   Returns the 16 raw (quantized, CAVLC-ready) integer DC levels in RASTER
+   order (idx=row*4+col, BEFORE zigzag scan — matches `luma-dc-hadamard`'s
+   own `dc-raster` input convention) such that calling the real, tested
+   `luma-dc-hadamard` on the zigzag-unscanned version of these levels
+   reproduces `target-dc-per-block` up to integer rounding (this rounding
+   IS the lossy-compression quantization step, by design — not an
+   implementation defect).
+
+   Derived as the exact matrix inverse of `dc-hadamard-fwd-matrix`
+   (`H^-1 = H^T / 16`, see that def's docstring), NOT a separately
+   re-derived or memorized formula."
+  [target-dc-per-block qmul]
+  (vec (for [p (range 16)]
+         (let [s (reduce + (map (fn [b] (* (get-in dc-hadamard-fwd-matrix [b p])
+                                            (nth target-dc-per-block b)))
+                                 (range 16)))]
+           (round-half-up-frac (* 16 s) qmul)))))
+
+(def chroma-dc-hadamard-fwd-matrix
+  "4x4 integer matrix `H4` such that the EXISTING, tested `chroma-dc-hadamard`
+   (called with `qmul=128`, which makes its internal `sc` scaling the
+   identity — `(v*128)>>7 = v` exactly, no truncation, the chroma-DC analogue
+   of `dc-hadamard-fwd-matrix`'s `qmul=256` for luma) computes
+   `dc-quad[i] = sum_k (H4[i][k] * dc-raster[k])` for every unit-impulse
+   `dc-raster`. Empirically PROBED (not hand-derived), by unit-impulse-testing
+   `chroma-dc-hadamard` directly (see ADR-2607122000 chroma-encode session
+   notes): impulse at position 0 -> `[1 1 1 1]`, position 1 -> `[1 -1 1 -1]`,
+   position 2 -> `[1 1 -1 -1]`, position 3 -> `[1 -1 -1 1]` — i.e. `H4` is
+   exactly the 4x4 Sylvester Hadamard matrix, and (since `chroma-dc-hadamard`
+   applies the SAME matrix on both the row and column pass — see its own
+   `e`/`a'`/`b'`/`c'` derivation) each probed column equals the matching row,
+   so `H4` is symmetric. Self-consistency verified programmatically:
+   `H4 * H4^T = 4 * I` exactly (checked in `transform_test.clj`, the chroma
+   analogue of `dc-hadamard-fwd-matrix`'s own `16*I` check), proving `H4` is
+   invertible with `H4^-1 = H4^T/4 = H4/4` (symmetric). `forward-chroma-dc-hadamard`
+   below uses this exact inverse relationship, not a separately-derived
+   formula."
+  [[1 1 1 1]
+   [1 -1 1 -1]
+   [1 1 -1 -1]
+   [1 -1 -1 1]])
+
+(defn forward-chroma-dc-hadamard
+  "Encode-side exact dual of `chroma-dc-hadamard`. `target-dc-quad` is 4
+   values indexed b=0..3 (SAME raster indexing `chroma-dc-hadamard` returns,
+   idx=row*2+col — i.e. index b is the desired transform-domain DC
+   coefficient of the 4x4 chroma quadrant at that raster position, typically
+   just the sum of that quadrant's pixel-domain residual samples — see
+   `h264.encode`). `qmul` is this component's `h264.quant/dc-qmul` applied to
+   QPc (`h264.quant/chroma-qp`).
+
+   Returns the 4 raw (quantized, CAVLC-ready) integer DC levels in RASTER
+   order (idx=row*2+col — NO zigzag scan for chroma DC, matching
+   `chroma-dc-hadamard`'s own `dc-raster` input convention and
+   `h264.decode/decode-chroma-dc!`'s docstring on the identity scan) such
+   that calling the real, tested `chroma-dc-hadamard` on these levels
+   reproduces `target-dc-quad` up to integer rounding.
+
+   Derivation (mirrors `forward-luma-dc-hadamard`'s own derivation exactly,
+   just with the chroma-DC transform's own scale constants): decode computes
+   `out = sc(H4 * raw)` where `sc(v) = (v*qmul)>>7` (NO `+64` rounding bias,
+   unlike luma's `+128` — see `chroma-dc-hadamard`'s docstring), i.e.
+   `out ~= qmul*(H4*raw)/128`. Inverting: `raw ~= H4^-1 * out*128/qmul =
+   (H4/4) * out * (128/qmul) = H4*out*(32/qmul)` — so
+   `raw[p] = round(32 * (H4*target)[p] / qmul)`, using
+   `chroma-dc-hadamard-fwd-matrix` (symmetric, so `H4*target` and
+   `H4^T*target` are the same computation) via exact integer rounding
+   (`round-half-up-frac`, the same portable ties-away-from-negative-infinity
+   rounding `forward-luma-dc-hadamard` uses — no `Math/` interop)."
+  [target-dc-quad qmul]
+  (vec (for [p (range 4)]
+         (let [s (reduce + (map (fn [k] (* (get-in chroma-dc-hadamard-fwd-matrix [p k])
+                                            (nth target-dc-quad k)))
+                                 (range 4)))]
+           (round-half-up-frac (* 32 s) qmul)))))
+
+(defrecord H264BlockTransform []
+  cp-transform/BlockTransform
+  (forward [_ block] (forward-4x4 block))
+  (inverse [_ coeffs] (inverse-4x4 coeffs)))
+
+(def block-transform
+  "Shared `codec-primitives.transform/BlockTransform` instance."
+  (->H264BlockTransform))

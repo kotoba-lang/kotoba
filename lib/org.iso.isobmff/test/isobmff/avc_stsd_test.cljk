@@ -1,0 +1,302 @@
+(ns isobmff.avc-stsd-test
+  "Tests for `isobmff.mux/avcc`/`avc-stsd`/`avc-track` — the video counterpart of
+   `aac-stsd`, and the last thing between `kotoba-lang/org-iso-h264`'s encoder and
+   an MP4 that carries its output (`com-junkawasaki/root` ADR-2800002800).
+
+   Two independent references, same as the audio side:
+
+   1. **Real ffmpeg's own boxes.** `av_sample.mp4` contains an `avc1`/`avcC` that
+      ffmpeg wrote. `avcc-is-byte-identical-to-ffmpegs` feeds ffmpeg's OWN
+      parameter sets back through this writer and requires the same bytes out —
+      not merely the same fields. That is achievable here (unlike the AAC case,
+      where ffmpeg appends an optional SBR sync extension) and is therefore the
+      strongest available statement about the record's layout.
+   2. **A parser written separately from the writer**, which also has to read
+      ffmpeg's bytes, so a writer/reader pair agreeing on a wrong layout is
+      caught.
+
+   ## The part that is easy to get silently wrong
+
+   Not the boxes — the SAMPLES. MP4 carries length-prefixed NAL units, not the
+   Annex B start codes an encoder emits, and the parameter sets belong to `avcC`
+   rather than to the samples. A muxer that copied Annex B into `mdat` produces a
+   file that parses, reports the right codec and resolution, and decodes to
+   nothing. `annexb->sample` is tested on its own for exactly that reason.
+
+   ## `avc_video.mp4`
+
+   Built by the pipeline this box exists to enable — `org-iso-h264`'s encoder ->
+   `avc-track` -> `mux` — and verified with real ffmpeg: `ffprobe` reports
+   `Video: h264 (Baseline) (avc1 / 0x31637661), yuv420p, 128x96, 30 fps`, and
+   `ffmpeg -i avc_video.mp4 -f rawvideo` returns YUV **byte-identical** to
+   decoding the same access units as a raw Annex B stream, so the container
+   contributes no error. Committed as the bytes ffmpeg accepted; regenerating it
+   needs org-iso-h264's ENCODER, which this repo does not depend on (it depends
+   on the SPS parser only), so it is a fixture rather than a test step.
+
+   ffmpeg additionally writes `pasp` and `btrt` boxes inside its sample entry.
+   Both are optional and this writer omits them; the test asserts ffmpeg has them
+   so that difference stays a known one."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [isobmff.box :as box]
+            [isobmff.bytes :as b]
+            [isobmff.demux :as demux]
+            [isobmff.mux :as mux]))
+
+(defn- rd-bytes [p]
+  (mapv #(bit-and (int %) 0xff)
+        #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+           :cljs (js->clj (.readFileSync (js/require "fs")
+                                         (str "lib/org.iso.isobmff/resources/" p))))))
+
+;; --- a parser written independently of the writer ------------------------
+
+(defn- visual-sample-entry
+  "Pull the `avc1` fields out of a whole stsd box."
+  [stsd]
+  (let [e 16]                                  ; size+type+version/flags+entry_count
+    {:fourcc (b/ascii4 stsd (+ e 4))
+     :data-reference-index (b/u16 stsd (+ e 14))
+     :width (b/u16 stsd (+ e 32))
+     :height (b/u16 stsd (+ e 34))
+     :horizresolution (b/u32 stsd (+ e 36))
+     :vertresolution (b/u32 stsd (+ e 40))
+     :frame-count (b/u16 stsd (+ e 48))
+     :compressor-name (let [n (b/u8 stsd (+ e 50))]
+                        (apply str (map #(char (b/u8 stsd (+ e 51 %))) (range n))))
+     :depth (b/u16 stsd (+ e 82))
+     :child-start (+ e 86)}))
+
+(defn- child-boxes
+  "Box types and ranges inside the sample entry, after the fixed fields."
+  [stsd]
+  (let [{:keys [child-start]} (visual-sample-entry stsd)]
+    (loop [i child-start acc []]
+      (if (>= i (count stsd))
+        acc
+        (let [size (b/u32 stsd i)
+              t (b/ascii4 stsd (+ i 4))]
+          (if (or (zero? size) (> (+ i size) (count stsd)))
+            acc
+            (recur (+ i size) (conj acc {:type t :start i :end (+ i size)}))))))))
+
+(defn- box-of [stsd type]
+  (when-let [{:keys [start end]} (first (filter #(= type (:type %)) (child-boxes stsd)))]
+    (subvec stsd start end)))
+
+(defn- parse-avcc
+  "Parse a whole `avcC` box into its fields, including the parameter sets."
+  [bs]
+  (let [p 8                                    ; size + type
+        sps-count (bit-and (b/u8 bs (+ p 5)) 0x1f)
+        sps-len (b/u16 bs (+ p 6))
+        sps-start (+ p 8)
+        sps-end (+ sps-start sps-len)
+        pps-count (b/u8 bs sps-end)
+        pps-len (b/u16 bs (inc sps-end))
+        pps-start (+ sps-end 3)]
+    {:configuration-version (b/u8 bs p)
+     :profile (b/u8 bs (+ p 1))
+     :profile-compatibility (b/u8 bs (+ p 2))
+     :level (b/u8 bs (+ p 3))
+     :length-size-minus-one (bit-and (b/u8 bs (+ p 4)) 0x03)
+     :reserved-bits-set? (= 0xFC (bit-and (b/u8 bs (+ p 4)) 0xFC))
+     :sps-count sps-count
+     :pps-count pps-count
+     :sps (subvec bs sps-start sps-end)
+     :pps (subvec bs pps-start (+ pps-start pps-len))
+     :trailing (- (count bs) (+ pps-start pps-len))}))
+
+(defn- ffmpeg-video-stsd []
+  (let [d (demux/demux (rd-bytes "isobmff/fixtures/av_sample.mp4"))]
+    (:stsd (first (filter #(= "vide" (:handler %)) (:tracks d))))))
+
+;; --- cross-validation against ffmpeg ------------------------------------
+
+(deftest avcc-is-byte-identical-to-ffmpegs
+  (testing "given ffmpeg's OWN parameter sets, this writer produces ffmpeg's exact avcC bytes"
+    (let [theirs (box-of (ffmpeg-video-stsd) "avcC")
+          parsed (parse-avcc theirs)
+          ours (mux/avcc {:sps (:sps parsed) :pps (:pps parsed)})]
+      (testing "the fixture really is a Baseline AVC track with one SPS and one PPS"
+        (is (= 1 (:configuration-version parsed)))
+        (is (= 66 (:profile parsed)) "Baseline")
+        (is (= 1 (:sps-count parsed)))
+        (is (= 1 (:pps-count parsed)))
+        (is (= 3 (:length-size-minus-one parsed)) "4-byte NAL length prefixes")
+        (is (true? (:reserved-bits-set? parsed)))
+        (is (zero? (:trailing parsed)) "no profile-dependent extension on Baseline"))
+      (is (= theirs ours)))))
+
+(deftest profile-and-level-come-from-the-sps-not-from-arguments
+  (testing "a configuration record that disagreed with the SPS it carries would be the decoder's problem, so they are read out of it"
+    (let [sps [0x67 66 0xC0 30 0xAA 0xBB]
+          parsed (parse-avcc (mux/avcc {:sps sps :pps [0x68 0x01 0x02]}))]
+      (is (= 66 (:profile parsed)))
+      (is (= 0xC0 (:profile-compatibility parsed)))
+      (is (= 30 (:level parsed)))
+      (is (= sps (:sps parsed)))))
+  (testing "a High-profile SPS needs an extension this writer does not emit, so it refuses rather than truncating"
+    (doseq [high [100 110 122 144]]
+      (is (thrown? js/Error
+                   (mux/avcc {:sps [0x67 high 0 30] :pps [0x68 1]})))))
+  (testing "and parameter sets are not optional"
+    (is (thrown? js/Error (mux/avcc {:sps [0x67 66 0 30]})))
+    (is (thrown? js/Error (mux/avcc {:pps [0x68 1]})))
+    (is (thrown? js/Error (mux/avcc {:sps [0x67 66] :pps [0x68 1]}))
+        "an SPS too short to read profile/level from")))
+
+(deftest matches-the-avc1-fields-ffmpeg-writes
+  (let [theirs (visual-sample-entry (ffmpeg-video-stsd))
+        their-avcc (parse-avcc (box-of (ffmpeg-video-stsd) "avcC"))
+        ours (visual-sample-entry (mux/avc-stsd {:width (:width theirs)
+                                                 :height (:height theirs)
+                                                 :sps (:sps their-avcc)
+                                                 :pps (:pps their-avcc)}))]
+    (testing "the fixture is the 64x48 video track this comparison assumes"
+      (is (= "avc1" (:fourcc theirs)))
+      (is (= 64 (:width theirs)))
+      (is (= 48 (:height theirs))))
+    (testing "every field this writer sets matches ffmpeg's, except compressorname which names the encoder that made the samples"
+      (is (= (dissoc theirs :compressor-name :child-start)
+             (dissoc ours :compressor-name :child-start)))
+      (is (= 0x00480000 (:horizresolution ours)) "72 dpi, as ffmpeg writes")
+      (is (= 24 (:depth ours)))
+      (is (= 1 (:frame-count ours)))
+      (is (not= (:compressor-name theirs) (:compressor-name ours)))))
+  (testing "ffmpeg also writes optional pasp/btrt boxes that this writer omits — a known difference, not a suspected bug"
+    (let [theirs (set (map :type (child-boxes (ffmpeg-video-stsd))))
+          ours (set (map :type (child-boxes (mux/avc-stsd {:width 64 :height 48
+                                                          :sps [0x67 66 0 30] :pps [0x68 1]}))))]
+      (is (contains? theirs "pasp"))
+      (is (contains? theirs "btrt"))
+      (is (= #{"avcC"} ours))))
+  (testing "dimensions are required — a 0x0 video track gives a player nothing to size the picture from"
+    (is (thrown? js/Error
+                 (mux/avc-stsd {:height 48 :sps [0x67 66 0 30] :pps [0x68 1]})))
+    (is (thrown? js/Error
+                 (mux/avc-stsd {:width 64 :sps [0x67 66 0 30] :pps [0x68 1]})))))
+
+;; --- samples: the part that silently produces an undecodable file --------
+
+(deftest annexb-to-sample-drops-parameter-sets-and-prefixes-lengths
+  (let [sps [0x67 66 0 30]
+        pps [0x68 1 2]
+        idr (vec (concat [0x65] (repeat 9 0xAA)))
+        slice (vec (concat [0x41] (repeat 4 0xBB)))]
+    (testing "parameter sets are dropped — in MP4 they live in avcC, and a decoder reading them from a sample would be reading them twice"
+      (is (= (vec (concat [0 0 0 10] idr))
+             (mux/annexb->sample [sps pps idr]))))
+    (testing "every remaining NAL gets its own 4-byte length prefix"
+      (is (= (vec (concat [0 0 0 10] idr [0 0 0 5] slice))
+             (mux/annexb->sample [idr slice]))))
+    (testing "an access unit of nothing but parameter sets yields no sample at all"
+      (is (nil? (mux/annexb->sample [sps pps])))
+      (is (nil? (mux/annexb->sample []))))
+    (testing "no start codes survive: the length of every sample is the sum of its NALs plus 4 bytes each"
+      (let [s (mux/annexb->sample [idr slice])]
+        (is (= (+ (count idr) (count slice) 8) (count s)))))))
+
+(deftest avc-track-shape
+  (let [sps [0x67 66 0 30] pps [0x68 1]
+        idr [0x65 1 2 3] p1 [0x41 4 5] p2 [0x41 6]
+        t (mux/avc-track {:access-units [[sps pps idr] [p1] [p2]]
+                          :sps sps :pps pps :width 32 :height 16
+                          :timescale 30000 :sample-duration 1000})]
+    (testing "a video track, so mux picks vmhd"
+      (is (= "vide" (:handler t))))
+    (testing "one sample per access unit, parameter sets excluded from the first"
+      (is (= 3 (count (:samples t))))
+      ;; each sample is its NALs plus a 4-byte length prefix each: the 4-byte
+      ;; IDR, the 3-byte P slice, the 2-byte P slice
+      (is (= [8 7 6] (mapv :size (:samples t)))))
+    (testing "durations are the caller's — nothing in the bitstream states a frame rate"
+      (is (= 30000 (:timescale t)))
+      (is (= [1000 1000 1000] (mapv :duration (:samples t)))))
+    (testing "an access unit containing an IDR is a sync sample; a P slice is not"
+      (is (= [true false false] (mapv :keyframe (:samples t)))))
+    (testing "the caller can override sync-sample detection"
+      (let [t2 (mux/avc-track {:access-units [[idr] [p1] [p2]] :sps sps :pps pps
+                               :width 32 :height 16 :keyframes (fn [i] (even? i))})]
+        (is (= [true false true] (mapv :keyframe (:samples t2))))))
+    (testing "dimensions reach the track map, so tkhd can carry them"
+      (is (= 32 (:width t)))
+      (is (= 16 (:height t))))
+    (testing "an input with no codeable access units fails rather than producing an empty track"
+      (is (thrown? js/Error
+                   (mux/avc-track {:access-units [[sps pps]] :sps sps :pps pps
+                                   :width 32 :height 16}))))))
+
+(deftest tkhd-carries-dimensions-for-video-and-stays-zero-otherwise
+  (let [sps [0x67 66 0 30] pps [0x68 1]
+        mp4 (mux/mux {:timescale 30000
+                      :tracks [(mux/avc-track {:access-units [[[0x65 1 2 3]]]
+                                               :sps sps :pps pps :width 32 :height 16
+                                               :timescale 30000})]})
+        ;; tkhd's width/height are the last 8 bytes of its payload, 16.16 fixed
+        find-tkhd (fn [bs]
+                    (loop [i 0]
+                      (cond (>= i (- (count bs) 8)) nil
+                            (= "tkhd" (b/ascii4 bs (+ i 4))) (let [size (b/u32 bs i)]
+                                                               (subvec bs i (+ i size)))
+                            :else (recur (inc i)))))
+        tkhd (find-tkhd mp4)]
+    (testing "a video track's declared dimensions reach tkhd"
+      (is (some? tkhd))
+      (is (= 32 (b/u16 tkhd (- (count tkhd) 8))))
+      (is (= 16 (b/u16 tkhd (- (count tkhd) 4)))))
+    (testing "a track that declares none still writes 0, so remux output is unchanged"
+      (let [audio (mux/mux {:timescale 1000
+                            :tracks [{:track-id 1 :handler "soun" :timescale 1000
+                                      :stsd (mux/minimal-stsd "mp4a")
+                                      :samples [{:bytes [1 2 3] :size 3 :duration 100 :keyframe true}]}]})
+            t (find-tkhd audio)]
+        (is (zero? (b/u16 t (- (count t) 8))))
+        (is (zero? (b/u16 t (- (count t) 4))))))))
+
+;; --- the MP4 ffmpeg actually decoded ------------------------------------
+
+(deftest reproduces-the-stsd-of-the-mp4-ffmpeg-decoded
+  (let [file (rd-bytes "isobmff/fixtures/avc_video.mp4")
+        d (demux/demux file)
+        track (first (:tracks d))
+        stsd (:stsd track)
+        entry (visual-sample-entry stsd)
+        parsed (parse-avcc (box-of stsd "avcC"))]
+    (testing "one 128x96 Baseline AVC track of 6 access units, only the first a sync sample"
+      (is (= 1 (count (:tracks d))))
+      (is (= "vide" (:handler track)))
+      (is (= 6 (count (:samples track))))
+      (is (= 1 (count (filter :keyframe (:samples track)))))
+      (is (= "avc1" (:fourcc entry)))
+      (is (= 128 (:width entry)))
+      (is (= 96 (:height entry)))
+      (is (= 66 (:profile parsed)))
+      (is (= "kotoba-lang/org-iso-h264" (:compressor-name entry))))
+    (testing "every sample's length prefixes account for exactly its bytes — no start code slipped through"
+      (doseq [s (:samples track)]
+        (let [bs (:bytes s)]
+          (loop [i 0 n 0]
+            (if (>= i (count bs))
+              (is (pos? n) "at least one NAL per sample")
+              (let [len (b/u32 bs i)]
+                (is (pos? len))
+                (is (<= (+ i 4 len) (count bs)) "a NAL length ran past the sample")
+                (recur (+ i 4 len) (inc n))))))))
+    (testing "this writer still regenerates that exact stsd from the parameter sets inside it"
+      (is (= stsd (mux/avc-stsd {:width (:width entry) :height (:height entry)
+                                 :sps (:sps parsed) :pps (:pps parsed)}))))
+    (testing "and muxing the demuxed track back reproduces the file"
+      (is (= file (mux/mux {:timescale (:timescale track)
+                            :tracks [(assoc track :width (:width entry) :height (:height entry))]}))))))
+
+(deftest generated-boxes-are-structurally-valid
+  (testing "the generated stsd parses as boxes, so a strict reader finds an avc1 with an avcC child"
+    (let [stsd (mux/avc-stsd {:width 640 :height 360
+                              :sps [0x67 66 0xC0 40 1 2 3] :pps [0x68 0xCE 1]})
+          boxes (box/parse-boxes stsd 0 (count stsd))]
+      (is (= ["stsd"] (mapv :type boxes)))
+      (is (= (count stsd) (:size (first boxes))))
+      (is (= 640 (:width (visual-sample-entry stsd))))
+      (is (= ["avcC"] (mapv :type (child-boxes stsd)))))))

@@ -1,0 +1,112 @@
+;; test/stat_test.cljk -- build the command and compare it with the system
+;; stat, byte for byte, on stdout, stderr AND exit status.
+;;
+;;   AMU_HOME=<amu checkout> kbb --backend sci test/stat_test.cljk
+(ns stat-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args) (clj->js (merge {:encoding "buffer"} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-stat "/usr/bin/stat")
+
+;; Files with KNOWN sizes, modes and mtimes (set with utimes), so %m is a
+;; number the suite can predict and not whatever the clock said.
+(def fixtures
+  {"abc" {:content "abc" :mode 0644 :mtime 1700000000}
+   "empty" {:content "" :mode 0600 :mtime 0}
+   "exec" {:content "#!/bin/sh\n" :mode 0755 :mtime 951782400}
+   "big" {:content (.repeat "x" 100000) :mode 0644 :mtime 4102444800}})
+
+(def cases
+  [["-f" "%z" "abc"] ["-f" "%z" "empty"] ["-f" "%z" "big"]
+   ["-f" "%m" "abc"] ["-f" "%m" "empty"] ["-f" "%m" "exec"] ["-f" "%m" "big"]
+   ["-f" "%N" "abc"] ["-f" "%p" "abc"] ["-f" "%p" "exec"] ["-f" "%p" "empty"] ["-f" "%p" "dir"]
+   ["-f" "%z %m" "abc"] ["-f" "%N: %z bytes, %m" "exec"] ["-f" "%%|%z|%%" "abc"]
+   ["-f" "%z" "abc" "exec" "big"]
+   ["-f" "%z" "missing"] ["-f" "%z" "abc" "missing" "exec"]
+   ["-f" "%z" "dir"] ["-f" "%m" "dir"]])
+
+(def divergences
+  [{:argv ["-f" "%Sm" "abc"] :out "" :exit 1
+    :err "stat: only %z %m %N %p %% are supported (%S... needs the zone database)\n"}
+   {:argv ["-f" "%u" "abc"] :out "" :exit 1
+    :err "stat: only %z %m %N %p %% are supported (%S... needs the zone database)\n"}
+   {:argv ["abc"] :out "" :exit 1
+    :err "stat: the default line needs uid names, device numbers and local times this build cannot read; use -f\n"}
+   {:argv ["-c" "%Y" "abc"] :out "" :exit 1 :err "stat: -c is GNU stat; this is BSD stat, use -f\n"}
+   {:argv ["-f" "%z"] :out "" :exit 1 :err "stat: -f needs a format and at least one file\n"}])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs system-stat) (refuse (str "no " system-stat)))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-stat-"))
+        src (.resolve path (.cwd js/process) "stat" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "stat.kexe")
+        blob (.join path tmp "stat.bin")
+        exe (.join path tmp "stat")
+        data (.join path tmp "data")]
+    (.mkdirSync fs data)
+    (doseq [[name {:keys [content mode mtime]}] fixtures]
+      (let [f (.join path data name)]
+        (.writeFileSync fs f content "utf8")
+        (.chmodSync fs f mode)
+        (.utimesSync fs f mtime mtime)))
+    (.mkdirSync fs (.join path data "dir"))
+    (.utimesSync fs (.join path data "dir") 1700000000 1700000000)
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free" "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c)) (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          offset (second (re-find #":offset (\d+)" (str (:out e))))]
+      (when-not offset (refuse "no :offset in the extract report"))
+      (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                           "--allow" "35,37,38,39" "--fs-scope" (.realpathSync fs data) "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+    (let [real (.realpathSync fs data)
+          argv-of (fn [names] (vec (map-indexed (fn [i a] (cond (str/starts-with? a "-") a
+                                                                (and (>= i 1) (str/starts-with? (nth names (dec i)) "-")) a
+                                                                :else (.join path real a))) names)))
+          b64 (fn [buf] (.toString buf "base64"))
+          results
+          (for [names cases]
+            (let [argv (argv-of names)
+                  k (run exe argv {})
+                  s (run system-stat argv {})
+                  same? (and (= (b64 (:out k)) (b64 (:out s))) (= (b64 (:err k)) (b64 (:err s)))
+                             (= (:status k) (:status s)))]
+              {:argv names :ok same? :kotoba (.toString (:out k) "utf8") :system (.toString (:out s) "utf8")
+               :kotoba-err (.toString (:err k) "utf8") :system-err (.toString (:err s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          div-results
+          (for [d divergences]
+            (let [k (run exe (argv-of (:argv d)) {})
+                  ok? (and (= (.toString (:out k) "utf8") (:out d)) (= (.toString (:err k) "utf8") (:err d))
+                           (= (:status k) (:exit d)))]
+              {:argv [(:argv d) :divergence] :ok ok? :kotoba (.toString (:out k) "utf8") :system "(not compared)"
+               :kotoba-err (.toString (:err k) "utf8") :system-err (:err d) :exit [(:status k) (:exit d)]}))
+          all (concat results div-results)
+          bad (remove :ok all)]
+      (doseq [r all]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r)) " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-stat " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r)) " stderr " (pr-str (:kotoba-err r)) " vs " (pr-str (:system-err r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count all) :compared (count results) :divergences (count div-results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

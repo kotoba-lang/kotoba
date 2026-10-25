@@ -1,0 +1,324 @@
+(ns av1.encode-test
+  "End-to-end validation of av1.encode/encode-keyframe (2026-07 AV1 encode
+   task, ADR-2607122000 Migration step 9 continuation -- \"AV1 encode
+   side\", the mirror image of this repo's decode-side pixel-
+   reconstruction milestones): a single monochrome 32x32 KEY_FRAME, one
+   BLOCK_32X32/PARTITION_NONE/DC_PRED/TX_32X32/DCT_DCT leaf.
+
+   Validation strategy (matching the H.264 sibling repo's own
+   decode->encode task methodology, and this repo's own decode-side
+   \"real bitstream + independent decoder, bit-exact, no tolerance\"
+   practice):
+
+     1. Round-trip: this repo's OWN decoder (av1.decode-block, already
+        validated against real aomenc/SVT-AV1 streams) decodes THIS
+        repo's own encoder's output and must reproduce the target pixels
+        exactly for flat/low-frequency content (SSD=0), and closely for
+        busier content (small, expected lossy-transform-coding error).
+     2. REAL independent decoder (dav1d, via checked-in fixtures --
+        `test/av1/fixtures.cljk`'s `encode-keyframe-32x32-*-bytes`/
+        `-golden-yuv` pairs): this repo's own decode of the CHECKED-IN
+        `.obu` fixture must be bit-exact (no tolerance) against the
+        CHECKED-IN `dav1d.yuv` golden output -- the single most important
+        check for this task (does dav1d, a real independent AV1 decoder,
+        actually accept and correctly decode this repo's own encoder's
+        bitstream). See test/av1/fixtures.cljk's docstrings for the exact
+        `dav1d`/`aomdec` invocations used to produce these fixtures, and
+        for `aomdec`'s independent cross-check of the same `.obu` files.
+     3. Determinism: re-running `av1.encode/encode-keyframe` with the same
+        arguments used to generate each checked-in fixture reproduces the
+        checked-in `.obu` bytes EXACTLY -- confirms the fixtures aren't
+        stale (drifted from the current encoder) and that encoding is
+        deterministic (no hidden randomness/nondeterministic map-ordering
+        dependency)."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [av1.bitreader :as br]
+            [av1.obu :as obu]
+            [av1.sequence-header :as sh]
+            [av1.frame-header :as fh]
+            [av1.tile-group :as tg]
+            [av1.decode-block :as db]
+            [av1.encode :as enc]
+            [av1.fixtures :as fixtures]))
+
+(defn- find-obu [bytes type-kw]
+  (loop [r (br/make-reader bytes)]
+    (let [o (obu/parse-obu r)]
+      (cond
+        (= type-kw (get-in o [:header :obu-type-kw])) o
+        (>= (:payload-end o) (* 8 (count bytes))) nil
+        :else (recur (obu/seek r (:payload-end o)))))))
+
+(defn- decode-luma-plane
+  "Parses `bytes` end-to-end via this repo's own decode side (sequence
+   header -> frame header -> tile_group_obu -> decode_partition ->
+   decode_block, av1.decode-block/make-decode-block-fn wired in) and
+   returns the flat row-major reconstructed luma plane."
+  [bytes]
+  (let [seq-obu (find-obu bytes :obu-sequence-header)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obu (find-obu bytes :obu-frame)
+        frame-hdr0 (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+        decode-block-fn (db/make-decode-block-fn frame-hdr0 seq-hdr)
+        result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+        tile (first (:tiles (:tile-group result)))]
+    (:luma-plane (:final-tile-state tile))))
+
+(defn- decode-all-planes
+  "Chroma encode extension (ADR-2607122000 Migration step 9 continuation):
+   same as `decode-luma-plane` above, but also returns `:u-plane`/
+   `:v-plane` for a color (`mono_chrome=0`) frame."
+  [bytes]
+  (let [seq-obu (find-obu bytes :obu-sequence-header)
+        seq-hdr (sh/parse (:reader-at-payload seq-obu))
+        frame-obu (find-obu bytes :obu-frame)
+        frame-hdr0 (fh/parse (:reader-at-payload frame-obu) seq-hdr)
+        decode-block-fn (db/make-decode-block-fn frame-hdr0 seq-hdr)
+        result (tg/parse-frame-obu frame-obu seq-hdr {:decode-block-fn decode-block-fn})
+        tile (first (:tiles (:tile-group result)))
+        st (:final-tile-state tile)]
+    {:luma-plane (:luma-plane st) :u-plane (:u-plane st) :v-plane (:v-plane st)
+     :seq-hdr seq-hdr :frame-hdr frame-hdr0}))
+
+(defn- ssd [a b] (reduce + (map (fn [x y] (let [d (- x y)] (* d d))) a b)))
+(defn- max-abs-diff [a b] (apply max (map (fn [x y] (abs (- (long x) (long y)))) a b)))
+
+(defn- bytes->unsigned-vec
+  "java.io.InputStream bytes come back as a Java byte[] (signed);
+   fixtures.clj's `load-resource` returns that raw byte[] -- normalize to
+   unsigned 0-255 ints for pixel comparison against this repo's own
+   0-255 luma-plane vectors."
+  [^bytes raw]
+  (mapv #(bit-and % 0xff) raw))
+
+;; ---------------------------------------------------------------------
+;; 1. Round-trip against the ORIGINAL target pixels (not the checked-in
+;;    fixture -- this exercises av1.encode/encode-keyframe fresh, end to
+;;    end, every test run).
+
+(deftest flat-skip-roundtrip-test
+  (testing "a flat 128 (== DC_PRED's no-neighbors predicted value exactly)
+            32x32 frame, encoded with skip=1 (no residual), decodes back
+            to the target EXACTLY"
+    (let [target (vec (repeat 1024 128))
+          bytes (enc/encode-keyframe target 100 {:skip? true})
+          decoded (decode-luma-plane bytes)]
+      (is (= target decoded)))))
+
+(deftest flat-dc-only-roundtrip-test
+  (testing "a flat (non-128) 32x32 frame, encoded with a real (non-skip)
+            DC-only residual, decodes back to the target EXACTLY (a
+            constant residual is exactly the DC basis function -- no
+            quantization error possible for a single coefficient at a
+            reasonable quantizer)"
+    (doseq [v [90 138 200]]
+      (let [target (vec (repeat 1024 v))
+            bytes (enc/encode-keyframe target 100 {:skip? false})
+            decoded (decode-luma-plane bytes)]
+        (is (= target decoded) (str "flat " v " did not round-trip exactly"))))))
+
+(deftest gradient-small-lossy-error-test
+  (testing "a smooth low-frequency sinusoid round-trips with small
+            (expected, normal lossy-transform-coding) error at a moderate
+            quantizer"
+    (let [target (vec (for [_y (range 32) x (range 32)]
+                        (int (+ 128 (* 20 (Math/sin (* 2 Math/PI (/ x 32.0))))))))
+          bytes (enc/encode-keyframe target 60 {:skip? false})
+          decoded (decode-luma-plane bytes)]
+      (is (<= (max-abs-diff target decoded) 3))
+      (is (< (ssd target decoded) 500)))))
+
+(deftest negative-residual-sign-test
+  (testing "a dark (below-128, negative-residual) flat frame exercises the
+            dc_sign symbol's negative branch and round-trips exactly"
+    (let [target (vec (repeat 1024 40))
+          bytes (enc/encode-keyframe target 80 {:skip? false})
+          decoded (decode-luma-plane bytes)]
+      (is (= target decoded)))))
+
+;; ---------------------------------------------------------------------
+;; 2. REAL independent decoder (dav1d) validation via checked-in fixtures
+;;    -- see test/av1/fixtures.cljk's docstrings for exactly how each
+;;    `.obu`/`.dav1d.yuv` pair was produced (this repo's own encoder, then
+;;    real `dav1d`/cross-checked against real `aomdec`).
+
+(deftest dav1d-bit-exact-flat-test
+  (testing "encode-keyframe-32x32-flat: this repo's own decode of its own
+            checked-in encoder output is bit-exact against dav1d's
+            independent decode of the SAME bitstream"
+    (let [our-decoded (decode-luma-plane (fixtures/encode-keyframe-32x32-flat-bytes))
+          dav1d-decoded (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-flat-golden-yuv))]
+      (is (= our-decoded dav1d-decoded))
+      (is (= our-decoded (vec (repeat 1024 128)))))))
+
+(deftest dav1d-bit-exact-dc-test
+  (testing "encode-keyframe-32x32-dc: bit-exact against dav1d, AND exactly
+            matches the original target (170) -- a pure-DC residual has
+            no quantization loss at this quantizer"
+    (let [our-decoded (decode-luma-plane (fixtures/encode-keyframe-32x32-dc-bytes))
+          dav1d-decoded (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-dc-golden-yuv))]
+      (is (= our-decoded dav1d-decoded))
+      (is (= our-decoded (vec (repeat 1024 170)))))))
+
+(deftest dav1d-bit-exact-gradient-test
+  (testing "encode-keyframe-32x32-gradient: bit-exact against dav1d (real
+            multi-coefficient AC residual, several coeff_base/
+            coeff_base_eob symbols)"
+    (let [our-decoded (decode-luma-plane (fixtures/encode-keyframe-32x32-gradient-bytes))
+          dav1d-decoded (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-gradient-golden-yuv))]
+      (is (= our-decoded dav1d-decoded)))))
+
+(deftest dav1d-bit-exact-busy-golomb-test
+  (testing "encode-keyframe-32x32-busy: bit-exact against dav1d -- this
+            fixture's quantized coefficients include several with
+            |value| > 14 (confirmed in test/av1/fixtures.cljk's docstring),
+            so this is the regression test for av1.encode-block/
+            write-golomb specifically (the coeff_br continuation loop's
+            full-4-iteration 'maxed out' escape path)"
+    (let [our-decoded (decode-luma-plane (fixtures/encode-keyframe-32x32-busy-bytes))
+          dav1d-decoded (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-busy-golden-yuv))]
+      (is (= our-decoded dav1d-decoded)))))
+
+;; ---------------------------------------------------------------------
+;; 1b. CHROMA (Cb/Cr) round-trip against ORIGINAL target pixels (chroma
+;;     encode extension, ADR-2607122000 Migration step 9 continuation --
+;;     see av1.encode namespace docstring's chroma section). Same
+;;     methodology as section 1 above, extended to all three planes.
+
+(deftest color-flat-skip-roundtrip-test
+  (testing "a flat 128 Y/Cb/Cr 32x32 4:2:0 color frame, encoded with
+            skip=1 (no residual on any plane), decodes back to the target
+            EXACTLY on all three planes"
+    (let [y (vec (repeat 1024 128)) cb (vec (repeat 256 128)) cr (vec (repeat 256 128))
+          bytes (enc/encode-keyframe y 100 {:skip? true :cb cb :cr cr})
+          {:keys [luma-plane u-plane v-plane frame-hdr seq-hdr]} (decode-all-planes bytes)]
+      (is (= 0 (:mono-chrome seq-hdr)))
+      (is (= 3 (:num-planes frame-hdr)))
+      (is (= 1 (:subsampling-x seq-hdr)))
+      (is (= 1 (:subsampling-y seq-hdr)))
+      (is (= y luma-plane))
+      (is (= cb u-plane))
+      (is (= cr v-plane)))))
+
+(deftest color-gradient-small-lossy-error-test
+  (testing "a smooth luma sinusoid + linear Cb/Cr ramps round-trip with
+            small (expected, normal lossy-transform-coding) error at a
+            moderate quantizer -- genuinely different profiles per plane
+            so a plane-buffer/delta/cdf mixup would show up as a wrong (not
+            coincidentally-right) reconstruction"
+    (let [y (vec (for [_y (range 32) x (range 32)]
+                   (int (+ 128 (* 20 (Math/sin (* 2 Math/PI (/ x 32.0))))))))
+          cb (vec (for [_y (range 16) x (range 16)] (int (+ 100 (* 24 (/ x 15.0))))))
+          cr (vec (for [y (range 16) _x (range 16)] (int (+ 160 (* 18 (/ y 15.0))))))
+          bytes (enc/encode-keyframe y 60 {:skip? false :cb cb :cr cr})
+          {:keys [luma-plane u-plane v-plane]} (decode-all-planes bytes)]
+      (is (<= (max-abs-diff y luma-plane) 3))
+      (is (<= (max-abs-diff cb u-plane) 3))
+      (is (<= (max-abs-diff cr v-plane) 3))
+      (is (< (ssd y luma-plane) 500))
+      (is (< (ssd cb u-plane) 500))
+      (is (< (ssd cr v-plane) 500)))))
+
+(deftest color-cb-cr-mismatch-rejected-test
+  (testing ":cb without :cr (or vice versa) is rejected rather than
+            silently encoding monochrome or crashing uncontrolled"
+    (is (thrown? Exception (enc/encode-keyframe (vec (repeat 1024 128)) 100 {:cb (vec (repeat 256 128))})))
+    (is (thrown? Exception (enc/encode-keyframe (vec (repeat 1024 128)) 100 {:cr (vec (repeat 256 128))})))))
+
+;; ---------------------------------------------------------------------
+;; 2b. REAL independent decoder (dav1d/aomdec) validation for COLOR
+;;     fixtures -- see test/av1/fixtures.cljk's docstrings for exactly how
+;;     each `encode-keyframe-32x32-color-*.obu`/`.dav1d.yuv` pair was
+;;     produced.
+
+(deftest dav1d-bit-exact-color-flat-test
+  (testing "encode-keyframe-32x32-color-flat: this repo's own decode of
+            its own checked-in COLOR encoder output is bit-exact (all
+            three planes) against dav1d's independent decode"
+    (let [{:keys [luma-plane u-plane v-plane]} (decode-all-planes (fixtures/encode-keyframe-32x32-color-flat-bytes))
+          golden (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-color-flat-golden-yuv))
+          golden-y (subvec golden 0 1024) golden-u (subvec golden 1024 1280) golden-v (subvec golden 1280 1536)]
+      (is (= luma-plane golden-y))
+      (is (= u-plane golden-u))
+      (is (= v-plane golden-v))
+      (is (= luma-plane (vec (repeat 1024 128))))
+      (is (= u-plane (vec (repeat 256 128))))
+      (is (= v-plane (vec (repeat 256 128)))))))
+
+(deftest dav1d-bit-exact-color-gradient-test
+  (testing "encode-keyframe-32x32-color-gradient: bit-exact against dav1d
+            on all three planes (real multi-coefficient AC residual on
+            luma AND both chroma planes)"
+    (let [{:keys [luma-plane u-plane v-plane]} (decode-all-planes (fixtures/encode-keyframe-32x32-color-gradient-bytes))
+          golden (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-color-gradient-golden-yuv))
+          golden-y (subvec golden 0 1024) golden-u (subvec golden 1024 1280) golden-v (subvec golden 1280 1536)]
+      (is (= luma-plane golden-y))
+      (is (= u-plane golden-u))
+      (is (= v-plane golden-v)))))
+
+(deftest dav1d-bit-exact-color-busy-golomb-test
+  (testing "encode-keyframe-32x32-color-busy: bit-exact against dav1d --
+            this fixture's quantized U/V coefficients both include several
+            with |value| > 14 (confirmed in test/av1/fixtures.cljk's
+            docstring), so this is the regression test for
+            av1.encode-block/write-golomb reached via the CHROMA cdf-key
+            family (the monochrome busy fixture already covers luma's)"
+    (let [{:keys [luma-plane u-plane v-plane]} (decode-all-planes (fixtures/encode-keyframe-32x32-color-busy-bytes))
+          golden (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-color-busy-golden-yuv))
+          golden-y (subvec golden 0 1024) golden-u (subvec golden 1024 1280) golden-v (subvec golden 1280 1536)]
+      (is (= luma-plane golden-y))
+      (is (= u-plane golden-u))
+      (is (= v-plane golden-v)))))
+
+;; ---------------------------------------------------------------------
+;; 3. Determinism -- re-encoding with the same target pixels/args used to
+;;    produce each checked-in fixture reproduces it byte-for-byte.
+
+(deftest encoder-determinism-matches-checked-in-fixtures-test
+  (testing "re-running av1.encode/encode-keyframe with each fixture's
+            documented arguments (see test/av1/fixtures.cljk) reproduces
+            the checked-in .obu bytes exactly -- confirms the fixtures
+            are not stale and encoding has no hidden nondeterminism"
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-flat-bytes)))
+           (vec (enc/encode-keyframe (vec (repeat 1024 128)) 100 {:skip? true}))))
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-dc-bytes)))
+           (vec (enc/encode-keyframe (vec (repeat 1024 170)) 100 {:skip? false}))))
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-gradient-bytes)))
+           (vec (enc/encode-keyframe
+                 (vec (for [_y (range 32) x (range 32)]
+                        (int (+ 128 (* 20 (Math/sin (* 2 Math/PI (/ x 32.0))))))))
+                 60 {:skip? false}))))
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-busy-bytes)))
+           (vec (enc/encode-keyframe
+                 (vec (for [y (range 32) x (range 32)]
+                        (max 0 (min 255 (int (+ 128 (* 60 (Math/sin (* 0.9 x)))
+                                                (* 40 (Math/cos (* 0.7 y)))
+                                                (* 15 (Math/sin (* 3.1 x)))))))))
+                 20 {:skip? false})))))
+  (testing "same, for the three checked-in COLOR (chroma encode extension)
+            fixtures"
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-color-flat-bytes)))
+           (vec (enc/encode-keyframe (vec (repeat 1024 128)) 100
+                                      {:skip? true :cb (vec (repeat 256 128)) :cr (vec (repeat 256 128))}))))
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-color-gradient-bytes)))
+           (vec (enc/encode-keyframe
+                 (vec (for [_y (range 32) x (range 32)]
+                        (int (+ 128 (* 20 (Math/sin (* 2 Math/PI (/ x 32.0))))))))
+                 60
+                 {:skip? false
+                  :cb (vec (for [_y (range 16) x (range 16)] (int (+ 100 (* 24 (/ x 15.0))))))
+                  :cr (vec (for [y (range 16) _x (range 16)] (int (+ 160 (* 18 (/ y 15.0))))))}))))
+    (is (= (vec (bytes->unsigned-vec (fixtures/encode-keyframe-32x32-color-busy-bytes)))
+           (vec (enc/encode-keyframe
+                 (vec (for [y (range 32) x (range 32)]
+                        (max 0 (min 255 (int (+ 128 (* 60 (Math/sin (* 0.9 x)))
+                                                (* 40 (Math/cos (* 0.7 y)))
+                                                (* 15 (Math/sin (* 3.1 x)))))))))
+                 20
+                 {:skip? false
+                  :cb (vec (for [y (range 16) x (range 16)]
+                             (max 0 (min 255 (int (+ 100 (* 50 (Math/sin (* 1.1 x)))
+                                                     (* 30 (Math/cos (* 0.5 y)))))))))
+                  :cr (vec (for [y (range 16) x (range 16)]
+                             (max 0 (min 255 (int (+ 160 (* 45 (Math/cos (* 0.8 x)))
+                                                     (* 35 (Math/sin (* 1.3 y)))))))))}))))))

@@ -1,0 +1,295 @@
+;; head -- POSIX head (IEEE Std 1003.1) as a Kotoba command, for ONE operand.
+;;
+;;   head FILE          the first 10 lines
+;;   head -n N FILE     the first N lines, N >= 1 (also -N and -nN)
+;;   head -c N FILE     the first N bytes (also -cN)
+;;   ... | head [-n N]  the same, from standard input
+;;
+;; ## What "the first N lines" is, measured
+;;
+;; It is the bytes up to and including the Nth newline, and NOTHING is added.
+;; Measured 2026-09-10 against /usr/bin/head on a file holding `x\ny` -- two
+;; lines, no trailing newline -- the answer is `x\ny`, three bytes. A version
+;; that reasoned in "lines" and re-joined them with newlines would answer
+;; four. A file with fewer than N newlines is emitted whole, unchanged.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/read (41).
+;;
+;; ## Standard input, and why it is read in pieces
+;;
+;; Measured 2026-09-16 over 1,268,018 Bash calls in 558 agent transcripts:
+;; `head` is a LATER pipeline segment 97% of the time (54,444 of 56,211),
+;; and `grep ... | head` alone is the most frequent pipeline shape there is.
+;; So with no operand this reads standard input -- wire 41, which landed
+;; that day -- and reads it 64 KiB at a time, stopping at the chunk that
+;; holds the Nth newline. Two reasons, both measured: `yes | head` must end
+;; (the whole-input form would read forever), and the string pool is a
+;; budget of the binary, so an input larger than it would be REFUSED if
+;; slurped whole and is answered when the first chunk already has the lines
+;; (the suite feeds 8 MB into a 4 MB pool).
+;;
+;; ## The error paths this can and cannot match
+;;
+;; `-n 0` IS matched, byte for byte, since :io/write-error (wire 39) landed:
+;; /usr/bin/head writes `head: illegal line count -- 0` to stderr and exits
+;; 1, and so does this. That message is the guest's own decision, so having
+;; somewhere to write it was the whole gap.
+;;
+;; A MISSING OPERAND is not matched, and stderr does not fix it. The read
+;; capability TRAPS on a path it cannot serve rather than answering a
+;; result, so the guest never gets control back to report anything --
+;; measured 2026-09-10, `SIGILL` and exit 120 where /usr/bin/head writes
+;; `head: PATH: No such file or directory` and exits 1. Reporting that needs
+;; the capability to answer `[:result T E]`, which is a change to its
+;; contract and not to this program.
+
+(ns head.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; A one-byte "\n", cut from a two-line literal: Kotoba source cannot write a
+;; control character and has no char-to-string builtin. head adds no newline
+;; to its OUTPUT -- this is only for the diagnostic line.
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+;; Wire 41: a decimal request answers at most that many unread bytes of
+;; standard input, the empty string at EOF.
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards -- which is
+;; why this command shipped saying a missing operand was not matched.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+;; Decimal TEXT to i64. The argument arrives as text and the guest has no
+;; text->number builtin, so the digits are folded one at a time; a byte that
+;; is not a digit answers -1, which the caller reads as "not a count".
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+;; The byte offset ONE PAST the nth newline of S, or -1 when S has fewer than
+;; n of them. Walking with string-index-of never constructs an offset it has
+;; not reached, so a multi-byte line is not a special case.
+(defn after-nth-newline [s :string from :i64 remaining :i64] :i64
+  (let [rest (string-substring s from (string-byte-length s))
+        i (string-index-of rest "\n")]
+    (if (< i 0)
+      -1
+      (if (= remaining 1)
+        (+ from (+ i 1))
+        (after-nth-newline s (+ from (+ i 1)) (- remaining 1))))))
+
+;; Scan S from FROM for the next REMAINING newlines in ONE walk. Answers the
+;; offset one past the last of them, or -(k + 1) with k the number still to
+;; find when S ran out -- so a chunked input is never rescanned from the
+;; start: the next call resumes at the old length with the count it was
+;; handed back.
+(defn scan-newlines [s :string from :i64 remaining :i64] :i64
+  (let [i (string-find-byte s 10 from)]
+    (if (< i 0)
+      (- 0 (+ remaining 1))
+      (if (= remaining 1)
+        (+ i 1)
+        (scan-newlines s (+ i 1) (- remaining 1))))))
+
+;; One chunk of standard input: everything up to the Nth newline is OUTPUT,
+;; so a chunk holding fewer than REMAINING newlines is emitted whole and only
+;; the count is carried -- nothing accumulates. Answers the newlines still to
+;; find, or -1 when the answer is complete (the Nth newline was in this chunk,
+;; or the input ended).
+(defn step [remaining :i64] :i64
+  (let [chunk (stdin "65536")]
+    (if (= 0 (string-byte-length chunk))
+      -1
+      (let [r (scan-newlines chunk 0 remaining)]
+        (if (>= r 0)
+          (do (emit (string-substring chunk 0 r)) -1)
+          (do (emit chunk) (- 0 (+ r 1))))))))
+
+;; Standard input, 64 KiB at a time. Each step runs in its own arena region,
+;; so the chunk it read is reclaimed when it returns and the pool never
+;; holds more than one chunk: measured 2026-09-16, accumulating the chunks
+;; instead made the pool grow as the SQUARE of the input (a chunk read at
+;; the pool's tail leaves the accumulator unable to tail-append, so every
+;; append copied both), and `-n 20000` over 8 MB was refused at a 4 MB pool.
+(defn head-stdin [remaining :i64] :i64
+  (let [next (arena-scope (step remaining))]
+    (if (< next 0) 0 (head-stdin next))))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; With TWO OR MORE files each one is introduced by `==> FILE <==`, and with
+;; one file there is no header at all. Measured against /usr/bin/head
+;; 2026-09-10.
+;;
+;; A blank line precedes every header EXCEPT the first one printed -- and
+;; "printed" is the exact word, because a missing operand does not count:
+;;
+;;   head -n 2 nope.txt h1.txt      h1's header has NO blank line before it
+;;   head -n 2 h1.txt nope.txt h2   h2's header DOES
+;;
+;; So the flag being carried is "has a header been written", not "is this
+;; the first operand". An EMPTY file still gets its header, and contributes
+;; nothing between it and the next blank line.
+(defn header [path :string] :string
+  (do (emit "==> ") (emit path) (emit " <==") (emit (nl))))
+
+;; Returns 1 once a header has been written, so the caller can carry it on.
+(defn show [path :string count :i64 multi? :i64 printed? :i64] :i64
+  (do
+    (if (= multi? 1)
+      (do (if (= printed? 1) (emit (nl)) "")
+          (header path))
+      "")
+    (let [text (slurp-file path)]
+      (if (< count 0)
+        ;; -c: the first -COUNT bytes. A cut inside a multi-byte sequence
+        ;; is refused by string-substring (SIGILL) -- /usr/bin/head prints
+        ;; the raw bytes there; a named divergence, since this build cannot
+        ;; write a partial sequence.
+        (let [n (string-byte-length text)
+              want (- 0 count)]
+          (emit (string-substring text 0 (if (< want n) want n))))
+        (let [cut (after-nth-newline text 0 count)]
+          (if (< cut 0)
+            (emit text)
+            (emit (string-substring text 0 cut))))))
+    1))
+
+;; -c over standard input: at most 64 KiB per request until the count is
+;; met or the input ends. The decimal form answers whole code points, so a
+;; count that lands inside a sequence stops at the boundary before it.
+(defn- bytes-stdin [remaining :i64] :i64
+  (if (<= remaining 0)
+    0
+    (let [chunk (stdin (decimal-of (if (< remaining 65536) remaining 65536)))
+          got (string-byte-length chunk)]
+      (if (= got 0)
+        0
+        (do (emit chunk) (bytes-stdin (- remaining got)))))))
+
+(defn complain [path :string] :i64
+  (do
+    (emit-error "head: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; `worst` is the exit status and `printed?` the header flag; both are
+;; carried because each operand can change either. Five parameters is the
+;; compiler's limit, which is why the two are not split apart.
+(defn each [i :i64 total :string count :i64 multi? :i64 state :i64] :i64
+  (if (string=? (decimal-of i) total)
+    state
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (each (+ i 1) total count multi?
+              ;; bit 0 = a header has been written, bit 1 = something failed
+              (+ (show path count multi? (- state (* 2 (quot state 2))))
+                 (* 2 (quot state 2))))
+        (each (+ i 1) total count multi?
+              (do (complain path)
+                  (+ (- state (* 2 (quot state 2))) 2)))))))
+
+;; The count flag, measured 2026-09-17 over 1,268,018 agent Bash calls:
+;; `head -3` 6,176, `-20` 6,048, `-1` 5,967, `-5` 4,962 -- the NUMERIC
+;; SHORTHAND dominates -- then `-c N` 2,964 (bytes) and `-n N`. A leading
+;; dash and a digit is a line count; `-n` / `-c` take the next argument or
+;; their attached tail. Bytes mode is carried as a NEGATIVE count through the
+;; walks, so their five parameters stay five.
+(defn- dash-digit? [a :string] :bool
+  (if (< (string-byte-length a) 2)
+    false
+    (if (= (string-code-point-at a 0) 45)
+      (let [c (string-code-point-at a 1)] (if (>= c 48) (<= c 57) false))
+      false)))
+
+(defn- attached? [a :string letter :string] :bool
+  (if (>= (string-byte-length a) 3) (string=? (string-substring a 0 2) letter) false))
+
+;; Arguments the flag consumed: 0, 1 (-N, -nN, -cN) or 2 (-n N, -c N).
+(defn- flag-width [] :i64
+  (let [a (arg "0")]
+    (if (if (string=? a "-n") true (string=? a "-c"))
+      2
+      (if (dash-digit? a)
+        1
+        (if (if (attached? a "-n") true (attached? a "-c")) 1 0)))))
+
+(defn- bytes? [] :bool
+  (let [a (arg "0")]
+    (if (string=? a "-c") true (attached? a "-c"))))
+
+(defn- count-text [] :string
+  (let [a (arg "0")]
+    (if (if (string=? a "-n") true (string=? a "-c"))
+      (arg "1")
+      (if (dash-digit? a)
+        (string-substring a 1 (string-byte-length a))
+        (string-substring a 2 (string-byte-length a))))))
+
+(defn main [] :i64
+  (let [total (arg "")
+        width (flag-width)
+        given (if (= width 0) 10 (parse-count (count-text)))
+        count (if (bytes?) (- 0 given) given)
+        first-file width
+        files (- (parse-count total) first-file)]
+    (if (< given 1)
+      ;; -n 0, -c 0 and a non-numeric count. The message is byte-identical to
+      ;; /usr/bin/head's, including the two spaces around the dashes, and the
+      ;; count is echoed as GIVEN rather than re-rendered -- head reports the
+      ;; text it was handed, so `-n 00` reports `00`.
+      (do
+        (emit-error (if (bytes?) "head: illegal byte count -- " "head: illegal line count -- "))
+        (emit-error (count-text))
+        (emit-error (nl))
+        1)
+      (if (< files 1)
+        ;; No file operand: standard input, in pieces (see the header).
+        (if (bytes?) (bytes-stdin given) (head-stdin count))
+        ;; The state word carries the header flag in bit 0 and the failure in
+        ;; bit 1; only the failure survives as the exit status.
+        (quot (each first-file total count (if (> files 1) 1 0) 0) 2)))))

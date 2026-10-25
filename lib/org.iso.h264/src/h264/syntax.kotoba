@@ -1,0 +1,352 @@
+(ns h264.syntax
+  (:require [h264.expgolomb :as eg])
+  (:export [read-structure read-i64 read-keyword]))
+
+;; Generic table-driven reader for ISO/IEC 14496-10 §7.3-style syntax tables,
+;; in the Kotoba guest grammar.
+;;
+;; The compression claim this file exists to make good on: a §7.3 syntax table
+;; is DATA. One reader interprets it, so a new bitstream structure costs one
+;; table instead of one hand-written parser. If that reader is full Clojure it
+;; lands permanently on the JVM and can never reach wasm or native, and the
+;; design loses the thing it was for -- so it is written here, in the grammar
+;; `orgs/kotoba-lang/kotoba-lang/lang/guest-grammar.edn` admits.
+;;
+;; The table is a `document`: the grammar's inert closed EDN-shaped tree.
+;; The reader threads (values-document, bit-index) immutably, exactly as
+;; h264.expgolomb does; there is no mutable reader, because the grammar
+;; forbids ambient mutation. Errors are `[:result T :keyword]`, because the
+;; grammar forbids throw.
+;;
+;; Row grammar (a strict subset of the .cljc reader's -- see the ADR for the
+;; three constructs the guest profile does NOT carry and why):
+;;   [:u n-expr name] [:f n-expr name] [:ue name] [:se name]
+;;   [:infer name int-expr]
+;;   [:when cond-expr then-rows] / [:when cond-expr then-rows else-rows]
+;;   [:for count-expr rows]        ; index readable as [:idx]
+;;   [:escape key size-expr]       ; CLOSED set, see `run-escape`
+;;   [:unsupported reason]
+;; `name` is a keyword, or [:vec keyword] for the standard's element[ i ] form.
+
+(def read-pair-type [:vector [:i64 :i64]])
+(def read-result-type [:result [:alias read-pair-type] :keyword])
+(def state-type [:vector [:document :i64]])
+(def state-result-type [:result [:alias state-type] :keyword])
+(def i64-result-type [:result :i64 :keyword])
+
+;; --- document helpers -------------------------------------------------------
+
+(defn dat [v :document index :i64] :document
+  (option-value-of [:option :document] (document-vector-at v index) (document-null)))
+
+(defn dkw [d :document] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value d) :kotoba.syntax/not-keyword))
+
+(defn dnum [d :document] :i64
+  (option-value-of [:option :i64] (document-i64-value d) 0))
+
+(defn keyword-node? [d :document] :bool
+  (not= (dkw d) :kotoba.syntax/not-keyword))
+
+(defn empty-values [] :document (document {}))
+(defn empty-vector [] :document (document []))
+
+;; Absence is detected by probing the SAME node with two different defaults:
+;; a present integer answers both probes identically, an absent or non-integer
+;; node answers each probe with its own default. The grammar has no option
+;; pattern form here, and a lookup that silently answered 0 for an unread
+;; element would be the exact failure this reader is written to avoid.
+(defn value-present? [values :document k :keyword] :bool
+  (let [node (option-value-of [:option :document] (document-get values k) (document-null))
+        low (option-value-of [:option :i64] (document-i64-value node) 0)
+        high (option-value-of [:option :i64] (document-i64-value node) 1)]
+    (= low high)))
+
+(defn value-of [values :document k :keyword] :i64
+  (option-value-of [:option :i64]
+    (document-i64-value
+      (option-value-of [:option :document] (document-get values k) (document-null)))
+    0))
+
+(defn vector-of [values :document k :keyword] :document
+  (option-value-of [:option :document] (document-get values k) (empty-vector)))
+
+(defn state-values [state [:alias state-type]] :document
+  (hetero-vector-at state-type state 0))
+
+(defn state-index [state [:alias state-type]] :i64
+  (hetero-vector-at state-type state 1))
+
+(defn state-of [values :document index :i64] [:alias state-type]
+  (hetero-vector state-type values index))
+
+(defn fail [reason :keyword] [:alias state-result-type]
+  (result-err-of state-result-type reason))
+
+;; --- expression evaluation --------------------------------------------------
+
+(defn member-loop [items :document probe :i64 index :i64 total :i64] :i64
+  (if (>= index total) 0
+    (if (= (dnum (dat items index)) probe) 1
+      (member-loop items probe (+ index 1) total))))
+
+(defn eval-expr [expression :document values :document] [:alias i64-result-type]
+  (if (not (keyword-node? (dat expression 0)))
+    ;; a bare integer literal is a leaf, not a one-element node
+    (result-ok-of i64-result-type (dnum expression))
+    (let [head (dkw (dat expression 0))]
+      (cond
+        (= head :var)
+        (let [k (dkw (dat expression 1))]
+          (if (value-present? values k)
+            (result-ok-of i64-result-type (value-of values k))
+            (result-err-of i64-result-type :unread-syntax-element)))
+
+        (= head :idx)
+        (if (value-present? values :kotoba.syntax/idx)
+          (result-ok-of i64-result-type (value-of values :kotoba.syntax/idx))
+          (result-err-of i64-result-type :index-outside-for))
+
+        (= head :at)
+        (let [k (dkw (dat expression 1))]
+          (match-result (eval-expr (dat expression 2) values) i64-result-type
+            (ok position
+              (let [items (vector-of values k)]
+                (if (or (< position 0) (>= position (document-count items)))
+                  (result-err-of i64-result-type :array-index-out-of-range)
+                  (result-ok-of i64-result-type (dnum (dat items position))))))
+            (err reason (result-err-of i64-result-type reason))))
+
+        (= head :in)
+        (match-result (eval-expr (dat expression 1) values) i64-result-type
+          (ok probe
+            (let [items (dat expression 2)]
+              (result-ok-of i64-result-type
+                (member-loop items probe 0 (document-count items)))))
+          (err reason (result-err-of i64-result-type reason)))
+
+        (= head :not)
+        (match-result (eval-expr (dat expression 1) values) i64-result-type
+          (ok value (result-ok-of i64-result-type (if (= value 0) 1 0)))
+          (err reason (result-err-of i64-result-type reason)))
+
+        (= head :if)
+        (match-result (eval-expr (dat expression 1) values) i64-result-type
+          (ok test
+            (if (= test 0)
+              (eval-expr (dat expression 3) values)
+              (eval-expr (dat expression 2) values)))
+          (err reason (result-err-of i64-result-type reason)))
+
+        :else (eval-binary head (dat expression 1) (dat expression 2) values)))))
+
+(defn eval-binary
+  [head :keyword left :document right :document values :document]
+  [:alias i64-result-type]
+  (match-result (eval-expr left values) i64-result-type
+    (ok a
+      (match-result (eval-expr right values) i64-result-type
+        (ok b
+          (cond
+            (= head :=) (result-ok-of i64-result-type (if (= a b) 1 0))
+            (= head :not=) (result-ok-of i64-result-type (if (= a b) 0 1))
+            (= head :<) (result-ok-of i64-result-type (if (< a b) 1 0))
+            (= head :<=) (result-ok-of i64-result-type (if (<= a b) 1 0))
+            (= head :>) (result-ok-of i64-result-type (if (> a b) 1 0))
+            (= head :and) (result-ok-of i64-result-type (if (or (= a 0) (= b 0)) 0 1))
+            (= head :or) (result-ok-of i64-result-type (if (and (= a 0) (= b 0)) 0 1))
+            (= head :+) (result-ok-of i64-result-type (+ a b))
+            (= head :-) (result-ok-of i64-result-type (- a b))
+            (= head :*) (result-ok-of i64-result-type (* a b))
+            :else (result-err-of i64-result-type :unknown-expression-operator)))
+        (err reason (result-err-of i64-result-type reason))))
+    (err reason (result-err-of i64-result-type reason))))
+
+;; A presence condition must be RELATIONAL by construction. H.264 flags are
+;; 0/1 integers, so a table writing [:var :some_flag] where a condition belongs
+;; would silently take the 0 branch as true; rejecting it structurally is the
+;; same guarantee the .cljc reader gets from requiring a strict boolean.
+(defn relational-head? [head :keyword] :bool
+  (or (= head :=) (or (= head :not=) (or (= head :<) (or (= head :<=)
+    (or (= head :>) (or (= head :in) (or (= head :and) (or (= head :or)
+      (= head :not))))))))))
+
+(defn eval-condition [expression :document values :document] [:alias i64-result-type]
+  (if (not (keyword-node? (dat expression 0)))
+    (result-err-of i64-result-type :non-relational-condition)
+    (if (relational-head? (dkw (dat expression 0)))
+      (eval-expr expression values)
+      (result-err-of i64-result-type :non-relational-condition))))
+
+;; --- storing a read element -------------------------------------------------
+
+(defn store [values :document name-node :document value :i64] :document
+  (if (keyword-node? name-node)
+    (document-assoc values (dkw name-node) (document-i64 value))
+    (let [k (dkw (dat name-node 1))]
+      (document-assoc values k
+        (document-vector-conj (vector-of values k) (document-i64 value))))))
+
+;; --- §7.3.2.1.1.1 scaling_list( ): the closed escape --------------------------
+;;
+;; The one place this reader hands off to ordinary code, and it is honest about
+;; why: the standard prints scaling_list( ) as a table, but three of its lines
+;; are ASSIGNMENTS -- the loop's continuation depends on a running
+;; lastScale/nextScale the loop itself computes. No (name, descriptor,
+;; condition) triple determines that. Values are consumed and discarded, which
+;; is h264.sps's own scope.
+;;
+;; The escape SET is closed at compile time, because the grammar forbids
+;; computed dispatch. That is a real limit of the guest profile and is stated
+;; as one rather than worked around.
+
+(defn scaling-list-loop
+  [data :vector-i64 index :i64 remaining :i64 last-scale :i64 next-scale :i64]
+  [:alias read-result-type]
+  (if (<= remaining 0)
+    (result-ok-of read-result-type (hetero-vector read-pair-type 0 index))
+    (if (= next-scale 0)
+      (scaling-list-loop data index (- remaining 1) last-scale next-scale)
+      (match-result (eg/read-se data index) read-result-type
+        (ok pair
+          (let [delta (hetero-vector-at read-pair-type pair 0)
+                following (- (hetero-vector-at read-pair-type pair 1) 0)
+                raw (+ (+ last-scale delta) 256)
+                scaled (- raw (* (quot raw 256) 256))]
+            (scaling-list-loop data following (- remaining 1)
+              (if (= scaled 0) last-scale scaled) scaled)))
+        (err reason (result-err-of read-result-type reason))))))
+
+(defn run-escape
+  [key :keyword data :vector-i64 state [:alias state-type] size :i64]
+  [:alias state-result-type]
+  (if (not= key :h264/scaling-list)
+    (fail :no-handler-for-escape)
+    (match-result (scaling-list-loop data (state-index state) size 8 8) read-result-type
+      (ok pair
+        (result-ok-of state-result-type
+          (state-of (state-values state) (hetero-vector-at read-pair-type pair 1))))
+      (err reason (fail reason)))))
+
+;; --- row and structure reading ----------------------------------------------
+
+(defn store-read
+  [state [:alias state-type] name-node :document pair [:alias read-pair-type]]
+  [:alias state-result-type]
+  (result-ok-of state-result-type
+    (state-of (store (state-values state) name-node
+                (hetero-vector-at read-pair-type pair 0))
+              (hetero-vector-at read-pair-type pair 1))))
+
+(defn read-fixed
+  [row :document data :vector-i64 state [:alias state-type] width :i64]
+  [:alias state-result-type]
+  (match-result (eg/read-bits data (state-index state) width) read-result-type
+    (ok pair (store-read state (dat row 2) pair))
+    (err reason (fail reason))))
+
+(defn read-rows
+  [rows :document data :vector-i64 state [:alias state-type] index :i64]
+  [:alias state-result-type]
+  (if (>= index (document-count rows))
+    (result-ok-of state-result-type state)
+    (match-result (read-row (dat rows index) data state) state-result-type
+      (ok next (read-rows rows data next (+ index 1)))
+      (err reason (fail reason)))))
+
+(defn read-for
+  [rows :document data :vector-i64 state [:alias state-type] countdown :i64]
+  [:alias state-result-type]
+  (if (<= countdown 0)
+    (result-ok-of state-result-type state)
+    (let [values (state-values state)
+          position (if (value-present? values :kotoba.syntax/idx)
+                     (+ (value-of values :kotoba.syntax/idx) 1) 0)
+          seeded (state-of
+                   (document-assoc values :kotoba.syntax/idx (document-i64 position))
+                   (state-index state))]
+      (match-result (read-rows rows data seeded 0) state-result-type
+        (ok next (read-for rows data next (- countdown 1)))
+        (err reason (fail reason))))))
+
+(defn read-row
+  [row :document data :vector-i64 state [:alias state-type]]
+  [:alias state-result-type]
+  (let [head (dkw (dat row 0))
+        values (state-values state)]
+    (cond
+      (or (= head :u) (= head :f))
+      (match-result (eval-expr (dat row 1) values) i64-result-type
+        (ok width (read-fixed row data state width))
+        (err reason (fail reason)))
+
+      (= head :ue)
+      (match-result (eg/read-ue data (state-index state)) read-result-type
+        (ok pair (store-read state (dat row 1) pair))
+        (err reason (fail reason)))
+
+      (= head :se)
+      (match-result (eg/read-se data (state-index state)) read-result-type
+        (ok pair (store-read state (dat row 1) pair))
+        (err reason (fail reason)))
+
+      (= head :infer)
+      (match-result (eval-expr (dat row 2) values) i64-result-type
+        (ok value
+          (result-ok-of state-result-type
+            (state-of (store values (dat row 1) value) (state-index state))))
+        (err reason (fail reason)))
+
+      (= head :when)
+      (match-result (eval-condition (dat row 1) values) i64-result-type
+        (ok test
+          (if (not= test 0)
+            (read-rows (dat row 2) data state 0)
+            (if (>= (document-count row) 4)
+              (read-rows (dat row 3) data state 0)
+              (result-ok-of state-result-type state))))
+        (err reason (fail reason)))
+
+      (= head :for)
+      (match-result (eval-expr (dat row 1) values) i64-result-type
+        (ok total
+          (match-result (read-for (dat row 2) data state total) state-result-type
+            (ok next
+              (result-ok-of state-result-type
+                ;; the grammar has no document-dissoc; assoc'ing a null node
+                ;; is what un-binds it, because value-present? probes for an
+                ;; INTEGER and a null answers the two probes differently
+                (state-of (document-assoc (state-values next) :kotoba.syntax/idx
+                                          (document-null))
+                          (state-index next))))
+            (err reason (fail reason))))
+        (err reason (fail reason)))
+
+      (= head :escape)
+      (match-result (eval-expr (dat row 2) values) i64-result-type
+        (ok size (run-escape (dkw (dat row 1)) data state size))
+        (err reason (fail reason)))
+
+      ;; ae(v) and anything else the table declares unreadable. An
+      ;; arithmetic-coded element's bit cost depends on adaptive context state
+      ;; that depends on every previously decoded element, so no
+      ;; (name, descriptor, condition) triple determines it. Refusing is the
+      ;; only honest answer; this row exists so the refusal is in the table.
+      (= head :unsupported) (fail :syntax-element-not-expressible)
+
+      :else (fail :unknown-row-operator))))
+
+(defn read-structure
+  "Read `rows` from bit 0 of `data`. Returns (values-document, next-bit-index)."
+  [rows :document data :vector-i64]
+  [:alias state-result-type]
+  (read-rows rows data (state-of (empty-values) 0) 0))
+
+(defn read-i64
+  "One syntax element's value out of a completed read, by its spec name."
+  [state [:alias state-type] k :keyword] [:alias i64-result-type]
+  (if (value-present? (state-values state) k)
+    (result-ok-of i64-result-type (value-of (state-values state) k))
+    (result-err-of i64-result-type :unread-syntax-element)))
+
+(defn read-keyword [d :document] :keyword (dkw d))

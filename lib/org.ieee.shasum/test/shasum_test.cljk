@@ -1,0 +1,113 @@
+;; test/shasum_test.cljk -- build the command and compare it with the system
+;; shasum, byte for byte, on stdout, stderr AND exit status.
+;;
+;;   AMU_HOME=<amu checkout> kbb --backend sci test/shasum_test.cljk
+(ns shasum-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args) (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-shasum "/usr/bin/shasum")
+
+(def fixtures
+  {"abc" "abc"
+   "empty" ""
+   "line" "hello world\n"
+   ;; Exactly one block, one byte short of the two-block padding case, and
+   ;; well past both.
+   "b64" (.repeat "x" 64)
+   "b55" (.repeat "y" 55)
+   "b56" (.repeat "z" 56)
+   "big" (.repeat "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n" 16384)
+   "utf8" "日本語\n"})
+
+;; A vector case is an argv over fixture names (flags pass through); a map
+;; case feeds a fixture as standard input.
+(def cases
+  [["-a" "256" "abc"] ["-a" "256" "empty"] ["-a" "256" "line"] ["-a" "256" "b64"] ["-a" "256" "b55"]
+   ["-a" "256" "b56"] ["-a" "256" "big"] ["-a" "256" "utf8"]
+   ["-a" "256" "abc" "line" "empty"]
+   ;; A missing operand: reported, skipped, exit 1; the others still print.
+   ["-a" "256" "missing"] ["-a" "256" "abc" "missing" "line"]
+   {:argv ["-a" "256"] :stdin "abc"} {:argv ["-a" "256"] :stdin "empty"}
+   {:argv ["-a" "256"] :stdin "big"}])
+
+(def divergences
+  [{:argv ["-a" "1" "abc"] :stdin nil :out "" :exit 1
+    :err "shasum: only -a 256 is supported here (Unrecognized algorithm)\n"}
+   {:argv ["abc"] :stdin nil :out "" :exit 1
+    :err "shasum: only -a 256 is supported here (Unrecognized algorithm)\n"}
+   {:argv [] :stdin nil :out "" :exit 1
+    :err "shasum: only -a 256 is supported here (Unrecognized algorithm)\n"}])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs system-shasum) (refuse (str "no " system-shasum)))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-shasum-"))
+        src (.resolve path (.cwd js/process) "shasum" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "shasum.kexe")
+        blob (.join path tmp "shasum.bin")
+        exe (.join path tmp "shasum")
+        data (.join path tmp "data")]
+    (.mkdirSync fs data)
+    (doseq [[name content] fixtures] (.writeFileSync fs (.join path data name) content "utf8"))
+    (.writeFileSync fs policy "{:allow #{[:cap/call 3] [:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free" "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c)) (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          offset (second (re-find #":offset (\d+)" (str (:out e))))]
+      (when-not offset (refuse "no :offset in the extract report"))
+      (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                           "--allow" "3,35,37,38,39,41" "--fs-scope" (.realpathSync fs data)
+                           "--string-pool" "8000000" "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+    (let [real (.realpathSync fs data)
+          argv-of (fn [names] (mapv #(if (or (str/starts-with? % "-") (re-matches #"[0-9]+" %)) % (.join path real %)) names))
+          b64 (fn [buf] (.toString buf "base64"))
+          run-case (fn [c]
+                     (let [names (if (map? c) (:argv c) c)
+                           input (when (and (map? c) (:stdin c)) (get fixtures (:stdin c)))
+                           opts (if input {:input (js/Buffer.from input "utf8")} {})]
+                       [(run exe (argv-of names) opts) (run system-shasum (argv-of names) opts)]))
+          results
+          (for [c cases]
+            (let [[k s] (run-case c)
+                  same? (and (= (b64 (:out k)) (b64 (:out s))) (= (b64 (:err k)) (b64 (:err s)))
+                             (= (:status k) (:status s)))]
+              {:argv (if (map? c) [(:argv c) :stdin (:stdin c)] c) :ok same?
+               :kotoba (.toString (:out k) "utf8") :system (.toString (:out s) "utf8")
+               :kotoba-err (.toString (:err k) "utf8") :system-err (.toString (:err s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          div-results
+          (for [d divergences]
+            (let [k (run exe (argv-of (:argv d)) {})
+                  ok? (and (= (.toString (:out k) "utf8") (:out d)) (= (.toString (:err k) "utf8") (:err d))
+                           (= (:status k) (:exit d)))]
+              {:argv [(:argv d) :divergence] :ok ok? :kotoba (.toString (:out k) "utf8") :system "(not compared)"
+               :kotoba-err (.toString (:err k) "utf8") :system-err (:err d) :exit [(:status k) (:exit d)]}))
+          all (concat results div-results)
+          bad (remove :ok all)]
+      (doseq [r all]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r)) " -> " (pr-str (subs (:kotoba r) 0 (min 90 (count (:kotoba r)))))
+                      (when-not (:ok r) (str " but " system-shasum " says " (pr-str (subs (:system r) 0 (min 90 (count (:system r)))))
+                                             " exits " (pr-str (:exit r)) " stderr " (pr-str (:kotoba-err r)) " vs " (pr-str (:system-err r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count all) :compared (count results) :divergences (count div-results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

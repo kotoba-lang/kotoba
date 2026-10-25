@@ -1,0 +1,165 @@
+(ns h264.decode-p-slice-test
+  "Golden-vector tests for `h264.decode`'s P-slice (inter prediction) support
+   — ADR-2607122000 Migration step 7's first increment: P_Skip + P_L0_16x16,
+   MV=(0,0) motion compensation only, single reference frame (the
+   immediately-preceding decoded picture). See `h264.decode`'s namespace
+   docstring and `decode-gop` for the exact scope.
+
+   `p-skip-flat16.h264` is a REAL libx264 (Constrained Baseline, CAVLC)
+   2-frame (IDR + P) Annex B stream:
+     ffmpeg -f lavfi -i color=c=0x808080:s=16x16:r=25 -frames:v 2 \\
+       -pix_fmt yuv420p flat16-2f.y4m
+     x264 --input-res 16x16 --fps 25 -o p-skip-flat16.h264 --qp 26 \\
+       --keyint 250 --min-keyint 2 --ref 1 --profile baseline flat16-2f.y4m
+   Two IDENTICAL flat-gray frames — a real encoder has zero RD reason to
+   spend ANY bits on the second frame beyond declaring it P_Skip (confirmed
+   via the encoder's own log: `mb P ... skip:100.0%`, size 8 bytes). This
+   is the single most basic real-world P-slice case: `mb_skip_run` covering
+   the whole picture, zero macroblock_layer() calls at all.
+
+   `p-16x16-mb0-realac.h264` and `p-skip-then-16x16-multimb.h264` are NOT
+   x264 output — real encoders (verified empirically across dozens of
+   qp/content/motion-estimation-range combinations while developing this
+   fixture) essentially NEVER choose P_L0_16x16 with a genuinely zero final
+   motion vector AND nonzero residual for any content that also keeps the
+   REFERENCE frame's own intra coding within this repo's Intra_16x16-only
+   scope: flat/near-flat content that avoids forcing Intra_4x4 in the IDR
+   frame is exactly the content where ANY spatial correlation gives real
+   motion search a incentive to find a nonzero (often just-better-by-a-
+   hair) integer-pel shift instead of MV=(0,0) — observed directly (mv
+   [0 4], [0 16], [0 32] on different gradient/texture fixtures — all
+   real, all out of this milestone's motion-compensation scope, see
+   `h264.decode/mc-predict`). Rather than ship an untestable P_L0_16x16
+   path, these 2 fixtures are HAND-AUTHORED using this repo's OWN
+   already-bit-exact-tested encode-side primitives (`h264.encode`'s
+   `encode-idr-luma-frame` for the reference IDR frame; `h264.expgolomb`'s
+   writer + `h264.cavlc/encode-residual-block!` for a hand-built P-slice
+   NAL, following `h264.slice/parse-header!`'s exact P-slice syntax order)
+   — NOT a claim that this exact bitstream is something a real encoder
+   would produce, but a claim that it is a SPEC-VALID P_L0_16x16 macroblock
+   (P_Skip's mb_skip_run bookkeeping, mvd/coded_block_pattern/mb_qp_delta/
+   residual syntax all follow §7.3.5.1 exactly). The independent
+   correctness check is the SAME bit-exact-vs-real-ffmpeg discipline this
+   repo's whole decode side uses: real `ffmpeg 8.1.1` decodes THESE EXACT
+   bytes to the SAME pixels this repo's own `h264.decode` produces — ffmpeg
+   did not see or trust anything about how the bytes were constructed, only
+   the bytes themselves, so this is a genuine independent-decoder
+   cross-check, not a self-consistency tautology.
+
+   `p-16x16-mb0-realac.h264` — single 16x16 MB (matching `p-skip-flat16`'s
+   dimensions): IDR reference frame flat luma/chroma=128 (qp 26); P-slice
+   is ONE P_L0_16x16 macroblock, mvd=(0,0) (so final mv=(0,0) — the only
+   neighbor-derived predictor component available here, since there ARE no
+   neighbors, is trivially (0,0) too), `coded_block_pattern` codeNum 2 →
+   CodedBlockPatternLuma=1/CodedBlockPatternChroma=0 (`golomb-to-inter-cbp`
+   Table 9-4 Inter mapping), real nonzero CAVLC residual (one coefficient,
+   level 2) in ONLY the top-left 8x8 luma quadrant (blocks 0..3 — 3 of
+   those 4 blocks still real-decoded as all-zero, exercising
+   `decode-regular-block!`'s maxNumCoeff=16 full-block path, NOT the
+   Intra16x16 DC/AC split), no chroma residual at all
+   (CodedBlockPatternChroma=0).
+
+   `p-skip-then-16x16-multimb.h264` — 32x16 (2 macroblocks, addr 0/1),
+   otherwise IDENTICAL recipe: MB0 is `mb_skip_run`=1 (P_Skip, motion-
+   compensated copy of the flat IDR reference, zero residual), MB1 is
+   P_L0_16x16 with the SAME real-residual construction as
+   `p-16x16-mb0-realac.h264`'s single MB — exercising the slice_data()
+   loop's skip-run → macroblock_layer() TRANSITION (not just a
+   single-macroblock-covers-the-whole-picture degenerate case) and
+   cross-macroblock CAVLC neighbor (`nC`) derivation where the LEFT
+   neighbor is itself a P_Skip macroblock (not another coded inter/intra
+   MB) — `decode-p-skip-macroblock!`'s all-zero `:ac-nnz` contribution."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [h264.decode :as decode]))
+
+(defn- rd [p] (mapv #(bit-and (int %) 0xff)
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "lib/org.iso.h264/resources/" p))))))
+
+(defn- frame-planes
+  "Split a flat yuv420p byte seq (possibly multiple concatenated frames)
+   into {:luma :cb :cr} for ONE frame of `width`x`height`, starting at
+   `offset` (bytes)."
+  [yuv offset width height]
+  (let [luma-size (* width height)
+        chroma-size (* (quot width 2) (quot height 2))
+        v (vec yuv)]
+    {:luma (subvec v offset (+ offset luma-size))
+     :cb (subvec v (+ offset luma-size) (+ offset luma-size chroma-size))
+     :cr (subvec v (+ offset luma-size chroma-size) (+ offset luma-size (* 2 chroma-size)))}))
+
+(deftest p-skip-flat16-golden-vector
+  (testing "p-skip-flat16.h264 — REAL libx264, 2 identical flat-gray 16x16
+   frames, second frame 100% P_Skip (see namespace docstring)"
+    (let [bytes (rd "h264/fixtures/p-skip-flat16.h264")
+          frames (decode/decode-gop bytes)
+          ref (rd "h264/fixtures/p-skip-flat16.ref.yuv")
+          frame-size (+ 256 64 64)]
+      (testing "decodes exactly 2 pictures (IDR + P), in bitstream order"
+        (is (= 2 (count frames)))
+        (is (= :i (:slice-type-class (first frames))))
+        (is (= :p (:slice-type-class (second frames)))))
+      (testing "the P-frame's single macroblock is inter-coded with MV=(0,0) (P_Skip)"
+        (is (= [true] (:mb-inter? (second frames))))
+        (is (= [[0 0]] (:mb-mvs (second frames)))))
+      (doseq [[idx frame] (map-indexed vector frames)]
+        (let [planes (frame-planes ref (* idx frame-size) 16 16)]
+          (testing (str "frame " idx " reconstructed luma/Cb/Cr are bit-exact vs. real ffmpeg decode")
+            (is (= (:luma planes) (:luma frame)))
+            (is (= (:cb planes) (:cb frame)))
+            (is (= (:cr planes) (:cr frame)))))))))
+
+(deftest p-16x16-mb0-realac-golden-vector
+  (testing "p-16x16-mb0-realac.h264 — hand-authored (see namespace docstring
+   for why + the independent-ffmpeg-decode discipline), single 16x16 MB,
+   P_L0_16x16 with MV=(0,0) and real nonzero luma AC residual in one 8x8
+   quadrant"
+    (let [bytes (rd "h264/fixtures/p-16x16-mb0-realac.h264")
+          frames (decode/decode-gop bytes)
+          ref (rd "h264/fixtures/p-16x16-mb0-realac.ref.yuv")
+          frame-size (+ 256 64 64)]
+      (testing "decodes exactly 2 pictures (IDR + P), in bitstream order"
+        (is (= 2 (count frames)))
+        (is (= :i (:slice-type-class (first frames))))
+        (is (= :p (:slice-type-class (second frames)))))
+      (testing "the P-frame's single macroblock is P_L0_16x16 with MV=(0,0) — NOT P_Skip"
+        (is (= [true] (:mb-inter? (second frames))))
+        (is (= [[0 0]] (:mb-mvs (second frames)))))
+      (testing "the hand-built residual actually changed pixels (sanity: this isn't accidentally an all-zero/skip-equivalent reconstruction)"
+        (is (> (count (distinct (:luma (second frames)))) 1)))
+      (doseq [[idx frame] (map-indexed vector frames)]
+        (let [planes (frame-planes ref (* idx frame-size) 16 16)]
+          (testing (str "frame " idx " reconstructed luma/Cb/Cr are bit-exact vs. real ffmpeg's INDEPENDENT decode of these same hand-authored bytes")
+            (is (= (:luma planes) (:luma frame)))
+            (is (= (:cb planes) (:cb frame)))
+            (is (= (:cr planes) (:cr frame)))))))))
+
+(deftest p-skip-then-16x16-multimb-golden-vector
+  (testing "p-skip-then-16x16-multimb.h264 — hand-authored, 32x16 (2 MBs):
+   MB0 = P_Skip, MB1 = P_L0_16x16 (MV=(0,0), real residual) — exercises the
+   slice_data() mb_skip_run → macroblock_layer() loop transition and
+   cross-macroblock nC derivation against a P_Skip left-neighbor"
+    (let [bytes (rd "h264/fixtures/p-skip-then-16x16-multimb.h264")
+          frames (decode/decode-gop bytes)
+          ref (rd "h264/fixtures/p-skip-then-16x16-multimb.ref.yuv")
+          frame-size (+ 512 128 128)]
+      (testing "decodes exactly 2 pictures (IDR + P), in bitstream order"
+        (is (= 2 (count frames)))
+        (is (= :i (:slice-type-class (first frames))))
+        (is (= :p (:slice-type-class (second frames)))))
+      (testing "both P-frame macroblocks are inter-coded with MV=(0,0) — MB0 via P_Skip, MB1 via explicit P_L0_16x16"
+        (is (= [true true] (:mb-inter? (second frames))))
+        (is (= [[0 0] [0 0]] (:mb-mvs (second frames)))))
+      (testing "MB1's residual actually changed pixels relative to MB0's unchanged (skip-copied) region"
+        (let [luma (:luma (second frames))
+              mb0-vals (set (for [ry (range 16) rx (range 16)] (nth luma (+ (* ry 32) rx))))
+              mb1-vals (set (for [ry (range 16) rx (range 16 32)] (nth luma (+ (* ry 32) rx))))]
+          (is (= 1 (count mb0-vals)) "MB0 (P_Skip) stays perfectly flat")
+          (is (> (count mb1-vals) 1) "MB1 (P_L0_16x16) has a real, spatially-localized residual")))
+      (doseq [[idx frame] (map-indexed vector frames)]
+        (let [planes (frame-planes ref (* idx frame-size) 32 16)]
+          (testing (str "frame " idx " reconstructed luma/Cb/Cr are bit-exact vs. real ffmpeg's INDEPENDENT decode of these same hand-authored bytes")
+            (is (= (:luma planes) (:luma frame)))
+            (is (= (:cb planes) (:cb frame)))
+            (is (= (:cr planes) (:cr frame)))))))))

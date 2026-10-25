@@ -1,0 +1,463 @@
+;; test/grep_test.cljk — build the command and compare it with the system
+;; grep, byte for byte AND by exit status.
+;;
+;; The comparison is against `grep -F`, and that is not a convenience. POSIX
+;; grep reads its pattern as a basic regular expression; this reads it
+;; literally. Measured 2026-09-10 on a file holding `a.c` and `abc`,
+;; `grep 'a.c'` answers BOTH lines and `grep -F 'a.c'` answers one.
+;; Comparing against plain grep would be comparing two different operations
+;; and calling the difference a bug.
+;;
+;; The exit status is asserted with the bytes because for grep it IS the
+;; answer: 0 when something was selected, 1 when nothing was, 2 when an
+;; operand could not be read.
+;;
+;; One flag at a time: -i, -v, -c, -n, -l. Combining them is out of scope and
+;; is not compared here -- the guest exits 2 on any dashed argument 0 it does
+;; not implement, and /usr/bin/grep prints a usage block, so a case over `-in`
+;; would be asserting a difference nobody intends to remove.
+
+(ns grep-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      ;; The large fixture answers 5.4 MB; Node's default
+                      ;; 1 MiB maxBuffer kills the child and the kill reads
+                      ;; as a difference between the two implementations.
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-grep "/usr/bin/grep")
+
+;; The regex engine this links: org-ieee-regex, a sibling checkout by default.
+(def regex-home
+  (or (.-REGEX_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." "org-ieee-regex")]
+        (when (.existsSync fs (.join path guess "regex" "core.kotoba")) guess))))
+
+;; A directory of fixtures, and the cases over them. Each case is an argv,
+;; and each is here because it separates a right implementation from a wrong
+;; one that passes the others:
+;;
+;;   a match / no match  -- exit 0 and exit 1, which grep uses as an answer
+;;                          rather than as a health report
+;;   an EMPTY file       -- reads as the empty string, which must not end the
+;;                          line walk the way "no more lines" does
+;;   no trailing newline -- grep ADDS one to a matched last line
+;;   a substring match   -- `alpha` matches `alphabet` too
+;;   a metacharacter     -- `a.c` matches literally under -F, so the
+;;                          comparison is against -F and the README says so
+;;   multi-byte          -- matched and unmatched, so the walk is not just
+;;                          counting bytes
+;;   TWO OR MORE files   -- every matching line gains a `FILE:` prefix, and
+;;                          with one file it gains none
+;;   a missing operand   -- among good ones, where the error status must beat
+;;                          the match status
+;;   ONE flag            -- -i, -v, -c, -n, -l, each alone and each with
+;;                          several files, because every one of them changes
+;;                          what the `FILE:` prefix means
+;;
+;; The prefix and the exit precedence are the two that a single-file
+;; implementation passes everything else without.
+(def fixtures
+  {"words"  "alpha\nbeta\ngamma\nalphabet\n"
+   "dots"   "a.b\naxb\n[b]\n"
+   "dashes" "-x marks\nplain\n--x\n"
+   "none"   "no match here\n"
+   "empty"  ""
+   "one"    "x\n"
+   ;; No trailing newline, and grep ADDS one to a matched last line -- 20
+   ;; bytes in, 21 out. This is the opposite of head, which adds nothing.
+   "nonl"   "tail without newline"
+   "rep"    "aaa\n"
+   ;; A metacharacter, so that -F is doing something observable.
+   "meta"   "a.c\nabc\n"
+   "utf8"   "\u65e5\u672c\u8a9e\n\u00e9clair\nplain\n"
+   ;; Three spellings of one word, so -i has something to fold in BOTH
+   ;; directions -- a lowercase needle must reach `Alpha`, and an uppercase
+   ;; needle must reach `alpha`.
+   "mixed"  "Alpha\nALPHA\nalpha\nBeta\n"
+   ;; EMPTY lines, which -v selects and the folding walk must survive. An
+   ;; empty line is not the end of the walk, and `string-index-of` on an
+   ;; empty haystack has to answer -1 rather than trap.
+   "blank"  "alpha\n\nbeta\n\n"
+   ;; The one place this is NARROWER than the system utility: U+00C9 and
+   ;; U+00E9 are one letter to /usr/bin/grep -i and two here. Used by the
+   ;; divergence assertion below, never by a case that claims agreement.
+   "acc"    "\u00c9clair\n\u00e9clair\n"
+   ;; A LARGE file: 80,000 lines, 3.4 MB, so that the arenas are a
+   ;; measurement. Every 40th line carries `SIGILL` (2,000 matches, thirty
+   ;; nine lines apart -- the window walk to a line start has to double
+   ;; back past them), every line carries `e`, no line carries `zzzz`, and
+   ;; `Static_Assert` appears in three spellings for -i. The previous
+   ;; core.kotoba trapped on 2 MB of a 3.3 MB file: `string-index-of` was
+   ;; a per-byte rewrite and the pair arena spent one handle per byte.
+   "big"    (str/join "" (map (fn [i]
+                               (str "line " i " of the corpus keeps "
+                                    (case (mod i 40) 0 "SIGILL " 13 "Static_Assert " 27 "STATIC_ASSERT " "")
+                                    "some text every line has an e in it\n"))
+                             (range 80000)))})
+
+;; PATTERN then FILE. Each case separates a right implementation from a wrong
+;; one that passes the others:
+;;
+;;   alpha/words    -- TWO matching lines, and `alphabet` is a substring match
+;;   zzz/words      -- no match: exit 1 and nothing on stdout
+;;   alpha/none     -- a non-empty file that simply does not match
+;;   a/empty        -- an empty file, which is not the same as no match
+;;   tail/nonl      -- the newline grep adds
+;;   a/rep          -- a line matching more than once is printed ONCE
+;;   a.c/meta       -- fixed string, not a pattern
+;;   multi-byte     -- a needle and a haystack that are not ASCII
+(def cases
+  [["alpha" "words"] ["zzz" "words"] ["alpha" "none"] ["a" "empty"]
+   ["tail" "nonl"] ["a" "rep"] ["x" "one"] ["beta" "words"]
+   ["alphabet" "words"] ["a.c" "meta"] ["abc" "meta"]
+   ["\u65e5\u672c" "utf8"] ["\u00e9" "utf8"] ["plain" "utf8"] ["zz" "utf8"]
+   ;; A MISSING operand: matched on stderr and exit status since wire 35
+   ;; gained an EXISTS form. Every utility words this differently --
+   ;; measured on each, not copied from a sibling.
+   ["x" "missing"]
+   ;; --- two or more operands ------------------------------------------
+   ;; With two files every matching line is prefixed `FILE:`; with one it is
+   ;; not. The prefix is the operand as written.
+   ["alpha" "words" "one"] ["x" "words" "one"]
+   ;; A match in only the SECOND file, so the prefix cannot come from the
+   ;; first operand by accident.
+   ["x" "none" "one"]
+   ;; No match in either: exit 1 and nothing written.
+   ["zzz" "words" "one"]
+   ;; The same operand twice is not de-duplicated, and each line carries the
+   ;; prefix separately.
+   ["alpha" "words" "words"]
+   ;; An empty file among the operands contributes nothing but must not end
+   ;; the walk.
+   ["x" "empty" "one"] ["x" "one" "empty"]
+   ;; Three operands.
+   ["a" "words" "rep" "meta"]
+   ;; The exit-status precedence: a match AND an unreadable operand. grep
+   ;; exits 2, not 0 -- the error outranks the match. A worst-of that simply
+   ;; kept the last answer, or that let 0 win, passes every case above.
+   ["alpha" "words" "missing"] ["alpha" "missing" "words"]
+   ;; No match and an unreadable operand: still 2, not 1.
+   ["zzz" "words" "missing"]
+   ;; Multi-byte with a prefix.
+   ["\u65e5\u672c" "utf8" "words"]
+
+   ;; --- ONE flag, found by SHAPE ---------------------------------------
+   ;;
+   ;; Argument 0 is the flag when it STARTS WITH `-`, never when the argument
+   ;; COUNT says so. `["-c" "alpha" "words"]` and `["alpha" "words" "one"]`
+   ;; are both three arguments and mean entirely different things, and both
+   ;; are in this list on purpose -- a length test passes one and ruins the
+   ;; other.
+
+   ;; -i: ASCII case folding, in both directions.
+   ["-i" "alpha" "mixed"]            ; lowercase needle reaching `Alpha`
+   ["-i" "ALPHA" "mixed"]            ; uppercase needle reaching `alpha`
+   ["-i" "Beta" "mixed"]             ; mixed needle, one line
+   ["-i" "zzz" "mixed"]              ; nothing folds into a match: exit 1
+   ["-i" "PLAIN" "utf8"]             ; an ASCII needle in a non-ASCII file
+   ["-i" "\u65e5\u672c" "utf8"]        ; a needle with no case at all
+   ["-i" "alpha" "blank"]            ; empty lines survive the fold
+   ["-i" "ALPHA" "blank"]            ; ... and the fold RUNS over them: with
+                                     ; the fold removed this one goes red,
+                                     ; where the line above stays green
+   ["-i" "alpha" "mixed" "words"]    ; folding AND the file prefix
+   ["-i" "alpha" "mixed" "missing"]  ; folding AND the error status
+
+   ;; -v: the lines that do NOT match, and the status follows what was
+   ;; PRINTED rather than what matched.
+   ["-v" "alpha" "words"]
+   ["-v" "a" "words"]                ; every line matches: nothing out, exit 1
+   ["-v" "tail" "nonl"]              ; the only line matches: exit 1
+   ["-v" "zzz" "nonl"]               ; and here -v still ADDS the newline
+   ["-v" "alpha" "blank"]            ; empty lines are selected BY -v
+   ["-v" "a" "empty"]                ; an empty file selects nothing
+   ["-v" "alpha" "words" "one"]      ; -v with the file prefix
+   ["-v" "alpha" "words" "missing"]
+
+   ;; -c: a COUNT per file, and the count is printed even when it is zero.
+   ["-c" "alpha" "words"]            ; 2
+   ["-c" "zzz" "words"]              ; prints `0` AND exits 1
+   ["-c" "a" "rep"]                  ; a line matching twice counts ONCE
+   ["-c" "tail" "nonl"]              ; the unterminated last line counts
+   ["-c" "a" "empty"]                ; 0
+   ["-c" "alpha" "words" "one"]      ; `words:2` then `one:0` -- the prefix
+                                     ; reaches -c, and 0 is still a line
+   ["-c" "zzz" "words" "one"]        ; two zeroes, exit 1
+   ["-c" "alpha" "words" "missing"]  ; NO line for the unreadable operand
+
+   ;; -n: a 1-based line number, after the file prefix and before the line.
+   ["-n" "alpha" "words"]            ; 1: and 4:, not 1: and 2:
+   ["-n" "a" "words"]                ; 1..4
+   ["-n" "tail" "nonl"]              ; numbered AND newline-terminated
+   ["-n" "zzz" "words"]              ; nothing, exit 1
+   ["-n" "alpha" "blank"]            ; empty lines are counted, not skipped
+   ["-n" "alpha" "words" "one"]      ; `words:1:alpha` -- prefix, THEN number
+   ["-n" "a" "words" "rep"]          ; the number RESETS at the second file
+   ["-n" "alpha" "words" "missing"]
+
+   ;; -l: the name of each file with a match, once.
+   ["-l" "alpha" "words"]            ; TWO matches, ONE line, and no colon
+   ["-l" "alpha" "none"]             ; nothing, exit 1
+   ["-l" "a" "empty"]                ; nothing, exit 1
+   ["-l" "alpha" "words" "one"]      ; only the file that matched
+   ["-l" "alpha" "words" "words"]    ; the same operand twice is not merged
+   ["-l" "a" "words" "rep" "meta"]   ; three files, in operand order
+   ["-l" "zzz" "words" "one"]        ; nothing, exit 1
+   ["-l" "alpha" "words" "missing"]
+
+   ;; --- the large file ---------------------------------------------------
+   ;; The cases the previous guest cannot pass (it traps at about 2 MB):
+   ;; sparse matches, a match on every line, no match at all, and every
+   ;; flag over the same 3.4 MB. Each is compared byte for byte.
+   ["SIGILL" "big"] ["e" "big"] ["zzzz" "big"] ["Static_Assert" "big"]
+   ["-n" "SIGILL" "big"] ["-c" "e" "big"] ["-c" "zzzz" "big"] ["-l" "SIGILL" "big"]
+   ["-v" "e" "big"] ["-v" "SIGILL" "big"]
+   ["-i" "static_assert" "big"] ["-i" "zzzz" "big"]
+   ["SIGILL" "big" "words"] ["-n" "SIGILL" "words" "big"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 67% of grep's invocations in agent tool use are a later pipeline
+   ;; segment (27,408 of 41,041 measured), and `grep | head` is the most
+   ;; frequent pipeline shape of all (8,593). No `FILE:` prefix; `-l`
+   ;; answers `(standard input)`; `-c` a bare count.
+   {:argv ["alpha"] :stdin "words"}
+   {:argv ["zzz"] :stdin "words"}
+   {:argv ["a"] :stdin "empty"}
+   {:argv ["-n" "alpha"] :stdin "words"}
+   {:argv ["-v" "alpha"] :stdin "words"}
+   {:argv ["-c" "alpha"] :stdin "words"}
+   {:argv ["-c" "zzz"] :stdin "words"}
+   {:argv ["-l" "alpha"] :stdin "words"}
+   {:argv ["-l" "zzz"] :stdin "words"}
+   {:argv ["-i" "ALPHA"] :stdin "words"}
+   {:argv ["e"] :stdin "big"}
+   {:argv ["-c" "e"] :stdin "big"}
+   ;; --- combined flags, -o, -h, -q (2026-09-17) ---------------------------
+   ;; Measured: -n 17,633, -c 7,822, -v 6,234, -o 3,183, -i 2,929; the
+   ;; combinations were an unknown flag here. Every spelling of a set.
+   ["-in" "ALPHA" "words"] ["-i" "-n" "ALPHA" "words"] ["-ni" "ALPHA" "words"]
+   ["-vc" "alpha" "words"] ["-cv" "alpha" "words"] ["-vn" "alpha" "words"] ["-vi" "ALPHA" "words"]
+   ["-cn" "alpha" "words" "one"] ["-nl" "alpha" "words" "one"] ["-il" "ALPHA" "words" "one"]
+   ["-inc" "ALPHA" "words"] ["-vcn" "alpha" "words"]
+   ;; -o: the match, every match, one per line; with -n, -i, -c, -v, -l.
+   ["-o" "a" "words"] ["-o" "alpha" "words"] ["-on" "a" "words"] ["-no" "a" "words"]
+   ["-oi" "A" "words"] ["-oc" "a" "words"] ["-ov" "a" "words"] ["-ol" "a" "words" "one"]
+   ["-o" "a" "words" "one"] ["-oin" "A" "words" "one"] ["-o" "zzz" "words"]
+   ;; -h: no FILE: prefix with several operands (alone and with -n, -c).
+   ["-h" "alpha" "words" "one"] ["-hn" "alpha" "words" "one"] ["-hc" "alpha" "words" "one"] ["-ho" "a" "words" "one"]
+   ;; -q: nothing printed, the status only; with a missing operand too.
+   ["-q" "alpha" "words"] ["-q" "zzz" "words"] ["-qn" "alpha" "words"] ["-q" "alpha" "missing"] ["-qc" "zzz" "words"]
+   ;; -- ends the flags: a pattern that begins with a dash.
+   ["--" "-x" "dashes"] ["-n" "--" "-x" "dashes"]
+   {:argv ["-on" "a"] :stdin "words"}
+   {:argv ["-o" "a"] :stdin "words"} {:argv ["-in" "ALPHA"] :stdin "words"} {:argv ["-oc" "e"] :stdin "big"}
+   {:argv ["-q" "alpha"] :stdin "words"} {:argv ["-vc" "e"] :stdin "big"}
+   ;; --- regular expressions (2026-09-17, org-ieee-regex) ------------------
+   ;; A :re case is compared WITHOUT -F. The measured shapes first: word
+   ;; alternation, anchored alternation, +, ., classes; then each flag with
+   ;; a regex, BRE (plain grep) vs ERE (-E), and -F on a metacharacter.
+   [:re ["-E" "alpha|gamma" "words"]] [:re ["-E" "^(alpha|beta)" "words"]] [:re ["-E" "^beta |gamma" "words"]]
+   [:re ["-E" "a+" "words"]] [:re ["-E" "al.ha" "words"]] [:re ["-E" "^a.*t$" "words"]] [:re ["-E" "[bg]" "words"]]
+   [:re ["-E" "[[:upper:]]" "words"]] [:re ["-E" "ph?a" "words"]] [:re ["-E" "a{2}" "words"]] [:re ["-E" "z{0,1}gam" "words"]]
+   [:re ["-En" "alpha|gamma" "words"]] [:re ["-Ec" "a" "words"]] [:re ["-Ev" "a" "words"]] [:re ["-El" "^b" "words" "one"]]
+   [:re ["-Ei" "ALPHA|GAMMA" "words"]] [:re ["-Eo" "[a-z]+a" "words"]] [:re ["-Eo" "a." "words"]] [:re ["-Eon" "a." "words"]]
+   [:re ["-E" "alpha|gamma" "words" "one"]] [:re ["-Eh" "alpha" "words" "one"]] [:re ["-Eq" "gam+a" "words"]]
+   [:re ["-E" "SIGILL|static_assert" "big"]] [:re ["-Ec" "e+ " "big"]] [:re ["-En" "^line 1[0-9]* " "big"]]
+   ;; BRE: plain grep. `a+` is literal there; `\+` quantifies.
+   [:re ["alp.a" "words"]] [:re ["^beta$" "words"]] [:re ["a\\+" "words"]] [:re ["a+" "words"]] [:re ["\\(al\\)" "words"]]
+   [:re ["[a-c]et" "words"]] [:re ["-n" "a.*a" "words"]] [:re ["-c" "^" "words"]] [:re ["-v" "^a" "words"]]
+   ;; -F keeps a metacharacter literal; a . in the fixture proves it.
+   [:re ["-F" "a." "dots"]] [:re ["-F" "[b]" "dots"]] [:re ["a." "dots"]]
+   ;; Invalid patterns: exit 2 on both sides (the message is compared as
+   ;; a divergence below, not here).
+   [:re {:argv ["-E" "alpha|gamma"] :stdin "words"}] [:re {:argv ["-Eo" "[a-z]+"] :stdin "words"}]
+   [:re {:argv ["-E" "^(alpha|beta)"] :stdin "words"}] [:re {:argv ["a.*a"] :stdin "words"}]])
+
+;; --- where this is NARROWER than the system utility ----------------------
+;;
+;; `-i` folds ASCII A-Z and nothing else, because there is no case-folding
+;; builtin on this surface and the fold is twenty-six hand-written
+;; replacements. /usr/bin/grep in en_US.UTF-8 folds U+00C9 to U+00E9; this
+;; does not.
+;;
+;; That belongs in the suite as a DIVERGENCE rather than in the README alone.
+;; A case in the list above would simply fail; a line missing from the list
+;; would say nothing at all. This asserts both sides by name, so the day
+;; someone implements Unicode folding this check goes red and asks for the
+;; README to be corrected -- which is the only way a documented limit stays
+;; true.
+(def divergences
+  [{:argv ["-i" "\u00c9" "acc"]
+    :why "U+00C9 folds to U+00E9 for /usr/bin/grep and not here"
+    :kotoba "\u00c9clair\n"
+    :system "\u00c9clair\n\u00e9clair\n"}])
+
+;; The argv a case names, with every FILE operand made absolute and the
+;; pattern left alone.
+;;
+;; Which element is the pattern is decided by SHAPE, exactly as the guest
+;; decides it: argument 0 is the flag when it starts with `-`, so the pattern
+;; is element 1 there and element 0 otherwise. Deciding it by LENGTH would
+;; make `["-c" "alpha" "words"]` and `["alpha" "words" "one"]` the same shape
+;; and quietly hand `-c` two files.
+;;
+;; This is the line that stopped the suite from being able to fail once
+;; already -- see the note below on the twelve multi-operand cases.
+(defn- argv-for [names data]
+  ;; Every leading flag (a dash and letters) then the pattern, then files.
+  (let [nflags (count (take-while #(and (str/starts-with? % "-") (not= % "--")) names))
+        after-dd (if (= "--" (nth names nflags nil)) 1 0)
+        head (take (+ nflags after-dd 1) names)
+        files (drop (+ nflags after-dd 1) names)]
+    (into (vec head) (map #(.join path data %) files))))
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-grep) (refuse (str "no " system-grep " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-wc-"))
+        src (.resolve path (.cwd js/process) "grep" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "grep.kexe")
+        blob (.join path tmp "grep.bin")
+        exe (.join path tmp "grep")
+        exe-big (.join path tmp "grep-big")]
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
+    ;; The fixtures live in the tree the binary is packaged for. The native
+    ;; loader refuses a relative request outright, so operands are absolute.
+    (let [data (.join path tmp "data")]
+      (.mkdirSync fs data)
+      (doseq [[name content] fixtures]
+        (.writeFileSync fs (.join path data name)
+                        content
+                        "utf8")))
+    (when-not regex-home (refuse "set REGEX_HOME to an org-ieee-regex checkout"))
+    (let [c (run "node" [amu "compile" src "--source-path" (.resolve path (.cwd js/process))
+                         "--source-path" regex-home "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      ;; TWO binaries from the same code: one with the loader's default
+      ;; string-arena budget and one with a raised budget. The pair is what
+      ;; makes the ceiling below a measurement instead of a claim -- a single
+      ;; binary could only show that some size works and some does not, not
+      ;; that the bound is the arena and that it moves.
+      ;; Fuel and arena are constants of the binary, so they are packaged
+      ;; here rather than supplied at run time. Counting words walks one code
+      ;; point at a time, so the guest recursion is as long as the file and
+      ;; the default 512 fuel counts almost nothing.
+      ;; The budgets are sized for the large fixture: `-i` folds each of its
+      ;; 80,000 lines in 26 passes (about 80 handles and 26 line copies per
+      ;; line), which is the documented slow mode; every other mode spends
+      ;; a few handles per MATCH. CPU seconds too -- the fold takes about a
+      ;; second of CPU on a loaded machine, and the loader's default is one.
+      ;; The loader's DEFAULT handle budget: with every allocating step of a
+      ;; match a region (arena-scope, ABI v6) the scan holds the text and
+      ;; one match's views, so 80,000 matching lines and the 26-pass fold of
+      ;; each line under -i run in 4,096 handles, where the unscoped guest
+      ;; spent four per match and eighty per folded line.
+      (doseq [[out extra] [[exe ["--fuel" "4000000000" "--string-pool" "67108864"
+                                 "--pairs" "65536"
+                                 "--cpu-seconds" "600" "--wall-seconds" "600"]]]]
+        (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                                   "--allow" "35,37,38,39,41"
+                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
+                                   "--output" out]
+                                  extra) {})]
+          (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))
+          (when-not (re-find #":cpu-seconds \"600\"" (str (:out p)))
+            (refuse "the packager did not echo --cpu-seconds: AMU_HOME predates 2026-09-15 and would bound the scan to one CPU second")))))
+    ;; Now the only thing that matters: run it.
+    (let [results
+          (for [case0 cases]
+            ;; [PATTERN FILE...]: the first element is the pattern and
+            ;; EVERY remaining one is a path.
+            ;;
+            ;; This built `[(first names) (second names)]` until 2026-09-10,
+            ;; which silently dropped every operand past the second. The
+            ;; twelve multi-operand cases added that day all PASSED against
+            ;; it, because both implementations were handed one file and
+            ;; agreed about it -- a suite that could not have failed. The
+            ;; giveaway was in the output: cases naming three files printed
+            ;; the first file's lines with no `FILE:` prefix anywhere.
+            (let [re? (and (vector? case0) (= :re (first case0)))
+                  case (if re? (second case0) case0)
+                  names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture fed as standard input to BOTH
+                  ;; binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (or (get fixtures (:stdin case))
+                              (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (argv-for names (.realpathSync fs (.join path tmp "data")))
+                  ;; A :re case is compared without -F: the pattern is a
+                  ;; regular expression on both sides. Every other case is
+                  ;; a fixed string on BOTH sides -- since 2026-09-17 a plain
+                  ;; pattern is a BRE here too, so `-F` goes to both.
+                  k (run exe (if re? argv (into ["-F"] argv)) opts)
+                  s (run system-grep (if re? argv (into ["-F"] argv)) opts)
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             ;; stderr too: a missing operand differs there
+                             ;; and nowhere else, so a suite that compared
+                             ;; only stdout and status would call it green.
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s)))]
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case) (when re? :re)] (if re? [:re names] names))
+               :ok same? :kotoba (.toString (:out k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          ;; The documented -i limit, asserted from BOTH sides. Each of these
+          ;; is green only when this command answers exactly what it claims to
+          ;; answer AND the system utility answers exactly what the README
+          ;; says it answers -- and the two differ. So it goes red if either
+          ;; side changes, and a stale claim in the README cannot survive.
+          divs
+          (for [d divergences]
+            (let [data (.realpathSync fs (.join path tmp "data"))
+                  argv (argv-for (:argv d) data)
+                  k (.toString (:out (run exe (into ["-F"] argv) {})) "utf8")
+                  y (.toString (:out (run system-grep (into ["-F"] argv) {})) "utf8")]
+              {:argv (:argv d) :why (:why d)
+               :ok (and (= k (:kotoba d)) (= y (:system d)) (not= k y))
+               :kotoba k :system y}))
+          bad (concat (remove :ok results) (remove :ok divs))]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ")
+                      (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-grep " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r))))))) 
+      (doseq [d divs]
+        (println (str (if (:ok d) "  ok   " "  FAIL ") "DIVERGES "
+                      (pr-str (:argv d)) " -- " (:why d)
+                      " -> " (pr-str (:kotoba d))
+                      " vs " (pr-str (:system d)))))
+      (println (pr-str {:ok (empty? bad) :cases (+ (count results) (count divs))
+                        :divergences (count divs) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

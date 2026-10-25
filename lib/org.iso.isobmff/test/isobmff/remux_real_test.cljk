@@ -1,0 +1,146 @@
+(ns isobmff.remux-real-test
+  "Validates isobmff.remux/trim+remux and isobmff.remux/concat-streams+remux
+   against ffmpeg's own `-c copy` (stream-copy, re-encode-free) trim/concat
+   of REAL libx264-encoded MP4 files. This is the gap left open by
+   demux_real_test (whose own docstring says it only cross-validates
+   mux/demux/remux against each other — no external ffmpeg trim/concat
+   result was ever compared against isobmff.remux before this file).
+
+   Fixtures (committed under resources/isobmff/fixtures/, generated once
+   with ffmpeg 8.1.1 / libx264; commands reproduced here verbatim so the
+   fixtures can be regenerated/audited):
+
+   trim_concat_source_a.mp4 — 64x64 testsrc, 10fps, 2s (20 video frames,
+     no audio), baseline profile, `-g 5` (closed-ish GOP every 5 frames ->
+     keyframes at frame idx 0,5,10,15 / pts 0,5120,10240,15360 at
+     timescale 10240):
+       ffmpeg -flags +bitexact -fflags +bitexact -f lavfi \\
+         -i testsrc=size=64x64:rate=10:duration=2 -c:v libx264 \\
+         -profile:v baseline -g 5 -pix_fmt yuv420p -an -flags:v +bitexact \\
+         trim_concat_source_a.mp4
+
+   trim_concat_source_b.mp4 — same encode settings, testsrc2, 1s (10 video
+     frames, keyframes at idx 0,5), used only as the 2nd concat operand:
+       ffmpeg -flags +bitexact -fflags +bitexact -f lavfi \\
+         -i testsrc2=size=64x64:rate=10:duration=1 -c:v libx264 \\
+         -profile:v baseline -g 5 -pix_fmt yuv420p -an -flags:v +bitexact \\
+         trim_concat_source_b.mp4
+
+   trim_ffmpeg_stream_copy.mp4 — ffmpeg's own re-encode-free trim of
+     source_a, seeking exactly onto a keyframe boundary on both ends so
+     that no rounding / decode-refresh ambiguity is possible:
+       ffmpeg -i trim_concat_source_a.mp4 -ss 0.5 -t 0.5 -c copy \\
+         -avoid_negative_ts make_zero trim_ffmpeg_stream_copy.mp4
+     (pts 0.5s == 5120 == a keyframe; `-t 0.5` stops exactly before the
+     next keyframe at pts 10240 -- this window is a single whole GOP, so
+     isobmff.remux/trim's documented \"R0 does not round to keyframe
+     boundaries\" caveat never comes into play here, by construction.)
+
+   concat_ffmpeg_stream_copy.mp4 — ffmpeg's own re-encode-free concat of
+     source_a ++ source_b via the concat demuxer:
+       printf \"file 'trim_concat_source_a.mp4'\\nfile 'trim_concat_source_b.mp4'\\n\" > list.txt
+       ffmpeg -f concat -safe 0 -i list.txt -c copy concat_ffmpeg_stream_copy.mp4
+
+   FINDING, reported honestly rather than smoothed over: trim matches
+   ffmpeg's stream-copy byte-for-byte on every single sample (verified
+   below). concat does NOT match byte-for-byte on keyframe samples --
+   ffmpeg's `-f concat` demuxer runs an implicit `h264_mp4toannexb`
+   bitstream filter (visible in ffmpeg's own stderr as \"Auto-inserting
+   h264_mp4toannexb bitstream filter\") that re-injects an inline SPS+PPS
+   NAL pair (36 Annex-B length-prefixed bytes, in this fixture) immediately
+   before the first VCL NAL of every IDR access unit, so each GOP stays
+   independently decodable after concatenation. isobmff.remux/concat-
+   streams does no NAL-level rewriting at all -- it only concatenates
+   sample lists at the container/sample-table level -- so this insertion
+   is an expected divergence from ffmpeg's own concat semantics, not a bug
+   in isobmff.remux. What's actually verified below: every non-keyframe
+   sample is byte-identical, and every keyframe sample is byte-identical
+   to ffmpeg's own keyframe sample modulo exactly that one well-defined
+   36-byte inline-parameter-set insertion (checked structurally, not
+   assumed)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [isobmff.demux :as demux]
+            [isobmff.remux :as remux]
+            [isobmff.blob :as blob]))
+
+(defn- rd-bytes [p]
+  (mapv #(bit-and (int %) 0xff)
+        #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+           :cljs (js->clj (.readFileSync (js/require "fs") (str "lib/org.iso.isobmff/resources/" p))))))
+
+(defn- video-track [demuxed] (first (:tracks demuxed)))
+
+;; --------------------------------------------------------------------
+;; trim
+;; --------------------------------------------------------------------
+
+(deftest real-ffmpeg-trim-matches-stream-copy
+  (let [src          (demux/demux (rd-bytes "isobmff/fixtures/trim_concat_source_a.mp4"))
+        ours-demux   (-> src (remux/trim 5120 10240) remux/remux demux/demux)
+        ffmpeg-demux (demux/demux (rd-bytes "isobmff/fixtures/trim_ffmpeg_stream_copy.mp4"))
+        ov           (video-track ours-demux)
+        fv           (video-track ffmpeg-demux)]
+    (testing "same sample count as ffmpeg's own stream-copy trim (one full GOP)"
+      (is (= 5 (count (:samples fv))))
+      (is (= (count (:samples fv)) (count (:samples ov)))))
+    (testing "sample bytes (elementary-stream H.264 NAL data) are byte-identical to ffmpeg's own trim"
+      (is (= (mapv :bytes (:samples fv)) (mapv :bytes (:samples ov))))
+      (is (= (mapv (comp blob/content-id :bytes) (:samples fv))
+             (mapv (comp blob/content-id :bytes) (:samples ov)))))
+    (testing "keyframe flags and sizes agree"
+      (is (= (mapv :keyframe (:samples fv)) (mapv :keyframe (:samples ov))))
+      (is (= (mapv :size (:samples fv)) (mapv :size (:samples ov)))))))
+
+;; --------------------------------------------------------------------
+;; concat
+;; --------------------------------------------------------------------
+
+(defn- single-block-insertion
+  "If `big` equals `small` with exactly one contiguous block of bytes
+   inserted somewhere in the middle (otherwise byte-for-byte identical),
+   returns {:split <index-into-small> :inserted <bytes>}; else nil.
+   Test-only helper (not a general diff algorithm) -- just precise enough
+   to characterize the ffmpeg h264_mp4toannexb SPS/PPS re-injection
+   documented in the namespace docstring above."
+  [small big]
+  (let [small (vec small) big (vec big)
+        ns (count small) nb (count big) gap (- nb ns)]
+    (when (pos? gap)
+      (loop [i 0]
+        (cond
+          (> i ns) nil
+          (not= (subvec small 0 i) (subvec big 0 i)) nil
+          (= (subvec small i ns) (subvec big (+ i gap) nb))
+          {:split i :inserted (subvec big i (+ i gap))}
+          :else (recur (inc i)))))))
+
+(deftest real-ffmpeg-concat-matches-stream-copy
+  (let [a            (demux/demux (rd-bytes "isobmff/fixtures/trim_concat_source_a.mp4"))
+        b            (demux/demux (rd-bytes "isobmff/fixtures/trim_concat_source_b.mp4"))
+        ours-demux   (-> (remux/concat-streams a b) remux/remux demux/demux)
+        ffmpeg-demux (demux/demux (rd-bytes "isobmff/fixtures/concat_ffmpeg_stream_copy.mp4"))
+        ov           (video-track ours-demux)
+        fv           (video-track ffmpeg-demux)
+        os           (:samples ov)
+        fs           (:samples fv)]
+    (testing "same sample count (20 + 10 = 30) and pts sequence as ffmpeg's own concat"
+      (is (= 30 (count os) (count fs)))
+      (is (= (mapv :pts fs) (mapv :pts os))))
+    (testing "every non-keyframe sample is byte-identical (concat never touches inter-frame NALs)"
+      (doseq [i (range (count os))]
+        (when-not (:keyframe (nth os i))
+          (is (= (:bytes (nth fs i)) (:bytes (nth os i)))
+              (str "sample " i " (non-keyframe) byte mismatch")))))
+    (testing "every keyframe sample differs from ffmpeg's concat only by ffmpeg's own inline SPS+PPS re-injection"
+      (doseq [i (range (count os))]
+        (when (:keyframe (nth os i))
+          (let [our-bytes    (:bytes (nth os i))
+                ffmpeg-bytes (:bytes (nth fs i))]
+            (when-not (= our-bytes ffmpeg-bytes)
+              (let [m (single-block-insertion our-bytes ffmpeg-bytes)]
+                (is (some? m)
+                    (str "sample " i " (keyframe) differs by more than a single inserted block"))
+                (is (= 36 (count (:inserted m)))
+                    (str "sample " i " (keyframe) unexpected insertion size "
+                         (count (:inserted m))))))))))))

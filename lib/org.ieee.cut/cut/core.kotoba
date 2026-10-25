@@ -1,0 +1,745 @@
+;; cut -- POSIX cut (IEEE Std 1003.1), the single-field form.
+;;
+;;   cut -f N FILE        field N, delimited by TAB
+;;   cut -dX -fN FILE     field N, delimited by X
+;;   cut -cLIST FILE      characters (code points) by position
+;;   ... | cut ...        the same over standard input (wire 41)
+;;
+;; ## A line with no delimiter is printed WHOLE
+;;
+;; That is the behaviour, not an edge case to work around: `cut -d: -f2` over
+;; a line reading `nofield` answers `nofield`, not the empty string.
+;; (`-s` suppresses such lines; this does not implement `-s`.) Measured
+;; against /usr/bin/cut 2026-09-10.
+;;
+;; ## The default delimiter is a TAB, not a space
+;;
+;; Measured on the same day: `cut -f2` over `a:b:c` answers `a:b:c` -- the
+;; whole line, because there is no tab in it -- and over `one<TAB>two` it
+;; answers `two`.
+;;
+;; A tab cannot be written in Kotoba source (no control characters, no
+;; char-to-string builtin), so it is cut from the listing wire's own
+;; separator the same way a newline is cut from a two-line literal.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
+(ns cut.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+;; Wire 41: the empty request answers standard input to EOF.
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+;; "\n" is a literal since 2026-09-16: a literal evaluates to one fresh pair
+;; over the code image (`pair-new`), where the two-line substring this used
+;; to be cost a `string-substring` call as well.
+(defn nl [] :string "\n")
+
+;; A one-byte tab, cut from a literal that contains one.
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+;; --- arguments ------------------------------------------------------------
+;; `cut [-dX] [-s] -fLIST FILE...`, and the flags may come in ANY order --
+;; measured, `-d: -s -f1`, `-s -d: -f1` and `-d: -f2 -s` are the same request.
+;;
+;; So the arguments are SCANNED rather than indexed. This used to ask whether
+;; argument 0 began with `-d` and take the operand from a fixed offset, which
+;; is a positional assumption that `-s` breaks in three different places at
+;; once. A scan has no position to be wrong about.
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn dash? [a :string] :bool
+  (= (string-index-of a "-") 0))
+
+;; The index of the first argument that is not a flag.
+(defn first-file-from [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    i
+    (if (dash? (arg (decimal-of i)))
+      (first-file-from (+ i 1) total)
+      i)))
+
+(defn first-file [] :i64
+  (first-file-from 0 (arg "")))
+
+;; The flag beginning with PREFIX, or "" -- searched among the leading flags
+;; only, so a FILE named `-f...` is never mistaken for one.
+(defn flag-from [i :i64 stop :i64 prefix :string] :string
+  (if (>= i stop)
+    ""
+    (let [a (arg (decimal-of i))]
+      (if (= (string-index-of a prefix) 0)
+        a
+        (flag-from (+ i 1) stop prefix)))))
+
+(defn has-flag? [name :string] :bool
+  (string=? (flag-from 0 (first-file) name) name))
+
+(defn suppress? [] :bool
+  (has-flag? "-s"))
+
+(defn delim [] :string
+  (let [d (flag-from 0 (first-file) "-d")]
+    (if (string=? d "") (tab) (string-substring d 2 (string-byte-length d)))))
+
+(defn field-text [] :string
+  (let [f (flag-from 0 (first-file) "-f")]
+    (if (string=? f "") "" (string-substring f 2 (string-byte-length f)))))
+
+;; --- the field list ------------------------------------------------------
+;;
+;; `-f` takes a LIST, not a number: `-f2,4`, `-f2-4`, `-f2-`, `-f-3`, and any
+;; comma-separated mixture. Measured against /usr/bin/cut 2026-09-10, the
+;; list behaves as a SET tested per field rather than a sequence to walk:
+;;
+;;   -f3,1  -> a:c    the output is ASCENDING, not the order written
+;;   -f1,1  -> a      a repeat selects the field once
+;;   -f2,9  -> b      a field past the end is skipped, not an error
+;;   -f3-1  -> (empty line, exit 0)   a descending range selects nothing
+;;
+;; So this asks "is field n selected" for n = 1, 2, ... in order. Ascending
+;; order, de-duplication and out-of-range skipping all fall out of that; none
+;; of them needs a sort, which is fortunate because there is no ordering
+;; primitive to sort with.
+
+;; Non-empty and every byte a digit.
+(defn all-digits? [s :string i :i64 n :i64] :i64
+  (if (= n 0)
+    0
+    (if (>= i n)
+      1
+      (if (< (digit-value s i) 0) 0 (all-digits? s (+ i 1) n)))))
+
+;; 0 = well formed, 1 = illegal list value, 2 = value may not include zero.
+;; An EMPTY item is 2, not 1: measured, `-f1,` and `-f,1` and `-f` all report
+;; "values may not include zero", because an absent number reads as 0. A
+;; range with both sides absent (`-f-`) is 2 for the same reason -- while
+;; `-f1-` and `-f-1` are both well formed, since there an absent side means
+;; unbounded rather than zero.
+(defn classify-item [item :string] :i64
+  (let [n (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (= n 0)
+      2
+      (if (< d 0)
+        (if (= (all-digits? item 0 n) 1)
+          (if (= (text->i64 item 0 n 0) 0) 2 0)
+          1)
+        (let [lo (string-substring item 0 d)
+              hi (string-substring item (+ d 1) n)
+              ln (string-byte-length lo)
+              hn (string-byte-length hi)]
+          (if (>= (string-index-of hi "-") 0)
+            1
+            (if (= (+ ln hn) 0)
+              2
+              (if (= ln 0)
+                (if (= (all-digits? hi 0 hn) 1)
+                  (if (= (text->i64 hi 0 hn 0) 0) 2 0)
+                  1)
+                (if (= hn 0)
+                  (if (= (all-digits? lo 0 ln) 1)
+                    (if (= (text->i64 lo 0 ln 0) 0) 2 0)
+                    1)
+                  (if (= (all-digits? lo 0 ln) 1)
+                    (if (= (all-digits? hi 0 hn) 1)
+                      (if (= (text->i64 lo 0 ln 0) 0)
+                        2
+                        (if (= (text->i64 hi 0 hn 0) 0) 2 0))
+                      1)
+                    1))))))))))
+
+;; The first item that is not well formed decides, scanning left to right.
+(defn classify-spec [spec :string] :i64
+  (let [n (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (classify-item spec)
+      (let [c (classify-item (string-substring spec 0 i))]
+        (if (= c 0)
+          (classify-spec (string-substring spec (+ i 1) n))
+          c)))))
+
+;; An absent low bound is 1; an absent high bound is unbounded, carried here
+;; as 0 because a real bound can never be 0 (classify-spec rejected it).
+(defn item-selects? [item :string n :i64] :i64
+  (let [len (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (< d 0)
+      (if (= (text->i64 item 0 len 0) n) 1 0)
+      (let [lo (string-substring item 0 d)
+            hi (string-substring item (+ d 1) len)
+            ln (string-byte-length lo)
+            hn (string-byte-length hi)
+            lov (if (= ln 0) 1 (text->i64 lo 0 ln 0))
+            hiv (if (= hn 0) 0 (text->i64 hi 0 hn 0))]
+        (if (< n lov)
+          0
+          (if (= hiv 0) 1 (if (<= n hiv) 1 0)))))))
+
+(defn spec-selects? [spec :string n :i64] :i64
+  (let [len (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (item-selects? spec n)
+      (if (= (item-selects? (string-substring spec 0 i) n) 1)
+        1
+        (spec-selects? (string-substring spec (+ i 1) len) n)))))
+
+;; --- the field list as a bit set ----------------------------------------
+;;
+;; The list is parsed ONCE into an i64 (2026-09-16):
+;;
+;;   bit 0        -s
+;;   bits 1-40    field k selected, for k <= 40
+;;   bit 41       the list names a bounded field above 40, so a field
+;;                above 40 is asked of the list itself (`spec-selects?`)
+;;   bit 42       the list has an open range `N-`
+;;   bits 43-62   N of the smallest open range when bit 42 is set; else the
+;;                LAST selected field, past which the walk stops reading
+;;
+;; Until then every field of every line re-parsed the list (`spec-selects?`
+;; above, a dozen string operations per field) and every line was walked
+;; twice -- once to count its fields, once to cut them -- which was 1.6 s
+;; of a 33 MB cut where `/usr/bin/cut` spends 0.04. `spec-selects?` stays
+;; as the reference the bit set is measured against in the suite, and as
+;; the answer for a field above 40 when the list names one (bit 41): that
+;; path re-reads the list from the arguments per field and is slow, which
+;; a list like `-f60` pays and `-f2` does not.
+
+(defn cfg-sup? [cfg :i64] :bool (= 1 (bit-and cfg 1)))
+(defn cfg-high? [cfg :i64] :bool (= 1 (bit-and (i64-shift-right cfg 41) 1)))
+(defn cfg-open? [cfg :i64] :bool (= 1 (bit-and (i64-shift-right cfg 42) 1)))
+;; Bits 43-55: the smallest N of an open range, or the last selected field.
+(defn cfg-high [cfg :i64] :i64 (bit-and (i64-shift-right cfg 43) 8191))
+;; Bits 56-62: the delimiter as one ASCII byte, 0 when it is not one.
+(defn cfg-dbyte [cfg :i64] :i64 (i64-shift-right cfg 56))
+;; The fast walk applies when the delimiter is one ASCII byte and no field
+;; number was uncarried (bit 41 with nothing to stop at is the general
+;; walk's business too, but the fast walk asks the list the same way).
+(defn cfg-fast? [cfg :i64] :bool (> (cfg-dbyte cfg) 0))
+
+;; The smallest N of an open range, or 0.
+(defn cfg-open [cfg :i64] :i64
+  (if (cfg-open? cfg) (cfg-high cfg) 0))
+
+;; The last selected field when there is no open range, else 0 (walk all).
+(defn cfg-last [cfg :i64] :i64
+  (if (cfg-open? cfg) 0 (cfg-high cfg)))
+
+;; Bits 43-55 replaced, the rest kept.
+(defn with-high [cfg :i64 n :i64] :i64
+  (+ (bit-and cfg 9151323238909870079) (i64-shift-left n 43)))
+
+;; A field number the thirteen bits cannot carry (above 8191): the list is
+;; asked per field above 40 (bit 41) and the walk never stops early (the
+;; high bits cleared, the open mark cleared) -- correct through the slow
+;; question, without the two shortcuts.
+(defn with-uncarried [cfg :i64] :i64
+  (bit-or (bit-and (with-high cfg 0) -4398046511105) 2199023255552))
+
+(defn with-open [cfg :i64 n :i64] :i64
+  (if (> n 8191)
+    (with-uncarried cfg)
+    (let [o (cfg-open cfg)]
+      (if (if (= o 0) true (< n o))
+        (bit-or (with-high cfg n) 4398046511104)
+        cfg))))
+
+;; A bounded field: its bit (or the above-40 mark), and the last-field mark
+;; raised to it unless an open range already covers everything past some
+;; point.
+(defn with-field [cfg :i64 v :i64] :i64
+  (if (> v 8191)
+    (with-uncarried cfg)
+    (let [c (if (> v 40) (bit-or cfg 2199023255552) (bit-or cfg (i64-shift-left 1 v)))]
+      (if (cfg-open? c)
+        c
+        (if (if (cfg-high? c) (= 0 (cfg-high c)) false)
+          c
+          (if (> v (cfg-last c)) (with-high c v) c))))))
+
+(defn set-range [cfg :i64 lo :i64 hi :i64] :i64
+  (if (> lo hi)
+    cfg
+    (set-range (with-field cfg lo) (+ lo 1) hi)))
+
+(defn item-cfg [cfg :i64 item :string] :i64
+  (let [len (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (< d 0)
+      (with-field cfg (text->i64 item 0 len 0))
+      (let [lo (string-substring item 0 d)
+            hi (string-substring item (+ d 1) len)
+            ln (string-byte-length lo)
+            hn (string-byte-length hi)
+            lov (if (= ln 0) 1 (text->i64 lo 0 ln 0))
+            hiv (if (= hn 0) 0 (text->i64 hi 0 hn 0))]
+        (if (= hiv 0)
+          (with-open cfg lov)
+          ;; A range wider than the bit set is not enumerated: it is
+          ;; marked above-40 and asked of the list per field.
+          (if (> hiv 40)
+            (with-field (with-field (set-range cfg lov (if (> lov 40) lov 40)) hiv) hiv)
+            (set-range cfg lov hiv)))))))
+
+(defn spec-cfg [cfg :i64 spec :string] :i64
+  (let [len (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (item-cfg cfg spec)
+      (spec-cfg (item-cfg cfg (string-substring spec 0 i))
+                (string-substring spec (+ i 1) len)))))
+
+;; The delimiter rides in the cfg as one ASCII byte when it is one (2026-09-16,
+;; context ABI v10): the fast walk then searches for the BYTE
+;; (`string-find-byte`, no needle handle) and appends the delimiter between
+;; fields as the byte before the field, never needing the string.
+(defn spec->cfg [spec :string sup :bool d :string] :i64
+  (let [cfg (spec-cfg 0 spec)
+        c (if sup (bit-or cfg 1) cfg)
+        b (if (= 1 (string-byte-length d)) (string-code-point-at d 0) 0)]
+    (+ c (i64-shift-left (if (< b 128) b 0) 56))))
+
+;; Is field K selected? The open range first, then the bit set, then --
+;; for a field above 40 when the list names one -- the list itself.
+(defn selected? [cfg :i64 k :i64] :bool
+  (let [o (cfg-open cfg)]
+    (if (if (= o 0) false (>= k o))
+      true
+      (if (> k 40)
+        ;; A region: the list is re-read from the arguments per field, and
+        ;; those handles would otherwise count against the walk's budget.
+        (if (cfg-high? cfg) (arena-scope (= 1 (spec-selects? (field-text) k))) false)
+        (not (= 0 (bit-and cfg (i64-shift-left 1 k))))))))
+
+;; --- the field walk ------------------------------------------------------
+;;
+;; ONE pass over the line, APPENDING to an accumulator rather than writing:
+;; a write is a capability call -- validated, dispatched, its byte count
+;; interned as a string -- and measured 2026-09-16 at about 100 ns each on
+;; a 33 MB file, two per line, where a tail append (`string-concat` onto
+;; the pool's last allocation) is the bytes and nothing else. The batch
+;; driver below writes the accumulator once per KB of input.
+;;
+;; Field K starts at POS; the next delimiter ends it. PK packs the cursor,
+;; the field number, a field BUDGET, whether a field was already written
+;; (so the next selected one gets a delimiter before it) and whether this
+;; is the file's LAST line (unterminated) -- `wrote * 2^62 + pos * 2^31 +
+;; k * 2^11 + budget * 2 + last` (the pool is at most 1 GiB, so a cursor
+;; fits 31 bits) -- because a function carries five parameters. A line
+;; with NO delimiter is printed WHOLE whatever the list says -- measured:
+;; `cut -d: -f1,3` over `nofield` answers `nofield` -- which is the K = 1
+;; search finding none; -s drops it instead. The newline: every
+;; terminated line gets one unless -s dropped it; the last unterminated
+;; line gets one only when fields were cut (measured 2026-09-10, `cut -d:
+;; -f1` over `nonl-x:nonl-y` answers 7 bytes and over `g` answers `g`, 1
+;; byte). The walk stops after the last selected field (`cfg-last`): the
+;; rest of the line is never read. Every offset here is the index of a
+;; delimiter found by `string-index-of`, or 0, or the length; nothing else
+;; is a code-point boundary and a substring off one traps.
+;;
+;; The BUDGET is the handle bound: a field costs up to three handles (its
+;; view, its delimiter's and its own append; the search cuts none), and a line
+;; of thousands of fields would exhaust the loader's default 4,096 inside
+;; one region. So a line is cut on the batch's accumulator only for its
+;; first 256 fields; past that the accumulator is written and the REST of
+;; the line is cut in chunks of 256 fields, each its own region with its
+;; own write (`cut-rest`) -- a region nested in the batch's, whose handles
+;; it does not release, which is why 256: 1 KB of input (under 1,300),
+;; the line's first 256 fields (1,024) and one chunk (1,024) fit. Measured
+;; 2026-09-16 on 50 lines of 3,000 fields, every field selected, under
+;; 4,096 handles.
+(defn pk-pos [pk :i64] :i64 (bit-and (i64-shift-right pk 31) 2147483647))
+(defn pk-wrote? [pk :i64] :bool (= 1 (i64-shift-right pk 62)))
+(defn pk-k [pk :i64] :i64 (bit-and (i64-shift-right pk 11) 1048575))
+(defn pk-budget [pk :i64] :i64 (bit-and (i64-shift-right pk 1) 1023))
+(defn pk-last? [pk :i64] :bool (= 1 (bit-and pk 1)))
+(defn pack-pk [pos :i64 k :i64 budget :i64 last? :bool] :i64
+  (+ (i64-shift-left pos 31) (i64-shift-left k 11) (i64-shift-left budget 1)
+     (if last? 1 0)))
+
+(defn pk-next [pk :i64 end :i64 dlen :i64 wrote? :bool] :i64
+  (+ (pack-pk (+ end dlen) (+ (pk-k pk) 1) (- (pk-budget pk) 1) (pk-last? pk))
+     (if wrote? 4611686018427387904 0)))
+
+(defn pk-reset [pk :i64 end :i64 dlen :i64 wrote? :bool] :i64
+  (+ (pack-pk (+ end dlen) (+ (pk-k pk) 1) 255 (pk-last? pk))
+     (if wrote? 4611686018427387904 0)))
+
+;; The offset just past the end of the field starting at POS, plus the
+;; delimiter: `end * 2 + 1` when a delimiter ended it, `n * 2` when the
+;; line did.
+(defn field-end [line :string d :string pos :i64] :i64
+  ;; One host search from POS (`string-index-of-from`, context ABI v8): no
+  ;; view is cut per field, which halves the handles a field costs.
+  (let [i (string-index-of-from line d pos)]
+    (if (< i 0) (* (string-byte-length line) 2) (+ (* i 2) 1))))
+
+;; SEL: 0 not selected, 1 selected and first, 2 selected after another.
+(defn append-selected [line :string pos :i64 end :i64 sel :i64 acc :string] :string
+  ;; One host call, no view (`string-append-range`, context ABI v10).
+  (if (= sel 0)
+    acc
+    (string-append-range acc line pos end)))
+
+(defn sel-of [cfg :i64 pk :i64] :i64
+  (if (selected? cfg (pk-k pk))
+    (if (pk-wrote? pk) 2 1)
+    0))
+
+;; Fields from PK onto ACC until the line ends, the last selected field is
+;; passed, or the budget runs out -- then the accumulator is written and
+;; the rest goes to `cut-rest`; either way the line's newline is appended
+;; by whichever finishes it.
+(defn cut-fields [line :string d :string pk :i64 cfg :i64 acc :string] :string
+  (let [n (string-byte-length line)
+        pos (pk-pos pk)
+        k (pk-k pk)
+        fe (field-end line d pos)
+        end (i64-shift-right fe 1)
+        delimited? (= 1 (bit-and fe 1))]
+    (if (if (= k 1) (not delimited?) false)
+      (if (cfg-sup? cfg)
+        acc
+        (if (pk-last? pk)
+          (string-concat acc line)
+          (string-concat (string-concat acc line) (nl))))
+      (let [sel (sel-of cfg pk)
+            last (cfg-last cfg)
+            wrote? (if (> sel 0) true (pk-wrote? pk))
+            acc2 (append-selected line pos end sel (if (= sel 2) (string-concat acc d) acc))]
+        (if (if (not delimited?) true (if (= last 0) false (>= k last)))
+          (string-concat acc2 (nl))
+          (if (= (pk-budget pk) 0)
+            (do (emit acc2)
+                (cut-rest line d (pk-reset pk end (string-byte-length d) wrote?) cfg)
+                "")
+            (cut-fields line d (pk-next pk end (string-byte-length d) wrote?) cfg acc2)))))))
+
+;; One chunk of a long line: fields from PK onto a fresh accumulator until
+;; the budget runs out or the line ends, then ONE write. Answers the PK to
+;; continue from, or -1 when the line is done. K is never 1 here, so the
+;; no-delimiter case cannot arise.
+(defn cut-chunk [line :string d :string pk :i64 cfg :i64 acc :string] :i64
+  (let [pos (pk-pos pk)
+        k (pk-k pk)
+        fe (field-end line d pos)
+        end (i64-shift-right fe 1)
+        delimited? (= 1 (bit-and fe 1))
+        sel (sel-of cfg pk)
+        last (cfg-last cfg)
+        wrote? (if (> sel 0) true (pk-wrote? pk))
+        acc2 (append-selected line pos end sel (if (= sel 2) (string-concat acc d) acc))]
+    (if (if (not delimited?) true (if (= last 0) false (>= k last)))
+      (do (emit (string-concat acc2 (nl))) -1)
+      (if (= (pk-budget pk) 0)
+        (do (emit acc2) (pk-reset pk end (string-byte-length d) wrote?))
+        (cut-chunk line d (pk-next pk end (string-byte-length d) wrote?) cfg acc2)))))
+
+(defn cut-rest [line :string d :string pk :i64 cfg :i64] :i64
+  (let [next (arena-scope (cut-chunk line d pk cfg ""))]
+    (if (< next 0) 0 (cut-rest line d next cfg))))
+
+;; --- the fast walk: over the text by offsets (2026-09-16, ABI v10) ---------
+;;
+;; When the delimiter is one ASCII byte and every field number fits the
+;; cfg's thirteen bits, a line is cut WITHOUT a view of it: field K starts
+;; at the absolute offset POS and ends at the next delimiter BYTE
+;; (`string-find-byte`, no needle handle) or at END, the line's end; a
+;; selected field is appended as a range (`string-append-range`, no view),
+;; its delimiter as the one byte before it, and the line's newline as the
+;; byte at END. Per line that is the newline search, one search per field
+;; read, and one append per field written -- and no handle but the appends.
+;; Measured 2026-09-16 on 33 MB `-f2`: 0.16 s -> 0.11 s. The general walk
+;; above keeps every other case (a multi-byte delimiter, a field past 8191).
+;; PK is the general walk's; its POS is absolute here. The budget hands the
+;; rest of the line to the general chunks, as a view from the current field.
+(defn- cut-fields-fast [text :string pk :i64 end :i64 cfg :i64 acc :string] :string
+  (let [pos (pk-pos pk)
+        k (pk-k pk)
+        h (string-find-byte text (cfg-dbyte cfg) pos)
+        delimited? (if (< h 0) false (< h end))
+        fend (if delimited? h end)]
+    (if (if (= k 1) (not delimited?) false)
+      (if (cfg-sup? cfg)
+        acc
+        (if (pk-last? pk)
+          (string-append-range acc text pos end)
+          (string-append-range acc text pos (+ end 1))))
+      (let [sel (sel-of cfg pk)
+            last (cfg-last cfg)
+            wrote? (if (> sel 0) true (pk-wrote? pk))
+            acc2 (if (= sel 0)
+                   acc
+                   (string-append-range (if (= sel 2) (string-append-range acc text (- pos 1) pos) acc)
+                                        text pos fend))]
+        (if (if (not delimited?) true (if (= last 0) false (>= k last)))
+          (if (pk-last? pk)
+            (string-concat acc2 (nl))
+            (string-append-range acc2 text end (+ end 1)))
+          (if (= (pk-budget pk) 0)
+            (do (emit acc2)
+                (cut-rest (string-substring text (+ fend 1) end)
+                          (string-substring text fend (+ fend 1))
+                          (+ (pack-pk 0 (+ k 1) 255 (pk-last? pk)) (if wrote? 4611686018427387904 0))
+                          cfg)
+                "")
+            (cut-fields-fast text (+ (pk-next pk fend 1 wrote?) 0) end cfg acc2)))))))
+
+;; The lines from POS, cut onto ACC, until 1 KB of INPUT has been consumed
+;; or the text ends; then ONE write (the loader buffers stdout, so a write
+;; is a copy, not a syscall). Answers the cursor to continue from. Runs
+;; inside a region (arena-scope, context ABI v6): the accumulator, every
+;; search view, line view and field view of the batch are released as it
+;; answers, so a file leaves nothing in the arena. The bound is on INPUT
+;; bytes because that bounds the handles: a field costs at most two and is
+;; at least two bytes with its delimiter, a line at most five more, so 1 KB
+;; of input is under 1,300 handles, and with one line's 256-field budget
+;; (1,024) and one nested chunk's (1,024) on top the batch stays inside the
+;; loader's default 4,096, which the suite packages. Measured 2026-09-16:
+;; 16 KB batches trapped on `-f3-` over a C file at 4,096. PC packs the
+;; cursor and the bytes consumed: `pos * 2^22 + consumed`.
+(defn batch [text :string d :string cfg :i64 pc :i64 acc :string] :i64
+  (let [n (string-byte-length text)
+        pos (i64-shift-right pc 22)
+        consumed (bit-and pc 4194303)]
+    (if (>= pos n)
+      (do (emit acc) n)
+      (if (>= consumed 1024)
+        (do (emit acc) pos)
+        ;; The newline search takes the byte, not a needle string: no handle,
+        ;; no region (`string-find-byte`, context ABI v10).
+        (let [i (string-find-byte text 10 pos)
+              end (if (< i 0) n i)
+              next (if (< i 0) n (+ end 1))]
+          (batch text d cfg (+ (i64-shift-left next 22) (+ consumed (- next pos)))
+                 (if (cfg-fast? cfg)
+                   (cut-fields-fast text (pack-pk pos 1 255 (< i 0)) end cfg acc)
+                   (cut-fields (string-substring text pos end) d (pack-pk 0 1 255 (< i 0)) cfg acc))))))))
+
+(defn walk-from [text :string d :string cfg :i64 pos :i64] :i64
+  (if (>= pos (string-byte-length text))
+    0
+    (walk-from text d cfg (arena-scope (batch text d cfg (i64-shift-left pos 22) "")))))
+
+(defn walk [text :string d :string cfg :i64] :i64
+  (walk-from text d cfg 0))
+
+(defn complain [path :string] :i64
+  (do
+    (emit-error "cut: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; Each operand is cut on its own, exactly as sort reads each of its own
+;; operands as lines. There are no headers, so the outputs simply follow one
+;; another.
+;;
+;; What makes two operands look like one byte stream is the rule above, not
+;; concatenation. Measured 2026-09-10, with `g` holding one undelimited and
+;; unterminated line:
+;;
+;;   cut -d: -f1 g colon   ->  ga / d      `g` had no newline, so `a` follows it
+;;   cut -d: -f1 nl2 colon ->  nonl-x / a / d   a field WAS cut, so it did
+;;
+;; The first of those was read as "cut concatenates its operands" for about
+;; an hour. It does not; the previous operand's output was simply
+;; unterminated. The two cases together are what distinguish the models, and
+;; both are in the suite.
+(defn each [i :i64 total :string cfg :i64 worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do (walk (slurp-file path) (delim) cfg)
+            (each (+ i 1) total cfg worst))
+        (do (complain path) (each (+ i 1) total cfg 1))))))
+
+;; --- -c: a list of CHARACTER positions ----------------------------------
+;;
+;; Measured 2026-09-17 over 1,268,018 agent Bash calls: `cut -c1-200`,
+;; `-c1-120`, `-c1-160`, ... 5,598 in all, the most frequent cut flag --
+;; agents truncate lines before they reach the context window. Positions
+;; count CODE POINTS, as /usr/bin/cut does in a UTF-8 locale (`-c1-3` of
+;; 日本語テスト is 日本語, measured), and the list has the same grammar as
+;; -f's, tested as a set. A reversed range (`-c3-1`) selects nothing and is
+;; not an error -- /usr/bin/cut prints empty lines and exits 0, measured.
+;;
+;; The list becomes a TABLE: V[k] = 1 when position k (1..4095) is selected,
+;; V[4096] = the smallest open lower bound (`N-`), or 0. Built with writes
+;; only, then read only -- the linearity rule for vector-assoc!. A bound past
+;; 4095 is refused with a message; the measured lists stop at 300.
+(defn char-text [] :string
+  (let [f (flag-from 0 (first-file) "-c")]
+    (if (string=? f "") "" (string-substring f 2 (string-byte-length f)))))
+
+(defn- mark-range [v :vector-i64 lo :i64 hi :i64] :vector-i64
+  (if (> lo hi) v (mark-range (vector-assoc! v lo 1) (+ lo 1) hi)))
+
+;; One item into V; a bound past the table answers V with slot 0 set to -1.
+(defn- mark-item [v :vector-i64 item :string] :vector-i64
+  (let [len (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (< d 0)
+      (let [k (text->i64 item 0 len 0)]
+        (if (>= k 4096) (vector-assoc! v 0 -1) (vector-assoc! v k 1)))
+      (let [lo (string-substring item 0 d)
+            hi (string-substring item (+ d 1) len)
+            ln (string-byte-length lo)
+            hn (string-byte-length hi)
+            lov (if (= ln 0) 1 (text->i64 lo 0 ln 0))
+            hiv (if (= hn 0) 0 (text->i64 hi 0 hn 0))]
+        (if (>= lov 4096)
+          (vector-assoc! v 0 -1)
+          (if (= hiv 0)
+            ;; Open: everything from LOV on. Mark the table part and keep
+            ;; the smallest open bound in slot 4096 (0 = none yet).
+            (mark-range (vector-assoc! v 4096 lov) lov 4095)
+            (if (>= hiv 4096)
+              (vector-assoc! v 0 -1)
+              (mark-range v lov hiv))))))))
+
+(defn- mark-spec [v :vector-i64 spec :string] :vector-i64
+  (let [n (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (mark-item v spec)
+      (mark-spec (mark-item v (string-substring spec 0 i)) (string-substring spec (+ i 1) n)))))
+
+;; Two open ranges (`5-,9-`): the table holds positions under 4096 exactly,
+;; whichever bound was written last; past the table the LAST bound written
+;; decides, and for `5-,9-` that is 9 -- positions 4096 and beyond of a
+;; line longer than that would be dropped between two open ranges. Not a
+;; measured shape; named in the README rather than fixed with a comparison
+;; this build cannot express without reading the slot before writing it.
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- char-selected? [v :vector-i64 k :i64] :bool
+  (if (< k 4096)
+    (= 1 (vector-at v k))
+    (let [open (vector-at v 4096)] (if (= open 0) false (>= k open)))))
+
+;; One line [i, end): the selected characters, written as RUNS -- a run of
+;; consecutive selected characters is one substring and one write, not one
+;; per character (the first cut minted a view per character and `-c1-30`
+;; over 1 MB met the pair budget at exit 120). STATE packs the run's start
+;; (-1 = no open run) above the position counter k: run * 2^22 + k, so a
+;; line may hold up to four million characters.
+(defn- run-of [state :i64] :i64 (- (quot state 4194304) 1))
+(defn- k-of [state :i64] :i64 (- state (* 4194304 (quot state 4194304))))
+(defn- pack [run :i64 k :i64] :i64 (+ (* (+ run 1) 4194304) k))
+
+(defn- cut-chars [v :vector-i64 text :string i :i64 end :i64 state :i64] :i64
+  (let [run (run-of state)
+        k (k-of state)]
+    (if (>= i end)
+      (do (if (>= run 0) (emit (string-substring text run end)) "") 0)
+      (let [c (string-code-point-at text i)
+            w (cp-width c)]
+        (if (char-selected? v k)
+          (cut-chars v text (+ i w) end (pack (if (< run 0) i run) (+ k 1)))
+          (do (if (>= run 0) (emit (string-substring text run i)) "")
+              (cut-chars v text (+ i w) end (pack -1 (+ k 1)))))))))
+
+;; One line inside its own region, so the views it minted are reclaimed.
+(defn- cut-line [v :vector-i64 text :string pos :i64 end :i64] :i64
+  (do (cut-chars v text pos end (pack -1 1)) (emit (nl)) 0))
+
+;; Every line of TEXT. A last line without a newline gets one, as cut adds.
+(defn- walk-chars [v :vector-i64 text :string pos :i64] :i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      0
+      (let [nl-at (string-find-byte text 10 pos)
+            end (if (< nl-at 0) n nl-at)]
+        (do (arena-scope (cut-line v text pos end))
+            (walk-chars v text (+ end 1)))))))
+
+(defn- each-chars [i :i64 total :string v :vector-i64 worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do (walk-chars v (slurp-file path) 0) (each-chars (+ i 1) total v worst))
+        (do (complain path) (each-chars (+ i 1) total v 1))))))
+
+(defn- run-chars [spec :string] :i64
+  (let [bad (classify-spec spec)]
+    (if (= bad 1)
+      (do (emit-error "cut: [-bcf] list: illegal list value") (emit-error (nl)) 1)
+      (if (= bad 2)
+        (do (emit-error "cut: [-bcf] list: values may not include zero") (emit-error (nl)) 1)
+        (let [total (arg "")
+              start (first-file)]
+          (if (= -1 (vector-at (mark-spec (vector-alloc 4097) spec) 0))
+            (do (emit-error "cut: -c positions past 4095 are not supported by this build") (emit-error (nl)) 1)
+            (if (string=? (decimal-of start) total)
+              (do (walk-chars (mark-spec (vector-alloc 4097) spec) (stdin "") 0) 0)
+              (each-chars start total (mark-spec (vector-alloc 4097) spec) 0))))))))
+
+(defn main [] :i64
+  (if (not (string=? (char-text) ""))
+    (run-chars (char-text))
+  (let [spec (field-text)
+        total (arg "")
+        start (first-file)
+        bad (classify-spec spec)]
+    (if (= bad 1)
+      (do
+        (emit-error "cut: [-bcf] list: illegal list value")
+        (emit-error (nl))
+        1)
+      (if (= bad 2)
+        (do
+          (emit-error "cut: [-bcf] list: values may not include zero")
+          (emit-error (nl))
+          1)
+        ;; `start` already at the end means there is no file operand:
+        ;; standard input, whole (wire 41, 2026-09-16 -- 97% of cut's
+        ;; invocations in agent tool use are a later pipeline segment).
+        ;; Input past the string pool is refused, never cut short.
+        (if (string=? (decimal-of start) total)
+          (do (walk (stdin "") (delim) (spec->cfg spec (suppress?) (delim))) 0)
+          (each start total (spec->cfg spec (suppress?) (delim)) 0)))))))

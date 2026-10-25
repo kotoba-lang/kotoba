@@ -1,0 +1,428 @@
+(ns av1.tile-group
+  "tile_group_obu() entry (AV1 spec section 5.11, \"General tile group OBU
+   syntax\" / \"Decode tile syntax\") + decode_partition() (section 5.11.4,
+   \"Decode partition syntax\"), transcribed from 06.bitstream.syntax.md
+   #General tile group OBU syntax / #Decode tile syntax / #Decode partition
+   syntax and 09.parsing.process.md's `partition`/`split_or_horz`/
+   `split_or_vert` cdf-selection semantics, plus 10.additional.tables.md's
+   Default_Partition_W8/W16/W32/W64/W128_Cdf, Partition_Subsize,
+   Mi_Width_Log2, Mi_Height_Log2, Num_4x4_Blocks_Wide/High tables
+   (AOMediaCodec/av1-spec master, fetched 2026-07-12).
+
+   SCOPE (continuing Phase 0/1, ADR-2607122000 Migration step 9):
+   decode_partition() is implemented in full -- real default CDF tables,
+   real context derivation (bsl / AvailU / AvailL, via a MiSizes grid this
+   namespace maintains itself), real bool-decoder symbol reads through
+   av1.bool-decoder/read-symbol, down to every leaf partition. A leaf partition
+   is recorded as a tree node with `:leaf true` and decode_partition() returns
+   instead of calling decode_block().
+
+   **Pixel reconstruction is NOT absent from this repo, it just is not here.**
+   `av1.decode-block` reconstructs real pixels for a deliberately narrow slice
+   (see its own docstring for the exact boundary: BLOCK_32X32 leaves / TX_32X32 /
+   DCT_DCT / five intra modes for luma; TX_16X16 / UV_DC_PRED / 4:2:0 for
+   chroma). This namespace walks the partition tree for syntax and context
+   purposes and does not call it.
+
+   That distinction matters when sizing work on top of AV1: reading this
+   docstring alone suggests there is no reconstruction at all, the README
+   headline alone suggests there is, and the truth is reconstruction for a slice
+   too narrow to decode a file a real encoder would emit. A session assessing
+   this repo for AVIF support in 2026-07 was misled by the earlier wording of
+   this paragraph (com-junkawasaki/root ADR-2607300500 decision item 20).
+
+   IMPORTANT CORRECTNESS CAVEAT: because decode_block() is never called, none
+   of the bits/symbols it would read are consumed from the per-tile
+   bool-decoder. The returned partition-tree structure is only guaranteed
+   bit-exact against the real encoded tile UP TO the point where the first
+   real decode_block() call would occur in the spec's traversal order (i.e.
+   the very first leaf partition reached) -- every `partition`/
+   `split_or_horz`/`split_or_vert` symbol read *before* that point (including
+   full PARTITION_SPLIT recursion, since a split itself only reads more
+   partition-type symbols, never block data) is bit-exact against the real
+   stream. Every partition-tree read *after* that first leaf is reading from
+   a bitstream position the real decoder's decode_block() would already have
+   advanced past, so those later values are not semantically meaningful --
+   though they can never crash or run off the end of the buffer, because
+   av1.bool-decoder/read-symbol always terminates within the cdf's symbol
+   count and clamps its own bit consumption to 0 once the tile's declared
+   byte size (`SymbolMaxBits`) is exhausted. Walking a whole real multi-
+   superblock tile to completion without throwing is therefore still a
+   meaningful validation of the CDF-table/context-derivation/bool-decoder
+   wiring end-to-end (see test/av1/tile_group_test.cljk); bit-exact validation
+   of the FULL tile (beyond the first leaf) requires decode_block(), out of
+   scope here.
+
+   Approximation note: for the 6 spec-'extended' leaf partition types
+   (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4) whose real decode_block()
+   calls touch *multiple* sub-blocks of potentially different sizes within
+   the parent footprint, this namespace's MiSizes bookkeeping (used only for
+   later siblings' AvailU/AvailL context derivation, not for reconstruction)
+   approximates by recording the reported `subSize` uniformly across the
+   whole parent footprint. This is exact for PARTITION_NONE/HORZ/VERT (whose
+   real decode_block() calls all share the same subSize anyway) and an
+   approximation for the 6 extended types."
+  (:require [av1.bitreader :as br]
+            [av1.bool-decoder :as bd]
+            [av1.frame-header :as fh]))
+
+;; -- Block size enum (07.bitstream.semantics.md #Decode partition semantics,
+;; the "subSize" table) --
+(def BLOCK_4X4 0) (def BLOCK_4X8 1) (def BLOCK_8X4 2) (def BLOCK_8X8 3)
+(def BLOCK_8X16 4) (def BLOCK_16X8 5) (def BLOCK_16X16 6) (def BLOCK_16X32 7)
+(def BLOCK_32X16 8) (def BLOCK_32X32 9) (def BLOCK_32X64 10) (def BLOCK_64X32 11)
+(def BLOCK_64X64 12) (def BLOCK_64X128 13) (def BLOCK_128X64 14) (def BLOCK_128X128 15)
+(def BLOCK_4X16 16) (def BLOCK_16X4 17) (def BLOCK_8X32 18) (def BLOCK_32X8 19)
+(def BLOCK_16X64 20) (def BLOCK_64X16 21)
+
+;; -- Partition type enum (07.bitstream.semantics.md #Decode partition semantics) --
+(def PARTITION_NONE 0) (def PARTITION_HORZ 1) (def PARTITION_VERT 2) (def PARTITION_SPLIT 3)
+(def PARTITION_HORZ_A 4) (def PARTITION_HORZ_B 5) (def PARTITION_VERT_A 6) (def PARTITION_VERT_B 7)
+(def PARTITION_HORZ_4 8) (def PARTITION_VERT_4 9)
+
+;; -- 10.additional.tables.md "Conversion tables" -- indexed by the subSize
+;; enum above (22 entries, BLOCK_SIZES).
+(def Mi_Width_Log2 [0 0 1 1 1 2 2 2 3 3 3 4 4 4 5 5 0 2 1 3 2 4])
+(def Mi_Height_Log2 [0 1 0 1 2 1 2 3 2 3 4 3 4 5 4 5 2 0 3 1 4 2])
+(def Num_4x4_Blocks_Wide [1 1 2 2 2 4 4 4 8 8 8 16 16 16 32 32 1 4 2 8 4 16])
+(def Num_4x4_Blocks_High [1 2 1 2 4 2 4 8 4 8 16 8 16 32 16 32 4 1 8 2 16 4])
+
+;; Partition_Subsize[ p ][ x ]: 10 partition types x 22 block sizes -> subSize
+;; (nil = BLOCK_INVALID, an entry the spec documents as "never accessed" for
+;; the square bSizes decode_partition actually calls this with).
+(def Partition-Subsize
+  [;; PARTITION_NONE
+   [BLOCK_4X4 nil nil BLOCK_8X8 nil nil BLOCK_16X16 nil nil BLOCK_32X32 nil nil
+    BLOCK_64X64 nil nil BLOCK_128X128 nil nil nil nil nil nil]
+   ;; PARTITION_HORZ
+   [nil nil nil BLOCK_8X4 nil nil BLOCK_16X8 nil nil BLOCK_32X16 nil nil
+    BLOCK_64X32 nil nil BLOCK_128X64 nil nil nil nil nil nil]
+   ;; PARTITION_VERT
+   [nil nil nil BLOCK_4X8 nil nil BLOCK_8X16 nil nil BLOCK_16X32 nil nil
+    BLOCK_32X64 nil nil BLOCK_64X128 nil nil nil nil nil nil]
+   ;; PARTITION_SPLIT
+   [nil nil nil BLOCK_4X4 nil nil BLOCK_8X8 nil nil BLOCK_16X16 nil nil
+    BLOCK_32X32 nil nil BLOCK_64X64 nil nil nil nil nil nil]
+   ;; PARTITION_HORZ_A
+   [nil nil nil BLOCK_8X4 nil nil BLOCK_16X8 nil nil BLOCK_32X16 nil nil
+    BLOCK_64X32 nil nil BLOCK_128X64 nil nil nil nil nil nil]
+   ;; PARTITION_HORZ_B
+   [nil nil nil BLOCK_8X4 nil nil BLOCK_16X8 nil nil BLOCK_32X16 nil nil
+    BLOCK_64X32 nil nil BLOCK_128X64 nil nil nil nil nil nil]
+   ;; PARTITION_VERT_A
+   [nil nil nil BLOCK_4X8 nil nil BLOCK_8X16 nil nil BLOCK_16X32 nil nil
+    BLOCK_32X64 nil nil BLOCK_64X128 nil nil nil nil nil nil]
+   ;; PARTITION_VERT_B
+   [nil nil nil BLOCK_4X8 nil nil BLOCK_8X16 nil nil BLOCK_16X32 nil nil
+    BLOCK_32X64 nil nil BLOCK_64X128 nil nil nil nil nil nil]
+   ;; PARTITION_HORZ_4
+   [nil nil nil nil nil nil BLOCK_16X4 nil nil BLOCK_32X8 nil nil
+    BLOCK_64X16 nil nil nil nil nil nil nil nil nil]
+   ;; PARTITION_VERT_4
+   [nil nil nil nil nil nil BLOCK_4X16 nil nil BLOCK_8X32 nil nil
+    BLOCK_16X64 nil nil nil nil nil nil nil nil nil]])
+
+;; -- Default_Partition_W{8,16,32,64,128}_Cdf, 10.additional.tables.md.
+;; PARTITION_CONTEXTS = 4 (ctx 0..3, from `ctx = left*2 + above`).
+(def Default_Partition_W8_Cdf
+  [[19132 25510 30392 32768 0]
+   [13928 19855 28540 32768 0]
+   [12522 23679 28629 32768 0]
+   [9896 18783 25853 32768 0]])
+
+(def Default_Partition_W16_Cdf
+  [[15597 20929 24571 26706 27664 28821 29601 30571 31902 32768 0]
+   [7925 11043 16785 22470 23971 25043 26651 28701 29834 32768 0]
+   [5414 13269 15111 20488 22360 24500 25537 26336 32117 32768 0]
+   [2662 6362 8614 20860 23053 24778 26436 27829 31171 32768 0]])
+
+(def Default_Partition_W32_Cdf
+  [[18462 20920 23124 27647 28227 29049 29519 30178 31544 32768 0]
+   [7689 9060 12056 24992 25660 26182 26951 28041 29052 32768 0]
+   [6015 9009 10062 24544 25409 26545 27071 27526 32047 32768 0]
+   [1394 2208 2796 28614 29061 29466 29840 30185 31899 32768 0]])
+
+(def Default_Partition_W64_Cdf
+  [[20137 21547 23078 29566 29837 30261 30524 30892 31724 32768 0]
+   [6732 7490 9497 27944 28250 28515 28969 29630 30104 32768 0]
+   [5945 7663 8348 28683 29117 29749 30064 30298 32238 32768 0]
+   [870 1212 1487 31198 31394 31574 31743 31881 32332 32768 0]])
+
+(def Default_Partition_W128_Cdf
+  [[27899 28219 28529 32484 32539 32619 32639 32768 0]
+   [6607 6990 8268 32060 32219 32338 32371 32768 0]
+   [5429 6676 7122 32027 32227 32531 32582 32768 0]
+   [711 966 1172 32448 32538 32617 32664 32768 0]])
+
+(defn- partition-cdf-table [bsl]
+  (case (long bsl)
+    1 Default_Partition_W8_Cdf
+    2 Default_Partition_W16_Cdf
+    3 Default_Partition_W32_Cdf
+    4 Default_Partition_W64_Cdf
+    5 Default_Partition_W128_Cdf))
+
+(defn- get-partition-cdf [state bsl ctx]
+  (or (get-in state [:partition-cdfs [bsl ctx]])
+      (nth (partition-cdf-table bsl) ctx)))
+
+(defn- put-partition-cdf [state bsl ctx cdf]
+  (assoc-in state [:partition-cdfs [bsl ctx]] cdf))
+
+(defn- read-partition-symbol
+  "spec 09.parsing.process.md \"partition\": read the `partition` syntax
+   element from the persisted, tile-adapted TilePartitionW*Cdf[ctx]."
+  [state bsl ctx]
+  (let [cdf (get-partition-cdf state bsl ctx)
+        adapt? (:cdf-adapt? state true)
+        [sym cdf' bd'] (bd/read-symbol (:bd state) cdf adapt?)
+        state' (-> state (assoc :bd bd') (put-partition-cdf bsl ctx cdf'))]
+    [sym state']))
+
+;; -- split_or_horz / split_or_vert: derived 3-element throwaway cdf built
+;; from partitionCdf (09.parsing.process.md, "split_or_horz"/"split_or_vert").
+;; Never persisted (spec always reconstructs it fresh from partitionCdf), so
+;; read with adapt?=false -- same discard pattern as av1.bool-decoder/read-bool.
+
+(defn- psum-term [cdf hi] (- (nth cdf hi) (nth cdf (dec hi))))
+
+(defn- split-or-horz-cdf [partition-cdf bsize]
+  (let [psum (+ (psum-term partition-cdf PARTITION_VERT)
+                (psum-term partition-cdf PARTITION_SPLIT)
+                (psum-term partition-cdf PARTITION_HORZ_A)
+                (psum-term partition-cdf PARTITION_VERT_A)
+                (psum-term partition-cdf PARTITION_VERT_B))
+        psum (if (not= bsize BLOCK_128X128) (+ psum (psum-term partition-cdf PARTITION_VERT_4)) psum)]
+    [(- (bit-shift-left 1 15) psum) (bit-shift-left 1 15) 0]))
+
+(defn- split-or-vert-cdf [partition-cdf bsize]
+  (let [psum (+ (psum-term partition-cdf PARTITION_HORZ)
+                (psum-term partition-cdf PARTITION_SPLIT)
+                (psum-term partition-cdf PARTITION_HORZ_A)
+                (psum-term partition-cdf PARTITION_HORZ_B)
+                (psum-term partition-cdf PARTITION_VERT_A))
+        psum (if (not= bsize BLOCK_128X128) (+ psum (psum-term partition-cdf PARTITION_HORZ_4)) psum)]
+    [(- (bit-shift-left 1 15) psum) (bit-shift-left 1 15) 0]))
+
+(defn- read-split-or-horz [state bsl ctx bsize]
+  (let [cdf (split-or-horz-cdf (get-partition-cdf state bsl ctx) bsize)
+        [sym _ bd'] (bd/read-symbol (:bd state) cdf false)]
+    [sym (assoc state :bd bd')]))
+
+(defn- read-split-or-vert [state bsl ctx bsize]
+  (let [cdf (split-or-vert-cdf (get-partition-cdf state bsl ctx) bsize)
+        [sym _ bd'] (bd/read-symbol (:bd state) cdf false)]
+    [sym (assoc state :bd bd')]))
+
+;; -- MiSizes bookkeeping (spec #Is inside function's AvailU/AvailL context,
+;; via MiSizes) -- see namespace docstring's "Approximation note".
+
+(defn- inside-tile? [state r c]
+  (let [{:keys [mi-row-start mi-row-end mi-col-start mi-col-end]} state]
+    (and (>= c mi-col-start) (< c mi-col-end) (>= r mi-row-start) (< r mi-row-end))))
+
+(defn- mi-size-at [state r c] (get (:mi-sizes state) [r c]))
+
+(defn- set-mi-sizes
+  "Record `record-size` across every mi position in the `origin-bsize`
+   footprint rooted at (r,c) -- mirrors the side effect decode_block() would
+   have on MiSizes, without doing any of decode_block()'s bit/symbol reads."
+  [state r c origin-bsize record-size]
+  (let [w (nth Num_4x4_Blocks_Wide origin-bsize)
+        h (nth Num_4x4_Blocks_High origin-bsize)]
+    (update state :mi-sizes
+            (fn [m]
+              (reduce (fn [m [dr dc]] (assoc m [(+ r dr) (+ c dc)] record-size))
+                      m
+                      (for [dr (range h), dc (range w)] [dr dc]))))))
+
+(defn decode-partition
+  "spec #Decode partition syntax (recursive). Returns [tree-node state'].
+   tree-node is one of:
+     {:r r :c c :b-size bsize :out-of-bounds true}                     (r>=MiRows or c>=MiCols: spec's `return 0`, no read at all)
+     {:r r :c c :b-size bsize :partition p :sub-size s :leaf true}     (PARTITION_NONE/HORZ/VERT/HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4)
+     {:r r :c c :b-size bsize :partition PARTITION_SPLIT :sub-size s :children [4 tree-nodes]}
+   See namespace docstring for the bit-exactness caveat past the first leaf."
+  [state r c bsize]
+  (let [{:keys [mi-rows mi-cols]} state]
+    (if (or (>= r mi-rows) (>= c mi-cols))
+      [{:r r :c c :b-size bsize :out-of-bounds true} state]
+      (let [avail-u? (inside-tile? state (dec r) c)
+            avail-l? (inside-tile? state r (dec c))
+            above-size (when avail-u? (mi-size-at state (dec r) c))
+            left-size (when avail-l? (mi-size-at state r (dec c)))
+            num4x4 (nth Num_4x4_Blocks_Wide bsize)
+            half4x4 (quot num4x4 2)
+            ;; quarterBlock4x4 (spec: halfBlock4x4 >> 1) is only used by the
+            ;; real decode_partition() to place the 4 decode_block() calls for
+            ;; PARTITION_HORZ_4/VERT_4 -- since decode_block() is out of scope
+            ;; (those two partition types are recorded as opaque leaves here,
+            ;; see namespace docstring's "Approximation note"), it isn't
+            ;; needed in this implementation.
+            has-rows? (< (+ r half4x4) mi-rows)
+            has-cols? (< (+ c half4x4) mi-cols)
+            bsl (nth Mi_Width_Log2 bsize)
+            above (and above-size (< (nth Mi_Width_Log2 above-size) bsl))
+            left (and left-size (< (nth Mi_Height_Log2 left-size) bsl))
+            ;; spec 09.parsing.process.md "partition": ctx = left*2 + above.
+            ctx (+ (if left 2 0) (if above 1 0))
+            [partition state1]
+            (cond
+              (< bsize BLOCK_8X8) [PARTITION_NONE state]
+              (and has-rows? has-cols?) (read-partition-symbol state bsl ctx)
+              has-cols? (let [[so state'] (read-split-or-horz state bsl ctx bsize)]
+                          [(if (= so 1) PARTITION_SPLIT PARTITION_HORZ) state'])
+              has-rows? (let [[sv state'] (read-split-or-vert state bsl ctx bsize)]
+                          [(if (= sv 1) PARTITION_SPLIT PARTITION_VERT) state'])
+              :else [PARTITION_SPLIT state])
+            sub-size (get-in Partition-Subsize [partition bsize])]
+        (if (= partition PARTITION_SPLIT)
+          (let [[c1 s1] (decode-partition state1 r c sub-size)
+                [c2 s2] (decode-partition s1 r (+ c half4x4) sub-size)
+                [c3 s3] (decode-partition s2 (+ r half4x4) c sub-size)
+                [c4 s4] (decode-partition s3 (+ r half4x4) (+ c half4x4) sub-size)]
+            [{:r r :c c :b-size bsize :partition partition :sub-size sub-size
+              :children [c1 c2 c3 c4]}
+             s4])
+          (let [state2 (set-mi-sizes state1 r c bsize sub-size)
+                leaf-node {:r r :c c :b-size bsize :partition partition :sub-size sub-size :leaf true}]
+            ;; Phase 1 pixel-reconstruction continuation (ADR-2607122000
+            ;; Migration step 9): the spec's decode_partition() always calls
+            ;; decode_block() at every leaf (see #Decode partition syntax) --
+            ;; this was intentionally NOT done here in Phase 0/1's first cut
+            ;; (see namespace docstring's correctness caveat), but now that
+            ;; av1.decode-block implements decode_block() for this repo's
+            ;; narrow validated scope (single DC_PRED/TX_32X32/DCT_DCT leaf),
+            ;; an injectable `:decode-block-fn` callback lets callers opt in
+            ;; without disturbing existing callers/tests that don't set it
+            ;; (those keep the pre-existing "leaf recorded, no bits consumed
+            ;; past this point" behavior this namespace has always
+            ;; documented). Contract:
+            ;; `(decode-block-fn state r c mi-size avail-u? avail-l?)` ->
+            ;; `[block-result state']`; `block-result` (opaque to this
+            ;; namespace) is merged into the leaf node under `:decode-block`.
+            ;; avail-u?/avail-l? are passed through rather than recomputed by
+            ;; the callback, since decode_block()'s `AvailU`/`AvailL`
+            ;; (spec #Decode block syntax: `is_inside(r-1,c)`/`is_inside(r,c-1)`)
+            ;; are exactly this leaf's own avail-u?/avail-l? already computed
+            ;; above for the partition-symbol context.
+            (if-let [decode-block-fn (:decode-block-fn state2)]
+              (let [[block-result state3] (decode-block-fn state2 r c sub-size avail-u? avail-l?)]
+                [(assoc leaf-node :decode-block block-result) state3])
+              [leaf-node state2])))))))
+
+;; -- tile_group_obu() -- spec #General tile group OBU syntax / #Decode tile syntax.
+
+(defn- num-tiles [frame-hdr] (* (get-in frame-hdr [:tile-info :tile-cols])
+                                 (get-in frame-hdr [:tile-info :tile-rows])))
+
+(defn parse-tile-group-obu
+  "`sz` = the tile group payload's byte length, already header-stripped by
+   the caller (either a standalone OBU_TILE_GROUP's obu_size, or
+   frame_obu(sz)'s reduced sz for a combined OBU_FRAME -- see
+   `parse-frame-obu`). Decodes tiles tg_start..tg_end (the common
+   single-tile-group case covers every tile: tg_start=0,
+   tg_end=NumTiles-1). Per tile: init_symbol/decode-partition-over-superblocks
+   /exit_symbol (spec #Decode tile syntax's SB raster loop, minus
+   clear_cdef()/read_lr()/decode_block() -- all out of scope, see namespace
+   docstring).
+
+   `opts` (optional, default `{}`) supports `:decode-block-fn` -- see
+   `decode-partition`'s docstring for the callback contract. Threaded
+   through to every tile's initial state so av1.decode-block's decode_block()
+   implementation gets called at every leaf when supplied."
+  ([reader sz frame-hdr] (parse-tile-group-obu reader sz frame-hdr {}))
+  ([reader sz frame-hdr opts]
+  (let [{:keys [tile-cols tile-cols-log2 tile-rows-log2 tile-size-bytes
+                mi-col-starts mi-row-starts]} (:tile-info frame-hdr)
+        nt (num-tiles frame-hdr)
+        [tile-start-and-end-present r1] (if (> nt 1) (br/f reader 1) [0 reader])
+        [tg-start tg-end r2]
+        (if (or (= nt 1) (zero? tile-start-and-end-present))
+          [0 (dec nt) r1]
+          (let [tile-bits (+ tile-cols-log2 tile-rows-log2)
+                [s r'] (br/f r1 tile-bits)
+                [e r''] (br/f r' tile-bits)]
+            [s e r'']))
+        r3 (br/byte-alignment r2)
+        header-bytes (- (br/byte-pos r3) (br/byte-pos reader))
+        sz1 (- sz header-bytes)
+        use-128x128? (= 1 (:use-128x128-superblock frame-hdr))
+        sb-size (if use-128x128? BLOCK_128X128 BLOCK_64X64)
+        sb-size4 (nth Num_4x4_Blocks_Wide sb-size)
+        cdf-adapt? (zero? (:disable-cdf-update frame-hdr))]
+    (loop [tile-num tg-start, r r3, remaining sz1, acc []]
+      (if (> tile-num tg-end)
+        {:tile-start-and-end-present tile-start-and-end-present
+         :tg-start tg-start :tg-end tg-end :num-tiles nt :tiles acc}
+        (let [tile-row (quot tile-num tile-cols)
+              tile-col (mod tile-num tile-cols)
+              last-tile? (= tile-num tg-end)
+              [tile-size r']
+              (if last-tile?
+                [remaining r]
+                (let [[tsm1 r''] (br/le r tile-size-bytes)] [(inc tsm1) r'']))
+              remaining' (if last-tile? remaining (- remaining tile-size tile-size-bytes))
+              mi-row-start (nth mi-row-starts tile-row)
+              mi-row-end (nth mi-row-starts (inc tile-row))
+              mi-col-start (nth mi-col-starts tile-col)
+              mi-col-end (nth mi-col-starts (inc tile-col))
+              bd0 (bd/init-symbol r' tile-size)
+              tile-state0 (cond-> {:bd bd0 :partition-cdfs {} :mi-sizes {}
+                                    :mi-rows (:mi-rows frame-hdr) :mi-cols (:mi-cols frame-hdr)
+                                    :mi-row-start mi-row-start :mi-row-end mi-row-end
+                                    :mi-col-start mi-col-start :mi-col-end mi-col-end
+                                    :cdf-adapt? cdf-adapt?}
+                             (:decode-block-fn opts) (assoc :decode-block-fn (:decode-block-fn opts)))
+              [sb-partitions tile-state']
+              (loop [rr mi-row-start, state tile-state0, sbs []]
+                (if (>= rr mi-row-end)
+                  [sbs state]
+                  (let [[sbs' state']
+                        (loop [cc mi-col-start, state state, sbs sbs]
+                          (if (>= cc mi-col-end)
+                            [sbs state]
+                            (let [[tree state''] (decode-partition state rr cc sb-size)]
+                              (recur (+ cc sb-size4) state'' (conj sbs tree)))))]
+                    (recur (+ rr sb-size4) state' sbs'))))
+              reader-after-tile (bd/exit-symbol (:bd tile-state'))]
+          (recur (inc tile-num) reader-after-tile remaining'
+                 (conj acc {:tile-row tile-row :tile-col tile-col :tile-size tile-size
+                            :mi-row-start mi-row-start :mi-row-end mi-row-end
+                            :mi-col-start mi-col-start :mi-col-end mi-col-end
+                            :superblock-partitions sb-partitions
+                            ;; Phase 1 pixel-reconstruction continuation
+                            ;; (ADR-2607122000 Migration step 9): the final
+                            ;; per-tile state (minus :bd, which is only
+                            ;; meaningful mid-parse) is exposed so a caller
+                            ;; supplying :decode-block-fn can pull out
+                            ;; whatever it accumulated there (e.g.
+                            ;; av1.decode-block's :luma-plane reconstructed
+                            ;; pixel buffer) -- opaque to this namespace.
+                            :final-tile-state (dissoc tile-state' :bd)}))))))))
+
+(defn parse-frame-obu
+  "spec #Frame OBU syntax (`frame_obu(sz)`), for a combined OBU_FRAME: parses
+   frame_header_obu() (av1.frame-header/parse) then byte_alignment() then
+   tile_group_obu(sz) with sz reduced by the header's byte length. `obu` is
+   an entry from av1.obu/parse-obu (:reader-at-payload + :obu-size);
+   `seq-hdr` is the active sequence header (av1.sequence-header/parse).
+   `opts` (optional) forwarded to `parse-tile-group-obu` -- see its
+   docstring for `:decode-block-fn`."
+  ([obu seq-hdr] (parse-frame-obu obu seq-hdr {}))
+  ([obu seq-hdr opts]
+  (let [start-reader (:reader-at-payload obu)
+        start-byte (br/byte-pos start-reader)
+        frame-hdr (fh/parse start-reader seq-hdr)
+        aligned-reader (br/byte-alignment (:reader-after-frame-header frame-hdr))
+        header-bytes (- (br/byte-pos aligned-reader) start-byte)
+        sz (- (:obu-size obu) header-bytes)]
+    {:frame-header frame-hdr
+     :tile-group (parse-tile-group-obu aligned-reader sz frame-hdr opts)})))
+
+(defn parse-standalone-tile-group-obu
+  "For the standalone OBU_TILE_GROUP case (a preceding, separate
+   OBU_FRAME_HEADER already produced `frame-hdr`): `sz` is simply that tile
+   group OBU's own obu_size, no header-bytes subtraction needed."
+  [obu frame-hdr]
+  (parse-tile-group-obu (:reader-at-payload obu) (:obu-size obu) frame-hdr))
