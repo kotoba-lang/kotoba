@@ -194,6 +194,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.dirname` | `org.ieee.dirname/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.echo` | `org.ieee.echo/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.grep` | `org.ieee.grep/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.head` | `org.ieee.head/src` | `` (an external specification, publisher ieee.org) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |
